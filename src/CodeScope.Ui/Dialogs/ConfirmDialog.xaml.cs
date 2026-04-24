@@ -199,6 +199,13 @@ public partial class ConfirmDialog : Window
         }
     }
 
+    private void OnScrimClick(object sender, MouseButtonEventArgs e)
+    {
+        if (_strict) { return; }
+        DialogResult = false;
+        Close();
+    }
+
     private void OnConfirm(object sender, RoutedEventArgs e)
     {
         DialogResult = true;

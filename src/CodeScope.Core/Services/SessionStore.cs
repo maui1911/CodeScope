@@ -194,7 +194,25 @@ public sealed class SessionStore : ISessionStore
         }
         if (!changed) { return Result<bool>.Fail($"Session '{sessionId}' not found"); }
         var saved = await SaveSnapshotAsync(ct).ConfigureAwait(false);
-        if (saved.IsFailure) { return saved; }
+        if (saved.IsFailure)
+        {
+            // Rollback the in-memory mutation so a retry doesn't hit the idempotency guard
+            // and silently succeed without ever persisting.
+            lock (_lock)
+            {
+                for (var i = 0; i < _projects.Count; i++)
+                {
+                    var p = _projects[i];
+                    var sessions = p.Sessions.ToList();
+                    var idx = sessions.FindIndex(s => s.Id == sessionId);
+                    if (idx < 0) { continue; }
+                    sessions[idx] = sessions[idx] with { ClosedAt = null };
+                    _projects[i] = p with { Sessions = sessions };
+                    break;
+                }
+            }
+            return saved;
+        }
         // Fire SessionRemoved so the sidebar/tab strip drop the row — restore emits SessionAdded.
         Raise(new SessionStoreChange.SessionRemoved(sessionId));
         return Result<bool>.Ok(true);

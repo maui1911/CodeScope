@@ -201,17 +201,31 @@
                           Color="Black" />
     </Window.Resources>
 
-    <!-- The surface. Margin:30 leaves room for the drop shadow inside the transparent window. -->
-    <Border
-        Background="{StaticResource Dlg.Surface}"
-        BorderBrush="{StaticResource Dlg.Border}"
-        BorderThickness="1"
-        CornerRadius="12"
-        Margin="30"
-        Effect="{StaticResource Dlg.Shadow}"
-        MouseLeftButtonDown="OnChromeDrag"
-        SnapsToDevicePixels="True"
-        UseLayoutRounding="True">
+    <!-- Scrim: spec §03 — rgba(0,0,0,.55) + 2px blur. Covers the entire transparent window so
+         the owner dims visually. On non-strict dialogs, clicking the scrim dismisses (same as
+         Cancel). Strict/destructive: scrim is visual-only, click does nothing. The dialog
+         surface sits on top of the scrim inside the same Grid. -->
+    <Grid>
+        <Border
+            x:Name="ScrimBorder"
+            Background="#8C000000"
+            MouseLeftButtonDown="OnScrimClick">
+            <Border.Effect>
+                <BlurEffect Radius="2" />
+            </Border.Effect>
+        </Border>
+
+        <!-- The surface. Margin:30 leaves room for the drop shadow inside the transparent window. -->
+        <Border
+            Background="{StaticResource Dlg.Surface}"
+            BorderBrush="{StaticResource Dlg.Border}"
+            BorderThickness="1"
+            CornerRadius="12"
+            Margin="30"
+            Effect="{StaticResource Dlg.Shadow}"
+            MouseLeftButtonDown="OnChromeDrag"
+            SnapsToDevicePixels="True"
+            UseLayoutRounding="True">
         <Grid>
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" /> <!-- head -->
@@ -337,4 +351,5 @@
             </Border>
         </Grid>
     </Border>
+    </Grid>
 </Window>
