@@ -1,0 +1,19 @@
+<UserControl
+    x:Class="NoScope.CodeScope.Ui.Views.SessionTabView"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    xmlns:term="clr-namespace:EasyWindowsTerminalControl;assembly=EasyWindowsTerminalControl"
+    mc:Ignorable="d"
+    Background="#FF0A0A0A">
+    <Grid>
+        <term:EasyTerminalControl
+            x:Name="Terminal"
+            AutomationProperties.AutomationId="SessionTerminal"
+            FontFamilyWhenSettingTheme="FiraCode Nerd Font Mono"
+            FontSizeWhenSettingTheme="12"
+            Win32InputMode="True"
+            InputCapture="TabKey,DirectionKeys" />
+    </Grid>
+</UserControl>

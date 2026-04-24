@@ -1,0 +1,655 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>CodeScope — New Worktree</title>
+<meta name="viewport" content="width=1440" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<style>
+  :root {
+    --bg: #000;
+    --panel: #0A0A0A;
+    --elev: #141414;
+    --hover: #1F1F1F;
+    --border: #1F1F1F;
+    --text: #fff;
+    --text-2: #A0A0A0;
+    --text-3: #606060;
+    --accent: #0099FF;
+    --accent-soft: rgba(0, 153, 255, 0.20);
+    --ok: #4BD87B;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #000; color: #fff;
+    font-family: 'Inter', -apple-system, system-ui, sans-serif;
+    font-feature-settings: "cv01","cv05","cv09","cv11","ss03","ss07";
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+  }
+  body { display: flex; align-items: center; justify-content: center; }
+
+  /* ===== app backdrop (blurred / dimmed main window behind modal) ===== */
+  .page {
+    width: 1440px; height: 900px;
+    background:
+      radial-gradient(ellipse at 30% 20%, rgba(0,153,255,0.08), transparent 55%),
+      #050505;
+    border: 1px solid #1F1F1F;
+    border-radius: 8px;
+    position: relative;
+    overflow: hidden;
+  }
+  .backdrop-fake {
+    position: absolute; inset: 0;
+    display: grid;
+    grid-template-columns: 240px 1fr;
+    grid-template-rows: 48px 40px 1fr 32px;
+    filter: blur(1.5px);
+    opacity: 0.45;
+  }
+  .bf-sidebar { grid-row: 1 / span 4; background: #0A0A0A; border-right: 1px solid #1F1F1F; }
+  .bf-brand   { grid-row: 1; background: transparent; border-bottom: 1px solid #1F1F1F; }
+  .bf-tabs    { background: #0A0A0A; border-bottom: 1px solid #1F1F1F; }
+  .bf-term    { background: #000; }
+  .bf-status  { background: #0A0A0A; border-top: 1px solid #1F1F1F; }
+
+  .scrim {
+    position: absolute; inset: 0;
+    background: rgba(0,0,0,0.55);
+  }
+
+  /* ===== dialog ===== */
+  .dialog {
+    position: absolute;
+    left: 50%; top: 50%;
+    transform: translate(-50%, -50%);
+    width: 480px;
+    min-height: 360px;
+    background: #0A0A0A;
+    border: 1px solid #1F1F1F;
+    border-radius: 8px;
+    box-shadow:
+      0 20px 60px rgba(0,0,0,0.7),
+      0 0 0 1px rgba(0,153,255,0.08),
+      inset 0 1px 0 rgba(255,255,255,0.04);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .d-head {
+    padding: 20px 24px 16px;
+    display: flex; align-items: flex-start; gap: 12px;
+  }
+  .d-title-group { flex: 1 1 auto; min-width: 0; }
+  .d-eyebrow {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--accent);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+  .d-title {
+    font-size: 20px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    color: #fff;
+    margin: 0;
+  }
+  .d-sub {
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--text-2);
+    letter-spacing: -0.005em;
+  }
+  .d-close {
+    width: 24px; height: 24px;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--text-2);
+    cursor: pointer;
+    transition: background 120ms ease-out, color 120ms ease-out;
+    flex: 0 0 24px;
+  }
+  .d-close:hover { background: var(--hover); color: #fff; }
+
+  .d-body {
+    padding: 8px 24px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    flex: 1 1 auto;
+  }
+
+  .field-label {
+    display: flex; align-items: center; justify-content: space-between;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-2);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+  .field-hint {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--text-3);
+    text-transform: none;
+    letter-spacing: 0;
+  }
+
+  /* ----- dropdown (branch picker) ----- */
+  .dropdown {
+    position: relative;
+  }
+  .dd-trigger {
+    width: 100%;
+    height: 36px;
+    background: var(--elev);
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 0 12px;
+    display: flex; align-items: center; gap: 10px;
+    color: #fff;
+    font: 500 13px/1 'Inter', sans-serif;
+    letter-spacing: -0.005em;
+    cursor: pointer;
+    transition: background 120ms ease-out, border-color 120ms ease-out;
+  }
+  .dd-trigger:hover { background: var(--hover); }
+  .dd-trigger.open {
+    border-color: rgba(0,153,255,0.4);
+    background: #161A1F;
+  }
+  .dd-trigger .dd-value {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12.5px;
+    color: #fff;
+    flex: 1 1 auto;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .dd-trigger .dd-base {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--text-3);
+  }
+  .dd-trigger svg { color: var(--text-2); flex: 0 0 12px; transition: transform 200ms ease-out; }
+  .dd-trigger.open svg { transform: rotate(180deg); }
+  .dd-trigger .lead {
+    color: var(--accent);
+    flex: 0 0 12px;
+  }
+
+  .dd-menu {
+    position: absolute;
+    top: calc(100% + 6px); left: 0; right: 0;
+    background: #0E0E0E;
+    border: 1px solid #1F1F1F;
+    border-radius: 6px;
+    padding: 4px;
+    z-index: 30;
+    box-shadow: 0 16px 40px rgba(0,0,0,0.6), 0 0 0 1px rgba(0,153,255,0.08);
+    max-height: 220px;
+    overflow: auto;
+  }
+  .dd-search {
+    width: 100%;
+    background: transparent;
+    border: 0;
+    border-bottom: 1px solid var(--border);
+    padding: 8px 8px 10px;
+    color: #fff;
+    font: 400 12px/1 'Inter', sans-serif;
+    outline: none;
+    margin-bottom: 4px;
+  }
+  .dd-search::placeholder { color: var(--text-3); }
+  .dd-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 10px;
+    border-radius: 4px;
+    font-size: 12px;
+    color: var(--text-2);
+    cursor: pointer;
+    transition: background 120ms ease-out, color 120ms ease-out;
+  }
+  .dd-item:hover { background: var(--hover); color: #fff; }
+  .dd-item.selected { background: rgba(0,153,255,0.08); color: #fff; }
+  .dd-item .dd-i-name {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    flex: 1 1 auto;
+  }
+  .dd-item .dd-i-meta {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--text-3);
+  }
+  .dd-item.selected .dd-i-meta { color: var(--accent); }
+  .dd-sep {
+    height: 1px; background: var(--border); margin: 4px 2px;
+  }
+  .dd-group-label {
+    padding: 8px 10px 4px;
+    font-size: 9.5px;
+    font-weight: 500;
+    color: var(--text-3);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+  }
+
+  /* ----- input ----- */
+  .input-wrap {
+    position: relative;
+    display: flex; align-items: center;
+    height: 36px;
+    background: var(--elev);
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 0 12px;
+    transition: border-color 120ms ease-out, background 120ms ease-out;
+  }
+  .input-wrap:focus-within {
+    border-color: rgba(0,153,255,0.55);
+    background: #0F1318;
+    box-shadow: 0 0 0 2px rgba(0,153,255,0.18);
+  }
+  .input-wrap .prefix {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: var(--text-3);
+    margin-right: 0;
+  }
+  .input {
+    flex: 1 1 auto;
+    background: transparent;
+    border: 0;
+    outline: none;
+    color: #fff;
+    font: 500 13px/1 'JetBrains Mono', monospace;
+    letter-spacing: -0.005em;
+    padding: 0;
+    height: 100%;
+  }
+  .input::placeholder { color: var(--text-3); font-weight: 400; }
+  .input-wrap .suffix {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--text-3);
+    border-left: 1px solid var(--border);
+    padding-left: 10px;
+    margin-left: 10px;
+    white-space: nowrap;
+  }
+
+  /* ----- toggle row ----- */
+  .toggle-row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 14px;
+    background: var(--elev);
+    border-radius: 6px;
+    border: 1px solid transparent;
+    transition: background 120ms ease-out;
+    cursor: pointer;
+  }
+  .toggle-row:hover { background: #181818; }
+  .toggle-copy { flex: 1 1 auto; min-width: 0; }
+  .toggle-copy .t-title { font-size: 13px; font-weight: 500; color: #fff; letter-spacing: -0.005em; }
+  .toggle-copy .t-sub  { font-size: 11.5px; color: var(--text-2); margin-top: 2px; letter-spacing: -0.005em; }
+
+  .tg {
+    width: 34px; height: 20px;
+    border-radius: 10px;
+    background: #1F1F1F;
+    position: relative;
+    flex: 0 0 34px;
+    transition: background 200ms ease-out;
+  }
+  .tg::after {
+    content: "";
+    position: absolute; left: 2px; top: 2px;
+    width: 16px; height: 16px; border-radius: 50%;
+    background: #606060;
+    transition: left 200ms ease-out, background 200ms ease-out;
+  }
+  .tg.on { background: rgba(0,153,255,0.35); }
+  .tg.on::after { left: 16px; background: var(--accent); box-shadow: 0 0 0 3px rgba(0,153,255,0.15); }
+
+  /* ----- footer ----- */
+  .d-foot {
+    padding: 14px 24px 18px;
+    border-top: 1px solid var(--border);
+    display: flex; align-items: center; gap: 8px;
+    background: #080808;
+  }
+  .d-foot-meta {
+    flex: 1 1 auto;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10.5px;
+    color: var(--text-3);
+    letter-spacing: 0;
+  }
+  .btn {
+    height: 32px;
+    padding: 0 14px;
+    border-radius: 6px;
+    font: 500 13px/1 'Inter', sans-serif;
+    letter-spacing: -0.005em;
+    border: 0;
+    cursor: pointer;
+    display: inline-flex; align-items: center; gap: 8px;
+    transition: background 120ms ease-out, color 120ms ease-out, box-shadow 120ms ease-out;
+  }
+  .btn-ghost {
+    background: transparent;
+    color: var(--text-2);
+  }
+  .btn-ghost:hover { background: var(--hover); color: #fff; }
+  .btn-primary {
+    background: var(--accent);
+    color: #000;
+    font-weight: 600;
+    box-shadow: 0 0 0 0 rgba(0,153,255,0);
+  }
+  .btn-primary:hover {
+    background: #29A8FF;
+    box-shadow: 0 0 20px rgba(0,153,255,0.35);
+  }
+  .btn-primary .kbd {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    background: rgba(0,0,0,0.18);
+    padding: 2px 5px;
+    border-radius: 3px;
+    color: rgba(0,0,0,0.7);
+  }
+  .btn:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px #0A0A0A, 0 0 0 4px var(--accent);
+  }
+
+  /* ===== spec pane (to the right of the dialog) ===== */
+  .spec-pane {
+    position: absolute;
+    right: 24px; top: 24px;
+    width: 260px;
+    background: rgba(10,10,10,0.85);
+    border: 1px solid #1F1F1F;
+    border-radius: 8px;
+    padding: 16px;
+    backdrop-filter: blur(6px);
+    z-index: 5;
+  }
+  .spec-pane h5 {
+    margin: 0 0 10px;
+    font-size: 10px; font-weight: 600;
+    letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--accent);
+  }
+  .spec-row {
+    display: flex; align-items: baseline; justify-content: space-between;
+    padding: 5px 0;
+    border-bottom: 1px dashed #1A1A1A;
+    font-size: 11px;
+  }
+  .spec-row:last-child { border: 0; }
+  .spec-row .k { color: var(--text-2); letter-spacing: -0.005em; }
+  .spec-row .v {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10.5px;
+    color: #fff;
+  }
+
+  .caption {
+    position: absolute;
+    left: 24px; bottom: 24px;
+    max-width: 360px;
+    font-size: 11.5px;
+    color: var(--text-2);
+    line-height: 1.5;
+    letter-spacing: -0.005em;
+  }
+  .caption b { color: #fff; font-weight: 500; }
+
+  /* focus ring helper */
+  .focus-demo:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px #0A0A0A, 0 0 0 4px var(--accent);
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useRef, useEffect } = React;
+
+/* ===== icons ===== */
+const ChevronDown = ({ s = 12 }) => (
+  <svg width={s} height={s} viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M3 4.5 L6 7.5 L9 4.5" />
+  </svg>
+);
+const GitBranch = ({ s = 12 }) => (
+  <svg width={s} height={s} viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.2">
+    <circle cx="3" cy="3" r="1.3" /><circle cx="3" cy="9" r="1.3" /><circle cx="9" cy="4.5" r="1.3" />
+    <path d="M3 4.3v3.4M4.3 4.5c2 .2 3.4.8 4.7 0" strokeLinecap="round" />
+  </svg>
+);
+const Folder = ({ s = 12 }) => (
+  <svg width={s} height={s} viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round">
+    <path d="M1.5 3.5a1 1 0 0 1 1-1h2.3l1 1H9.5a1 1 0 0 1 1 1v4.5a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1v-4.5z" />
+  </svg>
+);
+const Close = ({ s = 10 }) => (
+  <svg width={s} height={s} viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round">
+    <path d="M2 2l6 6M8 2l-6 6" />
+  </svg>
+);
+const Check = ({ s = 10 }) => (
+  <svg width={s} height={s} viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M2 5.2 L4.2 7.3 L8 3" />
+  </svg>
+);
+
+/* ===== branch data ===== */
+const BRANCHES = [
+  { group: "Local", items: [
+    { name: "main",            meta: "8a4f2c1 · 2d ago" },
+    { name: "feat/reporting",  meta: "3f9a1b0 · 14m ago" },
+    { name: "bugfix/auth",     meta: "c81e402 · 1h ago" },
+  ]},
+  { group: "Remote", items: [
+    { name: "origin/main",         meta: "synced" },
+    { name: "origin/feat/billing", meta: "2 behind" },
+  ]},
+];
+
+/* ===== dropdown ===== */
+function BranchDropdown({ value, onChange }) {
+  const [open, setOpen] = useState(false);
+  const [q, setQ] = useState("");
+  const wrapRef = useRef(null);
+
+  useEffect(() => {
+    const h = (e) => { if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false); };
+    document.addEventListener('mousedown', h);
+    return () => document.removeEventListener('mousedown', h);
+  }, []);
+
+  const groups = BRANCHES.map(g => ({
+    group: g.group,
+    items: g.items.filter(i => i.name.toLowerCase().includes(q.toLowerCase())),
+  })).filter(g => g.items.length);
+
+  return (
+    <div className="dropdown" ref={wrapRef}>
+      <button
+        className={"dd-trigger focus-demo" + (open ? " open" : "")}
+        onClick={() => setOpen(o => !o)}
+        type="button"
+      >
+        <span className="lead"><GitBranch /></span>
+        <span className="dd-value">{value}</span>
+        <span className="dd-base">base</span>
+        <ChevronDown />
+      </button>
+      {open && (
+        <div className="dd-menu">
+          <input
+            className="dd-search"
+            placeholder="Search branches…"
+            value={q}
+            onChange={e => setQ(e.target.value)}
+            autoFocus
+          />
+          {groups.map((g, gi) => (
+            <div key={g.group}>
+              <div className="dd-group-label">{g.group}</div>
+              {g.items.map(it => (
+                <div
+                  key={it.name}
+                  className={"dd-item" + (it.name === value ? " selected" : "")}
+                  onClick={() => { onChange(it.name); setOpen(false); }}
+                >
+                  <GitBranch />
+                  <span className="dd-i-name">{it.name}</span>
+                  <span className="dd-i-meta">{it.meta}</span>
+                  {it.name === value && <span style={{ color: 'var(--accent)' }}><Check /></span>}
+                </div>
+              ))}
+              {gi < groups.length - 1 && <div className="dd-sep" />}
+            </div>
+          ))}
+          {!groups.length && (
+            <div style={{ padding: 14, fontSize: 12, color: 'var(--text-3)', textAlign: 'center' }}>
+              No matching branches
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ===== dialog ===== */
+function Dialog() {
+  const [branch, setBranch] = useState("feat/reporting");
+  const [name, setName] = useState("feat/csv-export");
+  const [spawn, setSpawn] = useState(true);
+
+  const valid = name.trim().length >= 2;
+
+  return (
+    <div className="dialog" role="dialog" aria-labelledby="nw-title">
+      <div className="d-head">
+        <div className="d-title-group">
+          <div className="d-eyebrow">PestScope</div>
+          <h3 className="d-title" id="nw-title">New worktree</h3>
+          <div className="d-sub">Isolated folder, fresh branch, optional agent session.</div>
+        </div>
+        <div className="d-close focus-demo" tabIndex={0}><Close /></div>
+      </div>
+
+      <div className="d-body">
+        {/* Branch picker */}
+        <div>
+          <div className="field-label">
+            <span>Base branch</span>
+            <span className="field-hint">worktree will branch off this</span>
+          </div>
+          <BranchDropdown value={branch} onChange={setBranch} />
+        </div>
+
+        {/* Name input */}
+        <div>
+          <div className="field-label">
+            <span>Worktree name</span>
+            <span className="field-hint">C:\src\pestscope-{name.replace(/[\/\\]/g, '-') || '…'}</span>
+          </div>
+          <div className="input-wrap">
+            <span className="prefix">$</span>
+            <input
+              className="input"
+              value={name}
+              onChange={e => setName(e.target.value)}
+              placeholder="feat/short-description"
+              spellCheck={false}
+            />
+            <span className="suffix">new branch</span>
+          </div>
+        </div>
+
+        {/* Spawn toggle */}
+        <div className="toggle-row focus-demo" tabIndex={0} onClick={() => setSpawn(s => !s)}>
+          <div className="toggle-copy">
+            <div className="t-title">Spawn session on creation</div>
+            <div className="t-sub">Opens a Claude Code tab in the new worktree immediately.</div>
+          </div>
+          <div className={"tg" + (spawn ? " on" : "")} />
+        </div>
+      </div>
+
+      <div className="d-foot">
+        <div className="d-foot-meta">git worktree add · {branch} → {name || "…"}</div>
+        <button className="btn btn-ghost focus-demo">Cancel</button>
+        <button className="btn btn-primary focus-demo" disabled={!valid}>
+          Create
+          <span className="kbd">↵</span>
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ===== page ===== */
+function App() {
+  return (
+    <div className="page" data-screen-label="01 New Worktree — Dialog">
+      {/* Dimmed/blurred main window stand-in */}
+      <div className="backdrop-fake">
+        <div className="bf-sidebar" />
+        <div className="bf-brand" />
+        <div className="bf-tabs" />
+        <div className="bf-term" />
+        <div className="bf-status" />
+      </div>
+      <div className="scrim" />
+
+      <Dialog />
+
+      <div className="spec-pane">
+        <h5>Dialog spec</h5>
+        <div className="spec-row"><span className="k">Size</span><span className="v">480 × 360</span></div>
+        <div className="spec-row"><span className="k">Surface</span><span className="v">#0A0A0A</span></div>
+        <div className="spec-row"><span className="k">Scrim</span><span className="v">rgba(0,0,0,.55)</span></div>
+        <div className="spec-row"><span className="k">Radius</span><span className="v">8px</span></div>
+        <div className="spec-row"><span className="k">Ring</span><span className="v">blue 8% 1px</span></div>
+        <div className="spec-row"><span className="k">Field h</span><span className="v">36px</span></div>
+        <div className="spec-row"><span className="k">Focus</span><span className="v">2px blue · offset 2px</span></div>
+        <div className="spec-row"><span className="k">Primary</span><span className="v">#0099FF on #000</span></div>
+        <div className="spec-row"><span className="k">Enter</span><span className="v">submits Create</span></div>
+        <div className="spec-row"><span className="k">Esc</span><span className="v">cancels</span></div>
+      </div>
+
+      <div className="caption">
+        <b>New Worktree</b> — matches the established tokens: layered-black surface, single blue accent, 8px grid, Inter chrome with JetBrains Mono for the branch/path atoms. The dropdown opens downward with a typeahead search; the Create button is disabled until the name has at least 2 characters.
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

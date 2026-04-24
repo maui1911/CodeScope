@@ -1,0 +1,143 @@
+<UserControl
+    x:Class="NoScope.CodeScope.Ui.Views.DiffPanelView"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:vm="clr-namespace:NoScope.CodeScope.Ui.ViewModels"
+    xmlns:conv="clr-namespace:NoScope.CodeScope.Ui.Converters"
+    Background="{DynamicResource Fig.Brush.GlassDark}"
+    TextElement.Foreground="{DynamicResource Fig.Brush.Ink}"
+    TextElement.FontFamily="{DynamicResource Fig.Font.Sans}"
+    d:DataContext="{d:DesignInstance Type=vm:DiffPanelViewModel}"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+    <UserControl.Resources>
+        <!-- Kind → brush. Diff lines reference these via DataTemplate trigger below. -->
+        <SolidColorBrush x:Key="DiffAddedBrush"    Color="#3fb950" />
+        <SolidColorBrush x:Key="DiffRemovedBrush"  Color="#f85149" />
+        <SolidColorBrush x:Key="DiffHunkBrush"     Color="#8b949e" />
+        <SolidColorBrush x:Key="DiffFileBrush"     Color="#d0d7de" />
+        <!-- Subtle row tints — match the mock's muted red/green row backgrounds. Keeping
+             opacity very low so the mono text stays readable against the panel surface. -->
+        <SolidColorBrush x:Key="DiffAddedRowBg"    Color="#143fb950" />
+        <SolidColorBrush x:Key="DiffRemovedRowBg"  Color="#14f85149" />
+        <SolidColorBrush x:Key="DiffHunkRowBg"     Color="#100099FF" />
+        <SolidColorBrush x:Key="DiffGutterBrush"   Color="#6d7680" />
+        <conv:ZeroToVisibleConverter x:Key="ZeroToVisible" />
+        <conv:ZeroToHiddenConverter  x:Key="ZeroToHidden" />
+        <BooleanToVisibilityConverter x:Key="BoolVisible" />
+    </UserControl.Resources>
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <DockPanel Grid.Row="0" Margin="12,6,12,4">
+            <TextBlock
+                Text="DIFF"
+                Style="{DynamicResource Fig.Style.MonoLabel}"
+                VerticalAlignment="Center" />
+            <!-- "2 files · +46 −2" summary from the VM — mirrors the mock's top-left
+                 bar. Hidden until the first refresh finishes so the header doesn't
+                 flash a stale count on worktree switches. -->
+            <TextBlock
+                Margin="12,0,0,0"
+                VerticalAlignment="Center"
+                FontFamily="{DynamicResource Fig.Font.Mono}"
+                FontSize="11"
+                Foreground="{DynamicResource Fig.Brush.InkMuted}"
+                Text="{Binding Summary}"
+                Visibility="{Binding HasSummary, Converter={StaticResource BoolVisible}}" />
+            <Button
+                AutomationProperties.AutomationId="DiffRefreshBtn"
+                DockPanel.Dock="Right"
+                HorizontalAlignment="Right"
+                Style="{DynamicResource Fig.Style.Button.Glass}"
+                Padding="12,3"
+                Content="↻"
+                FontSize="12"
+                ToolTip="Refresh diff"
+                Command="{Binding RefreshCommand}" />
+        </DockPanel>
+
+        <!-- Empty/error state when the line list is empty. -->
+        <TextBlock
+            Grid.Row="1"
+            Text="{Binding EmptyMessage}"
+            Opacity="0.6"
+            HorizontalAlignment="Center"
+            VerticalAlignment="Center"
+            Visibility="{Binding Lines.Count, Converter={StaticResource ZeroToVisible}}" />
+
+        <ScrollViewer
+            Grid.Row="1"
+            HorizontalScrollBarVisibility="Auto"
+            VerticalScrollBarVisibility="Auto"
+            Visibility="{Binding Lines.Count, Converter={StaticResource ZeroToHidden}}">
+            <ItemsControl
+                AutomationProperties.AutomationId="DiffLinesList"
+                ItemsSource="{Binding Lines}">
+                <ItemsControl.ItemTemplate>
+                    <!-- Per-row layout matches the mock: fixed-width old/new gutters, then
+                         the +/−/space sigil carried on the raw line, then the code. Row-
+                         level Border tints added/removed/hunk rows so scanning the diff
+                         reads like GitHub. -->
+                    <DataTemplate DataType="{x:Type vm:DiffLine}">
+                        <Border x:Name="RowBg" Padding="0">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="44" />
+                                    <ColumnDefinition Width="44" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock
+                                    Grid.Column="0"
+                                    Text="{Binding OldLineText}"
+                                    TextAlignment="Right"
+                                    Padding="0,0,8,0"
+                                    FontFamily="{DynamicResource Fig.Font.Mono}"
+                                    FontSize="{DynamicResource Fig.Size.MonoLabel}"
+                                    Foreground="{StaticResource DiffGutterBrush}" />
+                                <TextBlock
+                                    Grid.Column="1"
+                                    Text="{Binding NewLineText}"
+                                    TextAlignment="Right"
+                                    Padding="0,0,10,0"
+                                    FontFamily="{DynamicResource Fig.Font.Mono}"
+                                    FontSize="{DynamicResource Fig.Size.MonoLabel}"
+                                    Foreground="{StaticResource DiffGutterBrush}" />
+                                <TextBlock
+                                    x:Name="RowText"
+                                    Grid.Column="2"
+                                    Text="{Binding Text}"
+                                    FontFamily="{DynamicResource Fig.Font.Mono}"
+                                    FontSize="{DynamicResource Fig.Size.MonoLabel}"
+                                    Foreground="{DynamicResource Fig.Brush.Ink}"
+                                    Padding="0,0,12,0" />
+                            </Grid>
+                        </Border>
+                        <DataTemplate.Triggers>
+                            <DataTrigger Binding="{Binding Kind}" Value="Added">
+                                <Setter TargetName="RowBg" Property="Background" Value="{StaticResource DiffAddedRowBg}" />
+                                <Setter TargetName="RowText" Property="Foreground" Value="{StaticResource DiffAddedBrush}" />
+                            </DataTrigger>
+                            <DataTrigger Binding="{Binding Kind}" Value="Removed">
+                                <Setter TargetName="RowBg" Property="Background" Value="{StaticResource DiffRemovedRowBg}" />
+                                <Setter TargetName="RowText" Property="Foreground" Value="{StaticResource DiffRemovedBrush}" />
+                            </DataTrigger>
+                            <DataTrigger Binding="{Binding Kind}" Value="Hunk">
+                                <Setter TargetName="RowBg" Property="Background" Value="{StaticResource DiffHunkRowBg}" />
+                                <Setter TargetName="RowText" Property="Foreground" Value="{StaticResource DiffHunkBrush}" />
+                            </DataTrigger>
+                            <DataTrigger Binding="{Binding Kind}" Value="FileHeader">
+                                <Setter TargetName="RowText" Property="Foreground" Value="{StaticResource DiffFileBrush}" />
+                                <Setter TargetName="RowText" Property="FontWeight" Value="SemiBold" />
+                            </DataTrigger>
+                        </DataTemplate.Triggers>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+        </ScrollViewer>
+    </Grid>
+</UserControl>

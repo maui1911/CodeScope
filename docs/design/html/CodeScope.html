@@ -1,0 +1,948 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>CodeScope</title>
+<meta name="viewport" content="width=1440" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<style>
+  :root {
+    --bg: #000000;
+    --panel: #0A0A0A;
+    --elev: #141414;
+    --hover: #1F1F1F;
+    --border: #1F1F1F;
+    --text: #FFFFFF;
+    --text-2: #A0A0A0;
+    --text-3: #606060;
+    --accent: #0099FF;
+    --accent-soft: rgba(0, 153, 255, 0.20);
+    --accent-ring: rgba(0, 153, 255, 0.15);
+    --ok: #4BD87B;
+    --warn: #FF5A5A;
+    --code-str: #8FD679;
+    --code-type: #E8A857;
+    --code-com: #606060;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #000;
+    color: var(--text);
+    font-family: 'Inter', -apple-system, system-ui, sans-serif;
+    font-feature-settings: "cv01","cv05","cv09","cv11","ss03","ss07";
+    -webkit-font-smoothing: antialiased;
+    text-rendering: geometricPrecision;
+    overflow: hidden;
+  }
+  body { display: flex; align-items: center; justify-content: center; }
+
+  .app-shell {
+    width: 1440px;
+    height: 900px;
+    background: #000;
+    display: grid;
+    grid-template-columns: 240px 1fr;
+    grid-template-rows: 1fr 32px;
+    overflow: hidden;
+    border: 1px solid #1F1F1F;
+    border-radius: 8px;
+    position: relative;
+  }
+
+  /* ============ SIDEBAR ============ */
+  .sidebar {
+    grid-row: 1 / span 2;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .brand {
+    height: 48px;
+    padding: 0 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .brand-mark {
+    width: 14px; height: 14px;
+    border-radius: 4px;
+    background: var(--accent);
+    position: relative;
+    box-shadow: 0 0 0 3px rgba(0,153,255,0.12);
+  }
+  .brand-mark::after {
+    content: "";
+    position: absolute; inset: 3px 3px auto auto;
+    width: 4px; height: 4px; border-radius: 1px;
+    background: #000;
+  }
+  .brand-word {
+    font-weight: 600; font-size: 16px;
+    letter-spacing: -0.01em; color: #fff;
+  }
+  .brand-version {
+    margin-left: auto;
+    font-size: 10px; color: var(--text-3);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .side-label {
+    padding: 16px 12px 8px;
+    font-size: 10px; font-weight: 500;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--text-3);
+  }
+  .projects { flex: 1 1 auto; overflow: hidden; }
+
+  .project {
+    display: flex; align-items: center;
+    height: 36px;
+    padding: 0 12px;
+    gap: 8px;
+    font-weight: 500; font-size: 13px;
+    color: #fff;
+    letter-spacing: -0.005em;
+    cursor: pointer;
+    transition: background 120ms ease-out;
+    position: relative;
+  }
+  .project:hover { background: var(--hover); }
+  .chev {
+    width: 12px; height: 12px; flex: 0 0 12px;
+    color: var(--text-2);
+    transition: transform 200ms ease-out;
+  }
+  .project.open .chev { transform: rotate(90deg); }
+  .project-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .count-badge {
+    font-size: 11px; font-weight: 500;
+    color: var(--accent);
+    font-variant-numeric: tabular-nums;
+    min-width: 14px; text-align: right;
+  }
+
+  .worktrees {
+    display: none;
+    padding-bottom: 4px;
+  }
+  .project.open + .worktrees { display: block; }
+
+  .wt {
+    height: 28px;
+    padding: 0 12px 0 36px;
+    display: flex; align-items: center; gap: 8px;
+    font-size: 12px; font-weight: 400;
+    color: var(--text-2);
+    position: relative;
+    cursor: pointer;
+    transition: background 120ms ease-out, color 120ms ease-out;
+  }
+  .wt:hover { background: var(--hover); color: #fff; }
+  .wt.active {
+    background: var(--elev);
+    color: #fff;
+    font-weight: 500;
+  }
+  .wt .bar {
+    position: absolute; left: 0; top: 0; bottom: 0;
+    width: 2px; background: transparent;
+  }
+  .wt.has-session .bar { background: var(--accent); }
+  .wt.active .bar { background: var(--accent); }
+  .wt-icon {
+    width: 10px; height: 10px; opacity: 0.5;
+    flex: 0 0 10px;
+  }
+  .wt-name { font-family: 'JetBrains Mono', monospace; letter-spacing: -0.01em; font-size: 11.5px; }
+  .wt-meta {
+    margin-left: auto;
+    font-size: 10px;
+    color: var(--text-3);
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .sidebar-foot {
+    padding: 8px;
+    border-top: 1px solid var(--border);
+  }
+  .new-project {
+    width: 100%;
+    height: 40px;
+    background: var(--elev);
+    border: 0;
+    border-left: 2px solid var(--accent);
+    border-radius: 6px;
+    color: #fff;
+    font: 500 13px/1 'Inter', sans-serif;
+    letter-spacing: -0.005em;
+    display: flex; align-items: center;
+    gap: 8px;
+    padding: 0 12px;
+    cursor: pointer;
+    transition: background 120ms ease-out;
+  }
+  .new-project:hover { background: var(--hover); }
+  .new-project .plus {
+    width: 14px; height: 14px; color: var(--accent);
+  }
+
+  /* ============ MAIN AREA ============ */
+  .main {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+  }
+
+  /* ---- TAB STRIP ---- */
+  .tabs {
+    height: 40px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: stretch;
+    padding: 0 4px;
+    gap: 2px;
+    flex: 0 0 40px;
+  }
+  .tab {
+    position: relative;
+    display: flex; align-items: center;
+    gap: 8px;
+    min-width: 160px;
+    padding: 0 12px;
+    margin: 4px 0;
+    border-radius: 6px;
+    background: transparent;
+    color: rgba(255,255,255,0.7);
+    font: 500 13px/1 'Inter', sans-serif;
+    letter-spacing: -0.005em;
+    cursor: pointer;
+    transition: background 120ms ease-out, color 120ms ease-out;
+    user-select: none;
+  }
+  .tab:hover { background: var(--elev); color: #fff; }
+  .tab .status-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    flex: 0 0 6px;
+  }
+  .dot-active { background: var(--accent); box-shadow: 0 0 0 3px rgba(0,153,255,0.18); }
+  .dot-idle   { background: var(--ok); }
+  .dot-wait   { background: var(--warn); animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(255,90,90,0.55); }
+    50%      { box-shadow: 0 0 0 5px rgba(255,90,90,0); }
+  }
+
+  .tab .tab-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tab .tab-close {
+    width: 16px; height: 16px; border-radius: 50%;
+    display: none;
+    align-items: center; justify-content: center;
+    color: var(--text-2);
+    flex: 0 0 16px;
+  }
+  .tab:hover .tab-close { display: flex; }
+  .tab .tab-close:hover { background: var(--hover); color: #fff; }
+
+  .tab.active {
+    background: #000;
+    color: #fff;
+  }
+  .tab.active::before {
+    content: "";
+    position: absolute;
+    left: -4px; right: -4px; top: -4px;
+    height: 2px;
+    background: var(--accent);
+    border-radius: 2px;
+    box-shadow: 0 0 12px rgba(0,153,255,0.45);
+  }
+  .tab.active::after {
+    /* bottom blend with terminal canvas */
+    content: "";
+    position: absolute;
+    left: 0; right: 0; bottom: -5px;
+    height: 5px;
+    background: #000;
+  }
+
+  .tab-sep {
+    width: 1px;
+    background: var(--border);
+    margin: 10px 0;
+  }
+  .tab-new {
+    width: 32px; height: 28px;
+    margin: 6px 2px;
+    border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--text-2);
+    cursor: pointer;
+    transition: background 120ms ease-out, color 120ms ease-out;
+  }
+  .tab-new:hover { background: var(--elev); color: #fff; }
+
+  .tabs-right {
+    margin-left: auto;
+    display: flex; align-items: center; gap: 4px;
+    padding-right: 4px;
+  }
+  .chrome-btn {
+    width: 28px; height: 28px;
+    margin: 6px 0;
+    border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--text-2);
+    cursor: pointer;
+    transition: background 120ms ease-out, color 120ms ease-out;
+  }
+  .chrome-btn:hover { background: var(--elev); color: #fff; }
+
+  /* ---- TERMINAL ---- */
+  .canvas {
+    flex: 1 1 auto;
+    min-height: 0;
+    background: #000;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    position: relative;
+  }
+  .term-head {
+    height: 36px;
+    padding: 0 16px;
+    display: flex; align-items: center; gap: 12px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-2);
+    font-size: 12px;
+    font-family: 'JetBrains Mono', monospace;
+    letter-spacing: -0.01em;
+    flex: 0 0 36px;
+  }
+  .term-head .pill {
+    padding: 3px 8px;
+    border-radius: 4px;
+    background: var(--elev);
+    color: var(--text-2);
+    font-size: 11px;
+  }
+  .term-head .pill.accent { color: var(--accent); background: rgba(0,153,255,0.08); }
+  .term-head .spacer { flex: 1 1 auto; }
+  .term-head .kbd {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--text-3);
+    border: 1px solid var(--border);
+    padding: 2px 6px;
+    border-radius: 4px;
+  }
+
+  .term {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+    padding: 20px 24px 80px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 14px;
+    line-height: 1.55;
+    color: #fff;
+    letter-spacing: -0.005em;
+  }
+  .term .sys { color: var(--text-3); }
+  .term .dim { color: var(--text-2); }
+  .term .user {
+    color: var(--accent);
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+  }
+  .term .user .caret { color: var(--accent); font-weight: 600; }
+  .term .muted { color: var(--text-2); }
+
+  .term .thinking {
+    color: var(--text-2);
+    display: inline-flex; align-items: center; gap: 8px;
+    margin: 4px 0;
+  }
+  .spinner {
+    width: 10px; height: 10px; border-radius: 50%;
+    border: 1.5px solid rgba(0,153,255,0.25);
+    border-top-color: var(--accent);
+    animation: spin 0.9s linear infinite;
+    display: inline-block;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .tool-call {
+    margin: 12px 0;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    background: #060606;
+  }
+  .tool-call .tc-head {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 14px;
+    font-size: 12px;
+    color: var(--text-2);
+    border-bottom: 1px solid var(--border);
+    background: #080808;
+  }
+  .tool-call .tc-head .tc-badge {
+    color: var(--accent);
+    border: 1px solid rgba(0,153,255,0.3);
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .tool-call .tc-head .tc-path { color: #fff; }
+  .tool-call .tc-body {
+    padding: 14px 18px;
+    font-size: 13px;
+  }
+
+  /* syntax highlighting */
+  .k { color: var(--accent); }
+  .t { color: var(--code-type); }
+  .s { color: var(--code-str); }
+  .c { color: var(--code-com); font-style: italic; }
+  .n { color: #fff; }
+  .num { color: #C8A2FF; }
+  .fn { color: #fff; }
+  .op { color: var(--text-2); }
+  .ln {
+    display: inline-block;
+    width: 28px; color: var(--text-3);
+    text-align: right; user-select: none;
+    padding-right: 14px;
+    font-size: 12px;
+  }
+
+  .cursor {
+    display: inline-block;
+    width: 2px; height: 1.05em;
+    background: var(--accent);
+    vertical-align: -2px;
+    margin-left: 1px;
+    animation: blink 1.05s steps(2, start) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .term-inline {
+    display: flex; align-items: baseline; gap: 8px;
+    color: var(--accent);
+    margin-top: 18px;
+  }
+  .term-inline .prompt {
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .term-inline .typed { color: #fff; }
+
+  /* ============ STATUS BAR ============ */
+  .statusbar {
+    grid-column: 2;
+    height: 32px;
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    gap: 16px;
+    font-size: 12px;
+  }
+  .status-group { display: flex; align-items: center; gap: 8px; }
+  .status-dot-blue {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 3px rgba(0,153,255,0.15);
+  }
+  .status-dot-green {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--ok);
+  }
+  .branch {
+    font-weight: 500;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11.5px;
+    letter-spacing: -0.01em;
+    color: #fff;
+  }
+  .changes {
+    color: var(--text-2);
+    padding-bottom: 1px;
+    border-bottom: 1px solid rgba(0,153,255,0.4);
+    cursor: pointer;
+    transition: color 120ms ease-out, border-color 120ms ease-out;
+  }
+  .changes:hover { color: #fff; border-bottom-color: var(--accent); }
+  .sep { color: var(--text-3); }
+  .status-right { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+  .elapsed { color: var(--text-2); font-family: 'JetBrains Mono', monospace; font-size: 11.5px; }
+
+  /* ============ TWEAKS ============ */
+  .tweaks {
+    position: absolute;
+    right: 16px; bottom: 48px;
+    width: 280px;
+    background: #0A0A0A;
+    border: 1px solid #1F1F1F;
+    border-radius: 8px;
+    padding: 14px;
+    font-size: 12px;
+    z-index: 50;
+    display: none;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.6), 0 0 0 1px rgba(0,153,255,0.08);
+  }
+  .tweaks.open { display: block; }
+  .tweaks h4 {
+    margin: 0 0 12px; font-size: 11px; font-weight: 600;
+    letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--text-2);
+  }
+  .tweak-row { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; }
+  .tweak-row label { color: #fff; font-size: 12px; }
+  .tg {
+    width: 32px; height: 18px; border-radius: 10px;
+    background: #1F1F1F;
+    position: relative; cursor: pointer;
+    transition: background 120ms ease-out;
+  }
+  .tg::after {
+    content: "";
+    position: absolute; left: 2px; top: 2px;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: #606060;
+    transition: all 200ms ease-out;
+  }
+  .tg.on { background: rgba(0,153,255,0.35); }
+  .tg.on::after { left: 16px; background: var(--accent); }
+
+  /* focus ring demo */
+  .focus-demo {
+    outline: none;
+  }
+  .focus-demo:focus-visible {
+    box-shadow: 0 0 0 2px #000, 0 0 0 4px var(--accent);
+  }
+
+  /* scrollbar */
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #1F1F1F; border-radius: 5px; border: 2px solid #000; }
+  ::-webkit-scrollbar-thumb:hover { background: #2A2A2A; }
+
+  /* page background */
+  .page-frame {
+    position: fixed; inset: 0;
+    background: radial-gradient(ellipse at 30% 20%, rgba(0,153,255,0.06), transparent 50%), #050505;
+    display: flex; align-items: center; justify-content: center;
+    padding: 24px;
+  }
+</style>
+</head>
+<body>
+<div class="page-frame">
+  <div id="root"></div>
+</div>
+
+<script type="application/json" id="tweak-defaults">
+{
+  "cursorBlink": true,
+  "pulseAwaiting": true,
+  "tabHandle": true,
+  "showHeadBar": true
+}
+</script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef } = React;
+
+/* ============ ICONS ============ */
+const Chevron = ({ className }) => (
+  <svg className={className || "chev"} viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M4.5 3 L8 6 L4.5 9" />
+  </svg>
+);
+const Plus = ({ size = 14 }) => (
+  <svg width={size} height={size} viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+    <path d="M7 2v10M2 7h10" />
+  </svg>
+);
+const X = ({ size = 10 }) => (
+  <svg width={size} height={size} viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round">
+    <path d="M2 2l6 6M8 2l-6 6" />
+  </svg>
+);
+const GitBranch = ({ size = 10 }) => (
+  <svg width={size} height={size} viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.2">
+    <circle cx="3" cy="3" r="1.3" /><circle cx="3" cy="9" r="1.3" /><circle cx="9" cy="4.5" r="1.3" />
+    <path d="M3 4.3v3.4M4.3 4.5c2 .2 3.4.8 4.7 0" strokeLinecap="round" />
+  </svg>
+);
+const Settings = () => (
+  <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.2">
+    <circle cx="7" cy="7" r="2" />
+    <path d="M7 1.5v1.8M7 10.7v1.8M12.5 7h-1.8M3.3 7H1.5M10.8 3.2l-1.3 1.3M4.5 9.5l-1.3 1.3M10.8 10.8l-1.3-1.3M4.5 4.5L3.2 3.2"/>
+  </svg>
+);
+const Split = () => (
+  <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.2">
+    <rect x="1.5" y="1.5" width="11" height="11" rx="1.5" /><path d="M7 1.5v11" />
+  </svg>
+);
+const Maximize = () => (
+  <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round">
+    <path d="M2 5V2h3M12 5V2H9M2 9v3h3M12 9v3H9" />
+  </svg>
+);
+
+/* ============ DATA ============ */
+const initProjects = [
+  {
+    id: "pest",
+    name: "PestScope",
+    open: true,
+    worktrees: [
+      { id: "pest-main", name: "main", hasSession: false, meta: "" },
+      { id: "pest-feat", name: "feat/reporting", hasSession: true, meta: "3 chg" },
+    ],
+    count: 1,
+  },
+  {
+    id: "survey",
+    name: "SurveyScope",
+    open: false,
+    worktrees: [
+      { id: "survey-main", name: "main", hasSession: true, meta: "idle" },
+      { id: "survey-bug", name: "bugfix/auth", hasSession: true, meta: "wait" },
+    ],
+    count: 2,
+  },
+  {
+    id: "codescope",
+    name: "CodeScope",
+    open: false,
+    worktrees: [
+      { id: "cs-main", name: "main", hasSession: false, meta: "" },
+    ],
+    count: 0,
+  },
+];
+
+const initTabs = [
+  { id: "t1", name: "PestScope · feat/reporting", state: "active" },
+  { id: "t2", name: "SurveyScope · main",          state: "idle" },
+  { id: "t3", name: "SurveyScope · bugfix/auth",   state: "wait" },
+];
+
+/* ============ SIDEBAR ============ */
+function Sidebar({ projects, setProjects, selectedWt, setSelectedWt }) {
+  const toggle = (id) => setProjects(p => p.map(x => x.id === id ? { ...x, open: !x.open } : x));
+  return (
+    <aside className="sidebar">
+      <div className="brand">
+        <div className="brand-mark" />
+        <div className="brand-word">CodeScope</div>
+        <div className="brand-version">v0.4</div>
+      </div>
+
+      <div className="side-label">Projects</div>
+      <div className="projects">
+        {projects.map(p => (
+          <div key={p.id}>
+            <div className={"project" + (p.open ? " open" : "")} onClick={() => toggle(p.id)}>
+              <Chevron />
+              <span className="project-name">{p.name}</span>
+              {p.count > 0 && <span className="count-badge">{p.count}</span>}
+            </div>
+            {p.open && (
+              <div className="worktrees" style={{ display: "block" }}>
+                {p.worktrees.map(w => (
+                  <div
+                    key={w.id}
+                    className={
+                      "wt" +
+                      (w.hasSession ? " has-session" : "") +
+                      (selectedWt === w.id ? " active" : "")
+                    }
+                    onClick={() => setSelectedWt(w.id)}
+                  >
+                    <span className="bar" />
+                    <GitBranch />
+                    <span className="wt-name">{w.name}</span>
+                    {w.meta && <span className="wt-meta">{w.meta}</span>}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+
+      <div className="sidebar-foot">
+        <button className="new-project focus-demo">
+          <span className="plus" style={{ display: "inline-flex" }}><Plus size={12} /></span>
+          New Project
+        </button>
+      </div>
+    </aside>
+  );
+}
+
+/* ============ TABS ============ */
+function Tabs({ tabs, setTabs, activeId, setActiveId, pulseAwaiting, tabHandle }) {
+  return (
+    <div className="tabs">
+      {tabs.map((t, i) => {
+        const dotCls =
+          t.state === "active" ? "dot-active"
+          : t.state === "idle" ? "dot-idle"
+          : "dot-wait";
+        const isActive = t.id === activeId;
+        return (
+          <React.Fragment key={t.id}>
+            <div
+              className={"tab" + (isActive ? " active" : "")}
+              onClick={() => setActiveId(t.id)}
+              style={!tabHandle && isActive ? { boxShadow: "inset 0 2px 0 0 var(--accent)" } : undefined}
+            >
+              {tabHandle && isActive && <style>{''}</style>}
+              <span
+                className={"status-dot " + dotCls}
+                style={!pulseAwaiting && t.state === "wait" ? { animation: "none" } : undefined}
+              />
+              <span className="tab-name">{t.name}</span>
+              <span
+                className="tab-close"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setTabs(ts => ts.filter(x => x.id !== t.id));
+                }}
+              >
+                <X />
+              </span>
+            </div>
+            {i < tabs.length - 1 && <div className="tab-sep" />}
+          </React.Fragment>
+        );
+      })}
+      <div className="tab-new" title="New session"><Plus /></div>
+      <div className="tabs-right">
+        <div className="chrome-btn" title="Split view"><Split /></div>
+        <div className="chrome-btn" title="Maximize"><Maximize /></div>
+        <div className="chrome-btn" title="Settings"><Settings /></div>
+      </div>
+    </div>
+  );
+}
+
+/* ============ TERMINAL ============ */
+function Terminal({ showHeadBar, cursorBlink }) {
+  const termRef = useRef(null);
+  return (
+    <div className="canvas">
+      {showHeadBar && (
+        <div className="term-head">
+          <span className="pill accent">feat/reporting</span>
+          <span>claude-sonnet-4.5</span>
+          <span style={{ color: "#606060" }}>·</span>
+          <span>worktree: <span style={{ color: "#fff" }}>C:\src\pest-feat-reporting</span></span>
+          <span className="spacer" />
+          <span style={{ color: "#606060" }}>ctx</span>
+          <span style={{ color: "#A0A0A0" }}>41.2k / 200k</span>
+          <span className="kbd">⌘ K</span>
+        </div>
+      )}
+      <div className="term" ref={termRef}>
+        <div className="sys">● session started · PestScope · feat/reporting · 14:18</div>
+        <div className="sys">  git worktree: ready · 3 files staged · head at 8a4f2c1</div>
+        <div style={{ height: 12 }} />
+
+        <div className="user"><span className="caret">&gt;</span><span>implement CSV export for reports</span></div>
+
+        <div style={{ height: 8 }} />
+        <div className="dim">I'll add a CSV export endpoint to <span style={{ color: "#fff" }}>ReportsController</span> and a <span style={{ color: "#fff" }}>CsvWriter</span> helper. Writing the streaming version so large reports don't buffer.</div>
+
+        <div className="tool-call">
+          <div className="tc-head">
+            <span className="tc-badge">edit</span>
+            <span className="tc-path">src/Pest.Api/Controllers/ReportsController.cs</span>
+            <span style={{ marginLeft: "auto", color: "#606060" }}>+34  −0</span>
+          </div>
+          <div className="tc-body">
+            <div><span className="ln">42</span><span className="c">// Stream a CSV of the report so we never page into memory.</span></div>
+            <div><span className="ln">43</span><span className="k">[HttpGet</span>(<span className="s">"{`{id}`}/export.csv"</span>)<span className="k">]</span></div>
+            <div><span className="ln">44</span><span className="k">public async</span> <span className="t">Task</span>&lt;<span className="t">IActionResult</span>&gt; <span className="fn">ExportCsv</span>(<span className="t">Guid</span> <span className="n">id</span>, <span className="t">CancellationToken</span> <span className="n">ct</span>)</div>
+            <div><span className="ln">45</span>{'{'}</div>
+            <div><span className="ln">46</span>{'  '}<span className="k">var</span> <span className="n">report</span> = <span className="k">await</span> <span className="n">_reports</span>.<span className="fn">GetAsync</span>(<span className="n">id</span>, <span className="n">ct</span>);</div>
+            <div><span className="ln">47</span>{'  '}<span className="k">if</span> (<span className="n">report</span> <span className="op">is null</span>) <span className="k">return</span> <span className="fn">NotFound</span>();</div>
+            <div><span className="ln">48</span></div>
+            <div><span className="ln">49</span>{'  '}<span className="k">var</span> <span className="n">sb</span> = <span className="k">new</span> <span className="t">StringBuilder</span>();</div>
+            <div><span className="ln">50</span>{'  '}<span className="n">sb</span>.<span className="fn">AppendLine</span>(<span className="s">"Site,Technician,Date,Finding,Severity"</span>);</div>
+            <div><span className="ln">51</span>{'  '}<span className="k">foreach</span> (<span className="k">var</span> <span className="n">row</span> <span className="op">in</span> <span className="n">report</span>.<span className="n">Findings</span>)</div>
+            <div><span className="ln">52</span>{'  '}{'{'}</div>
+            <div><span className="ln">53</span>{'    '}<span className="n">sb</span>.<span className="fn">Append</span>(<span className="fn">Csv</span>.<span className="fn">Escape</span>(<span className="n">row</span>.<span className="n">Site</span>)).<span className="fn">Append</span>(<span className="s">","</span>);</div>
+            <div><span className="ln">54</span>{'    '}<span className="n">sb</span>.<span className="fn">Append</span>(<span className="fn">Csv</span>.<span className="fn">Escape</span>(<span className="n">row</span>.<span className="n">Technician</span>)).<span className="fn">Append</span>(<span className="s">","</span>);</div>
+            <div><span className="ln">55</span>{'    '}<span className="n">sb</span>.<span className="fn">Append</span>(<span className="n">row</span>.<span className="n">Date</span>.<span className="fn">ToString</span>(<span className="s">"yyyy-MM-dd"</span>)).<span className="fn">Append</span>(<span className="s">","</span>);</div>
+            <div><span className="ln">56</span>{'    '}<span className="n">sb</span>.<span className="fn">Append</span>(<span className="fn">Csv</span>.<span className="fn">Escape</span>(<span className="n">row</span>.<span className="n">Finding</span>)).<span className="fn">Append</span>(<span className="s">","</span>);</div>
+            <div><span className="ln">57</span>{'    '}<span className="n">sb</span>.<span className="fn">AppendLine</span>(<span className="n">row</span>.<span className="n">Severity</span>.<span className="fn">ToString</span>());</div>
+            <div><span className="ln">58</span>{'  '}{'}'}</div>
+            <div><span className="ln">59</span></div>
+            <div><span className="ln">60</span>{'  '}<span className="k">return</span> <span className="fn">File</span>(<span className="t">Encoding</span>.<span className="n">UTF8</span>.<span className="fn">GetBytes</span>(<span className="n">sb</span>.<span className="fn">ToString</span>()), <span className="s">"text/csv"</span>, <span className="s">$"report-</span><span className="op">{'{'}</span><span className="n">id</span><span className="op">{'}'}</span><span className="s">.csv"</span>);</div>
+            <div><span className="ln">61</span>{'}'}</div>
+          </div>
+        </div>
+
+        <div className="dim">Also adding a small helper so comma/quote escaping stays in one place:</div>
+
+        <div className="tool-call">
+          <div className="tc-head">
+            <span className="tc-badge">create</span>
+            <span className="tc-path">src/Pest.Api/Export/Csv.cs</span>
+            <span style={{ marginLeft: "auto", color: "#606060" }}>+12  −0</span>
+          </div>
+          <div className="tc-body">
+            <div><span className="ln">1</span><span className="k">internal static class</span> <span className="t">Csv</span></div>
+            <div><span className="ln">2</span>{'{'}</div>
+            <div><span className="ln">3</span>{'  '}<span className="k">public static</span> <span className="t">string</span> <span className="fn">Escape</span>(<span className="t">string</span>? <span className="n">value</span>)</div>
+            <div><span className="ln">4</span>{'  '}{'{'}</div>
+            <div><span className="ln">5</span>{'    '}<span className="k">if</span> (<span className="t">string</span>.<span className="fn">IsNullOrEmpty</span>(<span className="n">value</span>)) <span className="k">return</span> <span className="s">""</span>;</div>
+            <div><span className="ln">6</span>{'    '}<span className="k">var</span> <span className="n">needsQuotes</span> = <span className="n">value</span>.<span className="fn">IndexOfAny</span>(<span className="k">new</span>[] {'{'} <span className="s">','</span>, <span className="s">'"'</span>, <span className="s">'\\n'</span> {'}'}) &gt;= <span className="num">0</span>;</div>
+            <div><span className="ln">7</span>{'    '}<span className="k">return</span> <span className="n">needsQuotes</span></div>
+            <div><span className="ln">8</span>{'      '}? <span className="s">$"\""</span> + <span className="n">value</span>.<span className="fn">Replace</span>(<span className="s">"\""</span>, <span className="s">"\"\""</span>) + <span className="s">"\""</span></div>
+            <div><span className="ln">9</span>{'      '}: <span className="n">value</span>;</div>
+            <div><span className="ln">10</span>{'  '}{'}'}</div>
+            <div><span className="ln">11</span>{'}'}</div>
+          </div>
+        </div>
+
+        <div className="thinking">
+          <span className="spinner" />
+          <span>Running <span style={{ color: "#fff" }}>dotnet build</span> to verify the endpoint compiles…</span>
+        </div>
+
+        <div className="term-inline">
+          <span className="prompt">&gt;</span>
+          <span className="typed">add a test that the csv escapes quotes correctly</span>
+          {cursorBlink ? <span className="cursor" /> : <span className="cursor" style={{ animation: "none" }} />}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============ TWEAKS ============ */
+function Tweaks({ values, setValues, open }) {
+  const Row = ({ k, label }) => (
+    <div className="tweak-row">
+      <label>{label}</label>
+      <div
+        className={"tg" + (values[k] ? " on" : "")}
+        onClick={() => setValues(v => ({ ...v, [k]: !v[k] }))}
+      />
+    </div>
+  );
+  return (
+    <div className={"tweaks" + (open ? " open" : "")}>
+      <h4>Tweaks</h4>
+      <Row k="cursorBlink"    label="Cursor blink" />
+      <Row k="pulseAwaiting"  label="Awaiting-input pulse" />
+      <Row k="tabHandle"      label="Tab selection handle" />
+      <Row k="showHeadBar"    label="Terminal header bar" />
+    </div>
+  );
+}
+
+/* ============ APP ============ */
+function App() {
+  const [projects, setProjects] = useState(initProjects);
+  const [tabs, setTabs] = useState(initTabs);
+  const [activeId, setActiveId] = useState("t1");
+  const [selectedWt, setSelectedWt] = useState("pest-feat");
+
+  const defaults = JSON.parse(document.getElementById("tweak-defaults").textContent);
+  const [tweaks, setTweaks] = useState(defaults);
+  const [tweaksOpen, setTweaksOpen] = useState(false);
+
+  // Tweaks host handshake
+  useEffect(() => {
+    const handler = (e) => {
+      if (!e.data) return;
+      if (e.data.type === '__activate_edit_mode') setTweaksOpen(true);
+      if (e.data.type === '__deactivate_edit_mode') setTweaksOpen(false);
+    };
+    window.addEventListener('message', handler);
+    window.parent.postMessage({ type: '__edit_mode_available' }, '*');
+    return () => window.removeEventListener('message', handler);
+  }, []);
+
+  useEffect(() => {
+    window.parent.postMessage({ type: '__edit_mode_set_keys', edits: tweaks }, '*');
+  }, [tweaks]);
+
+  return (
+    <div className="app-shell" data-screen-label="01 CodeScope — Main">
+      <Sidebar
+        projects={projects} setProjects={setProjects}
+        selectedWt={selectedWt} setSelectedWt={setSelectedWt}
+      />
+      <div className="main">
+        <Tabs
+          tabs={tabs} setTabs={setTabs}
+          activeId={activeId} setActiveId={setActiveId}
+          pulseAwaiting={tweaks.pulseAwaiting}
+          tabHandle={tweaks.tabHandle}
+        />
+        <Terminal showHeadBar={tweaks.showHeadBar} cursorBlink={tweaks.cursorBlink} />
+      </div>
+
+      <div className="statusbar">
+        <div className="status-group">
+          <span className="status-dot-blue" />
+          <span className="branch">feat/reporting</span>
+        </div>
+        <div className="status-group">
+          <span className="changes">3 changes</span>
+        </div>
+        <div className="status-group" style={{ color: 'var(--text-2)' }}>
+          <span style={{ color: 'var(--text-3)', fontFamily: "'JetBrains Mono', monospace", fontSize: 11 }}>8a4f2c1</span>
+          <span className="sep">·</span>
+          <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5 }}>claude-sonnet-4.5</span>
+        </div>
+        <div className="status-right">
+          <div className="status-group">
+            <span className="status-dot-green" />
+            <span style={{ color: '#fff' }}>PR #42</span>
+          </div>
+          <span className="sep">·</span>
+          <span className="elapsed">14:32</span>
+        </div>
+      </div>
+
+      <Tweaks values={tweaks} setValues={setTweaks} open={tweaksOpen} />
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

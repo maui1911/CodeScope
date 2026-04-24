@@ -1,0 +1,1345 @@
+using System.Collections.ObjectModel;
+using System.IO;
+using System.Windows;
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+using NoScope.CodeScope.Core.Models;
+using NoScope.CodeScope.Core.Services;
+using Microsoft.Extensions.Logging;
+
+namespace NoScope.CodeScope.Ui.ViewModels;
+
+/// <summary>
+/// Root VM. Subscribes to <see cref="ISessionStore"/>; both the tabs strip and the sidebar
+/// are independent projections of the same store.
+/// </summary>
+public sealed partial class MainViewModel : ObservableObject
+{
+    public const string ShellSentinel = "shell";
+
+    private readonly ISessionManager _sessionManager;
+    private readonly ISessionStore _store;
+    private readonly IAgentRegistry _agents;
+    private readonly ILogger<MainViewModel> _logger;
+    private readonly Func<string?> _pickFolder;
+    private readonly Func<CancellationToken, Task>? _refresh;
+    private readonly IClaudeTelemetryService? _telemetry;
+    private readonly INotificationService? _notifications;
+    private readonly IClaudeSessionDiscovery? _discovery;
+    private readonly Dictionary<string, ClaudeActivityState> _lastActivity = [];
+    // Per-tab discovery watcher — disposed on adoption or tab close.
+    private readonly Dictionary<string, IDisposable> _discoveryWatches = [];
+
+    public MainViewModel(
+        ISessionManager sessionManager,
+        ISessionStore store,
+        IAgentRegistry agents,
+        ILogger<MainViewModel> logger,
+        Func<string?> pickFolder,
+        Func<CancellationToken, Task>? refresh = null,
+        IClaudeTelemetryService? telemetry = null,
+        INotificationService? notifications = null,
+        IClaudeSessionDiscovery? discovery = null)
+    {
+        _sessionManager = sessionManager;
+        _store = store;
+        _agents = agents;
+        _logger = logger;
+        _pickFolder = pickFolder;
+        _refresh = refresh;
+        _telemetry = telemetry;
+        _notifications = notifications;
+        _discovery = discovery;
+        if (_telemetry is not null) { _telemetry.Updated += OnTelemetryUpdated; }
+        if (_notifications is not null)
+        {
+            Notifications = new NotificationsViewModel(_notifications);
+            Notifications.ActivateRequested += (_, entry) =>
+            {
+                if (entry.SessionId is null) { return; }
+                var target = AllTabs.FirstOrDefault(t => FindStoredSession(t)?.AgentSessionId == entry.SessionId);
+                if (target is not null) { SelectedTab = target; }
+            };
+        }
+
+        Tabs = [];
+        // Default group shares the same Tabs collection instance — the canonical store
+        // for session tabs. When multi-group split lands, fresh groups will own their
+        // own collections and Tabs here becomes a proxy for FocusedGroup.Tabs.
+        var defaultGroup = new EditorGroupViewModel(Tabs) { IsFocused = true };
+        Groups = [defaultGroup];
+        _focusedGroup = defaultGroup;
+        HookGroupSelection(defaultGroup);
+        Groups.CollectionChanged += OnGroupsCollectionChanged;
+        _store.Changed += OnStoreChanged;
+    }
+
+    /// <summary>
+    /// Keeps <see cref="GroupWidths"/> parallel to <see cref="Groups"/> whenever the
+    /// collection mutates (split, close-group, auto-collapse, hydrate, drag-between).
+    /// Centralising here means individual mutation sites don't need to remember to
+    /// touch the widths list — they just drive <see cref="Groups"/> and the shape follows.
+    /// </summary>
+    private void OnGroupsCollectionChanged(object? sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
+    {
+        switch (e.Action)
+        {
+            case System.Collections.Specialized.NotifyCollectionChangedAction.Add:
+                {
+                    var start = e.NewStartingIndex;
+                    if (start < 0) { start = GroupWidths.Count; }
+                    for (var i = 0; i < (e.NewItems?.Count ?? 0); i++)
+                    {
+                        GroupWidths.Insert(Math.Min(start + i, GroupWidths.Count), 1.0);
+                    }
+                    break;
+                }
+            case System.Collections.Specialized.NotifyCollectionChangedAction.Remove:
+                {
+                    var idx = e.OldStartingIndex;
+                    var count = e.OldItems?.Count ?? 0;
+                    for (var i = 0; i < count; i++)
+                    {
+                        if (idx >= 0 && idx < GroupWidths.Count) { GroupWidths.RemoveAt(idx); }
+                    }
+                    break;
+                }
+            case System.Collections.Specialized.NotifyCollectionChangedAction.Move:
+                {
+                    var from = e.OldStartingIndex;
+                    var to = e.NewStartingIndex;
+                    if (from >= 0 && to >= 0 && from < GroupWidths.Count && to < GroupWidths.Count)
+                    {
+                        var v = GroupWidths[from];
+                        GroupWidths.RemoveAt(from);
+                        GroupWidths.Insert(to, v);
+                    }
+                    break;
+                }
+            case System.Collections.Specialized.NotifyCollectionChangedAction.Reset:
+                GroupWidths.Clear();
+                for (var i = 0; i < Groups.Count; i++) { GroupWidths.Add(1.0); }
+                break;
+        }
+        RaiseGroupWidthsReset();
+    }
+
+    /// <summary>
+    /// Forwards a group's SelectedTab changes into MainViewModel.SelectedTab when the
+    /// group is focused — keeps WindowTitle, per-tab IsActive bookkeeping, and the
+    /// diff panel in sync regardless of which group the user clicked.
+    /// </summary>
+    private void HookGroupSelection(EditorGroupViewModel group)
+    {
+        group.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName != nameof(EditorGroupViewModel.SelectedTab)) { return; }
+            if (!ReferenceEquals(group, FocusedGroup)) { return; }
+            if (ReferenceEquals(SelectedTab, group.SelectedTab)) { return; }
+            SelectedTab = group.SelectedTab;
+        };
+    }
+
+    /// <summary>Editor groups; every group owns a tab strip and a workspace region.</summary>
+    public ObservableCollection<EditorGroupViewModel> Groups { get; }
+
+    [ObservableProperty]
+    private EditorGroupViewModel _focusedGroup;
+
+    partial void OnFocusedGroupChanged(EditorGroupViewModel? oldValue, EditorGroupViewModel newValue)
+    {
+        if (oldValue is not null) { oldValue.IsFocused = false; }
+        newValue.IsFocused = true;
+        // Pull the newly-focused group's selection up to the window-global SelectedTab
+        // so the title bar + diff panel react to the group switch.
+        SelectedTab = newValue.SelectedTab;
+        OnPropertyChanged(nameof(CanCloseGroup));
+        CloseGroupCommand.NotifyCanExecuteChanged();
+    }
+
+    /// <summary>Flattened view of tabs across every group — used by sidebar lookups and Overview.</summary>
+    public IEnumerable<SessionTabViewModel> AllTabs => Groups.SelectMany(g => g.Tabs);
+
+    // Populated by LayoutStore before InitializeAsync runs. HydrateFromLoaded consults this
+    // to route each restored session to its saved group, so no cross-group re-parent /
+    // terminal respawn happens on cold start.
+    private IReadOnlyDictionary<string, int>? _pendingSessionToGroup;
+    private int _pendingFocusedIndex;
+
+    /// <summary>
+    /// Star-weight per group, parallel to <see cref="Groups"/>. Drives the workspace
+    /// ColumnDefinitions in MainWindow; persisted across restarts via LayoutStore.
+    /// The view captures drag ratios back into this list on splitter DragCompleted.
+    /// </summary>
+    public List<double> GroupWidths { get; } = [1.0];
+
+    /// <summary>
+    /// Raised after <see cref="GroupWidths"/> changes in bulk (hydrate / group add / remove)
+    /// so the view can rebuild ColumnDefinitions. Splitter-drag updates write into the list
+    /// directly and do NOT raise this — the view already owns the authoritative column widths
+    /// at that point.
+    /// </summary>
+    public event EventHandler? GroupWidthsReset;
+
+    private void RaiseGroupWidthsReset() => GroupWidthsReset?.Invoke(this, EventArgs.Empty);
+
+    /// <summary>
+    /// Pre-allocates enough groups to hold a persisted layout and stashes the session→group
+    /// mapping used during the next hydration. Call on window load, before
+    /// <see cref="InitializeAsync"/>. Does nothing if <paramref name="groupCount"/> is invalid.
+    /// </summary>
+    public void PrepareLayoutFromPersistence(
+        int groupCount,
+        int focusedIndex,
+        IReadOnlyDictionary<string, int> sessionToGroup,
+        double[]? groupWidths = null)
+    {
+        if (groupCount < 1) { return; }
+        while (Groups.Count < groupCount)
+        {
+            var g = new EditorGroupViewModel();
+            HookGroupSelection(g);
+            Groups.Add(g);
+        }
+        _pendingSessionToGroup = sessionToGroup;
+        _pendingFocusedIndex = Math.Clamp(focusedIndex, 0, Groups.Count - 1);
+
+        GroupWidths.Clear();
+        for (var i = 0; i < Groups.Count; i++)
+        {
+            var w = groupWidths is not null && i < groupWidths.Length && groupWidths[i] > 0
+                ? groupWidths[i]
+                : 1.0;
+            GroupWidths.Add(w);
+        }
+        RaiseGroupWidthsReset();
+    }
+
+    /// <summary>
+    /// Snapshots the current group layout — how many groups exist, which one has focus,
+    /// which group each session belongs to, and the per-group star widths.
+    /// Used by <c>LayoutStore.Save</c> at shutdown.
+    /// </summary>
+    public (int GroupCount, int FocusedIndex, Dictionary<string, int> SessionToGroup, double[] GroupWidths) CaptureLayout()
+    {
+        var map = new Dictionary<string, int>();
+        for (var i = 0; i < Groups.Count; i++)
+        {
+            foreach (var tab in Groups[i].Tabs)
+            {
+                map[tab.Descriptor.Id] = i;
+            }
+        }
+        var focused = Math.Max(0, Groups.IndexOf(FocusedGroup));
+        var widths = new double[Groups.Count];
+        for (var i = 0; i < widths.Length; i++)
+        {
+            widths[i] = i < GroupWidths.Count && GroupWidths[i] > 0 ? GroupWidths[i] : 1.0;
+        }
+        return (Groups.Count, focused, map, widths);
+    }
+
+    public bool CanCloseGroup => Groups.Count > 1;
+
+    /// <summary>
+    /// Adds a fresh empty group to the right of the focused group and shifts focus to it,
+    /// so the next <c>NewSession</c> lands there. Bound to <c>Ctrl+\</c>.
+    /// </summary>
+    [RelayCommand]
+    private void SplitRight()
+    {
+        var insertAt = Math.Max(0, Groups.IndexOf(FocusedGroup) + 1);
+        var group = new EditorGroupViewModel();
+        HookGroupSelection(group);
+        Groups.Insert(insertAt, group);
+        FocusedGroup = group;
+        OnPropertyChanged(nameof(CanCloseGroup));
+        OnPropertyChanged(nameof(AllTabs));
+        CloseGroupCommand.NotifyCanExecuteChanged();
+    }
+
+    /// <summary>
+    /// Closes the focused group. No-op when only one group exists. For v1 the group must
+    /// be empty; session evacuation to a neighbour ships in a follow-up so we don't
+    /// disturb long-running pwsh processes mid-flight.
+    /// </summary>
+    [RelayCommand(CanExecute = nameof(CanCloseGroupAndEmpty))]
+    private void CloseGroup()
+    {
+        if (Groups.Count < 2) { return; }
+        if (FocusedGroup.Tabs.Count > 0) { return; }
+        var idx = Groups.IndexOf(FocusedGroup);
+        var doomed = FocusedGroup;
+        var neighbour = Groups[idx == 0 ? 1 : idx - 1];
+        Groups.Remove(doomed);
+        FocusedGroup = neighbour;
+        OnPropertyChanged(nameof(CanCloseGroup));
+        OnPropertyChanged(nameof(AllTabs));
+    }
+
+    private bool CanCloseGroupAndEmpty() => Groups.Count > 1 && FocusedGroup.Tabs.Count == 0;
+
+    /// <summary>Transfers focus to <paramref name="group"/> (typically called from the view on click).</summary>
+    [RelayCommand]
+    private void FocusGroup(EditorGroupViewModel? group)
+    {
+        if (group is null || !Groups.Contains(group)) { return; }
+        FocusedGroup = group;
+    }
+
+    /// <summary>Alt+Right: cycle focus to the next group (wraps around).</summary>
+    [RelayCommand]
+    private void FocusNextGroup() => CycleFocus(+1);
+
+    /// <summary>Alt+Left: cycle focus to the previous group (wraps around).</summary>
+    [RelayCommand]
+    private void FocusPrevGroup() => CycleFocus(-1);
+
+    private void CycleFocus(int delta)
+    {
+        if (Groups.Count < 2) { return; }
+        var idx = Groups.IndexOf(FocusedGroup);
+        if (idx < 0) { return; }
+        var next = (idx + delta + Groups.Count) % Groups.Count;
+        FocusedGroup = Groups[next];
+    }
+
+    /// <summary>
+    /// Splits a fresh empty group to the right of the focused one and spawns a new
+    /// session for the sidebar's currently-selected worktree in that group. Wired to
+    /// the worktree context menu's <i>Open in new group</i> entry and to Ctrl+Shift+Enter.
+    /// </summary>
+    [RelayCommand]
+    private async Task OpenInNewGroupAsync(WorktreeViewModel? worktree)
+    {
+        await OpenInNewGroupWithAgentAsync(worktree, null).ConfigureAwait(true);
+    }
+
+    /// <summary>
+    /// Overload: split right + spawn a session of a specific agent. Invoked from the
+    /// sidebar's "Open in new group ▸ &lt;agent&gt;" submenu.
+    /// </summary>
+    [RelayCommand]
+    private async Task OpenInNewGroupWithAgentAsync((WorktreeViewModel? Worktree, string? AgentId) args)
+    {
+        await OpenInNewGroupWithAgentAsync(args.Worktree, args.AgentId).ConfigureAwait(true);
+    }
+
+    private async Task OpenInNewGroupWithAgentAsync(WorktreeViewModel? worktree, string? agentId)
+    {
+        if (worktree is not null && Sidebar is not null && !ReferenceEquals(Sidebar.SelectedWorktree, worktree))
+        {
+            Sidebar.SelectedWorktree = worktree;
+        }
+        SplitRight();
+        await NewSessionAsync(agentId).ConfigureAwait(true);
+    }
+
+    /// <summary>
+    /// Ctrl+1..8 → Tabs[0..7]; Ctrl+9 → last tab. Mirrors the browser convention.
+    /// Parameter is a string because XAML CommandParameter literals are strings; it's parsed here.
+    /// No-op if the requested index doesn't exist yet.
+    /// </summary>
+    [RelayCommand]
+    private void SelectTabByIndex(string? indexText)
+    {
+        var tabs = FocusedGroup.Tabs;
+        if (tabs.Count == 0 || !int.TryParse(indexText, out var index)) { return; }
+        var target = index == 9 ? tabs.Count - 1 : Math.Min(index - 1, tabs.Count - 1);
+        if (target < 0) { return; }
+        SelectedTab = tabs[target];
+    }
+
+    /// <summary>F5 / "Refresh all": force both pollers to tick immediately.</summary>
+    [RelayCommand]
+    private async Task RefreshAllAsync()
+    {
+        if (_refresh is null) { return; }
+        try
+        {
+            await _refresh(CancellationToken.None).ConfigureAwait(true);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "RefreshAll failed");
+        }
+    }
+
+    public ObservableCollection<SessionTabViewModel> Tabs { get; }
+
+    public IAgentRegistry Agents => _agents;
+
+    /// <summary>
+    /// Rows for the split-button's "New session with agent…" dropdown: a synthetic Shell entry
+    /// on top, then every registered agent. Refreshed on every get, so changes to the registry
+    /// (future: edit-agents UI) show up next time the menu opens.
+    /// </summary>
+    public IReadOnlyList<AgentMenuEntry> AgentMenuEntries
+    {
+        get
+        {
+            var rows = new List<AgentMenuEntry> { new("Shell", ShellSentinel) };
+            rows.AddRange(_agents.GetAll().Select(a =>
+                new AgentMenuEntry(
+                    string.IsNullOrWhiteSpace(a.Icon) ? a.DisplayName : $"{a.Icon}  {a.DisplayName}",
+                    a.Id)));
+            return rows;
+        }
+    }
+
+    public SidebarViewModel Sidebar { get; private set; } = null!;
+
+    /// <summary>Notification queue projection for the status-bar bell cluster (spec §11).</summary>
+    public NotificationsViewModel? Notifications { get; }
+
+    public DiffPanelViewModel? Diff { get; private set; }
+
+    public OverviewViewModel? Overview { get; private set; }
+
+    public void AttachDiffPanel(DiffPanelViewModel diff) => Diff = diff;
+
+    /// <summary>
+    /// Toggles the session grid that takes over the right column when the user hits
+    /// <c>Ctrl+Shift+O</c> or the sidebar's Overview button. While visible, the tabs strip
+    /// and per-tab terminals stay mounted underneath so sessions keep running.
+    /// </summary>
+    [ObservableProperty]
+    private bool _isOverviewVisible;
+
+    [RelayCommand]
+    private void ToggleOverview() => IsOverviewVisible = !IsOverviewVisible;
+
+    [RelayCommand]
+    private void ShowOverview() => IsOverviewVisible = true;
+
+    [RelayCommand]
+    private void HideOverview() => IsOverviewVisible = false;
+
+    [RelayCommand]
+    private void FocusSidebarFilter()
+    {
+        // Walk the visual tree to find the sidebar view — it exposes a public focus helper.
+        if (Application.Current?.MainWindow is not Window win) { return; }
+        var view = FindDescendant<Views.SidebarView>(win);
+        view?.FocusFilter();
+    }
+
+    private static T? FindDescendant<T>(System.Windows.DependencyObject root) where T : System.Windows.DependencyObject
+    {
+        var count = System.Windows.Media.VisualTreeHelper.GetChildrenCount(root);
+        for (var i = 0; i < count; i++)
+        {
+            var child = System.Windows.Media.VisualTreeHelper.GetChild(root, i);
+            if (child is T hit) { return hit; }
+            var nested = FindDescendant<T>(child);
+            if (nested is not null) { return nested; }
+        }
+        return null;
+    }
+
+    [RelayCommand]
+    private void ToggleDiffPanel()
+    {
+        if (Diff is null) { return; }
+        Diff.IsVisible = !Diff.IsVisible;
+        if (Diff.IsVisible && Sidebar?.SelectedWorktree is { } wt) { Diff.AttachWorktree(wt); }
+    }
+
+    [ObservableProperty]
+    private SessionTabViewModel? _selectedTab;
+
+    /// <summary>Title bar text: "CodeScope — {tab}" when a tab is active, else just "CodeScope".</summary>
+    public string WindowTitle => SelectedTab is { } t ? $"CodeScope — {t.DisplayName}" : "CodeScope";
+
+    partial void OnSelectedTabChanged(SessionTabViewModel? value)
+    {
+        // When SelectedTab is set externally (sidebar, palette), transfer focus to the
+        // group that owns the tab and update its SelectedTab — that way the view that
+        // actually renders the tab becomes visible.
+        if (value is not null)
+        {
+            var owner = FindGroupContaining(value);
+            if (owner is not null && !ReferenceEquals(owner, FocusedGroup))
+            {
+                FocusedGroup = owner;
+            }
+        }
+        if (FocusedGroup is not null && !ReferenceEquals(FocusedGroup.SelectedTab, value))
+        {
+            FocusedGroup.SelectedTab = value;
+        }
+        OnPropertyChanged(nameof(WindowTitle));
+        RaiseStatusBarChanged();
+        // Focusing a tab implicitly acknowledges its pending notifications.
+        if (value is not null && _notifications is not null)
+        {
+            var stored = FindStoredSession(value);
+            if (stored?.AgentSessionId is { Length: > 0 } sid) { _notifications.MarkSessionRead(sid); }
+        }
+        // Status dot is window-global: only the focused-group's selected tab gets Active;
+        // every other tab (including selected tabs in other groups) drops to Idle unless
+        // it's still waiting (Wait survives focus changes per top-bar spec §3).
+        // IsActive is per-group and is set by EditorGroupViewModel.OnSelectedTabChanged —
+        // do NOT touch it here, or selecting an empty group hides every terminal.
+        foreach (var t in AllTabs)
+        {
+            var isWindowSelected = ReferenceEquals(t, value);
+            if (t.Status != TabStatus.Wait)
+            {
+                t.Status = isWindowSelected ? TabStatus.Active : TabStatus.Idle;
+            }
+        }
+    }
+
+    [ObservableProperty]
+    private string? _selectedProjectId;
+
+    public void AttachSidebar(SidebarViewModel sidebar)
+    {
+        Sidebar = sidebar;
+        OnPropertyChanged(nameof(Sidebar));
+
+        Overview = new OverviewViewModel(sidebar, Groups, _agents);
+        Overview.FocusSessionRequested += (_, session) =>
+        {
+            SelectedTab = session;
+            IsOverviewVisible = false;
+        };
+        Overview.BackRequested += (_, _) => IsOverviewVisible = false;
+        OnPropertyChanged(nameof(Overview));
+
+        // Dialog → "Spawn session on creation" — fires after the store has inserted the
+        // new worktree and the sidebar has selected it. NewSessionAsync() picks up the
+        // current selection and uses the project's default agent.
+        sidebar.SpawnSessionRequested += async (_, _) =>
+        {
+            await NewSessionAsync().ConfigureAwait(true);
+        };
+
+        // Status-bar metrics recompute on any worktree status / PR event.
+        _store.Changed += (_, change) =>
+        {
+            if (change is SessionStoreChange.WorktreeStatusUpdated
+                or SessionStoreChange.WorktreePullRequestUpdated
+                or SessionStoreChange.WorktreeAdded
+                or SessionStoreChange.WorktreeRemoved
+                or SessionStoreChange.ProjectRemoved
+                or SessionStoreChange.ProjectAdded
+                or SessionStoreChange.Loaded)
+            {
+                if (Application.Current?.Dispatcher is { } d)
+                {
+                    d.BeginInvoke(() => { OnPropertyChanged(nameof(StatusBarText)); RaiseStatusBarChanged(); });
+                }
+                else
+                {
+                    OnPropertyChanged(nameof(StatusBarText));
+                    RaiseStatusBarChanged();
+                }
+            }
+        };
+
+        HookStatusBarSources();
+    }
+
+    /// <summary>
+    /// Live status bar: "N dirty · M PRs · K CI failing" aggregated across all tracked worktrees.
+    /// Empty-case shows a humble tagline so the bar isn't blank.
+    /// </summary>
+    public string StatusBarText
+    {
+        get
+        {
+            if (Sidebar is null) { return string.Empty; }
+
+            var dirty = 0; var prs = 0; var ciFail = 0; var wts = 0;
+            foreach (var p in Sidebar.Projects)
+            {
+                foreach (var w in p.Worktrees)
+                {
+                    wts++;
+                    if (w.IsDirty) { dirty++; }
+                    if (w.HasPullRequest) { prs++; }
+                    if (w.PullRequest?.CiStatus == CiStatus.Failure) { ciFail++; }
+                }
+            }
+
+            // Empty state: the status bar's LEFT column already shows StatusEmptyMessage;
+            // returning empty here avoids the same sentence rendering twice (once on each side).
+            if (wts == 0) { return string.Empty; }
+
+            var parts = new List<string>
+            {
+                $"{wts} worktree{(wts == 1 ? "" : "s")}",
+            };
+            if (dirty > 0)   { parts.Add($"{dirty} dirty"); }
+            if (prs > 0)     { parts.Add($"{prs} PR{(prs == 1 ? "" : "s")}"); }
+            if (ciFail > 0)  { parts.Add($"{ciFail} CI failing"); }
+            if (Groups.Count > 1) { parts.Add($"{Groups.Count} groups"); }
+            return string.Join(" · ", parts);
+        }
+    }
+
+    public async Task InitializeAsync(CancellationToken ct = default)
+    {
+        await _store.LoadAsync(ct).ConfigureAwait(true);
+    }
+
+    /// <summary>
+    /// Ctrl+K action: assembles the palette from current state and dispatches the pick.
+    /// Built each time so per-worktree "Create PR" entries stay fresh against the latest sidebar tree.
+    /// </summary>
+    [RelayCommand]
+    private async Task OpenCommandPaletteAsync()
+    {
+        var actions = BuildPaletteActions();
+        var picked = Dialogs.CommandPaletteDialog.Prompt(actions);
+        if (picked is null) { return; }
+        await picked.Execute().ConfigureAwait(true);
+    }
+
+    internal IReadOnlyList<PaletteAction> BuildPaletteActions()
+    {
+        var list = new List<PaletteAction>
+        {
+            new("New session",       "Ctrl+T",         () => { NewSessionCommand.Execute(null); return Task.CompletedTask; }, Icon: "▶"),
+            new("Close current tab", "Ctrl+W",         () => { CloseTabCommand.Execute(null); return Task.CompletedTask; }, Icon: "×"),
+            new("Next tab",          "Ctrl+Tab",       () => { NextTabCommand.Execute(null); return Task.CompletedTask; }, Icon: "→"),
+            new("Previous tab",      "Ctrl+Shift+Tab", () => { PrevTabCommand.Execute(null); return Task.CompletedTask; }, Icon: "←"),
+            new("Rename session",    "F2",             () => { RenameSessionCommand.Execute(null); return Task.CompletedTask; }, Icon: "✎"),
+            new("Toggle diff panel", "Ctrl+D",         () => { ToggleDiffPanelCommand.Execute(null); return Task.CompletedTask; }, Icon: "≡"),
+            new("Focus sidebar filter", "Ctrl+F",      () => { FocusSidebarFilterCommand.Execute(null); return Task.CompletedTask; }, Icon: "⌕"),
+            new("Refresh all",          "F5",          () => { RefreshAllCommand.Execute(null); return Task.CompletedTask; }, Icon: "↻"),
+            new("Overview · all sessions", "Ctrl+Shift+O", () => { ToggleOverviewCommand.Execute(null); return Task.CompletedTask; }, Icon: "▦"),
+        };
+
+        // Open tab rows: quick-switch without reaching for the mouse.
+        foreach (var tab in Tabs)
+        {
+            var local = tab;
+            list.Add(new PaletteAction(
+                $"Switch to: {local.DisplayName}",
+                local.Descriptor.WorkingDirectory,
+                () => { SelectedTab = local; return Task.CompletedTask; },
+                Icon: "◉"));
+        }
+
+        if (Sidebar is not null)
+        {
+            list.Add(new PaletteAction("Add project", "pick a folder",
+                () => { Sidebar.AddProjectCommand.Execute(null); return Task.CompletedTask; }, Icon: "+"));
+
+            foreach (var project in Sidebar.Projects)
+            {
+                foreach (var wt in project.Worktrees)
+                {
+                    var branch = wt.DisplayBranch;
+
+                    list.Add(new PaletteAction(
+                        $"Reveal: {project.Name} · {branch}",
+                        wt.Path,
+                        () => { Sidebar.RevealInExplorerCommand.Execute(wt); return Task.CompletedTask; },
+                        Icon: "📁"));
+
+                    list.Add(new PaletteAction(
+                        $"Open in new group: {project.Name} · {branch}",
+                        "Ctrl+Shift+↵",
+                        () => { OpenInNewGroupCommand.Execute(wt); return Task.CompletedTask; },
+                        Icon: "⫎"));
+
+                    if (wt.HasPullRequest)
+                    {
+                        list.Add(new PaletteAction(
+                            $"Open pull request {wt.PrBadgeText}",
+                            $"{project.Name} · {branch}",
+                            () => { wt.OpenPullRequestCommand.Execute(null); return Task.CompletedTask; },
+                            Icon: wt.CiGlyph));
+                    }
+                    else if (!string.IsNullOrWhiteSpace(wt.Worktree.Branch))
+                    {
+                        list.Add(new PaletteAction(
+                            "Create pull request",
+                            $"{project.Name} · {branch}",
+                            () => { Sidebar.CreatePullRequestCommand.Execute(wt); return Task.CompletedTask; },
+                            Icon: "◎"));
+                    }
+                }
+            }
+        }
+
+        return list;
+    }
+
+    [RelayCommand]
+    private async Task NewSessionAsync(string? agentId = null)
+    {
+        // Resolve project + worktree + target folder. Priority:
+        //   1. Sidebar's selected worktree (Phase 3) — use its path and owning project.
+        //   2. Sidebar's selected project — use its primary worktree.
+        //   3. Folder picker → folder becomes a new project in 'Unsorted'.
+        Project? project = null;
+        Worktree? worktree = null;
+        string? folder = null;
+
+        var selectedWorktree = Sidebar?.SelectedWorktree;
+        if (selectedWorktree is not null)
+        {
+            project = _store.Projects.FirstOrDefault(p => p.Id == selectedWorktree.ProjectId);
+            worktree = project?.Worktrees.FirstOrDefault(w => w.Id == selectedWorktree.Id);
+            folder = worktree?.Path;
+        }
+        else if (!string.IsNullOrEmpty(SelectedProjectId))
+        {
+            project = _store.Projects.FirstOrDefault(p => p.Id == SelectedProjectId);
+            worktree = project?.Worktrees.FirstOrDefault(w => w.IsPrimary) ?? project?.Worktrees.FirstOrDefault();
+            folder = worktree?.Path ?? project?.Path;
+        }
+
+        if (string.IsNullOrWhiteSpace(folder))
+        {
+            folder = _pickFolder();
+            if (string.IsNullOrWhiteSpace(folder)) { return; }
+
+            project = _store.Projects.FirstOrDefault(p =>
+                !string.IsNullOrEmpty(p.Path)
+                && string.Equals(Path.GetFullPath(p.Path), Path.GetFullPath(folder), StringComparison.OrdinalIgnoreCase));
+
+            if (project is null)
+            {
+                var unsorted = _store.Projects.FirstOrDefault(p => p.Id == "unsorted");
+                if (unsorted is null)
+                {
+                    var created = await _store.AddProjectAsync(folder, displayName: null).ConfigureAwait(true);
+                    if (created.IsFailure) { _logger.LogWarning("AddProject: {Error}", created.Error); return; }
+                    project = created.Value;
+                }
+                else
+                {
+                    project = unsorted;
+                }
+            }
+            worktree = project.Worktrees.FirstOrDefault(w => w.IsPrimary) ?? project.Worktrees.FirstOrDefault();
+        }
+
+        if (project is null) { return; }
+
+        // Resolve agent / shell. Priority: explicit arg → project's DefaultAgentId → global default.
+        var useShell = string.Equals(agentId, ShellSentinel, StringComparison.OrdinalIgnoreCase);
+        AgentProfile? agent;
+        if (useShell)
+        {
+            agent = null;
+        }
+        else if (!string.IsNullOrEmpty(agentId))
+        {
+            agent = _agents.GetById(agentId);
+        }
+        else if (!string.IsNullOrEmpty(project.DefaultAgentId)
+                 && !string.Equals(project.DefaultAgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase))
+        {
+            agent = _agents.GetById(project.DefaultAgentId) ?? _agents.GetDefault();
+        }
+        else if (string.Equals(project.DefaultAgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase))
+        {
+            useShell = true;
+            agent = null;
+        }
+        else
+        {
+            agent = _agents.GetDefault();
+        }
+        var targetFolder = folder;
+        // Claude Code (and any agent with SessionIdFlag) gets a CodeScope-minted UUID up
+        // front so we can later resume with `--resume <id>` instead of `--continue`.
+        var agentSessionId = AgentSupportsSessionId(agent) ? Guid.NewGuid().ToString() : null;
+        var descriptor = agent is null
+            ? _sessionManager.CreateShellSession(targetFolder)
+            : _sessionManager.CreateAgentSession(targetFolder, agent, agentSessionId: agentSessionId);
+
+        // Tab label format: `{project} · {branch}` — agent identity is carried by the
+        // status dot + icon glyph, so the label stays focused on *what's being worked on*
+        // rather than *which CLI is running it*.
+        if (worktree?.Branch is { Length: > 0 } branch)
+        {
+            descriptor = descriptor with { Title = $"{project.Name} · {branch}" };
+        }
+
+        var session = new Session
+        {
+            Id = descriptor.Id,
+            WorktreePath = descriptor.WorkingDirectory,
+            WorktreeId = worktree?.Id,
+            AgentId = agent?.Id ?? (useShell ? ShellSentinel : null),
+            AgentSessionId = agentSessionId,
+        };
+
+        var added = await _store.AddSessionAsync(project.Id, session).ConfigureAwait(true);
+        if (added.IsFailure)
+        {
+            _logger.LogWarning("AddSession: {Error}", added.Error);
+            return;
+        }
+
+        var vm = new SessionTabViewModel(descriptor, project.Id, session.AgentId, session.DisplayName, agent?.Icon);
+        FocusedGroup.Tabs.Add(vm);
+        SelectedTab = vm;
+        BeginClaudeAdoption(descriptor.Id, agent?.Id, targetFolder, DateTimeOffset.UtcNow);
+        OnPropertyChanged(nameof(CanCloseGroup));
+        CloseGroupCommand.NotifyCanExecuteChanged();
+    }
+
+    /// <summary>
+    /// Spawns a fresh session at the same worktree + agent as <paramref name="tab"/>.
+    /// Use-case: keep one tab for long-running work and duplicate a parallel shell for ad-hoc commands.
+    /// </summary>
+    [RelayCommand]
+    private async Task DuplicateTabAsync(SessionTabViewModel? tab)
+    {
+        tab ??= SelectedTab;
+        if (tab is null) { return; }
+        var folder = tab.Descriptor.WorkingDirectory;
+        if (string.IsNullOrWhiteSpace(folder)) { return; }
+
+        var project = _store.Projects.FirstOrDefault(p => p.Id == tab.ProjectId);
+        if (project is null) { return; }
+        var worktree = project.Worktrees.FirstOrDefault(w =>
+            string.Equals(w.Path, folder, StringComparison.OrdinalIgnoreCase));
+
+        var useShell = string.Equals(tab.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase);
+        var agent = useShell || string.IsNullOrEmpty(tab.AgentId)
+            ? null
+            : _agents.GetById(tab.AgentId);
+
+        // Duplicate semantically = a *fresh* conversation at the same worktree/agent, so
+        // a new UUID (not the source tab's) if the agent supports session ids.
+        var agentSessionId = AgentSupportsSessionId(agent) ? Guid.NewGuid().ToString() : null;
+        var descriptor = agent is null
+            ? _sessionManager.CreateShellSession(folder)
+            : _sessionManager.CreateAgentSession(folder, agent, agentSessionId: agentSessionId);
+        if (worktree?.Branch is { Length: > 0 } branch)
+        {
+            descriptor = descriptor with { Title = $"{project.Name} · {branch}" };
+        }
+
+        var session = new Session
+        {
+            Id = descriptor.Id,
+            WorktreePath = descriptor.WorkingDirectory,
+            WorktreeId = worktree?.Id,
+            AgentId = agent?.Id ?? (useShell ? ShellSentinel : null),
+            AgentSessionId = agentSessionId,
+        };
+        var added = await _store.AddSessionAsync(project.Id, session).ConfigureAwait(true);
+        if (added.IsFailure) { _logger.LogWarning("DuplicateTab AddSession: {Error}", added.Error); return; }
+
+        var vm = new SessionTabViewModel(descriptor, project.Id, session.AgentId, session.DisplayName, agent?.Icon);
+        FocusedGroup.Tabs.Add(vm);
+        SelectedTab = vm;
+        BeginClaudeAdoption(descriptor.Id, agent?.Id, folder, DateTimeOffset.UtcNow);
+        CloseGroupCommand.NotifyCanExecuteChanged();
+    }
+
+    [RelayCommand]
+    private async Task CloseTabAsync(SessionTabViewModel? tab)
+    {
+        tab ??= SelectedTab;
+        if (tab is null)
+        {
+            // Ctrl+W on an empty focused group collapses the group: once every tab
+            // is closed, another Ctrl+W removes the now-empty split.
+            if (Groups.Count > 1 && FocusedGroup.Tabs.Count == 0) { CloseGroup(); }
+            return;
+        }
+
+        // The tab lives in whichever group owns it — not necessarily the focused group
+        // (a middle-click on a tab in another group hits this path too).
+        var group = FindGroupContaining(tab) ?? FocusedGroup;
+        var index = group.Tabs.IndexOf(tab);
+        if (index >= 0) { group.Tabs.RemoveAt(index); }
+        var storedForTab = FindStoredSession(tab);
+        if (storedForTab?.AgentSessionId is { Length: > 0 } tsid) { _telemetry?.Unregister(tsid); }
+        StopClaudeAdoption(tab.Descriptor.Id);
+        await _store.RemoveSessionAsync(tab.Descriptor.Id).ConfigureAwait(true);
+
+        // Auto-collapse a group when its last tab closes and another group exists — the
+        // invariant is "groups exist to hold sessions; an empty one adds visual noise".
+        if (group.Tabs.Count == 0 && Groups.Count > 1)
+        {
+            var gi = Groups.IndexOf(group);
+            var neighbour = Groups[gi == 0 ? 1 : gi - 1];
+            Groups.Remove(group);
+            FocusedGroup = neighbour;
+            SelectedTab = neighbour.SelectedTab;
+        }
+        else
+        {
+            var next = group.Tabs.Count == 0 ? null : group.Tabs[Math.Min(index, group.Tabs.Count - 1)];
+            group.SelectedTab = next;
+            if (ReferenceEquals(group, FocusedGroup)) { SelectedTab = next; }
+        }
+        CloseGroupCommand.NotifyCanExecuteChanged();
+        OnPropertyChanged(nameof(CanCloseGroup));
+    }
+
+    private EditorGroupViewModel? FindGroupContaining(SessionTabViewModel tab)
+        => Groups.FirstOrDefault(g => g.Tabs.Contains(tab));
+
+    /// <summary>
+    /// True when <paramref name="agent"/> accepts a caller-supplied session id on launch
+    /// — i.e. has a <see cref="AgentProfile.SessionIdFlag"/>. Drives whether
+    /// <c>NewSessionAsync</c> / <c>DuplicateTabAsync</c> mint a UUID to persist.
+    /// </summary>
+    private static bool AgentSupportsSessionId(AgentProfile? agent)
+        => !string.IsNullOrEmpty(agent?.SessionIdFlag);
+
+    /// <summary>
+    /// Walks the store for the persisted <see cref="Session"/> backing <paramref name="tab"/>.
+    /// Returns null when the tab is transient (not yet persisted) or the session was removed.
+    /// </summary>
+    private Session? FindStoredSession(SessionTabViewModel tab)
+    {
+        foreach (var p in _store.Projects)
+        {
+            foreach (var s in p.Sessions)
+            {
+                if (s.Id == tab.Descriptor.Id) { return s; }
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Transfers <paramref name="tab"/> from its current group into <paramref name="targetGroup"/>.
+    /// Called from <c>EditorGroupView</c>'s drop handler.
+    ///
+    /// <para><b>Known v1 limitation:</b> the underlying pwsh process restarts. The source
+    /// group's <c>ItemsControl</c> destroys its <c>ContentPresenter</c> for the tab when
+    /// the VM leaves its <c>Tabs</c>, which unloads the hosted <c>EasyTerminalControl</c>
+    /// and tears down the native HWND; the target group then creates a fresh one. The
+    /// tab's title and worktree persist, but agent state resets. Preserving the HWND
+    /// across groups needs a shared hosting pool — see the follow-up note in
+    /// <c>docs/HANDOFF.md</c>.</para>
+    /// </summary>
+    public void MoveTabToGroup(SessionTabViewModel tab, EditorGroupViewModel targetGroup, int targetIndex = -1)
+    {
+        var sourceGroup = FindGroupContaining(tab);
+        if (sourceGroup is null) { return; }
+        if (ReferenceEquals(sourceGroup, targetGroup))
+        {
+            // Same-group drop: reorder (clamp index, no-op if unchanged).
+            if (targetIndex < 0 || targetIndex > targetGroup.Tabs.Count - 1) { return; }
+            var currentIdx = targetGroup.Tabs.IndexOf(tab);
+            if (currentIdx == targetIndex) { return; }
+            targetGroup.Tabs.Move(currentIdx, targetIndex);
+            return;
+        }
+
+        // Cross-group moves force the terminal to respawn (HWND lifecycle — see doc comment
+        // above). Rebind the descriptor to use ResumeArgs so Claude Code / codex / OpenCode
+        // pick up the previous conversation in this working directory instead of starting
+        // fresh. Shell-only tabs need no rebinding.
+        var agent = string.IsNullOrEmpty(tab.AgentId)
+                    || string.Equals(tab.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase)
+            ? null
+            : _agents.GetById(tab.AgentId);
+        if (agent is not null)
+        {
+            var old = tab.Descriptor;
+            var storedAgentId = FindStoredSession(tab)?.AgentSessionId;
+            var resumed = _sessionManager.CreateAgentSession(old.WorkingDirectory, agent, id: old.Id, resume: true, agentSessionId: storedAgentId)
+                with { Title = old.Title };
+            tab.Rebind(resumed);
+            // Cross-group respawn = new pwsh process = new claude session id. Tear down the
+            // old telemetry watch and start fresh adoption so the status bar keeps tracking.
+            if (storedAgentId is { Length: > 0 } oldId) { _telemetry?.Unregister(oldId); }
+            BeginClaudeAdoption(tab.Descriptor.Id, agent.Id, old.WorkingDirectory, DateTimeOffset.UtcNow);
+        }
+
+        sourceGroup.Tabs.Remove(tab);
+        if (targetIndex < 0 || targetIndex > targetGroup.Tabs.Count)
+        {
+            targetGroup.Tabs.Add(tab);
+        }
+        else
+        {
+            targetGroup.Tabs.Insert(targetIndex, tab);
+        }
+
+        // Fix up selections: source falls back to its last remaining tab, target
+        // adopts the moved one + takes window focus.
+        if (sourceGroup.SelectedTab is null && sourceGroup.Tabs.Count > 0)
+        {
+            sourceGroup.SelectedTab = sourceGroup.Tabs[^1];
+        }
+        targetGroup.SelectedTab = tab;
+
+        // Auto-collapse the source if it became empty — matches the CloseTab rule so
+        // drag-the-last-tab-away behaves the same as close-the-last-tab.
+        if (sourceGroup.Tabs.Count == 0 && Groups.Count > 1)
+        {
+            Groups.Remove(sourceGroup);
+        }
+
+        FocusedGroup = targetGroup;
+        CloseGroupCommand.NotifyCanExecuteChanged();
+        OnPropertyChanged(nameof(CanCloseGroup));
+    }
+
+    /// <summary>
+    /// Kills <paramref name="tab"/> and re-spawns a fresh session at the same worktree with the
+    /// same agent. Used from the sidebar context menu "Restart session" action — a recovery
+    /// hatch for an agent process that got stuck without losing the surrounding tab layout.
+    /// </summary>
+    [RelayCommand]
+    private async Task RestartSessionAsync(SessionTabViewModel? tab)
+    {
+        tab ??= SelectedTab;
+        if (tab is null) { return; }
+
+        await DuplicateTabAsync(tab).ConfigureAwait(true);
+        await CloseTabAsync(tab).ConfigureAwait(true);
+    }
+
+    [RelayCommand]
+    private void NextTab()
+    {
+        var tabs = FocusedGroup.Tabs;
+        if (tabs.Count < 2 || SelectedTab is null) { return; }
+        var idx = tabs.IndexOf(SelectedTab);
+        if (idx < 0) { return; }
+        SelectedTab = tabs[(idx + 1) % tabs.Count];
+    }
+
+    [RelayCommand]
+    private void PrevTab()
+    {
+        var tabs = FocusedGroup.Tabs;
+        if (tabs.Count < 2 || SelectedTab is null) { return; }
+        var idx = tabs.IndexOf(SelectedTab);
+        if (idx < 0) { return; }
+        SelectedTab = tabs[(idx - 1 + tabs.Count) % tabs.Count];
+    }
+
+    [RelayCommand]
+    private async Task RenameSessionAsync(SessionTabViewModel? tab)
+    {
+        tab ??= SelectedTab;
+        if (tab is null) { return; }
+        var newName = Dialogs.RenameDialog.Prompt(tab.DisplayName);
+        if (newName is null) { return; }
+        await _store.RenameSessionAsync(tab.Descriptor.Id, newName).ConfigureAwait(true);
+    }
+
+    private void OnStoreChanged(object? sender, SessionStoreChange change)
+    {
+        void Apply()
+        {
+            switch (change)
+            {
+                case SessionStoreChange.Loaded loaded:
+                    HydrateFromLoaded(loaded);
+                    break;
+                case SessionStoreChange.SessionRenamed renamed:
+                    var t = AllTabs.FirstOrDefault(x => x.Descriptor.Id == renamed.SessionId);
+                    if (t is not null)
+                    {
+                        t.DisplayName = renamed.NewName ?? t.Descriptor.Title;
+                    }
+                    break;
+                case SessionStoreChange.WorktreeStatusUpdated wtStatus:
+                    // Reflect dirty state on tab titles bound to this worktree.
+                    foreach (var tab in AllTabs)
+                    {
+                        var p = _store.Projects.FirstOrDefault(x => x.Id == tab.ProjectId);
+                        var session = p?.Sessions.FirstOrDefault(s => s.Id == tab.Descriptor.Id);
+                        if (session?.WorktreeId != wtStatus.WorktreeId) { continue; }
+
+                        // Top-bar spec §4: tab label is just "Project · branch". Dirty state
+                        // is carried by the sidebar ("chg" slug) and the status dot — no glyph
+                        // suffixing the title.
+                        tab.DisplayName = tab.Descriptor.Title;
+                    }
+                    break;
+                case SessionStoreChange.SessionRemoved removed:
+                    foreach (var g in Groups)
+                    {
+                        var tr = g.Tabs.FirstOrDefault(x => x.Descriptor.Id == removed.SessionId);
+                        if (tr is not null)
+                        {
+                            g.Tabs.Remove(tr);
+                            break;
+                        }
+                    }
+                    CloseGroupCommand.NotifyCanExecuteChanged();
+                    break;
+            }
+        }
+
+        if (Application.Current?.Dispatcher is { } dispatcher && !dispatcher.CheckAccess())
+        {
+            dispatcher.Invoke(Apply);
+        }
+        else
+        {
+            Apply();
+        }
+    }
+
+    private void HydrateFromLoaded(SessionStoreChange.Loaded loaded)
+    {
+        // If PrepareLayoutFromPersistence ran, Groups already has the right count and
+        // every tab below routes to its saved group via _pendingSessionToGroup. Otherwise
+        // tabs all land in Groups[0] (the shared-instance default group).
+        foreach (var g in Groups) { g.Tabs.Clear(); }
+        Tabs.Clear();
+        foreach (var p in loaded.Projects)
+        {
+            foreach (var s in p.Sessions)
+            {
+                if (!Directory.Exists(s.WorktreePath)) { continue; }
+                var agent = string.IsNullOrEmpty(s.AgentId) || string.Equals(s.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase)
+                    ? null
+                    : _agents.GetById(s.AgentId);
+                // resume=true on hydration so Claude Code / codex / OpenCode reopen the
+                // conversation that was alive in that working directory when CodeScope last
+                // closed — matches the drag-move behaviour and means app-restart isn't a
+                // context-destroying event.
+                var descriptor = agent is null
+                    ? _sessionManager.CreateShellSession(s.WorktreePath, s.Id)
+                    : _sessionManager.CreateAgentSession(s.WorktreePath, agent, s.Id, resume: true, agentSessionId: s.AgentSessionId);
+
+                // Title reflects `{project} · {branch}` when we have the branch.
+                var wt = p.Worktrees.FirstOrDefault(w => w.Id == s.WorktreeId);
+                if (wt?.Branch is { Length: > 0 } branch)
+                {
+                    descriptor = descriptor with { Title = $"{p.Name} · {branch}" };
+                }
+
+                var vm = new SessionTabViewModel(descriptor, p.Id, s.AgentId, s.DisplayName);
+                var targetIdx = 0;
+                if (_pendingSessionToGroup is not null
+                    && _pendingSessionToGroup.TryGetValue(s.Id, out var saved)
+                    && saved >= 0 && saved < Groups.Count)
+                {
+                    targetIdx = saved;
+                }
+                Groups[targetIdx].Tabs.Add(vm);
+            }
+        }
+
+        // Drop groups that ended up empty after routing — e.g. a persisted layout
+        // mapped a session to a group, but that session was since deleted from
+        // projects.json, or a worktree was removed. Without this the user sees a
+        // dead empty column on the right at every startup. Keep at least one group.
+        for (var i = Groups.Count - 1; i >= 0 && Groups.Count > 1; i--)
+        {
+            if (Groups[i].Tabs.Count == 0) { Groups.RemoveAt(i); }
+        }
+
+        // Restore focus to the persisted group (clamped to surviving group count).
+        // Each group's SelectedTab mirrors its first tab; window-global SelectedTab
+        // then follows the focused group's selection through OnFocusedGroupChanged.
+        foreach (var g in Groups)
+        {
+            if (g.SelectedTab is null && g.Tabs.Count > 0) { g.SelectedTab = g.Tabs[0]; }
+        }
+        var focusIdx = Math.Clamp(_pendingFocusedIndex, 0, Groups.Count - 1);
+        FocusedGroup = Groups[focusIdx];
+        SelectedTab = FocusedGroup.SelectedTab ?? Groups.SelectMany(g => g.Tabs).FirstOrDefault();
+
+        // One-shot: consume the layout so subsequent SessionStoreChange.Loaded events
+        // (rare — usually only at startup) don't re-apply stale mappings.
+        _pendingSessionToGroup = null;
+        _pendingFocusedIndex = 0;
+
+        CloseGroupCommand.NotifyCanExecuteChanged();
+        OnPropertyChanged(nameof(CanCloseGroup));
+
+        // Hydrate path: persisted AgentSessionId values from pre-session-17 builds point at
+        // abandoned transcripts (Claude Code v2.1.118+ rotates ids on /clear and on resume).
+        // Kick off a fresh adoption watch per Claude tab — discovery supplants the persisted
+        // id the moment the new pwsh session writes its first jsonl line.
+        var now = DateTimeOffset.UtcNow;
+        foreach (var p in loaded.Projects)
+        {
+            foreach (var s in p.Sessions)
+            {
+                BeginClaudeAdoption(s.Id, s.AgentId, s.WorktreePath, now);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Starts a discovery watch on <paramref name="workingDir"/> and, on first new jsonl,
+    /// persists the adopted id onto <paramref name="storedSessionId"/> and registers the
+    /// Claude telemetry tail. No-op for non-Claude agents or when discovery isn't wired
+    /// (tests / headless).
+    /// </summary>
+    private void BeginClaudeAdoption(string storedSessionId, string? agentId, string workingDir, DateTimeOffset since)
+    {
+        if (_discovery is null) { return; }
+        if (!string.Equals(agentId, "claude", StringComparison.OrdinalIgnoreCase)) { return; }
+        if (string.IsNullOrWhiteSpace(workingDir)) { return; }
+
+        StopClaudeAdoption(storedSessionId);
+
+        var handle = _discovery.Watch(workingDir, since, (adoptedId, _path) =>
+        {
+            var app = Application.Current;
+            async Task ApplyAsync()
+            {
+                _telemetry?.Register(adoptedId, workingDir);
+                var result = await _store.UpdateAgentSessionIdAsync(storedSessionId, adoptedId).ConfigureAwait(true);
+                if (result.IsFailure)
+                {
+                    _logger.LogDebug("Adoption persist failed for {Sid}: {Error}", storedSessionId, result.Error);
+                }
+                StopClaudeAdoption(storedSessionId);
+            }
+            if (app?.Dispatcher is { } d && !d.CheckAccess())
+            {
+                d.BeginInvoke(new Action(() => { _ = ApplyAsync(); }));
+            }
+            else
+            {
+                _ = ApplyAsync();
+            }
+        });
+        _discoveryWatches[storedSessionId] = handle;
+    }
+
+    private void StopClaudeAdoption(string storedSessionId)
+    {
+        if (_discoveryWatches.Remove(storedSessionId, out var handle))
+        {
+            try { handle.Dispose(); }
+            catch (Exception ex) { _logger.LogTrace(ex, "StopClaudeAdoption: dispose threw for {SessionId}", storedSessionId); }
+        }
+    }
+
+    /// <summary>
+    /// Telemetry update dispatch. Service raises on a non-UI thread (FileSystemWatcher pool),
+    /// so marshal onto the dispatcher before touching ObservableObject properties.
+    /// </summary>
+    private void OnTelemetryUpdated(object? sender, ClaudeSessionTelemetry snap)
+    {
+        var app = Application.Current;
+        if (app?.Dispatcher is { } d && !d.CheckAccess())
+        {
+            d.BeginInvoke(() => ApplyTelemetry(snap));
+            return;
+        }
+        ApplyTelemetry(snap);
+    }
+
+    /// <summary>
+    /// Projects <see cref="ClaudeActivityState"/> onto <see cref="TabStatus"/>:
+    /// <list type="bullet">
+    ///   <item>PendingToolUse → Wait (pulse; in auto-accept this flickers on tool calls,
+    ///     but is a true "paused for permission" signal in manual mode).</item>
+    ///   <item>Idle → Idle (overrides the selection-based Active flip so a focused-but-quiet
+    ///     tab reads as idle rather than active).</item>
+    ///   <item>Composing → Active if the tab is the window-selected one, else Idle.</item>
+    /// </list>
+    /// </summary>
+    /// <summary>
+    /// Emits notification entries on semantic transitions of a session's activity FSM:
+    /// <list type="bullet">
+    ///   <item>* → <c>PendingToolUse</c> → "Needs attention" (Wait pulse is visual-only; this persists).</item>
+    ///   <item><c>PendingToolUse</c>/<c>Composing</c> → <c>Idle</c> → "Ready" (response delivered).</item>
+    /// </list>
+    /// Suppresses the notification when the owning tab is currently focused — the user is
+    /// watching that session, so the bell adds noise rather than signal.
+    /// </summary>
+    private void PushActivityNotification(SessionTabViewModel tab, ClaudeSessionTelemetry snap)
+    {
+        if (_notifications is null) { return; }
+        var prev = _lastActivity.TryGetValue(snap.SessionId, out var p) ? p : ClaudeActivityState.Unknown;
+        _lastActivity[snap.SessionId] = snap.Activity;
+        if (prev == snap.Activity) { return; }
+        // Don't pester the user about the tab they're actively staring at.
+        if (ReferenceEquals(tab, SelectedTab)) { return; }
+
+        NotificationKind? kind = null;
+        string title = string.Empty;
+        string detail = string.Empty;
+        switch (snap.Activity)
+        {
+            case ClaudeActivityState.PendingToolUse:
+                kind = NotificationKind.SessionWaiting;
+                title = "Needs attention";
+                detail = "Agent paused on a tool prompt.";
+                break;
+            case ClaudeActivityState.Idle when prev is ClaudeActivityState.PendingToolUse or ClaudeActivityState.Composing:
+                kind = NotificationKind.SessionReady;
+                title = "Ready";
+                detail = snap.LastTurnDuration is { } d
+                    ? $"Turn complete · {FormatDuration(d.TotalSeconds)}"
+                    : "Turn complete.";
+                break;
+        }
+        if (kind is null) { return; }
+
+        _notifications.Push(new NotificationEntry(
+            Id: Guid.NewGuid().ToString("N"),
+            SessionId: snap.SessionId,
+            SessionTitle: tab.DisplayName,
+            Kind: kind.Value,
+            Title: title,
+            Detail: detail,
+            Timestamp: DateTimeOffset.Now,
+            IsRead: false));
+    }
+
+    private void ApplyActivityToStatus(SessionTabViewModel tab, ClaudeActivityState activity)
+    {
+        var isSelected = ReferenceEquals(tab, SelectedTab);
+        tab.Status = activity switch
+        {
+            ClaudeActivityState.PendingToolUse => TabStatus.Wait,
+            ClaudeActivityState.Idle => TabStatus.Idle,
+            ClaudeActivityState.Composing => isSelected ? TabStatus.Active : TabStatus.Idle,
+            _ => tab.Status,
+        };
+    }
+
+    private void ApplyTelemetry(ClaudeSessionTelemetry snap)
+    {
+        string? matchedTabId = null;
+        foreach (var tab in AllTabs)
+        {
+            var stored = FindStoredSession(tab);
+            if (stored?.AgentSessionId == snap.SessionId)
+            {
+                tab.TokensUsed = snap.TotalTokens;
+                tab.TurnCount = snap.TurnCount;
+                tab.LastTurnDurationSec = snap.LastTurnDuration?.TotalSeconds ?? 0;
+                if (snap.ContextWindowTokens > 0) { tab.ContextWindowTokens = snap.ContextWindowTokens; }
+                ApplyActivityToStatus(tab, snap.Activity);
+                PushActivityNotification(tab, snap);
+                matchedTabId = tab.Descriptor.Id;
+                break;
+            }
+        }
+
+        // Sidebar's worktree.Sessions holds mirror VMs with independent Status fields;
+        // keep them in lockstep so the sidebar dot (+ its pulse storyboard) lights up
+        // when the focused tab's agent enters Wait.
+        if (matchedTabId is not null && Sidebar is not null)
+        {
+            foreach (var p in Sidebar.Projects)
+            {
+                foreach (var w in p.Worktrees)
+                {
+                    foreach (var s in w.Sessions)
+                    {
+                        if (s.Descriptor.Id == matchedTabId)
+                        {
+                            ApplyActivityToStatus(s, snap.Activity);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

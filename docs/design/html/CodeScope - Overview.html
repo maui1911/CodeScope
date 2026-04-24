@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>CodeScope — Overview</title>
+<meta name="viewport" content="width=1440" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="codescope-shared.css">
+<style>
+  .app-shell { grid-template-columns: 240px 1fr; }
+  .main {
+    display: flex; flex-direction: column;
+    background: #000;
+    min-height: 0;
+  }
+  .ov-head {
+    height: 56px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center;
+    padding: 0 24px;
+    gap: 16px;
+  }
+  .ov-head .title {
+    font-size: 13px; color: var(--text-2);
+    letter-spacing: -0.005em;
+  }
+  .ov-head .title b { color: #fff; font-weight: 600; }
+  .ov-head .eyebrow {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--accent);
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    padding: 3px 7px;
+    border: 1px solid rgba(0,153,255,0.25);
+    border-radius: 3px;
+    background: rgba(0,153,255,0.05);
+  }
+  .ov-head .right { margin-left: auto; display: flex; align-items: center; gap: 14px; }
+  .back-link {
+    color: var(--accent);
+    font-size: 13px; font-weight: 500;
+    display: inline-flex; align-items: center; gap: 6px;
+    letter-spacing: -0.005em;
+    cursor: pointer;
+  }
+  .back-link:hover { text-decoration: underline; text-decoration-color: rgba(0,153,255,0.4); }
+  .ov-filter {
+    display: flex; gap: 4px;
+    background: var(--elev);
+    border-radius: 5px;
+    padding: 2px;
+  }
+  .ov-filter > div {
+    font-size: 11px;
+    padding: 5px 10px;
+    border-radius: 3px;
+    color: var(--text-2);
+    cursor: pointer;
+  }
+  .ov-filter > div.on { background: #000; color: #fff; box-shadow: inset 0 0 0 1px var(--border); }
+
+  .grid {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+    padding: 24px;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+    align-content: start;
+  }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    display: flex; flex-direction: column;
+    transition: background 120ms ease-out, border-color 120ms ease-out;
+    cursor: pointer;
+    min-width: 0;
+  }
+  .card:hover {
+    background: var(--elev);
+    border-color: var(--accent);
+  }
+  .card.focused {
+    border: 2px solid var(--accent);
+    box-shadow: 0 0 0 4px rgba(0,153,255,0.12);
+  }
+
+  .card-head {
+    height: 40px;
+    padding: 0 12px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .card-head .name {
+    font: 500 13px/1 'Inter', sans-serif;
+    color: #fff;
+    letter-spacing: -0.005em;
+    flex: 1 1 auto;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .focus-btn {
+    width: 22px; height: 22px;
+    border-radius: 4px;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--text-3);
+    cursor: pointer;
+    transition: background 120ms ease-out, color 120ms ease-out;
+  }
+  .focus-btn:hover { background: var(--hover); color: var(--accent); }
+
+  .card-term {
+    margin: 0 8px;
+    height: 160px;
+    background: #000;
+    border-radius: 4px;
+    padding: 10px 12px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    line-height: 1.5;
+    color: var(--text-2);
+    overflow: hidden;
+    position: relative;
+  }
+  .card-term::after {
+    content: "";
+    position: absolute; left: 0; right: 0; bottom: 0; height: 40px;
+    background: linear-gradient(180deg, transparent, #000);
+    pointer-events: none;
+  }
+  .card-term .u { color: var(--accent); }
+  .card-term .w { color: #fff; }
+  .card-term .q { color: var(--warn); }
+  .card-term .s { color: var(--code-str); }
+
+  .card-foot {
+    height: 32px;
+    padding: 0 12px;
+    display: flex; align-items: center; gap: 8px;
+    margin-top: 8px;
+  }
+  .card-foot .branch-s {
+    font: 400 11px/1 'JetBrains Mono', monospace;
+    color: var(--text-2);
+    letter-spacing: 0;
+    flex: 1 1 auto;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .chg-chip {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    padding: 2px 7px;
+    border: 1px solid rgba(0,153,255,0.45);
+    border-radius: 10px;
+    color: var(--accent);
+    letter-spacing: 0;
+  }
+  .elapsed {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10.5px;
+    color: var(--text-3);
+  }
+
+  .ov-type-badge {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9.5px;
+    color: var(--text-3);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    margin-right: 4px;
+  }
+</style>
+</head>
+<body>
+<div class="app-shell" data-screen-label="03 Overview — 6 sessions">
+
+  <aside class="sidebar">
+    <div class="brand"><div class="brand-mark"></div><div class="brand-word">CodeScope</div></div>
+    <div class="side-label">Projects</div>
+    <div class="proj open">
+      <svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3 L8 6 L4.5 9"/></svg>
+      PestScope<span class="count">3</span>
+    </div>
+    <div class="wt has-session"><span class="bar"></span>feat/reporting</div>
+    <div class="wt has-session"><span class="bar"></span>feat/billing</div>
+    <div class="wt has-session"><span class="bar"></span>main</div>
+    <div class="proj open">
+      <svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3 L8 6 L4.5 9"/></svg>
+      SurveyScope<span class="count">2</span>
+    </div>
+    <div class="wt has-session"><span class="bar"></span>main</div>
+    <div class="wt has-session"><span class="bar"></span>bugfix/auth</div>
+    <div class="proj open">
+      <svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3 L8 6 L4.5 9"/></svg>
+      CodeScope<span class="count">1</span>
+    </div>
+    <div class="wt has-session"><span class="bar"></span>feat/overview</div>
+    <div class="sidebar-foot">
+      <button class="overview-btn active">Overview<span class="kbd">⌃⇧ O</span></button>
+      <button class="new-project"><span style="color:var(--accent);font-family:'JetBrains Mono',monospace;font-size:13px">＋</span>New Project</button>
+    </div>
+  </aside>
+
+  <div class="main">
+    <div class="ov-head">
+      <span class="eyebrow">Overview</span>
+      <span class="title"><b>6 sessions</b> across 3 projects</span>
+      <div class="right">
+        <div class="ov-filter">
+          <div class="on">All</div>
+          <div>Active</div>
+          <div>Idle</div>
+          <div>Waiting</div>
+        </div>
+        <span class="back-link">← Back to workspace</span>
+      </div>
+    </div>
+
+    <div class="grid">
+
+      <!-- 1 · focused · active -->
+      <div class="card focused">
+        <div class="card-head">
+          <span class="sdot active"></span>
+          <span class="name">PestScope · feat/reporting</span>
+          <span class="ov-type-badge">focus</span>
+          <div class="focus-btn" title="Focus">
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M2 2h3M7 2h3v3M2 7v3h3M7 10h3v-3"/></svg>
+          </div>
+        </div>
+        <div class="card-term">
+          <div><span class="u">&gt;</span> implement CSV export for reports</div>
+          <div class="w">Writing CsvWriter helper…</div>
+          <div>  <span class="w">sb.AppendLine(</span><span class="s">"Site,Technician,Date"</span><span class="w">);</span></div>
+          <div>  <span class="w">foreach (var row in report.Findings)</span></div>
+          <div>    sb.Append(Csv.Escape(row.Site));</div>
+          <div>    sb.Append(<span class="s">","</span>);</div>
+          <div>— edited ReportsController.cs  +34 −0</div>
+          <div>— created Export/Csv.cs          +12 −0</div>
+          <div><span class="u">&gt;</span> add a test that csv escapes quotes</div>
+        </div>
+        <div class="card-foot">
+          <span class="branch-s">feat/reporting</span>
+          <span class="chg-chip">changes: 3</span>
+          <span class="elapsed">14:32</span>
+        </div>
+      </div>
+
+      <!-- 2 · active -->
+      <div class="card">
+        <div class="card-head">
+          <span class="sdot active"></span>
+          <span class="name">PestScope · feat/billing</span>
+          <div class="focus-btn"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M2 2h3M7 2h3v3M2 7v3h3M7 10h3v-3"/></svg></div>
+        </div>
+        <div class="card-term">
+          <div><span class="u">&gt;</span> stripe webhook for subscription_updated</div>
+          <div class="w">Adding handler in BillingController…</div>
+          <div>  <span class="w">case </span><span class="s">"subscription.updated"</span><span class="w">:</span></div>
+          <div>    await _billing.SyncAsync(ev);</div>
+          <div>    break;</div>
+          <div>  <span class="w">case </span><span class="s">"subscription.deleted"</span><span class="w">:</span></div>
+          <div>    await _billing.CancelAsync(ev);</div>
+          <div>— edited BillingController.cs  +18 −0</div>
+          <div><span class="u">&gt;</span> verify idempotency key is passed</div>
+        </div>
+        <div class="card-foot">
+          <span class="branch-s">feat/billing</span>
+          <span class="chg-chip">changes: 1</span>
+          <span class="elapsed">08:11</span>
+        </div>
+      </div>
+
+      <!-- 3 · idle -->
+      <div class="card">
+        <div class="card-head">
+          <span class="sdot idle"></span>
+          <span class="name">PestScope · main</span>
+          <div class="focus-btn"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M2 2h3M7 2h3v3M2 7v3h3M7 10h3v-3"/></svg></div>
+        </div>
+        <div class="card-term">
+          <div><span class="u">&gt;</span> summarize yesterday's changes</div>
+          <div class="w">Here's a summary of commits since 2026-04-21:</div>
+          <div>  · fix: null guard on Site export (8a4f2c1)</div>
+          <div>  · chore: bump .NET SDK to 9.0.201</div>
+          <div>  · refactor: extract ReportRenderer</div>
+          <div>  · test: coverage for CsvWriter</div>
+          <div>  · docs: README for worktree setup</div>
+          <div>Net: 5 commits · +412 −138 · 11 files</div>
+          <div class="w">idle · awaiting next prompt</div>
+        </div>
+        <div class="card-foot">
+          <span class="branch-s">main</span>
+          <span class="chg-chip" style="border-color:#1F1F1F;color:var(--text-3)">changes: 0</span>
+          <span class="elapsed">—</span>
+        </div>
+      </div>
+
+      <!-- 4 · idle -->
+      <div class="card">
+        <div class="card-head">
+          <span class="sdot idle"></span>
+          <span class="name">SurveyScope · main</span>
+          <div class="focus-btn"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M2 2h3M7 2h3v3M2 7v3h3M7 10h3v-3"/></svg></div>
+        </div>
+        <div class="card-term">
+          <div><span class="u">&gt;</span> generate release notes for v2.4</div>
+          <div class="w">v2.4 — April 22, 2026</div>
+          <div class="w">Highlights</div>
+          <div>  · Multi-survey batching in the response ingest pipeline.</div>
+          <div>  · Updated OTEL exporter config for Grafana Cloud.</div>
+          <div>Fixes</div>
+          <div>  · Trim invisible unicode from open-text answers.</div>
+          <div>  · Graceful retry when Postgres connection drops mid-stream.</div>
+          <div class="w">idle · last run 3m ago</div>
+        </div>
+        <div class="card-foot">
+          <span class="branch-s">main</span>
+          <span class="chg-chip" style="border-color:#1F1F1F;color:var(--text-3)">changes: 0</span>
+          <span class="elapsed">03:02</span>
+        </div>
+      </div>
+
+      <!-- 5 · waiting -->
+      <div class="card">
+        <div class="card-head">
+          <span class="sdot wait"></span>
+          <span class="name">SurveyScope · bugfix/auth</span>
+          <div class="focus-btn"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M2 2h3M7 2h3v3M2 7v3h3M7 10h3v-3"/></svg></div>
+        </div>
+        <div class="card-term">
+          <div><span class="u">&gt;</span> fix the expired-token redirect loop</div>
+          <div class="w">Inspecting AuthMiddleware. Refresh calls back into the same handler.</div>
+          <div class="w">Two paths forward — I need your call before I edit further:</div>
+          <div class="q">?  Should I use JWT in the Authorization header,</div>
+          <div class="q">   or stick with HttpOnly cookies like the rest</div>
+          <div class="q">   of the app? Either works but the codebase</div>
+          <div class="q">   is cookie-based.</div>
+          <div>  [y] cookies · [j] jwt · [?] trade-offs</div>
+          <div class="w">awaiting input · 2m 14s</div>
+        </div>
+        <div class="card-foot">
+          <span class="branch-s">bugfix/auth</span>
+          <span class="chg-chip">changes: 1</span>
+          <span class="elapsed">02:14</span>
+        </div>
+      </div>
+
+      <!-- 6 · idle (meta) -->
+      <div class="card">
+        <div class="card-head">
+          <span class="sdot idle"></span>
+          <span class="name">CodeScope · feat/overview</span>
+          <div class="focus-btn"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M2 2h3M7 2h3v3M2 7v3h3M7 10h3v-3"/></svg></div>
+        </div>
+        <div class="card-term">
+          <div><span class="u">&gt;</span> add a 3-column grid mode for the overview</div>
+          <div class="w">Done. Cards render at 300px min width, wrap to 2 cols &lt; 1180.</div>
+          <div>  · OverviewGrid.tsx             +86 −0</div>
+          <div>  · useSessionSnapshot.ts        +24 −0</div>
+          <div>  · commands.ts                  +4  −0  (⌃⇧O)</div>
+          <div class="w">Preview attached in #42.</div>
+          <div class="w">idle · last run 11m ago</div>
+        </div>
+        <div class="card-foot">
+          <span class="branch-s">feat/overview</span>
+          <span class="chg-chip">changes: 2</span>
+          <span class="elapsed">11:02</span>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+</body>
+</html>

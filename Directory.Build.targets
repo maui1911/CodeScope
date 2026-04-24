@@ -1,0 +1,28 @@
+<Project>
+    <!--
+        Derives the product version from the current git tag at build time.
+        git describe gives us: the tag when HEAD is exactly tagged, the tag
+        plus commits-ahead and short SHA when ahead, or just the short SHA
+        when no tags exist yet. "-dirty" is appended when the tree has
+        uncommitted changes.
+
+        The result is baked into AssemblyInformationalVersionAttribute so
+        the UI (and any crash-report / about-dialog consumer) can read it
+        at runtime. See CodeScope.App.VersionInfo.
+    -->
+    <Target Name="SetVersionFromGit"
+            BeforeTargets="GetAssemblyVersion;GenerateAssemblyInfo;CoreCompile">
+        <Exec Command="git describe --tags --always --dirty"
+              ConsoleToMSBuild="true"
+              IgnoreExitCode="true"
+              ContinueOnError="true"
+              StandardOutputImportance="low"
+              StandardErrorImportance="low">
+            <Output TaskParameter="ConsoleOutput" PropertyName="_GitDescribe" />
+        </Exec>
+        <PropertyGroup>
+            <InformationalVersion Condition="'$(_GitDescribe)' != ''">$(_GitDescribe)</InformationalVersion>
+            <InformationalVersion Condition="'$(_GitDescribe)' == ''">0.0-unknown</InformationalVersion>
+        </PropertyGroup>
+    </Target>
+</Project>

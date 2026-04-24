@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>CodeScope — Tab Motion</title>
+<meta name="viewport" content="width=1600" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<style>
+  :root {
+    --bg: #000;
+    --panel: #0A0A0A;
+    --elev: #141414;
+    --hover: #1F1F1F;
+    --border: #1F1F1F;
+    --text: #fff;
+    --text-2: #A0A0A0;
+    --text-3: #606060;
+    --accent: #0099FF;
+    --ok: #4BD87B;
+    --warn: #FF5A5A;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #050505; color: #fff;
+    font-family: 'Inter', -apple-system, system-ui, sans-serif;
+    font-feature-settings: "cv01","cv05","cv09","cv11","ss03","ss07";
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ===== frame ===== */
+  .frame {
+    width: 960px;
+    background: #000;
+    border: 1px solid #1F1F1F;
+    border-radius: 8px;
+    overflow: hidden;
+    position: relative;
+  }
+
+  .tabs {
+    position: relative;
+    height: 40px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: stretch;
+    padding: 0 4px;
+    gap: 2px;
+  }
+  .tab {
+    position: relative;
+    display: flex; align-items: center; gap: 8px;
+    min-width: 170px;
+    padding: 0 12px;
+    margin: 4px 0;
+    border-radius: 6px;
+    background: transparent;
+    color: rgba(255,255,255,0.7);
+    font: 500 13px/1 'Inter', sans-serif;
+    letter-spacing: -0.005em;
+    user-select: none;
+    transition: background 120ms ease-out, color 120ms ease-out;
+  }
+  .tab.active { background: #000; color: #fff; }
+  .tab .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    flex: 0 0 6px;
+  }
+  .d-active { background: var(--accent); box-shadow: 0 0 0 3px rgba(0,153,255,0.18); }
+  .d-idle   { background: var(--ok); }
+  .d-wait   { background: var(--warn); }
+  .tab-sep { width: 1px; background: var(--border); margin: 10px 0; }
+  .tab-new {
+    width: 32px; height: 28px; margin: 6px 2px;
+    border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--text-2);
+  }
+
+  /* ===== the motion trail ===== */
+  /* The trail is a single absolutely-positioned line that spans from
+     the old tab's left edge to the new tab's right edge. During the
+     mid-frame it's stretched; at rest it's just a 2px underline on
+     the active tab's top edge. */
+  .trail {
+    position: absolute;
+    top: 0;
+    height: 2px;
+    background: var(--accent);
+    border-radius: 2px;
+    box-shadow: 0 0 16px rgba(0,153,255,0.6), 0 0 2px rgba(0,153,255,0.8);
+  }
+  .trail::before, .trail::after {
+    content: "";
+    position: absolute;
+    top: -1px;
+    width: 20px;
+    height: 4px;
+    border-radius: 2px;
+    background: linear-gradient(90deg, transparent, rgba(0,153,255,0.9));
+    filter: blur(1px);
+  }
+  .trail::before { left: -20px; transform: scaleX(-1); }
+  .trail::after  { right: -20px; }
+
+  /* simulated terminal strip beneath the tab row */
+  .canvas-strip {
+    height: 38px;
+    background: #000;
+    display: flex; align-items: center;
+    padding: 0 20px;
+    color: var(--text-3);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+  }
+  .canvas-strip .dim { color: var(--text-3); }
+  .canvas-strip .hl  { color: var(--accent); }
+  .canvas-strip .fade {
+    opacity: 0.4;
+    transition: opacity 200ms ease-out;
+  }
+  .canvas-strip .incoming {
+    opacity: 1;
+  }
+
+  /* ===== frame annotations ===== */
+  .frame-label {
+    display: flex; align-items: baseline; gap: 12px;
+    margin-bottom: 14px;
+  }
+  .frame-num {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--accent);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+  .frame-title {
+    font-size: 16px; font-weight: 600;
+    letter-spacing: -0.01em;
+    color: #fff;
+  }
+  .frame-sub {
+    margin-top: 10px;
+    font-size: 12px; color: var(--text-2);
+    max-width: 820px;
+    line-height: 1.5;
+    letter-spacing: -0.005em;
+  }
+  .frame-sub b { color: #fff; font-weight: 500; }
+  .frame-sub code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--accent);
+    background: rgba(0,153,255,0.08);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
+  /* timing strip below canvas */
+  .timing {
+    margin-top: 24px;
+    height: 44px;
+    position: relative;
+    border-top: 1px solid #1F1F1F;
+    padding-top: 12px;
+  }
+  .timing-track {
+    position: relative;
+    height: 2px;
+    background: #1F1F1F;
+    border-radius: 2px;
+  }
+  .timing-fill {
+    position: absolute; left: 0; top: 0; bottom: 0;
+    background: var(--accent);
+    border-radius: 2px;
+  }
+  .timing-tick {
+    position: absolute;
+    top: -4px;
+    width: 2px; height: 10px;
+    background: #606060;
+  }
+  .timing-tick.on { background: var(--accent); }
+  .timing-label {
+    position: absolute;
+    top: 14px;
+    transform: translateX(-50%);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--text-3);
+    letter-spacing: 0.05em;
+  }
+  .timing-label.on { color: var(--accent); }
+
+  /* spec block at the bottom of each artboard */
+  .spec {
+    margin-top: 14px;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+    font-size: 11px;
+    color: var(--text-2);
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .spec-row { display: flex; flex-direction: column; gap: 4px; }
+  .spec-row .k { color: var(--text-3); letter-spacing: 0.08em; text-transform: uppercase; font-size: 9.5px; }
+  .spec-row .v { color: #fff; font-size: 11px; }
+
+  /* Arrow connectors between frames (rendered by canvas layout, this is just decoration inside each frame) */
+  .guide-arrow {
+    position: absolute;
+    right: -40px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--accent);
+    opacity: 0.7;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 18px;
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" src="design-canvas.jsx"></script>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useLayoutEffect } = React;
+
+/* ---- tab model ---- */
+const TABS = [
+  { id: "t1", name: "PestScope · feat/reporting", state: "active" },
+  { id: "t2", name: "SurveyScope · main",          state: "idle" },
+  { id: "t3", name: "SurveyScope · bugfix/auth",   state: "wait" },
+];
+
+function TabStrip({ activeId, trailGeom }) {
+  // trailGeom: { left, width } in px relative to .tabs
+  return (
+    <div className="tabs">
+      {TABS.map((t, i) => {
+        const isActive = t.id === activeId;
+        const cls =
+          t.state === "active" ? "d-active" :
+          t.state === "idle"   ? "d-idle"   : "d-wait";
+        return (
+          <React.Fragment key={t.id}>
+            <div className={"tab" + (isActive ? " active" : "")} data-tab={t.id}>
+              <span className={"dot " + cls} />
+              <span>{t.name}</span>
+            </div>
+            {i < TABS.length - 1 && <div className="tab-sep" />}
+          </React.Fragment>
+        );
+      })}
+      <div className="tab-new">+</div>
+      {trailGeom && (
+        <div
+          className="trail"
+          style={{ left: trailGeom.left, width: trailGeom.width }}
+        />
+      )}
+    </div>
+  );
+}
+
+/* For the sketch, we measure tab rects on mount and pass in explicit
+   rects for "old" and "new" active tabs to derive trail geometry. */
+function useTabRects(ref) {
+  const [rects, setRects] = useState({});
+  useLayoutEffect(() => {
+    if (!ref.current) return;
+    const root = ref.current;
+    const tabsEl = root.querySelector('.tabs');
+    const out = {};
+    root.querySelectorAll('[data-tab]').forEach(el => {
+      const rT = tabsEl.getBoundingClientRect();
+      const r = el.getBoundingClientRect();
+      out[el.dataset.tab] = {
+        left: r.left - rT.left - 4, // extend 4px past edge per spec
+        right: r.right - rT.left + 4,
+        width: r.width + 8,
+      };
+    });
+    setRects(out);
+  }, [ref]);
+  return rects;
+}
+
+/* ===== Frame 1: REST — old active tab, selection sits on it ===== */
+function FrameRest({ activeId }) {
+  const ref = useRef(null);
+  const rects = useTabRects(ref);
+  const a = rects[activeId];
+  const trail = a ? { left: a.left, width: a.width } : null;
+  return (
+    <div className="frame" ref={ref}>
+      <TabStrip activeId={activeId} trailGeom={trail} />
+      <div className="canvas-strip">
+        <span className="hl">&gt;</span>&nbsp;
+        <span>implement CSV export for reports</span>
+      </div>
+    </div>
+  );
+}
+
+/* ===== Frame 2: MID-TRANSITION — trail stretched across both ===== */
+function FrameStretch({ fromId, toId }) {
+  const ref = useRef(null);
+  const rects = useTabRects(ref);
+  const a = rects[fromId], b = rects[toId];
+  // the single line spans from whichever is leftmost to whichever is rightmost
+  const trail = (a && b) ? {
+    left: Math.min(a.left, b.left),
+    width: Math.max(a.right, b.right) - Math.min(a.left, b.left),
+  } : null;
+  return (
+    <div className="frame" ref={ref}>
+      <TabStrip activeId={toId} trailGeom={trail} />
+      <div className="canvas-strip">
+        <span className="dim fade">&gt; implement CSV export…</span>
+      </div>
+    </div>
+  );
+}
+
+/* ===== Frame 3: LANDED — trail settles on new tab ===== */
+function FrameLanded({ activeId }) {
+  const ref = useRef(null);
+  const rects = useTabRects(ref);
+  const a = rects[activeId];
+  const trail = a ? { left: a.left, width: a.width } : null;
+  return (
+    <div className="frame" ref={ref}>
+      <TabStrip activeId={activeId} trailGeom={trail} />
+      <div className="canvas-strip">
+        <span className="hl">&gt;</span>&nbsp;
+        <span className="incoming">dotnet test --filter AuthMiddleware</span>
+      </div>
+    </div>
+  );
+}
+
+/* ===== Timing strip ===== */
+function Timing({ progress }) {
+  // progress ∈ [0, 1] marks how far through the 200ms ease-out we are
+  return (
+    <div className="timing">
+      <div className="timing-track">
+        <div className="timing-fill" style={{ width: (progress * 100) + "%" }} />
+        <div className="timing-tick on" style={{ left: 0 }} />
+        <div className="timing-tick"    style={{ left: "50%" }} />
+        <div className="timing-tick on" style={{ left: "calc(100% - 2px)" }} />
+        <div className="timing-label on" style={{ left: 0 }}>0ms</div>
+        <div className="timing-label"    style={{ left: "50%" }}>100ms</div>
+        <div className="timing-label on" style={{ left: "100%" }}>200ms · ease-out</div>
+        {/* progress marker */}
+        <div style={{
+          position: 'absolute',
+          left: `calc(${progress * 100}% - 6px)`, top: -7,
+          width: 12, height: 16,
+          background: 'var(--accent)',
+          clipPath: 'polygon(50% 100%, 0 0, 100% 0)',
+          filter: 'drop-shadow(0 0 6px rgba(0,153,255,0.6))',
+        }} />
+      </div>
+    </div>
+  );
+}
+
+/* ===== Spec footer ===== */
+function Spec({ rows }) {
+  return (
+    <div className="spec">
+      {rows.map(([k, v]) => (
+        <div className="spec-row" key={k}>
+          <span className="k">{k}</span>
+          <span className="v">{v}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ===== Page ===== */
+function App() {
+  return (
+    <DesignCanvas title="CodeScope · Tab Strip Motion Trail" subtitle="Three frames · active indicator animates as one continuous line">
+      <DCSection id="motion" title="Frame sequence · 0 → 100ms → 200ms">
+
+        <DCArtboard id="f1" label="Frame 1 — Rest on old tab" width={960} height={260}>
+          <div style={{ padding: 24 }}>
+            <div className="frame-label">
+              <span className="frame-num">01 · t = 0ms</span>
+              <span className="frame-title">Before — selection rests on PestScope</span>
+            </div>
+            <FrameRest activeId="t1" />
+            <Timing progress={0} />
+            <Spec rows={[
+              ["Trail", "2px · left = tab-4px · width = tab+8px"],
+              ["State", "User clicks SurveyScope · bugfix/auth"],
+              ["Glow", "0 0 16px rgba(0,153,255,0.6)"],
+            ]} />
+          </div>
+        </DCArtboard>
+
+        <DCArtboard id="f2" label="Frame 2 — Stretched trail" width={960} height={260}>
+          <div style={{ padding: 24 }}>
+            <div className="frame-label">
+              <span className="frame-num">02 · t ≈ 100ms</span>
+              <span className="frame-title">Mid — one line bridges old and new</span>
+            </div>
+            <FrameStretch fromId="t1" toId="t3" />
+            <Timing progress={0.5} />
+            <Spec rows={[
+              ["Trail", "spans min(old.left, new.left) → max(old.right, new.right)"],
+              ["Easing", "ease-out · width shrinks toward new.right"],
+              ["Feel", "Single continuous beam — never two handles"],
+            ]} />
+          </div>
+        </DCArtboard>
+
+        <DCArtboard id="f3" label="Frame 3 — Landed" width={960} height={260}>
+          <div style={{ padding: 24 }}>
+            <div className="frame-label">
+              <span className="frame-num">03 · t = 200ms</span>
+              <span className="frame-title">After — selection lands on bugfix/auth</span>
+            </div>
+            <FrameLanded activeId="t3" />
+            <Timing progress={1} />
+            <Spec rows={[
+              ["Trail", "2px · left = tab-4px · width = tab+8px"],
+              ["Canvas", "Terminal swaps via 120ms opacity crossfade"],
+              ["Dot", "wait-state pulse resumes on new tab"],
+            ]} />
+          </div>
+        </DCArtboard>
+
+      </DCSection>
+
+      <DCSection id="notes" title="Implementation notes">
+        <DCArtboard id="impl" label="One-line motion — how it works" width={960} height={360}>
+          <div style={{ padding: 32, color: 'var(--text-2)', fontSize: 13, lineHeight: 1.7, letterSpacing: '-0.005em', maxWidth: 820 }}>
+            <div style={{ color: '#fff', fontSize: 15, fontWeight: 600, marginBottom: 16, letterSpacing: '-0.01em' }}>
+              A single DOM element owns the indicator.
+            </div>
+            <p style={{ marginTop: 0 }}>
+              The top-border is not per-tab — it lives once in <span style={{ color: '#fff', fontFamily: "'JetBrains Mono', monospace", fontSize: 12 }}>.tabs</span> and animates its <span style={{ color: '#fff', fontFamily: "'JetBrains Mono', monospace", fontSize: 12 }}>left</span> and <span style={{ color: '#fff', fontFamily: "'JetBrains Mono', monospace", fontSize: 12 }}>width</span> between the bounding rects of the old and new active tabs.
+            </p>
+            <p>
+              On tab change, set both properties to the <b style={{ color: '#fff' }}>enclosing rect</b> of the two tabs, then on next frame set them to the new tab's rect. With <span style={{ color: '#fff', fontFamily: "'JetBrains Mono', monospace", fontSize: 12 }}>transition: left 200ms ease-out, width 200ms ease-out</span>, the line extends toward the new tab and contracts onto it — reading as one continuous beam rather than two separate underlines.
+            </p>
+            <p style={{ color: 'var(--text-3)' }}>
+              Glow is a soft box-shadow that scales with width, so during stretch the beam feels slightly "charged" before settling. The ::before / ::after pseudo-elements add a 20px fade at each end for a trail taper, visible only mid-transition when velocity is high.
+            </p>
+          </div>
+        </DCArtboard>
+      </DCSection>
+    </DesignCanvas>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

@@ -1,0 +1,543 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>CodeScope — Worktree context menu</title>
+<meta name="viewport" content="width=1440" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="codescope-shared.css">
+<style>
+  /* spec annotations column on the right */
+  .app-shell { grid-template-columns: 240px 1fr; }
+
+  .stage {
+    position: relative;
+    background:
+      radial-gradient(1100px 600px at 20% 30%, rgba(0,153,255,0.05), transparent 60%),
+      #000;
+    display: flex; flex-direction: column;
+    min-height: 0;
+  }
+
+  .stage-head {
+    height: 56px;
+    border-bottom: 1px solid var(--border);
+    padding: 0 24px;
+    display: flex; align-items: center; gap: 14px;
+  }
+  .eyebrow {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--accent);
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    padding: 3px 7px;
+    border: 1px solid rgba(0,153,255,0.25);
+    border-radius: 3px;
+    background: rgba(0,153,255,0.05);
+  }
+  .stage-head .title { font-size: 13px; color: var(--text-2); }
+  .stage-head .title b { color: #fff; font-weight: 600; }
+
+  .stage-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: 1fr 340px;
+  }
+
+  /* the "canvas" that the menu is anchored over — mostly empty, to keep focus on the menu */
+  .canvas {
+    position: relative;
+    border-right: 1px solid var(--border);
+    padding: 40px 56px;
+  }
+  .canvas-hint {
+    position: absolute; left: 56px; bottom: 32px;
+    font-size: 11px; color: var(--text-3);
+    letter-spacing: -0.005em;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .kbd-mini {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--text-2);
+    border: 1px solid var(--border);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
+  /* ghost cursor marker sitting on the row */
+  .cursor-marker {
+    position: absolute;
+    left: 54px; top: 104px;
+    width: 14px; height: 18px;
+    color: #fff;
+    filter: drop-shadow(0 0 4px rgba(0,153,255,0.5));
+    z-index: 30;
+    pointer-events: none;
+  }
+  .right-click-pulse {
+    position: absolute;
+    left: 40px; top: 94px;
+    width: 24px; height: 24px;
+    border-radius: 50%;
+    border: 1px solid var(--accent);
+    opacity: 0.4;
+    z-index: 25;
+  }
+
+  /* ==== context menu ==== */
+  .menu {
+    position: absolute;
+    top: 92px; left: 82px;
+    width: 260px;
+    background: #141414;
+    border: 1px solid #2A2A2A;
+    border-radius: 8px;
+    padding: 6px;
+    box-shadow:
+      0 0 0 1px rgba(0,0,0,0.5),
+      0 12px 32px rgba(0,0,0,0.55),
+      0 0 0 4px rgba(0,153,255,0.04);
+    z-index: 40;
+    font-family: 'Inter', sans-serif;
+    letter-spacing: -0.005em;
+  }
+  .menu-header {
+    padding: 6px 10px 8px;
+    border-bottom: 1px solid #1F1F1F;
+    margin-bottom: 6px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .menu-header .sdot { width: 6px; height: 6px; flex: 0 0 6px; }
+  .menu-header .mh-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: #fff;
+  }
+  .menu-header .mh-repo {
+    font-size: 10px; color: var(--text-3);
+    margin-left: auto;
+  }
+
+  .mi {
+    position: relative;
+    display: flex; align-items: center; gap: 10px;
+    height: 28px;
+    padding: 0 10px;
+    border-radius: 5px;
+    font-size: 12.5px;
+    color: #E6E6E6;
+    cursor: default;
+  }
+  .mi:hover { background: rgba(0,153,255,0.12); color: #fff; }
+  .mi.active {
+    background: rgba(0,153,255,0.18);
+    color: #fff;
+    box-shadow: inset 0 0 0 1px rgba(0,153,255,0.45);
+  }
+  .mi .ic {
+    width: 14px; height: 14px;
+    color: var(--text-2);
+    flex: 0 0 14px;
+  }
+  .mi:hover .ic, .mi.active .ic { color: var(--accent); }
+  .mi .label { flex: 1 1 auto; }
+  .mi .shortcut {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--text-3);
+    letter-spacing: 0;
+  }
+  .mi.active .shortcut { color: var(--accent); }
+  .mi .chev {
+    width: 10px; height: 10px; color: var(--text-3);
+  }
+  .mi.danger { color: #FF8A8A; }
+  .mi.danger .ic { color: #FF8A8A; }
+  .mi.danger:hover { background: rgba(255,90,90,0.12); }
+  .mi.danger:hover .ic { color: #FF8A8A; }
+
+  .mi.disabled { color: var(--text-3); }
+  .mi.disabled .ic { color: #3A3A3A; }
+  .mi.disabled:hover { background: transparent; color: var(--text-3); }
+
+  .msep {
+    height: 1px;
+    background: #1F1F1F;
+    margin: 6px 4px;
+  }
+  .mgroup {
+    font-size: 9.5px;
+    font-weight: 500;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--text-3);
+    padding: 8px 10px 4px;
+  }
+
+  /* submenu */
+  .submenu {
+    position: absolute;
+    left: calc(100% + 6px);
+    top: -6px;
+    width: 220px;
+    background: #141414;
+    border: 1px solid #2A2A2A;
+    border-radius: 8px;
+    padding: 6px;
+    box-shadow:
+      0 0 0 1px rgba(0,0,0,0.5),
+      0 12px 32px rgba(0,0,0,0.55);
+  }
+
+  /* right-clicked row in the sidebar */
+  .wt.rclicked {
+    background: #141414;
+    box-shadow: inset 0 0 0 1px #2A2A2A;
+    color: #fff;
+  }
+
+  /* spec annotation column */
+  .spec {
+    padding: 32px 28px;
+    background: #070707;
+    overflow: auto;
+    font-size: 12px;
+    color: var(--text-2);
+    line-height: 1.55;
+  }
+  .spec h3 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 10px;
+  }
+  .spec h4 {
+    margin: 22px 0 6px;
+    font-size: 11px;
+    font-weight: 500;
+    color: #fff;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .spec ul { margin: 0; padding: 0; list-style: none; }
+  .spec li {
+    display: grid;
+    grid-template-columns: 88px 1fr;
+    gap: 10px;
+    padding: 4px 0;
+    border-bottom: 1px solid #141414;
+    font-size: 11.5px;
+  }
+  .spec li .k {
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--text-3);
+    font-size: 10.5px;
+    letter-spacing: 0;
+  }
+  .spec li .v { color: #E6E6E6; }
+  .spec .swatch {
+    display: inline-block; width: 10px; height: 10px;
+    border-radius: 2px; vertical-align: -1px; margin-right: 6px;
+    border: 1px solid rgba(255,255,255,0.1);
+  }
+  .spec code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10.5px;
+    color: var(--accent);
+    background: rgba(0,153,255,0.08);
+    padding: 1px 5px; border-radius: 3px;
+  }
+
+</style>
+</head>
+<body>
+<div class="app-shell" data-screen-label="04 Worktree context menu">
+
+  <aside class="sidebar">
+    <div class="brand"><div class="brand-mark"></div><div class="brand-word">CodeScope</div></div>
+    <div class="side-label">Projects</div>
+
+    <div class="proj open">
+      <svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3 L8 6 L4.5 9"/></svg>
+      PestScope
+      <span class="count">1</span>
+    </div>
+    <div class="wt">main</div>
+    <!-- right-clicked row -->
+    <div class="wt active has-session rclicked"><span class="bar"></span>feat/reporting</div>
+
+    <div class="proj open">
+      <svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3 L8 6 L4.5 9"/></svg>
+      SurveyScope
+      <span class="count">1</span>
+    </div>
+    <div class="wt">main</div>
+    <div class="wt has-session"><span class="bar"></span>bugfix/auth</div>
+
+    <div class="proj">
+      <svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3 L8 6 L4.5 9"/></svg>
+      CodeScope
+    </div>
+
+    <div class="sidebar-foot">
+      <button class="overview-btn">Overview<span class="kbd">⌃⇧ O</span></button>
+      <button class="new-project">
+        <span style="color:var(--accent);font-family:'JetBrains Mono',monospace;font-size:13px">＋</span>
+        New Project
+      </button>
+    </div>
+  </aside>
+
+  <div class="stage">
+    <div class="stage-head">
+      <span class="eyebrow">Context menu</span>
+      <span class="title">Right-click on a worktree · <b>PestScope / feat/reporting</b></span>
+    </div>
+
+    <div class="stage-body">
+      <div class="canvas">
+
+        <!-- pulse + cursor marker where the right-click happened -->
+        <div class="right-click-pulse"></div>
+        <svg class="cursor-marker" viewBox="0 0 14 18" fill="currentColor">
+          <path d="M1 1 L1 13 L4.5 10 L6.5 15 L8.5 14 L6.5 9 L11 9 Z"/>
+        </svg>
+
+        <!-- MENU -->
+        <div class="menu" role="menu" aria-label="Worktree actions">
+
+          <!-- contextual header -->
+          <div class="menu-header">
+            <span class="sdot active"></span>
+            <span class="mh-label">feat/reporting</span>
+            <span class="mh-repo">PestScope</span>
+          </div>
+
+          <div class="mgroup">Session</div>
+
+          <div class="mi active" role="menuitem">
+            <svg class="ic" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="1.5" y="2.5" width="11" height="9" rx="1.5"/>
+              <path d="M3.5 5.5 L5.5 7 L3.5 8.5"/>
+              <path d="M6.5 8.5 H10"/>
+            </svg>
+            <span class="label">Open session</span>
+            <span class="shortcut">↵</span>
+          </div>
+          <div class="mi" role="menuitem">
+            <svg class="ic" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="1.5" y="2.5" width="5" height="9" rx="1"/>
+              <rect x="7.5" y="2.5" width="5" height="9" rx="1"/>
+            </svg>
+            <span class="label">Open in new group</span>
+            <span class="shortcut">⌘⇧ ↵</span>
+          </div>
+          <div class="mi" role="menuitem">
+            <svg class="ic" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="7" cy="7" r="5"/>
+              <path d="M7 4v3l2 1.5"/>
+            </svg>
+            <span class="label">Restart session</span>
+            <span class="shortcut">⌘R</span>
+          </div>
+
+          <div class="msep"></div>
+          <div class="mgroup">Git</div>
+
+          <div class="mi" role="menuitem">
+            <svg class="ic" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="4" cy="3.5" r="1.3"/>
+              <circle cx="10" cy="7" r="1.3"/>
+              <circle cx="4" cy="10.5" r="1.3"/>
+              <path d="M4 4.8 V9.2"/>
+              <path d="M4 7 Q7 7 8.8 7"/>
+            </svg>
+            <span class="label">Create pull request</span>
+            <span class="shortcut">⌘⇧P</span>
+          </div>
+          <div class="mi" role="menuitem">
+            <svg class="ic" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 2 V9"/>
+              <path d="M3 12 V11"/>
+              <circle cx="3" cy="10" r="1"/>
+              <path d="M11 2 V7"/>
+              <path d="M7 2 H11 V6"/>
+              <path d="M11 10 V11"/>
+              <circle cx="11" cy="12" r="1"/>
+            </svg>
+            <span class="label">Pull (fast-forward)</span>
+            <span class="shortcut">⌘⇧F</span>
+          </div>
+          <div class="mi" role="menuitem">
+            <svg class="ic" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M7 2 V10"/>
+              <path d="M4 7 L7 10 L10 7"/>
+              <path d="M3 12 H11"/>
+            </svg>
+            <span class="label">Rebase onto main…</span>
+          </div>
+          <div class="mi" role="menuitem">
+            <svg class="ic" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M2 4 H12"/>
+              <path d="M3 4 V11 A1 1 0 0 0 4 12 H10 A1 1 0 0 0 11 11 V4"/>
+              <path d="M5.5 2.5 H8.5"/>
+              <path d="M6 6.5 V10"/>
+              <path d="M8 6.5 V10"/>
+            </svg>
+            <span class="label">Discard changes…</span>
+          </div>
+
+          <div class="msep"></div>
+          <div class="mgroup">Reveal</div>
+
+          <div class="mi" role="menuitem">
+            <svg class="ic" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M1.5 4 A1 1 0 0 1 2.5 3 H6 L7.5 4.5 H11.5 A1 1 0 0 1 12.5 5.5 V10.5 A1 1 0 0 1 11.5 11.5 H2.5 A1 1 0 0 1 1.5 10.5 Z"/>
+            </svg>
+            <span class="label">Reveal in File Explorer</span>
+          </div>
+          <div class="mi" role="menuitem">
+            <svg class="ic" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="1.5" y="2.5" width="11" height="9" rx="1.5"/>
+              <path d="M3.5 5.5 L5.5 7 L3.5 8.5"/>
+              <path d="M6.5 8.5 H10"/>
+            </svg>
+            <span class="label">Open in Windows Terminal</span>
+          </div>
+          <div class="mi has-sub" role="menuitem" aria-haspopup="true" aria-expanded="true">
+            <svg class="ic" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="2" y="2" width="8" height="10" rx="1"/>
+              <path d="M4 5 H8 M4 7 H8 M4 9 H6.5"/>
+            </svg>
+            <span class="label">Copy</span>
+            <svg class="chev" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 2 L7 5 L4 8"/>
+            </svg>
+
+            <!-- flyout -->
+            <div class="submenu" role="menu" aria-label="Copy">
+              <div class="mi" role="menuitem">
+                <svg class="ic" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="2" y="2" width="8" height="10" rx="1"/>
+                  <path d="M4 5 H8 M4 7 H8"/>
+                </svg>
+                <span class="label">Path</span>
+                <span class="shortcut">⌘⌥C</span>
+              </div>
+              <div class="mi" role="menuitem">
+                <svg class="ic" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="4" cy="3.5" r="1.3"/>
+                  <circle cx="10" cy="10.5" r="1.3"/>
+                  <path d="M4 4.8 V9"/>
+                  <path d="M4 9 Q4 10.5 6 10.5 H8.5"/>
+                </svg>
+                <span class="label">Branch name</span>
+              </div>
+              <div class="mi" role="menuitem">
+                <svg class="ic" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="7" cy="7" r="5"/>
+                  <path d="M4.5 7 H9.5 M7 4.5 V9.5"/>
+                </svg>
+                <span class="label">SHA (8a4f2c1)</span>
+              </div>
+              <div class="mi" role="menuitem">
+                <svg class="ic" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="1.5" y="3" width="11" height="8" rx="1"/>
+                  <path d="M1.5 5 H12.5"/>
+                </svg>
+                <span class="label">PR URL</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="msep"></div>
+
+          <div class="mi" role="menuitem">
+            <svg class="ic" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 3 L11 3 L11 6"/>
+              <path d="M8 6 H11 V9"/>
+              <rect x="2" y="9" width="7" height="3" rx="0.6"/>
+            </svg>
+            <span class="label">Rename worktree…</span>
+            <span class="shortcut">F2</span>
+          </div>
+          <div class="mi danger" role="menuitem">
+            <svg class="ic" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M2 4 H12"/>
+              <path d="M3 4 V11 A1 1 0 0 0 4 12 H10 A1 1 0 0 0 11 11 V4"/>
+              <path d="M5.5 2.5 H8.5"/>
+              <path d="M6 6.5 V10"/>
+              <path d="M8 6.5 V10"/>
+            </svg>
+            <span class="label">Remove worktree…</span>
+            <span class="shortcut">⌫</span>
+          </div>
+        </div>
+
+        <div class="canvas-hint">
+          <span class="kbd-mini">esc</span>
+          <span>closes the menu · <span class="kbd-mini">↑↓</span> navigates · <span class="kbd-mini">→</span> opens submenu</span>
+        </div>
+      </div>
+
+      <aside class="spec">
+        <h3>Spec · context menu</h3>
+        <ul>
+          <li><span class="k">width</span><span class="v">260px (sub 220px)</span></li>
+          <li><span class="k">padding</span><span class="v">6px outer · 10px item H</span></li>
+          <li><span class="k">item H</span><span class="v">28px</span></li>
+          <li><span class="k">radius</span><span class="v">8px panel · 5px item</span></li>
+          <li><span class="k">offset</span><span class="v">+4px from cursor</span></li>
+        </ul>
+
+        <h4>Surfaces</h4>
+        <ul>
+          <li><span class="k"><span class="swatch" style="background:#141414"></span>panel</span><span class="v">#141414</span></li>
+          <li><span class="k"><span class="swatch" style="background:#2A2A2A"></span>border</span><span class="v">#2A2A2A</span></li>
+          <li><span class="k"><span class="swatch" style="background:#1F1F1F"></span>divider</span><span class="v">#1F1F1F</span></li>
+          <li><span class="k"><span class="swatch" style="background:rgba(0,153,255,0.18)"></span>hover</span><span class="v">accent @ 12–18%</span></li>
+        </ul>
+
+        <h4>Type</h4>
+        <ul>
+          <li><span class="k">label</span><span class="v">Inter 400 12.5px</span></li>
+          <li><span class="k">group</span><span class="v">Inter 500 9.5px · 0.14em</span></li>
+          <li><span class="k">shortcut</span><span class="v">JetBrains Mono 10px</span></li>
+        </ul>
+
+        <h4>Icons</h4>
+        <ul>
+          <li><span class="k">size</span><span class="v">14px · 1.4 stroke</span></li>
+          <li><span class="k">color</span><span class="v">#A0A0A0 → accent on hover</span></li>
+          <li><span class="k">danger</span><span class="v">#FF8A8A fill + bg tint</span></li>
+        </ul>
+
+        <h4>Behavior</h4>
+        <ul>
+          <li><span class="k">open</span><span class="v">fade+scale 92→100% · 120ms</span></li>
+          <li><span class="k">keys</span><span class="v">↑↓ move · ↵ invoke · → submenu · esc close</span></li>
+          <li><span class="k">edge</span><span class="v">flips to left if clipped</span></li>
+          <li><span class="k">scope</span><span class="v">header shows target so menu stays honest</span></li>
+        </ul>
+
+        <h4>Grouping rationale</h4>
+        <ul>
+          <li><span class="k">session</span><span class="v">primary actions — live things</span></li>
+          <li><span class="k">git</span><span class="v">remote-state verbs</span></li>
+          <li><span class="k">reveal</span><span class="v">OS handoffs · copy flyout</span></li>
+          <li><span class="k">destructive</span><span class="v">own tail, tinted red</span></li>
+        </ul>
+      </aside>
+    </div>
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,685 @@
+<Window
+    x:Class="NoScope.CodeScope.Ui.Dialogs.NewWorktreeDialog"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:dlg="clr-namespace:NoScope.CodeScope.Ui.Dialogs"
+    Title="New worktree"
+    Width="580"
+    SizeToContent="Height"
+    ResizeMode="NoResize"
+    WindowStartupLocation="CenterOwner"
+    ShowInTaskbar="False"
+    WindowStyle="None"
+    AllowsTransparency="True"
+    Background="Transparent"
+    TextElement.Foreground="{DynamicResource Fig.Brush.Ink}"
+    TextElement.FontFamily="{DynamicResource Fig.Font.Sans}"
+    TextElement.FontSize="{DynamicResource Fig.Size.Body}">
+    <Window.Resources>
+        <!-- Dialog-local styles matching docs/design/html/CodeScope - New Worktree.html -->
+        <BooleanToVisibilityConverter x:Key="NW.BoolToVis" />
+        <dlg:InverseBoolToVisibilityConverter x:Key="NW.BoolToVisInverse" />
+
+        <!-- Eyebrow: mono, small, accent, tracked caps. -->
+        <Style x:Key="NW.Eyebrow" TargetType="TextBlock">
+            <Setter Property="FontFamily" Value="{DynamicResource Fig.Font.Mono}" />
+            <Setter Property="FontSize" Value="10" />
+            <Setter Property="Foreground" Value="{DynamicResource Accent.Primary}" />
+            <Setter Property="TextOptions.TextFormattingMode" Value="Ideal" />
+        </Style>
+
+        <!-- Field label row: uppercase caption on the left, mono hint on the right. -->
+        <Style x:Key="NW.FieldLabel" TargetType="TextBlock">
+            <Setter Property="FontSize" Value="11" />
+            <Setter Property="FontWeight" Value="Medium" />
+            <Setter Property="Foreground" Value="{DynamicResource Fig.Brush.InkMuted}" />
+        </Style>
+        <Style x:Key="NW.FieldHint" TargetType="TextBlock">
+            <Setter Property="FontFamily" Value="{DynamicResource Fig.Font.Mono}" />
+            <Setter Property="FontSize" Value="10" />
+            <Setter Property="Foreground" Value="{DynamicResource Fig.Brush.InkDim}" />
+            <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+        </Style>
+
+        <!-- 36px field chrome (used by both the plain branch box and the composite path row). -->
+        <Style x:Key="NW.FieldChrome" TargetType="Border">
+            <Setter Property="Height" Value="36" />
+            <Setter Property="Background" Value="{DynamicResource Fig.Brush.GlassDark}" />
+            <Setter Property="BorderBrush" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="CornerRadius" Value="6" />
+        </Style>
+
+        <!-- Borderless mono TextBox that sits inside a field chrome. Focus styling lives on the chrome. -->
+        <Style x:Key="NW.InnerMonoBox" TargetType="TextBox">
+            <Setter Property="FontFamily" Value="{DynamicResource Fig.Font.Mono}" />
+            <Setter Property="FontSize" Value="13" />
+            <Setter Property="FontWeight" Value="Medium" />
+            <Setter Property="Foreground" Value="{DynamicResource Fig.Brush.Ink}" />
+            <Setter Property="CaretBrush" Value="{DynamicResource Framer.Brush.Blue}" />
+            <Setter Property="SelectionBrush" Value="{DynamicResource Framer.Brush.Blue}" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TextBox">
+                        <ScrollViewer x:Name="PART_ContentHost" VerticalAlignment="Center" />
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Close (×) button: 24px circle, ghosted by default, hover reveals #1F1F1F. -->
+        <Style x:Key="NW.CloseBtn" TargetType="Button">
+            <Setter Property="Width" Value="24" />
+            <Setter Property="Height" Value="24" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="Foreground" Value="{DynamicResource Fig.Brush.InkMuted}" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bg"
+                                Background="{TemplateBinding Background}"
+                                CornerRadius="12">
+                            <Path x:Name="Glyph"
+                                  Data="M 0,0 L 8,8 M 8,0 L 0,8"
+                                  Stroke="{TemplateBinding Foreground}"
+                                  StrokeThickness="1.4"
+                                  StrokeStartLineCap="Round"
+                                  StrokeEndLineCap="Round"
+                                  HorizontalAlignment="Center"
+                                  VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bg" Property="Background" Value="#1F1F1F" />
+                                <Setter Property="Foreground" Value="{DynamicResource Fig.Brush.Ink}" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Ghost footer button: transparent, hover reveals #1F1F1F. -->
+        <Style x:Key="NW.GhostBtn" TargetType="Button">
+            <Setter Property="Height" Value="32" />
+            <Setter Property="Padding" Value="14,0" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="Foreground" Value="{DynamicResource Fig.Brush.InkMuted}" />
+            <Setter Property="FontFamily" Value="{DynamicResource Fig.Font.Sans}" />
+            <Setter Property="FontSize" Value="13" />
+            <Setter Property="FontWeight" Value="Medium" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bg"
+                                Background="{TemplateBinding Background}"
+                                CornerRadius="6"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bg" Property="Background" Value="#1F1F1F" />
+                                <Setter Property="Foreground" Value="{DynamicResource Fig.Brush.Ink}" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Primary footer button: Framer Blue on black ink, 32px, kbd chip. -->
+        <Style x:Key="NW.PrimaryBtn" TargetType="Button">
+            <Setter Property="Height" Value="32" />
+            <Setter Property="Padding" Value="14,0" />
+            <Setter Property="Background" Value="{DynamicResource Accent.Primary}" />
+            <Setter Property="Foreground" Value="{DynamicResource Fig.Brush.Canvas}" />
+            <Setter Property="FontFamily" Value="{DynamicResource Fig.Font.Sans}" />
+            <Setter Property="FontSize" Value="13" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bg"
+                                Background="{TemplateBinding Background}"
+                                CornerRadius="6"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bg" Property="Background" Value="#29A8FF" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="Bg" Property="Background" Value="#1F1F1F" />
+                                <Setter Property="Foreground" Value="{DynamicResource Fig.Brush.InkDim}" />
+                                <Setter Property="Cursor" Value="Arrow" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+
+    <!-- Outer wrap keeps the drop-shadow margin; actual surface is the inner Border. -->
+    <Grid Margin="30">
+        <Border
+            x:Name="DialogSurface"
+            Background="#0A0A0A"
+            BorderBrush="#1F1F1F"
+            BorderThickness="1"
+            CornerRadius="{DynamicResource Fig.Radius.Medium}"
+            Effect="{DynamicResource Shadow.Dialog}"
+            ClipToBounds="True"
+            MouseLeftButtonDown="OnChromeDrag">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <!-- head -->
+                    <RowDefinition Height="Auto" />
+                    <!-- body -->
+                    <RowDefinition Height="Auto" />
+                    <!-- foot -->
+                </Grid.RowDefinitions>
+
+                <!-- ===== HEAD ===== -->
+                <Grid Grid.Row="0" Margin="24,20,24,16">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+
+                    <StackPanel Grid.Column="0" Orientation="Vertical">
+                        <TextBlock
+                            x:Name="EyebrowText"
+                            Style="{StaticResource NW.Eyebrow}"
+                            Text="PROJECT"
+                            Margin="0,0,0,6" />
+                        <TextBlock
+                            FontSize="20"
+                            FontWeight="SemiBold"
+                            Foreground="{DynamicResource Fig.Brush.Ink}"
+                            Text="New worktree" />
+                        <TextBlock
+                            Margin="0,4,0,0"
+                            FontSize="12"
+                            Foreground="{DynamicResource Fig.Brush.InkMuted}"
+                            Text="Isolated folder, fresh branch, ready for a session." />
+                    </StackPanel>
+
+                    <Button
+                        Grid.Column="1"
+                        AutomationProperties.AutomationId="NewWorktreeCloseBtn"
+                        Style="{StaticResource NW.CloseBtn}"
+                        VerticalAlignment="Top"
+                        IsCancel="True"
+                        Click="OnCancel" />
+                </Grid>
+
+                <!-- ===== BODY ===== -->
+                <StackPanel Grid.Row="1" Margin="24,0,24,16">
+
+                    <!-- Base branch picker -->
+                    <DockPanel Margin="0,0,0,6" LastChildFill="True">
+                        <TextBlock
+                            DockPanel.Dock="Right"
+                            Style="{StaticResource NW.FieldHint}"
+                            Text="worktree will branch off this" />
+                        <TextBlock
+                            Style="{StaticResource NW.FieldLabel}"
+                            Text="BASE BRANCH" />
+                    </DockPanel>
+                    <Grid Margin="0,0,0,16">
+                        <Button
+                            x:Name="BaseTrigger"
+                            AutomationProperties.AutomationId="NewWorktreeBaseTrigger"
+                            Click="OnBaseTriggerClick"
+                            Height="36"
+                            HorizontalAlignment="Stretch"
+                            HorizontalContentAlignment="Stretch"
+                            Cursor="Hand"
+                            FocusVisualStyle="{x:Null}">
+                            <Button.Template>
+                                <ControlTemplate TargetType="Button">
+                                    <Border x:Name="Chrome"
+                                            Background="{DynamicResource Fig.Brush.GlassDark}"
+                                            BorderBrush="Transparent"
+                                            BorderThickness="1"
+                                            CornerRadius="6">
+                                        <ContentPresenter VerticalAlignment="Center" HorizontalAlignment="Stretch" />
+                                    </Border>
+                                    <ControlTemplate.Triggers>
+                                        <Trigger Property="IsMouseOver" Value="True">
+                                            <Setter TargetName="Chrome" Property="Background" Value="#1F1F1F" />
+                                        </Trigger>
+                                    </ControlTemplate.Triggers>
+                                </ControlTemplate>
+                            </Button.Template>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock
+                                    Grid.Column="0"
+                                    Margin="12,0,10,0"
+                                    VerticalAlignment="Center"
+                                    FontFamily="{DynamicResource Fig.Font.Mono}"
+                                    FontSize="12"
+                                    Foreground="{DynamicResource Accent.Primary}"
+                                    Text="&#x2387;" />
+                                <TextBlock
+                                    Grid.Column="1"
+                                    x:Name="BaseValueText"
+                                    Margin="0,0,10,0"
+                                    VerticalAlignment="Center"
+                                    FontFamily="{DynamicResource Fig.Font.Mono}"
+                                    FontSize="12.5"
+                                    FontWeight="Medium"
+                                    Foreground="{DynamicResource Fig.Brush.Ink}"
+                                    TextTrimming="CharacterEllipsis"
+                                    Text="(HEAD)" />
+                                <TextBlock
+                                    Grid.Column="2"
+                                    x:Name="BaseMetaText"
+                                    Margin="0,0,10,0"
+                                    VerticalAlignment="Center"
+                                    FontFamily="{DynamicResource Fig.Font.Mono}"
+                                    FontSize="10.5"
+                                    Foreground="{DynamicResource Fig.Brush.InkDim}"
+                                    Text="" />
+                                <Path
+                                    Grid.Column="3"
+                                    Margin="0,0,12,0"
+                                    VerticalAlignment="Center"
+                                    Data="M 0,0 L 3,3 L 6,0"
+                                    Stroke="{DynamicResource Fig.Brush.InkMuted}"
+                                    StrokeThickness="1.4"
+                                    StrokeStartLineCap="Round"
+                                    StrokeEndLineCap="Round"
+                                    Width="6" Height="3" />
+                            </Grid>
+                        </Button>
+
+                        <Popup
+                            x:Name="BasePopup"
+                            PlacementTarget="{Binding ElementName=BaseTrigger}"
+                            Placement="Bottom"
+                            VerticalOffset="6"
+                            StaysOpen="False"
+                            AllowsTransparency="True"
+                            PopupAnimation="Fade">
+                            <Border
+                                Width="{Binding ActualWidth, ElementName=BaseTrigger}"
+                                Background="#0E0E0E"
+                                BorderBrush="#1F1F1F"
+                                BorderThickness="1"
+                                CornerRadius="6"
+                                Padding="4"
+                                Effect="{DynamicResource Shadow.Dialog}">
+                                <Grid>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="*" />
+                                    </Grid.RowDefinitions>
+                                    <TextBox
+                                        Grid.Row="0"
+                                        x:Name="BaseSearch"
+                                        AutomationProperties.AutomationId="NewWorktreeBaseSearch"
+                                        BorderThickness="0,0,0,1"
+                                        BorderBrush="#1F1F1F"
+                                        Background="Transparent"
+                                        Foreground="{DynamicResource Fig.Brush.Ink}"
+                                        CaretBrush="{DynamicResource Framer.Brush.Blue}"
+                                        Padding="8,8,8,10"
+                                        Margin="0,0,0,4"
+                                        FontSize="12"
+                                        TextChanged="OnBaseSearchChanged"
+                                        PreviewKeyDown="OnBaseSearchKeyDown"
+                                        Tag="Search branches…">
+                                        <TextBox.Style>
+                                            <Style TargetType="TextBox">
+                                                <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+                                            </Style>
+                                        </TextBox.Style>
+                                    </TextBox>
+                                    <ListBox
+                                        Grid.Row="1"
+                                        x:Name="BaseList"
+                                        AutomationProperties.AutomationId="NewWorktreeBaseList"
+                                        Background="Transparent"
+                                        BorderThickness="0"
+                                        MaxHeight="360"
+                                        MinHeight="200"
+                                        ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                                        ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                        Focusable="False">
+                                        <ListBox.ItemContainerStyle>
+                                            <Style TargetType="ListBoxItem">
+                                                <Setter Property="Padding" Value="0" />
+                                                <Setter Property="Margin" Value="0" />
+                                                <Setter Property="Background" Value="Transparent" />
+                                                <Setter Property="BorderThickness" Value="0" />
+                                                <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+                                                <Setter Property="Template">
+                                                    <Setter.Value>
+                                                        <ControlTemplate TargetType="ListBoxItem">
+                                                            <Border x:Name="Bg"
+                                                                    Background="{TemplateBinding Background}"
+                                                                    CornerRadius="4"
+                                                                    Margin="0,1">
+                                                                <ContentPresenter />
+                                                            </Border>
+                                                            <ControlTemplate.Triggers>
+                                                                <Trigger Property="IsMouseOver" Value="True">
+                                                                    <Setter TargetName="Bg" Property="Background" Value="#1F1F1F" />
+                                                                </Trigger>
+                                                                <Trigger Property="IsSelected" Value="True">
+                                                                    <Setter TargetName="Bg" Property="Background" Value="#140F1A1F" />
+                                                                </Trigger>
+                                                            </ControlTemplate.Triggers>
+                                                        </ControlTemplate>
+                                                    </Setter.Value>
+                                                </Setter>
+                                            </Style>
+                                        </ListBox.ItemContainerStyle>
+                                        <ListBox.ItemTemplate>
+                                            <DataTemplate DataType="{x:Type dlg:NewWorktreeDialog+BranchListItem}">
+                                                <Grid>
+                                                    <!-- Group-label header row -->
+                                                    <TextBlock
+                                                        Visibility="{Binding IsHeader, Converter={StaticResource NW.BoolToVis}}"
+                                                        Padding="10,8,10,4"
+                                                        FontSize="9.5"
+                                                        FontWeight="Medium"
+                                                        Foreground="{DynamicResource Fig.Brush.InkDim}"
+                                                        Text="{Binding Name}" />
+                                                    <!-- Real branch row -->
+                                                    <Grid
+                                                        Visibility="{Binding IsHeader, Converter={StaticResource NW.BoolToVisInverse}}"
+                                                        MouseLeftButtonUp="OnBaseItemClick"
+                                                        Background="Transparent"
+                                                        Cursor="Hand">
+                                                        <Grid.ColumnDefinitions>
+                                                            <ColumnDefinition Width="Auto" />
+                                                            <ColumnDefinition Width="*" />
+                                                            <ColumnDefinition Width="Auto" />
+                                                        </Grid.ColumnDefinitions>
+                                                        <TextBlock
+                                                            Grid.Column="0"
+                                                            Margin="10,0,10,0"
+                                                            VerticalAlignment="Center"
+                                                            Padding="0,8,0,8"
+                                                            FontFamily="{DynamicResource Fig.Font.Mono}"
+                                                            FontSize="11"
+                                                            Foreground="{DynamicResource Fig.Brush.InkMuted}"
+                                                            Text="&#x2387;" />
+                                                        <TextBlock
+                                                            Grid.Column="1"
+                                                            VerticalAlignment="Center"
+                                                            FontFamily="{DynamicResource Fig.Font.Mono}"
+                                                            FontSize="12"
+                                                            Foreground="{DynamicResource Fig.Brush.Ink}"
+                                                            TextTrimming="CharacterEllipsis"
+                                                            Text="{Binding Name}" />
+                                                        <TextBlock
+                                                            Grid.Column="2"
+                                                            Margin="10,0,10,0"
+                                                            VerticalAlignment="Center"
+                                                            FontFamily="{DynamicResource Fig.Font.Mono}"
+                                                            FontSize="10"
+                                                            Foreground="{DynamicResource Fig.Brush.InkDim}"
+                                                            Text="{Binding Meta}" />
+                                                    </Grid>
+                                                </Grid>
+                                            </DataTemplate>
+                                        </ListBox.ItemTemplate>
+                                    </ListBox>
+                                </Grid>
+                            </Border>
+                        </Popup>
+                    </Grid>
+
+                    <!-- New branch field -->
+                    <DockPanel Margin="0,0,0,6" LastChildFill="True">
+                        <TextBlock
+                            DockPanel.Dock="Right"
+                            Style="{StaticResource NW.FieldHint}"
+                            Text="will be created with -b" />
+                        <TextBlock
+                            Style="{StaticResource NW.FieldLabel}"
+                            Text="NEW BRANCH" />
+                    </DockPanel>
+                    <Border x:Name="BranchChrome" Style="{StaticResource NW.FieldChrome}" Margin="0,0,0,16">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock
+                                Grid.Column="0"
+                                Margin="12,0,8,0"
+                                VerticalAlignment="Center"
+                                FontFamily="{DynamicResource Fig.Font.Mono}"
+                                FontSize="12"
+                                Foreground="{DynamicResource Accent.Primary}"
+                                Text="&#x2387;" />
+                            <TextBox
+                                Grid.Column="1"
+                                x:Name="BranchBox"
+                                AutomationProperties.AutomationId="NewWorktreeBranchBox"
+                                Style="{StaticResource NW.InnerMonoBox}"
+                                Margin="0,0,12,0"
+                                GotKeyboardFocus="OnFieldFocused"
+                                LostKeyboardFocus="OnFieldBlurred" />
+                        </Grid>
+                    </Border>
+
+                    <!-- Worktree folder field -->
+                    <DockPanel Margin="0,0,0,6" LastChildFill="True">
+                        <TextBlock
+                            x:Name="PathHint"
+                            DockPanel.Dock="Right"
+                            Style="{StaticResource NW.FieldHint}"
+                            Text="" />
+                        <TextBlock
+                            Style="{StaticResource NW.FieldLabel}"
+                            Text="WORKTREE FOLDER" />
+                    </DockPanel>
+                    <Border x:Name="PathChrome" Style="{StaticResource NW.FieldChrome}">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock
+                                Grid.Column="0"
+                                Margin="12,0,10,0"
+                                VerticalAlignment="Center"
+                                FontFamily="{DynamicResource Fig.Font.Mono}"
+                                FontSize="12"
+                                Foreground="{DynamicResource Fig.Brush.InkDim}"
+                                Text="$" />
+                            <TextBox
+                                Grid.Column="1"
+                                x:Name="PathBox"
+                                AutomationProperties.AutomationId="NewWorktreePathBox"
+                                Style="{StaticResource NW.InnerMonoBox}"
+                                Margin="0,0,10,0"
+                                GotKeyboardFocus="OnFieldFocused"
+                                LostKeyboardFocus="OnFieldBlurred" />
+                            <Border
+                                Grid.Column="2"
+                                BorderBrush="#1F1F1F"
+                                BorderThickness="1,0,0,0"
+                                Padding="10,0,12,0">
+                                <TextBlock
+                                    VerticalAlignment="Center"
+                                    FontFamily="{DynamicResource Fig.Font.Mono}"
+                                    FontSize="10"
+                                    Foreground="{DynamicResource Fig.Brush.InkDim}"
+                                    Text="folder" />
+                            </Border>
+                        </Grid>
+                    </Border>
+
+                    <!-- Path relation caption — where the folder lives and how it relates to the project. -->
+                    <DockPanel Margin="2,6,2,18" LastChildFill="True">
+                        <TextBlock
+                            x:Name="PathRelationText"
+                            DockPanel.Dock="Right"
+                            FontFamily="{DynamicResource Fig.Font.Mono}"
+                            FontSize="10.5"
+                            Foreground="{DynamicResource Fig.Brush.InkDim}"
+                            TextTrimming="CharacterEllipsis"
+                            Text="" />
+                        <TextBlock
+                            x:Name="PathParentText"
+                            FontFamily="{DynamicResource Fig.Font.Mono}"
+                            FontSize="10.5"
+                            Foreground="{DynamicResource Fig.Brush.InkDim}"
+                            TextTrimming="CharacterEllipsis"
+                            Text="" />
+                    </DockPanel>
+
+                    <!-- Spawn-session toggle — wrapped in a Button for reliable hit-testing + UIA exposure -->
+                    <Button
+                        AutomationProperties.AutomationId="NewWorktreeSpawnToggle"
+                        Click="OnSpawnToggleClick"
+                        HorizontalAlignment="Stretch"
+                        HorizontalContentAlignment="Stretch"
+                        Cursor="Hand"
+                        FocusVisualStyle="{x:Null}"
+                        Padding="0">
+                        <Button.Template>
+                            <ControlTemplate TargetType="Button">
+                                <Border x:Name="Chrome"
+                                        Background="{DynamicResource Fig.Brush.GlassDark}"
+                                        BorderBrush="Transparent"
+                                        BorderThickness="1"
+                                        CornerRadius="6"
+                                        Padding="14,12">
+                                    <ContentPresenter HorizontalAlignment="Stretch" />
+                                </Border>
+                                <ControlTemplate.Triggers>
+                                    <Trigger Property="IsMouseOver" Value="True">
+                                        <Setter TargetName="Chrome" Property="Background" Value="#181818" />
+                                    </Trigger>
+                                </ControlTemplate.Triggers>
+                            </ControlTemplate>
+                        </Button.Template>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                                <TextBlock
+                                    FontSize="13"
+                                    FontWeight="Medium"
+                                    Foreground="{DynamicResource Fig.Brush.Ink}"
+                                    Text="Spawn session on creation" />
+                                <TextBlock
+                                    Margin="0,2,0,0"
+                                    FontSize="11.5"
+                                    Foreground="{DynamicResource Fig.Brush.InkMuted}"
+                                    Text="Opens the project's default agent in the new worktree immediately." />
+                            </StackPanel>
+                            <!-- Track -->
+                            <Border
+                                Grid.Column="1"
+                                x:Name="SpawnTrack"
+                                Width="34"
+                                Height="20"
+                                CornerRadius="10"
+                                Background="#1F1F1F"
+                                VerticalAlignment="Center">
+                                <!-- Thumb -->
+                                <Border
+                                    x:Name="SpawnThumb"
+                                    Width="16"
+                                    Height="16"
+                                    CornerRadius="8"
+                                    Background="#606060"
+                                    HorizontalAlignment="Left"
+                                    Margin="2,0,0,0" />
+                            </Border>
+                        </Grid>
+                    </Button>
+                </StackPanel>
+
+                <!-- ===== FOOT ===== -->
+                <Border
+                    Grid.Row="2"
+                    Background="#080808"
+                    BorderBrush="#1F1F1F"
+                    BorderThickness="0,1,0,0">
+                    <Grid Margin="24,14,24,18">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock
+                            Grid.Column="0"
+                            x:Name="FootMeta"
+                            VerticalAlignment="Center"
+                            FontFamily="{DynamicResource Fig.Font.Mono}"
+                            FontSize="10.5"
+                            Foreground="{DynamicResource Fig.Brush.InkDim}"
+                            TextTrimming="CharacterEllipsis"
+                            Text="git worktree add · … → …" />
+                        <Button
+                            Grid.Column="1"
+                            AutomationProperties.AutomationId="NewWorktreeCancelBtn"
+                            Style="{StaticResource NW.GhostBtn}"
+                            Content="Cancel"
+                            Margin="0,0,8,0"
+                            IsCancel="True"
+                            Click="OnCancel" />
+                        <Button
+                            Grid.Column="2"
+                            x:Name="CreateBtn"
+                            AutomationProperties.AutomationId="NewWorktreeCreateBtn"
+                            Style="{StaticResource NW.PrimaryBtn}"
+                            IsDefault="True"
+                            IsEnabled="False"
+                            Click="OnOk">
+                            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                <TextBlock Text="Create" VerticalAlignment="Center" />
+                                <Border
+                                    Margin="8,0,0,0"
+                                    Background="#26000000"
+                                    CornerRadius="3"
+                                    Padding="5,2,5,2">
+                                    <TextBlock
+                                        FontFamily="{DynamicResource Fig.Font.Mono}"
+                                        FontSize="10"
+                                        Foreground="#B3000000"
+                                        Text="&#x21B5;" />
+                                </Border>
+                            </StackPanel>
+                        </Button>
+                    </Grid>
+                </Border>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>

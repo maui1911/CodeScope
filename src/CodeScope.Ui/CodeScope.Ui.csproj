@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net10.0-windows</TargetFramework>
+        <UseWPF>true</UseWPF>
+        <RootNamespace>NoScope.CodeScope.Ui</RootNamespace>
+        <AssemblyName>CodeScope.Ui</AssemblyName>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\CodeScope.Core\CodeScope.Core.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.0" />
+        <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.0" />
+        <PackageReference Include="WPF-UI" Version="4.2.0" />
+        <PackageReference Include="EasyWindowsTerminalControl" Version="1.0.36" />
+    </ItemGroup>
+
+</Project>

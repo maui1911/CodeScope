@@ -1,0 +1,68 @@
+<Window
+    x:Class="NoScope.CodeScope.Ui.Dialogs.RenameDialog"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="Rename session"
+    Width="420"
+    SizeToContent="Height"
+    ResizeMode="NoResize"
+    WindowStartupLocation="CenterOwner"
+    ShowInTaskbar="False"
+    WindowStyle="None"
+    AllowsTransparency="True"
+    Background="Transparent"
+    TextElement.Foreground="{DynamicResource Fig.Brush.Ink}"
+    TextElement.FontFamily="{DynamicResource Fig.Font.Sans}"
+    TextElement.FontSize="{DynamicResource Fig.Size.Body}">
+    <Border
+        Background="{DynamicResource Fig.Brush.SurfaceDialog}"
+        CornerRadius="{DynamicResource Fig.Radius.Medium}"
+        BorderBrush="{DynamicResource Accent.Ring}"
+        BorderThickness="1"
+        Effect="{DynamicResource Shadow.Dialog}"
+        Margin="30"
+        Padding="24"
+        MouseLeftButtonDown="OnChromeDrag">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+            <TextBlock
+                Grid.Row="0"
+                Text="RENAME SESSION"
+                Style="{DynamicResource Fig.Style.MonoLabel}"
+                Margin="0,0,0,14" />
+            <TextBlock
+                Grid.Row="1"
+                Text="New name:"
+                Margin="0,0,0,6"
+                Foreground="{DynamicResource Fig.Brush.InkMuted}" />
+            <TextBox
+                Grid.Row="2"
+                x:Name="NameBox"
+                AutomationProperties.AutomationId="RenameNameBox"
+                Style="{DynamicResource Fig.Style.TextBox}"
+                Margin="0,0,0,18" />
+            <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button
+                    AutomationProperties.AutomationId="RenameCancelBtn"
+                    Style="{DynamicResource Fig.Style.Button.Glass}"
+                    Content="Cancel"
+                    Margin="0,0,8,0"
+                    Padding="18,7"
+                    IsCancel="True"
+                    Click="OnCancel" />
+                <Button
+                    AutomationProperties.AutomationId="RenameOkBtn"
+                    Style="{DynamicResource Fig.Style.Button.Pill}"
+                    Content="Rename"
+                    Padding="18,7"
+                    IsDefault="True"
+                    Click="OnOk" />
+            </StackPanel>
+        </Grid>
+    </Border>
+</Window>

@@ -1,0 +1,298 @@
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Windows;
+using NoScope.CodeScope.Core.Interop;
+using NoScope.CodeScope.Core.Models;
+using NoScope.CodeScope.Core.Services;
+using NoScope.CodeScope.Ui.ViewModels;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+
+namespace NoScope.CodeScope.App;
+
+/// <summary>
+/// WPF entry point. Hosts a generic host for DI/logging and enforces single-instance via a named mutex.
+/// </summary>
+public partial class App : Application
+{
+    private const string SingleInstanceMutexName = "Global\\CodeScope.SingleInstance";
+
+    private IHost? _host;
+    private Mutex? _singleInstanceMutex;
+    private ProcessTreeKiller? _appKiller;
+
+    protected override void OnStartup(StartupEventArgs e)
+    {
+        base.OnStartup(e);
+
+        // Allocate a hidden console before anything else. WPF WinExe apps launch without one,
+        // and without a console the parent ConPTY session that EasyWindowsTerminalControl spins
+        // up for each tab dies milliseconds after the child shell starts — the shell emits its
+        // title sequence, the pty shuts down, and the user sees "Session Terminated" on a black
+        // pane. Allocating a console here gives CreateProcess's PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
+        // a real console to re-parent from. The console window itself is hidden immediately.
+        EnsureHiddenConsole();
+
+        AppDomain.CurrentDomain.UnhandledException += (_, ev) => LogFatal("AppDomain", ev.ExceptionObject as Exception);
+        DispatcherUnhandledException += (_, ev) => { LogFatal("Dispatcher", ev.Exception); ev.Handled = true; };
+        System.Threading.Tasks.TaskScheduler.UnobservedTaskException += (_, ev) => { LogFatal("Task", ev.Exception); ev.SetObserved(); };
+
+        _singleInstanceMutex = new Mutex(initiallyOwned: true, SingleInstanceMutexName, out var createdNew);
+        if (!createdNew)
+        {
+            MessageBox.Show(
+                "CodeScope is already running.",
+                "CodeScope",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            Shutdown();
+            return;
+        }
+
+        _appKiller = new ProcessTreeKiller();
+        _appKiller.Adopt(System.Diagnostics.Process.GetCurrentProcess().Handle);
+
+        _host = Host.CreateDefaultBuilder()
+            .ConfigureLogging(log =>
+            {
+                log.ClearProviders();
+                log.AddDebug();
+                log.AddSimpleConsole(o =>
+                {
+                    o.SingleLine = true;
+                    o.TimestampFormat = "HH:mm:ss ";
+                });
+            })
+            .ConfigureServices(services =>
+            {
+                services.AddSingleton<IProjectStore, ProjectStore>();
+                services.AddSingleton<IAgentRegistry>(sp =>
+                {
+                    // Bootstrap agents from persisted config; defaults fill in if empty/missing.
+                    var store = sp.GetRequiredService<IProjectStore>();
+                    var cfg = store.LoadAsync().GetAwaiter().GetResult();
+                    return AgentRegistry.FromConfig(cfg.IsSuccess ? cfg.Value : new ProjectsConfig());
+                });
+                services.AddSingleton<IGitService, GitService>();
+                services.AddSingleton<Wpf.Ui.ISnackbarService, Wpf.Ui.SnackbarService>();
+                services.AddSingleton<IGitHubPullRequestService, GitHubPullRequestService>();
+                services.AddSingleton<IGiteaPullRequestService, GiteaPullRequestService>();
+                services.AddSingleton<IPullRequestService, PullRequestService>();
+                services.AddSingleton<ISessionManager, SessionManager>();
+                services.AddSingleton<ISessionStore, SessionStore>();
+                services.AddSingleton<IClaudeTelemetryService, ClaudeTelemetryService>();
+                services.AddSingleton<IClaudeSessionDiscovery, ClaudeSessionDiscovery>();
+                services.AddSingleton<INotificationService, NotificationService>();
+                // Pollers are registered as singletons so the Refresh command can resolve them
+                // from DI; the hosted-service indirection re-uses the same instance.
+                services.AddSingleton<WorktreeStatusPoller>();
+                services.AddHostedService(sp => sp.GetRequiredService<WorktreeStatusPoller>());
+                services.AddSingleton<PullRequestStatusPoller>();
+                services.AddHostedService(sp => sp.GetRequiredService<PullRequestStatusPoller>());
+                services.AddSingleton<SidebarViewModel>(sp => new SidebarViewModel(
+                    sp.GetRequiredService<ISessionStore>(),
+                    sp.GetRequiredService<ILogger<SidebarViewModel>>(),
+                    PickFolder,
+                    PickNewWorktree,
+                    sp.GetRequiredService<IPullRequestService>(),
+                    sp.GetRequiredService<Wpf.Ui.ISnackbarService>(),
+                    sp.GetRequiredService<IAgentRegistry>(),
+                    sp.GetRequiredService<IGitService>()));
+                services.AddSingleton<DiffPanelViewModel>();
+                services.AddSingleton<MainViewModel>(sp =>
+                {
+                    var wtPoller = sp.GetRequiredService<WorktreeStatusPoller>();
+                    var prPoller = sp.GetRequiredService<PullRequestStatusPoller>();
+                    Task RefreshAll(CancellationToken ct)
+                        => Task.WhenAll(wtPoller.RefreshAsync(ct), prPoller.RefreshAsync(ct));
+
+                    var vm = new MainViewModel(
+                        sp.GetRequiredService<ISessionManager>(),
+                        sp.GetRequiredService<ISessionStore>(),
+                        sp.GetRequiredService<IAgentRegistry>(),
+                        sp.GetRequiredService<ILogger<MainViewModel>>(),
+                        PickFolder,
+                        RefreshAll,
+                        sp.GetRequiredService<IClaudeTelemetryService>(),
+                        sp.GetRequiredService<INotificationService>(),
+                        sp.GetRequiredService<IClaudeSessionDiscovery>());
+                    var sidebar = sp.GetRequiredService<SidebarViewModel>();
+                    vm.AttachSidebar(sidebar);
+                    var diff = sp.GetRequiredService<DiffPanelViewModel>();
+                    vm.AttachDiffPanel(diff);
+                    // Bridge sidebar selection → diff panel.
+                    sidebar.WorktreeSelected += (_, wt) => diff.AttachWorktree(wt);
+                    return vm;
+                });
+                services.AddSingleton<MainWindow>();
+            })
+            .Build();
+
+        _host.Start();
+
+        var window = _host.Services.GetRequiredService<MainWindow>();
+        MainWindow = window;
+        window.Show();
+    }
+
+    protected override void OnExit(ExitEventArgs e)
+    {
+        _host?.StopAsync().GetAwaiter().GetResult();
+        _host?.Dispose();
+        _host = null;
+
+        _appKiller?.Dispose();
+        _appKiller = null;
+
+        if (_singleInstanceMutex is not null)
+        {
+            try { _singleInstanceMutex.ReleaseMutex(); }
+            catch (ApplicationException ex)
+            {
+                // Not-owner on a clean shutdown path — traced so it isn't silently dropped.
+                System.Diagnostics.Debug.WriteLine($"[App] ReleaseMutex: {ex.Message}");
+            }
+            _singleInstanceMutex.Dispose();
+            _singleInstanceMutex = null;
+        }
+
+        base.OnExit(e);
+    }
+
+    private static void EnsureHiddenConsole()
+    {
+        // WinExe apps don't get a console at startup. ConPTY — used by
+        // EasyWindowsTerminalControl for each tab — needs the parent process to own a
+        // console, otherwise every child pwsh dies milliseconds after start and the tab
+        // reads "Session Terminated". Detach any inherited console first (e.g. when the
+        // exe was launched from wpf-cli / cmd), then allocate a fresh one and hide it.
+        //
+        // Critical: `AllocConsole` creates `CONIN$`/`CONOUT$` devices but does NOT rebind
+        // the process's STD_INPUT/OUTPUT/ERROR handles when they were already redirected
+        // by the parent launcher (bash pipe, wpf-cli, VS run-with-redirect). Child
+        // processes inherit those stale pipes and see non-TTY stdin — pwsh exits, claude
+        // flips to `--print` and errors out with "Input must be provided…". We re-point
+        // the three std handles at the fresh console to force ConPTY children to inherit
+        // clean TTY handles. Ref: github.com/microsoft/terminal/issues/11276.
+        try
+        {
+            _ = FreeConsole();
+            if (!AllocConsole())
+            {
+                var err = Marshal.GetLastWin32Error();
+                System.Diagnostics.Debug.WriteLine($"[App] AllocConsole failed, last-error={err}");
+                LogDiag($"AllocConsole failed, last-error={err}");
+                return;
+            }
+            var hwnd = GetConsoleWindow();
+            if (hwnd != IntPtr.Zero) { ShowWindow(hwnd, SW_HIDE); }
+
+            // Rebind STD_INPUT_HANDLE → CONIN$, STD_OUTPUT_HANDLE / STD_ERROR_HANDLE → CONOUT$.
+            // SHARE_READ | SHARE_WRITE so children can also open the same console.
+            var inHandle = CreateFile("CONIN$",
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+            var outHandle = CreateFile("CONOUT$",
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+            var inOk = inHandle != INVALID_HANDLE_VALUE && SetStdHandle(STD_INPUT_HANDLE, inHandle);
+            var outOk = outHandle != INVALID_HANDLE_VALUE
+                && SetStdHandle(STD_OUTPUT_HANDLE, outHandle)
+                && SetStdHandle(STD_ERROR_HANDLE, outHandle);
+            LogDiag($"console allocated, hwnd={hwnd}, inOk={inOk}, outOk={outOk}");
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[App] EnsureHiddenConsole: {ex.Message}");
+            LogDiag($"EnsureHiddenConsole ex: {ex.Message}");
+        }
+    }
+
+    private static void LogDiag(string msg)
+    {
+        try
+        {
+            var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodeScope");
+            Directory.CreateDirectory(dir);
+            File.AppendAllText(Path.Combine(dir, "console.log"),
+                $"{DateTime.Now:HH:mm:ss.fff} {msg}{Environment.NewLine}");
+        }
+        catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"LogDiag failed: {ex}"); }
+    }
+
+    private const int SW_HIDE = 0;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AllocConsole();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool FreeConsole();
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetConsoleWindow();
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr CreateFile(
+        string lpFileName,
+        uint dwDesiredAccess,
+        uint dwShareMode,
+        IntPtr lpSecurityAttributes,
+        uint dwCreationDisposition,
+        uint dwFlagsAndAttributes,
+        IntPtr hTemplateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetStdHandle(int nStdHandle, IntPtr handle);
+
+    private const int STD_INPUT_HANDLE = -10;
+    private const int STD_OUTPUT_HANDLE = -11;
+    private const int STD_ERROR_HANDLE = -12;
+    private const uint GENERIC_READ = 0x80000000;
+    private const uint GENERIC_WRITE = 0x40000000;
+    private const uint FILE_SHARE_READ = 0x00000001;
+    private const uint FILE_SHARE_WRITE = 0x00000002;
+    private const uint OPEN_EXISTING = 3;
+    private static readonly IntPtr INVALID_HANDLE_VALUE = new(-1);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    private static void LogFatal(string source, Exception? ex)
+    {
+        try
+        {
+            var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodeScope");
+            Directory.CreateDirectory(dir);
+            var path = Path.Combine(dir, "crash.log");
+            var line = $"[{DateTime.Now:O}] {source}: {ex}\n";
+            File.AppendAllText(path, line);
+        }
+        catch (Exception writeEx)
+        {
+            // Fatal-handler write failed — last-resort debug trace before the process dies.
+            System.Diagnostics.Debug.WriteLine($"[App] LogFatal write: {writeEx.Message}");
+        }
+    }
+
+    private static string? PickFolder()
+    {
+        var dialog = new Microsoft.Win32.OpenFolderDialog
+        {
+            Title = "Pick a folder to open in a new tab",
+            Multiselect = false,
+        };
+
+        return dialog.ShowDialog() == true ? dialog.FolderName : null;
+    }
+
+    private static NoScope.CodeScope.Ui.Dialogs.NewWorktreeResult? PickNewWorktree(NoScope.CodeScope.Ui.Dialogs.NewWorktreeRequest request)
+        => NoScope.CodeScope.Ui.Dialogs.NewWorktreeDialog.Prompt(request);
+}

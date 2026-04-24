@@ -1,0 +1,53 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>WinExe</OutputType>
+        <TargetFramework>net10.0-windows</TargetFramework>
+        <UseWPF>true</UseWPF>
+        <RootNamespace>NoScope.CodeScope.App</RootNamespace>
+        <AssemblyName>CodeScope</AssemblyName>
+        <ApplicationManifest>app.manifest</ApplicationManifest>
+        <ApplicationIcon>assets\codescope.ico</ApplicationIcon>
+        <StartupObject>NoScope.CodeScope.App.App</StartupObject>
+        <Nullable>enable</Nullable>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <Resource Include="assets\codescope.ico" />
+    </ItemGroup>
+
+    <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+        <PublishReadyToRun>true</PublishReadyToRun>
+        <PublishSingleFile>true</PublishSingleFile>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\CodeScope.Core\CodeScope.Core.csproj" />
+        <ProjectReference Include="..\CodeScope.Ui\CodeScope.Ui.csproj" />
+    </ItemGroup>
+
+    <!--
+        conpty.dll ships under runtimes/win10-x64/native in the Ci.Microsoft.Windows.Console.ConPTY
+        package. Framework-dependent builds don't flatten those into the output root, so
+        EasyWindowsTerminalControl throws DllNotFoundException at runtime and the terminal
+        renders as a black pane with no prompt. Copy the native DLL next to the exe so ConPTY boots.
+    -->
+    <Target Name="CopyConPtyNative" AfterTargets="Build">
+        <Copy
+            SourceFiles="$(OutDir)runtimes\win10-x64\native\conpty.dll"
+            DestinationFolder="$(OutDir)"
+            SkipUnchangedFiles="true"
+            Condition="Exists('$(OutDir)runtimes\win10-x64\native\conpty.dll')" />
+    </Target>
+
+    <ItemGroup>
+        <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.0" />
+        <PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.0" />
+        <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="9.0.0" />
+        <PackageReference Include="Microsoft.Extensions.Logging" Version="9.0.0" />
+        <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="9.0.0" />
+        <PackageReference Include="Microsoft.Extensions.Logging.Debug" Version="9.0.0" />
+        <PackageReference Include="WPF-UI" Version="4.2.0" />
+    </ItemGroup>
+
+</Project>

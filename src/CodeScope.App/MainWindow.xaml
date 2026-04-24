@@ -1,0 +1,375 @@
+<ui:FluentWindow
+    x:Class="NoScope.CodeScope.App.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+    xmlns:vm="clr-namespace:NoScope.CodeScope.Ui.ViewModels;assembly=CodeScope.Ui"
+    xmlns:conv="clr-namespace:NoScope.CodeScope.Ui.Converters;assembly=CodeScope.Ui"
+    xmlns:views="clr-namespace:NoScope.CodeScope.Ui.Views;assembly=CodeScope.Ui"
+    xmlns:app="clr-namespace:NoScope.CodeScope.App"
+    mc:Ignorable="d"
+    Title="{Binding WindowTitle}"
+    Icon="pack://application:,,,/assets/codescope.ico"
+    Width="1280"
+    Height="800"
+    MinWidth="720"
+    MinHeight="480"
+    ExtendsContentIntoTitleBar="True"
+    WindowBackdropType="Mica"
+    WindowCornerPreference="Default"
+    WindowStartupLocation="CenterScreen"
+    TextElement.Foreground="{DynamicResource Fig.Brush.Ink}"
+    TextElement.FontFamily="{DynamicResource Fig.Font.Sans}"
+    TextElement.FontSize="{DynamicResource Fig.Size.Body}"
+    TextOptions.TextFormattingMode="Ideal"
+    TextOptions.TextRenderingMode="ClearType"
+    d:DataContext="{d:DesignInstance Type=vm:MainViewModel}">
+
+    <ui:FluentWindow.Resources>
+        <BooleanToVisibilityConverter x:Key="BoolVisible" />
+        <conv:TabStatusToBrushConverter x:Key="TabDotBrush" />
+
+        <!-- Shared look for caption buttons: 46×full titlebar, transparent bg, icon
+             centered; hover fills cell. Close button overrides hover bg with red. -->
+        <Style x:Key="CaptionButton" TargetType="Button">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Width" Value="46" />
+            <Setter Property="VerticalAlignment" Value="Stretch" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="HorizontalContentAlignment" Value="Center" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="Foreground" Value="{DynamicResource Text.Primary}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bg" Background="{TemplateBinding Background}" SnapsToDevicePixels="True">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bg" Property="Background" Value="#1F1F1F" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="CaptionCloseButton" TargetType="Button" BasedOn="{StaticResource CaptionButton}">
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bg" Background="{TemplateBinding Background}" SnapsToDevicePixels="True">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bg" Property="Background" Value="#E81123" />
+                                <Setter Property="Foreground" Value="White" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </ui:FluentWindow.Resources>
+
+
+    <ui:FluentWindow.InputBindings>
+        <KeyBinding Key="T" Modifiers="Control" Command="{Binding NewSessionCommand}" />
+        <KeyBinding Key="W" Modifiers="Control" Command="{Binding CloseTabCommand}" />
+        <KeyBinding Key="Tab" Modifiers="Control" Command="{Binding NextTabCommand}" />
+        <KeyBinding Key="Tab" Modifiers="Control+Shift" Command="{Binding PrevTabCommand}" />
+        <KeyBinding Key="F2" Command="{Binding RenameSessionCommand}" />
+        <KeyBinding Key="K" Modifiers="Control" Command="{Binding OpenCommandPaletteCommand}" />
+        <KeyBinding Key="P" Modifiers="Control+Shift" Command="{Binding OpenCommandPaletteCommand}" />
+        <KeyBinding Key="O" Modifiers="Control+Shift" Command="{Binding ToggleOverviewCommand}" />
+        <KeyBinding Key="D" Modifiers="Control" Command="{Binding ToggleDiffPanelCommand}" />
+        <KeyBinding Key="F" Modifiers="Control" Command="{Binding FocusSidebarFilterCommand}" />
+        <KeyBinding Key="F5" Command="{Binding RefreshAllCommand}" />
+        <KeyBinding Key="OemPipe" Modifiers="Control" Command="{Binding SplitRightCommand}" />
+        <KeyBinding Key="Return" Modifiers="Control+Shift" Command="{Binding OpenInNewGroupCommand}" CommandParameter="{Binding Sidebar.SelectedWorktree}" />
+        <KeyBinding Key="Right" Modifiers="Alt" Command="{Binding FocusNextGroupCommand}" />
+        <KeyBinding Key="Left"  Modifiers="Alt" Command="{Binding FocusPrevGroupCommand}" />
+        <KeyBinding Key="D1" Modifiers="Control" Command="{Binding SelectTabByIndexCommand}" CommandParameter="1" />
+        <KeyBinding Key="D2" Modifiers="Control" Command="{Binding SelectTabByIndexCommand}" CommandParameter="2" />
+        <KeyBinding Key="D3" Modifiers="Control" Command="{Binding SelectTabByIndexCommand}" CommandParameter="3" />
+        <KeyBinding Key="D4" Modifiers="Control" Command="{Binding SelectTabByIndexCommand}" CommandParameter="4" />
+        <KeyBinding Key="D5" Modifiers="Control" Command="{Binding SelectTabByIndexCommand}" CommandParameter="5" />
+        <KeyBinding Key="D6" Modifiers="Control" Command="{Binding SelectTabByIndexCommand}" CommandParameter="6" />
+        <KeyBinding Key="D7" Modifiers="Control" Command="{Binding SelectTabByIndexCommand}" CommandParameter="7" />
+        <KeyBinding Key="D8" Modifiers="Control" Command="{Binding SelectTabByIndexCommand}" CommandParameter="8" />
+        <KeyBinding Key="D9" Modifiers="Control" Command="{Binding SelectTabByIndexCommand}" CommandParameter="9" />
+    </ui:FluentWindow.InputBindings>
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="40" />    <!-- Row 0: brand + tab strip + caption buttons -->
+            <RowDefinition Height="*" />      <!-- Row 1: sidebar + content -->
+            <RowDefinition Height="Auto" />   <!-- Row 2: status bar -->
+        </Grid.RowDefinitions>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="240" MinWidth="200" />
+            <ColumnDefinition Width="1" />       <!-- 1px splitter gutter -->
+            <ColumnDefinition Width="*" />       <!-- strips in Row 0, workspaces in Row 1 -->
+        </Grid.ColumnDefinitions>
+
+        <!-- Brand pane — lives in the title-bar strip at the top-left.
+             Spans column 0 (same as the sidebar below) so they share the sidebar-panel
+             background and stay pixel-aligned when the splitter drags. The Window has
+             ExtendsContentIntoTitleBar=True, so this content paints under the native
+             title-bar area; the caption buttons live in <ui:TitleBar> on the right. -->
+        <Border
+            Grid.Row="0"
+            Grid.Column="0"
+            Background="{DynamicResource Surface.Panel}"
+            BorderBrush="{DynamicResource Surface.Border}"
+            BorderThickness="0,0,0,1"
+            MouseLeftButtonDown="OnCaptionDrag">
+            <Grid Margin="12,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <!-- Accent square mark with a small cutout in the top-right corner. -->
+                <Grid Grid.Column="0" Width="14" Height="14" VerticalAlignment="Center">
+                    <Border
+                        Background="{DynamicResource Accent.Primary}"
+                        CornerRadius="4">
+                        <Border.Effect>
+                            <DropShadowEffect
+                                BlurRadius="6"
+                                ShadowDepth="0"
+                                Color="#0099FF"
+                                Opacity="0.45" />
+                        </Border.Effect>
+                    </Border>
+                    <Rectangle
+                        Width="4"
+                        Height="4"
+                        HorizontalAlignment="Right"
+                        VerticalAlignment="Top"
+                        Margin="0,3,3,0"
+                        Fill="{DynamicResource Surface.Panel}"
+                        RadiusX="1"
+                        RadiusY="1" />
+                </Grid>
+
+                <TextBlock
+                    Grid.Column="1"
+                    Margin="10,0,0,0"
+                    Text="CodeScope"
+                    VerticalAlignment="Center"
+                    FontFamily="{DynamicResource Fig.Font.Sans}"
+                    FontSize="16"
+                    FontWeight="SemiBold"
+                    Foreground="{DynamicResource Text.Primary}" />
+
+                <!-- Version slug, right-aligned, mono small-caps. -->
+                <TextBlock
+                    Grid.Column="3"
+                    Text="{x:Static app:VersionInfo.Display}"
+                    VerticalAlignment="Center"
+                    FontFamily="{DynamicResource Fig.Font.Mono}"
+                    FontSize="10"
+                    Foreground="{DynamicResource Text.Faint}"
+                    Typography.Capitals="AllSmallCaps" />
+            </Grid>
+        </Border>
+
+        <!-- Row 0 Col 2: per-group strips fill the full column width so strip-N
+             lines up exactly with workspace-N below. Caption glyphs + split/close
+             cluster overlay the top-right via declaration order (later = on top).
+             The rightmost GroupStripView gets a right-margin of CaptionClusterWidth
+             (184 px = 4 × 46 px CaptionButtons) applied in MainWindow.xaml.cs, so
+             its tabs and `+` button never sit under the caption cluster. -->
+        <Border
+            Grid.Row="0"
+            Grid.Column="2"
+            Background="{DynamicResource Surface.Panel}"
+            BorderBrush="{DynamicResource Surface.Border}"
+            BorderThickness="0,0,0,1"
+            MouseLeftButtonDown="OnCaptionDrag">
+            <Grid>
+                <!-- Populated in MainWindow.xaml.cs: one GroupStripView per editor group,
+                     column widths mirror WorkspacesHost so each strip sits directly above
+                     its workspace. 1px splitter columns stay empty here (no strip-side
+                     drag handle; dragging happens in WorkspacesHost). -->
+                <Grid
+                    x:Name="StripsHost"
+                    AutomationProperties.AutomationId="GroupStrips"
+                    VerticalAlignment="Stretch" />
+
+                <!-- Caption cluster — overlays the strips on the top-right. -->
+                <StackPanel HorizontalAlignment="Right" Orientation="Horizontal" VerticalAlignment="Stretch">
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Stretch">
+                        <Button
+                            AutomationProperties.AutomationId="SplitRightBtn"
+                            Command="{Binding SplitRightCommand}"
+                            Style="{StaticResource CaptionButton}"
+                            ToolTip="Split right (Ctrl+\)">
+                            <Viewbox Width="14" Height="14">
+                                <Canvas Width="14" Height="14">
+                                    <Rectangle Canvas.Left="1.5" Canvas.Top="2.5"
+                                               Width="5" Height="9"
+                                               Stroke="{DynamicResource Text.Primary}"
+                                               StrokeThickness="1.2"
+                                               RadiusX="1" RadiusY="1" />
+                                    <Rectangle Canvas.Left="7.5" Canvas.Top="2.5"
+                                               Width="5" Height="9"
+                                               Stroke="{DynamicResource Text.Primary}"
+                                               StrokeThickness="1.2"
+                                               RadiusX="1" RadiusY="1" />
+                                </Canvas>
+                            </Viewbox>
+                        </Button>
+                        <!-- Close-group × button removed: closing the last tab in a split
+                             pane auto-collapses the pane (MainViewModel.CloseTabAsync);
+                             Ctrl+W on an already-empty focused group still collapses it,
+                             which covers the "split by mistake, undo" path. -->
+                    </StackPanel>
+                    <!-- Custom caption buttons — matched to SplitRightBtn so the whole
+                         cluster reads as one visual unit. FluentWindow's
+                         ExtendsContentIntoTitleBar=True lets us handle click input here. -->
+                    <Button
+                        AutomationProperties.AutomationId="TitleBarMinimizeButton"
+                        Style="{StaticResource CaptionButton}"
+                        Click="OnCaptionMinimize"
+                        ToolTip="Minimize">
+                        <Path Width="10" Height="1"
+                              Stretch="Uniform"
+                              Fill="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"
+                              Data="M0,0 H10" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1" />
+                    </Button>
+                    <Button
+                        AutomationProperties.AutomationId="TitleBarMaximizeButton"
+                        Style="{StaticResource CaptionButton}"
+                        Click="OnCaptionMaxRestore"
+                        ToolTip="Maximize">
+                        <Path Width="10" Height="10"
+                              Stretch="Uniform"
+                              Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"
+                              StrokeThickness="1"
+                              Data="M0,0 H10 V10 H0 Z" />
+                    </Button>
+                    <Button
+                        AutomationProperties.AutomationId="TitleBarCloseButton"
+                        Style="{StaticResource CaptionCloseButton}"
+                        Click="OnCaptionClose"
+                        ToolTip="Close">
+                        <Path Width="10" Height="10"
+                              Stretch="Uniform"
+                              Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"
+                              StrokeThickness="1"
+                              Data="M0,0 L10,10 M10,0 L0,10" />
+                    </Button>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- Sidebar sits directly below the brand in the same column. -->
+        <views:SidebarView Grid.Row="1" Grid.Column="0" DataContext="{Binding Sidebar}" />
+
+        <!-- Splitter spans rows 0+1 so dragging it resizes both the brand and the sidebar. -->
+        <GridSplitter
+            Grid.Row="0"
+            Grid.RowSpan="2"
+            Grid.Column="1"
+            Width="1"
+            HorizontalAlignment="Stretch"
+            VerticalAlignment="Stretch"
+            ResizeBehavior="PreviousAndNext"
+            ResizeDirection="Columns"
+            Background="{DynamicResource Surface.Border}" />
+
+        <Grid Grid.Row="1" Grid.Column="2">
+                <Grid.Resources>
+                    <BooleanToVisibilityConverter x:Key="BoolVis" />
+                </Grid.Resources>
+
+                <!-- Workspace layer: tabs + per-tab session views + diff.
+                     Collapsed when Overview is on so the hosted terminal HWNDs hide
+                     (WPF airspace: native HWNDs paint above all WPF siblings regardless
+                     of ZIndex, so the only way to "cover" them is to hide them).
+                     Also collapsed when no projects exist — the EmptyStateView hero
+                     takes over. -->
+                <Grid x:Name="WorkspaceLayer">
+                    <Grid.Style>
+                        <Style TargetType="Grid">
+                            <Setter Property="Visibility" Value="Visible" />
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding IsOverviewVisible}" Value="True">
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                </DataTrigger>
+                                <DataTrigger Binding="{Binding Sidebar.IsEmpty}" Value="True">
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Grid.Style>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+
+                <!--
+                    Multi-group workspace: populated in MainWindow.xaml.cs with one
+                    EditorGroupView per group + 1px GridSplitters in between. View
+                    instances are cached by VM so terminals survive Groups mutations.
+                    Drag a splitter to repartition — ratios persist via LayoutStore.
+                -->
+                <Grid
+                    x:Name="WorkspacesHost"
+                    Grid.Row="0"
+                    AutomationProperties.AutomationId="EditorGroups" />
+
+                <!-- Diff panel: hidden by default, toggled via Ctrl+D. -->
+                <GridSplitter
+                    Grid.Row="1"
+                    Height="4"
+                    HorizontalAlignment="Stretch"
+                    VerticalAlignment="Stretch"
+                    Background="{DynamicResource DividerStrokeColorDefaultBrush}"
+                    Visibility="{Binding Diff.IsVisible, Converter={StaticResource BoolVisible}}" />
+                    <views:DiffPanelView
+                        Grid.Row="2"
+                        Height="260"
+                        DataContext="{Binding Diff}"
+                        Visibility="{Binding IsVisible, Converter={StaticResource BoolVisible}}" />
+                </Grid>
+
+                <!-- Overview layer. Shown when IsOverviewVisible is true; sibling of
+                     WorkspaceLayer so both stay mounted but only one is visible. -->
+                <views:OverviewView
+                    DataContext="{Binding Overview}"
+                    Visibility="{Binding DataContext.IsOverviewVisible, RelativeSource={RelativeSource AncestorType=Window}, Converter={StaticResource BoolVis}}" />
+
+                <!-- First-run empty state — takes over the main stage when no projects exist.
+                     Inherits DataContext from the window so the CTA finds Sidebar.AddProjectCommand. -->
+                <views:EmptyStateView
+                    Visibility="{Binding Sidebar.IsEmpty, Converter={StaticResource BoolVis}}" />
+        </Grid>
+
+        <views:StatusBarView
+            Grid.Row="2"
+            Grid.ColumnSpan="3" />
+
+        <!-- Overlay: non-blocking when empty; draws over every row+col. -->
+        <ui:SnackbarPresenter
+            x:Name="SnackbarHost"
+            Grid.Row="0"
+            Grid.RowSpan="3"
+            Grid.Column="0"
+            Grid.ColumnSpan="3"
+            HorizontalAlignment="Right"
+            VerticalAlignment="Bottom"
+            Margin="0,0,16,28" />
+    </Grid>
+</ui:FluentWindow>

@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>CodeScope — Split Groups</title>
+<meta name="viewport" content="width=1440" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="codescope-shared.css">
+<style>
+  .app-shell { grid-template-columns: 240px 1fr; }
+  .workspace {
+    display: grid;
+    grid-template-columns: 60fr 1px 40fr;
+    min-height: 0;
+  }
+  .group {
+    display: flex; flex-direction: column;
+    min-width: 0; min-height: 0;
+    position: relative;
+  }
+  .group.focused .tabs { box-shadow: inset 0 -1px 0 var(--accent); }
+  .group:not(.focused) .tabs { box-shadow: inset 0 -1px 0 var(--border); }
+  .group.focused { background: #000; }
+  .group:not(.focused) .term, .group:not(.focused) .statusbar { opacity: 0.92; }
+
+  .divider {
+    background: var(--border);
+    cursor: col-resize;
+    position: relative;
+  }
+  .divider::before {
+    content: "";
+    position: absolute; left: -2px; right: -2px; top: 0; bottom: 0;
+  }
+  .divider:hover { background: var(--accent-glow); }
+
+  /* bottom gradient fade for unfocused terminal */
+  .group:not(.focused) .term::after {
+    content: ""; pointer-events: none;
+    position: absolute; left: 0; right: 0; bottom: 0; height: 80px;
+    background: linear-gradient(180deg, transparent, rgba(0,0,0,0.6));
+  }
+
+  .focus-badge {
+    position: absolute;
+    top: 8px; right: 12px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9.5px;
+    color: var(--accent);
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    opacity: 0.8;
+    pointer-events: none;
+  }
+
+  /* question block inside unfocused terminal */
+  .q-block {
+    margin-top: 12px;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-left: 2px solid var(--warn);
+    border-radius: 6px;
+    background: #080808;
+    color: #fff;
+    font-size: 12.5px;
+    line-height: 1.55;
+  }
+  .q-block .q-label {
+    font-family: 'Inter', sans-serif;
+    font-size: 10px;
+    color: var(--warn);
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+
+  .group-head-hairline {
+    position: absolute;
+    left: 0; right: 0;
+    top: 40px;
+    height: 1px;
+    background: var(--border);
+    pointer-events: none;
+  }
+  .group.focused .group-head-hairline {
+    background: var(--accent);
+    box-shadow: 0 0 8px rgba(0,153,255,0.4);
+  }
+</style>
+</head>
+<body>
+<div class="app-shell" data-screen-label="01 Split groups — 60/40">
+
+  <aside class="sidebar">
+    <div class="brand"><div class="brand-mark"></div><div class="brand-word">CodeScope</div></div>
+    <div class="side-label">Projects</div>
+    <div class="proj open">
+      <svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3 L8 6 L4.5 9"/></svg>
+      PestScope
+      <span class="count">1</span>
+    </div>
+    <div class="wt">main</div>
+    <div class="wt active has-session"><span class="bar"></span>feat/reporting</div>
+
+    <div class="proj open">
+      <svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3 L8 6 L4.5 9"/></svg>
+      SurveyScope
+      <span class="count">1</span>
+    </div>
+    <div class="wt">main</div>
+    <div class="wt has-session"><span class="bar"></span>bugfix/auth</div>
+
+    <div class="proj">
+      <svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3 L8 6 L4.5 9"/></svg>
+      CodeScope
+    </div>
+
+    <div class="sidebar-foot">
+      <button class="overview-btn">
+        Overview
+        <span class="kbd">⌃⇧ O</span>
+      </button>
+      <button class="new-project">
+        <span style="color:var(--accent);font-family:'JetBrains Mono',monospace;font-size:13px">＋</span>
+        New Project
+      </button>
+    </div>
+  </aside>
+
+  <div class="workspace">
+
+    <!-- LEFT (focused) -->
+    <div class="group focused">
+      <div class="tabs">
+        <div class="tab active">
+          <span class="sdot active"></span>
+          <span class="tab-name">PestScope · feat/reporting</span>
+        </div>
+        <div class="tab">
+          <span class="sdot idle"></span>
+          <span class="tab-name">PestScope · main</span>
+        </div>
+        <div class="tg-icon" title="New tab" style="width:26px;margin-left:4px">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M6 2v8M2 6h8"/></svg>
+        </div>
+        <div class="tab-group-ctrls">
+          <div class="tg-icon" title="Split right">
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.2"><rect x="1.5" y="2.5" width="5" height="9" rx="1"/><rect x="7.5" y="2.5" width="5" height="9" rx="1"/></svg>
+          </div>
+          <div class="tg-icon" title="Close group">
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M2 2l6 6M8 2l-6 6"/></svg>
+          </div>
+        </div>
+      </div>
+      <div class="focus-badge">Focused</div>
+      <div class="group-head-hairline"></div>
+
+      <div class="term">
+        <div><span class="dim">●</span> <span class="mut">session · feat/reporting · 14:18</span></div>
+        <div style="height:8px"></div>
+        <div><span class="user">&gt;</span>&nbsp;implement CSV export for reports</div>
+        <div style="height:6px"></div>
+        <div class="mut">Writing <span style="color:#fff">CsvWriter</span> helper and wiring the endpoint on <span style="color:#fff">ReportsController</span>.</div>
+        <div style="height:10px"></div>
+<div>  <span class="c">// Stream a CSV of the report so we never page into memory.</span></div>
+<div>  <span class="k">[HttpGet</span>(<span class="s">"{id}/export.csv"</span>)<span class="k">]</span></div>
+<div>  <span class="k">public async</span> <span class="t">Task</span>&lt;<span class="t">IActionResult</span>&gt; ExportCsv(<span class="t">Guid</span> id, <span class="t">CancellationToken</span> ct)</div>
+<div>  {</div>
+<div>    <span class="k">var</span> report = <span class="k">await</span> _reports.GetAsync(id, ct);</div>
+<div>    <span class="k">if</span> (report <span class="k">is null</span>) <span class="k">return</span> NotFound();</div>
+<div></div>
+<div>    <span class="k">var</span> sb = <span class="k">new</span> <span class="t">StringBuilder</span>();</div>
+<div>    sb.AppendLine(<span class="s">"Site,Technician,Date,Finding,Severity"</span>);</div>
+<div>    <span class="k">foreach</span> (<span class="k">var</span> row <span class="k">in</span> report.Findings)</div>
+<div>    {</div>
+<div>      sb.Append(<span class="t">Csv</span>.Escape(row.Site)).Append(<span class="s">","</span>);</div>
+<div>      sb.Append(row.Date.ToString(<span class="s">"yyyy-MM-dd"</span>)).Append(<span class="s">","</span>);</div>
+<div>      sb.AppendLine(row.Severity.ToString());</div>
+<div>    }</div>
+<div>    <span class="k">return</span> File(<span class="t">Encoding</span>.UTF8.GetBytes(sb.ToString()), <span class="s">"text/csv"</span>);</div>
+<div>  }</div>
+        <div style="height:14px"></div>
+        <div class="dim">— edited ReportsController.cs  +34 −0</div>
+        <div class="dim">— created Export/Csv.cs          +12 −0</div>
+        <div style="height:14px"></div>
+        <div><span class="user">&gt;</span>&nbsp;add a test that csv escapes quotes correctly<span class="cursor"></span></div>
+      </div>
+
+      <div class="statusbar">
+        <span class="sdot active"></span>
+        <span class="branch">feat/reporting</span>
+        <span class="muted">3 changes</span>
+        <div class="right">
+          <span class="sdot-g"></span>
+          <span style="color:#fff">PR #42</span>
+          <span style="color:var(--text-3)">·</span>
+          <span class="muted">14:32</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- divider -->
+    <div class="divider" title="Drag to resize"></div>
+
+    <!-- RIGHT (unfocused, awaiting input) -->
+    <div class="group">
+      <div class="tabs">
+        <div class="tab active">
+          <span class="sdot wait"></span>
+          <span class="tab-name">SurveyScope · bugfix/auth</span>
+        </div>
+        <div class="tg-icon" title="New tab" style="width:26px;margin-left:4px">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M6 2v8M2 6h8"/></svg>
+        </div>
+        <div class="tab-group-ctrls">
+          <div class="tg-icon" title="Split right">
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.2"><rect x="1.5" y="2.5" width="5" height="9" rx="1"/><rect x="7.5" y="2.5" width="5" height="9" rx="1"/></svg>
+          </div>
+          <div class="tg-icon" title="Close group">
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M2 2l6 6M8 2l-6 6"/></svg>
+          </div>
+        </div>
+      </div>
+      <div class="group-head-hairline"></div>
+
+      <div class="term">
+        <div><span class="dim">●</span> <span class="mut">session · bugfix/auth · 12:22</span></div>
+        <div style="height:8px"></div>
+        <div><span class="user">&gt;</span>&nbsp;fix the expired-token redirect loop</div>
+        <div style="height:6px"></div>
+        <div class="mut">Inspecting <span style="color:#fff">AuthMiddleware</span>. The refresh flow calls back into the same handler; need to understand the storage target first.</div>
+        <div class="q-block">
+          <div class="q-label">Awaiting input</div>
+          Should I use JWT in the <span style="color:var(--accent)">Authorization</span> header, or stick with HttpOnly cookies like the rest of the app? Either works but the rest of the codebase is cookie-based.
+          <div style="height:8px"></div>
+          <div class="mut" style="font-size:11.5px">reply below — [y] cookies · [j] jwt header · [?] explain trade-offs</div>
+        </div>
+        <div style="height:10px"></div>
+        <div><span class="user">&gt;</span>&nbsp;<span class="cursor"></span></div>
+      </div>
+
+      <div class="statusbar">
+        <span class="sdot wait"></span>
+        <span class="branch">bugfix/auth</span>
+        <span class="muted">1 change</span>
+        <div class="right">
+          <span style="color:var(--text-3)">no PR</span>
+          <span style="color:var(--text-3)">·</span>
+          <span class="muted">02:14</span>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+</body>
+</html>

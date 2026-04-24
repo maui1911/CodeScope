@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>CodeScope — Tab Drag</title>
+<meta name="viewport" content="width=1440" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="codescope-shared.css">
+<style>
+  .app-shell { grid-template-columns: 240px 1fr; }
+  .workspace {
+    display: grid;
+    grid-template-columns: 60fr 1px 40fr;
+    min-height: 0;
+    position: relative;
+  }
+  .group {
+    display: flex; flex-direction: column;
+    min-width: 0; min-height: 0;
+    position: relative;
+  }
+  .group.focused .tabs { box-shadow: inset 0 -1px 0 var(--accent); }
+  .group:not(.focused) .tabs { box-shadow: inset 0 -1px 0 var(--border); }
+  .divider { background: var(--border); }
+
+  .group-head-hairline {
+    position: absolute; left: 0; right: 0; top: 40px; height: 1px;
+    background: var(--border); pointer-events: none;
+  }
+  .group.focused .group-head-hairline {
+    background: var(--accent); box-shadow: 0 0 8px rgba(0,153,255,0.4);
+  }
+
+  /* ghost placeholder — where the tab was */
+  .tab-ghost {
+    min-width: 190px; margin: 4px 0;
+    border-radius: 6px;
+    border: 1px dashed #2A2A2A;
+    background: rgba(255,255,255,0.015);
+  }
+
+  /* drop indicator — 2px vertical blue bar */
+  .drop-indicator {
+    width: 2px;
+    margin: 4px 0;
+    background: var(--accent);
+    border-radius: 2px;
+    box-shadow: 0 0 10px rgba(0,153,255,0.6);
+    align-self: stretch;
+  }
+
+  /* floating drag chip */
+  .drag-chip {
+    position: absolute;
+    left: 930px; top: 64px;
+    display: inline-flex; align-items: center; gap: 8px;
+    background: #141414;
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    padding: 7px 12px;
+    font: 500 13px/1 'Inter', sans-serif;
+    color: #fff;
+    letter-spacing: -0.005em;
+    box-shadow: 0 0 0 3px rgba(0,153,255,0.2), 0 0 24px rgba(0,153,255,0.35);
+    z-index: 20;
+    pointer-events: none;
+    transform: rotate(-1.5deg);
+  }
+  .drag-chip .sdot { width: 6px; height: 6px; }
+
+  /* cursor marker */
+  .cursor-mark {
+    position: absolute;
+    left: 916px; top: 56px;
+    width: 16px; height: 20px;
+    z-index: 21;
+    color: #fff;
+    filter: drop-shadow(0 0 4px rgba(0,153,255,0.5));
+    pointer-events: none;
+  }
+
+  /* dim backdrop animation cue — right group tab strip highlight at drop zone */
+  .target-highlight {
+    position: absolute;
+    left: 0; top: 0; right: 0; bottom: 0;
+    pointer-events: none;
+    background: linear-gradient(180deg, rgba(0,153,255,0.08), transparent 70%);
+  }
+
+  .term { opacity: 0.55; }
+  .statusbar { opacity: 0.7; }
+
+  .caption {
+    position: absolute;
+    left: 260px; bottom: 48px;
+    background: rgba(10,10,10,0.85);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 14px;
+    font-size: 11px; color: var(--text-2);
+    max-width: 360px; line-height: 1.5;
+    letter-spacing: -0.005em;
+    backdrop-filter: blur(6px);
+    z-index: 30;
+  }
+  .caption b { color: #fff; font-weight: 500; }
+  .caption .dot { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="app-shell" data-screen-label="02 Tab drag preview">
+
+  <aside class="sidebar">
+    <div class="brand"><div class="brand-mark"></div><div class="brand-word">CodeScope</div></div>
+    <div class="side-label">Projects</div>
+    <div class="proj open">
+      <svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3 L8 6 L4.5 9"/></svg>
+      PestScope
+      <span class="count">1</span>
+    </div>
+    <div class="wt">main</div>
+    <div class="wt active has-session"><span class="bar"></span>feat/reporting</div>
+    <div class="proj open">
+      <svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3 L8 6 L4.5 9"/></svg>
+      SurveyScope
+      <span class="count">1</span>
+    </div>
+    <div class="wt has-session"><span class="bar"></span>bugfix/auth</div>
+    <div class="sidebar-foot">
+      <button class="overview-btn">Overview<span class="kbd">⌃⇧ O</span></button>
+      <button class="new-project"><span style="color:var(--accent);font-family:'JetBrains Mono',monospace;font-size:13px">＋</span>New Project</button>
+    </div>
+  </aside>
+
+  <div class="workspace">
+
+    <!-- LEFT — source group, shows ghost where tab was -->
+    <div class="group focused">
+      <div class="tabs">
+        <div class="tab-ghost" style="width:190px"></div>
+        <div class="tab active">
+          <span class="sdot idle"></span>
+          <span class="tab-name">PestScope · main</span>
+        </div>
+      </div>
+      <div class="group-head-hairline"></div>
+      <div class="term">
+        <div class="mut">● session · main · idle</div>
+        <div style="height:8px"></div>
+        <div class="mut">Last: build succeeded · 8a4f2c1</div>
+      </div>
+      <div class="statusbar">
+        <span class="sdot idle"></span>
+        <span class="branch">main</span>
+        <span class="muted">0 changes</span>
+      </div>
+    </div>
+
+    <div class="divider"></div>
+
+    <!-- RIGHT — target group, shows drop indicator in tab strip -->
+    <div class="group" style="position: relative">
+      <div class="tabs">
+        <div class="tab">
+          <span class="sdot wait"></span>
+          <span class="tab-name">SurveyScope · bugfix/auth</span>
+        </div>
+        <!-- drop indicator sits between existing tab and where new tab will land -->
+        <div class="drop-indicator"></div>
+      </div>
+      <div class="target-highlight"></div>
+      <div class="group-head-hairline"></div>
+      <div class="term">
+        <div class="mut">● session · bugfix/auth · waiting for reply</div>
+      </div>
+      <div class="statusbar">
+        <span class="sdot wait"></span>
+        <span class="branch">bugfix/auth</span>
+        <span class="muted">1 change</span>
+      </div>
+    </div>
+
+    <!-- floating drag chip follows cursor -->
+    <svg class="cursor-mark" viewBox="0 0 16 20" fill="currentColor">
+      <path d="M1 1 L1 15 L5 11 L7.5 17 L10 16 L7.5 10 L13 10 Z"/>
+    </svg>
+    <div class="drag-chip">
+      <span class="sdot active"></span>
+      <span>PestScope · feat/reporting</span>
+    </div>
+  </div>
+
+  <div class="caption">
+    <b>Tab drag</b> <span class="dot">·</span> dragging <b>PestScope · feat/reporting</b> from the left group toward the right.<br>
+    Source shows a dashed ghost where it lived. Target shows a 2px blue drop indicator at the insertion point. The floating chip follows the cursor with a blue outer glow.
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,58 @@
+# Build output
+bin/
+obj/
+out/
+publish/
+*.user
+*.suo
+*.pdb
+
+# VS / Rider / VS Code
+.vs/
+.idea/
+.vscode/
+
+# JetBrains
+*.ReSharper*
+
+# dotnet
+*.nupkg
+*.snupkg
+project.lock.json
+project.assets.json
+
+# Test results
+TestResults/
+coverage.*
+*.trx
+
+# Logs
+*.log
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local tools cache
+.dotnet/
+.nuget/
+
+# Local config overrides
+appsettings.Development.json
+appsettings.Local.json
+
+# Superpowers visual companion
+.superpowers/
+
+# Desloppify local state
+.desloppify/
+
+# Scratch area (never commit). Throwaway captures, session logs, and any
+# tooling output that shouldn't ship. docs/screenshots/ is the tracked
+# home for README imagery — only that folder is published.
+scratch/
+
+# Tool-state directories surfaced by AI / automation runners
+.claude/
+.playwright-cli/

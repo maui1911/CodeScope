@@ -1,0 +1,16 @@
+# Auto-detect text vs binary; normalize text to LF in the repo.
+* text=auto eol=lf
+
+# Windows-native files — keep CRLF in working tree.
+*.sln      text eol=crlf
+*.cmd      text eol=crlf
+*.bat      text eol=crlf
+*.ps1      text eol=crlf
+*.manifest text eol=crlf
+
+# Known binaries — do not touch.
+*.png binary
+*.jpg binary
+*.ico binary
+*.dll binary
+*.exe binary

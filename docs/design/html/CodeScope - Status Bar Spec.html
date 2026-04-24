@@ -1,0 +1,671 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>CodeScope — Status Bar Spec</title>
+<meta name="viewport" content="width=1600" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:#000; --panel:#0A0A0A; --elev:#141414;
+    --border:#1F1F1F; --hover:#1F1F1F;
+    --text:#fff; --text-2:#A0A0A0; --text-3:#606060;
+    --accent:#0099FF; --ok:#4BD87B; --warn:#FF5A5A;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; min-height: 100%;
+    background: radial-gradient(1100px 600px at 30% 15%, rgba(0,153,255,0.05), transparent 60%), #000;
+    color: #fff;
+    font-family: 'Inter', -apple-system, system-ui, sans-serif;
+    font-feature-settings: "cv01","cv05","cv09","cv11","ss03","ss07";
+    -webkit-font-smoothing: antialiased;
+  }
+  .page { max-width: 1520px; margin: 0 auto; padding: 56px 48px 80px; }
+
+  .doc-head { margin-bottom: 40px; display: flex; align-items: flex-end; gap: 20px; }
+  .eyebrow {
+    font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--accent);
+    letter-spacing: 0.16em; text-transform: uppercase;
+    padding: 4px 8px; border: 1px solid rgba(0,153,255,0.3); border-radius: 3px;
+    background: rgba(0,153,255,0.05); align-self: flex-start; margin-top: 6px;
+  }
+  .doc-head h1 { font-size: 36px; font-weight: 600; letter-spacing: -0.02em; margin: 0; line-height: 1.1; }
+  .doc-head .sub {
+    margin-left: auto; color: var(--text-2); font-size: 13px;
+    max-width: 460px; line-height: 1.5; text-align: right;
+  }
+  .doc-head .sub b { color: #fff; font-weight: 500; }
+
+  /* frame */
+  .frame {
+    position: relative;
+    background: #000;
+    border: 1px solid var(--border); border-radius: 10px;
+    padding: 220px 80px 260px;
+    overflow: hidden;
+  }
+  .frame::before {
+    content:""; position:absolute; inset:0;
+    background:
+      linear-gradient(to right, rgba(255,255,255,0.025) 1px, transparent 1px) 0 0 / 80px 80px,
+      linear-gradient(to bottom, rgba(255,255,255,0.025) 1px, transparent 1px) 0 0 / 80px 80px;
+    opacity: .5; pointer-events: none;
+  }
+
+  /* the status bar under inspection */
+  .sb-wrap { position: relative; z-index: 2; }
+  .sb {
+    height: 32px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    display: flex; align-items: center;
+    padding: 0 12px;
+    gap: 14px;
+    font-size: 11.5px;
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--text-2);
+    letter-spacing: -0.005em;
+  }
+  .sb-sep { width: 1px; height: 14px; background: var(--border); flex: 0 0 1px; }
+  .sb-item { display: flex; align-items: center; gap: 6px; height: 100%; padding: 0 2px; color: var(--text-2); }
+  .sb-item b { color: #fff; font-weight: 500; }
+  .sb-item .ic { width: 12px; height: 12px; color: var(--text-3); flex: 0 0 12px; }
+  .sb-item.active .ic { color: var(--accent); }
+  .sb-item.warn { color: var(--warn); }
+  .sb-item.warn .ic { color: var(--warn); }
+  .sb-right { margin-left: auto; display: flex; align-items: center; gap: 14px; }
+  .sdot { width: 6px; height: 6px; border-radius: 50%; flex: 0 0 6px; }
+  .sdot-active { background: var(--accent); box-shadow: 0 0 0 3px rgba(0,153,255,0.18); }
+  .sdot-idle { background: var(--ok); }
+  .sdot-wait { background: var(--warn); animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse {
+    0%,100% { box-shadow: 0 0 0 0 rgba(255,90,90,0.55); }
+    50%     { box-shadow: 0 0 0 5px rgba(255,90,90,0); }
+  }
+  .tok-count {
+    display: inline-flex; align-items: center; gap: 4px;
+  }
+  .tok-bar {
+    width: 40px; height: 4px; border-radius: 2px;
+    background: #1F1F1F; position: relative; overflow: hidden;
+  }
+  .tok-bar::after {
+    content:""; position: absolute; inset: 0;
+    width: 62%;
+    background: var(--accent);
+    border-radius: 2px;
+  }
+
+  /* callouts */
+  .cx { position: absolute; inset: 0; z-index: 3; pointer-events: none; }
+  .cx .dot {
+    position: absolute; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--accent); box-shadow: 0 0 0 3px rgba(0,153,255,0.18);
+    transform: translate(-50%, -50%);
+  }
+  .cx .line { position: absolute; background: rgba(0,153,255,0.45); }
+  .cx .line.h { height: 1px; }
+  .cx .line.v { width: 1px; }
+  .cx .label {
+    position: absolute;
+    background: #0A0A0A; border: 1px solid #1F1F1F; border-radius: 6px;
+    padding: 10px 12px; width: 240px;
+    color: #fff; font-size: 12px; line-height: 1.5;
+    letter-spacing: -0.005em;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  }
+  .cx .label .num {
+    display: inline-block; width: 18px; height: 18px;
+    border-radius: 3px; background: var(--accent); color: #000;
+    font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 600;
+    text-align: center; line-height: 18px;
+    margin-right: 8px; vertical-align: 1px;
+  }
+  .cx .label b { font-weight: 600; }
+  .cx .label code {
+    font-family: 'JetBrains Mono', monospace; font-size: 10.5px;
+    color: var(--accent); background: rgba(0,153,255,0.08);
+    padding: 1px 5px; border-radius: 3px;
+  }
+  .cx .label .hint { display: block; color: var(--text-2); margin-top: 4px; font-size: 11.5px; }
+
+  /* sections */
+  .sec { margin-top: 64px; }
+  .sec-title {
+    font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--accent);
+    letter-spacing: 0.16em; text-transform: uppercase; margin-bottom: 16px;
+  }
+  .sec h2 { font-size: 22px; font-weight: 600; letter-spacing: -0.015em; margin: 0 0 24px; }
+
+  .states { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+  .state {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px;
+  }
+  .state .stlabel {
+    font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--text-3);
+    letter-spacing: 0.14em; text-transform: uppercase; margin-bottom: 12px;
+  }
+  .state .preview {
+    background: #000; border: 1px solid var(--border); border-radius: 6px;
+    padding: 4px; margin-bottom: 12px; overflow: hidden;
+  }
+  .state p { margin: 0; font-size: 12px; color: var(--text-2); line-height: 1.5; }
+  .state p b { color: #fff; font-weight: 500; }
+
+  .spec-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 20px;
+  }
+  .panel h3 {
+    font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--accent);
+    letter-spacing: 0.16em; text-transform: uppercase; margin: 0 0 14px;
+  }
+  .panel ul { list-style: none; padding: 0; margin: 0; }
+  .panel li {
+    display: grid; grid-template-columns: 110px 1fr; gap: 10px;
+    padding: 8px 0; border-bottom: 1px solid #141414;
+    font-size: 12px; line-height: 1.4;
+  }
+  .panel li:last-child { border-bottom: 0; }
+  .panel li .k { font-family: 'JetBrains Mono', monospace; color: var(--text-3); font-size: 11px; }
+  .panel li .v { color: #E6E6E6; }
+  .swatch {
+    display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+    vertical-align: -1px; margin-right: 6px; border: 1px solid rgba(255,255,255,0.08);
+  }
+
+  .notes { margin-top: 40px; display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+  .note {
+    background: var(--panel); border: 1px solid var(--border);
+    border-left: 2px solid var(--accent);
+    border-radius: 6px; padding: 14px 16px;
+    font-size: 12.5px; line-height: 1.5; color: #E6E6E6;
+  }
+  .note b { color: #fff; }
+  .note .t {
+    display: block; font-family: 'JetBrains Mono', monospace; font-size: 10px;
+    color: var(--accent); letter-spacing: 0.14em; text-transform: uppercase; margin-bottom: 6px;
+  }
+
+  .impl {
+    margin-top: 48px; background: #070707; border: 1px solid var(--border);
+    border-radius: 8px; padding: 28px 32px;
+  }
+  .impl h3 {
+    font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--accent);
+    letter-spacing: 0.16em; text-transform: uppercase; margin: 0 0 16px;
+  }
+  .impl pre {
+    margin: 0; font-family: 'JetBrains Mono', monospace;
+    font-size: 12.5px; line-height: 1.65; color: #E6E6E6;
+    white-space: pre-wrap;
+  }
+  .impl .c { color: var(--text-3); font-style: italic; }
+  .impl .k { color: var(--accent); }
+  .impl .s { color: #8FD679; }
+  .impl .t { color: #E8A857; }
+</style>
+</head>
+<body>
+<div class="page" data-screen-label="Status bar — annotated spec">
+
+  <div class="doc-head">
+    <span class="eyebrow">Component spec</span>
+    <div>
+      <h1>Status bar · window footer</h1>
+    </div>
+    <div class="sub">
+      Handoff for implementation in Claude Code. The status bar lives at the bottom of the window, <b>spanning the full width</b> (under the sidebar and the editor groups). It reads from the <b>focused session</b> and the workspace-wide stores (git, model, diagnostics).
+    </div>
+  </div>
+
+  <!-- ============ ANNOTATED FRAME ============ -->
+  <div class="frame">
+    <div class="sb-wrap">
+      <div class="sb" id="sb">
+
+        <!-- LEFT: session context -->
+        <div class="sb-item active">
+          <span class="sdot sdot-active"></span>
+          <span><b>feat/reporting</b></span>
+        </div>
+        <div class="sb-sep"></div>
+
+        <!-- Git state -->
+        <div class="sb-item">
+          <svg class="ic" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="3" cy="3" r="1.2"/><circle cx="9" cy="6" r="1.2"/><circle cx="3" cy="9" r="1.2"/>
+            <path d="M3 4.2 V7.8"/><path d="M3 6 Q6 6 7.8 6"/>
+          </svg>
+          <span>+3 <span style="color:var(--text-3)">−1</span></span>
+        </div>
+        <div class="sb-sep"></div>
+
+        <!-- Remote -->
+        <div class="sb-item">
+          <svg class="ic" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M6 2 V8"/><path d="M3.5 5.5 L6 8 L8.5 5.5"/><path d="M2.5 10 H9.5"/>
+          </svg>
+          <span>↑2 <span style="color:var(--text-3)">↓0</span></span>
+        </div>
+        <div class="sb-sep"></div>
+
+        <!-- Diagnostics -->
+        <div class="sb-item warn">
+          <svg class="ic" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M6 1.5 L11 10 H1 Z"/><path d="M6 5 V7"/><circle cx="6" cy="8.5" r="0.5" fill="currentColor"/>
+          </svg>
+          <span>2</span>
+        </div>
+        <div class="sb-item">
+          <svg class="ic" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="6" cy="6" r="4.5"/><path d="M6 3.5 V6.5"/><circle cx="6" cy="8.2" r="0.5" fill="currentColor"/>
+          </svg>
+          <span>7</span>
+        </div>
+
+        <!-- RIGHT side -->
+        <div class="sb-right">
+
+          <!-- model -->
+          <div class="sb-item">
+            <svg class="ic" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M6 1.5 L10 3.5 V8.5 L6 10.5 L2 8.5 V3.5 Z"/>
+              <path d="M6 5.5 L10 3.5"/><path d="M6 5.5 L2 3.5"/><path d="M6 5.5 V10.5"/>
+            </svg>
+            <span>claude-sonnet-4-5</span>
+          </div>
+
+          <!-- tokens / context -->
+          <div class="sb-item tok-count">
+            <span>124.2k</span>
+            <span class="tok-bar" title="62% of 200k"></span>
+            <span style="color:var(--text-3)">/ 200k</span>
+          </div>
+          <div class="sb-sep"></div>
+
+          <!-- runtime -->
+          <div class="sb-item">
+            <svg class="ic" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="6" cy="6" r="4.5"/><path d="M6 3.5 V6 L8 7.2"/>
+            </svg>
+            <span>12m 04s</span>
+          </div>
+
+          <!-- agent status summary -->
+          <div class="sb-item">
+            <span class="sdot sdot-active"></span>
+            <span>1 active</span>
+            <span style="color:var(--text-3)">·</span>
+            <span class="sdot sdot-idle"></span>
+            <span>2 idle</span>
+            <span style="color:var(--text-3)">·</span>
+            <span class="sdot sdot-wait"></span>
+            <span>1 wait</span>
+          </div>
+          <div class="sb-sep"></div>
+
+          <!-- notifications -->
+          <div class="sb-item">
+            <svg class="ic" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 9 V5.5 A3 3 0 0 1 9 5.5 V9 Z"/>
+              <path d="M5 10.5 Q6 11.2 7 10.5"/>
+            </svg>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <!-- ==== CALLOUTS (12) — bar y=222–252 ==== -->
+
+    <!-- 1. The bar (top-left corner) -->
+    <div class="cx">
+      <div class="dot" style="left:80px;top:222px"></div>
+      <div class="line v" style="left:80px;top:160px;height:62px"></div>
+      <div class="label" style="left:16px;top:96px">
+        <span class="num">1</span><b>The bar</b>
+        <span class="hint">32px tall · <code>#0A0A0A</code> · 1px top <code>#1F1F1F</code>. Full window width — spans sidebar + editor groups. Always visible.</span>
+      </div>
+    </div>
+
+    <!-- 2. Active-session context (cx≈150) -->
+    <div class="cx">
+      <div class="dot" style="left:150px;top:252px"></div>
+      <div class="line v" style="left:150px;top:252px;height:44px"></div>
+      <div class="label" style="left:30px;top:300px">
+        <span class="num">2</span><b>Session context</b>
+        <span class="hint">Status dot + branch in white Inter 500. Mirrors the focused tab. Click → worktree context menu.</span>
+      </div>
+    </div>
+
+    <!-- 12. Separator (cx=220) → now anchored to an actual .sb-sep -->
+    <div class="cx">
+      <div class="dot" style="left:220px;top:222px"></div>
+      <div class="line v" style="left:220px;top:96px;height:126px"></div>
+      <div class="label" style="left:186px;top:24px">
+        <span class="num">12</span><b>Cluster separator</b>
+        <span class="hint">1 × 14px <code>#1F1F1F</code> hairline. Only between <i>clusters</i> of items, never between every item. Gap rhythm is 14px.</span>
+      </div>
+    </div>
+
+    <!-- 3. Git dirty (cx=263) -->
+    <div class="cx">
+      <div class="dot" style="left:263px;top:222px"></div>
+      <div class="line v" style="left:263px;top:132px;height:90px"></div>
+      <div class="label" style="left:242px;top:58px">
+        <span class="num">3</span><b>Git dirty state</b>
+        <span class="hint"><code>+3</code> in white, <code>−1</code> in <code>#606060</code>. Click → Diff Panel. Hides when clean.</span>
+      </div>
+    </div>
+
+    <!-- 4. Remote (cx=348) -->
+    <div class="cx">
+      <div class="dot" style="left:348px;top:252px"></div>
+      <div class="line v" style="left:348px;top:252px;height:120px"></div>
+      <div class="label" style="left:240px;top:378px">
+        <span class="num">4</span><b>Remote sync</b>
+        <span class="hint"><code>↑2 ↓0</code> · commits ahead / behind origin. Click → Pull/Push menu.</span>
+      </div>
+    </div>
+
+    <!-- 5. Errors (cx=419) -->
+    <div class="cx">
+      <div class="dot" style="left:419px;top:222px"></div>
+      <div class="line v" style="left:419px;top:96px;height:126px"></div>
+      <div class="label" style="left:458px;top:24px">
+        <span class="num">5</span><b>Errors</b>
+        <span class="hint">Triangle glyph + integer in <code>#FF5A5A</code>. Compiler + lint errors for the active worktree. Hides at 0.</span>
+      </div>
+    </div>
+
+    <!-- 6. Warnings (cx=462) -->
+    <div class="cx">
+      <div class="dot" style="left:462px;top:252px"></div>
+      <div class="line v" style="left:462px;top:252px;height:44px"></div>
+      <div class="label" style="left:440px;top:300px">
+        <span class="num">6</span><b>Warnings</b>
+        <span class="hint">Circle-i glyph + integer in <code>#A0A0A0</code>. Severity &lt; error. Hides at 0.</span>
+      </div>
+    </div>
+
+    <!-- 7. Model (cx=740) -->
+    <div class="cx">
+      <div class="dot" style="left:740px;top:222px"></div>
+      <div class="line v" style="left:740px;top:132px;height:90px"></div>
+      <div class="label" style="left:720px;top:58px">
+        <span class="num">7</span><b>Model</b>
+        <span class="hint">Model powering the focused session. Click → model switcher.</span>
+      </div>
+    </div>
+
+    <!-- 8. Tokens (cx=891) -->
+    <div class="cx">
+      <div class="dot" style="left:891px;top:252px"></div>
+      <div class="line v" style="left:891px;top:252px;height:44px"></div>
+      <div class="label" style="left:772px;top:300px">
+        <span class="num">8</span><b>Context window</b>
+        <span class="hint">Used / cap with a 40×4 meter. Fills <code>#0099FF</code>, turns red past 90%.</span>
+      </div>
+    </div>
+
+    <!-- 9. Runtime (cx=1022) -->
+    <div class="cx">
+      <div class="dot" style="left:1022px;top:222px"></div>
+      <div class="line v" style="left:1022px;top:96px;height:126px"></div>
+      <div class="label" style="left:1000px;top:24px">
+        <span class="num">9</span><b>Runtime</b>
+        <span class="hint">Wall-clock of the current turn. Resets on each new prompt. Stops when idle.</span>
+      </div>
+    </div>
+
+    <!-- 10. Agent roll-up (cx=1178) -->
+    <div class="cx">
+      <div class="dot" style="left:1178px;top:252px"></div>
+      <div class="line v" style="left:1178px;top:252px;height:120px"></div>
+      <div class="label" style="left:1058px;top:378px">
+        <span class="num">10</span><b>Agent roll-up</b>
+        <span class="hint">Workspace-wide counters by state. <i>Not</i> scoped to the active tab. Click → Overview.</span>
+      </div>
+    </div>
+
+    <!-- 11. Notifications (cx=1322) -->
+    <div class="cx">
+      <div class="dot" style="left:1322px;top:222px"></div>
+      <div class="line v" style="left:1322px;top:132px;height:90px"></div>
+      <div class="label" style="left:1200px;top:58px">
+        <span class="num">11</span><b>Notifications</b>
+        <span class="hint">Bell glyph. Unread count as a 4px blue dot over the icon. Click → notifications popover.</span>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ============ STATES ============ -->
+  <div class="sec">
+    <div class="sec-title">States</div>
+    <h2>Four states the status bar must handle</h2>
+    <div class="states">
+
+      <div class="state">
+        <div class="stlabel">Rest · clean</div>
+        <div class="preview">
+          <div class="sb" style="border:0;border-radius:0;height:32px">
+            <div class="sb-item active"><span class="sdot sdot-idle"></span><b>main</b></div>
+            <div class="sb-sep"></div>
+            <div class="sb-item" style="color:var(--text-3)">clean</div>
+            <div class="sb-right">
+              <div class="sb-item"><span>claude-sonnet-4-5</span></div>
+              <div class="sb-item"><span style="color:var(--text-3)">idle</span></div>
+            </div>
+          </div>
+        </div>
+        <p><b>Nothing to report.</b> Git counts, diagnostics, and runtime all hide. Only invariants remain: branch, model.</p>
+      </div>
+
+      <div class="state">
+        <div class="stlabel">Working</div>
+        <div class="preview">
+          <div class="sb" style="border:0;border-radius:0;height:32px">
+            <div class="sb-item active"><span class="sdot sdot-active"></span><b>feat/reporting</b></div>
+            <div class="sb-sep"></div>
+            <div class="sb-item"><span>+3 <span style="color:var(--text-3)">−1</span></span></div>
+            <div class="sb-right">
+              <div class="sb-item tok-count"><span>124k</span><span class="tok-bar"></span></div>
+              <div class="sb-item"><span>12m 04s</span></div>
+            </div>
+          </div>
+        </div>
+        <p><b>Agent streaming.</b> Context meter ticks up, runtime counts up, dirty diff grows. Primary working state.</p>
+      </div>
+
+      <div class="state">
+        <div class="stlabel">Attention</div>
+        <div class="preview">
+          <div class="sb" style="border:0;border-radius:0;height:32px">
+            <div class="sb-item active"><span class="sdot sdot-wait"></span><b>bugfix/auth</b></div>
+            <div class="sb-sep"></div>
+            <div class="sb-item warn"><span>awaiting input</span></div>
+            <div class="sb-right">
+              <div class="sb-item"><span class="sdot sdot-wait"></span><span>1 wait</span></div>
+            </div>
+          </div>
+        </div>
+        <p><b>Agent paused.</b> Left cluster replaced with the pending question count in <code style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent)">#FF5A5A</code>. Dot pulses.</p>
+      </div>
+
+      <div class="state">
+        <div class="stlabel">Context near cap</div>
+        <div class="preview">
+          <div class="sb" style="border:0;border-radius:0;height:32px">
+            <div class="sb-item active"><span class="sdot sdot-active"></span><b>feat/reporting</b></div>
+            <div class="sb-right">
+              <div class="sb-item tok-count" style="color:var(--warn)"><span>186k</span>
+                <span class="tok-bar" style="background:rgba(255,90,90,0.15)"><span style="position:absolute;inset:0;width:93%;background:#FF5A5A;border-radius:2px"></span></span>
+                <span style="color:var(--text-3)">/ 200k</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <p><b>Meter turns red</b> past 90% of the cap. Everything else dims slightly so the warning reads first.</p>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ============ TOKENS ============ -->
+  <div class="sec">
+    <div class="sec-title">Tokens</div>
+    <h2>Values for every measurable thing</h2>
+    <div class="spec-grid">
+
+      <div class="panel">
+        <h3>Dimensions</h3>
+        <ul>
+          <li><span class="k">bar H</span><span class="v">32px</span></li>
+          <li><span class="k">pad-x</span><span class="v">12px</span></li>
+          <li><span class="k">item gap</span><span class="v">14px (between groups)</span></li>
+          <li><span class="k">icon-text</span><span class="v">6px gap</span></li>
+          <li><span class="k">separator</span><span class="v">1 × 14px</span></li>
+          <li><span class="k">icon</span><span class="v">12×12 · stroke 1.4</span></li>
+          <li><span class="k">dot</span><span class="v">6×6</span></li>
+          <li><span class="k">tok-bar</span><span class="v">40 × 4 · radius 2</span></li>
+          <li><span class="k">hit area</span><span class="v">full bar height (32px)</span></li>
+        </ul>
+      </div>
+
+      <div class="panel">
+        <h3>Colors</h3>
+        <ul>
+          <li><span class="k"><span class="swatch" style="background:#0A0A0A"></span>bar bg</span><span class="v">#0A0A0A</span></li>
+          <li><span class="k"><span class="swatch" style="background:#1F1F1F"></span>top border / sep</span><span class="v">#1F1F1F</span></li>
+          <li><span class="k"><span class="swatch" style="background:#fff"></span>primary text</span><span class="v">#FFFFFF (b)</span></li>
+          <li><span class="k"><span class="swatch" style="background:#A0A0A0"></span>secondary</span><span class="v">#A0A0A0</span></li>
+          <li><span class="k"><span class="swatch" style="background:#606060"></span>meta / off</span><span class="v">#606060</span></li>
+          <li><span class="k"><span class="swatch" style="background:#0099FF"></span>accent / meter</span><span class="v">#0099FF</span></li>
+          <li><span class="k"><span class="swatch" style="background:#4BD87B"></span>idle</span><span class="v">#4BD87B</span></li>
+          <li><span class="k"><span class="swatch" style="background:#FF5A5A"></span>error / cap</span><span class="v">#FF5A5A</span></li>
+        </ul>
+      </div>
+
+      <div class="panel">
+        <h3>Type &amp; motion</h3>
+        <ul>
+          <li><span class="k">primary</span><span class="v">JB Mono · 11.5px · 500</span></li>
+          <li><span class="k">secondary</span><span class="v">JB Mono · 11.5px · 400</span></li>
+          <li><span class="k">branch</span><span class="v">Inter 500 · 11.5px · #fff</span></li>
+          <li><span class="k">tracking</span><span class="v">-0.005em</span></li>
+          <li><span class="k">hover</span><span class="v">bg #141414 · 120ms</span></li>
+          <li><span class="k">runtime tick</span><span class="v">1Hz · tabular-nums</span></li>
+          <li><span class="k">meter fill</span><span class="v">300ms ease-out</span></li>
+          <li><span class="k">pulse</span><span class="v">1.4s · ease-in-out · infinite</span></li>
+        </ul>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ============ BUILD NOTES ============ -->
+  <div class="sec">
+    <div class="sec-title">Build notes</div>
+    <h2>Things that aren't obvious from the pixels</h2>
+
+    <div class="notes">
+      <div class="note">
+        <span class="t">Window-global, session-scoped</span>
+        One bar per window. Left cluster reads from the <b>focused session</b> (branch, git, diagnostics, model, tokens, runtime). Right-side agent roll-up reads <b>workspace-wide</b>. Don't mix scopes within a cluster.
+      </div>
+      <div class="note">
+        <span class="t">Items hide, they don't placeholder</span>
+        Zero counts collapse entirely — no "0 errors" chip. The bar gets quieter when nothing's wrong, louder when it is. This is a feature; it makes anomalies pop.
+      </div>
+      <div class="note">
+        <span class="t">Everything is clickable</span>
+        Every segment is a button with a 32px hit area. Branch → context menu · git → Diff panel · remote → Pull/Push · errors/warnings → Diagnostics panel · model → switcher · tokens → Context inspector · roll-up → Overview · bell → Notifications.
+      </div>
+      <div class="note">
+        <span class="t">Icons are line, not filled</span>
+        12px, 1.4 stroke, rounded caps/joins — matches the rest of the chrome. Don't pull from a filled-icon set; the density will feel wrong at this size.
+      </div>
+      <div class="note">
+        <span class="t">Separators are structural, not decorative</span>
+        Hairlines between <i>clusters</i> (session context · diagnostics · model · agents · notifications), never between every item. Internal items share a gap of 14px, cluster boundaries add the 1×14 separator.
+      </div>
+      <div class="note">
+        <span class="t">Overflow</span>
+        If width is tight (narrow window), collapse from the middle outward: runtime → warnings → remote → model name (becomes icon-only with tooltip). Branch, error count, and agent roll-up never collapse.
+      </div>
+      <div class="note">
+        <span class="t">Don't animate the bar itself</span>
+        Ticking numbers (tokens, runtime) use <code>font-variant-numeric: tabular-nums</code> so digits don't jitter. The meter fills with a 300ms transition; everything else is static. The bar is a reference; it shouldn't compete with the terminal.
+      </div>
+      <div class="note">
+        <span class="t">Tooltip on every cluster</span>
+        300ms delay, dark popover above the bar. Expands the terse value: "+3 additions, −1 deletion across 2 files" — so novices can learn the vocabulary and experts get the short form.
+      </div>
+    </div>
+
+    <div class="impl">
+      <h3>Suggested component shape</h3>
+<pre><span class="c">// One bar per window. Reads from focused session + workspace.</span>
+
+<span class="k">type</span> <span class="t">GitState</span> = {
+  <span class="t">dirty</span>: { added: number; removed: number };
+  <span class="t">remote</span>: { ahead: number; behind: number } | <span class="s">"detached"</span>;
+};
+
+<span class="k">type</span> <span class="t">Diagnostics</span> = { errors: number; warnings: number };
+
+<span class="k">type</span> <span class="t">SessionCtx</span> = {
+  <span class="t">branch</span>: string;
+  <span class="t">status</span>: <span class="s">"active"</span> | <span class="s">"idle"</span> | <span class="s">"wait"</span>;
+  <span class="t">model</span>: string;                <span class="c">// "claude-sonnet-4-5"</span>
+  <span class="t">tokens</span>: { used: number; cap: number };
+  <span class="t">runtimeSec</span>: number | null;   <span class="c">// null when idle</span>
+};
+
+<span class="k">type</span> <span class="t">AgentRollup</span> = { active: number; idle: number; wait: number };
+
+<span class="k">type</span> <span class="t">StatusBarProps</span> = {
+  <span class="t">session</span>: SessionCtx;
+  <span class="t">git</span>: GitState;
+  <span class="t">diagnostics</span>: Diagnostics;
+  <span class="t">agents</span>: AgentRollup;            <span class="c">// workspace-wide</span>
+  <span class="t">unreadNotifications</span>: number;
+
+  <span class="t">onBranchClick</span>(): void;
+  <span class="t">onDiffClick</span>(): void;
+  <span class="t">onRemoteClick</span>(): void;
+  <span class="t">onDiagnosticsClick</span>(severity: <span class="s">"error"</span> | <span class="s">"warn"</span>): void;
+  <span class="t">onModelClick</span>(): void;
+  <span class="t">onTokensClick</span>(): void;
+  <span class="t">onOverviewClick</span>(): void;
+  <span class="t">onNotificationsClick</span>(): void;
+};
+
+<span class="c">// DOM:
+//   &lt;footer class="sb"&gt;
+//     &lt;Cluster id="session"&gt;
+//       &lt;Branch /&gt; &lt;Sep /&gt; &lt;Git /&gt; &lt;Sep /&gt; &lt;Remote /&gt;
+//     &lt;/Cluster&gt;
+//     &lt;Sep /&gt;
+//     &lt;Cluster id="diagnostics"&gt;
+//       &lt;Errors /&gt; &lt;Warnings /&gt;
+//     &lt;/Cluster&gt;
+//     &lt;Spacer /&gt;                         ← margin-left: auto
+//     &lt;Cluster id="model"&gt;&lt;Model /&gt;&lt;Tokens /&gt;&lt;/Cluster&gt;
+//     &lt;Sep /&gt;
+//     &lt;Cluster id="turn"&gt;&lt;Runtime /&gt;&lt;Agents /&gt;&lt;/Cluster&gt;
+//     &lt;Sep /&gt;
+//     &lt;Bell /&gt;
+//   &lt;/footer&gt;</span></pre>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>

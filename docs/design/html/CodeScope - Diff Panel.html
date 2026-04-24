@@ -1,0 +1,591 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>CodeScope — Diff Panel</title>
+<meta name="viewport" content="width=1440" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+<style>
+  :root {
+    --bg: #000;
+    --panel: #0A0A0A;
+    --elev: #141414;
+    --hover: #1F1F1F;
+    --border: #1F1F1F;
+    --text: #fff;
+    --text-2: #A0A0A0;
+    --text-3: #606060;
+    --accent: #0099FF;
+    /* muted semantic */
+    --add-bg: rgba(82, 168, 104, 0.08);
+    --add-edge: rgba(82, 168, 104, 0.55);
+    --add-text: #9DD9B0;
+    --del-bg: rgba(220, 95, 95, 0.08);
+    --del-edge: rgba(220, 95, 95, 0.5);
+    --del-text: #E49A9A;
+    --code-str: #8FD679;
+    --code-type: #E8A857;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #000; color: #fff;
+    font-family: 'Inter', -apple-system, system-ui, sans-serif;
+    font-feature-settings: "cv01","cv05","cv09","cv11","ss03","ss07";
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+  }
+  body { display: flex; align-items: center; justify-content: center; }
+
+  .app-shell {
+    width: 1440px; height: 900px;
+    background: #000;
+    display: grid;
+    grid-template-columns: 240px 1fr 400px;
+    grid-template-rows: 40px 1fr 32px;
+    grid-template-areas:
+      "sidebar tabs     diffhead"
+      "sidebar terminal diff"
+      "sidebar statusb  statusb";
+    overflow: hidden;
+    border: 1px solid #1F1F1F;
+    border-radius: 8px;
+    position: relative;
+  }
+
+  /* ===== sidebar stub ===== */
+  .sidebar {
+    grid-area: sidebar;
+    grid-row: 1 / span 3;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column;
+  }
+  .brand {
+    height: 48px;
+    padding: 0 12px;
+    display: flex; align-items: center; gap: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .brand-mark {
+    width: 14px; height: 14px; border-radius: 4px;
+    background: var(--accent);
+    box-shadow: 0 0 0 3px rgba(0,153,255,0.12);
+    position: relative;
+  }
+  .brand-mark::after {
+    content:""; position:absolute; inset:3px 3px auto auto;
+    width:4px; height:4px; border-radius:1px; background:#000;
+  }
+  .brand-word { font-weight: 600; font-size: 16px; letter-spacing: -0.01em; }
+  .side-label {
+    padding: 16px 12px 8px; font-size: 10px; font-weight: 500;
+    letter-spacing: 0.12em; text-transform: uppercase; color: var(--text-3);
+  }
+  .proj {
+    display: flex; align-items: center; gap: 8px;
+    height: 36px; padding: 0 12px;
+    font-size: 13px; font-weight: 500; color: #fff;
+  }
+  .proj .chev {
+    width: 10px; height: 10px; color: var(--text-2);
+    transform: rotate(90deg);
+  }
+  .wt {
+    height: 28px; padding: 0 12px 0 36px;
+    display: flex; align-items: center; gap: 8px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11.5px; color: var(--text-2);
+    position: relative;
+  }
+  .wt.active { background: var(--elev); color: #fff; }
+  .wt .bar { position: absolute; left: 0; top: 0; bottom: 0; width: 2px; background: var(--accent); }
+
+  /* ===== tabs ===== */
+  .tabs {
+    grid-area: tabs;
+    height: 40px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: stretch;
+    padding: 0 4px; gap: 2px;
+  }
+  .tab {
+    display: flex; align-items: center; gap: 8px;
+    min-width: 160px; padding: 0 12px; margin: 4px 0;
+    border-radius: 6px;
+    color: rgba(255,255,255,0.7);
+    font: 500 13px/1 'Inter', sans-serif;
+    letter-spacing: -0.005em;
+    position: relative;
+  }
+  .tab.active { background: #000; color: #fff; }
+  .tab.active::before {
+    content:""; position:absolute; left:-4px; right:-4px; top:-4px; height:2px;
+    background: var(--accent); border-radius: 2px;
+    box-shadow: 0 0 12px rgba(0,153,255,0.45);
+  }
+  .tab .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 3px rgba(0,153,255,0.18); }
+
+  /* ===== terminal (left of diff) ===== */
+  .terminal {
+    grid-area: terminal;
+    background: #000;
+    padding: 18px 22px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px; line-height: 1.55;
+    color: var(--text-2);
+    overflow: hidden;
+    border-right: 1px solid var(--border);
+  }
+  .terminal .user { color: var(--accent); }
+  .terminal .dim  { color: var(--text-3); }
+  .terminal .w    { color: #fff; }
+  .terminal .cursor {
+    display: inline-block; width: 2px; height: 1.05em;
+    background: var(--accent); vertical-align: -2px;
+    animation: blink 1.05s steps(2,start) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  /* ===== DIFF HEADER ===== */
+  .diff-head {
+    grid-area: diffhead;
+    height: 40px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    border-left: 1px solid var(--border);
+    display: flex; align-items: center;
+    padding: 0 12px; gap: 10px;
+  }
+  .diff-head .title {
+    font-size: 12px; font-weight: 500; color: #fff;
+    letter-spacing: -0.005em;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .diff-head .count {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10.5px; color: var(--text-3);
+  }
+  .diff-head .spacer { flex: 1 1 auto; }
+  .icon-btn {
+    width: 26px; height: 26px; border-radius: 5px;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--text-2);
+    cursor: pointer;
+    transition: background 120ms ease-out, color 120ms ease-out;
+  }
+  .icon-btn:hover { background: var(--hover); color: #fff; }
+  .icon-btn.active { background: var(--elev); color: var(--accent); }
+  .seg {
+    display: flex; background: var(--elev); border-radius: 5px; padding: 2px;
+    height: 26px;
+  }
+  .seg > div {
+    font-size: 11px; font-weight: 500;
+    padding: 0 10px; border-radius: 3px;
+    display: flex; align-items: center;
+    color: var(--text-2); cursor: pointer;
+    letter-spacing: -0.005em;
+  }
+  .seg > div.on { background: #000; color: #fff; box-shadow: inset 0 0 0 1px var(--border); }
+
+  /* ===== DIFF PANEL ===== */
+  .diff {
+    grid-area: diff;
+    background: #050505;
+    border-left: 1px solid var(--border);
+    display: flex; flex-direction: column;
+    min-height: 0;
+  }
+  /* file tab strip inside diff */
+  .diff-files {
+    display: flex; gap: 2px;
+    padding: 6px;
+    background: #070707;
+    border-bottom: 1px solid var(--border);
+    overflow: hidden;
+  }
+  .diff-file {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 10px;
+    border-radius: 5px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--text-2);
+    cursor: pointer;
+    max-width: 160px;
+    transition: background 120ms ease-out, color 120ms ease-out;
+  }
+  .diff-file:hover { background: var(--hover); color: #fff; }
+  .diff-file.active { background: var(--elev); color: #fff; }
+  .diff-file .nm { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .diff-file .dd { display: flex; gap: 4px; margin-left: auto; flex: 0 0 auto; }
+  .diff-file .add-n { color: var(--add-text); font-size: 10px; }
+  .diff-file .del-n { color: var(--del-text); font-size: 10px; }
+
+  /* file header (path + stats) */
+  .file-bar {
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 10px;
+    background: #080808;
+  }
+  .file-bar .path {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11.5px; color: #fff;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    flex: 1 1 auto;
+  }
+  .file-bar .dir { color: var(--text-3); }
+  .stats {
+    display: flex; align-items: center; gap: 6px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+  }
+  .stats .add { color: var(--add-text); }
+  .stats .del { color: var(--del-text); }
+  .stats .bars { display: flex; gap: 1px; }
+  .stats .bar {
+    width: 4px; height: 8px; background: var(--border); border-radius: 1px;
+  }
+  .stats .bar.add { background: var(--add-edge); }
+  .stats .bar.del { background: var(--del-edge); }
+
+  /* diff body */
+  .diff-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12.5px;
+    line-height: 1.55;
+  }
+  .hunk-head {
+    display: flex; align-items: center;
+    padding: 6px 12px;
+    background: rgba(0,153,255,0.05);
+    border-top: 1px solid rgba(0,153,255,0.18);
+    border-bottom: 1px solid rgba(0,153,255,0.18);
+    color: var(--accent);
+    font-size: 11px;
+    letter-spacing: -0.005em;
+    user-select: none;
+  }
+  .hunk-head .label {
+    flex: 1 1 auto;
+    color: var(--text-2);
+    padding-left: 10px;
+  }
+  .hunk-head .range {
+    color: var(--accent);
+  }
+
+  .row {
+    display: grid;
+    grid-template-columns: 36px 36px 14px 1fr;
+    min-height: 20px;
+    align-items: center;
+    position: relative;
+  }
+  .row .ln, .row .ln-new {
+    color: var(--accent);
+    opacity: 0.75;
+    font-size: 11px;
+    text-align: right;
+    padding-right: 10px;
+    user-select: none;
+  }
+  .row .ln { border-right: 1px solid #0F0F0F; }
+  .row .marker {
+    text-align: center;
+    color: var(--text-3);
+    font-weight: 600;
+    user-select: none;
+  }
+  .row .code {
+    padding-right: 16px;
+    padding-left: 4px;
+    white-space: pre;
+    color: #fff;
+    overflow-x: auto;
+  }
+
+  .row.add { background: var(--add-bg); }
+  .row.add::before {
+    content: ""; position: absolute;
+    left: 72px; top: 0; bottom: 0; width: 2px;
+    background: var(--add-edge);
+  }
+  .row.add .marker { color: var(--add-text); }
+
+  .row.del { background: var(--del-bg); }
+  .row.del::before {
+    content: ""; position: absolute;
+    left: 72px; top: 0; bottom: 0; width: 2px;
+    background: var(--del-edge);
+  }
+  .row.del .marker { color: var(--del-text); }
+  .row.del .ln-new { opacity: 0; }
+  .row.add .ln     { opacity: 0; }
+
+  .row.ctx .ln, .row.ctx .ln-new { color: var(--accent); opacity: 0.45; }
+  .row.ctx .code { color: var(--text-2); }
+
+  /* syntax */
+  .k { color: var(--accent); }
+  .t { color: var(--code-type); }
+  .s { color: var(--code-str); }
+  .c { color: var(--text-3); font-style: italic; }
+  .n { color: #fff; }
+  .fn { color: #fff; }
+
+  /* inline-change highlight — word-level shimmer for del → add */
+  .hl-del { background: rgba(220,95,95,0.22); border-radius: 2px; padding: 0 1px; }
+  .hl-add { background: rgba(82,168,104,0.22); border-radius: 2px; padding: 0 1px; }
+
+  /* diff foot actions */
+  .diff-foot {
+    padding: 10px 12px;
+    border-top: 1px solid var(--border);
+    background: #080808;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .btn {
+    height: 30px; padding: 0 12px;
+    border-radius: 5px; border: 0; cursor: pointer;
+    font: 500 12px/1 'Inter', sans-serif;
+    letter-spacing: -0.005em;
+    display: inline-flex; align-items: center; gap: 6px;
+    transition: background 120ms ease-out, color 120ms ease-out;
+  }
+  .btn-ghost { background: transparent; color: var(--text-2); }
+  .btn-ghost:hover { background: var(--hover); color: #fff; }
+  .btn-primary { background: var(--accent); color: #000; font-weight: 600; }
+  .btn-primary:hover { background: #29A8FF; }
+  .foot-meta {
+    flex: 1 1 auto;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10.5px;
+    color: var(--text-3);
+  }
+  .kbd {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    background: rgba(0,0,0,0.22);
+    padding: 2px 5px; border-radius: 3px;
+    color: rgba(0,0,0,0.7);
+  }
+
+  /* status bar */
+  .statusbar {
+    grid-area: statusb;
+    grid-column: 2 / span 2;
+    height: 32px;
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    display: flex; align-items: center;
+    padding: 0 12px; gap: 16px;
+    font-size: 12px;
+  }
+  .dot-b { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 3px rgba(0,153,255,0.15); }
+  .branch { font-family: 'JetBrains Mono', monospace; font-size: 11.5px; color: #fff; }
+  .muted { color: var(--text-2); }
+  .changes {
+    color: var(--text-2); padding-bottom: 1px;
+    border-bottom: 1px solid rgba(0,153,255,0.4);
+    cursor: pointer;
+  }
+  .changes.on { color: var(--accent); border-bottom-color: var(--accent); }
+  .statusbar .right { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+  .dot-g { width: 6px; height: 6px; border-radius: 50%; background: #4BD87B; }
+
+  /* spec sticker */
+  .sticker {
+    position: absolute;
+    left: 260px; top: 56px;
+    background: rgba(10,10,10,0.85);
+    border: 1px solid #1F1F1F;
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-size: 10.5px;
+    color: var(--text-2);
+    font-family: 'JetBrains Mono', monospace;
+    letter-spacing: 0;
+    backdrop-filter: blur(6px);
+    z-index: 10;
+    max-width: 320px;
+  }
+  .sticker b { color: var(--accent); font-weight: 500; }
+</style>
+</head>
+<body>
+
+<div class="app-shell" data-screen-label="01 Diff panel docked right">
+
+  <!-- sidebar -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark"></div>
+      <div class="brand-word">CodeScope</div>
+    </div>
+    <div class="side-label">Projects</div>
+    <div class="proj">
+      <svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M4.5 3 L8 6 L4.5 9" /></svg>
+      PestScope
+    </div>
+    <div class="wt">main</div>
+    <div class="wt active"><span class="bar"></span>feat/reporting</div>
+  </aside>
+
+  <!-- tabs -->
+  <div class="tabs">
+    <div class="tab active"><span class="dot"></span>PestScope · feat/reporting</div>
+  </div>
+
+  <!-- terminal (left half below tabs) -->
+  <div class="terminal">
+    <div><span class="dim">●</span> session · <span class="w">feat/reporting</span></div>
+    <div style="height:8px"></div>
+    <div><span class="user">&gt;</span>&nbsp;implement CSV export for reports</div>
+    <div style="height:6px"></div>
+    <div>Writing <span class="w">CsvWriter</span> helper and wiring the endpoint on <span class="w">ReportsController</span>.</div>
+    <div style="height:12px"></div>
+    <div class="dim">— edited src/Pest.Api/Controllers/ReportsController.cs  +34 −0</div>
+    <div class="dim">— created src/Pest.Api/Export/Csv.cs                +12 −0</div>
+    <div style="height:12px"></div>
+    <div>Running <span class="w">dotnet build</span>…</div>
+    <div class="dim">Build succeeded. 0 Warning(s) · 0 Error(s)</div>
+    <div style="height:18px"></div>
+    <div><span class="user">&gt;</span>&nbsp;add a test that csv escapes quotes correctly<span class="cursor"></span></div>
+  </div>
+
+  <!-- diff header -->
+  <div class="diff-head">
+    <div class="title">
+      Diff
+      <span class="count">· 2 files · <span style="color:var(--add-text)">+46</span> <span style="color:var(--del-text)">−2</span></span>
+    </div>
+    <div class="spacer"></div>
+    <div class="seg" title="View mode">
+      <div class="on">Unified</div>
+      <div>Split</div>
+    </div>
+    <div class="icon-btn" title="Collapse unchanged">
+      <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"><path d="M3 5h8M3 9h8M5 3l2-2 2 2M5 11l2 2 2-2"/></svg>
+    </div>
+    <div class="icon-btn" title="Dock / undock">
+      <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.2"><rect x="1.5" y="1.5" width="11" height="11" rx="1.5"/><path d="M8 1.5v11"/></svg>
+    </div>
+    <div class="icon-btn" title="Close panel">
+      <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"><path d="M2 2l6 6M8 2l-6 6"/></svg>
+    </div>
+  </div>
+
+  <!-- diff panel -->
+  <section class="diff">
+    <!-- file tabs within the diff -->
+    <div class="diff-files">
+      <div class="diff-file active">
+        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.1"><path d="M2 1.5h4L8 3.5v5a.7.7 0 0 1-.7.7H2.7A.7.7 0 0 1 2 8.5v-7z"/><path d="M6 1.5v2h2"/></svg>
+        <span class="nm">ReportsController.cs</span>
+        <span class="dd">
+          <span class="add-n">+34</span>
+          <span class="del-n">−2</span>
+        </span>
+      </div>
+      <div class="diff-file">
+        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.1"><path d="M2 1.5h4L8 3.5v5a.7.7 0 0 1-.7.7H2.7A.7.7 0 0 1 2 8.5v-7z"/><path d="M6 1.5v2h2"/></svg>
+        <span class="nm">Csv.cs</span>
+        <span class="dd"><span class="add-n">+12</span></span>
+      </div>
+    </div>
+
+    <!-- active file header -->
+    <div class="file-bar">
+      <span class="path"><span class="dir">src/Pest.Api/Controllers/</span>ReportsController.cs</span>
+      <div class="stats">
+        <span class="add">+34</span>
+        <span class="del">−2</span>
+        <span class="bars">
+          <span class="bar add"></span><span class="bar add"></span><span class="bar add"></span>
+          <span class="bar add"></span><span class="bar del"></span>
+        </span>
+      </div>
+    </div>
+
+    <!-- diff body -->
+    <div class="diff-body">
+      <div class="hunk-head">
+        <span class="range">@@ −38,6 +38,38 @@</span>
+        <span class="label">public class ReportsController : ControllerBase</span>
+      </div>
+
+      <div class="row ctx"><div class="ln">38</div><div class="ln-new">38</div><div class="marker"> </div><div class="code">    <span class="k">public async</span> <span class="t">Task</span>&lt;<span class="t">IActionResult</span>&gt; <span class="fn">Get</span>(<span class="t">Guid</span> id, <span class="t">CancellationToken</span> ct)</div></div>
+      <div class="row ctx"><div class="ln">39</div><div class="ln-new">39</div><div class="marker"> </div><div class="code">    {'{'}</div></div>
+      <div class="row ctx"><div class="ln">40</div><div class="ln-new">40</div><div class="marker"> </div><div class="code">        <span class="k">var</span> report = <span class="k">await</span> _reports.<span class="fn">GetAsync</span>(id, ct);</div></div>
+      <div class="row del"><div class="ln">41</div><div class="ln-new"></div><div class="marker">−</div><div class="code">        <span class="k">return</span> report <span class="k">is null</span> ? <span class="hl-del">NotFound()</span> : Ok(report);</div></div>
+      <div class="row add"><div class="ln"></div><div class="ln-new">41</div><div class="marker">+</div><div class="code">        <span class="k">return</span> report <span class="k">is null</span> ? <span class="hl-add">NotFound() : Ok(report.ToDto())</span>;</div></div>
+      <div class="row ctx"><div class="ln">42</div><div class="ln-new">42</div><div class="marker"> </div><div class="code">    {'}'}</div></div>
+      <div class="row ctx"><div class="ln">43</div><div class="ln-new">43</div><div class="marker"> </div><div class="code"></div></div>
+      <div class="row add"><div class="ln"></div><div class="ln-new">44</div><div class="marker">+</div><div class="code">    <span class="c">// Stream CSV so large reports never buffer in memory.</span></div></div>
+      <div class="row add"><div class="ln"></div><div class="ln-new">45</div><div class="marker">+</div><div class="code">    <span class="k">[HttpGet</span>(<span class="s">"{`{id}`}/export.csv"</span>)<span class="k">]</span></div></div>
+      <div class="row add"><div class="ln"></div><div class="ln-new">46</div><div class="marker">+</div><div class="code">    <span class="k">public async</span> <span class="t">Task</span>&lt;<span class="t">IActionResult</span>&gt; <span class="fn">ExportCsv</span>(<span class="t">Guid</span> id, <span class="t">CancellationToken</span> ct)</div></div>
+      <div class="row add"><div class="ln"></div><div class="ln-new">47</div><div class="marker">+</div><div class="code">    {'{'}</div></div>
+      <div class="row add"><div class="ln"></div><div class="ln-new">48</div><div class="marker">+</div><div class="code">        <span class="k">var</span> report = <span class="k">await</span> _reports.<span class="fn">GetAsync</span>(id, ct);</div></div>
+      <div class="row add"><div class="ln"></div><div class="ln-new">49</div><div class="marker">+</div><div class="code">        <span class="k">if</span> (report <span class="k">is null</span>) <span class="k">return</span> <span class="fn">NotFound</span>();</div></div>
+      <div class="row add"><div class="ln"></div><div class="ln-new">50</div><div class="marker">+</div><div class="code"></div></div>
+      <div class="row add"><div class="ln"></div><div class="ln-new">51</div><div class="marker">+</div><div class="code">        <span class="k">var</span> sb = <span class="k">new</span> <span class="t">StringBuilder</span>();</div></div>
+      <div class="row add"><div class="ln"></div><div class="ln-new">52</div><div class="marker">+</div><div class="code">        sb.<span class="fn">AppendLine</span>(<span class="s">"Site,Technician,Date,Finding,Severity"</span>);</div></div>
+      <div class="row add"><div class="ln"></div><div class="ln-new">53</div><div class="marker">+</div><div class="code">        <span class="k">foreach</span> (<span class="k">var</span> row <span class="k">in</span> report.Findings)</div></div>
+      <div class="row add"><div class="ln"></div><div class="ln-new">54</div><div class="marker">+</div><div class="code">        {'{'}</div></div>
+      <div class="row add"><div class="ln"></div><div class="ln-new">55</div><div class="marker">+</div><div class="code">            sb.<span class="fn">Append</span>(<span class="fn">Csv</span>.<span class="fn">Escape</span>(row.Site)).<span class="fn">Append</span>(<span class="s">","</span>);</div></div>
+      <div class="row add"><div class="ln"></div><div class="ln-new">56</div><div class="marker">+</div><div class="code">            sb.<span class="fn">Append</span>(<span class="fn">Csv</span>.<span class="fn">Escape</span>(row.Technician)).<span class="fn">Append</span>(<span class="s">","</span>);</div></div>
+      <div class="row add"><div class="ln"></div><div class="ln-new">57</div><div class="marker">+</div><div class="code">            sb.<span class="fn">Append</span>(row.Date.<span class="fn">ToString</span>(<span class="s">"yyyy-MM-dd"</span>)).<span class="fn">Append</span>(<span class="s">","</span>);</div></div>
+      <div class="row add"><div class="ln"></div><div class="ln-new">58</div><div class="marker">+</div><div class="code">            sb.<span class="fn">Append</span>(<span class="fn">Csv</span>.<span class="fn">Escape</span>(row.Finding)).<span class="fn">Append</span>(<span class="s">","</span>);</div></div>
+      <div class="row add"><div class="ln"></div><div class="ln-new">59</div><div class="marker">+</div><div class="code">            sb.<span class="fn">AppendLine</span>(row.Severity.<span class="fn">ToString</span>());</div></div>
+      <div class="row add"><div class="ln"></div><div class="ln-new">60</div><div class="marker">+</div><div class="code">        {'}'}</div></div>
+      <div class="row add"><div class="ln"></div><div class="ln-new">61</div><div class="marker">+</div><div class="code"></div></div>
+      <div class="row add"><div class="ln"></div><div class="ln-new">62</div><div class="marker">+</div><div class="code">        <span class="k">var</span> bytes = <span class="t">Encoding</span>.UTF8.<span class="fn">GetBytes</span>(sb.<span class="fn">ToString</span>());</div></div>
+      <div class="row add"><div class="ln"></div><div class="ln-new">63</div><div class="marker">+</div><div class="code">        <span class="k">return</span> <span class="fn">File</span>(bytes, <span class="s">"text/csv"</span>, <span class="s">$"report-{'{'}id{'}'}.csv"</span>);</div></div>
+      <div class="row add"><div class="ln"></div><div class="ln-new">64</div><div class="marker">+</div><div class="code">    {'}'}</div></div>
+      <div class="row ctx"><div class="ln">42</div><div class="ln-new">65</div><div class="marker"> </div><div class="code">{'}'}</div></div>
+    </div>
+
+    <!-- foot -->
+    <div class="diff-foot">
+      <div class="foot-meta">HEAD → 8a4f2c1 · unstaged</div>
+      <button class="btn btn-ghost">Revert</button>
+      <button class="btn btn-primary">
+        Stage all
+        <span class="kbd">⌘ S</span>
+      </button>
+    </div>
+  </section>
+
+  <!-- status bar -->
+  <div class="statusbar">
+    <span class="dot-b"></span>
+    <span class="branch">feat/reporting</span>
+    <span class="changes on">Diff · 2 files</span>
+    <span class="muted" style="font-family:'JetBrains Mono',monospace;font-size:11px">claude-sonnet-4.5</span>
+    <div class="right">
+      <span class="dot-g"></span>
+      <span>PR #42</span>
+      <span style="color:var(--text-3)">·</span>
+      <span class="muted" style="font-family:'JetBrains Mono',monospace;font-size:11.5px">14:32</span>
+    </div>
+  </div>
+
+  <div class="sticker">
+    <b>diff panel</b> · 400px · right-dock · replaces terminal<br>
+    unified · muted add/del · blue line nrs · ⇧⌘D toggle
+  </div>
+
+</div>
+
+</body>
+</html>

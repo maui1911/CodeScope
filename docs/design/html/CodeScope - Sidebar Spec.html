@@ -1,0 +1,665 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>CodeScope — Sidebar Spec</title>
+<meta name="viewport" content="width=1600" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #000; --panel: #0A0A0A; --elev: #141414;
+    --border: #1F1F1F; --hover: #1F1F1F;
+    --text: #fff; --text-2: #A0A0A0; --text-3: #606060;
+    --accent: #0099FF; --ok: #4BD87B; --warn: #FF5A5A;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; min-height: 100%;
+    background: radial-gradient(1100px 600px at 20% 20%, rgba(0,153,255,0.05), transparent 60%), #000;
+    color: #fff;
+    font-family: 'Inter', -apple-system, system-ui, sans-serif;
+    font-feature-settings: "cv01","cv05","cv09","cv11","ss03","ss07";
+    -webkit-font-smoothing: antialiased;
+  }
+  .page { max-width: 1520px; margin: 0 auto; padding: 56px 48px 80px; }
+
+  .doc-head { margin-bottom: 40px; display: flex; align-items: flex-end; gap: 20px; }
+  .eyebrow {
+    font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--accent);
+    letter-spacing: 0.16em; text-transform: uppercase;
+    padding: 4px 8px; border: 1px solid rgba(0,153,255,0.3); border-radius: 3px;
+    background: rgba(0,153,255,0.05); align-self: flex-start; margin-top: 6px;
+  }
+  .doc-head h1 { font-size: 36px; font-weight: 600; letter-spacing: -0.02em; margin: 0; line-height: 1.1; }
+  .doc-head .sub {
+    margin-left: auto; color: var(--text-2); font-size: 13px;
+    max-width: 420px; line-height: 1.5; text-align: right;
+  }
+  .doc-head .sub b { color: #fff; font-weight: 500; }
+
+  /* annotated frame */
+  .frame {
+    position: relative;
+    background: #000;
+    border: 1px solid var(--border); border-radius: 10px;
+    padding: 56px 56px 56px 56px;
+    min-height: 900px;
+    overflow: hidden;
+  }
+  .frame::before {
+    content:""; position:absolute; inset:0;
+    background:
+      linear-gradient(to right, rgba(255,255,255,0.025) 1px, transparent 1px) 0 0 / 80px 80px,
+      linear-gradient(to bottom, rgba(255,255,255,0.025) 1px, transparent 1px) 0 0 / 80px 80px;
+    opacity: .5; pointer-events: none;
+  }
+
+  /* live sidebar subject */
+  .sidebar {
+    position: relative; z-index: 2;
+    width: 240px;
+    height: 780px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  .brand {
+    height: 48px; padding: 0 12px;
+    display: flex; align-items: center; gap: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .brand-mark {
+    width: 14px; height: 14px; border-radius: 4px;
+    background: var(--accent);
+    box-shadow: 0 0 0 3px rgba(0,153,255,0.12);
+    position: relative;
+  }
+  .brand-mark::after {
+    content:""; position:absolute; inset:3px 3px auto auto;
+    width:4px; height:4px; border-radius:1px; background:#000;
+  }
+  .brand-word { font-weight: 600; font-size: 16px; letter-spacing: -0.01em; }
+  .brand-version {
+    margin-left: auto; font-size: 10px; color: var(--text-3);
+    letter-spacing: 0.08em; text-transform: uppercase;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .side-label {
+    padding: 16px 12px 8px;
+    font-size: 10px; font-weight: 500;
+    letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--text-3);
+  }
+  .project {
+    display: flex; align-items: center; height: 36px;
+    padding: 0 12px; gap: 8px;
+    font-weight: 500; font-size: 13px; color: #fff;
+    letter-spacing: -0.005em;
+  }
+  .chev { width: 12px; height: 12px; color: var(--text-2); transition: transform 200ms ease-out; }
+  .project.open .chev { transform: rotate(90deg); }
+  .project .nm { flex: 1 1 auto; }
+  .count {
+    font-size: 11px; color: var(--accent);
+    font-variant-numeric: tabular-nums;
+  }
+  .wt {
+    height: 28px; padding: 0 12px 0 36px;
+    display: flex; align-items: center; gap: 8px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11.5px; color: var(--text-2);
+    position: relative;
+  }
+  .wt.active { background: var(--elev); color: #fff; font-weight: 500; }
+  .wt .bar { position: absolute; left: 0; top: 0; bottom: 0; width: 2px; background: transparent; }
+  .wt.has-session .bar, .wt.active .bar { background: var(--accent); }
+  .wt .meta {
+    margin-left: auto;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px; color: var(--text-3);
+  }
+  .wt .sdot { width: 6px; height: 6px; border-radius: 50%; flex: 0 0 6px; }
+  .sdot-active { background: var(--accent); box-shadow: 0 0 0 3px rgba(0,153,255,0.18); }
+  .sdot-idle { background: var(--ok); }
+  .sdot-wait { background: var(--warn); animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse {
+    0%,100% { box-shadow: 0 0 0 0 rgba(255,90,90,0.55); }
+    50%     { box-shadow: 0 0 0 5px rgba(255,90,90,0); }
+  }
+  .sidebar-foot {
+    margin-top: auto;
+    padding: 8px;
+    border-top: 1px solid var(--border);
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .ov-btn, .np-btn {
+    width: 100%; height: 36px;
+    background: var(--elev); border: 0; border-radius: 6px;
+    color: #fff; cursor: pointer;
+    font: 500 12.5px/1 'Inter', sans-serif;
+    letter-spacing: -0.005em;
+    display: flex; align-items: center; gap: 8px; padding: 0 12px;
+  }
+  .np-btn { height: 40px; border-left: 2px solid var(--accent); font-size: 13px; }
+  .ov-btn { color: var(--text-2); }
+  .ov-btn .kbd {
+    margin-left: auto; font-family: 'JetBrains Mono', monospace;
+    font-size: 10px; color: var(--text-3);
+    border: 1px solid var(--border); padding: 1px 5px; border-radius: 3px;
+  }
+
+  /* callouts */
+  .cx { position: absolute; inset: 0; z-index: 3; pointer-events: none; }
+  .cx .dot {
+    position: absolute; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--accent); box-shadow: 0 0 0 3px rgba(0,153,255,0.18);
+    transform: translate(-50%, -50%);
+  }
+  .cx .line { position: absolute; background: rgba(0,153,255,0.45); }
+  .cx .line.h { height: 1px; }
+  .cx .line.v { width: 1px; }
+  .cx .label {
+    position: absolute;
+    background: #0A0A0A; border: 1px solid #1F1F1F; border-radius: 6px;
+    padding: 10px 12px; width: 260px;
+    color: #fff; font-size: 12px; line-height: 1.5;
+    letter-spacing: -0.005em;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  }
+  .cx .label .num {
+    display: inline-block; width: 18px; height: 18px;
+    border-radius: 3px; background: var(--accent); color: #000;
+    font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 600;
+    text-align: center; line-height: 18px;
+    margin-right: 8px; vertical-align: 1px;
+  }
+  .cx .label b { font-weight: 600; }
+  .cx .label code {
+    font-family: 'JetBrains Mono', monospace; font-size: 10.5px;
+    color: var(--accent); background: rgba(0,153,255,0.08);
+    padding: 1px 5px; border-radius: 3px;
+  }
+  .cx .label .hint { display: block; color: var(--text-2); margin-top: 4px; font-size: 11.5px; }
+
+  /* state gallery / tokens — reused styling */
+  .sec { margin-top: 64px; }
+  .sec-title {
+    font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--accent);
+    letter-spacing: 0.16em; text-transform: uppercase; margin-bottom: 16px;
+  }
+  .sec h2 { font-size: 22px; font-weight: 600; letter-spacing: -0.015em; margin: 0 0 24px; }
+
+  .states { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+  .state {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px;
+  }
+  .state .stlabel {
+    font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--text-3);
+    letter-spacing: 0.14em; text-transform: uppercase; margin-bottom: 12px;
+  }
+  .state .preview {
+    background: #0A0A0A; border: 1px solid var(--border); border-radius: 6px;
+    margin-bottom: 12px; overflow: hidden;
+  }
+  .state p { margin: 0; font-size: 12px; color: var(--text-2); line-height: 1.5; }
+  .state p b { color: #fff; font-weight: 500; }
+
+  .spec-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 20px;
+  }
+  .panel h3 {
+    font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--accent);
+    letter-spacing: 0.16em; text-transform: uppercase; margin: 0 0 14px;
+  }
+  .panel ul { list-style: none; padding: 0; margin: 0; }
+  .panel li {
+    display: grid; grid-template-columns: 110px 1fr; gap: 10px;
+    padding: 8px 0; border-bottom: 1px solid #141414;
+    font-size: 12px; line-height: 1.4;
+  }
+  .panel li:last-child { border-bottom: 0; }
+  .panel li .k { font-family: 'JetBrains Mono', monospace; color: var(--text-3); font-size: 11px; }
+  .panel li .v { color: #E6E6E6; }
+  .swatch {
+    display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+    vertical-align: -1px; margin-right: 6px; border: 1px solid rgba(255,255,255,0.08);
+  }
+
+  .notes { margin-top: 40px; display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+  .note {
+    background: var(--panel); border: 1px solid var(--border);
+    border-left: 2px solid var(--accent);
+    border-radius: 6px; padding: 14px 16px;
+    font-size: 12.5px; line-height: 1.5; color: #E6E6E6;
+  }
+  .note b { color: #fff; }
+  .note .t {
+    display: block; font-family: 'JetBrains Mono', monospace; font-size: 10px;
+    color: var(--accent); letter-spacing: 0.14em; text-transform: uppercase; margin-bottom: 6px;
+  }
+
+  .impl {
+    margin-top: 48px; background: #070707; border: 1px solid var(--border);
+    border-radius: 8px; padding: 28px 32px;
+  }
+  .impl h3 {
+    font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--accent);
+    letter-spacing: 0.16em; text-transform: uppercase; margin: 0 0 16px;
+  }
+  .impl pre {
+    margin: 0; font-family: 'JetBrains Mono', monospace;
+    font-size: 12.5px; line-height: 1.65; color: #E6E6E6;
+    white-space: pre-wrap;
+  }
+  .impl .c { color: var(--text-3); font-style: italic; }
+  .impl .k { color: var(--accent); }
+  .impl .s { color: #8FD679; }
+  .impl .t { color: #E8A857; }
+
+  /* positioning anchor */
+  .frame-inner { position: relative; width: 100%; height: 100%; min-height: 780px; display: flex; }
+</style>
+</head>
+<body>
+<div class="page" data-screen-label="Sidebar — annotated spec">
+
+  <div class="doc-head">
+    <span class="eyebrow">Component spec</span>
+    <div>
+      <h1>Sidebar · projects &amp; worktrees</h1>
+    </div>
+    <div class="sub">
+      Handoff for implementation in Claude Code. The sidebar is a <b>window-global</b> surface — shared across all editor groups. It owns branding, the projects tree, and the global actions at the foot.
+    </div>
+  </div>
+
+  <!-- ============ ANNOTATED FRAME ============ -->
+  <div class="frame">
+    <div class="frame-inner">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark"></div>
+          <div class="brand-word">CodeScope</div>
+          <div class="brand-version">v0.4</div>
+        </div>
+
+        <div class="side-label">Projects</div>
+
+        <div class="project open">
+          <svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3 L8 6 L4.5 9"/></svg>
+          <span class="nm">PestScope</span>
+          <span class="count">2</span>
+        </div>
+        <div class="wt">
+          <span class="bar"></span>
+          <span class="sdot sdot-idle"></span>
+          <span>main</span>
+          <span class="meta">8a4f</span>
+        </div>
+        <div class="wt active has-session">
+          <span class="bar"></span>
+          <span class="sdot sdot-active"></span>
+          <span>feat/reporting</span>
+          <span class="meta">3</span>
+        </div>
+
+        <div class="project open">
+          <svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3 L8 6 L4.5 9"/></svg>
+          <span class="nm">SurveyScope</span>
+          <span class="count">1</span>
+        </div>
+        <div class="wt">
+          <span class="bar"></span>
+          <span class="sdot sdot-idle"></span>
+          <span>main</span>
+          <span class="meta">—</span>
+        </div>
+        <div class="wt has-session">
+          <span class="bar"></span>
+          <span class="sdot sdot-wait"></span>
+          <span>bugfix/auth</span>
+          <span class="meta">1</span>
+        </div>
+
+        <div class="project">
+          <svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3 L8 6 L4.5 9"/></svg>
+          <span class="nm">CodeScope</span>
+        </div>
+
+        <div class="sidebar-foot">
+          <button class="ov-btn">
+            Overview
+            <span class="kbd">⌃⇧ O</span>
+          </button>
+          <button class="np-btn">
+            <span style="color:var(--accent);font-family:'JetBrains Mono',monospace;font-size:13px">＋</span>
+            New Project
+          </button>
+        </div>
+      </aside>
+    </div>
+
+    <!-- ==== CALLOUTS ==== -->
+
+    <!-- 1. Whole rail -->
+    <div class="cx">
+      <div class="dot" style="left:296px;top:80px"></div>
+      <div class="line h" style="left:296px;top:80px;width:160px"></div>
+      <div class="label" style="left:466px;top:52px">
+        <span class="num">1</span><b>The rail</b>
+        <span class="hint">240px fixed width · <code>#0A0A0A</code> · 1px right <code>#1F1F1F</code>. Window-global: persists across all editor groups, never splits.</span>
+      </div>
+    </div>
+
+    <!-- 2. Brand row -->
+    <div class="cx">
+      <div class="dot" style="left:180px;top:104px"></div>
+      <div class="line h" style="left:180px;top:104px;width:276px"></div>
+      <div class="label" style="left:466px;top:78px">
+        <span class="num">2</span><b>Brand row</b>
+        <span class="hint">48px · logo 14×14 with <code>rgba(0,153,255,.12)</code> ring · "CodeScope" Inter 600 16px · version tag monospace 10px right-aligned.</span>
+      </div>
+    </div>
+
+    <!-- 3. Section label -->
+    <div class="cx">
+      <div class="dot" style="left:108px;top:152px"></div>
+      <div class="line h" style="left:108px;top:152px;width:348px"></div>
+      <div class="label" style="left:466px;top:128px">
+        <span class="num">3</span><b>Section label</b>
+        <span class="hint">Inter 500 10px · 0.12em tracking · <code>#606060</code>. 16/8 top/bottom pad — headline for the projects tree. Only one per sidebar.</span>
+      </div>
+    </div>
+
+    <!-- 4. Project row -->
+    <div class="cx">
+      <div class="dot" style="left:290px;top:188px"></div>
+      <div class="line h" style="left:290px;top:188px;width:166px"></div>
+      <div class="label" style="left:466px;top:164px">
+        <span class="num">4</span><b>Project row</b>
+        <span class="hint">36px · chevron (rotates 0→90° on open, 200ms) · name Inter 500 13px · count badge in <code>#0099FF</code>. Click anywhere to toggle.</span>
+      </div>
+    </div>
+
+    <!-- 5. Status bar (2px) -->
+    <div class="cx">
+      <div class="dot" style="left:57px;top:252px"></div>
+      <div class="line h" style="left:57px;top:252px;width:399px"></div>
+      <div class="label" style="left:466px;top:228px">
+        <span class="num">5</span><b>Session rail</b>
+        <span class="hint">2px bar on the left edge, <code>#0099FF</code> when the worktree has a live session OR is the active selection. Only accent on the rail at rest.</span>
+      </div>
+    </div>
+
+    <!-- 6. Worktree row active -->
+    <div class="cx">
+      <div class="dot" style="left:180px;top:280px"></div>
+      <div class="line h" style="left:180px;top:280px;width:276px"></div>
+      <div class="label" style="left:466px;top:256px">
+        <span class="num">6</span><b>Active worktree</b>
+        <span class="hint"><code>#141414</code> fill · Inter 500 (bump from 400) · JetBrains Mono 11.5px branch · right-side <b>changes count</b> in <code>#606060</code> monospace.</span>
+      </div>
+    </div>
+
+    <!-- 7. Status dot -->
+    <div class="cx">
+      <div class="dot" style="left:92px;top:280px"></div>
+      <div class="line h" style="left:92px;top:280px;width:4px"></div>
+      <div class="line v" style="left:96px;top:280px;height:90px"></div>
+      <div class="line h" style="left:96px;top:370px;width:360px"></div>
+      <div class="label" style="left:466px;top:346px">
+        <span class="num">7</span><b>Session state dot</b>
+        <span class="hint">6px · same semantics as the tab bar dot.
+          <span style="color:var(--accent)">●</span>active ·
+          <span style="color:var(--ok)">●</span>idle ·
+          <span style="color:var(--warn)">●</span>wait (pulses). Single source of truth — both surfaces read the same session state.</span>
+      </div>
+    </div>
+
+    <!-- 8. Worktree meta -->
+    <div class="cx">
+      <div class="dot" style="left:264px;top:308px"></div>
+      <div class="line h" style="left:264px;top:308px;width:192px"></div>
+      <div class="label" style="left:466px;top:440px">
+        <span class="num">8</span><b>Row meta</b>
+        <span class="hint">Right-aligned. Shows <b>uncommitted changes</b> (integer) or commit SHA short (monospace 10px, <code>#606060</code>). <code>—</code> for clean + no session.</span>
+      </div>
+    </div>
+
+    <!-- 9. Waiting branch emphasis -->
+    <div class="cx">
+      <div class="dot" style="left:92px;top:420px"></div>
+      <div class="line v" style="left:92px;top:420px;height:100px"></div>
+      <div class="line h" style="left:92px;top:520px;width:364px"></div>
+      <div class="label" style="left:466px;top:516px">
+        <span class="num">9</span><b>Attention propagates</b>
+        <span class="hint">When a worktree's session is <code>wait</code>, its red pulse shows here too — even if the project is collapsed, the project row surfaces a small red dot next to the count.</span>
+      </div>
+    </div>
+
+    <!-- 10. Footer - Overview -->
+    <div class="cx">
+      <div class="dot" style="left:180px;top:700px"></div>
+      <div class="line h" style="left:180px;top:700px;width:276px"></div>
+      <div class="label" style="left:466px;top:676px">
+        <span class="num">10</span><b>Overview toggle</b>
+        <span class="hint">36px · ghost button (<code>#141414</code>). Shows the <code>⌃⇧O</code> kbd chip right-aligned. Active state fills <code>#11161C</code> + 2px blue left rail.</span>
+      </div>
+    </div>
+
+    <!-- 11. Footer - New Project -->
+    <div class="cx">
+      <div class="dot" style="left:180px;top:756px"></div>
+      <div class="line h" style="left:180px;top:756px;width:276px"></div>
+      <div class="label" style="left:466px;top:732px">
+        <span class="num">11</span><b>New Project</b>
+        <span class="hint">40px · 2px <code>#0099FF</code> left rail · matches the accent glyph on the "＋" — signature CTA, always visible. Opens the New Project flow.</span>
+      </div>
+    </div>
+
+    <!-- 12. Footer divider -->
+    <div class="cx">
+      <div class="dot" style="left:120px;top:672px"></div>
+      <div class="line h" style="left:120px;top:672px;width:336px"></div>
+      <div class="label" style="left:466px;top:600px">
+        <span class="num">12</span><b>Foot anchor</b>
+        <span class="hint">8px pad · 1px top <code>#1F1F1F</code>. The projects tree grows + scrolls <i>above</i> the foot; foot is always pinned so the CTAs never get pushed out of reach.</span>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ============ WORKTREE ROW STATES ============ -->
+  <div class="sec">
+    <div class="sec-title">Worktree row states</div>
+    <h2>Five states the worktree row must handle</h2>
+    <div class="states">
+
+      <div class="state">
+        <div class="stlabel">Rest (no session)</div>
+        <div class="preview">
+          <div class="wt" style="padding-left:36px"><span class="bar"></span><span class="sdot" style="background:#2A2A2A"></span><span>main</span><span class="meta">—</span></div>
+        </div>
+        <p><b>Default.</b> No rail, dim dot. Branch exists but nothing's running. Row is the muted <code style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent)">#A0A0A0</code>.</p>
+      </div>
+
+      <div class="state">
+        <div class="stlabel">Has session · idle</div>
+        <div class="preview">
+          <div class="wt has-session" style="padding-left:36px"><span class="bar"></span><span class="sdot sdot-idle"></span><span>feat/billing</span><span class="meta">1</span></div>
+        </div>
+        <p><b>Agent idle.</b> Green dot + 2px accent rail. Running session exists but isn't streaming output.</p>
+      </div>
+
+      <div class="state">
+        <div class="stlabel">Active · streaming</div>
+        <div class="preview">
+          <div class="wt has-session active" style="padding-left:36px"><span class="bar"></span><span class="sdot sdot-active"></span><span>feat/reporting</span><span class="meta">3</span></div>
+        </div>
+        <p><b>Selected + working.</b> <code style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent)">#141414</code> bg, 500 weight, blue ringed dot. What the focused tab in the top bar points at.</p>
+      </div>
+
+      <div class="state">
+        <div class="stlabel">Waiting (attention)</div>
+        <div class="preview">
+          <div class="wt has-session" style="padding-left:36px"><span class="bar"></span><span class="sdot sdot-wait"></span><span>bugfix/auth</span><span class="meta">1</span></div>
+        </div>
+        <p><b>Agent paused on a question.</b> Red dot pulses 1.4s. Only moving element in the rail — movement = your turn.</p>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ============ TOKENS ============ -->
+  <div class="sec">
+    <div class="sec-title">Tokens</div>
+    <h2>Values for every measurable thing</h2>
+    <div class="spec-grid">
+
+      <div class="panel">
+        <h3>Dimensions</h3>
+        <ul>
+          <li><span class="k">rail W</span><span class="v">240px fixed</span></li>
+          <li><span class="k">brand H</span><span class="v">48px</span></li>
+          <li><span class="k">section label</span><span class="v">16/8 pad</span></li>
+          <li><span class="k">project H</span><span class="v">36px</span></li>
+          <li><span class="k">project pad</span><span class="v">0 12px · gap 8</span></li>
+          <li><span class="k">worktree H</span><span class="v">28px</span></li>
+          <li><span class="k">wt indent</span><span class="v">36px left pad</span></li>
+          <li><span class="k">session rail</span><span class="v">2px, full-height</span></li>
+          <li><span class="k">chevron</span><span class="v">12×12, rot 0→90°</span></li>
+          <li><span class="k">dot</span><span class="v">6×6</span></li>
+          <li><span class="k">foot pad</span><span class="v">8px</span></li>
+          <li><span class="k">ov-btn H</span><span class="v">36px</span></li>
+          <li><span class="k">np-btn H</span><span class="v">40px</span></li>
+        </ul>
+      </div>
+
+      <div class="panel">
+        <h3>Colors</h3>
+        <ul>
+          <li><span class="k"><span class="swatch" style="background:#0A0A0A"></span>rail bg</span><span class="v">#0A0A0A</span></li>
+          <li><span class="k"><span class="swatch" style="background:#141414"></span>row active / btn</span><span class="v">#141414</span></li>
+          <li><span class="k"><span class="swatch" style="background:#1F1F1F"></span>border / hover</span><span class="v">#1F1F1F</span></li>
+          <li><span class="k"><span class="swatch" style="background:#0099FF"></span>accent</span><span class="v">#0099FF</span></li>
+          <li><span class="k"><span class="swatch" style="background:#fff"></span>text</span><span class="v">#FFFFFF</span></li>
+          <li><span class="k"><span class="swatch" style="background:#A0A0A0"></span>wt rest</span><span class="v">#A0A0A0</span></li>
+          <li><span class="k"><span class="swatch" style="background:#606060"></span>label / meta</span><span class="v">#606060</span></li>
+          <li><span class="k"><span class="swatch" style="background:#4BD87B"></span>ok (idle)</span><span class="v">#4BD87B</span></li>
+          <li><span class="k"><span class="swatch" style="background:#FF5A5A"></span>warn (wait)</span><span class="v">#FF5A5A</span></li>
+        </ul>
+      </div>
+
+      <div class="panel">
+        <h3>Type &amp; motion</h3>
+        <ul>
+          <li><span class="k">brand word</span><span class="v">Inter 600 · 16px · -0.01em</span></li>
+          <li><span class="k">version</span><span class="v">JB Mono 10px · 0.08em UP</span></li>
+          <li><span class="k">section</span><span class="v">Inter 500 · 10px · 0.12em UP</span></li>
+          <li><span class="k">project</span><span class="v">Inter 500 · 13px · -0.005em</span></li>
+          <li><span class="k">count</span><span class="v">Inter 500 · 11px · accent · tnum</span></li>
+          <li><span class="k">worktree</span><span class="v">JB Mono · 11.5px · 500 active</span></li>
+          <li><span class="k">row meta</span><span class="v">JB Mono · 10px · #606060</span></li>
+          <li><span class="k">hover</span><span class="v">bg + color 120ms ease-out</span></li>
+          <li><span class="k">chevron</span><span class="v">rotate 200ms ease-out</span></li>
+          <li><span class="k">pulse</span><span class="v">1.4s ease-in-out infinite</span></li>
+        </ul>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ============ BUILD NOTES ============ -->
+  <div class="sec">
+    <div class="sec-title">Build notes</div>
+    <h2>Things that aren't obvious from the pixels</h2>
+
+    <div class="notes">
+      <div class="note">
+        <span class="t">Window-global</span>
+        The rail belongs to the window, not to any group. When the user splits the workspace into multiple editor groups, the sidebar does <b>not</b> duplicate. One rail, many groups.
+      </div>
+      <div class="note">
+        <span class="t">Tree scrolls, foot is pinned</span>
+        The projects tree takes <code>flex: 1 1 auto</code> with <code>overflow-y: auto</code>. The foot (<code>Overview</code> + <code>New Project</code>) is pinned via <code>margin-top: auto</code> on the foot + 1px top border. Never let project rows push past the foot.
+      </div>
+      <div class="note">
+        <span class="t">One accent, signaled twice</span>
+        The 2px session rail (left edge) and the 6px status dot both convey "this worktree has a session." Redundant but intentional — the rail scans at-a-glance vertically, the dot tells you <i>which</i> state.
+      </div>
+      <div class="note">
+        <span class="t">Active ≠ has-session</span>
+        A row can be <b>active</b> (selected in the UI) without having a session, and vice versa. Both trigger the blue rail, but only <code>active</code> gets the <code>#141414</code> fill. Keep them as two independent props.
+      </div>
+      <div class="note">
+        <span class="t">Counts and dots propagate up</span>
+        The project-row count badge is the number of <i>live sessions</i> in that project. If any child is in <code>wait</code>, the project row shows a tiny red dot next to the count — so a collapsed project still tells you it needs attention.
+      </div>
+      <div class="note">
+        <span class="t">Right-click</span>
+        Every worktree row has a context menu (see <b>Context Menu</b> frame). Opening it puts a subtle <code>#141414</code> fill + 1px <code>#2A2A2A</code> inset on the row so you know which target the menu acts on.
+      </div>
+      <div class="note">
+        <span class="t">Keyboard nav</span>
+        ↑↓ moves through flattened tree (projects + worktrees). ←/→ collapses/expands the parent. ↵ opens the selected worktree's session in the focused group. ⌘↵ opens in a new group.
+      </div>
+      <div class="note">
+        <span class="t">Empty state</span>
+        When the projects array is empty, the rail hides the tree + section label entirely. Only brand + foot remain; the main area shows the empty-state design.
+      </div>
+    </div>
+
+    <div class="impl">
+      <h3>Suggested component shape</h3>
+<pre><span class="c">// Window-global. Reads the workspace store, emits events.</span>
+
+<span class="k">type</span> <span class="t">SessionStatus</span> = <span class="s">"active"</span> | <span class="s">"idle"</span> | <span class="s">"wait"</span>;
+
+<span class="k">type</span> <span class="t">Worktree</span> = {
+  <span class="t">id</span>: string;
+  <span class="t">branch</span>: string;              <span class="c">// "feat/reporting"</span>
+  <span class="t">hasSession</span>: boolean;
+  <span class="t">status</span>?: SessionStatus;      <span class="c">// only if hasSession</span>
+  <span class="t">changes</span>: number;             <span class="c">// uncommitted; 0 → show "—" if no session</span>
+  <span class="t">sha</span>?: string;                <span class="c">// short 7-char; used for meta fallback</span>
+};
+
+<span class="k">type</span> <span class="t">Project</span> = {
+  <span class="t">id</span>: string;
+  <span class="t">name</span>: string;                <span class="c">// "PestScope"</span>
+  <span class="t">open</span>: boolean;               <span class="c">// expanded?</span>
+  <span class="t">worktrees</span>: Worktree[];
+};
+
+<span class="k">type</span> <span class="t">SidebarProps</span> = {
+  <span class="t">projects</span>: Project[];
+  <span class="t">activeWorktreeId</span>: string | null;
+  <span class="t">overviewOpen</span>: boolean;
+  <span class="t">onToggleProject</span>(id: string): void;
+  <span class="t">onSelectWorktree</span>(id: string): void;
+  <span class="t">onContextWorktree</span>(id: string, pos: {x:number;y:number}): void;
+  <span class="t">onNewProject</span>(): void;
+  <span class="t">onToggleOverview</span>(): void;
+};
+
+<span class="c">// DOM:
+//   &lt;aside class="sidebar"&gt;
+//     &lt;Brand /&gt;                              ← 48px, 1px bottom border
+//     &lt;div class="tree" /&gt;                   ← flex:1, overflow-y:auto
+//       &lt;SectionLabel&gt;Projects&lt;/SectionLabel&gt;
+//       &lt;ProjectRow /&gt; &lt;WorktreeRow x N /&gt;   ← repeat
+//     &lt;Foot /&gt;                               ← margin-top:auto, 1px top border
+//       &lt;OverviewBtn /&gt;
+//       &lt;NewProjectBtn /&gt;
+//   &lt;/aside&gt;</span></pre>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>
