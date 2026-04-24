@@ -1221,18 +1221,33 @@ public sealed partial class MainViewModel : ObservableObject
 
         StopClaudeAdoption(storedSessionId);
 
+        // Watch stays alive for the tab's lifetime: Claude Code rotates its session id on
+        // `/clear` by writing a fresh jsonl in the same cwd dir. Each rotation fires the
+        // callback with the new id; we unregister the old telemetry tail, persist the new
+        // id, and register the new tail so the status bar keeps tracking. Disposed on
+        // tab close / cross-group drop via StopClaudeAdoption.
         var handle = _discovery.Watch(workingDir, since, (adoptedId, _path) =>
         {
             var app = Application.Current;
             async Task ApplyAsync()
             {
+                // Skip if this id is already the one we're persisting — the initial launch
+                // adoption fires on startup and the poll fallback can re-fire on a live file.
+                var currentId = FindStoredSessionById(storedSessionId)?.AgentSessionId;
+                if (string.Equals(currentId, adoptedId, StringComparison.OrdinalIgnoreCase))
+                {
+                    // Still make sure telemetry is registered — a just-loaded hydrate may need it.
+                    _telemetry?.Register(adoptedId, workingDir);
+                    return;
+                }
+
+                if (!string.IsNullOrEmpty(currentId)) { _telemetry?.Unregister(currentId!); }
                 _telemetry?.Register(adoptedId, workingDir);
                 var result = await _store.UpdateAgentSessionIdAsync(storedSessionId, adoptedId).ConfigureAwait(true);
                 if (result.IsFailure)
                 {
                     _logger.LogDebug("Adoption persist failed for {Sid}: {Error}", storedSessionId, result.Error);
                 }
-                StopClaudeAdoption(storedSessionId);
             }
             if (app?.Dispatcher is { } d && !d.CheckAccess())
             {
@@ -1244,6 +1259,18 @@ public sealed partial class MainViewModel : ObservableObject
             }
         });
         _discoveryWatches[storedSessionId] = handle;
+    }
+
+    private Session? FindStoredSessionById(string storedSessionId)
+    {
+        foreach (var p in _store.Projects)
+        {
+            foreach (var s in p.Sessions)
+            {
+                if (s.Id == storedSessionId) { return s; }
+            }
+        }
+        return null;
     }
 
     private void StopClaudeAdoption(string storedSessionId)
