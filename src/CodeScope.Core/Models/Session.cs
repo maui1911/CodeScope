@@ -36,4 +36,11 @@ public sealed record Session
     /// <see cref="AgentProfile.SessionIdFlag"/>.
     /// </summary>
     public string? AgentSessionId { get; init; }
+
+    /// <summary>
+    /// Soft-close marker. Non-null means the tab was closed but the conversation
+    /// is kept on disk so the next <c>New session</c> on the same worktree/agent
+    /// can resume it via <c>--resume &lt;AgentSessionId&gt;</c>. Null = live.
+    /// </summary>
+    public DateTimeOffset? ClosedAt { get; init; }
 }

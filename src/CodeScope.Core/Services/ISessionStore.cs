@@ -22,6 +22,20 @@ public interface ISessionStore
 
     Task<Result<bool>> RemoveSessionAsync(string sessionId, CancellationToken ct = default);
 
+    /// <summary>
+    /// Marks a session as closed without discarding it — persists a <see cref="Session.ClosedAt"/>
+    /// timestamp so the next <c>New session</c> on the same worktree + agent can resume it via
+    /// <c>--resume &lt;AgentSessionId&gt;</c>. Raises <see cref="SessionStoreChange.SessionRemoved"/>
+    /// so listeners drop their tab/row; <see cref="RestoreSessionAsync"/> brings it back.
+    /// </summary>
+    Task<Result<bool>> SoftCloseSessionAsync(string sessionId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Clears <see cref="Session.ClosedAt"/> on a previously soft-closed session and re-publishes it
+    /// via <see cref="SessionStoreChange.SessionAdded"/>. Returns the restored <see cref="Session"/>.
+    /// </summary>
+    Task<Result<Session>> RestoreSessionAsync(string sessionId, CancellationToken ct = default);
+
     Task<Result<bool>> RenameSessionAsync(string sessionId, string? newName, CancellationToken ct = default);
 
     /// <summary>

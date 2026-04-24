@@ -173,6 +173,62 @@ public sealed class SessionStore : ISessionStore
         return Result<bool>.Ok(true);
     }
 
+    public async Task<Result<bool>> SoftCloseSessionAsync(string sessionId, CancellationToken ct = default)
+    {
+        var changed = false;
+        lock (_lock)
+        {
+            for (var i = 0; i < _projects.Count; i++)
+            {
+                var p = _projects[i];
+                var sessions = p.Sessions.ToList();
+                var idx = sessions.FindIndex(s => s.Id == sessionId);
+                if (idx < 0) { continue; }
+                // Idempotent — re-closing an already-closed session is a no-op, not an error.
+                if (sessions[idx].ClosedAt is not null) { return Result<bool>.Ok(true); }
+                sessions[idx] = sessions[idx] with { ClosedAt = DateTimeOffset.UtcNow };
+                _projects[i] = p with { Sessions = sessions };
+                changed = true;
+                break;
+            }
+        }
+        if (!changed) { return Result<bool>.Fail($"Session '{sessionId}' not found"); }
+        var saved = await SaveSnapshotAsync(ct).ConfigureAwait(false);
+        if (saved.IsFailure) { return saved; }
+        // Fire SessionRemoved so the sidebar/tab strip drop the row — restore emits SessionAdded.
+        Raise(new SessionStoreChange.SessionRemoved(sessionId));
+        return Result<bool>.Ok(true);
+    }
+
+    public async Task<Result<Session>> RestoreSessionAsync(string sessionId, CancellationToken ct = default)
+    {
+        Session? restored = null;
+        string? projectId = null;
+        lock (_lock)
+        {
+            for (var i = 0; i < _projects.Count; i++)
+            {
+                var p = _projects[i];
+                var sessions = p.Sessions.ToList();
+                var idx = sessions.FindIndex(s => s.Id == sessionId);
+                if (idx < 0) { continue; }
+                restored = sessions[idx] with { ClosedAt = null, LastOpened = DateTimeOffset.UtcNow };
+                sessions[idx] = restored;
+                _projects[i] = p with { Sessions = sessions };
+                projectId = p.Id;
+                break;
+            }
+        }
+        if (restored is null || projectId is null)
+        {
+            return Result<Session>.Fail($"Session '{sessionId}' not found");
+        }
+        var saved = await SaveSnapshotAsync(ct).ConfigureAwait(false);
+        if (saved.IsFailure) { return Result<Session>.Fail(saved.Error); }
+        Raise(new SessionStoreChange.SessionAdded(projectId, restored));
+        return Result<Session>.Ok(restored);
+    }
+
     public async Task<Result<bool>> RenameSessionAsync(string sessionId, string? newName, CancellationToken ct = default)
     {
         var renamed = false;

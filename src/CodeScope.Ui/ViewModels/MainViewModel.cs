@@ -756,6 +756,27 @@ public sealed partial class MainViewModel : ObservableObject
 
         if (project is null) { return; }
 
+        // Soft-close resume — if this worktree has a closed session that would match the agent
+        // the user is about to spawn, restore it instead of minting a new one. Restart is the
+        // explicit "start fresh" escape hatch; New session gives you back whatever was live
+        // last time. Keeps the 1-session-per-worktree invariant (we match on WorktreeId +
+        // resolved agent id).
+        var resolvedAgentId = ResolveAgentIdForNewSession(project, agentId);
+        if (worktree is not null
+            && resolvedAgentId is not null
+            && !string.Equals(resolvedAgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase))
+        {
+            var closed = project.Sessions.FirstOrDefault(s =>
+                s.ClosedAt is not null
+                && string.Equals(s.WorktreeId, worktree.Id, StringComparison.Ordinal)
+                && string.Equals(s.AgentId, resolvedAgentId, StringComparison.OrdinalIgnoreCase)
+                && s.AgentSessionId is { Length: > 0 });
+            if (closed is not null && await TryRestoreSessionAsync(project, worktree, closed).ConfigureAwait(true))
+            {
+                return;
+            }
+        }
+
         // Resolve agent / shell. Priority: explicit arg → project's DefaultAgentId → global default.
         var useShell = string.Equals(agentId, ShellSentinel, StringComparison.OrdinalIgnoreCase);
         AgentProfile? agent;
@@ -822,6 +843,71 @@ public sealed partial class MainViewModel : ObservableObject
     }
 
     /// <summary>
+    /// Resolves the agent id that <see cref="NewSessionAsync"/> would end up using, mirroring
+    /// its priority (explicit arg → project default → global default). Used to look up a
+    /// matching soft-closed session *before* we spawn anything. Returns null for the global
+    /// default when no profile is registered — caller treats null as "no resume candidate".
+    /// </summary>
+    private string? ResolveAgentIdForNewSession(Project project, string? explicitAgentId)
+    {
+        if (!string.IsNullOrEmpty(explicitAgentId))
+        {
+            return string.Equals(explicitAgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase)
+                ? ShellSentinel
+                : _agents.GetById(explicitAgentId)?.Id;
+        }
+        if (string.Equals(project.DefaultAgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase))
+        {
+            return ShellSentinel;
+        }
+        if (!string.IsNullOrEmpty(project.DefaultAgentId))
+        {
+            return _agents.GetById(project.DefaultAgentId!)?.Id ?? _agents.GetDefault()?.Id;
+        }
+        return _agents.GetDefault()?.Id;
+    }
+
+    /// <summary>
+    /// Restores a soft-closed session: clears <see cref="Session.ClosedAt"/> in the store,
+    /// spawns a resume-flavoured descriptor (<c>--resume &lt;AgentSessionId&gt;</c> via
+    /// <see cref="SessionManager.CreateAgentSession"/> with <c>resume: true</c>), adds the tab,
+    /// and kicks off Claude adoption so telemetry follows across the rotation. Returns
+    /// <c>false</c> when the restore couldn't be persisted or the agent profile has vanished.
+    /// </summary>
+    private async Task<bool> TryRestoreSessionAsync(Project project, Worktree worktree, Session closed)
+    {
+        if (string.IsNullOrEmpty(closed.AgentId)
+            || string.Equals(closed.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+        var agent = _agents.GetById(closed.AgentId);
+        if (agent is null) { return false; }
+
+        var restored = await _store.RestoreSessionAsync(closed.Id).ConfigureAwait(true);
+        if (restored.IsFailure)
+        {
+            _logger.LogWarning("RestoreSession: {Error}", restored.Error);
+            return false;
+        }
+
+        var descriptor = _sessionManager.CreateAgentSession(
+            worktree.Path, agent, closed.Id, resume: true, agentSessionId: closed.AgentSessionId);
+        if (worktree.Branch is { Length: > 0 } branch)
+        {
+            descriptor = descriptor with { Title = $"{project.Name} · {branch}" };
+        }
+
+        var vm = new SessionTabViewModel(descriptor, project.Id, closed.AgentId, closed.DisplayName, agent.Icon);
+        FocusedGroup.Tabs.Add(vm);
+        SelectedTab = vm;
+        BeginClaudeAdoption(descriptor.Id, closed.AgentId, worktree.Path, DateTimeOffset.UtcNow);
+        OnPropertyChanged(nameof(CanCloseGroup));
+        CloseGroupCommand.NotifyCanExecuteChanged();
+        return true;
+    }
+
+    /// <summary>
     /// Spawns a fresh session at the same worktree + agent as <paramref name="tab"/>.
     /// Use-case: keep one tab for long-running work and duplicate a parallel shell for ad-hoc commands.
     /// </summary>
@@ -873,7 +959,16 @@ public sealed partial class MainViewModel : ObservableObject
     }
 
     [RelayCommand]
-    private async Task CloseTabAsync(SessionTabViewModel? tab)
+    private Task CloseTabAsync(SessionTabViewModel? tab) => CloseTabAsync(tab, hardRemove: false);
+
+    /// <summary>
+    /// Closes a tab. When <paramref name="hardRemove"/> is <c>false</c> (default) the session is
+    /// <em>soft-closed</em> for agents that can resume (<see cref="AgentProfile.ResumeByIdArgs"/> +
+    /// persisted <see cref="Session.AgentSessionId"/>) — next <c>New session</c> on the same worktree
+    /// restores the conversation. Shells and agents without resume support are always hard-removed.
+    /// Callers that definitely want the session gone (Restart, worktree cascade) pass <c>true</c>.
+    /// </summary>
+    private async Task CloseTabAsync(SessionTabViewModel? tab, bool hardRemove)
     {
         tab ??= SelectedTab;
         if (tab is null)
@@ -892,7 +987,22 @@ public sealed partial class MainViewModel : ObservableObject
         var storedForTab = FindStoredSession(tab);
         if (storedForTab?.AgentSessionId is { Length: > 0 } tsid) { _telemetry?.Unregister(tsid); }
         StopClaudeAdoption(tab.Descriptor.Id);
-        await _store.RemoveSessionAsync(tab.Descriptor.Id).ConfigureAwait(true);
+
+        // Resumable = agent with ResumeByIdArgs and a persisted AgentSessionId.
+        var resumable = !hardRemove
+            && storedForTab?.AgentSessionId is { Length: > 0 }
+            && !string.IsNullOrEmpty(storedForTab.AgentId)
+            && !string.Equals(storedForTab.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase)
+            && _agents.GetById(storedForTab.AgentId!)?.ResumeByIdArgs.Count > 0;
+
+        if (resumable)
+        {
+            await _store.SoftCloseSessionAsync(tab.Descriptor.Id).ConfigureAwait(true);
+        }
+        else
+        {
+            await _store.RemoveSessionAsync(tab.Descriptor.Id).ConfigureAwait(true);
+        }
 
         // Auto-collapse a group when its last tab closes and another group exists — the
         // invariant is "groups exist to hold sessions; an empty one adds visual noise".
@@ -1035,7 +1145,11 @@ public sealed partial class MainViewModel : ObservableObject
         if (tab is null) { return; }
 
         await DuplicateTabAsync(tab).ConfigureAwait(true);
-        await CloseTabAsync(tab).ConfigureAwait(true);
+        // Hard-remove: Restart is "throw away the old conversation and start fresh" — without
+        // hardRemove the old row would linger as a soft-closed entry and get resumed the next
+        // time the user clicks New session on this worktree, which is exactly the opposite of
+        // what Restart means.
+        await CloseTabAsync(tab, hardRemove: true).ConfigureAwait(true);
     }
 
     [RelayCommand]
@@ -1134,6 +1248,10 @@ public sealed partial class MainViewModel : ObservableObject
         {
             foreach (var s in p.Sessions)
             {
+                // Soft-closed sessions are kept on disk for resume-on-next-NewSession but
+                // don't materialise as tabs at startup — they'd spawn dozens of ghost pwsh
+                // children otherwise.
+                if (s.ClosedAt is not null) { continue; }
                 if (!Directory.Exists(s.WorktreePath)) { continue; }
                 var agent = string.IsNullOrEmpty(s.AgentId) || string.Equals(s.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase)
                     ? null
@@ -1202,6 +1320,8 @@ public sealed partial class MainViewModel : ObservableObject
         {
             foreach (var s in p.Sessions)
             {
+                // Skip watches for soft-closed sessions — no tab to update.
+                if (s.ClosedAt is not null) { continue; }
                 BeginClaudeAdoption(s.Id, s.AgentId, s.WorktreePath, now);
             }
         }
