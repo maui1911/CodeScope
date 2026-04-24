@@ -96,6 +96,13 @@ public sealed partial class SidebarViewModel : ObservableObject
     internal void RaiseSpawnSessionRequested(WorktreeViewModel worktree)
         => SpawnSessionRequested?.Invoke(this, worktree);
 
+    /// <summary>
+    /// Hook wired by <see cref="MainViewModel.AttachSidebar"/> to close any tabs currently pinned
+    /// to a worktree before it is removed. Without this, the pwsh processes hosting those tabs
+    /// keep Windows file locks on the worktree directory and <c>git worktree remove</c> fails.
+    /// </summary>
+    public Func<string, string, Task>? CloseWorktreeSessionsAsync { get; set; }
+
     private void Toast(string title, string message, ControlAppearance appearance)
     {
         if (_snackbar is null) { return; }

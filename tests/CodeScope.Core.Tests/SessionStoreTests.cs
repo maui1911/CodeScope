@@ -21,7 +21,7 @@ public sealed class SessionStoreTests
         var git = Substitute.For<IGitService>();
         git.AddWorktreeAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string?>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(Result<bool>.Ok(true)));
-        git.RemoveWorktreeAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+        git.RemoveWorktreeAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<bool>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(Result<bool>.Ok(true)));
         git.MoveWorktreeAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(Result<bool>.Ok(true)));

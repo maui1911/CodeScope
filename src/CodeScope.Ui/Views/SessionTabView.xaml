@@ -8,6 +8,14 @@
     mc:Ignorable="d"
     Background="#FF0A0A0A">
     <Grid>
+        <Grid.ContextMenu>
+            <ContextMenu x:Name="TerminalContextMenu" Opened="OnContextMenuOpened">
+                <MenuItem x:Name="MenuOpenUrl" Header="Open link" InputGestureText="Ctrl+Shift+O" Click="OnOpenUrlClicked" />
+                <Separator />
+                <MenuItem x:Name="MenuCopy" Header="Copy" InputGestureText="Ctrl+Shift+C" Click="OnCopyClicked" />
+                <MenuItem Header="Paste" InputGestureText="Ctrl+Shift+V" Click="OnPasteClicked" />
+            </ContextMenu>
+        </Grid.ContextMenu>
         <term:EasyTerminalControl
             x:Name="Terminal"
             AutomationProperties.AutomationId="SessionTerminal"

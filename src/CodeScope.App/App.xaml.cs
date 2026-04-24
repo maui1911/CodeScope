@@ -18,7 +18,7 @@ namespace NoScope.CodeScope.App;
 /// </summary>
 public partial class App : Application
 {
-    private const string SingleInstanceMutexName = "Global\\CodeScope.SingleInstance";
+    private static readonly string SingleInstanceMutexName = NoScope.CodeScope.Core.AppPaths.SingleInstanceMutexName;
 
     private IHost? _host;
     private Mutex? _singleInstanceMutex;
@@ -225,7 +225,7 @@ public partial class App : Application
     {
         try
         {
-            var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodeScope");
+            var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), NoScope.CodeScope.Core.AppPaths.AppFolderName);
             Directory.CreateDirectory(dir);
             File.AppendAllText(Path.Combine(dir, "console.log"),
                 $"{DateTime.Now:HH:mm:ss.fff} {msg}{Environment.NewLine}");
@@ -278,7 +278,7 @@ public partial class App : Application
     {
         try
         {
-            var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodeScope");
+            var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), NoScope.CodeScope.Core.AppPaths.AppFolderName);
             Directory.CreateDirectory(dir);
             var path = Path.Combine(dir, "crash.log");
             var line = $"[{DateTime.Now:O}] {source}: {ex}\n";

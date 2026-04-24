@@ -449,7 +449,17 @@ public sealed partial class MainViewModel : ObservableObject
     private SessionTabViewModel? _selectedTab;
 
     /// <summary>Title bar text: "CodeScope — {tab}" when a tab is active, else just "CodeScope".</summary>
-    public string WindowTitle => SelectedTab is { } t ? $"CodeScope — {t.DisplayName}" : "CodeScope";
+    public string WindowTitle
+    {
+        get
+        {
+            // Visual delimiter between an installed build and a side-by-side dev run —
+            // CODESCOPE_DEV=1 also routes the config/layout/mutex to a `.Dev` namespace,
+            // so the suffix mirrors that split in the titlebar.
+            var brand = NoScope.CodeScope.Core.AppPaths.IsDevMode ? "CodeScope [dev]" : "CodeScope";
+            return SelectedTab is { } t ? $"{brand} — {t.DisplayName}" : brand;
+        }
+    }
 
     partial void OnSelectedTabChanged(SessionTabViewModel? value)
     {
@@ -514,6 +524,29 @@ public sealed partial class MainViewModel : ObservableObject
         sidebar.SpawnSessionRequested += async (_, _) =>
         {
             await NewSessionAsync().ConfigureAwait(true);
+        };
+
+        // Worktree deletion needs every tab pinned to that worktree closed first so the
+        // pwsh children release their Windows cwd lock. Match via the persisted Session
+        // (authoritative WorktreeId link); tabs without a stored session are transient
+        // and tear themselves down on group removal anyway.
+        sidebar.CloseWorktreeSessionsAsync = async (projectId, worktreeId) =>
+        {
+            var targetSessionIds = _store.Projects
+                .FirstOrDefault(p => p.Id == projectId)?.Sessions
+                .Where(s => s.WorktreeId == worktreeId)
+                .Select(s => s.Id)
+                .ToHashSet() ?? [];
+            if (targetSessionIds.Count == 0) { return; }
+
+            var tabs = Groups
+                .SelectMany(g => g.Tabs)
+                .Where(t => targetSessionIds.Contains(t.Descriptor.Id))
+                .ToList();
+            foreach (var tab in tabs)
+            {
+                await CloseTabAsync(tab).ConfigureAwait(true);
+            }
         };
 
         // Status-bar metrics recompute on any worktree status / PR event.
@@ -949,10 +982,15 @@ public sealed partial class MainViewModel : ObservableObject
             var resumed = _sessionManager.CreateAgentSession(old.WorkingDirectory, agent, id: old.Id, resume: true, agentSessionId: storedAgentId)
                 with { Title = old.Title };
             tab.Rebind(resumed);
-            // Cross-group respawn = new pwsh process = new claude session id. Tear down the
-            // old telemetry watch and start fresh adoption so the status bar keeps tracking.
-            if (storedAgentId is { Length: > 0 } oldId) { _telemetry?.Unregister(oldId); }
-            BeginClaudeAdoption(tab.Descriptor.Id, agent.Id, old.WorkingDirectory, DateTimeOffset.UtcNow);
+            // Resume-by-id (e.g. `claude --resume <id>`) appends to the existing jsonl, so the
+            // telemetry watcher keeps tracking the same file across the pwsh respawn. Only when
+            // we can't resume by id do we need to tear the tail down and rediscover a fresh one.
+            var resumesById = storedAgentId is { Length: > 0 } && agent.ResumeByIdArgs.Count > 0;
+            if (!resumesById)
+            {
+                if (storedAgentId is { Length: > 0 } oldId) { _telemetry?.Unregister(oldId); }
+                BeginClaudeAdoption(tab.Descriptor.Id, agent.Id, old.WorkingDirectory, DateTimeOffset.UtcNow);
+            }
         }
 
         sourceGroup.Tabs.Remove(tab);
@@ -1311,7 +1349,7 @@ public sealed partial class MainViewModel : ObservableObject
             var stored = FindStoredSession(tab);
             if (stored?.AgentSessionId == snap.SessionId)
             {
-                tab.TokensUsed = snap.TotalTokens;
+                tab.TokensUsed = snap.ContextTokens;
                 tab.TurnCount = snap.TurnCount;
                 tab.LastTurnDurationSec = snap.LastTurnDuration?.TotalSeconds ?? 0;
                 if (snap.ContextWindowTokens > 0) { tab.ContextWindowTokens = snap.ContextWindowTokens; }

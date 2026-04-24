@@ -374,8 +374,52 @@ public sealed partial class SidebarViewModel
             System.Windows.MessageBoxImage.Warning);
         if (confirm != System.Windows.MessageBoxResult.OK) { return; }
 
+        // Close any tabs pinned to this worktree first so pwsh releases the cwd lock on
+        // the directory. Without this `git worktree remove` fails on Windows with a file-
+        // in-use error and the sidebar silently stays stale.
+        if (CloseWorktreeSessionsAsync is { } closeSessions)
+        {
+            try { await closeSessions(worktree.ProjectId, worktree.Id).ConfigureAwait(true); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Closing sessions for worktree {Id} failed", worktree.Id); }
+
+            // Give WPF a beat to run the SessionTabView Unloaded teardown and let ConPTY
+            // kill the pwsh child — otherwise we race the file lock into `git worktree remove`.
+            await Task.Delay(250).ConfigureAwait(true);
+        }
+
         var r = await _store.RemoveWorktreeAsync(worktree.ProjectId, worktree.Id).ConfigureAwait(true);
-        if (r.IsFailure) { _logger.LogWarning("RemoveWorktree failed: {Error}", r.Error); }
+        if (r.IsSuccess)
+        {
+            Toast("Worktree removed", worktree.DisplayBranch, ControlAppearance.Success);
+            return;
+        }
+
+        _logger.LogWarning("RemoveWorktree failed: {Error}", r.Error);
+
+        // Offer --force when the normal remove is rejected — typically dirty worktree or
+        // a lingering lock. Force still can't beat a live Windows file lock, but it covers
+        // the common "you have uncommitted changes" case cleanly.
+        var retry = System.Windows.MessageBox.Show(
+            $"Couldn't remove worktree:\n\n{r.Error}\n\nForce remove? Uncommitted changes and untracked files in the worktree will be lost.",
+            "CodeScope — Force remove worktree",
+            System.Windows.MessageBoxButton.OKCancel,
+            System.Windows.MessageBoxImage.Warning);
+        if (retry != System.Windows.MessageBoxResult.OK)
+        {
+            Toast("Remove failed", r.Error, ControlAppearance.Danger);
+            return;
+        }
+
+        var forced = await _store.RemoveWorktreeAsync(worktree.ProjectId, worktree.Id, force: true).ConfigureAwait(true);
+        if (forced.IsSuccess)
+        {
+            Toast("Worktree force-removed", worktree.DisplayBranch, ControlAppearance.Success);
+        }
+        else
+        {
+            _logger.LogWarning("Force RemoveWorktree failed: {Error}", forced.Error);
+            Toast("Remove failed", forced.Error, ControlAppearance.Danger);
+        }
     }
 
     /// <summary>Unwraps the ProjectViewModel / WorktreeViewModel / string alternatives passed by menus.</summary>

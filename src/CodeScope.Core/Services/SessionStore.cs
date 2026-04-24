@@ -283,7 +283,7 @@ public sealed class SessionStore : ISessionStore
         return Result<Worktree>.Ok(worktree);
     }
 
-    public async Task<Result<bool>> RemoveWorktreeAsync(string projectId, string worktreeId, CancellationToken ct = default)
+    public async Task<Result<bool>> RemoveWorktreeAsync(string projectId, string worktreeId, bool force = false, CancellationToken ct = default)
     {
         Project? project;
         Worktree? worktree;
@@ -302,7 +302,7 @@ public sealed class SessionStore : ISessionStore
             return Result<bool>.Fail("Primary worktrees cannot be removed");
         }
 
-        var gitResult = await _git.RemoveWorktreeAsync(project.Path, worktree.Path, ct).ConfigureAwait(false);
+        var gitResult = await _git.RemoveWorktreeAsync(project.Path, worktree.Path, force, ct).ConfigureAwait(false);
         if (gitResult.IsFailure)
         {
             return Result<bool>.Fail(gitResult.Error);

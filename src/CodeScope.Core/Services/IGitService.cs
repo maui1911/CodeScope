@@ -28,8 +28,13 @@ public interface IGitService
     /// </summary>
     Task<Result<IReadOnlyList<Models.BranchInfo>>> ListBranchesAsync(string repoPath, CancellationToken ct = default);
 
-    /// <summary>Runs <c>git worktree remove &lt;worktreePath&gt;</c> in <paramref name="repoPath"/>.</summary>
-    Task<Result<bool>> RemoveWorktreeAsync(string repoPath, string worktreePath, CancellationToken ct = default);
+    /// <summary>
+    /// Runs <c>git worktree remove &lt;worktreePath&gt;</c> in <paramref name="repoPath"/>.
+    /// <paramref name="force"/> appends <c>--force</c>, which lets git drop the worktree even when it
+    /// still has uncommitted changes or untracked files. Windows file locks (processes holding the
+    /// directory as cwd) are not bypassed by <c>--force</c> — callers must close those first.
+    /// </summary>
+    Task<Result<bool>> RemoveWorktreeAsync(string repoPath, string worktreePath, bool force = false, CancellationToken ct = default);
 
     /// <summary>
     /// Runs <c>git worktree move &lt;oldPath&gt; &lt;newPath&gt;</c> in <paramref name="repoPath"/>.

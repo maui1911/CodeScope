@@ -122,7 +122,7 @@ public sealed class ClaudeTelemetryService : IClaudeTelemetryService
                 fs.Seek(watch.Offset, SeekOrigin.Begin);
                 using var reader = new StreamReader(fs);
 
-                var total = watch.Snapshot?.TotalTokens ?? 0;
+                var contextTokens = watch.Snapshot?.ContextTokens ?? 0;
                 var turns = watch.Snapshot?.TurnCount ?? 0;
                 var lastAt = watch.Snapshot?.LastTurnAt;
                 var lastDuration = watch.Snapshot?.LastTurnDuration;
@@ -175,7 +175,10 @@ public sealed class ClaudeTelemetryService : IClaudeTelemetryService
                         if (detected > 0) { contextCap = detected; }
                     }
 
-                    total += entry.BillableTokens;
+                    // Overwrite, not accumulate — see the ClaudeSessionTelemetry docstring for why.
+                    // Cache-read IS included here (it's in-context even if prefilled), unlike
+                    // BillableTokens which excludes it to reflect Anthropic's metered pricing.
+                    contextTokens = entry.InputTokens + entry.CacheReadTokens + entry.CacheCreationTokens + entry.OutputTokens;
                     turns += 1;
                     if (entry.Timestamp is { } ts)
                     {
@@ -192,7 +195,7 @@ public sealed class ClaudeTelemetryService : IClaudeTelemetryService
                 if (changed)
                 {
                     var snap = new ClaudeSessionTelemetry(
-                        watch.SessionId, total, turns, lastAt, lastDuration, activity, modelId, contextCap);
+                        watch.SessionId, contextTokens, turns, lastAt, lastDuration, activity, modelId, contextCap);
                     watch.Snapshot = snap;
                     try { Updated?.Invoke(this, snap); }
                     catch (Exception ex) { _logger.LogWarning(ex, "Claude telemetry subscriber threw"); }

@@ -37,8 +37,12 @@ public interface ISessionStore
     /// </summary>
     Task<Result<Worktree>> AddWorktreeAsync(string projectId, string newWorktreePath, string newBranch, string? baseBranch = null, CancellationToken ct = default);
 
-    /// <summary>Runs <c>git worktree remove</c> and removes the worktree from the project. Primary worktrees are rejected.</summary>
-    Task<Result<bool>> RemoveWorktreeAsync(string projectId, string worktreeId, CancellationToken ct = default);
+    /// <summary>
+    /// Runs <c>git worktree remove</c> and removes the worktree from the project. Primary worktrees are rejected.
+    /// <paramref name="force"/> passes <c>--force</c> through to git, which discards uncommitted changes /
+    /// untracked files in the worktree. Callers must confirm with the user first.
+    /// </summary>
+    Task<Result<bool>> RemoveWorktreeAsync(string projectId, string worktreeId, bool force = false, CancellationToken ct = default);
 
     /// <summary>
     /// Runs <c>git worktree move</c> to relocate the worktree folder, then cascades the new path
