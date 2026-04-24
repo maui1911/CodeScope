@@ -23,6 +23,7 @@ public partial class App : Application
     private IHost? _host;
     private Mutex? _singleInstanceMutex;
     private ProcessTreeKiller? _appKiller;
+    private CancellationTokenSource? _updateCts;
 
     public App()
     {
@@ -134,6 +135,7 @@ public partial class App : Application
                     return vm;
                 });
                 services.AddSingleton<MainWindow>();
+                services.AddSingleton<UpdateService>();
             })
             .Build();
 
@@ -142,10 +144,33 @@ public partial class App : Application
         var window = _host.Services.GetRequiredService<MainWindow>();
         MainWindow = window;
         window.Show();
+
+        // Kick off the auto-update check 10s after the window is visible. The delay keeps it
+        // off the startup-critical path (no network blocking first paint) and gives the host
+        // loggers a moment to wire up so we see any check failures in the console. Fire-and-
+        // forget by design: UpdateService swallows its own exceptions. The CancellationToken
+        // is cancelled in OnExit so the check is aborted if the user closes the app within
+        // the 10s delay — prevents hitting disposed services.
+        _updateCts = new CancellationTokenSource();
+        var updateToken = _updateCts.Token;
+        var updater = _host.Services.GetRequiredService<UpdateService>();
+        _ = System.Threading.Tasks.Task.Run(async () =>
+        {
+            try
+            {
+                await System.Threading.Tasks.Task.Delay(System.TimeSpan.FromSeconds(10), updateToken).ConfigureAwait(false);
+                await updater.CheckAsync().ConfigureAwait(false);
+            }
+            catch (System.OperationCanceledException) { }
+        });
     }
 
     protected override void OnExit(ExitEventArgs e)
     {
+        try { _updateCts?.Cancel(); } catch { }
+        _updateCts?.Dispose();
+        _updateCts = null;
+
         _host?.StopAsync().GetAwaiter().GetResult();
         _host?.Dispose();
         _host = null;
