@@ -79,11 +79,9 @@ public partial class MainWindow : FluentWindow
         }
         catch (Exception ex)
         {
-            System.Windows.MessageBox.Show(
-                $"Failed to initialize: {ex.Message}",
-                "CodeScope",
-                System.Windows.MessageBoxButton.OK,
-                System.Windows.MessageBoxImage.Warning);
+            NoScope.CodeScope.Ui.Dialogs.ConfirmDialog.Inform(
+                title: "Failed to initialize",
+                body: ex.Message);
         }
     }
 

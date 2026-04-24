@@ -51,11 +51,9 @@ public partial class App : Application
         _singleInstanceMutex = new Mutex(initiallyOwned: true, SingleInstanceMutexName, out var createdNew);
         if (!createdNew)
         {
-            MessageBox.Show(
-                "CodeScope is already running.",
-                "CodeScope",
-                MessageBoxButton.OK,
-                MessageBoxImage.Information);
+            NoScope.CodeScope.Ui.Dialogs.ConfirmDialog.Inform(
+                title: "CodeScope is already running",
+                body: "Another instance of CodeScope owns the single-instance mutex. Activate the running window instead.");
             Shutdown();
             return;
         }
