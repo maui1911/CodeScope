@@ -9,9 +9,10 @@ namespace NoScope.CodeScope.App;
 
 /// <summary>
 /// Background updater backed by Velopack + GitHub releases (the same channel the release.yml
-/// workflow publishes to). On success it fires a non-blocking <see cref="ISnackbarService"/>
-/// toast the user can click to restart into the new version. The check is best-effort — any
-/// exception (offline, rate-limited, not an installed build) is swallowed with a warning log.
+/// workflow publishes to). On success it surfaces a non-blocking <see cref="ISnackbarService"/>
+/// toast to signal that the update finished downloading, then later offers restart via a
+/// confirmation dialog. The check is best-effort — any exception (offline, rate-limited, not
+/// an installed build) is swallowed with a warning log.
 /// </summary>
 public sealed class UpdateService
 {
@@ -98,18 +99,32 @@ public sealed class UpdateService
 
         _ = System.Threading.Tasks.Task.Run(async () =>
         {
-            await System.Threading.Tasks.Task.Delay(System.TimeSpan.FromSeconds(3)).ConfigureAwait(false);
-            app?.Dispatcher.Invoke(() =>
+            try
             {
-                var restart = NoScope.CodeScope.Ui.Dialogs.ConfirmDialog.Confirm(
-                    title: $"CodeScope {version} is ready",
-                    body: "Restart now to finish installing. Open sessions will be closed and their transcripts resumed automatically on the next launch.",
-                    confirmLabel: "Restart",
-                    cancelLabel: "Later");
-                if (!restart) { return; }
-                try { mgr.ApplyUpdatesAndRestart(info); }
-                catch (System.Exception ex) { _logger.LogWarning(ex, "ApplyUpdatesAndRestart failed"); }
-            });
+                await System.Threading.Tasks.Task.Delay(System.TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+
+                var dispatcher = app?.Dispatcher;
+                if (dispatcher is null || dispatcher.HasShutdownStarted || dispatcher.HasShutdownFinished)
+                {
+                    return;
+                }
+
+                await dispatcher.InvokeAsync(() =>
+                {
+                    var restart = NoScope.CodeScope.Ui.Dialogs.ConfirmDialog.Confirm(
+                        title: $"CodeScope {version} is ready",
+                        body: "Restart now to finish installing. Open sessions will be closed and their transcripts resumed automatically on the next launch.",
+                        confirmLabel: "Restart",
+                        cancelLabel: "Later");
+                    if (!restart) { return; }
+                    try { mgr.ApplyUpdatesAndRestart(info); }
+                    catch (System.Exception ex) { _logger.LogWarning(ex, "ApplyUpdatesAndRestart failed"); }
+                });
+            }
+            catch (System.Exception ex)
+            {
+                _logger.LogWarning(ex, "Unable to show update ready prompt");
+            }
         });
     }
 }
