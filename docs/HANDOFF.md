@@ -5,16 +5,66 @@
 > **Intent:** cursor + last 1–2 sessions in depth, everything else a one-liner.
 > Old detail lives in `git log` — don't duplicate it here.
 
-**Last updated:** 2026-04-23 (session 18)
+**Last updated:** 2026-04-24 (session 19)
 **Branch:** `main`.
-**Head:** `8edf392` — `fix(terminal): rebind std handles + shell -NoExit + agent-picker submenu`
+**Head:** `a0df3cc` — `Add Velopack distribution and v0.1.0 release workflow (#1)`
+**Release:** `v0.1.0` shipped via GitHub Actions — https://github.com/maui1911/CodeScope/releases/tag/v0.1.0
 **Build status:** ✅ `dotnet build` clean. `dotnet test` 145/145 green.
 **Uncommitted work:** none.
-**Unpushed commits (sessions 16–18):** `49fdd60` `e25f918` `86f874b` `51659c2` `8edf392` — run `git push` when ready.
+**Unpushed commits:** none — pushed via PR #1.
 
 ---
 
 ## Cursor — current focus
+
+**Distribution is live.** Session 19 wired Velopack end-to-end and cut the
+first public release. Push a SemVer tag `v*.*.*` and CI handles the rest:
+`dotnet publish` → `vpk pack` (auto-downloads the prior release first so
+delta nupkgs compute) → `vpk upload github` creates the Release with
+installer + full/delta packages + `releases.win.json` attached. For v0.1.1+
+the flow is: commit → `git tag v0.1.1` → `git push origin v0.1.1`.
+
+### Session 19 — Velopack + GitHub Actions release pipeline (shipped)
+
+- `a0df3cc` (PR #1) — **First distributable build.** Five-part landing:
+  * `Velopack` 0.0.1298 package added to `CodeScope.App`;
+    `VelopackApp.Build().Run()` runs in the `App` ctor before any WPF
+    state so the installer/updater handoff args
+    (`--veloapp-install/-uninstall/-obsolete/-firstrun`) short-circuit
+    the main UI.
+  * **`conpty.dll` publish bug fixed.** `Ci.Microsoft.Windows.Console.ConPTY`
+    only ships `win10-x64` RID assets and .NET 10 no longer falls back
+    from `win-x64` (NETSDK1206), so the DLL never reached the publish
+    folder and installed builds would've killed every terminal tab
+    instantly with `DllNotFoundException`. Swapped the fragile
+    `AfterBuild` `Copy` target for a `Content` include pulled straight
+    from `$(NuGetPackageRoot)`, with both `CopyToOutputDirectory` and
+    `CopyToPublishDirectory=PreserveNewest`. Now flows through `dotnet
+    build` and `dotnet publish` alike.
+  * `.github/workflows/release.yml` — tag-triggered (`v[0-9]+.[0-9]+.[0-9]+`,
+    plus pre-release tag pattern + `workflow_dispatch`). `windows-latest`,
+    `dotnet-version: 10.0.x`, `dotnet tool install -g vpk`, publishes
+    self-contained win-x64 loose files (`PublishSingleFile=false` — Velopack
+    needs loose files for delta updates), downloads prior release
+    (`vpk download github`, `continue-on-error` for first release),
+    `vpk pack` with `--icon`, `--splashImage`, `--channel win`,
+    `--packAuthors maui1911`, then `vpk upload github --publish`
+    creates the GitHub Release.
+  * `tools/release.ps1` — local counterpart to CI flow for iteration
+    without tagging.
+  * **Custom installer splash.** 640×400 PNG rendered from
+    `src/CodeScope.App/assets/splash.html` via Playwright. Design-token
+    matched: black bg, accent-blue radial glow + grid, 40 px brand mark
+    with the cut-corner (matches sidebar `brand-mark` token), "INSTALLING"
+    pill, "Spinning up a workspace for your parallel agent sessions"
+    headline, terminal-style activity log bottom-right. Source HTML is
+    checked in so the splash can be re-rendered when the visual language
+    evolves — re-run Playwright with `setContent` against `splash.html`
+    and overwrite the PNG.
+
+  **Release timings:** 2 min 32 s wall-clock from tag push to release
+  published. Release artefacts on v0.1.0 total ~220 MB across Setup,
+  Portable ZIP, full nupkg, RELEASES, and `releases.win.json`.
 
 **Claude telemetry → status bar + sidebar + tab strip** was a
 six-session arc (10 → 16). Status-bar spec checklist is now
@@ -331,4 +381,8 @@ dotnet publish src/CodeScope.App -c Release -r win-x64 `
 - Real Gitea CI rollup (`tea pulls status` / REST).
 - PR review-comments dialog (`gh pr view --comments`).
 - Kanban overview of active sessions.
-- Auto-update (Velopack) — post-Phase 7.
+- **In-app update notifier** — `UpdateManager.CheckForUpdatesAsync` on
+  startup (+ throttled poll), surface a status-bar pill / toast when a
+  newer release is available, one-click apply via
+  `ApplyUpdatesAndRestart`. The release pipeline is live — this is just
+  wiring the client side to it.
