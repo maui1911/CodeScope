@@ -9,6 +9,7 @@ using NoScope.CodeScope.Ui.ViewModels;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Velopack;
 
 namespace NoScope.CodeScope.App;
 
@@ -22,6 +23,14 @@ public partial class App : Application
     private IHost? _host;
     private Mutex? _singleInstanceMutex;
     private ProcessTreeKiller? _appKiller;
+
+    public App()
+    {
+        // Velopack hooks must run before any WPF state is constructed. The bootstrap intercepts
+        // installer/updater handoff arguments (--veloapp-install/-uninstall/-obsolete/-firstrun)
+        // and exits the process for those, so the main UI never spins up during install/update.
+        VelopackApp.Build().Run();
+    }
 
     protected override void OnStartup(StartupEventArgs e)
     {

@@ -1,0 +1,113 @@
+name: Release
+
+# Push a SemVer tag (v0.1.0) to cut a release. The workflow publishes CodeScope,
+# runs Velopack to build the installer + delta package, and attaches them to a
+# GitHub Release with the matching tag.
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'   # pre-release tags e.g. v0.2.0-beta.1
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'SemVer version (without leading v), e.g. 0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write   # needed to create the GitHub Release
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout (with tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # needed so `git describe` in Directory.Build.targets sees tags
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            $v = '${{ inputs.version }}'
+          } else {
+            # refs/tags/v0.1.0 → 0.1.0
+            $v = '${{ github.ref_name }}' -replace '^v',''
+          }
+          Write-Host "Release version: $v"
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Install vpk
+        run: dotnet tool install -g vpk
+
+      - name: Restore
+        run: dotnet restore CodeScope.sln
+
+      - name: Publish (win-x64, self-contained, loose files)
+        shell: pwsh
+        run: |
+          dotnet publish src/CodeScope.App/CodeScope.App.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=false `
+            -p:PublishReadyToRun=true `
+            -p:PublishTrimmed=false `
+            -o artifacts/publish
+
+      - name: Download prior releases (for delta generation)
+        # Best-effort: pulls the latest GitHub release's artefacts into ./releases so
+        # `vpk pack` can compute a delta nupkg. Safe on first release — just no-ops.
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path releases -Force | Out-Null
+          vpk download github `
+            --repoUrl "https://github.com/${{ github.repository }}" `
+            --token "${{ secrets.GITHUB_TOKEN }}" `
+            --outputDir releases `
+            --channel win
+
+      - name: Pack with Velopack
+        shell: pwsh
+        run: |
+          vpk pack `
+            --packId CodeScope `
+            --packVersion ${{ steps.ver.outputs.version }} `
+            --packDir artifacts/publish `
+            --mainExe CodeScope.exe `
+            --packTitle CodeScope `
+            --packAuthors maui1911 `
+            --icon src/CodeScope.App/assets/codescope.ico `
+            --channel win `
+            --outputDir releases
+
+      - name: Upload Velopack artefacts (workflow)
+        uses: actions/upload-artifact@v4
+        with:
+          name: codescope-${{ steps.ver.outputs.version }}-win
+          path: releases/
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          vpk upload github `
+            --repoUrl "https://github.com/${{ github.repository }}" `
+            --token "$env:GH_TOKEN" `
+            --outputDir releases `
+            --channel win `
+            --publish `
+            --releaseName "CodeScope v${{ steps.ver.outputs.version }}" `
+            --tag "v${{ steps.ver.outputs.version }}"
