@@ -52,6 +52,7 @@ $appProj    = Join-Path $repoRoot 'src\CodeScope.App\CodeScope.App.csproj'
 $publishDir = Join-Path $repoRoot 'artifacts\publish'
 $releasesDir = Join-Path $repoRoot 'releases'
 $icon       = Join-Path $repoRoot 'src\CodeScope.App\assets\codescope.ico'
+$splash     = Join-Path $repoRoot 'src\CodeScope.App\assets\splash.png'
 
 Write-Host "==> CodeScope release v$Version  (channel=$Channel)" -ForegroundColor Cyan
 
@@ -93,6 +94,7 @@ $packArgs = @(
     '--packTitle',   'CodeScope',
     '--packAuthors', 'maui1911',
     '--icon',        $icon,
+    '--splashImage', $splash,
     '--channel',     $Channel,
     '--outputDir',   $releasesDir
 )
