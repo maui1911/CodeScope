@@ -134,6 +134,7 @@ public partial class App : Application
                     return vm;
                 });
                 services.AddSingleton<MainWindow>();
+                services.AddSingleton<UpdateService>();
             })
             .Build();
 
@@ -142,6 +143,17 @@ public partial class App : Application
         var window = _host.Services.GetRequiredService<MainWindow>();
         MainWindow = window;
         window.Show();
+
+        // Kick off the auto-update check 10s after the window is visible. The delay keeps it
+        // off the startup-critical path (no network blocking first paint) and gives the host
+        // loggers a moment to wire up so we see any check failures in the console. Fire-and-
+        // forget by design: UpdateService swallows its own exceptions.
+        var updater = _host.Services.GetRequiredService<UpdateService>();
+        _ = System.Threading.Tasks.Task.Run(async () =>
+        {
+            await System.Threading.Tasks.Task.Delay(System.TimeSpan.FromSeconds(10)).ConfigureAwait(false);
+            await updater.CheckAsync().ConfigureAwait(false);
+        });
     }
 
     protected override void OnExit(ExitEventArgs e)
