@@ -331,6 +331,30 @@ docs/
 - **Gitea CI rollup is always `None`** — `tea pulls status`/REST integration deferred.
 - **Session-exit toasts deferred** — `SessionManager` starts pwsh with `-NoExit`; detecting agent exit needs `SessionManager` refactor or pty-output parsing.
 - **Drag tab between groups restarts pwsh** — agent resumes via `--continue`/`--resume` but the scroll buffer is lost. Fix needs a shared SessionTabView host pool (see `memory/project_terminal_lifecycle.md`).
+- **Terminal right-click opens no context menu** — parked for a dedicated
+  research pass. Short version: `Microsoft.Terminal.Wpf` hosts a native
+  Win32 child HWND (`TerminalContainer : HwndHost`) that intercepts
+  `WM_RBUTTONUP` at the native layer, so WPF's routed mouse events never
+  fire and `Grid.ContextMenu` / `PreviewMouseRightButtonUp` / the
+  top-level `HwndSource.AddHook` all see nothing. Tested three tunneling
+  routes via wpf-cli — the right-click instead pasted the clipboard into
+  pwsh (the terminal's own right-click-to-paste path). `PreviewKeyDown`
+  is unaffected because it rides tunneling at the keyboard layer, which
+  is why the current build ships `Ctrl+Shift+O` / `Ctrl+Shift+C` /
+  `Ctrl+Shift+V` via the keyboard handler in `SessionTabView.xaml.cs`.
+  Options to investigate later:
+  * Subclass the terminal's native HWND via `SetWindowLongPtr(GWLP_WNDPROC)`
+    to peek `WM_RBUTTONUP` and forward → most robust but fragile across
+    `Microsoft.Terminal.Wpf` versions; P/Invoke heavy.
+  * Flip `Win32InputMode="False"` and rebuild keyboard forwarding
+    ourselves → recovers WPF mouse events but is a big rewrite of the
+    keyboard path.
+  * Keyboard-only fallback: `Shift+F10` / Apps-key handler that opens a
+    WPF ContextMenu programmatically (small, but no mouse UX).
+  * Upstream a right-click event in `Microsoft.Terminal.Wpf` so no
+    subclassing is needed.
+  Context-menu XAML + click handlers were prototyped and reverted in
+  `3bef676` (see diff — can be resurrected once a reach route lands).
 
 ## Dev loop quick-reference
 
