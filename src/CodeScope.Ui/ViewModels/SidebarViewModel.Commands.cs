@@ -148,15 +148,11 @@ public sealed partial class SidebarViewModel
         var defaultBranch = string.IsNullOrWhiteSpace(project?.DefaultBranch) ? "main" : project!.DefaultBranch;
         var baseRef = $"origin/{defaultBranch}";
 
-        var confirm = System.Windows.MessageBox.Show(
-            $"Rebase '{worktree.DisplayBranch}' onto {baseRef}?\n\n" +
-            $"Conflicts (if any) will leave the rebase in progress — resolve them in the worktree " +
-            $"and run `git rebase --continue` / `--abort` manually.\n\n" +
-            $"Path: {worktree.Path}",
-            "CodeScope — Rebase onto default branch",
-            System.Windows.MessageBoxButton.OKCancel,
-            System.Windows.MessageBoxImage.Question);
-        if (confirm != System.Windows.MessageBoxResult.OK) { return; }
+        var confirm = Dialogs.ConfirmDialog.Confirm(
+            title: $"Rebase '{worktree.DisplayBranch}' onto {baseRef}?",
+            body: $"Conflicts (if any) will leave the rebase in progress — resolve them in the worktree and run `git rebase --continue` / `--abort` manually.\n\nPath: {worktree.Path}",
+            confirmLabel: "Rebase");
+        if (!confirm) { return; }
 
         var r = await _git.RebaseOntoAsync(worktree.Path, baseRef).ConfigureAwait(true);
         if (r.IsSuccess)
@@ -174,15 +170,11 @@ public sealed partial class SidebarViewModel
     private async Task DiscardChangesAsync(WorktreeViewModel? worktree)
     {
         if (worktree is null || _git is null || string.IsNullOrWhiteSpace(worktree.Path)) { return; }
-        var confirm = System.Windows.MessageBox.Show(
-            $"Discard ALL local changes in '{worktree.DisplayBranch}'?\n\n" +
-            $"This resets the worktree to HEAD and removes untracked files/dirs.\n" +
-            $"Unsaved work cannot be recovered.\n\n" +
-            $"Path: {worktree.Path}",
-            "CodeScope — Discard changes",
-            System.Windows.MessageBoxButton.OKCancel,
-            System.Windows.MessageBoxImage.Warning);
-        if (confirm != System.Windows.MessageBoxResult.OK) { return; }
+        var confirm = Dialogs.ConfirmDialog.Destructive(
+            title: $"Discard ALL local changes in '{worktree.DisplayBranch}'?",
+            body: $"This resets the worktree to HEAD and removes untracked files/dirs. Unsaved work cannot be recovered.\n\nPath: {worktree.Path}",
+            confirmLabel: "Discard");
+        if (!confirm) { return; }
 
         var r = await _git.DiscardChangesAsync(worktree.Path).ConfigureAwait(true);
         if (r.IsSuccess)
@@ -367,15 +359,69 @@ public sealed partial class SidebarViewModel
     private async Task RemoveWorktreeAsync(WorktreeViewModel? worktree)
     {
         if (worktree is null || worktree.IsPrimary) { return; }
-        var confirm = System.Windows.MessageBox.Show(
-            $"Delete worktree '{worktree.DisplayBranch}' at\n{worktree.Path}?",
-            "CodeScope — Remove worktree",
-            System.Windows.MessageBoxButton.OKCancel,
-            System.Windows.MessageBoxImage.Warning);
-        if (confirm != System.Windows.MessageBoxResult.OK) { return; }
+        var confirm = Dialogs.ConfirmDialog.Destructive(
+            title: $"Delete worktree '{worktree.DisplayBranch}'?",
+            body: $"Path: {worktree.Path}\n\nOpen sessions will be closed first. Unpushed commits stay on the branch.",
+            confirmLabel: "Delete");
+        if (!confirm) { return; }
+
+        // Close any tabs pinned to this worktree first so pwsh releases the cwd lock on
+        // the directory. Without this `git worktree remove` fails on Windows with a file-
+        // in-use error and the sidebar silently stays stale. The close callback returns a
+        // rollback lambda we invoke if the whole remove flow ultimately fails — without it,
+        // a failed delete would leave the worktree in place but with its tabs vanished.
+        Func<Task>? rollback = null;
+        if (CloseWorktreeSessionsAsync is { } closeSessions)
+        {
+            try { rollback = await closeSessions(worktree.ProjectId, worktree.Id).ConfigureAwait(true); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Closing sessions for worktree {Id} failed", worktree.Id); }
+
+            // Give WPF a beat to run the SessionTabView Unloaded teardown and let ConPTY
+            // kill the pwsh child — otherwise we race the file lock into `git worktree remove`.
+            await Task.Delay(250).ConfigureAwait(true);
+        }
 
         var r = await _store.RemoveWorktreeAsync(worktree.ProjectId, worktree.Id).ConfigureAwait(true);
-        if (r.IsFailure) { _logger.LogWarning("RemoveWorktree failed: {Error}", r.Error); }
+        if (r.IsSuccess)
+        {
+            Toast("Worktree removed", worktree.DisplayBranch, ControlAppearance.Success);
+            return;
+        }
+
+        _logger.LogWarning("RemoveWorktree failed: {Error}", r.Error);
+
+        // Offer --force when the normal remove is rejected — typically dirty worktree or
+        // a lingering lock. Force still can't beat a live Windows file lock, but it covers
+        // the common "you have uncommitted changes" case cleanly.
+        var retry = Dialogs.ConfirmDialog.Destructive(
+            title: "Couldn't remove worktree — force?",
+            body: $"{r.Error}\n\nForce remove will discard uncommitted changes and untracked files in the worktree.",
+            confirmLabel: "Force remove");
+        if (!retry)
+        {
+            await InvokeRollbackAsync(rollback).ConfigureAwait(true);
+            Toast("Remove failed", r.Error, ControlAppearance.Danger);
+            return;
+        }
+
+        var forced = await _store.RemoveWorktreeAsync(worktree.ProjectId, worktree.Id, force: true).ConfigureAwait(true);
+        if (forced.IsSuccess)
+        {
+            Toast("Worktree force-removed", worktree.DisplayBranch, ControlAppearance.Success);
+        }
+        else
+        {
+            _logger.LogWarning("Force RemoveWorktree failed: {Error}", forced.Error);
+            await InvokeRollbackAsync(rollback).ConfigureAwait(true);
+            Toast("Remove failed", forced.Error, ControlAppearance.Danger);
+        }
+    }
+
+    private async Task InvokeRollbackAsync(Func<Task>? rollback)
+    {
+        if (rollback is null) { return; }
+        try { await rollback().ConfigureAwait(true); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Worktree close rollback threw"); }
     }
 
     /// <summary>Unwraps the ProjectViewModel / WorktreeViewModel / string alternatives passed by menus.</summary>

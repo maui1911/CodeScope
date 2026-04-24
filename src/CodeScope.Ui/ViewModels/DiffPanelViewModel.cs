@@ -28,11 +28,24 @@ public sealed partial class DiffPanelViewModel : ObservableObject
         Lines = [];
 
         // Re-render on each status tick: cheap since diff runs only when the panel is expanded.
+        // WorktreeStatusUpdated is raised by the status poller on a thread-pool thread, so we
+        // must marshal onto the dispatcher before kicking off RefreshAsync — otherwise
+        // Lines.Clear() / Lines.Add() below mutate an ObservableCollection off the UI thread
+        // and WPF raises "SourceCollection from a thread different from the Dispatcher thread".
         _store.Changed += (_, change) =>
         {
-            if (change is SessionStoreChange.WorktreeStatusUpdated updated
-                && _worktree is { } wvm
-                && updated.WorktreeId == wvm.Id)
+            if (change is not SessionStoreChange.WorktreeStatusUpdated updated
+                || _worktree is not { } wvm
+                || updated.WorktreeId != wvm.Id)
+            {
+                return;
+            }
+            var app = Application.Current;
+            if (app?.Dispatcher is { } d && !d.CheckAccess())
+            {
+                d.BeginInvoke(new Action(() => { _ = RefreshAsync(); }));
+            }
+            else
             {
                 _ = RefreshAsync();
             }

@@ -27,14 +27,20 @@ public static class ClaudeModelCatalog
         if (string.IsNullOrWhiteSpace(modelId)) { return 0; }
         var id = modelId.ToLowerInvariant();
 
-        // Extended-context SKUs — either a "[1m]" tag or an embedded "-1m-" / "-1m" segment.
+        // Explicit 1M marker always wins — overrides any family default (e.g. a future
+        // `claude-sonnet-*-1m` SKU or the legacy `claude-opus-4-7[1m]` tag).
         if (id.Contains("1m")) { return ExtendedContextTokens; }
 
-        if (id.Contains("claude")
-            && (id.Contains("opus") || id.Contains("sonnet") || id.Contains("haiku")))
-        {
-            return StandardContextTokens;
-        }
+        // Sonnet / Haiku — 200k; no current 1M SKU.
+        if (id.Contains("sonnet") || id.Contains("haiku")) { return StandardContextTokens; }
+
+        // Claude 3.x Opus — 200k. Matches "claude-3-opus-*" without catching "claude-opus-4-*".
+        if (id.Contains("claude-3")) { return StandardContextTokens; }
+
+        // Opus 4.x (and later) ships the 1M context window by default in Claude Code CLI —
+        // the transcript's `message.model` is a plain `claude-opus-4-7` with no `[1m]` suffix,
+        // so we treat the Opus 4+ family as 1M by default.
+        if (id.Contains("claude") && id.Contains("opus")) { return ExtendedContextTokens; }
 
         return 0;
     }

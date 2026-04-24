@@ -119,6 +119,46 @@ public sealed class ClaudeSessionDiscoveryTests : IDisposable
     }
 
     [Fact]
+    public async Task Callback_Fires_For_Each_New_Jsonl_So_Clear_Rotations_Are_Adopted()
+    {
+        var sut = NewSut();
+        var adopted = new List<string>();
+        using var handle = sut.Watch(_cwd, DateTimeOffset.UtcNow, (id, _) =>
+        {
+            lock (adopted) { adopted.Add(id); }
+        });
+
+        Directory.CreateDirectory(_encodedDir);
+
+        var id1 = Guid.NewGuid().ToString("D");
+        await File.WriteAllTextAsync(Path.Combine(_encodedDir, id1 + ".jsonl"), "{}");
+
+        await WaitForAsync(() => { lock (adopted) { return adopted.Count >= 1; } }, TimeSpan.FromSeconds(3));
+
+        // Simulates what Claude Code does on `/clear`: a fresh session id ⇒ a fresh jsonl.
+        var id2 = Guid.NewGuid().ToString("D");
+        await File.WriteAllTextAsync(Path.Combine(_encodedDir, id2 + ".jsonl"), "{}");
+
+        await WaitForAsync(() => { lock (adopted) { return adopted.Count >= 2; } }, TimeSpan.FromSeconds(3));
+
+        lock (adopted)
+        {
+            adopted.Should().Contain(id1);
+            adopted.Should().Contain(id2);
+        }
+    }
+
+    private static async Task WaitForAsync(Func<bool> predicate, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            if (predicate()) { return; }
+            await Task.Delay(50);
+        }
+    }
+
+    [Fact]
     public async Task Dispose_Before_Discovery_Suppresses_Callback()
     {
         var sut = NewSut();

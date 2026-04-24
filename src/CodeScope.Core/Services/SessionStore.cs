@@ -173,6 +173,80 @@ public sealed class SessionStore : ISessionStore
         return Result<bool>.Ok(true);
     }
 
+    public async Task<Result<bool>> SoftCloseSessionAsync(string sessionId, CancellationToken ct = default)
+    {
+        var changed = false;
+        lock (_lock)
+        {
+            for (var i = 0; i < _projects.Count; i++)
+            {
+                var p = _projects[i];
+                var sessions = p.Sessions.ToList();
+                var idx = sessions.FindIndex(s => s.Id == sessionId);
+                if (idx < 0) { continue; }
+                // Idempotent — re-closing an already-closed session is a no-op, not an error.
+                if (sessions[idx].ClosedAt is not null) { return Result<bool>.Ok(true); }
+                sessions[idx] = sessions[idx] with { ClosedAt = DateTimeOffset.UtcNow };
+                _projects[i] = p with { Sessions = sessions };
+                changed = true;
+                break;
+            }
+        }
+        if (!changed) { return Result<bool>.Fail($"Session '{sessionId}' not found"); }
+        var saved = await SaveSnapshotAsync(ct).ConfigureAwait(false);
+        if (saved.IsFailure)
+        {
+            // Rollback the in-memory mutation so a retry doesn't hit the idempotency guard
+            // and silently succeed without ever persisting.
+            lock (_lock)
+            {
+                for (var i = 0; i < _projects.Count; i++)
+                {
+                    var p = _projects[i];
+                    var sessions = p.Sessions.ToList();
+                    var idx = sessions.FindIndex(s => s.Id == sessionId);
+                    if (idx < 0) { continue; }
+                    sessions[idx] = sessions[idx] with { ClosedAt = null };
+                    _projects[i] = p with { Sessions = sessions };
+                    break;
+                }
+            }
+            return saved;
+        }
+        // Fire SessionRemoved so the sidebar/tab strip drop the row — restore emits SessionAdded.
+        Raise(new SessionStoreChange.SessionRemoved(sessionId));
+        return Result<bool>.Ok(true);
+    }
+
+    public async Task<Result<Session>> RestoreSessionAsync(string sessionId, CancellationToken ct = default)
+    {
+        Session? restored = null;
+        string? projectId = null;
+        lock (_lock)
+        {
+            for (var i = 0; i < _projects.Count; i++)
+            {
+                var p = _projects[i];
+                var sessions = p.Sessions.ToList();
+                var idx = sessions.FindIndex(s => s.Id == sessionId);
+                if (idx < 0) { continue; }
+                restored = sessions[idx] with { ClosedAt = null, LastOpened = DateTimeOffset.UtcNow };
+                sessions[idx] = restored;
+                _projects[i] = p with { Sessions = sessions };
+                projectId = p.Id;
+                break;
+            }
+        }
+        if (restored is null || projectId is null)
+        {
+            return Result<Session>.Fail($"Session '{sessionId}' not found");
+        }
+        var saved = await SaveSnapshotAsync(ct).ConfigureAwait(false);
+        if (saved.IsFailure) { return Result<Session>.Fail(saved.Error); }
+        Raise(new SessionStoreChange.SessionAdded(projectId, restored));
+        return Result<Session>.Ok(restored);
+    }
+
     public async Task<Result<bool>> RenameSessionAsync(string sessionId, string? newName, CancellationToken ct = default)
     {
         var renamed = false;
@@ -283,7 +357,7 @@ public sealed class SessionStore : ISessionStore
         return Result<Worktree>.Ok(worktree);
     }
 
-    public async Task<Result<bool>> RemoveWorktreeAsync(string projectId, string worktreeId, CancellationToken ct = default)
+    public async Task<Result<bool>> RemoveWorktreeAsync(string projectId, string worktreeId, bool force = false, CancellationToken ct = default)
     {
         Project? project;
         Worktree? worktree;
@@ -302,7 +376,7 @@ public sealed class SessionStore : ISessionStore
             return Result<bool>.Fail("Primary worktrees cannot be removed");
         }
 
-        var gitResult = await _git.RemoveWorktreeAsync(project.Path, worktree.Path, ct).ConfigureAwait(false);
+        var gitResult = await _git.RemoveWorktreeAsync(project.Path, worktree.Path, force, ct).ConfigureAwait(false);
         if (gitResult.IsFailure)
         {
             return Result<bool>.Fail(gitResult.Error);

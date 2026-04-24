@@ -121,6 +121,6 @@ public sealed class ProjectStore : IProjectStore
     private static string DefaultConfigPath()
     {
         var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-        return Path.Combine(appData, "CodeScope", "projects.json");
+        return Path.Combine(appData, AppPaths.AppFolderName, "projects.json");
     }
 }

@@ -17,7 +17,7 @@ public static class WindowGeometryStore
     {
         get
         {
-            var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodeScope");
+            var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), NoScope.CodeScope.Core.AppPaths.AppFolderName);
             Directory.CreateDirectory(dir);
             return Path.Combine(dir, "window.json");
         }

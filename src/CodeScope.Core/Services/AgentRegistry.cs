@@ -38,14 +38,16 @@ public sealed class AgentRegistry : IAgentRegistry
             Id = "claude",
             DisplayName = "Claude Code",
             Command = "claude",
-            // Claude Code v2.1.118+ broke client-minted session ids and `--continue` / `--resume`
-            // on fresh hydrates (no deferred tool marker; forks session id on /clear). CodeScope
-            // now always launches `claude` bare and adopts whichever UUID the CLI picks by
-            // watching the transcript directory — see `IClaudeSessionDiscovery`.
+            // Fresh launches (no known id) go through NewSessionArgs = [] → bare `claude`, and
+            // `IClaudeSessionDiscovery` adopts whichever UUID the CLI mints. When we already
+            // know the session id — cross-group drag, layout hydrate — we resume it via
+            // `claude --resume <id>` (ResumeByIdArgs) so the conversation continues instead
+            // of the user landing on a fresh agent. SessionIdFlag stays null because v2.1.118+
+            // still refuses client-minted ids on new sessions.
             ResumeArgs = [],
             NewSessionArgs = [],
             SessionIdFlag = null,
-            ResumeByIdArgs = [],
+            ResumeByIdArgs = ["--resume"],
             IsDefault = true,
             Icon = "✶",
             ContextWindowTokens = 1_000_000,

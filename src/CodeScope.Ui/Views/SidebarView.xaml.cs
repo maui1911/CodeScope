@@ -20,6 +20,20 @@ public partial class SidebarView : UserControl
     /// handler still binds. We may re-surface filtering via the command palette instead.</summary>
     public void FocusFilter() { }
 
+    /// <summary>
+    /// Chevron click toggles the owning TreeViewItem's expansion. Without this, the chevron
+    /// is a decorative Path and only a double-click on the row expands/collapses — which is
+    /// what users report as "clicking the chevron doesn't do anything."
+    /// </summary>
+    private void OnChevronClick(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is not DependencyObject origin) { return; }
+        var item = FindAncestor<TreeViewItem>(origin);
+        if (item is null) { return; }
+        item.IsExpanded = !item.IsExpanded;
+        e.Handled = true;
+    }
+
     /// <summary>Accept drops only when the payload contains at least one directory.</summary>
     private void OnDragOver(object sender, DragEventArgs e)
     {

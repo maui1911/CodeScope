@@ -5,24 +5,108 @@
 > **Intent:** cursor + last 1–2 sessions in depth, everything else a one-liner.
 > Old detail lives in `git log` — don't duplicate it here.
 
-**Last updated:** 2026-04-24 (session 19)
-**Branch:** `main`.
-**Head:** `a0df3cc` — `Add Velopack distribution and v0.1.0 release workflow (#1)`
+**Last updated:** 2026-04-24 (session 20)
+**Branch:** `bugfix/post-v0.1.0` — 5 commits ahead of `origin/main`, pushed to origin.
+**Head:** `bd882eb` — `fix(telemetry): keep adoption watch alive across /clear rotations`
 **Release:** `v0.1.0` shipped via GitHub Actions — https://github.com/maui1911/CodeScope/releases/tag/v0.1.0
-**Build status:** ✅ `dotnet build` clean. `dotnet test` 145/145 green.
+**Build status:** ✅ `dotnet build` clean. `dotnet test` 147/147 green.
 **Uncommitted work:** none.
-**Unpushed commits:** none — pushed via PR #1.
+**Unpushed commits:** none — branch is up to date with `origin/bugfix/post-v0.1.0`; no PR opened yet.
 
 ---
 
 ## Cursor — current focus
 
-**Distribution is live.** Session 19 wired Velopack end-to-end and cut the
-first public release. Push a SemVer tag `v*.*.*` and CI handles the rest:
-`dotnet publish` → `vpk pack` (auto-downloads the prior release first so
-delta nupkgs compute) → `vpk upload github` creates the Release with
-installer + full/delta packages + `releases.win.json` attached. For v0.1.1+
-the flow is: commit → `git tag v0.1.1` → `git push origin v0.1.1`.
+**Post-v0.1.0 bugfix pass.** Session 20 shipped six fixes hit in daily use
+of the v0.1.0 install, plus a dev-mode env var so a debug build can run
+alongside the installed app. Branch `bugfix/post-v0.1.0` is pushed; next
+concrete step is a PR to `main`. After merge, bump the tag to `v0.1.1`
+and let the Session-19 release pipeline cut the update.
+
+### Session 20 — post-v0.1.0 bugfixes + dev-mode side-by-side (shipped)
+
+- `7e284ae` — **Six-in-one bundle** (separated here, kept together because
+  the shared files `MainViewModel.cs` and `SessionTabView.xaml.cs` touch
+  multiple concerns and splitting would have required hunk-level staging):
+  * **Worktree delete cascade.** Right-click → Remove now closes any open
+    tabs pinned to the worktree first (via a `CloseWorktreeSessionsAsync`
+    callback the `MainViewModel` wires onto the sidebar VM) so pwsh
+    releases its Windows cwd lock before `git worktree remove` runs.
+    Failure surfaces as a toast plus an optional `--force` retry dialog.
+    `SessionTabView` gained an `Unloaded` teardown
+    (`DisconnectConPTYTerm` + `CloseStdinToApp` + `StopExternalTermOnly`)
+    so the ConPTY child actually dies when the tab VM leaves its group.
+    `IGitService.RemoveWorktreeAsync` + `ISessionStore.RemoveWorktreeAsync`
+    grew a `bool force = false` param; existing NSubstitute stub widened.
+  * **Terminal clipboard.** Windows-Terminal semantics in a
+    `PreviewKeyDown` handler: `Ctrl+C` copies on a non-empty selection
+    else falls through as SIGINT; `Ctrl+Shift+C` always copies;
+    `Ctrl+V` / `Ctrl+Shift+V` paste with `\r\n` → `\r` normalisation
+    (otherwise each CR is an Enter and multiline pastes emit blank
+    commands). Clipboard contention gets one retry.
+  * **URL open via selection.** `Ctrl+Shift+O` on a selected URL opens
+    the default browser via `Process.Start(UseShellExecute=true)`.
+    Multi-line terminal-wrapped URLs are stitched before validation.
+    A WPF ContextMenu was prototyped for right-click access but is
+    unreachable — see rough-edges below.
+  * **Drag-resume Claude cross-group.** `AgentRegistry` restored
+    `ResumeByIdArgs = ["--resume"]` for the claude profile so a
+    cross-group drop relaunches `claude --resume <id>` instead of a
+    bare session. `MainViewModel.MoveTabToGroup` preserves the
+    telemetry tail when we can resume by id (same jsonl gets appended).
+  * **Status-bar token semantics.** `ClaudeSessionTelemetry.TotalTokens`
+    → `ContextTokens`, semantically the *latest* assistant turn's
+    `input + cache_read + cache_creation + output` (overwrite, not
+    accumulate). Claude is stateless per request so each turn's
+    `input_tokens` already covers the prior conversation — summing
+    double-counts and blew the % past 100 within a handful of turns.
+  * **Dev-mode isolation.** New `NoScope.CodeScope.Core.AppPaths`
+    resolves `CODESCOPE_DEV=1` at process start and redirects the
+    single-instance mutex, `%APPDATA%\CodeScope\`, and
+    `%LOCALAPPDATA%\CodeScope\` to `.Dev` variants. Window title
+    suffix `[dev]`. CLAUDE.md documents the workflow.
+- `3bef676` — **Drop dead WPF ContextMenu.** Right-click on the terminal
+  couldn't open any WPF context menu: `Microsoft.Terminal.Wpf`'s HwndHost
+  child captures `WM_RBUTTONUP` at the native layer, so WPF's routed
+  mouse events (`Grid.ContextMenu`, `PreviewMouseRightButtonUp`, and a
+  top-level `HwndSource.AddHook`) all see nothing. Confirmed via wpf-cli
+  — right-click pasted the clipboard into pwsh via the terminal's
+  own right-click-to-paste path. Keyboard shortcuts remain as the
+  supported clipboard/URL surface.
+- `a5aefea` — **Park right-click research** in the rough-edges list with
+  four fix options (native HWND subclass / `Win32InputMode` flip /
+  keyboard-only fallback / upstream event) so the next pass doesn't
+  re-derive them.
+- `d75097d` — **Model catalog: Opus 4.x defaults to 1M.** Real Claude
+  Code CLI transcripts carry `message.model = claude-opus-4-7` with no
+  `[1m]` tag — the 1M SKU is selected out of band. The old substring
+  rule matched `claude && opus` and returned 200k, so the status bar
+  divided ~30k context by the wrong cap and reported ~15% while Claude
+  Code itself showed ~3% against the real 1M cap. Catalog now: explicit
+  `1m` tag wins, sonnet/haiku stay 200k, `claude-3*` is 200k, every
+  other `claude-opus-*` defaults to 1M.
+- `bd882eb` — **Continuous adoption for `/clear` rotations.**
+  `ClaudeSessionDiscovery.Watch` was one-shot — after the first
+  adoption it disposed. Claude rotates its session id on `/clear` by
+  writing a brand new jsonl in the same cwd dir, so every `/clear`
+  stranded telemetry on the abandoned transcript and the status bar
+  froze. `WatchHandle` now tracks fired paths in a set and keeps the
+  watch alive for the tab's lifetime; `MainViewModel.BeginClaudeAdoption`
+  short-circuits when the adopted id already matches the persisted one
+  (stops churn on startup/poll re-fires) and otherwise unregisters the
+  old telemetry, registers the new id, and persists. Single-tab
+  `/clear` verified in the dev build against a real Opus 4.7 session.
+  Multi-tab same-cwd is an accepted limitation: both tabs would see
+  a rotation event for either; flag if it ever surfaces.
+
+**Test coverage added/updated this session:**
+- `SessionStoreTests` — mock signature widened for `force` param
+- `ClaudeTelemetryServiceTests.ContextTokens` — expects latest-turn
+  context size (was cumulative sum)
+- `ClaudeModelCatalogTests` — Opus 4.x ids now expect 1M
+- `ClaudeSessionDiscoveryTests.Callback_Fires_For_Each_New_Jsonl…` — new,
+  covers the `/clear` rotation path
+- Total 147/147 green (145 pre-session + 2 new)
 
 ### Session 19 — Velopack + GitHub Actions release pipeline (shipped)
 
@@ -110,150 +194,16 @@ cap is now model-aware instead of a baked 1M default.
   default `SubmenuHeader` template via `Ctx.Menu.PrimaryTemplate` and
   strips the chevron — don't set it on submenu parents, only leaves.
 
-### Session 17 — Claude CLI v2.1.118 adoption fix (shipped)
+### Sessions 13–18 (one-liners — see `git log` for detail)
 
-- `86f874b` — **Claude Code v2.1.118 rotates session ids.** Two
-  symptoms the user hit on cold hydrate: (a) `claude --continue`
-  errored with `No deferred tool marker found in the resumed session`
-  and exited, so every Claude tab terminated instantly; (b) persisted
-  `agentSessionId` values in `projects.json` pointed at abandoned
-  transcripts (Claude rotates the UUID on `/clear` and on resume), so
-  the telemetry tail had nothing to watch — status dot, tokens, turns,
-  activity FSM, Wait pulse, and notifications all went dark. New
-  shape: **stop owning the id, adopt from disk.** `IClaudeSessionDiscovery`
-  + `ClaudeSessionDiscovery` do a one-shot FSWatcher+350 ms poll over
-  `~/.claude/projects/<enc-cwd>/*.jsonl`, filter by `CreationTimeUtc
-  >= since`, fire once with `(adoptedId, path)`, then self-dispose.
-  `AgentRegistry` drops Claude's `SessionIdFlag` / `ResumeArgs` /
-  `ResumeByIdArgs` — `SessionManager` now launches a bare
-  `pwsh -Command "& { claude }"` from every path (fresh, duplicate,
-  cross-group drag, hydrate). `MainViewModel.BeginClaudeAdoption`
-  starts a watch per tab, dispatcher-marshals the callback, calls
-  `ISessionStore.UpdateAgentSessionIdAsync` to persist the adopted id,
-  then `IClaudeTelemetryService.Register` so the status bar wakes up.
-  Watches are torn down on adoption, tab close, and cross-group drop.
-  Old persisted ids become harmless — overwritten on first launch.
-  6 new unit tests cover fresh-create, pre-existing-via-poll, age
-  filter, non-UUID rejection, once-only firing, dispose-before-discovery.
-  Total 145/145 green.
-
-### Session 16 — notifications cluster (shipped)
-
-- `49fdd60` — **Status-bar bell + popover, activity-driven queue.**
-  Core gains `INotificationService` / `NotificationService` —
-  thread-safe in-memory ring buffer (cap 50) with `Push`, `MarkRead`,
-  `MarkSessionRead`, `MarkAllRead`, `Clear`, and a single `Changed`
-  event. `NotificationEntry` carries id + sessionId + kind
-  (SessionReady / SessionWaiting / Generic) + title + detail +
-  timestamp + IsRead. `MainViewModel` tracks each session's last
-  `ClaudeActivityState` and pushes entries on semantic transitions:
-  * → `PendingToolUse` → "Needs attention"; `PendingToolUse` /
-  `Composing` → `Idle` → "Ready · Turn complete · <duration>".
-  Suppresses the push when the transitioning tab is already the
-  window-selected one; focusing a tab calls `MarkSessionRead` for
-  its AgentSessionId so badges clear on reveal. `StatusBarView.xaml`
-  gains the rightmost cluster — 1×14 separator + bell-glyph Button
-  (12×12 path per spec §11) + 4 px Accent.Primary unread dot
-  overlaid top-right. Clicking the bell opens a 360 px `Popup`
-  (`Placement=Top`, fade, `StaysOpen=False`, 8 px radius,
-  SurfaceDialog bg + drop-shadow) with "Notifications" header +
-  "Clear" action, "No notifications yet." empty state, scrollable
-  `ItemsControl` of entries (kind-coloured dot · title · detail ·
-  session · HH:mm) and a "Click an entry to jump to its session"
-  footer. Entry clicks invoke the VM's `ActivateCommand`, which flips
-  `SelectedTab` via the Claude AgentSessionId match and closes the
-  popover. 9 new unit tests cover ordering, MaxEntries trim, unread
-  count, mark semantics, Clear, event firing. Total 139/139 green.
-
-### Session 15 — telemetry polish + chrome polish (shipped)
-
-- `abf4e45` — **250 ms poll fallback.** Shared `Timer` in
-  `ClaudeTelemetryService` stats each watched file and re-reads when
-  `Length > Offset` — zero-cost on quiet sessions, closes the
-  FSWatcher latency gap so the Wait pulse feels instant. New
-  three-arg ctor opts polling in; two-arg test-seam stays
-  deterministic. Added `Polling_Picks_Up_Appended_Lines…` test.
-- `4b45770` — **Per-model context window detection.**
-  `ClaudeTranscriptParser` now extracts `message.model`; new
-  `ClaudeModelCatalog.GetContextWindow` maps ids to 200k (standard)
-  or 1M (any id containing `1m`). `ClaudeSessionTelemetry` carries
-  `ModelId` + `ContextWindowTokens`; `SessionTabViewModel` mirrors
-  the cap; `MainViewModel.StatusBar.ContextWindowFor` prefers the
-  detected value over the baked `AgentProfile` default. 9 catalog
-  cases + 1 end-to-end telemetry test.
-- `b97788c` — **Caption-cluster margin on rightmost strip.**
-  `RebuildGroupLayout` now stamps a 184 px right-margin (4 × 46 px
-  `CaptionButton`) on the last `GroupStripView` so its tabs + `+`
-  button can't sit under the window caption overlay. Zero margin on
-  the others so column alignment to `WorkspacesHost` is preserved.
-- `5239ea0` — **Empty-project placeholder.** `ProjectViewModel.HasNoWorktrees`
-  + a `MultiDataTrigger` in the project `HierarchicalDataTemplate`
-  render a muted "(no worktrees)" row beneath an expanded empty
-  project. Collapsed stays a one-line row.
-- `b551730` — **Fase-7 token polish pass.** `Fig.Style.Dialog` +
-  the three dialog outer borders point at `Fig.Radius.Medium` (8 px,
-  was `Radius.Panel` 15 px / hard-coded). `Fig.Style.Button.*` swap
-  `Framer.FocusVisual` → `Fig.FocusVisual` (dashed 2,2). Tab-strip
-  titles drop to variable-weight 340 unselected with a Medium trigger
-  on `IsSelected`, `TextFormattingMode=Ideal` for the sub-integer
-  weight. "Pill on hero CTAs" pile item dropped — current hero buttons
-  match HTML mocks pixel-for-pixel.
-- `39d2786` — **Diff panel: stats header + line-number gutters + row
-  tints.** `DiffPanelViewModel.RefreshAsync` now walks the patch once
-  and tracks old/new counters seeded from each hunk header; `DiffLine`
-  grew `OldLine` / `NewLine`. New `Summary` + `HasSummary` feed a muted
-  mono "N files · +A −B" stats pill next to the panel's DIFF label.
-  View rebuilt to a 44 / 44 / * grid (old gutter, new gutter, code)
-  with per-kind row backgrounds (Added / Removed / Hunk); Context rows
-  get an explicit `Fig.Brush.Ink` foreground to stop them falling
-  through to SystemColors black. Also dropped the empty-state status
-  duplication — `StatusBarText` now returns "" when `wts == 0` so it
-  no longer collides with `StatusEmptyMessage`.
-- `93cde45` — **Focused-group hairline accent (later reverted in `071da29`).**
-  Shipped a bottom-border accent on the focused strip; user called it out as
-  a redundant double-line against the already-present selected-tab rail.
-  Reverted with the Tab Motion pass.
-- `071da29` — **Tab Motion single-rail animation.** Per-tab `TabRail`
-  border replaced with one shared `Border` in a `Canvas` above `StripList`.
-  `SelectionChanged`/`Loaded`/`SizeChanged` measure the selected
-  `ListBoxItem` via `TranslatePoint` and animate `Canvas.Left` + `Width`
-  with a 200 ms `CubicEase` ease-out. First paint snaps without animation;
-  `DispatcherPriority.Loaded` retry handles the "container not realised
-  yet" race. Same commit reverts the `93cde45` hairline and drops the
-  outer strip border's bottom thickness (`0,0,1,1` → `0,0,1,0`) so
-  unselected tabs don't show a leftover grey line.
-
-### Session 14 — wait-state propagation (shipped)
-
-- `4455c42` — Single-page deck recapping sessions 10–13 (four
-  CSS-rebuilt status bars, flow diagram, four idea cards, live
-  shot, commit log). *(Deck file removed during 2026-04-24 cleanup;
-  still reachable via the commit.)*
-- `792505f` — Sidebar propagation. `WorktreeViewModel.DotState` +
-  `StatusLabel` now reflect child `TabStatus.Wait`; subscribes
-  per-session `PropertyChanged(Status)`. `ProjectViewModel.HasWaitingChild`
-  lives via per-child `PropertyChanged(DotState)`. Cross-instance fix:
-  `ApplyTelemetry` stamps both the tab-strip VM *and* the sidebar
-  mirror (distinct refs per the sidebar-flatten pattern).
-- `0400fda` — Top-bar §3 pulse. Halo `Ellipse` behind the 6px tab
-  dot, 1.4s scale 1→2.4× + opacity .55→0, `DataTrigger` on
-  `Status == Wait`. Same timing as the sidebar so they read as one
-  system.
-
-**Known latency:** `FileSystemWatcher` + JSONL flush boundaries mean
-Wait surfaces 100–500 ms after Claude emits the `tool_use` line.
-Acceptable; a 250 ms poll fallback over the watcher would close the
-gap if it ever feels laggy.
-
-### Session 13 — transcript-driven activity state (shipped)
-
-- `2ee7b1d` — `TranscriptEntry.StopReason` +
-  `UserCarriesToolResult`; new `ClaudeActivityState` enum + FSM
-  (`user` → Composing; `assistant end_turn` → Idle;
-  `assistant tool_use` → PendingToolUse).
-- `3b0f5b4` — `MainViewModel.ApplyActivityToStatus` projects
-  activity onto `TabStatus` (PendingToolUse → Wait, etc.).
-- `86291f2` — handoff update.
+| # | Gist |
+|---|---|
+| 18 | **ConPTY std-handle rebind + agent picker** (`8edf392`) — fresh `AllocConsole` + `SetStdHandle(CONIN$/CONOUT$)` so pwsh/claude don't die on inherited redirected stdio. Worktree-ctx "New session" / "Open in new group" turned into agent submenus. |
+| 17 | **Claude CLI session-id adoption** (`86f874b`) — stop owning the id, adopt from disk via `IClaudeSessionDiscovery` FSWatcher tail. `AgentRegistry` drops Claude's resume flags (all bare launches); status bar wakes via `Register(adoptedId, workingDir)`. 6 discovery tests. *(Superseded in session 20: continuous adoption + resume-by-id restored.)* |
+| 16 | **Notifications cluster** (`49fdd60`) — `INotificationService` ring buffer (cap 50), status-bar bell + 360 px popover, activity-driven pushes on `→PendingToolUse` / `→Idle`. Entry click jumps via Claude AgentSessionId match. |
+| 15 | **Telemetry polish + chrome polish** (`abf4e45` poll fallback, `4b45770` per-model cap, `b97788c` caption margin, `5239ea0` empty-project placeholder, `b551730` Fig token pass, `39d2786` diff panel gutters, `071da29` single-rail tab motion). |
+| 14 | **Wait-state propagation** (`792505f` sidebar → project → worktree rollup, `0400fda` top-bar tab-dot halo pulse). Note: 100–500 ms FSWatcher latency is accepted; poll fallback landed in 15. |
+| 13 | **Transcript-driven activity FSM** (`2ee7b1d` + `3b0f5b4`) — user → Composing; assistant end_turn → Idle; assistant tool_use → PendingToolUse. |
 
 ### Earlier sessions (one-liners)
 
@@ -330,7 +280,31 @@ docs/
 
 - **Gitea CI rollup is always `None`** — `tea pulls status`/REST integration deferred.
 - **Session-exit toasts deferred** — `SessionManager` starts pwsh with `-NoExit`; detecting agent exit needs `SessionManager` refactor or pty-output parsing.
-- **Drag tab between groups restarts pwsh** — agent resumes via `--continue`/`--resume` but the scroll buffer is lost. Fix needs a shared SessionTabView host pool (see `memory/project_terminal_lifecycle.md`).
+- **Drag tab between groups loses scroll buffer** — pwsh respawns because WPF unloads the `SessionTabView` (HWND lifecycle) when the VM leaves its group. As of session 20 Claude resumes its conversation via `claude --resume <id>` and telemetry keeps tracking (same jsonl), but the terminal scrollback is gone. Fix still needs a shared `SessionTabView` host pool — see `memory/project_terminal_lifecycle.md`.
+- **Terminal right-click opens no context menu** — parked for a dedicated
+  research pass. Short version: `Microsoft.Terminal.Wpf` hosts a native
+  Win32 child HWND (`TerminalContainer : HwndHost`) that intercepts
+  `WM_RBUTTONUP` at the native layer, so WPF's routed mouse events never
+  fire and `Grid.ContextMenu` / `PreviewMouseRightButtonUp` / the
+  top-level `HwndSource.AddHook` all see nothing. Tested three tunneling
+  routes via wpf-cli — the right-click instead pasted the clipboard into
+  pwsh (the terminal's own right-click-to-paste path). `PreviewKeyDown`
+  is unaffected because it rides tunneling at the keyboard layer, which
+  is why the current build ships `Ctrl+Shift+O` / `Ctrl+Shift+C` /
+  `Ctrl+Shift+V` via the keyboard handler in `SessionTabView.xaml.cs`.
+  Options to investigate later:
+  * Subclass the terminal's native HWND via `SetWindowLongPtr(GWLP_WNDPROC)`
+    to peek `WM_RBUTTONUP` and forward → most robust but fragile across
+    `Microsoft.Terminal.Wpf` versions; P/Invoke heavy.
+  * Flip `Win32InputMode="False"` and rebuild keyboard forwarding
+    ourselves → recovers WPF mouse events but is a big rewrite of the
+    keyboard path.
+  * Keyboard-only fallback: `Shift+F10` / Apps-key handler that opens a
+    WPF ContextMenu programmatically (small, but no mouse UX).
+  * Upstream a right-click event in `Microsoft.Terminal.Wpf` so no
+    subclassing is needed.
+  Context-menu XAML + click handlers were prototyped and reverted in
+  `3bef676` (see diff — can be resurrected once a reach route lands).
 
 ## Dev loop quick-reference
 

@@ -61,7 +61,6 @@ public sealed class ClaudeSessionDiscovery : IClaudeSessionDiscovery
                 foreach (var path in Directory.EnumerateFiles(dir, "*.jsonl"))
                 {
                     handle.TryConsider(path);
-                    if (handle.IsDone) { break; }
                 }
             }
             catch (Exception ex) { _logger.LogTrace(ex, "Claude discovery poll failed for {Dir}", dir); }
@@ -75,15 +74,21 @@ public sealed class ClaudeSessionDiscovery : IClaudeSessionDiscovery
 
     private sealed class WatchHandle(DateTime sinceUtc, Action<string, string> onDiscovered, ILogger logger) : IDisposable
     {
-        private int _done;
-        public bool IsDone => Volatile.Read(ref _done) != 0;
+        // Keeps the watch running for the tab's lifetime. Claude Code rotates its session id
+        // on `/clear` by writing a brand new jsonl in the same cwd dir — a one-shot watcher
+        // would miss every rotation and leave telemetry pinned to the abandoned transcript.
+        // Each unique jsonl path fires the callback once; the caller (MainViewModel) decides
+        // whether to actually re-adopt by comparing against its current persisted id.
+        private readonly HashSet<string> _fired = new(StringComparer.OrdinalIgnoreCase);
+        private readonly object _firedLock = new();
+        private int _disposed;
 
         public FileSystemWatcher? Watcher;
         public Timer? PollTimer;
 
         public void TryConsider(string path)
         {
-            if (IsDone) { return; }
+            if (Volatile.Read(ref _disposed) != 0) { return; }
             try
             {
                 var info = new FileInfo(path);
@@ -96,13 +101,13 @@ public sealed class ClaudeSessionDiscovery : IClaudeSessionDiscovery
                 var id = Path.GetFileNameWithoutExtension(path);
                 if (!IsValidSessionId(id)) { return; }
 
-                if (Interlocked.CompareExchange(ref _done, 1, 0) != 0) { return; }
+                lock (_firedLock)
+                {
+                    if (!_fired.Add(path)) { return; }
+                }
 
                 try { onDiscovered(id, path); }
                 catch (Exception ex) { logger.LogWarning(ex, "Claude discovery: subscriber threw"); }
-
-                // One-shot: tear the watcher down after the first successful adoption.
-                Dispose();
             }
             catch (Exception ex) { logger.LogTrace(ex, "Claude discovery: consider failed for {Path}", path); }
         }
@@ -112,6 +117,7 @@ public sealed class ClaudeSessionDiscovery : IClaudeSessionDiscovery
 
         public void Dispose()
         {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) { return; }
             try { Watcher?.Dispose(); }
             catch (Exception ex) { logger.LogTrace(ex, "Claude discovery: watcher dispose threw"); }
             try { PollTimer?.Dispose(); }

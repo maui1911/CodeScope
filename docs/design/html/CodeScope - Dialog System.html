@@ -1,0 +1,781 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>CodeScope — Dialog system</title>
+<meta name="viewport" content="width=1600" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:#000; --panel:#0A0A0A; --elev:#141414; --elev-2:#1A1A1A;
+    --border:#1F1F1F; --border-2:#2A2A2A;
+    --text:#fff; --text-2:#A0A0A0; --text-3:#606060;
+    --accent:#0099FF; --ok:#4BD87B; --warn:#FF5A5A;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin:0; padding:0; min-height:100%;
+    background: radial-gradient(1100px 600px at 30% 15%, rgba(0,153,255,0.05), transparent 60%), #000;
+    color:#fff;
+    font-family:'Inter',-apple-system,system-ui,sans-serif;
+    font-feature-settings:"cv01","cv05","cv09","cv11","ss03","ss07";
+    -webkit-font-smoothing:antialiased;
+  }
+  .page { max-width:1520px; margin:0 auto; padding:56px 48px 80px; }
+
+  .doc-head { margin-bottom:40px; display:flex; align-items:flex-end; gap:20px; }
+  .eyebrow {
+    font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--accent);
+    letter-spacing:0.16em; text-transform:uppercase;
+    padding:4px 8px; border:1px solid rgba(0,153,255,0.3); border-radius:3px;
+    background:rgba(0,153,255,0.05); align-self:flex-start; margin-top:6px;
+  }
+  .doc-head h1 { font-size:36px; font-weight:600; letter-spacing:-0.02em; margin:0; line-height:1.1; }
+  .doc-head .sub { margin-left:auto; color:var(--text-2); font-size:13px; max-width:460px; line-height:1.5; text-align:right; }
+  .doc-head .sub b { color:#fff; font-weight:500; }
+
+  /* section */
+  .sec { margin-bottom: 56px; }
+  .sec-label {
+    font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--accent);
+    letter-spacing:0.16em; text-transform:uppercase; margin-bottom:16px;
+  }
+  .sec h2 { font-size:22px; font-weight:600; letter-spacing:-0.015em; margin:0 0 10px; }
+  .sec .sec-sub { color:var(--text-2); font-size:13px; line-height:1.55; max-width:820px; margin:0 0 24px; }
+  .sec .sec-sub b { color:#fff; font-weight:500; }
+  .sec .sec-sub code { font-family:'JetBrains Mono',monospace; font-size:11.5px; color:var(--accent); background:rgba(0,153,255,0.08); padding:1px 5px; border-radius:3px; }
+
+  /* stage that holds each dialog sample */
+  .stage {
+    position:relative;
+    background:
+      linear-gradient(to right, rgba(255,255,255,0.025) 1px, transparent 1px) 0 0 / 80px 80px,
+      linear-gradient(to bottom, rgba(255,255,255,0.025) 1px, transparent 1px) 0 0 / 80px 80px,
+      #000;
+    border:1px solid var(--border); border-radius:10px;
+    padding: 60px;
+    display:flex; justify-content:center; align-items:flex-start;
+    min-height: 420px;
+  }
+  .stage.scrim::before {
+    content:""; position:absolute; inset:0; border-radius:10px;
+    background: rgba(0,0,0,0.55);
+    backdrop-filter: blur(2px);
+  }
+
+  /* dialog primitive */
+  .dlg {
+    position:relative; z-index:1;
+    background: var(--panel);
+    border: 1px solid var(--border-2);
+    border-radius: 12px;
+    box-shadow: 0 30px 80px rgba(0,0,0,0.55), 0 0 0 1px rgba(0,0,0,0.2);
+    color:#fff;
+    overflow:hidden;
+  }
+  .dlg.w-sm { width: 420px; }
+  .dlg.w-md { width: 480px; }
+  .dlg.w-lg { width: 560px; }
+  .dlg.w-xl { width: 640px; }
+
+  .dlg-head {
+    padding: 20px 24px 4px;
+    display:flex; align-items:flex-start; gap:14px;
+  }
+  .dlg-icon {
+    width: 32px; height: 32px; flex: 0 0 32px;
+    border-radius: 8px;
+    display:flex; align-items:center; justify-content:center;
+    background: rgba(0,153,255,0.1);
+    color: var(--accent);
+    border: 1px solid rgba(0,153,255,0.25);
+  }
+  .dlg-icon.warn { background: rgba(255,90,90,0.1); border-color: rgba(255,90,90,0.3); color: var(--warn); }
+  .dlg-icon.ok { background: rgba(75,216,123,0.08); border-color: rgba(75,216,123,0.25); color: var(--ok); }
+  .dlg-icon.neutral { background: var(--elev); border-color: var(--border-2); color: var(--text-2); }
+  .dlg-icon svg { width: 16px; height: 16px; }
+
+  .dlg-title-wrap { flex:1 1 auto; min-width:0; padding-top:4px; }
+  .dlg-title {
+    font-size: 16px; font-weight: 600; letter-spacing: -0.01em;
+    margin: 0; line-height: 1.3;
+  }
+  .dlg-subtitle {
+    display:block;
+    font-family:'JetBrains Mono',monospace; font-size: 10.5px;
+    color: var(--text-3); letter-spacing: 0.06em;
+    text-transform: uppercase;
+    margin-bottom: 4px;
+  }
+  .dlg-close {
+    width: 24px; height: 24px; border-radius: 4px;
+    display:flex; align-items:center; justify-content:center;
+    color: var(--text-3); background:transparent; border:0; cursor:pointer;
+    flex: 0 0 24px;
+  }
+  .dlg-close svg { width: 12px; height: 12px; }
+
+  .dlg-body { padding: 10px 24px 20px; }
+  .dlg-body p { margin: 0; font-size: 13px; line-height: 1.55; color: var(--text-2); }
+  .dlg-body p + p { margin-top: 10px; }
+  .dlg-body p b { color:#fff; font-weight: 500; }
+  .dlg-body code {
+    font-family:'JetBrains Mono',monospace; font-size: 12px;
+    color: var(--accent); background: rgba(0,153,255,0.08); padding: 1px 5px; border-radius: 3px;
+  }
+
+  /* foot */
+  .dlg-foot {
+    display: flex; align-items: center; gap: 8px;
+    padding: 14px 20px;
+    background: #070707;
+    border-top: 1px solid var(--border);
+  }
+  .dlg-foot .space { flex: 1 1 auto; }
+  .dlg-foot .meta { font-size: 11px; color: var(--text-3); font-family:'JetBrains Mono',monospace; }
+
+  /* buttons */
+  .btn {
+    height: 32px; padding: 0 14px;
+    border-radius: 6px;
+    font: 500 12.5px/1 'Inter', sans-serif; letter-spacing: -0.005em;
+    display: inline-flex; align-items: center; gap: 8px;
+    border: 0; cursor: pointer; color:#fff;
+    background: transparent;
+    transition: background 120ms ease-out, color 120ms ease-out, border-color 120ms ease-out;
+  }
+  .btn.ghost { color: var(--text-2); }
+  .btn.ghost:hover { background: var(--elev); color:#fff; }
+  .btn.secondary { background: var(--elev); color:#fff; box-shadow: inset 0 0 0 1px var(--border-2); }
+  .btn.secondary:hover { background: var(--elev-2); }
+  .btn.primary { background: var(--accent); color:#000; font-weight: 600; }
+  .btn.primary:hover { background: #1AA8FF; }
+  .btn.destructive { background: var(--warn); color:#000; font-weight: 600; }
+  .btn.destructive:hover { background: #FF7474; }
+  .btn .kbd {
+    font-family:'JetBrains Mono',monospace; font-size: 10px;
+    padding: 1px 4px; border-radius: 3px;
+    background: rgba(255,255,255,0.1); color: rgba(0,0,0,0.7);
+    margin-left: 2px;
+  }
+  .btn.ghost .kbd, .btn.secondary .kbd {
+    background: var(--elev-2); color: var(--text-3);
+  }
+
+  /* form controls used inside dialog bodies */
+  .field { display:flex; flex-direction:column; gap:6px; margin-bottom: 14px; }
+  .field:last-child { margin-bottom: 0; }
+  .field label {
+    font-size: 11px; font-weight: 500; color: var(--text-2);
+    letter-spacing: 0.02em; text-transform: uppercase;
+  }
+  .field .help { font-size: 11.5px; color: var(--text-3); margin-top: 4px; line-height: 1.45; }
+  .input, .select, .textarea {
+    width: 100%; height: 34px;
+    background: #000;
+    border: 1px solid var(--border-2); border-radius: 6px;
+    color: #fff;
+    font: 500 13px/1 'Inter', sans-serif;
+    padding: 0 12px;
+    outline: none;
+  }
+  .input:focus, .select:focus, .textarea:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(0,153,255,0.15);
+  }
+  .input.mono { font-family: 'JetBrains Mono', monospace; font-size: 12.5px; }
+  .textarea { height: auto; padding: 10px 12px; resize: vertical; min-height: 72px; line-height: 1.45; }
+  .select-wrap { position: relative; }
+  .select { appearance: none; padding-right: 32px; cursor: pointer; }
+  .select-wrap::after {
+    content:""; position:absolute; right: 12px; top: 50%;
+    width: 6px; height: 6px; border-right: 1.5px solid var(--text-2); border-bottom: 1.5px solid var(--text-2);
+    transform: translateY(-70%) rotate(45deg);
+    pointer-events:none;
+  }
+
+  /* toggle row */
+  .trow {
+    display:flex; align-items:center; gap:12px;
+    padding: 12px 14px;
+    background: #050505;
+    border: 1px solid var(--border); border-radius: 8px;
+  }
+  .trow .txt { flex: 1 1 auto; min-width: 0; }
+  .trow .tt { font-size: 13px; font-weight: 500; }
+  .trow .th { font-size: 11.5px; color: var(--text-3); margin-top: 2px; }
+  .toggle {
+    width: 30px; height: 18px; border-radius: 999px;
+    background: var(--elev-2); position: relative; flex: 0 0 30px;
+    transition: background 140ms ease-out;
+  }
+  .toggle::after {
+    content:""; position:absolute; top: 2px; left: 2px;
+    width: 14px; height: 14px; border-radius: 50%;
+    background:#fff;
+    transition: transform 140ms ease-out;
+  }
+  .toggle.on { background: var(--accent); }
+  .toggle.on::after { transform: translateX(12px); }
+
+  /* checkbox list */
+  .chk {
+    display:flex; align-items:flex-start; gap:10px;
+    padding: 8px 0; border-bottom: 1px solid var(--border);
+    font-size: 12.5px;
+  }
+  .chk:last-child { border-bottom: 0; }
+  .chk-box {
+    width: 14px; height: 14px; border-radius: 3px;
+    border: 1.5px solid var(--text-3); flex: 0 0 14px; margin-top: 1px;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .chk-box.on { background: var(--accent); border-color: var(--accent); }
+  .chk-box.on::after { content:""; width: 3px; height: 7px; border-right: 2px solid #000; border-bottom: 2px solid #000; transform: rotate(45deg) translate(-1px, -1px); }
+  .chk .tt { color:#fff; font-weight: 500; }
+  .chk .th { color: var(--text-3); font-size: 11px; margin-top: 2px; line-height: 1.4; }
+
+  /* callouts (anatomy) */
+  .cx { position: absolute; inset: 0; z-index: 3; pointer-events: none; }
+  .cx .dot {
+    position: absolute; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--accent); box-shadow: 0 0 0 3px rgba(0,153,255,0.18);
+    transform: translate(-50%, -50%);
+  }
+  .cx .line { position: absolute; background: rgba(0,153,255,0.45); }
+  .cx .line.h { height: 1px; }
+  .cx .line.v { width: 1px; }
+  .cx .label {
+    position: absolute;
+    background: #0A0A0A; border: 1px solid #1F1F1F; border-radius: 6px;
+    padding: 10px 12px; width: 240px;
+    color: #fff; font-size: 12px; line-height: 1.5;
+    letter-spacing: -0.005em;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  }
+  .cx .label .num {
+    display: inline-block; width: 18px; height: 18px;
+    border-radius: 3px; background: var(--accent); color: #000;
+    font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 600;
+    text-align: center; line-height: 18px;
+    margin-right: 8px; vertical-align: 1px;
+  }
+  .cx .label b { font-weight: 600; }
+  .cx .label code {
+    font-family: 'JetBrains Mono', monospace; font-size: 10.5px;
+    color: var(--accent); background: rgba(0,153,255,0.08);
+    padding: 1px 5px; border-radius: 3px;
+  }
+  .cx .label .hint { display: block; color: var(--text-2); margin-top: 4px; font-size: 11.5px; }
+
+  /* variants grid */
+  .vgrid {
+    display:grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 16px;
+  }
+  .vcard {
+    background: var(--panel); border:1px solid var(--border); border-radius:10px;
+    padding: 16px;
+  }
+  .vcard .vlabel {
+    display:flex; align-items:center; justify-content:space-between;
+    font-family:'JetBrains Mono',monospace; font-size:10px;
+    color: var(--text-3); letter-spacing:0.14em; text-transform:uppercase;
+    margin-bottom: 14px;
+  }
+  .vcard .vlabel .pill {
+    color:var(--accent); border:1px solid rgba(0,153,255,0.3);
+    padding:2px 6px; border-radius:3px; background:rgba(0,153,255,0.05);
+  }
+  .vcard .vstage {
+    background:
+      linear-gradient(to right, rgba(255,255,255,0.025) 1px, transparent 1px) 0 0 / 80px 80px,
+      linear-gradient(to bottom, rgba(255,255,255,0.025) 1px, transparent 1px) 0 0 / 80px 80px,
+      #000;
+    border-radius: 8px;
+    min-height: 360px;
+    display:flex; align-items:center; justify-content:center;
+    padding: 24px;
+  }
+  .vcard .vnote {
+    margin-top: 12px;
+    font-size: 12px; color: var(--text-2); line-height: 1.5;
+  }
+  .vcard .vnote b { color:#fff; font-weight: 500; }
+  .vcard .vnote code {
+    font-family:'JetBrains Mono',monospace; font-size:11.5px; color:var(--accent);
+    background:rgba(0,153,255,0.08); padding:1px 5px; border-radius:3px;
+  }
+
+  /* tokens panels */
+  .spec-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:16px; }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:20px; }
+  .panel h3 { font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--accent); letter-spacing:0.16em; text-transform:uppercase; margin:0 0 14px; }
+  .panel ul { list-style:none; padding:0; margin:0; }
+  .panel li { display:grid; grid-template-columns:110px 1fr; gap:10px; padding:8px 0; border-bottom:1px solid #141414; font-size:12px; line-height:1.4; }
+  .panel li:last-child { border-bottom:0; }
+  .panel li .k { font-family:'JetBrains Mono',monospace; color:var(--text-3); font-size:11px; }
+  .panel li .v { color:#E6E6E6; }
+  .swatch { display:inline-block; width:10px; height:10px; border-radius:2px; vertical-align:-1px; margin-right:6px; border:1px solid rgba(255,255,255,0.08); }
+
+  .notes { display:grid; grid-template-columns:repeat(2,1fr); gap:16px; }
+  .note {
+    background:var(--panel); border:1px solid var(--border);
+    border-left:2px solid var(--accent);
+    border-radius:6px; padding:14px 16px;
+    font-size:12.5px; line-height:1.5; color:#E6E6E6;
+  }
+  .note b { color:#fff; }
+  .note .t {
+    display:block; font-family:'JetBrains Mono',monospace; font-size:10px;
+    color:var(--accent); letter-spacing:0.14em; text-transform:uppercase; margin-bottom:6px;
+  }
+  .note code { font-family:'JetBrains Mono',monospace; font-size:11.5px; color:var(--accent); background:rgba(0,153,255,0.08); padding:1px 5px; border-radius:3px; }
+
+  .impl { background:#070707; border:1px solid var(--border); border-radius:8px; padding:28px 32px; }
+  .impl h3 { font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--accent); letter-spacing:0.16em; text-transform:uppercase; margin:0 0 16px; }
+  .impl pre { margin:0; font-family:'JetBrains Mono',monospace; font-size:12.5px; line-height:1.65; color:#E6E6E6; white-space:pre-wrap; }
+  .impl .c { color:var(--text-3); font-style:italic; }
+  .impl .k { color:var(--accent); }
+  .impl .s { color:#8FD679; }
+  .impl .t { color:#E8A857; }
+</style>
+</head>
+<body>
+<div class="page" data-screen-label="Dialog system — handoff">
+
+  <div class="doc-head">
+    <span class="eyebrow">Component spec</span>
+    <div><h1>Dialog system</h1></div>
+    <div class="sub">
+      One <b>Dialog</b> primitive, five recurring flavors: <b>Confirm</b>, <b>Destructive</b>, <b>Info</b>, <b>Form</b>, and <b>Choice</b>. Every dialog in CodeScope should compose from these parts — don't build bespoke modals. Handoff for Claude Code.
+    </div>
+  </div>
+
+  <!-- =================== ANATOMY =================== -->
+  <div class="sec">
+    <div class="sec-label">01 · Anatomy</div>
+    <h2>The dialog primitive</h2>
+    <p class="sec-sub">
+      Every dialog is the same 7 slots: <b>scrim</b>, <b>icon</b>, <b>eyebrow</b>, <b>title</b>, <b>close</b>, <b>body</b>, <b>footer</b>. Width picked from the <code>w-sm / w-md / w-lg / w-xl</code> scale (420 / 480 / 560 / 640). Height grows to fit content; there is no fixed height.
+    </p>
+
+    <div class="stage scrim" style="min-height: 580px; padding: 0; display: block; position: relative;">
+      <div class="dlg w-md" id="anatomy-dlg" style="position: absolute; left: 80px; top: 110px; margin: 0">
+        <div class="dlg-head">
+          <div class="dlg-icon"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6"/><path d="M8 5v3.5"/><circle cx="8" cy="11" r="0.6" fill="currentColor"/></svg></div>
+          <div class="dlg-title-wrap">
+            <span class="dlg-subtitle">Confirm</span>
+            <h3 class="dlg-title">Delete worktree &ldquo;feat/reporting&rdquo;?</h3>
+          </div>
+          <button class="dlg-close"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M2 2l8 8M10 2l-8 8"/></svg></button>
+        </div>
+        <div class="dlg-body">
+          <p>This will remove the worktree directory and end the Claude session running in it. The branch <code>feat/reporting</code> and its commits stay in the repo.</p>
+        </div>
+        <div class="dlg-foot">
+          <span class="meta">⎋ to cancel</span>
+          <div class="space"></div>
+          <button class="btn ghost">Cancel</button>
+          <button class="btn primary">Delete<span class="kbd">↵</span></button>
+        </div>
+      </div>
+
+      <!-- callouts — anchored to measured dialog geometry: dlg at L81–561, T111–331.
+           Layout: labels 2 & 4 go LEFT of the dialog (left column at L0–250).
+                   labels 1, 3, 5, 6, 7 go RIGHT of the dialog (right column at L620–1140),
+                   stacked in 5 vertical bands so none touch. -->
+      <div class="cx">
+
+        <!-- LEFT COLUMN -->
+
+        <!-- 2 icon tile @ L105–137, T132–164 → label LEFT of dialog, band 1 -->
+        <div class="dot" style="left:121px;top:148px"></div>
+        <div class="line v" style="left:121px;top:70px;height:78px"></div>
+        <div class="line h" style="left:30px;top:70px;width:91px"></div>
+        <div class="label" style="left:30px;top:10px">
+          <span class="num">2</span><b>Icon tile</b>
+          <span class="hint">32 × 32 · radius 8 · tinted bg + border. Color follows the dialog intent (info / warn / ok / neutral).</span>
+        </div>
+
+        <!-- 4 title @ ~L151, T164 → label LEFT of dialog, band 2 (lower) -->
+        <div class="dot" style="left:300px;top:164px"></div>
+        <div class="line h" style="left:30px;top:400px;width:0"></div>
+        <div class="line v" style="left:30px;top:164px;height:236px"></div>
+        <div class="line h" style="left:30px;top:164px;width:270px"></div>
+        <div class="label" style="left:30px;top:410px">
+          <span class="num">4</span><b>Title</b>
+          <span class="hint">16px Inter 600 · <code>-0.01em</code> · sentence case. Phrases the user's question — not a noun.</span>
+        </div>
+
+        <!-- RIGHT COLUMN (5 bands) -->
+
+        <!-- 1 scrim → point to empty scrim area, top band -->
+        <div class="dot" style="left:780px;top:60px"></div>
+        <div class="line h" style="left:780px;top:60px;width:110px"></div>
+        <div class="label" style="left:890px;top:20px">
+          <span class="num">1</span><b>Scrim</b>
+          <span class="hint"><code>rgba(0,0,0,0.55)</code> + 2px blur. Click = cancel, unless destructive.</span>
+        </div>
+
+        <!-- 3 eyebrow @ ~L200, T143 → right column, band 2 -->
+        <div class="dot" style="left:230px;top:143px"></div>
+        <div class="line h" style="left:230px;top:143px;width:660px"></div>
+        <div class="label" style="left:890px;top:135px">
+          <span class="num">3</span><b>Eyebrow</b>
+          <span class="hint">10.5px JB Mono · <code>#606060</code> · uppercase. Category label — constant per flavor.</span>
+        </div>
+
+        <!-- 5 close @ L511–535, T132–156 → right column, band 3 -->
+        <div class="dot" style="left:523px;top:144px"></div>
+        <div class="line h" style="left:523px;top:144px;width:0"></div>
+        <div class="line v" style="left:523px;top:144px;height:100px"></div>
+        <div class="line h" style="left:523px;top:244px;width:367px"></div>
+        <div class="label" style="left:890px;top:245px">
+          <span class="num">5</span><b>Close</b>
+          <span class="hint">Only on <i>dismissible</i> dialogs. Absent on required / blocking confirmations.</span>
+        </div>
+
+        <!-- 6 body @ L81–561, T179–269 → right column, band 4 -->
+        <div class="dot" style="left:561px;top:260px"></div>
+        <div class="line h" style="left:561px;top:260px;width:90px"></div>
+        <div class="line v" style="left:651px;top:260px;height:80px"></div>
+        <div class="line h" style="left:651px;top:340px;width:239px"></div>
+        <div class="label" style="left:890px;top:340px">
+          <span class="num">6</span><b>Body</b>
+          <span class="hint">13px · line-height 1.55 · <code>#A0A0A0</code>. Max 2 paragraphs; beyond that, use a form dialog.</span>
+        </div>
+
+        <!-- 7 footer @ L81–561, T269–330 → right column, band 5 -->
+        <div class="dot" style="left:561px;top:300px"></div>
+        <div class="line h" style="left:561px;top:300px;width:60px"></div>
+        <div class="line v" style="left:621px;top:300px;height:150px"></div>
+        <div class="line h" style="left:621px;top:450px;width:269px"></div>
+        <div class="label" style="left:890px;top:450px">
+          <span class="num">7</span><b>Footer</b>
+          <span class="hint">Right-aligned: <b>cancel</b> (ghost) then <b>primary</b>. Left side is the keyboard hint — never a third button.</span>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <!-- =================== VARIANTS =================== -->
+  <div class="sec">
+    <div class="sec-label">02 · Variants</div>
+    <h2>Five flavors · five specimens</h2>
+    <p class="sec-sub">
+      Every real dialog maps to one of these. Icon, eyebrow, primary-button style, and dismissal behavior change; the primitive doesn't.
+    </p>
+
+    <div class="vgrid">
+
+      <!-- CONFIRM -->
+      <div class="vcard">
+        <div class="vlabel"><span>Confirm</span><span class="pill">primary</span></div>
+        <div class="vstage">
+          <div class="dlg w-sm">
+            <div class="dlg-head">
+              <div class="dlg-icon"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6"/><path d="M8 5v3.5"/><circle cx="8" cy="11" r="0.6" fill="currentColor"/></svg></div>
+              <div class="dlg-title-wrap">
+                <span class="dlg-subtitle">Confirm</span>
+                <h3 class="dlg-title">Switch model for this session?</h3>
+              </div>
+              <button class="dlg-close"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M2 2l8 8M10 2l-8 8"/></svg></button>
+            </div>
+            <div class="dlg-body">
+              <p>You're mid-turn on <b>feat/reporting</b>. Switching to <code>claude-opus-4</code> will finish the current reply on the old model, then swap.</p>
+            </div>
+            <div class="dlg-foot">
+              <div class="space"></div>
+              <button class="btn ghost">Cancel</button>
+              <button class="btn primary">Switch<span class="kbd">↵</span></button>
+            </div>
+          </div>
+        </div>
+        <p class="vnote"><b>When.</b> Reversible, low-risk actions. Primary CTA is Framer Blue. Scrim click dismisses. <code>↵</code> confirms, <code>⎋</code> cancels.</p>
+      </div>
+
+      <!-- DESTRUCTIVE -->
+      <div class="vcard">
+        <div class="vlabel"><span>Destructive</span><span class="pill" style="color:var(--warn);border-color:rgba(255,90,90,0.3);background:rgba(255,90,90,0.05)">danger</span></div>
+        <div class="vstage">
+          <div class="dlg w-sm">
+            <div class="dlg-head">
+              <div class="dlg-icon warn"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2L14.5 13H1.5Z"/><path d="M8 6v3.5"/><circle cx="8" cy="11.5" r="0.6" fill="currentColor"/></svg></div>
+              <div class="dlg-title-wrap">
+                <span class="dlg-subtitle" style="color:var(--warn)">Destructive</span>
+                <h3 class="dlg-title">Delete project &ldquo;PestScope&rdquo;?</h3>
+              </div>
+            </div>
+            <div class="dlg-body">
+              <p>This removes <b>3 worktrees</b> and ends <b>2 active sessions</b>. The cloned repo at <code>~/code/pest-scope</code> stays on disk.</p>
+              <div class="field" style="margin-top:14px">
+                <label>Type <b style="color:#fff;font-family:'JetBrains Mono',monospace;text-transform:none;letter-spacing:0">PestScope</b> to confirm</label>
+                <input class="input mono" value="PestSc" />
+              </div>
+            </div>
+            <div class="dlg-foot">
+              <div class="space"></div>
+              <button class="btn ghost">Cancel</button>
+              <button class="btn destructive" style="opacity:.5">Delete project</button>
+            </div>
+          </div>
+        </div>
+        <p class="vnote"><b>When.</b> Irreversible. No close icon · scrim click does <i>not</i> dismiss · primary is red · ↵ never auto-confirms. High-value ones require typed confirmation.</p>
+      </div>
+
+      <!-- INFO / SUCCESS -->
+      <div class="vcard">
+        <div class="vlabel"><span>Info / Success</span><span class="pill" style="color:var(--ok);border-color:rgba(75,216,123,0.3);background:rgba(75,216,123,0.05)">ok</span></div>
+        <div class="vstage">
+          <div class="dlg w-sm">
+            <div class="dlg-head">
+              <div class="dlg-icon ok"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 8.5 L7 12 L13 5"/></svg></div>
+              <div class="dlg-title-wrap">
+                <span class="dlg-subtitle" style="color:var(--ok)">Session ready</span>
+                <h3 class="dlg-title">Worktree spawned</h3>
+              </div>
+              <button class="dlg-close"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M2 2l8 8M10 2l-8 8"/></svg></button>
+            </div>
+            <div class="dlg-body">
+              <p><code>feat/export-pdf</code> is checked out at <code>~/code/pest-scope/wt/export-pdf</code>. A Claude session is attached and warm.</p>
+            </div>
+            <div class="dlg-foot">
+              <span class="meta">1 of 3 this week</span>
+              <div class="space"></div>
+              <button class="btn ghost">Dismiss</button>
+              <button class="btn primary">Open<span class="kbd">↵</span></button>
+            </div>
+          </div>
+        </div>
+        <p class="vnote"><b>When.</b> Non-blocking confirmations of async success. Usually auto-dismiss after 6s unless hovered.</p>
+      </div>
+
+      <!-- FORM -->
+      <div class="vcard">
+        <div class="vlabel"><span>Form</span><span class="pill">input</span></div>
+        <div class="vstage">
+          <div class="dlg w-md">
+            <div class="dlg-head">
+              <div class="dlg-icon neutral"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="10" height="10" rx="1.5"/><path d="M3 6h10"/><path d="M6 13V6"/></svg></div>
+              <div class="dlg-title-wrap">
+                <span class="dlg-subtitle">New worktree</span>
+                <h3 class="dlg-title">Spawn a parallel session</h3>
+              </div>
+              <button class="dlg-close"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M2 2l8 8M10 2l-8 8"/></svg></button>
+            </div>
+            <div class="dlg-body">
+              <div class="field">
+                <label>Branch</label>
+                <div class="select-wrap"><select class="select"><option>feat/export-pdf</option></select></div>
+              </div>
+              <div class="field">
+                <label>Worktree name</label>
+                <input class="input mono" value="export-pdf" />
+                <span class="help">Will live at <code>~/code/pest-scope/wt/export-pdf</code>.</span>
+              </div>
+              <div class="trow">
+                <div class="txt"><div class="tt">Spawn Claude session on creation</div><div class="th">Opens a new session pre-attached to the worktree.</div></div>
+                <div class="toggle on"></div>
+              </div>
+            </div>
+            <div class="dlg-foot">
+              <div class="space"></div>
+              <button class="btn ghost">Cancel</button>
+              <button class="btn primary">Create<span class="kbd">⌘↵</span></button>
+            </div>
+          </div>
+        </div>
+        <p class="vnote"><b>When.</b> Asking for &gt;1 input. Uses <code>w-md</code> (480) or <code>w-lg</code>. Primary CTA commits the form · <code>⌘↵</code> submits from any field.</p>
+      </div>
+
+      <!-- CHOICE -->
+      <div class="vcard" style="grid-column: span 2">
+        <div class="vlabel"><span>Choice · list picker</span><span class="pill">select</span></div>
+        <div class="vstage">
+          <div class="dlg w-md">
+            <div class="dlg-head">
+              <div class="dlg-icon neutral"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4h10M3 8h10M3 12h10"/><circle cx="3" cy="4" r="0.5" fill="currentColor"/><circle cx="3" cy="8" r="0.5" fill="currentColor"/><circle cx="3" cy="12" r="0.5" fill="currentColor"/></svg></div>
+              <div class="dlg-title-wrap">
+                <span class="dlg-subtitle">Session handling</span>
+                <h3 class="dlg-title">What to do with the 2 running sessions?</h3>
+              </div>
+              <button class="dlg-close"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M2 2l8 8M10 2l-8 8"/></svg></button>
+            </div>
+            <div class="dlg-body">
+              <div class="chk"><div class="chk-box on"></div><div><div class="tt">Let them finish, then quit</div><div class="th">CodeScope stays open until every session reaches idle.</div></div></div>
+              <div class="chk"><div class="chk-box"></div><div><div class="tt">Interrupt and quit</div><div class="th">Sends <code>SIGINT</code> to each session. Pending tool calls are cancelled.</div></div></div>
+              <div class="chk"><div class="chk-box"></div><div><div class="tt">Detach &amp; keep running in background</div><div class="th">Sessions continue headless. Reattach from the tray next launch.</div></div></div>
+            </div>
+            <div class="dlg-foot">
+              <span class="meta">↑ ↓ to navigate · ↵ to pick</span>
+              <div class="space"></div>
+              <button class="btn ghost">Cancel</button>
+              <button class="btn primary">Continue</button>
+            </div>
+          </div>
+        </div>
+        <p class="vnote"><b>When.</b> One-of-N decisions with enough detail per option that a dropdown feels cramped. Radio-style checkboxes with a description under each title.</p>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- =================== TOKENS =================== -->
+  <div class="sec">
+    <div class="sec-label">03 · Tokens</div>
+    <h2>Every measurable value</h2>
+    <div class="spec-grid">
+
+      <div class="panel">
+        <h3>Dimensions</h3>
+        <ul>
+          <li><span class="k">w-sm</span><span class="v">420px</span></li>
+          <li><span class="k">w-md</span><span class="v">480px</span></li>
+          <li><span class="k">w-lg</span><span class="v">560px</span></li>
+          <li><span class="k">w-xl</span><span class="v">640px</span></li>
+          <li><span class="k">radius</span><span class="v">12px</span></li>
+          <li><span class="k">pad head</span><span class="v">20 · 24 · 4</span></li>
+          <li><span class="k">pad body</span><span class="v">10 · 24 · 20</span></li>
+          <li><span class="k">pad foot</span><span class="v">14 · 20</span></li>
+          <li><span class="k">icon tile</span><span class="v">32 × 32 · r 8</span></li>
+          <li><span class="k">icon</span><span class="v">16 × 16 · stroke 1.5</span></li>
+          <li><span class="k">btn H</span><span class="v">32 · pad-x 14 · r 6</span></li>
+          <li><span class="k">max viewport</span><span class="v">min(content, 85vh)</span></li>
+        </ul>
+      </div>
+
+      <div class="panel">
+        <h3>Colors</h3>
+        <ul>
+          <li><span class="k"><span class="swatch" style="background:#0A0A0A"></span>surface</span><span class="v">#0A0A0A</span></li>
+          <li><span class="k"><span class="swatch" style="background:#070707"></span>footer bg</span><span class="v">#070707</span></li>
+          <li><span class="k"><span class="swatch" style="background:#2A2A2A"></span>border</span><span class="v">#2A2A2A</span></li>
+          <li><span class="k"><span class="swatch" style="background:rgba(0,0,0,0.55)"></span>scrim</span><span class="v">rgba(0,0,0,.55) + blur 2</span></li>
+          <li><span class="k"><span class="swatch" style="background:#0099FF"></span>accent</span><span class="v">#0099FF · btn text #000</span></li>
+          <li><span class="k"><span class="swatch" style="background:#FF5A5A"></span>danger</span><span class="v">#FF5A5A</span></li>
+          <li><span class="k"><span class="swatch" style="background:#4BD87B"></span>ok</span><span class="v">#4BD87B</span></li>
+          <li><span class="k">shadow</span><span class="v">0 30 80 rgba(0,0,0,.55)</span></li>
+        </ul>
+      </div>
+
+      <div class="panel">
+        <h3>Type &amp; motion</h3>
+        <ul>
+          <li><span class="k">eyebrow</span><span class="v">JB Mono · 10.5px · 0.06em UP</span></li>
+          <li><span class="k">title</span><span class="v">Inter 600 · 16px · -0.01em</span></li>
+          <li><span class="k">body</span><span class="v">Inter 400 · 13px · 1.55</span></li>
+          <li><span class="k">label</span><span class="v">Inter 500 · 11px UP</span></li>
+          <li><span class="k">btn</span><span class="v">Inter 500 · 12.5px</span></li>
+          <li><span class="k">open</span><span class="v">scale .96→1 · fade · 160ms ease-out</span></li>
+          <li><span class="k">close</span><span class="v">fade · 120ms ease-in</span></li>
+          <li><span class="k">scrim in</span><span class="v">fade · 120ms</span></li>
+          <li><span class="k">shake (err)</span><span class="v">±4px · 200ms</span></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- =================== BUILD NOTES =================== -->
+  <div class="sec">
+    <div class="sec-label">04 · Build notes</div>
+    <h2>Rules that aren't obvious from the pixels</h2>
+    <div class="notes">
+
+      <div class="note">
+        <span class="t">One primitive, five flavors</span>
+        Never branch on visual structure — branch on <code>flavor</code> (<code>confirm | destructive | info | form | choice</code>). The primitive picks icon, eyebrow color, primary-button style, dismiss behavior.
+      </div>
+      <div class="note">
+        <span class="t">Buttons always right-aligned</span>
+        Order: <b>ghost cancel</b> → <b>primary</b>. Destructive replaces primary with the red button but keeps the position — muscle memory never moves.
+      </div>
+      <div class="note">
+        <span class="t">Title is a question, body is context</span>
+        Write titles as the user's question to themselves (&ldquo;Delete worktree?&rdquo;), not a system noun (&ldquo;Deletion&rdquo;). Body fills in consequences and scope, never restates the title.
+      </div>
+      <div class="note">
+        <span class="t">Destructive defaults are strict</span>
+        No close icon · no scrim-click dismiss · <code>↵</code> doesn't auto-confirm · typed-name confirmation for project-level deletes. Red only for destructive — never for &ldquo;save,&rdquo; &ldquo;submit,&rdquo; &ldquo;error&rdquo;.
+      </div>
+      <div class="note">
+        <span class="t">Keyboard map</span>
+        <code>⎋</code> cancel (unless strict) · <code>↵</code> primary (unless destructive) · <code>⌘↵</code> submit from anywhere in a form · <code>Tab</code> trap inside dialog · focus returns to the trigger on close.
+      </div>
+      <div class="note">
+        <span class="t">Stacking</span>
+        Max one dialog at a time. Opening a second dismisses the first. For wizards, use the same dialog and swap body — don't stack.
+      </div>
+      <div class="note">
+        <span class="t">Loading + error inside the dialog</span>
+        When the primary action is async: disable buttons, show a spinner on the primary, freeze the body. On error, shake ±4px (200ms) and surface a red helper under the offending field — never a second dialog.
+      </div>
+      <div class="note">
+        <span class="t">Mobile / narrow</span>
+        Below 520px viewport, dialogs pin to bottom and span full width (radius 12px top corners only, 0 bottom). Footer buttons stack, primary on top.
+      </div>
+
+    </div>
+  </div>
+
+  <!-- =================== IMPLEMENTATION =================== -->
+  <div class="sec">
+    <div class="sec-label">05 · Implementation</div>
+    <h2>Suggested component shape</h2>
+    <div class="impl">
+<pre><span class="c">// Single primitive. Flavor drives visual + behavioral defaults.</span>
+
+<span class="k">type</span> <span class="t">DialogFlavor</span> = <span class="s">"confirm"</span> | <span class="s">"destructive"</span> | <span class="s">"info"</span> | <span class="s">"form"</span> | <span class="s">"choice"</span>;
+<span class="k">type</span> <span class="t">DialogSize</span>   = <span class="s">"sm"</span> | <span class="s">"md"</span> | <span class="s">"lg"</span> | <span class="s">"xl"</span>;
+
+<span class="k">type</span> <span class="t">DialogButton</span> = {
+  <span class="t">label</span>: string;
+  <span class="t">intent</span>?: <span class="s">"primary"</span> | <span class="s">"destructive"</span> | <span class="s">"ghost"</span> | <span class="s">"secondary"</span>;
+  <span class="t">kbd</span>?: string;                 <span class="c">// e.g. "↵" or "⌘↵"</span>
+  <span class="t">loading</span>?: boolean;
+  <span class="t">disabled</span>?: boolean;
+  <span class="t">onClick</span>(): void | Promise&lt;void&gt;;
+};
+
+<span class="k">type</span> <span class="t">DialogProps</span> = {
+  <span class="t">open</span>: boolean;
+  <span class="t">flavor</span>: DialogFlavor;
+  <span class="t">size</span>?: DialogSize;               <span class="c">// default md</span>
+  <span class="t">eyebrow</span>?: string;                <span class="c">// e.g. "Confirm", "Destructive"</span>
+  <span class="t">title</span>: string;                   <span class="c">// phrased as a question</span>
+  <span class="t">icon</span>?: ReactNode;                 <span class="c">// override the flavor icon</span>
+  <span class="t">body</span>: ReactNode;
+
+  <span class="t">buttons</span>: DialogButton[];          <span class="c">// right-aligned, max 2</span>
+  <span class="t">keyboardHint</span>?: string;           <span class="c">// left-side meta text</span>
+
+  <span class="t">strict</span>?: boolean;                 <span class="c">// true on destructive — no ⎋/scrim</span>
+  <span class="t">requireTypedConfirm</span>?: string;    <span class="c">// e.g. "PestScope"</span>
+
+  <span class="t">onDismiss</span>?(): void;
+};
+
+<span class="c">// Convenience wrappers — build in terms of the primitive:</span>
+<span class="k">function</span> <span class="t">ConfirmDialog</span>(p: …)     { <span class="c">/* flavor=confirm */</span> }
+<span class="k">function</span> <span class="t">DestructiveDialog</span>(p: …) { <span class="c">/* flavor=destructive, strict=true */</span> }
+<span class="k">function</span> <span class="t">InfoDialog</span>(p: …)        { <span class="c">/* flavor=info, auto-dismiss 6s */</span> }
+<span class="k">function</span> <span class="t">FormDialog</span>(p: …)        { <span class="c">/* flavor=form, ⌘↵ submits */</span> }
+<span class="k">function</span> <span class="t">ChoiceDialog</span>(p: …)      { <span class="c">/* flavor=choice, ↑↓ + ↵ */</span> }
+
+<span class="c">// Imperative API for firing from anywhere (menu handlers, shortcuts):
+//   const ok = await confirm({ title: "Switch model?", body: "…" });
+//   if (!ok) return;
+//
+//   const result = await dialog({
+//     flavor: "form", title: "…", render: ({ close }) =&gt; &lt;…/&gt;,
+//   });</span></pre>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>

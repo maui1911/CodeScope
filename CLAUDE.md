@@ -26,6 +26,38 @@ UI/UX decisions are documented in `docs/DESIGN.md` and `docs/DECISIONS.md`. Mirr
 - `var` always unless the type isn't obvious from the right-hand side
 - 4-space indent, 120 char line length guideline
 
+## Running side-by-side with an installed build
+
+The user develops CodeScope *inside* CodeScope — the installed v0.1.0+ build
+hosts the sessions that work on this repo, so closing it to test a dev build
+would kill every other project's session. Dev runs therefore need to coexist
+with the installed app.
+
+Start the dev build with the `CODESCOPE_DEV` env var set:
+
+```pwsh
+$env:CODESCOPE_DEV = "1"
+dotnet run --project src/CodeScope.App
+```
+
+`NoScope.CodeScope.Core.AppPaths` resolves the env var once at process start
+and redirects:
+
+- single-instance mutex → `Global\CodeScope.SingleInstance.Dev`
+- `%APPDATA%\CodeScope\` → `%APPDATA%\CodeScope.Dev\` (projects.json)
+- `%LOCALAPPDATA%\CodeScope\` → `%LOCALAPPDATA%\CodeScope.Dev\` (layout.json,
+  window.json, console.log, crash.log)
+- window title → `CodeScope [dev] — …`
+
+The Dev store is independent — projects opened in the dev build are separate
+from the installed build's projects. Typical loop: keep v0.1.0 running with
+real work, launch dev with a subset of projects (or different ones) to
+exercise changes. Claude telemetry tails at `~/.claude/projects/…` are shared
+by design — two FSWatchers, no state conflict.
+
+When adding new on-disk state, thread it through `AppPaths.AppFolderName` so
+dev-mode separation keeps working.
+
 ## Workflow
 
 - **First, on any fresh session, read `docs/HANDOFF.md`** — it holds the cursor (what we were doing), current build/test status, roadmap state, open rough edges, and suggested next entry points. It is updated at the end of each session.

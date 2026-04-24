@@ -1,9 +1,20 @@
 namespace NoScope.CodeScope.Core.Services;
 
-/// <summary>Snapshot of live telemetry for a single Claude Code session.</summary>
+/// <summary>
+/// Snapshot of live telemetry for a single Claude Code session.
+/// <para>
+/// <see cref="ContextTokens"/> is the most recent assistant turn's total context size
+/// (<c>input + cache_read + cache_creation + output</c>) — a close proxy for "how full is
+/// the context window right now". It overwrites on each assistant turn, it does NOT
+/// accumulate across turns. Summing would double-count: each turn's <c>input_tokens</c>
+/// already covers the full prior conversation (Claude is stateless per request), so a
+/// running sum explodes past the cap within a handful of turns and the percentage goes
+/// nonsensical.
+/// </para>
+/// </summary>
 public sealed record ClaudeSessionTelemetry(
     string SessionId,
-    int TotalTokens,
+    int ContextTokens,
     int TurnCount,
     DateTimeOffset? LastTurnAt,
     TimeSpan? LastTurnDuration,

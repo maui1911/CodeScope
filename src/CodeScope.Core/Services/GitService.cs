@@ -78,11 +78,12 @@ public sealed class GitService : IGitService
         return Result<IReadOnlyList<BranchInfo>>.Ok(list);
     }
 
-    public async Task<Result<bool>> RemoveWorktreeAsync(string repoPath, string worktreePath, CancellationToken ct = default)
+    public async Task<Result<bool>> RemoveWorktreeAsync(string repoPath, string worktreePath, bool force = false, CancellationToken ct = default)
     {
-        var result = await RunAsync(repoPath,
-            $"worktree remove \"{worktreePath}\"",
-            ct).ConfigureAwait(false);
+        var args = force
+            ? $"worktree remove --force \"{worktreePath}\""
+            : $"worktree remove \"{worktreePath}\"";
+        var result = await RunAsync(repoPath, args, ct).ConfigureAwait(false);
         return result.IsSuccess ? Result<bool>.Ok(true) : Result<bool>.Fail(result.Error);
     }
 

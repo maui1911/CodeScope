@@ -449,7 +449,17 @@ public sealed partial class MainViewModel : ObservableObject
     private SessionTabViewModel? _selectedTab;
 
     /// <summary>Title bar text: "CodeScope — {tab}" when a tab is active, else just "CodeScope".</summary>
-    public string WindowTitle => SelectedTab is { } t ? $"CodeScope — {t.DisplayName}" : "CodeScope";
+    public string WindowTitle
+    {
+        get
+        {
+            // Visual delimiter between an installed build and a side-by-side dev run —
+            // CODESCOPE_DEV=1 also routes the config/layout/mutex to a `.Dev` namespace,
+            // so the suffix mirrors that split in the titlebar.
+            var brand = NoScope.CodeScope.Core.AppPaths.IsDevMode ? "CodeScope [dev]" : "CodeScope";
+            return SelectedTab is { } t ? $"{brand} — {t.DisplayName}" : brand;
+        }
+    }
 
     partial void OnSelectedTabChanged(SessionTabViewModel? value)
     {
@@ -514,6 +524,91 @@ public sealed partial class MainViewModel : ObservableObject
         sidebar.SpawnSessionRequested += async (_, _) =>
         {
             await NewSessionAsync().ConfigureAwait(true);
+        };
+
+        // Worktree deletion needs every tab pinned to that worktree closed first so the
+        // pwsh children release their Windows cwd lock. Match via the persisted Session
+        // (authoritative WorktreeId link); tabs without a stored session are transient
+        // and tear themselves down on group removal anyway.
+        sidebar.CloseWorktreeSessionsAsync = async (projectId, worktreeId) =>
+        {
+            var targetSessionIds = _store.Projects
+                .FirstOrDefault(p => p.Id == projectId)?.Sessions
+                .Where(s => s.WorktreeId == worktreeId && s.ClosedAt is null)
+                .Select(s => s.Id)
+                .ToHashSet() ?? [];
+            if (targetSessionIds.Count == 0) { return () => Task.CompletedTask; }
+
+            // Snapshot each target tab's (stored state · group · groupIndex · indexInGroup) so
+            // a failed remove can reinsert them in place. FindStoredSession is called *before*
+            // CloseTabAsync since soft-close erases the AgentSessionId from memory state the
+            // restore needs. groupIndex is captured now because CloseTabAsync can auto-remove a
+            // group that ends up empty — on rollback we use that index to re-insert the group.
+            var snapshots = new List<(Session stored, EditorGroupViewModel group, int groupIndex, int indexInGroup)>();
+            for (var gi = 0; gi < Groups.Count; gi++)
+            {
+                var group = Groups[gi];
+                for (var i = 0; i < group.Tabs.Count; i++)
+                {
+                    var tab = group.Tabs[i];
+                    if (!targetSessionIds.Contains(tab.Descriptor.Id)) { continue; }
+                    if (FindStoredSession(tab) is { } stored)
+                    {
+                        snapshots.Add((stored, group, gi, i));
+                    }
+                }
+            }
+
+            foreach (var (stored, _, _, _) in snapshots)
+            {
+                var tab = Groups.SelectMany(g => g.Tabs).FirstOrDefault(t => t.Descriptor.Id == stored.Id);
+                if (tab is not null) { await CloseTabAsync(tab).ConfigureAwait(true); }
+            }
+
+            // Rollback lambda: only touches sessions that are *still* soft-closed at rollback
+            // time (a user might have already resumed one manually between close and failure).
+            return async () =>
+            {
+                // Group-level roll-back: CloseTabAsync auto-removes a now-empty non-focused group,
+                // which orphans that EditorGroupViewModel. Re-insert any such group at its original
+                // index before we start re-adding tabs — otherwise the restored tabs land in a
+                // detached group that isn't in `Groups` and effectively disappear.
+                foreach (var (_, group, groupIndex, _) in snapshots)
+                {
+                    if (Groups.Contains(group)) { continue; }
+                    var targetIndex = Math.Clamp(groupIndex, 0, Groups.Count);
+                    Groups.Insert(targetIndex, group);
+                }
+
+                foreach (var (stored, group, _, indexInGroup) in snapshots)
+                {
+                    var current = FindStoredSessionById(stored.Id);
+                    if (current is null || current.ClosedAt is null) { continue; }
+                    var restored = await _store.RestoreSessionAsync(stored.Id).ConfigureAwait(true);
+                    if (restored.IsFailure) { continue; }
+
+                    var agent = string.IsNullOrEmpty(stored.AgentId)
+                        || string.Equals(stored.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase)
+                        ? null
+                        : _agents.GetById(stored.AgentId!);
+                    var descriptor = agent is null
+                        ? _sessionManager.CreateShellSession(stored.WorktreePath, stored.Id)
+                        : _sessionManager.CreateAgentSession(stored.WorktreePath, agent, stored.Id,
+                            resume: true, agentSessionId: stored.AgentSessionId);
+                    var vm = new SessionTabViewModel(descriptor, projectId, stored.AgentId, stored.DisplayName, agent?.Icon);
+                    var insertAt = Math.Clamp(indexInGroup, 0, group.Tabs.Count);
+                    group.Tabs.Insert(insertAt, vm);
+
+                    if (string.Equals(stored.AgentId, "claude", StringComparison.OrdinalIgnoreCase)
+                        && stored.AgentSessionId is { Length: > 0 } sid)
+                    {
+                        _telemetry?.Register(sid, stored.WorktreePath);
+                    }
+                    BeginClaudeAdoption(descriptor.Id, stored.AgentId, stored.WorktreePath, DateTimeOffset.UtcNow);
+                }
+                CloseGroupCommand.NotifyCanExecuteChanged();
+                OnPropertyChanged(nameof(CanCloseGroup));
+            };
         };
 
         // Status-bar metrics recompute on any worktree status / PR event.
@@ -723,6 +818,27 @@ public sealed partial class MainViewModel : ObservableObject
 
         if (project is null) { return; }
 
+        // Soft-close resume — if this worktree has a closed session that would match the agent
+        // the user is about to spawn, restore it instead of minting a new one. Restart is the
+        // explicit "start fresh" escape hatch; New session gives you back whatever was live
+        // last time. Keeps the 1-session-per-worktree invariant (we match on WorktreeId +
+        // resolved agent id).
+        var resolvedAgentId = ResolveAgentIdForNewSession(project, agentId);
+        if (worktree is not null
+            && resolvedAgentId is not null
+            && !string.Equals(resolvedAgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase))
+        {
+            var closed = project.Sessions.FirstOrDefault(s =>
+                s.ClosedAt is not null
+                && string.Equals(s.WorktreeId, worktree.Id, StringComparison.Ordinal)
+                && string.Equals(s.AgentId, resolvedAgentId, StringComparison.OrdinalIgnoreCase)
+                && s.AgentSessionId is { Length: > 0 });
+            if (closed is not null && await TryRestoreSessionAsync(project, worktree, closed).ConfigureAwait(true))
+            {
+                return;
+            }
+        }
+
         // Resolve agent / shell. Priority: explicit arg → project's DefaultAgentId → global default.
         var useShell = string.Equals(agentId, ShellSentinel, StringComparison.OrdinalIgnoreCase);
         AgentProfile? agent;
@@ -789,6 +905,79 @@ public sealed partial class MainViewModel : ObservableObject
     }
 
     /// <summary>
+    /// Resolves the agent id that <see cref="NewSessionAsync"/> would end up using, mirroring
+    /// its priority (explicit arg → project default → global default). Used to look up a
+    /// matching soft-closed session *before* we spawn anything. Returns null for the global
+    /// default when no profile is registered — caller treats null as "no resume candidate".
+    /// </summary>
+    private string? ResolveAgentIdForNewSession(Project project, string? explicitAgentId)
+    {
+        if (!string.IsNullOrEmpty(explicitAgentId))
+        {
+            return string.Equals(explicitAgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase)
+                ? ShellSentinel
+                : _agents.GetById(explicitAgentId)?.Id;
+        }
+        if (string.Equals(project.DefaultAgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase))
+        {
+            return ShellSentinel;
+        }
+        if (!string.IsNullOrEmpty(project.DefaultAgentId))
+        {
+            return _agents.GetById(project.DefaultAgentId!)?.Id ?? _agents.GetDefault()?.Id;
+        }
+        return _agents.GetDefault()?.Id;
+    }
+
+    /// <summary>
+    /// Restores a soft-closed session: clears <see cref="Session.ClosedAt"/> in the store,
+    /// spawns a resume-flavoured descriptor (<c>--resume &lt;AgentSessionId&gt;</c> via
+    /// <see cref="SessionManager.CreateAgentSession"/> with <c>resume: true</c>), adds the tab,
+    /// and kicks off Claude adoption so telemetry follows across the rotation. Returns
+    /// <c>false</c> when the restore couldn't be persisted or the agent profile has vanished.
+    /// </summary>
+    private async Task<bool> TryRestoreSessionAsync(Project project, Worktree worktree, Session closed)
+    {
+        if (string.IsNullOrEmpty(closed.AgentId)
+            || string.Equals(closed.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+        var agent = _agents.GetById(closed.AgentId);
+        if (agent is null) { return false; }
+
+        var restored = await _store.RestoreSessionAsync(closed.Id).ConfigureAwait(true);
+        if (restored.IsFailure)
+        {
+            _logger.LogWarning("RestoreSession: {Error}", restored.Error);
+            return false;
+        }
+
+        var descriptor = _sessionManager.CreateAgentSession(
+            worktree.Path, agent, closed.Id, resume: true, agentSessionId: closed.AgentSessionId);
+        if (worktree.Branch is { Length: > 0 } branch)
+        {
+            descriptor = descriptor with { Title = $"{project.Name} · {branch}" };
+        }
+
+        var vm = new SessionTabViewModel(descriptor, project.Id, closed.AgentId, closed.DisplayName, agent.Icon);
+        FocusedGroup.Tabs.Add(vm);
+        SelectedTab = vm;
+        // Eager telemetry seed — same reasoning as the hydrate path: `claude --resume <id>`
+        // reuses the existing jsonl, so the adoption watch won't fire until the next turn
+        // and the status bar would stay frozen on the just-restored tab.
+        if (string.Equals(closed.AgentId, "claude", StringComparison.OrdinalIgnoreCase)
+            && closed.AgentSessionId is { Length: > 0 } sid)
+        {
+            _telemetry?.Register(sid, worktree.Path);
+        }
+        BeginClaudeAdoption(descriptor.Id, closed.AgentId, worktree.Path, DateTimeOffset.UtcNow);
+        OnPropertyChanged(nameof(CanCloseGroup));
+        CloseGroupCommand.NotifyCanExecuteChanged();
+        return true;
+    }
+
+    /// <summary>
     /// Spawns a fresh session at the same worktree + agent as <paramref name="tab"/>.
     /// Use-case: keep one tab for long-running work and duplicate a parallel shell for ad-hoc commands.
     /// </summary>
@@ -840,7 +1029,16 @@ public sealed partial class MainViewModel : ObservableObject
     }
 
     [RelayCommand]
-    private async Task CloseTabAsync(SessionTabViewModel? tab)
+    private Task CloseTabAsync(SessionTabViewModel? tab) => CloseTabAsync(tab, hardRemove: false);
+
+    /// <summary>
+    /// Closes a tab. When <paramref name="hardRemove"/> is <c>false</c> (default) the session is
+    /// <em>soft-closed</em> for agents that can resume (<see cref="AgentProfile.ResumeByIdArgs"/> +
+    /// persisted <see cref="Session.AgentSessionId"/>) — next <c>New session</c> on the same worktree
+    /// restores the conversation. Shells and agents without resume support are always hard-removed.
+    /// Callers that definitely want the session gone (Restart, worktree cascade) pass <c>true</c>.
+    /// </summary>
+    private async Task CloseTabAsync(SessionTabViewModel? tab, bool hardRemove)
     {
         tab ??= SelectedTab;
         if (tab is null)
@@ -859,7 +1057,22 @@ public sealed partial class MainViewModel : ObservableObject
         var storedForTab = FindStoredSession(tab);
         if (storedForTab?.AgentSessionId is { Length: > 0 } tsid) { _telemetry?.Unregister(tsid); }
         StopClaudeAdoption(tab.Descriptor.Id);
-        await _store.RemoveSessionAsync(tab.Descriptor.Id).ConfigureAwait(true);
+
+        // Resumable = agent with ResumeByIdArgs and a persisted AgentSessionId.
+        var resumable = !hardRemove
+            && storedForTab?.AgentSessionId is { Length: > 0 }
+            && !string.IsNullOrEmpty(storedForTab.AgentId)
+            && !string.Equals(storedForTab.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase)
+            && _agents.GetById(storedForTab.AgentId!)?.ResumeByIdArgs.Count > 0;
+
+        if (resumable)
+        {
+            await _store.SoftCloseSessionAsync(tab.Descriptor.Id).ConfigureAwait(true);
+        }
+        else
+        {
+            await _store.RemoveSessionAsync(tab.Descriptor.Id).ConfigureAwait(true);
+        }
 
         // Auto-collapse a group when its last tab closes and another group exists — the
         // invariant is "groups exist to hold sessions; an empty one adds visual noise".
@@ -949,10 +1162,15 @@ public sealed partial class MainViewModel : ObservableObject
             var resumed = _sessionManager.CreateAgentSession(old.WorkingDirectory, agent, id: old.Id, resume: true, agentSessionId: storedAgentId)
                 with { Title = old.Title };
             tab.Rebind(resumed);
-            // Cross-group respawn = new pwsh process = new claude session id. Tear down the
-            // old telemetry watch and start fresh adoption so the status bar keeps tracking.
-            if (storedAgentId is { Length: > 0 } oldId) { _telemetry?.Unregister(oldId); }
-            BeginClaudeAdoption(tab.Descriptor.Id, agent.Id, old.WorkingDirectory, DateTimeOffset.UtcNow);
+            // Resume-by-id (e.g. `claude --resume <id>`) appends to the existing jsonl, so the
+            // telemetry watcher keeps tracking the same file across the pwsh respawn. Only when
+            // we can't resume by id do we need to tear the tail down and rediscover a fresh one.
+            var resumesById = storedAgentId is { Length: > 0 } && agent.ResumeByIdArgs.Count > 0;
+            if (!resumesById)
+            {
+                if (storedAgentId is { Length: > 0 } oldId) { _telemetry?.Unregister(oldId); }
+                BeginClaudeAdoption(tab.Descriptor.Id, agent.Id, old.WorkingDirectory, DateTimeOffset.UtcNow);
+            }
         }
 
         sourceGroup.Tabs.Remove(tab);
@@ -997,7 +1215,11 @@ public sealed partial class MainViewModel : ObservableObject
         if (tab is null) { return; }
 
         await DuplicateTabAsync(tab).ConfigureAwait(true);
-        await CloseTabAsync(tab).ConfigureAwait(true);
+        // Hard-remove: Restart is "throw away the old conversation and start fresh" — without
+        // hardRemove the old row would linger as a soft-closed entry and get resumed the next
+        // time the user clicks New session on this worktree, which is exactly the opposite of
+        // what Restart means.
+        await CloseTabAsync(tab, hardRemove: true).ConfigureAwait(true);
     }
 
     [RelayCommand]
@@ -1096,6 +1318,10 @@ public sealed partial class MainViewModel : ObservableObject
         {
             foreach (var s in p.Sessions)
             {
+                // Soft-closed sessions are kept on disk for resume-on-next-NewSession but
+                // don't materialise as tabs at startup — they'd spawn dozens of ghost pwsh
+                // children otherwise.
+                if (s.ClosedAt is not null) { continue; }
                 if (!Directory.Exists(s.WorktreePath)) { continue; }
                 var agent = string.IsNullOrEmpty(s.AgentId) || string.Equals(s.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase)
                     ? null
@@ -1164,6 +1390,20 @@ public sealed partial class MainViewModel : ObservableObject
         {
             foreach (var s in p.Sessions)
             {
+                // Skip watches for soft-closed sessions — no tab to update.
+                if (s.ClosedAt is not null) { continue; }
+
+                // Eager telemetry register for hydrated Claude tabs. Resume-by-id (`claude
+                // --resume <id>`) reuses the existing jsonl, so ClaudeSessionDiscovery's
+                // `since >= file.LastWrite` filter skips it and the status bar would stay
+                // frozen until the user fires the next turn. Registering here synchronously
+                // replays the persisted transcript and seeds the snapshot immediately; the
+                // adoption watch still runs in parallel to catch `/clear` rotations.
+                if (string.Equals(s.AgentId, "claude", StringComparison.OrdinalIgnoreCase)
+                    && s.AgentSessionId is { Length: > 0 } sid)
+                {
+                    _telemetry?.Register(sid, s.WorktreePath);
+                }
                 BeginClaudeAdoption(s.Id, s.AgentId, s.WorktreePath, now);
             }
         }
@@ -1183,18 +1423,33 @@ public sealed partial class MainViewModel : ObservableObject
 
         StopClaudeAdoption(storedSessionId);
 
+        // Watch stays alive for the tab's lifetime: Claude Code rotates its session id on
+        // `/clear` by writing a fresh jsonl in the same cwd dir. Each rotation fires the
+        // callback with the new id; we unregister the old telemetry tail, persist the new
+        // id, and register the new tail so the status bar keeps tracking. Disposed on
+        // tab close / cross-group drop via StopClaudeAdoption.
         var handle = _discovery.Watch(workingDir, since, (adoptedId, _path) =>
         {
             var app = Application.Current;
             async Task ApplyAsync()
             {
+                // Skip if this id is already the one we're persisting — the initial launch
+                // adoption fires on startup and the poll fallback can re-fire on a live file.
+                var currentId = FindStoredSessionById(storedSessionId)?.AgentSessionId;
+                if (string.Equals(currentId, adoptedId, StringComparison.OrdinalIgnoreCase))
+                {
+                    // Still make sure telemetry is registered — a just-loaded hydrate may need it.
+                    _telemetry?.Register(adoptedId, workingDir);
+                    return;
+                }
+
+                if (!string.IsNullOrEmpty(currentId)) { _telemetry?.Unregister(currentId!); }
                 _telemetry?.Register(adoptedId, workingDir);
                 var result = await _store.UpdateAgentSessionIdAsync(storedSessionId, adoptedId).ConfigureAwait(true);
                 if (result.IsFailure)
                 {
                     _logger.LogDebug("Adoption persist failed for {Sid}: {Error}", storedSessionId, result.Error);
                 }
-                StopClaudeAdoption(storedSessionId);
             }
             if (app?.Dispatcher is { } d && !d.CheckAccess())
             {
@@ -1206,6 +1461,18 @@ public sealed partial class MainViewModel : ObservableObject
             }
         });
         _discoveryWatches[storedSessionId] = handle;
+    }
+
+    private Session? FindStoredSessionById(string storedSessionId)
+    {
+        foreach (var p in _store.Projects)
+        {
+            foreach (var s in p.Sessions)
+            {
+                if (s.Id == storedSessionId) { return s; }
+            }
+        }
+        return null;
     }
 
     private void StopClaudeAdoption(string storedSessionId)
@@ -1311,7 +1578,7 @@ public sealed partial class MainViewModel : ObservableObject
             var stored = FindStoredSession(tab);
             if (stored?.AgentSessionId == snap.SessionId)
             {
-                tab.TokensUsed = snap.TotalTokens;
+                tab.TokensUsed = snap.ContextTokens;
                 tab.TurnCount = snap.TurnCount;
                 tab.LastTurnDurationSec = snap.LastTurnDuration?.TotalSeconds ?? 0;
                 if (snap.ContextWindowTokens > 0) { tab.ContextWindowTokens = snap.ContextWindowTokens; }

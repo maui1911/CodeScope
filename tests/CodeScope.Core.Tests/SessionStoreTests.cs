@@ -21,7 +21,7 @@ public sealed class SessionStoreTests
         var git = Substitute.For<IGitService>();
         git.AddWorktreeAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string?>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(Result<bool>.Ok(true)));
-        git.RemoveWorktreeAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+        git.RemoveWorktreeAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<bool>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(Result<bool>.Ok(true)));
         git.MoveWorktreeAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(Result<bool>.Ok(true)));
@@ -499,5 +499,98 @@ public sealed class SessionStoreTests
         events.OfType<SessionStoreChange.WorktreePullRequestUpdated>()
             .Should().ContainSingle()
             .Which.PullRequest.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task SoftCloseSessionAsync_Marks_Closed_And_Emits_Removed()
+    {
+        var (store, _, _) = Make();
+        var project = (await store.AddProjectAsync(@"C:\demo", "D")).Value;
+        var sid = Guid.NewGuid().ToString("n");
+        await store.AddSessionAsync(project.Id, new Session
+        {
+            Id = sid, WorktreePath = @"C:\demo", AgentId = "claude",
+            AgentSessionId = "abc",
+        });
+
+        var events = new List<SessionStoreChange>();
+        store.Changed += (_, c) => events.Add(c);
+
+        var result = await store.SoftCloseSessionAsync(sid);
+
+        result.IsSuccess.Should().BeTrue();
+        var after = store.Projects.SelectMany(p => p.Sessions).Single(s => s.Id == sid);
+        after.ClosedAt.Should().NotBeNull();
+        after.AgentSessionId.Should().Be("abc", "the resume id must survive soft-close");
+        events.OfType<SessionStoreChange.SessionRemoved>().Should().ContainSingle();
+    }
+
+    [Fact]
+    public async Task RestoreSessionAsync_Clears_ClosedAt_And_Emits_Added()
+    {
+        var (store, _, _) = Make();
+        var project = (await store.AddProjectAsync(@"C:\demo", "D")).Value;
+        var sid = Guid.NewGuid().ToString("n");
+        await store.AddSessionAsync(project.Id, new Session
+        {
+            Id = sid, WorktreePath = @"C:\demo", AgentId = "claude",
+            AgentSessionId = "abc",
+        });
+        await store.SoftCloseSessionAsync(sid);
+
+        var events = new List<SessionStoreChange>();
+        store.Changed += (_, c) => events.Add(c);
+
+        var restored = await store.RestoreSessionAsync(sid);
+
+        restored.IsSuccess.Should().BeTrue();
+        restored.Value.ClosedAt.Should().BeNull();
+        restored.Value.AgentSessionId.Should().Be("abc");
+        events.OfType<SessionStoreChange.SessionAdded>().Should().ContainSingle();
+    }
+
+    [Fact]
+    public async Task SoftClose_Is_Idempotent()
+    {
+        var (store, _, _) = Make();
+        var project = (await store.AddProjectAsync(@"C:\demo", "D")).Value;
+        var sid = Guid.NewGuid().ToString("n");
+        await store.AddSessionAsync(project.Id, new Session
+        {
+            Id = sid, WorktreePath = @"C:\demo", AgentId = "claude",
+            AgentSessionId = "abc",
+        });
+
+        (await store.SoftCloseSessionAsync(sid)).IsSuccess.Should().BeTrue();
+
+        var events = new List<SessionStoreChange>();
+        store.Changed += (_, c) => events.Add(c);
+        var second = await store.SoftCloseSessionAsync(sid);
+
+        second.IsSuccess.Should().BeTrue();
+        events.OfType<SessionStoreChange.SessionRemoved>().Should().BeEmpty("re-close should not emit a second event");
+    }
+
+    [Fact]
+    public async Task RemoveWorktree_Cascades_Over_Soft_Closed_Sessions()
+    {
+        // Worktree delete should wipe both live and soft-closed sessions — a resurrected tree
+        // shouldn't resurrect a ghost conversation that no longer has a working directory.
+        var (store, _, _) = Make();
+        var project = (await store.AddProjectAsync(@"C:\demo", "D")).Value;
+        var wt = (await store.AddWorktreeAsync(project.Id, @"C:\demo.wt\feat-x", "feat/x")).Value;
+        var sid = Guid.NewGuid().ToString("n");
+        await store.AddSessionAsync(project.Id, new Session
+        {
+            Id = sid, WorktreePath = wt.Path, WorktreeId = wt.Id,
+            AgentId = "claude", AgentSessionId = "abc",
+        });
+        await store.SoftCloseSessionAsync(sid);
+
+        var removed = await store.RemoveWorktreeAsync(project.Id, wt.Id);
+        removed.IsSuccess.Should().BeTrue();
+
+        store.Projects.Single(p => p.Id == project.Id)
+            .Sessions.Should().BeEmpty();
     }
 }

@@ -39,8 +39,10 @@ public sealed class ClaudeTelemetryServiceTests : IDisposable
         last.Should().NotBeNull();
         last!.SessionId.Should().Be(sessionId);
         last.TurnCount.Should().Be(2);
-        // Billable: (10+20+100) + (5+15+0) = 150
-        last.TotalTokens.Should().Be(150);
+        // ContextTokens is the LATEST assistant turn's full context size, not a running sum —
+        // Claude carries the whole prior conversation in every request's input_tokens, so a
+        // cumulative total double-counts. Last turn = 5 + 15 + 0 + 200 = 220.
+        last.ContextTokens.Should().Be(220);
         last.LastTurnAt.Should().NotBeNull();
         // Pair: user@08:00:00 → assistant@08:01:00 → 1 min; then later user absent between
         // 08:01 and 08:02 so the duration from 08:00 (still the last-seen user turn) holds.

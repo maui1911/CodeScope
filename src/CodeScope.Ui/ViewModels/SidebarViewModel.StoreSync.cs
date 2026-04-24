@@ -72,7 +72,10 @@ public sealed partial class SidebarViewModel
         foreach (var wt in p.Worktrees)
         {
             var wvm = new WorktreeViewModel(p.Id, wt);
-            foreach (var s in p.Sessions.Where(x => x.WorktreeId == wt.Id))
+            // Soft-closed sessions persist on disk but have no live tab — skip them in the tree
+            // so the worktree row reflects "no active session" and offers New session (which
+            // will resume the soft-closed conversation transparently).
+            foreach (var s in p.Sessions.Where(x => x.WorktreeId == wt.Id && x.ClosedAt is null))
             {
                 wvm.Sessions.Add(BuildSessionRow(p.Id, wt.Id, s));
             }
