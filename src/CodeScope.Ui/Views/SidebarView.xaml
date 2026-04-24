@@ -407,39 +407,49 @@
 
                         <!-- Chevron — rotates 0→90° when the project expands (spec §4). Bound to the
                              ancestor TreeViewItem's IsExpanded (not VM's, because the outer template
-                             uses TreeViewItem.IsExpanded to drive ItemsHost visibility). -->
-                        <Path
+                             uses TreeViewItem.IsExpanded to drive ItemsHost visibility). Wrapped
+                             in a transparent hit-target Border so clicking the chevron toggles
+                             expand/collapse (without this, the Path's stroke-only hit area means
+                             most clicks miss and the row swallows them as selection). -->
+                        <Border
                             Grid.Column="1"
-                            Width="10" Height="10"
-                            Stretch="Uniform"
-                            Data="M4.5 3 L8 6 L4.5 9"
-                            Stroke="{DynamicResource Text.Secondary}"
-                            StrokeThickness="1.5"
-                            StrokeStartLineCap="Round"
-                            StrokeEndLineCap="Round"
-                            StrokeLineJoin="Round"
-                            HorizontalAlignment="Center"
-                            VerticalAlignment="Center"
-                            RenderTransformOrigin="0.5,0.5">
-                            <Path.Style>
-                                <Style TargetType="Path">
-                                    <Setter Property="RenderTransform">
-                                        <Setter.Value>
-                                            <RotateTransform Angle="0" />
-                                        </Setter.Value>
-                                    </Setter>
-                                    <Style.Triggers>
-                                        <DataTrigger Binding="{Binding Path=IsExpanded, RelativeSource={RelativeSource AncestorType=TreeViewItem}}" Value="True">
-                                            <Setter Property="RenderTransform">
-                                                <Setter.Value>
-                                                    <RotateTransform Angle="90" />
-                                                </Setter.Value>
-                                            </Setter>
-                                        </DataTrigger>
-                                    </Style.Triggers>
-                                </Style>
-                            </Path.Style>
-                        </Path>
+                            Background="Transparent"
+                            Cursor="Hand"
+                            ToolTip="Expand / collapse"
+                            PreviewMouseLeftButtonDown="OnChevronClick">
+                            <Path
+                                Width="10" Height="10"
+                                Stretch="Uniform"
+                                Data="M4.5 3 L8 6 L4.5 9"
+                                Stroke="{DynamicResource Text.Secondary}"
+                                StrokeThickness="1.5"
+                                StrokeStartLineCap="Round"
+                                StrokeEndLineCap="Round"
+                                StrokeLineJoin="Round"
+                                HorizontalAlignment="Center"
+                                VerticalAlignment="Center"
+                                IsHitTestVisible="False"
+                                RenderTransformOrigin="0.5,0.5">
+                                <Path.Style>
+                                    <Style TargetType="Path">
+                                        <Setter Property="RenderTransform">
+                                            <Setter.Value>
+                                                <RotateTransform Angle="0" />
+                                            </Setter.Value>
+                                        </Setter>
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding Path=IsExpanded, RelativeSource={RelativeSource AncestorType=TreeViewItem}}" Value="True">
+                                                <Setter Property="RenderTransform">
+                                                    <Setter.Value>
+                                                        <RotateTransform Angle="90" />
+                                                    </Setter.Value>
+                                                </Setter>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Path.Style>
+                            </Path>
+                        </Border>
 
                         <TextBlock
                             Grid.Column="2"
