@@ -3,6 +3,8 @@ bin/
 obj/
 out/
 publish/
+artifacts/
+releases/
 *.user
 *.suo
 *.pdb

@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CodeScope — installing</title>
+<style>
+  :root {
+    --bg: #000;
+    --panel: #0A0A0A;
+    --border: #1F1F1F;
+    --text: #fff;
+    --text-2: #A0A0A0;
+    --text-3: #606060;
+    --accent: #0099FF;
+    --accent-soft: rgba(0,153,255,0.20);
+    --accent-glow: rgba(0,153,255,0.40);
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    width: 640px;
+    height: 400px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', -apple-system, system-ui, 'Segoe UI', sans-serif;
+    font-feature-settings: "cv01","cv05","cv09","cv11","ss03","ss07";
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+  }
+
+  .frame {
+    width: 100%;
+    height: 100%;
+    position: relative;
+    background:
+      radial-gradient(1200px 500px at 15% -10%, rgba(0,153,255,0.18), transparent 60%),
+      radial-gradient(900px 400px at 110% 120%, rgba(0,153,255,0.10), transparent 60%),
+      linear-gradient(180deg, #050607 0%, #000 70%);
+    border: 1px solid var(--border);
+    overflow: hidden;
+  }
+
+  /* grid lines */
+  .grid {
+    position: absolute; inset: 0;
+    background-image:
+      linear-gradient(to right, rgba(255,255,255,0.025) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(255,255,255,0.025) 1px, transparent 1px);
+    background-size: 40px 40px;
+    mask-image: radial-gradient(900px 500px at 50% 50%, #000 30%, transparent 75%);
+  }
+
+  /* corner accent rule */
+  .rule-top {
+    position: absolute; top: 0; left: 0; right: 0; height: 2px;
+    background: linear-gradient(90deg, transparent, var(--accent) 30%, var(--accent) 70%, transparent);
+    opacity: 0.9;
+  }
+
+  .content {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column;
+    padding: 48px 56px;
+    justify-content: space-between;
+  }
+
+  .top {
+    display: flex; align-items: center; gap: 16px;
+  }
+
+  /* Brand mark — matches the sidebar brand-mark from design tokens */
+  .brand-mark {
+    width: 40px; height: 40px; border-radius: 10px;
+    background: var(--accent);
+    box-shadow:
+      0 0 0 6px rgba(0,153,255,0.14),
+      0 0 40px rgba(0,153,255,0.55),
+      inset 0 -8px 16px rgba(0,0,0,0.25);
+    position: relative;
+    flex: 0 0 auto;
+  }
+  .brand-mark::after {
+    content: "";
+    position: absolute;
+    top: 8px; right: 8px;
+    width: 12px; height: 12px;
+    border-radius: 3px;
+    background: #000;
+  }
+
+  .brand-word {
+    font-weight: 600;
+    font-size: 34px;
+    letter-spacing: -0.02em;
+    line-height: 1;
+  }
+
+  .tagline {
+    margin-top: 4px;
+    font-size: 13px;
+    font-weight: 400;
+    color: var(--text-2);
+    letter-spacing: 0.01em;
+  }
+
+  .middle {
+    display: flex; flex-direction: column; gap: 10px;
+  }
+
+  .pill {
+    align-self: flex-start;
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 6px 12px;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    border: 1px solid rgba(0,153,255,0.35);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #9FD6FF;
+  }
+  .pill .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 10px var(--accent-glow);
+  }
+
+  .headline {
+    font-size: 22px;
+    font-weight: 500;
+    letter-spacing: -0.01em;
+    color: var(--text);
+    max-width: 440px;
+    line-height: 1.3;
+  }
+  .headline em {
+    font-style: normal;
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  .bottom {
+    display: flex; align-items: flex-end; justify-content: space-between;
+    font-size: 11px;
+    color: var(--text-3);
+    letter-spacing: 0.02em;
+  }
+  .bottom .left { display: flex; flex-direction: column; gap: 4px; }
+  .bottom .label {
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    font-size: 10px;
+    color: var(--text-3);
+  }
+  .bottom .value {
+    font-size: 12px;
+    color: var(--text-2);
+    font-weight: 500;
+  }
+
+  /* Terminal mark — decorative stack of monospace lines */
+  .term {
+    font-family: 'JetBrains Mono', ui-monospace, Consolas, monospace;
+    font-size: 10px;
+    line-height: 1.5;
+    color: var(--text-3);
+    text-align: right;
+  }
+  .term .line { white-space: nowrap; }
+  .term .prompt { color: var(--accent); }
+  .term .ok { color: #4BD87B; }
+</style>
+</head>
+<body>
+  <div class="frame">
+    <div class="grid"></div>
+    <div class="rule-top"></div>
+    <div class="content">
+      <div class="top">
+        <div class="brand-mark"></div>
+        <div>
+          <div class="brand-word">CodeScope</div>
+          <div class="tagline">Orchestrate parallel AI coding sessions</div>
+        </div>
+      </div>
+
+      <div class="middle">
+        <div class="pill"><span class="dot"></span>Installing</div>
+        <div class="headline">
+          Spinning up a workspace for your<br>
+          <em>parallel agent sessions</em>.
+        </div>
+      </div>
+
+      <div class="bottom">
+        <div class="left">
+          <span class="label">Windows &middot; x64</span>
+          <span class="value">Native WPF &middot; .NET 10</span>
+        </div>
+        <div class="term">
+          <div class="line"><span class="prompt">&gt;</span> staging runtime&hellip; <span class="ok">ok</span></div>
+          <div class="line"><span class="prompt">&gt;</span> wiring update channel&hellip;</div>
+          <div class="line"><span class="prompt">&gt;</span> registering shortcut</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
