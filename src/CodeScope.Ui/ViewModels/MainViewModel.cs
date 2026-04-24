@@ -534,19 +534,67 @@ public sealed partial class MainViewModel : ObservableObject
         {
             var targetSessionIds = _store.Projects
                 .FirstOrDefault(p => p.Id == projectId)?.Sessions
-                .Where(s => s.WorktreeId == worktreeId)
+                .Where(s => s.WorktreeId == worktreeId && s.ClosedAt is null)
                 .Select(s => s.Id)
                 .ToHashSet() ?? [];
-            if (targetSessionIds.Count == 0) { return; }
+            if (targetSessionIds.Count == 0) { return () => Task.CompletedTask; }
 
-            var tabs = Groups
-                .SelectMany(g => g.Tabs)
-                .Where(t => targetSessionIds.Contains(t.Descriptor.Id))
-                .ToList();
-            foreach (var tab in tabs)
+            // Snapshot each target tab's (stored state · group · index) so a failed remove can
+            // reinsert them in place. FindStoredSession is called *before* CloseTabAsync since
+            // soft-close erases the AgentSessionId from memory state the restore needs.
+            var snapshots = new List<(Session stored, EditorGroupViewModel group, int indexInGroup)>();
+            foreach (var group in Groups)
             {
-                await CloseTabAsync(tab).ConfigureAwait(true);
+                for (var i = 0; i < group.Tabs.Count; i++)
+                {
+                    var tab = group.Tabs[i];
+                    if (!targetSessionIds.Contains(tab.Descriptor.Id)) { continue; }
+                    if (FindStoredSession(tab) is { } stored)
+                    {
+                        snapshots.Add((stored, group, i));
+                    }
+                }
             }
+
+            foreach (var (stored, _, _) in snapshots)
+            {
+                var tab = Groups.SelectMany(g => g.Tabs).FirstOrDefault(t => t.Descriptor.Id == stored.Id);
+                if (tab is not null) { await CloseTabAsync(tab).ConfigureAwait(true); }
+            }
+
+            // Rollback lambda: only touches sessions that are *still* soft-closed at rollback
+            // time (a user might have already resumed one manually between close and failure).
+            return async () =>
+            {
+                foreach (var (stored, group, indexInGroup) in snapshots)
+                {
+                    var current = FindStoredSessionById(stored.Id);
+                    if (current is null || current.ClosedAt is null) { continue; }
+                    var restored = await _store.RestoreSessionAsync(stored.Id).ConfigureAwait(true);
+                    if (restored.IsFailure) { continue; }
+
+                    var agent = string.IsNullOrEmpty(stored.AgentId)
+                        || string.Equals(stored.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase)
+                        ? null
+                        : _agents.GetById(stored.AgentId!);
+                    var descriptor = agent is null
+                        ? _sessionManager.CreateShellSession(stored.WorktreePath, stored.Id)
+                        : _sessionManager.CreateAgentSession(stored.WorktreePath, agent, stored.Id,
+                            resume: true, agentSessionId: stored.AgentSessionId);
+                    var vm = new SessionTabViewModel(descriptor, projectId, stored.AgentId, stored.DisplayName, agent?.Icon);
+                    var insertAt = Math.Clamp(indexInGroup, 0, group.Tabs.Count);
+                    group.Tabs.Insert(insertAt, vm);
+
+                    if (string.Equals(stored.AgentId, "claude", StringComparison.OrdinalIgnoreCase)
+                        && stored.AgentSessionId is { Length: > 0 } sid)
+                    {
+                        _telemetry?.Register(sid, stored.WorktreePath);
+                    }
+                    BeginClaudeAdoption(descriptor.Id, stored.AgentId, stored.WorktreePath, DateTimeOffset.UtcNow);
+                }
+                CloseGroupCommand.NotifyCanExecuteChanged();
+                OnPropertyChanged(nameof(CanCloseGroup));
+            };
         };
 
         // Status-bar metrics recompute on any worktree status / PR event.
@@ -1322,6 +1370,18 @@ public sealed partial class MainViewModel : ObservableObject
             {
                 // Skip watches for soft-closed sessions — no tab to update.
                 if (s.ClosedAt is not null) { continue; }
+
+                // Eager telemetry register for hydrated Claude tabs. Resume-by-id (`claude
+                // --resume <id>`) reuses the existing jsonl, so ClaudeSessionDiscovery's
+                // `since >= file.LastWrite` filter skips it and the status bar would stay
+                // frozen until the user fires the next turn. Registering here synchronously
+                // replays the persisted transcript and seeds the snapshot immediately; the
+                // adoption watch still runs in parallel to catch `/clear` rotations.
+                if (string.Equals(s.AgentId, "claude", StringComparison.OrdinalIgnoreCase)
+                    && s.AgentSessionId is { Length: > 0 } sid)
+                {
+                    _telemetry?.Register(sid, s.WorktreePath);
+                }
                 BeginClaudeAdoption(s.Id, s.AgentId, s.WorktreePath, now);
             }
         }

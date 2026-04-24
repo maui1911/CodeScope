@@ -100,8 +100,14 @@ public sealed partial class SidebarViewModel : ObservableObject
     /// Hook wired by <see cref="MainViewModel.AttachSidebar"/> to close any tabs currently pinned
     /// to a worktree before it is removed. Without this, the pwsh processes hosting those tabs
     /// keep Windows file locks on the worktree directory and <c>git worktree remove</c> fails.
+    ///
+    /// <para>Returns a rollback delegate that the caller invokes if the destructive operation
+    /// ultimately fails (git refuses + user declines the force retry). The rollback restores each
+    /// soft-closed session and re-adds its tab to the original group, so a failed delete doesn't
+    /// leave the user with a still-present worktree but an empty tab strip. A no-op lambda is
+    /// returned when nothing was closed.</para>
     /// </summary>
-    public Func<string, string, Task>? CloseWorktreeSessionsAsync { get; set; }
+    public Func<string, string, Task<Func<Task>>>? CloseWorktreeSessionsAsync { get; set; }
 
     private void Toast(string title, string message, ControlAppearance appearance)
     {

@@ -367,10 +367,13 @@ public sealed partial class SidebarViewModel
 
         // Close any tabs pinned to this worktree first so pwsh releases the cwd lock on
         // the directory. Without this `git worktree remove` fails on Windows with a file-
-        // in-use error and the sidebar silently stays stale.
+        // in-use error and the sidebar silently stays stale. The close callback returns a
+        // rollback lambda we invoke if the whole remove flow ultimately fails — without it,
+        // a failed delete would leave the worktree in place but with its tabs vanished.
+        Func<Task>? rollback = null;
         if (CloseWorktreeSessionsAsync is { } closeSessions)
         {
-            try { await closeSessions(worktree.ProjectId, worktree.Id).ConfigureAwait(true); }
+            try { rollback = await closeSessions(worktree.ProjectId, worktree.Id).ConfigureAwait(true); }
             catch (Exception ex) { _logger.LogWarning(ex, "Closing sessions for worktree {Id} failed", worktree.Id); }
 
             // Give WPF a beat to run the SessionTabView Unloaded teardown and let ConPTY
@@ -396,6 +399,7 @@ public sealed partial class SidebarViewModel
             confirmLabel: "Force remove");
         if (!retry)
         {
+            await InvokeRollbackAsync(rollback).ConfigureAwait(true);
             Toast("Remove failed", r.Error, ControlAppearance.Danger);
             return;
         }
@@ -408,8 +412,16 @@ public sealed partial class SidebarViewModel
         else
         {
             _logger.LogWarning("Force RemoveWorktree failed: {Error}", forced.Error);
+            await InvokeRollbackAsync(rollback).ConfigureAwait(true);
             Toast("Remove failed", forced.Error, ControlAppearance.Danger);
         }
+    }
+
+    private async Task InvokeRollbackAsync(Func<Task>? rollback)
+    {
+        if (rollback is null) { return; }
+        try { await rollback().ConfigureAwait(true); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Worktree close rollback threw"); }
     }
 
     /// <summary>Unwraps the ProjectViewModel / WorktreeViewModel / string alternatives passed by menus.</summary>
