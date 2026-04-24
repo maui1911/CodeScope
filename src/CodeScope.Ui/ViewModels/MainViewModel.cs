@@ -539,24 +539,27 @@ public sealed partial class MainViewModel : ObservableObject
                 .ToHashSet() ?? [];
             if (targetSessionIds.Count == 0) { return () => Task.CompletedTask; }
 
-            // Snapshot each target tab's (stored state · group · index) so a failed remove can
-            // reinsert them in place. FindStoredSession is called *before* CloseTabAsync since
-            // soft-close erases the AgentSessionId from memory state the restore needs.
-            var snapshots = new List<(Session stored, EditorGroupViewModel group, int indexInGroup)>();
-            foreach (var group in Groups)
+            // Snapshot each target tab's (stored state · group · groupIndex · indexInGroup) so
+            // a failed remove can reinsert them in place. FindStoredSession is called *before*
+            // CloseTabAsync since soft-close erases the AgentSessionId from memory state the
+            // restore needs. groupIndex is captured now because CloseTabAsync can auto-remove a
+            // group that ends up empty — on rollback we use that index to re-insert the group.
+            var snapshots = new List<(Session stored, EditorGroupViewModel group, int groupIndex, int indexInGroup)>();
+            for (var gi = 0; gi < Groups.Count; gi++)
             {
+                var group = Groups[gi];
                 for (var i = 0; i < group.Tabs.Count; i++)
                 {
                     var tab = group.Tabs[i];
                     if (!targetSessionIds.Contains(tab.Descriptor.Id)) { continue; }
                     if (FindStoredSession(tab) is { } stored)
                     {
-                        snapshots.Add((stored, group, i));
+                        snapshots.Add((stored, group, gi, i));
                     }
                 }
             }
 
-            foreach (var (stored, _, _) in snapshots)
+            foreach (var (stored, _, _, _) in snapshots)
             {
                 var tab = Groups.SelectMany(g => g.Tabs).FirstOrDefault(t => t.Descriptor.Id == stored.Id);
                 if (tab is not null) { await CloseTabAsync(tab).ConfigureAwait(true); }
@@ -566,7 +569,18 @@ public sealed partial class MainViewModel : ObservableObject
             // time (a user might have already resumed one manually between close and failure).
             return async () =>
             {
-                foreach (var (stored, group, indexInGroup) in snapshots)
+                // Group-level roll-back: CloseTabAsync auto-removes a now-empty non-focused group,
+                // which orphans that EditorGroupViewModel. Re-insert any such group at its original
+                // index before we start re-adding tabs — otherwise the restored tabs land in a
+                // detached group that isn't in `Groups` and effectively disappear.
+                foreach (var (_, group, groupIndex, _) in snapshots)
+                {
+                    if (Groups.Contains(group)) { continue; }
+                    var targetIndex = Math.Clamp(groupIndex, 0, Groups.Count);
+                    Groups.Insert(targetIndex, group);
+                }
+
+                foreach (var (stored, group, _, indexInGroup) in snapshots)
                 {
                     var current = FindStoredSessionById(stored.Id);
                     if (current is null || current.ClosedAt is null) { continue; }
@@ -949,6 +963,14 @@ public sealed partial class MainViewModel : ObservableObject
         var vm = new SessionTabViewModel(descriptor, project.Id, closed.AgentId, closed.DisplayName, agent.Icon);
         FocusedGroup.Tabs.Add(vm);
         SelectedTab = vm;
+        // Eager telemetry seed — same reasoning as the hydrate path: `claude --resume <id>`
+        // reuses the existing jsonl, so the adoption watch won't fire until the next turn
+        // and the status bar would stay frozen on the just-restored tab.
+        if (string.Equals(closed.AgentId, "claude", StringComparison.OrdinalIgnoreCase)
+            && closed.AgentSessionId is { Length: > 0 } sid)
+        {
+            _telemetry?.Register(sid, worktree.Path);
+        }
         BeginClaudeAdoption(descriptor.Id, closed.AgentId, worktree.Path, DateTimeOffset.UtcNow);
         OnPropertyChanged(nameof(CanCloseGroup));
         CloseGroupCommand.NotifyCanExecuteChanged();
