@@ -35,6 +35,14 @@ public partial class SessionTabView : UserControl
         Loaded += (_, _) => { _isLoaded = true; TryStartShell(); };
         Unloaded += (_, _) => TeardownShell();
         // Tunneling preview so we win over the inner TerminalControl's Win32 input path.
+        // Keyboard events tunnel through WPF fine even with Win32InputMode=True, but mouse
+        // events are another story: the Microsoft.Terminal.Wpf HwndHost child captures
+        // WM_*BUTTON* messages at the native layer, so WPF's routed mouse events never
+        // fire on this UserControl. That rules out a native right-click ContextMenu —
+        // a WPF ContextMenu on the Grid, PreviewMouseRightButtonUp, and HwndSource.AddHook
+        // on the top-level window were all tried and none reach this code path. Subclassing
+        // the terminal's native HWND would work but is fragile. The keyboard shortcuts
+        // below are the supported path for copy / paste / open-url.
         PreviewKeyDown += OnTerminalPreviewKeyDown;
     }
 
@@ -107,37 +115,6 @@ public partial class SessionTabView : UserControl
         }
     }
 
-    private void OnContextMenuOpened(object sender, RoutedEventArgs e)
-    {
-        var sel = Terminal.Terminal?.GetSelectedText();
-        var hasSelection = !string.IsNullOrEmpty(sel);
-        MenuCopy.IsEnabled = hasSelection;
-        MenuOpenUrl.IsEnabled = hasSelection && LooksLikeUrl(sel);
-    }
-
-    private static bool LooksLikeUrl(string? text)
-    {
-        if (string.IsNullOrWhiteSpace(text)) { return false; }
-        var t = text.Trim().Replace("\r\n", string.Empty).Replace("\n", string.Empty).Replace("\r", string.Empty);
-        return Uri.TryCreate(t, UriKind.Absolute, out var uri)
-            && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps);
-    }
-
-    private void OnOpenUrlClicked(object sender, RoutedEventArgs e) => TryOpenSelectedUrl();
-
-    private void OnCopyClicked(object sender, RoutedEventArgs e)
-    {
-        var sel = Terminal.Terminal?.GetSelectedText();
-        if (!string.IsNullOrEmpty(sel)) { TrySetClipboard(sel); }
-    }
-
-    private void OnPasteClicked(object sender, RoutedEventArgs e)
-    {
-        var text = TryGetClipboardText();
-        if (string.IsNullOrEmpty(text)) { return; }
-        var normalised = text.Replace("\r\n", "\r").Replace("\n", "\r");
-        Terminal.ConPTYTerm?.WriteToTerm(normalised.AsSpan());
-    }
 
     private static void TrySetClipboard(string text)
     {
