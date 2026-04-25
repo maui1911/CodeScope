@@ -283,6 +283,10 @@
                                         <DataTrigger Binding="{Binding HasActiveSession}" Value="True">
                                             <Setter Property="Opacity" Value="1" />
                                         </DataTrigger>
+                                        <!-- Per-group active worktree (any group's focused tab → row reads "active"). -->
+                                        <DataTrigger Binding="{Binding IsActiveInAnyGroup}" Value="True">
+                                            <Setter Property="Opacity" Value="1" />
+                                        </DataTrigger>
                                         <DataTrigger Binding="{Binding Path=IsSelected, RelativeSource={RelativeSource AncestorType=TreeViewItem}}" Value="True">
                                             <Setter Property="Opacity" Value="1" />
                                         </DataTrigger>
@@ -352,7 +356,13 @@
                                             <DataTrigger Binding="{Binding DotState}" Value="wait">
                                                 <Setter Property="Fill" Value="{DynamicResource Signal.Warn}" />
                                             </DataTrigger>
-                                            <!-- Selected row supersedes idle/rest with the accent "active" state. -->
+                                            <!-- Active in any group supersedes idle/rest with the accent "active" state.
+                                                 Multi-group splits can have one focused tab per group on different
+                                                 worktrees; each row should advertise that independently of which
+                                                 single TreeViewItem is currently IsSelected. -->
+                                            <DataTrigger Binding="{Binding IsActiveInAnyGroup}" Value="True">
+                                                <Setter Property="Fill" Value="{DynamicResource Accent.Primary}" />
+                                            </DataTrigger>
                                             <DataTrigger Binding="{Binding Path=IsSelected, RelativeSource={RelativeSource AncestorType=TreeViewItem}}" Value="True">
                                                 <Setter Property="Fill" Value="{DynamicResource Accent.Primary}" />
                                             </DataTrigger>
@@ -371,10 +381,16 @@
                             TextTrimming="CharacterEllipsis">
                             <TextBlock.Style>
                                 <Style TargetType="TextBlock">
-                                    <!-- Rest: muted. Selected row: white + Medium weight (spec §6). -->
+                                    <!-- Rest: muted. Active row (focused tab in any group): white + Medium weight (spec §6).
+                                         IsActiveInAnyGroup is a multi-row capable signal; IsSelected is the single
+                                         TreeView selection (keyboard nav / right-click target) — both bold the row. -->
                                     <Setter Property="Foreground" Value="{DynamicResource Text.Secondary}" />
                                     <Setter Property="FontWeight" Value="Normal" />
                                     <Style.Triggers>
+                                        <DataTrigger Binding="{Binding IsActiveInAnyGroup}" Value="True">
+                                            <Setter Property="Foreground" Value="{DynamicResource Text.Primary}" />
+                                            <Setter Property="FontWeight" Value="Medium" />
+                                        </DataTrigger>
                                         <DataTrigger Binding="{Binding Path=IsSelected, RelativeSource={RelativeSource AncestorType=TreeViewItem}}" Value="True">
                                             <Setter Property="Foreground" Value="{DynamicResource Text.Primary}" />
                                             <Setter Property="FontWeight" Value="Medium" />

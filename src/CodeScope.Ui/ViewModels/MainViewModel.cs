@@ -122,18 +122,28 @@ public sealed partial class MainViewModel : ObservableObject
                 break;
         }
         RaiseGroupWidthsReset();
+        // Group structure changed — the active set might shrink (close-group) or grow
+        // (split-right inheriting a tab); push the new flags into the sidebar.
+        RecomputeActiveWorktreesAcrossGroups();
     }
 
     /// <summary>
     /// Forwards a group's SelectedTab changes into MainViewModel.SelectedTab when the
     /// group is focused — keeps WindowTitle, per-tab IsActive bookkeeping, and the
-    /// diff panel in sync regardless of which group the user clicked.
+    /// diff panel in sync regardless of which group the user clicked. Also recomputes
+    /// the sidebar's per-worktree active flags for *every* group, so a tab change in
+    /// an unfocused group still updates that group's worktree row in the sidebar.
     /// </summary>
     private void HookGroupSelection(EditorGroupViewModel group)
     {
         group.PropertyChanged += (_, e) =>
         {
             if (e.PropertyName != nameof(EditorGroupViewModel.SelectedTab)) { return; }
+            // Every group's selection contributes to the sidebar's active set, even
+            // if the change happened in an unfocused group (drag-between-groups,
+            // close-tab cascading, hydrate). Recompute first so the row state is
+            // correct before any downstream sync touches the sidebar.
+            RecomputeActiveWorktreesAcrossGroups();
             if (!ReferenceEquals(group, FocusedGroup)) { return; }
             if (ReferenceEquals(SelectedTab, group.SelectedTab)) { return; }
             SelectedTab = group.SelectedTab;
@@ -514,6 +524,13 @@ public sealed partial class MainViewModel : ObservableObject
     {
         Sidebar = sidebar;
         OnPropertyChanged(nameof(Sidebar));
+
+        // Sidebar tree structure mutates from store events (Loaded clears + rebuilds, projects/
+        // worktrees added/removed). Each rebuild produces fresh WorktreeViewModel instances with
+        // IsActiveInAnyGroup=false; reapply the multi-group active flags after every structural
+        // change so the bold/rail visuals don't lose state on hydrate or worktree CRUD.
+        sidebar.Projects.CollectionChanged += OnSidebarProjectsChanged;
+        foreach (var p in sidebar.Projects) { HookProjectWorktrees(p); }
 
         Overview = new OverviewViewModel(sidebar, Groups, _agents);
         Overview.FocusSessionRequested += (_, session) =>
@@ -1122,46 +1139,108 @@ public sealed partial class MainViewModel : ObservableObject
     private void SyncSidebarToTab(SessionTabViewModel? tab)
     {
         if (tab is null || Sidebar is null) { return; }
+        var match = ResolveWorktreeForTab(tab);
+        if (match is not null && !ReferenceEquals(Sidebar.SelectedWorktree, match))
+        {
+            Sidebar.SelectedWorktree = match;
+        }
+    }
 
-        WorktreeViewModel? match = null;
+    private void OnSidebarProjectsChanged(object? sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
+    {
+        if (e.OldItems is not null)
+        {
+            foreach (var p in e.OldItems.OfType<ProjectViewModel>()) { UnhookProjectWorktrees(p); }
+        }
+        if (e.NewItems is not null)
+        {
+            foreach (var p in e.NewItems.OfType<ProjectViewModel>()) { HookProjectWorktrees(p); }
+        }
+        if (e.Action == System.Collections.Specialized.NotifyCollectionChangedAction.Reset && Sidebar is not null)
+        {
+            // Reset gives no Old/New items — re-hook from current state.
+            foreach (var p in Sidebar.Projects) { HookProjectWorktrees(p); }
+        }
+        RecomputeActiveWorktreesAcrossGroups();
+    }
 
-        // Authoritative path: find the project whose Sessions list owns this tab,
-        // then resolve the worktree inside that project's WorktreeViewModels.
+    private void HookProjectWorktrees(ProjectViewModel p)
+    {
+        // Idempotent: detach first so re-hooking on Reset doesn't double-subscribe.
+        p.Worktrees.CollectionChanged -= OnProjectWorktreesChanged;
+        p.Worktrees.CollectionChanged += OnProjectWorktreesChanged;
+    }
+
+    private void UnhookProjectWorktrees(ProjectViewModel p)
+    {
+        p.Worktrees.CollectionChanged -= OnProjectWorktreesChanged;
+    }
+
+    private void OnProjectWorktreesChanged(object? sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
+    {
+        RecomputeActiveWorktreesAcrossGroups();
+    }
+
+    /// <summary>
+    /// Recomputes <see cref="WorktreeViewModel.IsActiveInAnyGroup"/> for every worktree in
+    /// the sidebar by walking <see cref="Groups"/> and resolving each group's
+    /// <c>SelectedTab</c> to its owning worktree. The TreeView's single-selection model
+    /// can only mark one row as <c>IsSelected</c>, so this bool is the multi-group
+    /// counterpart that drives the bold/accent-rail/active-dot styling.
+    /// </summary>
+    private void RecomputeActiveWorktreesAcrossGroups()
+    {
+        if (Sidebar is null) { return; }
+
+        var active = new HashSet<WorktreeViewModel>();
+        foreach (var g in Groups)
+        {
+            var t = g.SelectedTab;
+            if (t is null) { continue; }
+            var wt = ResolveWorktreeForTab(t);
+            if (wt is not null) { active.Add(wt); }
+        }
+
+        foreach (var p in Sidebar.Projects)
+        {
+            foreach (var w in p.Worktrees)
+            {
+                var should = active.Contains(w);
+                if (w.IsActiveInAnyGroup != should) { w.IsActiveInAnyGroup = should; }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Maps <paramref name="tab"/> to the worktree row that owns it. Same lookup logic
+    /// as <see cref="SyncSidebarToTab"/> — store-authoritative first (project whose
+    /// <c>Sessions</c> list contains the descriptor id), then a working-directory
+    /// fallback for transient tabs that haven't been persisted yet.
+    /// </summary>
+    private WorktreeViewModel? ResolveWorktreeForTab(SessionTabViewModel tab)
+    {
+        if (Sidebar is null) { return null; }
+
         foreach (var p in _store.Projects)
         {
             var session = p.Sessions.FirstOrDefault(s => s.Id == tab.Descriptor.Id);
             if (session is null) { continue; }
             var projVm = Sidebar.Projects.FirstOrDefault(pv => pv.Id == p.Id);
-            if (projVm is null) { break; }
+            if (projVm is null) { return null; }
             if (session.WorktreeId is { Length: > 0 } wid)
             {
-                match = projVm.Worktrees.FirstOrDefault(w => w.Id == wid);
+                var byId = projVm.Worktrees.FirstOrDefault(w => w.Id == wid);
+                if (byId is not null) { return byId; }
             }
-            if (match is null)
-            {
-                match = projVm.Worktrees.FirstOrDefault(w =>
-                    string.Equals(w.Path, session.WorktreePath, StringComparison.OrdinalIgnoreCase));
-            }
-            break;
+            return projVm.Worktrees.FirstOrDefault(w =>
+                string.Equals(w.Path, session.WorktreePath, StringComparison.OrdinalIgnoreCase));
         }
 
-        // Transient-tab fallback: no persisted Session yet, so match purely by the
-        // tab's working directory across every project's worktrees.
-        if (match is null)
-        {
-            var path = tab.Descriptor.WorkingDirectory;
-            if (!string.IsNullOrWhiteSpace(path))
-            {
-                match = Sidebar.Projects
-                    .SelectMany(p => p.Worktrees)
-                    .FirstOrDefault(w => string.Equals(w.Path, path, StringComparison.OrdinalIgnoreCase));
-            }
-        }
-
-        if (match is not null && !ReferenceEquals(Sidebar.SelectedWorktree, match))
-        {
-            Sidebar.SelectedWorktree = match;
-        }
+        var path = tab.Descriptor.WorkingDirectory;
+        if (string.IsNullOrWhiteSpace(path)) { return null; }
+        return Sidebar.Projects
+            .SelectMany(p => p.Worktrees)
+            .FirstOrDefault(w => string.Equals(w.Path, path, StringComparison.OrdinalIgnoreCase));
     }
 
     /// <summary>

@@ -91,6 +91,17 @@ public sealed partial class WorktreeViewModel : ObservableObject
     [ObservableProperty]
     private bool _isVisible = true;
 
+    /// <summary>
+    /// True when at least one editor group's <c>SelectedTab</c> belongs to this worktree.
+    /// Drives the sidebar's bold/accent-rail/active-dot styling. Independent of
+    /// <see cref="System.Windows.Controls.TreeViewItem.IsSelected"/>: a TreeView only
+    /// supports a single selected item, but with multi-group splits the user can have
+    /// one focused tab per group on different worktrees, and every one of those rows
+    /// should look "active" in the sidebar. Recomputed by <c>MainViewModel</c>.
+    /// </summary>
+    [ObservableProperty]
+    private bool _isActiveInAnyGroup;
+
     /// <summary>Called by the sidebar filter: hides the row when <paramref name="filter"/> misses.</summary>
     public void ApplyFilter(string filter)
     {
