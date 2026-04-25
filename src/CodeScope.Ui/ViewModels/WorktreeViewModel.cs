@@ -47,6 +47,19 @@ public sealed partial class WorktreeViewModel : ObservableObject
 
     public string DisplayBranch => Worktree.Branch ?? (Worktree.IsPrimary ? "main" : "(no branch)");
 
+    /// <summary>
+    /// Stable, human-readable id for UIA automation. Combines project id with the
+    /// branch name so two worktrees in different projects on the same branch don't
+    /// collide. Wpf-cli snapshots will show e.g. <c>a:Worktree_codescope__main</c>.
+    /// </summary>
+    public string AutomationId
+        => $"Worktree_{SafeToken(ProjectId)}__{SafeToken(DisplayBranch)}";
+
+    private static string SafeToken(string? s)
+        => string.IsNullOrWhiteSpace(s)
+            ? "unknown"
+            : new string([.. s.Select(c => char.IsLetterOrDigit(c) ? c : '_')]).Trim('_');
+
     public ObservableCollection<SessionTabViewModel> Sessions { get; }
 
     [ObservableProperty]

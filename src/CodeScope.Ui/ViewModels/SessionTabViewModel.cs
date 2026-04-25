@@ -83,6 +83,23 @@ public sealed partial class SessionTabViewModel : ObservableObject
     /// <summary>Alias kept for XAML bindings that reference Title (e.g. window chrome).</summary>
     public string Title => DisplayName;
 
-    partial void OnDisplayNameChanged(string value) => OnPropertyChanged(nameof(Title));
+    /// <summary>
+    /// Stable, human-readable id for UIA automation. Falls back to the descriptor's
+    /// session id when DisplayName is empty so a:Tab_* always resolves. Wpf-cli
+    /// snapshots will show e.g. <c>a:Tab_main</c> instead of the VM type name.
+    /// </summary>
+    public string AutomationId
+        => $"Tab_{(string.IsNullOrWhiteSpace(DisplayName) ? Descriptor.Id : SafeToken(DisplayName))}";
+
+    private static string SafeToken(string s)
+        => string.IsNullOrWhiteSpace(s)
+            ? "unknown"
+            : new string([.. s.Select(c => char.IsLetterOrDigit(c) ? c : '_')]).Trim('_');
+
+    partial void OnDisplayNameChanged(string value)
+    {
+        OnPropertyChanged(nameof(Title));
+        OnPropertyChanged(nameof(AutomationId));
+    }
 }
 

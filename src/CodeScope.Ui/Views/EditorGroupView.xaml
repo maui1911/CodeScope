@@ -24,7 +24,8 @@
         AllowDrop="True"
         DragOver="OnStripDragOver"
         Drop="OnStripDrop"
-        PreviewMouseDown="OnGroupPreviewMouseDown">
+        PreviewMouseDown="OnGroupPreviewMouseDown"
+        GotKeyboardFocus="OnGroupGotKeyboardFocus">
         <Grid>
             <!-- Top accent rail, visible only when this group is focused — a subtle cue
                  since the window-global strip already shows the focused group's tabs. -->
@@ -49,6 +50,9 @@
                 <ItemsControl.ItemContainerStyle>
                     <Style TargetType="ContentPresenter">
                         <Setter Property="Visibility" Value="Collapsed" />
+                        <!-- Mirrors the tab strip's item id so a tab and its workspace pane
+                             resolve to the same a:Tab_* ref under different parents. -->
+                        <Setter Property="AutomationProperties.AutomationId" Value="{Binding AutomationId}" />
                         <Style.Triggers>
                             <DataTrigger Binding="{Binding IsActive}" Value="True">
                                 <Setter Property="Visibility" Value="Visible" />
