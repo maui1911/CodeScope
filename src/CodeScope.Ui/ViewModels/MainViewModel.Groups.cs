@@ -4,7 +4,7 @@ using CommunityToolkit.Mvvm.Input;
 
 namespace NoScope.CodeScope.Ui.ViewModels;
 
-public partial class MainViewModel
+public sealed partial class MainViewModel
 {
     /// <summary>Editor groups; every group owns a tab strip and a workspace region.</summary>
     public ObservableCollection<EditorGroupViewModel> Groups { get; }

@@ -67,12 +67,16 @@ public partial class App : Application
         // One-time async bootstrap before HostBuilder: load persisted ProjectsConfig and
         // construct the AgentRegistry from it. Doing this here (vs. inside an
         // AddSingleton factory) keeps GetAwaiter().GetResult() off the DI critical path
-        // and prevents any future blocking-during-resolution surprises.
-        var bootstrapLoggerFactory = LoggerFactory.Create(b => b.AddDebug());
-        var bootstrapStore = new ProjectStore(bootstrapLoggerFactory.CreateLogger<ProjectStore>());
-        var bootstrapCfg = bootstrapStore.LoadAsync().GetAwaiter().GetResult();
-        var agentRegistry = AgentRegistry.FromConfig(
-            bootstrapCfg.IsSuccess ? bootstrapCfg.Value : new ProjectsConfig());
+        // and prevents any future blocking-during-resolution surprises. The temporary
+        // LoggerFactory is disposed immediately — the host's logger pipeline replaces it.
+        AgentRegistry agentRegistry;
+        using (var bootstrapLoggerFactory = LoggerFactory.Create(b => b.AddDebug()))
+        {
+            var bootstrapStore = new ProjectStore(bootstrapLoggerFactory.CreateLogger<ProjectStore>());
+            var bootstrapCfg = bootstrapStore.LoadAsync().GetAwaiter().GetResult();
+            agentRegistry = AgentRegistry.FromConfig(
+                bootstrapCfg.IsSuccess ? bootstrapCfg.Value : new ProjectsConfig());
+        }
 
         _host = Host.CreateDefaultBuilder()
             .ConfigureLogging(log =>

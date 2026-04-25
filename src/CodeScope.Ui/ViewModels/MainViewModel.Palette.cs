@@ -2,7 +2,7 @@ using CommunityToolkit.Mvvm.Input;
 
 namespace NoScope.CodeScope.Ui.ViewModels;
 
-public partial class MainViewModel
+public sealed partial class MainViewModel
 {
     /// <summary>
     /// Ctrl+K action: assembles the palette from current state and dispatches the pick.

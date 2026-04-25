@@ -93,8 +93,12 @@ public static class ClaudeTranscriptParser
                 input, output, cacheCreate, cacheRead,
                 stopReason, userCarriesToolResult, model);
         }
-        catch (JsonException)
+        catch (JsonException ex)
         {
+            // Malformed line — Claude's transcript writer can produce a partially-flushed
+            // tail when the process exits mid-write. Tracing keeps the diagnostic out of
+            // the hot path (logs are parsed in tight loops) but visible to a debugger.
+            System.Diagnostics.Debug.WriteLine($"[ClaudeTranscriptParser] Skipping malformed JSONL line: {ex.Message}");
             return null;
         }
     }
