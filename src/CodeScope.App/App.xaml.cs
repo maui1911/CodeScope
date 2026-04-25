@@ -174,13 +174,20 @@ public partial class App : Application
                     await updater.CheckAsync().ConfigureAwait(false);
                 }
             }
-            catch (System.OperationCanceledException) { }
+            catch (System.OperationCanceledException)
+            {
+                // Expected on app shutdown — _updateCts was cancelled.
+            }
         });
     }
 
     protected override void OnExit(ExitEventArgs e)
     {
-        try { _updateCts?.Cancel(); } catch { }
+        try { _updateCts?.Cancel(); }
+        catch (System.ObjectDisposedException)
+        {
+            // CTS already disposed on a previous shutdown attempt — nothing to cancel.
+        }
         _updateCts?.Dispose();
         _updateCts = null;
 
