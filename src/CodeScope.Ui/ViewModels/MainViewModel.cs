@@ -1113,26 +1113,43 @@ public sealed partial class MainViewModel : ObservableObject
 
     /// <summary>
     /// Maps the focused tab back to the worktree row that owns it and updates the
-    /// sidebar's <see cref="SidebarViewModel.SelectedWorktree"/>. Prefers the stored
-    /// Session's <c>WorktreeId</c>; falls back to matching by <c>WorktreePath</c> for
-    /// pre-Phase 3 sessions and for transient tabs that haven't persisted yet (their
-    /// descriptor's <c>WorkingDirectory</c> is the same path).
+    /// sidebar's <see cref="SidebarViewModel.SelectedWorktree"/>. Worktree ids are NOT
+    /// globally unique (every project has a worktree literally called "primary"), so
+    /// we scope every lookup by the owning project — first by walking the store for
+    /// the project whose <c>Sessions</c> contains the tab's descriptor, then by the
+    /// worktree-path fallback for transient/pre-Phase 3 tabs.
     /// </summary>
     private void SyncSidebarToTab(SessionTabViewModel? tab)
     {
         if (tab is null || Sidebar is null) { return; }
 
         WorktreeViewModel? match = null;
-        var stored = FindStoredSession(tab);
-        if (stored?.WorktreeId is { Length: > 0 } wid)
+
+        // Authoritative path: find the project whose Sessions list owns this tab,
+        // then resolve the worktree inside that project's WorktreeViewModels.
+        foreach (var p in _store.Projects)
         {
-            match = Sidebar.Projects
-                .SelectMany(p => p.Worktrees)
-                .FirstOrDefault(w => w.Id == wid);
+            var session = p.Sessions.FirstOrDefault(s => s.Id == tab.Descriptor.Id);
+            if (session is null) { continue; }
+            var projVm = Sidebar.Projects.FirstOrDefault(pv => pv.Id == p.Id);
+            if (projVm is null) { break; }
+            if (session.WorktreeId is { Length: > 0 } wid)
+            {
+                match = projVm.Worktrees.FirstOrDefault(w => w.Id == wid);
+            }
+            if (match is null)
+            {
+                match = projVm.Worktrees.FirstOrDefault(w =>
+                    string.Equals(w.Path, session.WorktreePath, StringComparison.OrdinalIgnoreCase));
+            }
+            break;
         }
+
+        // Transient-tab fallback: no persisted Session yet, so match purely by the
+        // tab's working directory across every project's worktrees.
         if (match is null)
         {
-            var path = stored?.WorktreePath ?? tab.Descriptor.WorkingDirectory;
+            var path = tab.Descriptor.WorkingDirectory;
             if (!string.IsNullOrWhiteSpace(path))
             {
                 match = Sidebar.Projects
