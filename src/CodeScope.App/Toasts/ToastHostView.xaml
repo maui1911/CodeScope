@@ -12,6 +12,7 @@
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:t="clr-namespace:NoScope.CodeScope.App.Toasts"
+             xmlns:vm="clr-namespace:NoScope.CodeScope.Ui.ViewModels;assembly=CodeScope.Ui"
              Background="Transparent"
              IsHitTestVisible="False">
     <Popup x:Name="Popup"
@@ -36,7 +37,7 @@
                 </ItemsPanelTemplate>
             </ItemsControl.ItemsPanel>
             <ItemsControl.ItemTemplate>
-                <DataTemplate DataType="{x:Type t:ToastItemViewModel}">
+                <DataTemplate DataType="{x:Type vm:ToastItemViewModel}">
                     <t:ToastView Margin="0,0,0,10" />
                 </DataTemplate>
             </ItemsControl.ItemTemplate>
