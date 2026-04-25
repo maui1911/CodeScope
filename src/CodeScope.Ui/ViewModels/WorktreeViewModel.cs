@@ -198,6 +198,10 @@ public sealed partial class WorktreeViewModel : ObservableObject
         Worktree = worktree;
         OnPropertyChanged(nameof(DisplayBranch));
         OnPropertyChanged(nameof(Path));
+        // AutomationId is derived from DisplayBranch — a rename invalidates any wpf-cli
+        // ref that resolved to the old token, so notify or the test layer keeps pointing
+        // at a stale slug until something else triggers a snapshot.
+        OnPropertyChanged(nameof(AutomationId));
     }
 
     /// <summary>Applies a refreshed <see cref="NoScope.CodeScope.Core.Models.WorktreeStatus"/> from the poller.</summary>
@@ -213,6 +217,7 @@ public sealed partial class WorktreeViewModel : ObservableObject
         {
             Worktree = Worktree with { Branch = b };
             OnPropertyChanged(nameof(DisplayBranch));
+            OnPropertyChanged(nameof(AutomationId));
         }
         OnPropertyChanged(nameof(DirtyGlyph));
         OnPropertyChanged(nameof(AheadBehindText));

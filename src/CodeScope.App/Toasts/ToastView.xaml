@@ -11,7 +11,10 @@
              Width="380"
              Background="Transparent"
              SnapsToDevicePixels="True"
-             UseLayoutRounding="True">
+             UseLayoutRounding="True"
+             AutomationProperties.AutomationId="{Binding Id, StringFormat='Toast_{0}'}"
+             AutomationProperties.Name="{Binding Title}"
+             AutomationProperties.HelpText="{Binding Message}">
     <UserControl.Resources>
         <t:SeverityBrushConverter x:Key="SevBrush" />
         <t:SeverityIconConverter x:Key="SevIcon" />
@@ -107,7 +110,9 @@
                                         FontSize="11.5"
                                         FontWeight="Medium"
                                         Cursor="Hand"
-                                        SnapsToDevicePixels="True">
+                                        SnapsToDevicePixels="True"
+                                        AutomationProperties.AutomationId="{Binding Label, StringFormat='ToastAction_{0}'}"
+                                        AutomationProperties.Name="{Binding Label}">
                                     <Button.Style>
                                         <Style TargetType="Button">
                                             <!-- Default: ghost / secondary. Primary swaps to accent via DataTrigger. -->
@@ -141,10 +146,13 @@
                                             </Setter>
                                             <Style.Triggers>
                                                 <DataTrigger Binding="{Binding IsPrimary}" Value="True">
-                                                    <!-- Primary action: accent border + accent text + soft accent fill. -->
-                                                    <Setter Property="BorderBrush" Value="{StaticResource Severity.Info.Border}" />
-                                                    <Setter Property="Foreground" Value="{StaticResource Severity.Info}" />
-                                                    <Setter Property="Background" Value="{StaticResource Severity.Info.Bg}" />
+                                                    <!-- Primary action: accent border + accent text + soft accent fill.
+                                                         Colors flow from the toast's severity so an Err's "Retry" reads
+                                                         red, a Warn's primary action reads orange, etc — keeps the
+                                                         action visually anchored to the message it acts on. -->
+                                                    <Setter Property="BorderBrush" Value="{Binding Severity, Converter={StaticResource SevBrush}, ConverterParameter=Border}" />
+                                                    <Setter Property="Foreground" Value="{Binding Severity, Converter={StaticResource SevBrush}, ConverterParameter=Fg}" />
+                                                    <Setter Property="Background" Value="{Binding Severity, Converter={StaticResource SevBrush}, ConverterParameter=Bg}" />
                                                 </DataTrigger>
                                             </Style.Triggers>
                                         </Style>
@@ -164,7 +172,9 @@
                         Background="Transparent"
                         BorderThickness="0"
                         Cursor="Hand"
-                        ToolTip="Dismiss">
+                        ToolTip="Dismiss"
+                        AutomationProperties.AutomationId="{Binding Id, StringFormat='ToastDismiss_{0}'}"
+                        AutomationProperties.Name="Dismiss">
                     <Button.Template>
                         <ControlTemplate TargetType="Button">
                             <Border x:Name="Bd" Background="{TemplateBinding Background}" CornerRadius="4">

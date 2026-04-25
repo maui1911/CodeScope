@@ -1,6 +1,7 @@
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using System.Windows.Input;
 
 namespace NoScope.CodeScope.App.Toasts;
 
@@ -23,6 +24,12 @@ public partial class ToastHostView : UserControl
         Loaded += OnLoaded;
         Unloaded += OnUnloaded;
         Popup.CustomPopupPlacementCallback = PlaceBottomRight;
+        // Stack-level hover: a single enter/leave on the items host pauses every
+        // visible toast at once (spec §04). Subscribing here — instead of on each
+        // ToastView — guarantees the gap between two toasts also counts as "hover"
+        // because the StackPanel itself is the listening element.
+        ItemsHost.MouseEnter += OnStackEnter;
+        ItemsHost.MouseLeave += OnStackLeave;
     }
 
     private void OnLoaded(object sender, RoutedEventArgs e)
@@ -53,6 +60,18 @@ public partial class ToastHostView : UserControl
     }
 
     private void OnParentChanged(object? sender, EventArgs e) => ReplacePopup();
+
+    private void OnStackEnter(object sender, MouseEventArgs e)
+    {
+        if (DataContext is not ToastService svc) { return; }
+        foreach (var item in svc.Items) { item.Pause(); }
+    }
+
+    private void OnStackLeave(object sender, MouseEventArgs e)
+    {
+        if (DataContext is not ToastService svc) { return; }
+        foreach (var item in svc.Items) { item.Resume(); }
+    }
 
     /// <summary>
     /// WPF popups don't reposition automatically when their PlacementTarget moves or

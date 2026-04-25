@@ -113,4 +113,26 @@ public sealed partial class SidebarViewModel : ObservableObject
         if (_toasts is null) { return; }
         _toasts.Show(new ToastRequest(severity, title, message));
     }
+
+    /// <summary>
+    /// Variant that accepts inline actions (e.g. Retry / Copy). Errors get a Copy
+    /// action by default — the message is usually the raw stderr from git/gh which
+    /// the user wants to paste into a bug report or chat. Pass <paramref name="retry"/>
+    /// to add a primary "Retry" button that re-runs the failed command.
+    /// </summary>
+    private void ErrToast(string title, string message, Action? retry = null)
+    {
+        if (_toasts is null) { return; }
+        var actions = new List<ToastAction>(2);
+        if (retry is not null)
+        {
+            actions.Add(new ToastAction("Retry", retry, IsPrimary: true));
+        }
+        actions.Add(new ToastAction("Copy", () =>
+        {
+            try { System.Windows.Clipboard.SetText(message); }
+            catch (Exception ex) { _logger.LogDebug(ex, "Toast copy failed"); }
+        }));
+        _toasts.Show(new ToastRequest(ToastSeverity.Err, title, message, Actions: actions));
+    }
 }

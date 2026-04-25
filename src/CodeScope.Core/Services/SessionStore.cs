@@ -420,19 +420,36 @@ public sealed class SessionStore : ISessionStore
         }
 
         // Skip the git step intentionally — see XML doc on PruneMissingWorktreeAsync.
+        // Mutate-then-persist with explicit rollback: keep a snapshot of the original
+        // Project record so a failed SaveSnapshotAsync (disk full, AV lock, anything
+        // weird) can put the in-memory store back exactly where it was. Without this,
+        // a save failure left the store inconsistent — UI would show the worktree as
+        // removed but the next reload would resurrect it from disk.
+        Project? rollbackProject = null;
+        int rollbackIndex = -1;
         lock (_lock)
         {
-            var idx = _projects.FindIndex(p => p.Id == projectId);
-            var p = _projects[idx];
-            _projects[idx] = p with
+            rollbackIndex = _projects.FindIndex(p => p.Id == projectId);
+            rollbackProject = _projects[rollbackIndex];
+            _projects[rollbackIndex] = rollbackProject with
             {
-                Worktrees = p.Worktrees.Where(w => w.Id != worktreeId).ToList(),
-                Sessions = p.Sessions.Where(s => s.WorktreeId != worktreeId).ToList(),
+                Worktrees = rollbackProject.Worktrees.Where(w => w.Id != worktreeId).ToList(),
+                Sessions = rollbackProject.Sessions.Where(s => s.WorktreeId != worktreeId).ToList(),
             };
         }
 
         var saved = await SaveSnapshotAsync(ct).ConfigureAwait(false);
-        if (saved.IsFailure) { return saved; }
+        if (saved.IsFailure)
+        {
+            lock (_lock)
+            {
+                if (rollbackIndex >= 0 && rollbackIndex < _projects.Count && rollbackProject is not null)
+                {
+                    _projects[rollbackIndex] = rollbackProject;
+                }
+            }
+            return saved;
+        }
 
         Raise(new SessionStoreChange.WorktreeRemoved(projectId, worktreeId));
         return Result<bool>.Ok(true);

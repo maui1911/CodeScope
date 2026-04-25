@@ -120,7 +120,7 @@ public sealed partial class SidebarViewModel
         else
         {
             _logger.LogDebug("Fetch failed: {Error}", r.Error);
-            Toast("Fetch failed", r.Error, ToastSeverity.Err);
+            ErrToast("Fetch failed", r.Error, retry: () => _ = FetchAllAsync(project));
         }
     }
 
@@ -136,7 +136,7 @@ public sealed partial class SidebarViewModel
         else
         {
             _logger.LogDebug("Pull failed: {Error}", r.Error);
-            Toast("Pull failed", r.Error, ToastSeverity.Err);
+            ErrToast("Pull failed", r.Error, retry: () => _ = PullAsync(worktree));
         }
     }
 
@@ -162,7 +162,9 @@ public sealed partial class SidebarViewModel
         else
         {
             _logger.LogWarning("Rebase failed: {Error}", r.Error);
-            Toast("Rebase failed or has conflicts", r.Error, ToastSeverity.Err);
+            // Rebase failure usually means conflicts the user has to resolve manually,
+            // so a blind retry would re-fail. Copy-only is the right affordance here.
+            ErrToast("Rebase failed or has conflicts", r.Error);
         }
     }
 
@@ -184,7 +186,7 @@ public sealed partial class SidebarViewModel
         else
         {
             _logger.LogWarning("DiscardChanges failed: {Error}", r.Error);
-            Toast("Discard failed", r.Error, ToastSeverity.Err);
+            ErrToast("Discard failed", r.Error);
         }
     }
 
@@ -311,7 +313,8 @@ public sealed partial class SidebarViewModel
         if (result.IsFailure)
         {
             _logger.LogWarning("CreatePR failed: {Error}", result.Error);
-            Toast("Create pull request failed", result.Error, ToastSeverity.Err);
+            ErrToast("Create pull request failed", result.Error,
+                retry: () => _ = CreatePullRequestAsync(worktree));
             return;
         }
 
@@ -338,7 +341,7 @@ public sealed partial class SidebarViewModel
         var parent = System.IO.Path.GetDirectoryName(worktree.Path.TrimEnd('\\', '/'));
         if (string.IsNullOrWhiteSpace(parent))
         {
-            Toast("Rename failed", "Could not determine parent folder", ToastSeverity.Err);
+            ErrToast("Rename failed", "Could not determine parent folder");
             return;
         }
         var newPath = System.IO.Path.Combine(parent, newLeaf);
@@ -351,7 +354,7 @@ public sealed partial class SidebarViewModel
         else
         {
             _logger.LogWarning("RenameWorktree failed: {Error}", r.Error);
-            Toast("Rename failed", r.Error, ToastSeverity.Err);
+            ErrToast("Rename failed", r.Error);
         }
     }
 
@@ -400,7 +403,7 @@ public sealed partial class SidebarViewModel
         if (!retry)
         {
             await InvokeRollbackAsync(rollback).ConfigureAwait(true);
-            Toast("Remove failed", r.Error, ToastSeverity.Err);
+            ErrToast("Remove failed", r.Error);
             return;
         }
 
@@ -413,7 +416,7 @@ public sealed partial class SidebarViewModel
         {
             _logger.LogWarning("Force RemoveWorktree failed: {Error}", forced.Error);
             await InvokeRollbackAsync(rollback).ConfigureAwait(true);
-            Toast("Remove failed", forced.Error, ToastSeverity.Err);
+            ErrToast("Remove failed", forced.Error);
         }
     }
 

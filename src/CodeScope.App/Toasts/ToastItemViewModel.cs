@@ -1,4 +1,3 @@
-using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Windows.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -18,9 +17,13 @@ public sealed partial class ToastItemViewModel : ObservableObject
 {
     private readonly Action<ToastItemViewModel> _onDismiss;
     private readonly DispatcherTimer? _ticker;
-    private readonly DateTime _start;
     private readonly TimeSpan _duration;
-    private TimeSpan _elapsed;
+    // Mutable start anchor: shifts forward by the paused span on each Resume so OnTick
+    // can keep the simple `elapsed = now - start` formula without tracking a separate
+    // accumulator. Pausing 2s on a 4s toast → start moves +2s → meter resumes at the
+    // exact same Progress it paused at.
+    private DateTime _start;
+    private DateTime _pausedAt;
     private bool _paused;
 
     public ToastItemViewModel(
@@ -75,8 +78,8 @@ public sealed partial class ToastItemViewModel : ObservableObject
     private void OnTick(object? sender, EventArgs e)
     {
         if (_paused) { return; }
-        _elapsed = DateTime.UtcNow - _start;
-        var p = 1.0 - (_elapsed.TotalMilliseconds / _duration.TotalMilliseconds);
+        var elapsed = DateTime.UtcNow - _start;
+        var p = 1.0 - (elapsed.TotalMilliseconds / _duration.TotalMilliseconds);
         if (p <= 0)
         {
             Progress = 0;
@@ -88,16 +91,26 @@ public sealed partial class ToastItemViewModel : ObservableObject
 
     public void Pause()
     {
-        if (!HasMeter) { return; }
+        if (!HasMeter || _paused) { return; }
         _paused = true;
+        _pausedAt = DateTime.UtcNow;
     }
 
     public void Resume()
     {
-        if (!HasMeter) { return; }
-        // Reset the start anchor so the remaining time uses the current Progress.
+        if (!HasMeter || !_paused) { return; }
+        // Shift start forward by however long we were paused — the elapsed-since-start
+        // formula in OnTick then naturally resumes at the exact pre-pause Progress.
+        _start = _start + (DateTime.UtcNow - _pausedAt);
         _paused = false;
     }
+
+    /// <summary>
+    /// Stops the timer without invoking <see cref="DismissCommand"/>. Used by
+    /// <see cref="ToastService.Dismiss(string)"/> and the cap eviction so externally-
+    /// removed toasts don't keep ticking and re-firing dismissal on a detached VM.
+    /// </summary>
+    internal void StopTimer() => _ticker?.Stop();
 
     [RelayCommand]
     private void Dismiss()
@@ -126,6 +139,8 @@ public sealed partial class ToastActionViewModel : ObservableObject
 
     public string Label => _model.Label;
     public bool IsPrimary => _model.IsPrimary;
+    /// <summary>Forwarded so the action button's accent can follow the toast severity.</summary>
+    public ToastSeverity Severity => _owner.Severity;
 
     [RelayCommand]
     private void Invoke()

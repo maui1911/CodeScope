@@ -37,6 +37,7 @@ public sealed class ToastService : IToastService
             var existing = Items.FirstOrDefault(i => i.Id == id);
             if (existing is not null)
             {
+                existing.StopTimer();
                 Items.Remove(existing);
             }
         }
@@ -44,11 +45,16 @@ public sealed class ToastService : IToastService
         var vm = new ToastItemViewModel(request, duration, OnDismiss);
         Items.Add(vm);
 
-        // Cap at MaxVisible. Drop the oldest non-error first so error toasts stay until
-        // the user dismisses them (spec §04 "errors never fold").
-        while (Items.Count > MaxVisible)
+        // Cap at MaxVisible BUT errors never auto-fold (spec §04 "errors never fold")
+        // — count only non-error toasts against the cap and only evict from that pool.
+        // If everything visible is an error and the user keeps stacking errors, we let
+        // the stack grow past MaxVisible so the user sees them all rather than silently
+        // dropping the oldest critical message on the floor.
+        while (Items.Count(i => i.Severity != ToastSeverity.Err) > MaxVisible)
         {
-            var victim = Items.FirstOrDefault(i => i.Severity != ToastSeverity.Err) ?? Items[0];
+            var victim = Items.FirstOrDefault(i => i.Severity != ToastSeverity.Err);
+            if (victim is null) { break; }
+            victim.StopTimer();
             Items.Remove(victim);
         }
     }
@@ -64,7 +70,9 @@ public sealed class ToastService : IToastService
         }
 
         var match = Items.FirstOrDefault(i => i.Id == id);
-        if (match is not null) { Items.Remove(match); }
+        if (match is null) { return; }
+        match.StopTimer();
+        Items.Remove(match);
     }
 
     private void OnDismiss(ToastItemViewModel item)

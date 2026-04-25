@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.IO;
 using NoScope.CodeScope.Core.Models;
 using NoScope.CodeScope.Core.Services;
+using NoScope.CodeScope.Ui.Services;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -30,13 +31,19 @@ public sealed class WorktreeStatusPoller : BackgroundService
 
     private readonly ISessionStore _store;
     private readonly IGitService _git;
+    private readonly IToastService? _toasts;
     private readonly ILogger<WorktreeStatusPoller> _logger;
 
-    public WorktreeStatusPoller(ISessionStore store, IGitService git, ILogger<WorktreeStatusPoller> logger)
+    public WorktreeStatusPoller(
+        ISessionStore store,
+        IGitService git,
+        ILogger<WorktreeStatusPoller> logger,
+        IToastService? toasts = null)
     {
         _store = store;
         _git = git;
         _logger = logger;
+        _toasts = toasts;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -107,6 +114,15 @@ public sealed class WorktreeStatusPoller : BackgroundService
                             {
                                 _missingTicks.TryRemove(worktree.Id, out _);
                                 _states.TryRemove(worktree.Id, out _);
+                                // User-visible heads-up that the entry vanished — silent removal
+                                // is confusing when the sidebar count just changes by one without
+                                // any acknowledgment that "the folder you deleted is also gone here".
+                                var branchLabel = worktree.Branch ?? System.IO.Path.GetFileName(worktree.Path.TrimEnd('\\', '/'));
+                                _toasts?.Show(new ToastRequest(
+                                    ToastSeverity.Warn,
+                                    "Worktree removed",
+                                    $"'{branchLabel}' was pruned because its folder no longer exists.",
+                                    Id: $"prune-{worktree.Id}"));
                             }
                         }
                         catch (Exception ex)
