@@ -96,6 +96,41 @@
     <SolidColorBrush x:Key="Accent.Soft"          Color="{StaticResource Accent.Color.Soft}" />
     <SolidColorBrush x:Key="Accent.Glow"          Color="{StaticResource Accent.Color.Glow}" />
 
+    <!-- Toast / errors palette — sourced from "CodeScope - Errors and Toasts" spec.
+         Five severities × three roles (foreground / tint bg / tint border) so the same
+         Toast template can render any flavor by binding three brushes off the VM.
+         Note: existing `Signal.Warn` is historically red; we leave it for callers that
+         depend on it and introduce dedicated `Severity.*` keys here so toast/banner
+         consumers don't get tangled with the older naming. -->
+    <Color x:Key="Severity.Color.Info">#FF0099FF</Color>
+    <Color x:Key="Severity.Color.Ok">#FF4BD87B</Color>
+    <Color x:Key="Severity.Color.Warn">#FFFFB23F</Color>
+    <Color x:Key="Severity.Color.Err">#FFFF5A5A</Color>
+
+    <SolidColorBrush x:Key="Severity.Info"        Color="{StaticResource Severity.Color.Info}" />
+    <SolidColorBrush x:Key="Severity.Ok"          Color="{StaticResource Severity.Color.Ok}" />
+    <SolidColorBrush x:Key="Severity.Warn"        Color="{StaticResource Severity.Color.Warn}" />
+    <SolidColorBrush x:Key="Severity.Err"         Color="{StaticResource Severity.Color.Err}" />
+
+    <!-- Tint bg ≈ color/0.10 · tint border ≈ color/0.25–0.30. Pre-baked because WPF
+         doesn't let you compose alpha into a static SolidColorBrush at the call site. -->
+    <SolidColorBrush x:Key="Severity.Info.Bg"     Color="#1A0099FF" />
+    <SolidColorBrush x:Key="Severity.Info.Border" Color="#400099FF" />
+    <SolidColorBrush x:Key="Severity.Ok.Bg"       Color="#144BD87B" />
+    <SolidColorBrush x:Key="Severity.Ok.Border"   Color="#404BD87B" />
+    <SolidColorBrush x:Key="Severity.Warn.Bg"     Color="#1AFFB23F" />
+    <SolidColorBrush x:Key="Severity.Warn.Border" Color="#4DFFB23F" />
+    <SolidColorBrush x:Key="Severity.Err.Bg"      Color="#1AFF5A5A" />
+    <SolidColorBrush x:Key="Severity.Err.Border"  Color="#4DFF5A5A" />
+
+    <!-- Toast surface — slightly lighter than the panel black used elsewhere so the
+         toast pops a touch off the workspace background. Matches the spec's #0A0A0A. -->
+    <Color x:Key="Toast.Color.Bg">#FF0A0A0A</Color>
+    <Color x:Key="Toast.Color.Border">#FF2A2A2A</Color>
+    <SolidColorBrush x:Key="Toast.Bg"             Color="{StaticResource Toast.Color.Bg}" />
+    <SolidColorBrush x:Key="Toast.Border"         Color="{StaticResource Toast.Color.Border}" />
+    <SolidColorBrush x:Key="Toast.Meter.Track"    Color="{StaticResource Surface.Color.Border}" />
+
     <!-- ========================================================================= -->
     <!-- §5 SPACING SCALE — base 8, full Framer ladder                              -->
     <!-- ========================================================================= -->

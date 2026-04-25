@@ -3,9 +3,8 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using NoScope.CodeScope.Core.Models;
 using NoScope.CodeScope.Core.Services;
 using NoScope.CodeScope.Ui.Dialogs;
+using NoScope.CodeScope.Ui.Services;
 using Microsoft.Extensions.Logging;
-using Wpf.Ui;
-using Wpf.Ui.Controls;
 
 namespace NoScope.CodeScope.Ui.ViewModels;
 
@@ -21,7 +20,7 @@ public sealed partial class SidebarViewModel : ObservableObject
 {
     private readonly ISessionStore _store;
     private readonly IPullRequestService? _pullRequests;
-    private readonly ISnackbarService? _snackbar;
+    private readonly IToastService? _toasts;
     private readonly IAgentRegistry? _agents;
     private readonly IGitService? _git;
     private readonly ILogger<SidebarViewModel> _logger;
@@ -34,13 +33,13 @@ public sealed partial class SidebarViewModel : ObservableObject
         Func<string?>? pickFolder = null,
         Func<NewWorktreeRequest, NewWorktreeResult?>? pickNewWorktree = null,
         IPullRequestService? pullRequests = null,
-        ISnackbarService? snackbar = null,
+        IToastService? toasts = null,
         IAgentRegistry? agents = null,
         IGitService? git = null)
     {
         _store = store;
         _pullRequests = pullRequests;
-        _snackbar = snackbar;
+        _toasts = toasts;
         _agents = agents;
         _git = git;
         _logger = logger;
@@ -109,9 +108,9 @@ public sealed partial class SidebarViewModel : ObservableObject
     /// </summary>
     public Func<string, string, Task<Func<Task>>>? CloseWorktreeSessionsAsync { get; set; }
 
-    private void Toast(string title, string message, ControlAppearance appearance)
+    private void Toast(string title, string message, ToastSeverity severity)
     {
-        if (_snackbar is null) { return; }
-        _snackbar.Show(title, message, appearance, icon: null, TimeSpan.FromSeconds(4));
+        if (_toasts is null) { return; }
+        _toasts.Show(new ToastRequest(severity, title, message));
     }
 }

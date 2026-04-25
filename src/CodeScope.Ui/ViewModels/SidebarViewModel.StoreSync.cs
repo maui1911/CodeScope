@@ -1,7 +1,7 @@
 using System.Windows;
 using NoScope.CodeScope.Core.Models;
 using NoScope.CodeScope.Core.Services;
-using Wpf.Ui.Controls;
+using NoScope.CodeScope.Ui.Services;
 
 namespace NoScope.CodeScope.Ui.ViewModels;
 
@@ -171,10 +171,10 @@ public sealed partial class SidebarViewModel
         switch (pr.CiStatus)
         {
             case CiStatus.Success:
-                Toast($"CI passed on #{pr.Number}", label, ControlAppearance.Success);
+                Toast($"CI passed on #{pr.Number}", label, ToastSeverity.Ok);
                 break;
             case CiStatus.Failure:
-                Toast($"CI failed on #{pr.Number}", label, ControlAppearance.Danger);
+                Toast($"CI failed on #{pr.Number}", label, ToastSeverity.Err);
                 break;
         }
     }

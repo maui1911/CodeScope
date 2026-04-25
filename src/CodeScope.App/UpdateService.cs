@@ -1,15 +1,14 @@
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
+using NoScope.CodeScope.Ui.Services;
 using Velopack;
 using Velopack.Sources;
-using Wpf.Ui;
-using Wpf.Ui.Controls;
 
 namespace NoScope.CodeScope.App;
 
 /// <summary>
 /// Background updater backed by Velopack + GitHub releases (the same channel the release.yml
-/// workflow publishes to). On success it surfaces a non-blocking <see cref="ISnackbarService"/>
+/// workflow publishes to). On success it surfaces a non-blocking <see cref="IToastService"/>
 /// toast to signal that the update finished downloading, then later offers restart via a
 /// confirmation dialog. The check is best-effort — any exception (offline, rate-limited, not
 /// an installed build) is swallowed with a warning log.
@@ -21,12 +20,12 @@ public sealed class UpdateService
     private const string Channel = "win";
 
     private readonly ILogger<UpdateService> _logger;
-    private readonly ISnackbarService _snackbar;
+    private readonly IToastService _toasts;
 
-    public UpdateService(ILogger<UpdateService> logger, ISnackbarService snackbar)
+    public UpdateService(ILogger<UpdateService> logger, IToastService toasts)
     {
         _logger = logger;
-        _snackbar = snackbar;
+        _toasts = toasts;
     }
 
     /// <summary>
@@ -90,12 +89,12 @@ public sealed class UpdateService
             return;
         }
 
-        _snackbar.Show(
-            title: $"CodeScope {version} ready",
-            message: "Update downloaded — restart to install.",
-            appearance: ControlAppearance.Success,
-            icon: null,
-            timeout: System.TimeSpan.FromSeconds(10));
+        _toasts.Show(new ToastRequest(
+            ToastSeverity.Ok,
+            Title: $"CodeScope {version} ready",
+            Message: "Update downloaded — restart to install.",
+            Duration: System.TimeSpan.FromSeconds(10),
+            Id: "update-ready"));
 
         _ = System.Threading.Tasks.Task.Run(async () =>
         {
