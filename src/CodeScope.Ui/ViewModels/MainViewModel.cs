@@ -528,7 +528,9 @@ public sealed partial class MainViewModel : ObservableObject
         // Sidebar tree structure mutates from store events (Loaded clears + rebuilds, projects/
         // worktrees added/removed). Each rebuild produces fresh WorktreeViewModel instances with
         // IsActiveInAnyGroup=false; reapply the multi-group active flags after every structural
-        // change so the bold/rail visuals don't lose state on hydrate or worktree CRUD.
+        // change so the bold/rail visuals don't lose state on hydrate or worktree CRUD. Detach
+        // first so a re-attach (tests, theoretical hot-swap) doesn't double-subscribe.
+        sidebar.Projects.CollectionChanged -= OnSidebarProjectsChanged;
         sidebar.Projects.CollectionChanged += OnSidebarProjectsChanged;
         foreach (var p in sidebar.Projects) { HookProjectWorktrees(p); }
 
@@ -1322,8 +1324,16 @@ public sealed partial class MainViewModel : ObservableObject
         }
 
         // Fix up selections: source falls back to its last remaining tab, target
-        // adopts the moved one + takes window focus.
-        if (sourceGroup.SelectedTab is null && sourceGroup.Tabs.Count > 0)
+        // adopts the moved one + takes window focus. ObservableCollection.Remove does
+        // not null SelectedTab when the removed item was selected, so we re-check
+        // explicitly — otherwise the source group keeps a dangling reference to the
+        // moved tab and RecomputeActiveWorktreesAcrossGroups would mark the source's
+        // old worktree active forever.
+        if (ReferenceEquals(sourceGroup.SelectedTab, tab))
+        {
+            sourceGroup.SelectedTab = sourceGroup.Tabs.Count > 0 ? sourceGroup.Tabs[^1] : null;
+        }
+        else if (sourceGroup.SelectedTab is null && sourceGroup.Tabs.Count > 0)
         {
             sourceGroup.SelectedTab = sourceGroup.Tabs[^1];
         }
