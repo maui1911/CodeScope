@@ -400,6 +400,44 @@ public sealed class SessionStore : ISessionStore
         return Result<bool>.Ok(true);
     }
 
+    public async Task<Result<bool>> PruneMissingWorktreeAsync(string projectId, string worktreeId, CancellationToken ct = default)
+    {
+        Project? project;
+        Worktree? worktree;
+        lock (_lock)
+        {
+            project = _projects.FirstOrDefault(p => p.Id == projectId);
+            worktree = project?.Worktrees.FirstOrDefault(w => w.Id == worktreeId);
+        }
+
+        if (project is null || worktree is null)
+        {
+            return Result<bool>.Fail("Project or worktree not found");
+        }
+        if (worktree.IsPrimary)
+        {
+            return Result<bool>.Fail("Primary worktrees cannot be pruned");
+        }
+
+        // Skip the git step intentionally — see XML doc on PruneMissingWorktreeAsync.
+        lock (_lock)
+        {
+            var idx = _projects.FindIndex(p => p.Id == projectId);
+            var p = _projects[idx];
+            _projects[idx] = p with
+            {
+                Worktrees = p.Worktrees.Where(w => w.Id != worktreeId).ToList(),
+                Sessions = p.Sessions.Where(s => s.WorktreeId != worktreeId).ToList(),
+            };
+        }
+
+        var saved = await SaveSnapshotAsync(ct).ConfigureAwait(false);
+        if (saved.IsFailure) { return saved; }
+
+        Raise(new SessionStoreChange.WorktreeRemoved(projectId, worktreeId));
+        return Result<bool>.Ok(true);
+    }
+
     public async Task<Result<Worktree>> RenameWorktreeAsync(string projectId, string worktreeId, string newWorktreePath, CancellationToken ct = default)
     {
         Project? project;
