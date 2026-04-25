@@ -527,89 +527,9 @@ public sealed partial class MainViewModel : ObservableObject
         };
 
         // Worktree deletion needs every tab pinned to that worktree closed first so the
-        // pwsh children release their Windows cwd lock. Match via the persisted Session
-        // (authoritative WorktreeId link); tabs without a stored session are transient
-        // and tear themselves down on group removal anyway.
-        sidebar.CloseWorktreeSessionsAsync = async (projectId, worktreeId) =>
-        {
-            var targetSessionIds = _store.Projects
-                .FirstOrDefault(p => p.Id == projectId)?.Sessions
-                .Where(s => s.WorktreeId == worktreeId && s.ClosedAt is null)
-                .Select(s => s.Id)
-                .ToHashSet() ?? [];
-            if (targetSessionIds.Count == 0) { return () => Task.CompletedTask; }
-
-            // Snapshot each target tab's (stored state · group · groupIndex · indexInGroup) so
-            // a failed remove can reinsert them in place. FindStoredSession is called *before*
-            // CloseTabAsync since soft-close erases the AgentSessionId from memory state the
-            // restore needs. groupIndex is captured now because CloseTabAsync can auto-remove a
-            // group that ends up empty — on rollback we use that index to re-insert the group.
-            var snapshots = new List<(Session stored, EditorGroupViewModel group, int groupIndex, int indexInGroup)>();
-            for (var gi = 0; gi < Groups.Count; gi++)
-            {
-                var group = Groups[gi];
-                for (var i = 0; i < group.Tabs.Count; i++)
-                {
-                    var tab = group.Tabs[i];
-                    if (!targetSessionIds.Contains(tab.Descriptor.Id)) { continue; }
-                    if (FindStoredSession(tab) is { } stored)
-                    {
-                        snapshots.Add((stored, group, gi, i));
-                    }
-                }
-            }
-
-            foreach (var (stored, _, _, _) in snapshots)
-            {
-                var tab = Groups.SelectMany(g => g.Tabs).FirstOrDefault(t => t.Descriptor.Id == stored.Id);
-                if (tab is not null) { await CloseTabAsync(tab).ConfigureAwait(true); }
-            }
-
-            // Rollback lambda: only touches sessions that are *still* soft-closed at rollback
-            // time (a user might have already resumed one manually between close and failure).
-            return async () =>
-            {
-                // Group-level roll-back: CloseTabAsync auto-removes a now-empty non-focused group,
-                // which orphans that EditorGroupViewModel. Re-insert any such group at its original
-                // index before we start re-adding tabs — otherwise the restored tabs land in a
-                // detached group that isn't in `Groups` and effectively disappear.
-                foreach (var (_, group, groupIndex, _) in snapshots)
-                {
-                    if (Groups.Contains(group)) { continue; }
-                    var targetIndex = Math.Clamp(groupIndex, 0, Groups.Count);
-                    Groups.Insert(targetIndex, group);
-                }
-
-                foreach (var (stored, group, _, indexInGroup) in snapshots)
-                {
-                    var current = FindStoredSessionById(stored.Id);
-                    if (current is null || current.ClosedAt is null) { continue; }
-                    var restored = await _store.RestoreSessionAsync(stored.Id).ConfigureAwait(true);
-                    if (restored.IsFailure) { continue; }
-
-                    var agent = string.IsNullOrEmpty(stored.AgentId)
-                        || string.Equals(stored.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase)
-                        ? null
-                        : _agents.GetById(stored.AgentId!);
-                    var descriptor = agent is null
-                        ? _sessionManager.CreateShellSession(stored.WorktreePath, stored.Id)
-                        : _sessionManager.CreateAgentSession(stored.WorktreePath, agent, stored.Id,
-                            resume: true, agentSessionId: stored.AgentSessionId);
-                    var vm = new SessionTabViewModel(descriptor, projectId, stored.AgentId, stored.DisplayName, agent?.Icon);
-                    var insertAt = Math.Clamp(indexInGroup, 0, group.Tabs.Count);
-                    group.Tabs.Insert(insertAt, vm);
-
-                    if (string.Equals(stored.AgentId, "claude", StringComparison.OrdinalIgnoreCase)
-                        && stored.AgentSessionId is { Length: > 0 } sid)
-                    {
-                        _telemetry?.Register(sid, stored.WorktreePath);
-                    }
-                    BeginClaudeAdoption(descriptor.Id, stored.AgentId, stored.WorktreePath, DateTimeOffset.UtcNow);
-                }
-                CloseGroupCommand.NotifyCanExecuteChanged();
-                OnPropertyChanged(nameof(CanCloseGroup));
-            };
-        };
+        // pwsh children release their Windows cwd lock. Snapshot/close/rollback choreography
+        // lives in CloseWorktreeSessionsAsync / RestoreClosedWorktreeSessionsAsync below.
+        sidebar.CloseWorktreeSessionsAsync = CloseWorktreeSessionsAsync;
 
         // Status-bar metrics recompute on any worktree status / PR event.
         _store.Changed += (_, change) =>
@@ -870,6 +790,100 @@ public sealed partial class MainViewModel : ObservableObject
             return _agents.GetById(project.DefaultAgentId!)?.Id ?? _agents.GetDefault()?.Id;
         }
         return _agents.GetDefault()?.Id;
+    }
+
+    /// <summary>
+    /// Closes every open tab pinned to <paramref name="worktreeId"/> so its pwsh children
+    /// release the Windows cwd lock before the worktree is deleted. Returns a rollback
+    /// <see cref="Func{Task}"/> the caller invokes if the deletion itself fails — the rollback
+    /// re-inserts each soft-closed session in its original group/index.
+    /// </summary>
+    private async Task<Func<Task>> CloseWorktreeSessionsAsync(string projectId, string worktreeId)
+    {
+        var targetSessionIds = _store.Projects
+            .FirstOrDefault(p => p.Id == projectId)?.Sessions
+            .Where(s => s.WorktreeId == worktreeId && s.ClosedAt is null)
+            .Select(s => s.Id)
+            .ToHashSet() ?? [];
+        if (targetSessionIds.Count == 0) { return () => Task.CompletedTask; }
+
+        // Snapshot each target tab's (stored state · group · groupIndex · indexInGroup) so a
+        // failed remove can reinsert them in place. FindStoredSession is called *before*
+        // CloseTabAsync since soft-close erases the AgentSessionId from memory state the
+        // restore needs. groupIndex is captured now because CloseTabAsync can auto-remove an
+        // empty non-focused group — on rollback we use that index to re-insert the group.
+        var snapshots = new List<(Session stored, EditorGroupViewModel group, int groupIndex, int indexInGroup)>();
+        for (var gi = 0; gi < Groups.Count; gi++)
+        {
+            var group = Groups[gi];
+            for (var i = 0; i < group.Tabs.Count; i++)
+            {
+                var tab = group.Tabs[i];
+                if (!targetSessionIds.Contains(tab.Descriptor.Id)) { continue; }
+                if (FindStoredSession(tab) is { } stored)
+                {
+                    snapshots.Add((stored, group, gi, i));
+                }
+            }
+        }
+
+        foreach (var (stored, _, _, _) in snapshots)
+        {
+            var tab = Groups.SelectMany(g => g.Tabs).FirstOrDefault(t => t.Descriptor.Id == stored.Id);
+            if (tab is not null) { await CloseTabAsync(tab).ConfigureAwait(true); }
+        }
+
+        return () => RestoreClosedWorktreeSessionsAsync(projectId, snapshots);
+    }
+
+    /// <summary>
+    /// Rollback partner of <see cref="CloseWorktreeSessionsAsync"/>. Only touches sessions that
+    /// are *still* soft-closed at rollback time (a user might have manually resumed one between
+    /// close and failure). Re-inserts any group that <see cref="CloseTabAsync"/> auto-removed.
+    /// </summary>
+    private async Task RestoreClosedWorktreeSessionsAsync(
+        string projectId,
+        List<(Session stored, EditorGroupViewModel group, int groupIndex, int indexInGroup)> snapshots)
+    {
+        // Group-level roll-back: CloseTabAsync auto-removes a now-empty non-focused group,
+        // which orphans that EditorGroupViewModel. Re-insert any such group at its original
+        // index before we start re-adding tabs — otherwise the restored tabs land in a
+        // detached group that isn't in `Groups` and effectively disappear.
+        foreach (var (_, group, groupIndex, _) in snapshots)
+        {
+            if (Groups.Contains(group)) { continue; }
+            var targetIndex = Math.Clamp(groupIndex, 0, Groups.Count);
+            Groups.Insert(targetIndex, group);
+        }
+
+        foreach (var (stored, group, _, indexInGroup) in snapshots)
+        {
+            var current = FindStoredSessionById(stored.Id);
+            if (current is null || current.ClosedAt is null) { continue; }
+            var restored = await _store.RestoreSessionAsync(stored.Id).ConfigureAwait(true);
+            if (restored.IsFailure) { continue; }
+
+            var agent = string.IsNullOrEmpty(stored.AgentId)
+                || string.Equals(stored.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase)
+                ? null
+                : _agents.GetById(stored.AgentId!);
+            var descriptor = agent is null
+                ? _sessionManager.CreateShellSession(stored.WorktreePath, stored.Id)
+                : _sessionManager.CreateAgentSession(stored.WorktreePath, agent, stored.Id,
+                    resume: true, agentSessionId: stored.AgentSessionId);
+            var vm = new SessionTabViewModel(descriptor, projectId, stored.AgentId, stored.DisplayName, agent?.Icon);
+            var insertAt = Math.Clamp(indexInGroup, 0, group.Tabs.Count);
+            group.Tabs.Insert(insertAt, vm);
+
+            if (string.Equals(stored.AgentId, "claude", StringComparison.OrdinalIgnoreCase)
+                && stored.AgentSessionId is { Length: > 0 } sid)
+            {
+                _telemetry?.Register(sid, stored.WorktreePath);
+            }
+            BeginClaudeAdoption(descriptor.Id, stored.AgentId, stored.WorktreePath, DateTimeOffset.UtcNow);
+        }
+        CloseGroupCommand.NotifyCanExecuteChanged();
+        OnPropertyChanged(nameof(CanCloseGroup));
     }
 
     /// <summary>

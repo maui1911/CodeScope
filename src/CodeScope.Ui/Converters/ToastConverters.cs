@@ -4,7 +4,7 @@ using System.Windows.Data;
 using System.Windows.Media;
 using NoScope.CodeScope.Ui.Services;
 
-namespace NoScope.CodeScope.App.Toasts;
+namespace NoScope.CodeScope.Ui.Converters;
 
 /// <summary>
 /// Resolves the per-severity foreground brush from the static resource dictionary.
@@ -84,8 +84,8 @@ public sealed class SeverityIconConverter : IValueConverter
 /// <summary>
 /// Multiplies a 0..1 progress fraction by a target width (passed as <c>parameter</c>
 /// so the same converter handles meters of any width). Used by the meter strip so its
-/// inner fill drains right-to-left as <see cref="ToastItemViewModel.Progress"/> ticks
-/// down. Returns 0 for non-positive inputs to avoid layout warnings.
+/// inner fill drains right-to-left as the toast's <c>Progress</c> ticks down. Returns
+/// 0 for non-positive inputs to avoid layout warnings.
 /// </summary>
 [ValueConversion(typeof(double), typeof(double))]
 public sealed class ProgressToWidthConverter : IValueConverter

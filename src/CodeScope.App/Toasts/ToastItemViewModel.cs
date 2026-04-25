@@ -146,14 +146,7 @@ public sealed partial class ToastActionViewModel : ObservableObject
     public ToastSeverity Severity => _owner.Severity;
     /// <summary>Stable, sanitized UIA id — includes the owning toast's id so "Retry" buttons
     /// on two different error toasts don't collide in the automation tree.</summary>
-    public string AutomationId => $"ToastAction_{Sanitize(_model.Label)}_{_owner.Id}";
-
-    private static string Sanitize(string s)
-    {
-        if (string.IsNullOrWhiteSpace(s)) { return "unknown"; }
-        var token = new string([.. s.Select(c => char.IsLetterOrDigit(c) ? c : '_')]).Trim('_');
-        return string.IsNullOrEmpty(token) ? "unknown" : token;
-    }
+    public string AutomationId => $"ToastAction_{NoScope.CodeScope.Ui.AutomationIds.SafeToken(_model.Label)}_{_owner.Id}";
 
     [RelayCommand]
     private void Invoke()

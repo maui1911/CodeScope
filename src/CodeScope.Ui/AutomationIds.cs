@@ -1,6 +1,6 @@
 namespace NoScope.CodeScope.Ui;
 
-internal static class AutomationIds
+public static class AutomationIds
 {
     /// <summary>
     /// Reduces an arbitrary display string to a token safe for UIA AutomationId values.
