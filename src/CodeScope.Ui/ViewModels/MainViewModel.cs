@@ -387,7 +387,12 @@ public sealed partial class MainViewModel : ObservableObject
         }
     }
 
-    public SidebarViewModel Sidebar { get; private set; } = null!;
+    /// <summary>
+    /// Sidebar view-model. Set exactly once via <see cref="AttachSidebar"/> during host
+    /// startup (after DI resolution but before the first XAML binding fires); nullable so
+    /// the contract is honest. Bindings that access it before attach see the empty state.
+    /// </summary>
+    public SidebarViewModel? Sidebar { get; private set; }
 
     /// <summary>Notification queue projection for the status-bar bell cluster (spec §11).</summary>
     public NotificationsViewModel? Notifications { get; }
