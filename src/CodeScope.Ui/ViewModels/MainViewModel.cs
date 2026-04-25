@@ -514,6 +514,15 @@ public sealed partial class MainViewModel : ObservableObject
         Sidebar = sidebar;
         OnPropertyChanged(nameof(Sidebar));
 
+        WireOverview(sidebar);
+        WireSidebarCallbacks(sidebar);
+        WireStoreChangedToStatusBar();
+        HookStatusBarSources();
+    }
+
+    /// <summary>Builds the OverviewViewModel and wires its focus/back signals to the main window.</summary>
+    private void WireOverview(SidebarViewModel sidebar)
+    {
         Overview = new OverviewViewModel(sidebar, Groups, _agents);
         Overview.FocusSessionRequested += (_, session) =>
         {
@@ -522,7 +531,11 @@ public sealed partial class MainViewModel : ObservableObject
         };
         Overview.BackRequested += (_, _) => IsOverviewVisible = false;
         OnPropertyChanged(nameof(Overview));
+    }
 
+    /// <summary>Hooks sidebar-driven callbacks (spawn-session, close-worktree-sessions).</summary>
+    private void WireSidebarCallbacks(SidebarViewModel sidebar)
+    {
         // Dialog → "Spawn session on creation" — fires after the store has inserted the
         // new worktree and the sidebar has selected it. NewSessionAsync() picks up the
         // current selection and uses the project's default agent.
@@ -533,10 +546,13 @@ public sealed partial class MainViewModel : ObservableObject
 
         // Worktree deletion needs every tab pinned to that worktree closed first so the
         // pwsh children release their Windows cwd lock. Snapshot/close/rollback choreography
-        // lives in CloseWorktreeSessionsAsync / RestoreClosedWorktreeSessionsAsync below.
+        // lives in CloseWorktreeSessionsAsync / RestoreClosedWorktreeSessionsAsync.
         sidebar.CloseWorktreeSessionsAsync = CloseWorktreeSessionsAsync;
+    }
 
-        // Status-bar metrics recompute on any worktree status / PR event.
+    /// <summary>Recomputes status-bar metrics on every worktree-status / PR-state event.</summary>
+    private void WireStoreChangedToStatusBar()
+    {
         _store.Changed += (_, change) =>
         {
             if (change is SessionStoreChange.WorktreeStatusUpdated
@@ -557,98 +573,11 @@ public sealed partial class MainViewModel : ObservableObject
                 }
             }
         };
-
-        HookStatusBarSources();
     }
 
     public async Task InitializeAsync(CancellationToken ct = default)
     {
         await _store.LoadAsync(ct).ConfigureAwait(true);
-    }
-
-    /// <summary>
-    /// Ctrl+K action: assembles the palette from current state and dispatches the pick.
-    /// Built each time so per-worktree "Create PR" entries stay fresh against the latest sidebar tree.
-    /// </summary>
-    [RelayCommand]
-    private async Task OpenCommandPaletteAsync()
-    {
-        var actions = BuildPaletteActions();
-        var picked = Dialogs.CommandPaletteDialog.Prompt(actions);
-        if (picked is null) { return; }
-        await picked.Execute().ConfigureAwait(true);
-    }
-
-    internal IReadOnlyList<PaletteAction> BuildPaletteActions()
-    {
-        var list = new List<PaletteAction>
-        {
-            new("New session",       "Ctrl+T",         () => { NewSessionCommand.Execute(null); return Task.CompletedTask; }, Icon: "▶"),
-            new("Close current tab", "Ctrl+W",         () => { CloseTabCommand.Execute(null); return Task.CompletedTask; }, Icon: "×"),
-            new("Next tab",          "Ctrl+Tab",       () => { NextTabCommand.Execute(null); return Task.CompletedTask; }, Icon: "→"),
-            new("Previous tab",      "Ctrl+Shift+Tab", () => { PrevTabCommand.Execute(null); return Task.CompletedTask; }, Icon: "←"),
-            new("Rename session",    "F2",             () => { RenameSessionCommand.Execute(null); return Task.CompletedTask; }, Icon: "✎"),
-            new("Toggle diff panel", "Ctrl+D",         () => { ToggleDiffPanelCommand.Execute(null); return Task.CompletedTask; }, Icon: "≡"),
-            new("Focus sidebar filter", "Ctrl+F",      () => { FocusSidebarFilterCommand.Execute(null); return Task.CompletedTask; }, Icon: "⌕"),
-            new("Refresh all",          "F5",          () => { RefreshAllCommand.Execute(null); return Task.CompletedTask; }, Icon: "↻"),
-            new("Overview · all sessions", "Ctrl+Shift+O", () => { ToggleOverviewCommand.Execute(null); return Task.CompletedTask; }, Icon: "▦"),
-        };
-
-        // Open tab rows: quick-switch without reaching for the mouse.
-        foreach (var tab in Tabs)
-        {
-            var local = tab;
-            list.Add(new PaletteAction(
-                $"Switch to: {local.DisplayName}",
-                local.Descriptor.WorkingDirectory,
-                () => { SelectedTab = local; return Task.CompletedTask; },
-                Icon: "◉"));
-        }
-
-        if (Sidebar is not null)
-        {
-            list.Add(new PaletteAction("Add project", "pick a folder",
-                () => { Sidebar.AddProjectCommand.Execute(null); return Task.CompletedTask; }, Icon: "+"));
-
-            foreach (var project in Sidebar.Projects)
-            {
-                foreach (var wt in project.Worktrees)
-                {
-                    var branch = wt.DisplayBranch;
-
-                    list.Add(new PaletteAction(
-                        $"Reveal: {project.Name} · {branch}",
-                        wt.Path,
-                        () => { Sidebar.RevealInExplorerCommand.Execute(wt); return Task.CompletedTask; },
-                        Icon: "📁"));
-
-                    list.Add(new PaletteAction(
-                        $"Open in new group: {project.Name} · {branch}",
-                        "Ctrl+Shift+↵",
-                        () => { OpenInNewGroupCommand.Execute(wt); return Task.CompletedTask; },
-                        Icon: "⫎"));
-
-                    if (wt.HasPullRequest)
-                    {
-                        list.Add(new PaletteAction(
-                            $"Open pull request {wt.PrBadgeText}",
-                            $"{project.Name} · {branch}",
-                            () => { wt.OpenPullRequestCommand.Execute(null); return Task.CompletedTask; },
-                            Icon: wt.CiGlyph));
-                    }
-                    else if (!string.IsNullOrWhiteSpace(wt.Worktree.Branch))
-                    {
-                        list.Add(new PaletteAction(
-                            "Create pull request",
-                            $"{project.Name} · {branch}",
-                            () => { Sidebar.CreatePullRequestCommand.Execute(wt); return Task.CompletedTask; },
-                            Icon: "◎"));
-                    }
-                }
-            }
-        }
-
-        return list;
     }
 
     [RelayCommand]
