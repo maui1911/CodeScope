@@ -74,9 +74,9 @@ public sealed class UpdateService
 
             _logger.LogInformation("UpdateService: downloading update {Version}", version);
             await mgr.DownloadUpdatesAsync(info).ConfigureAwait(false);
-            _stagedVersion = version;
 
             ShowUpdateReadyToast(mgr, info, version);
+            _stagedVersion = version;
         }
         catch (System.Exception ex)
         {

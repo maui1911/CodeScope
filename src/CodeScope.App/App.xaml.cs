@@ -165,10 +165,12 @@ public partial class App : Application
             try
             {
                 await System.Threading.Tasks.Task.Delay(System.TimeSpan.FromSeconds(10), updateToken).ConfigureAwait(false);
+                updateToken.ThrowIfCancellationRequested();
                 await updater.CheckAsync().ConfigureAwait(false);
                 while (!updateToken.IsCancellationRequested)
                 {
                     await System.Threading.Tasks.Task.Delay(System.TimeSpan.FromHours(3), updateToken).ConfigureAwait(false);
+                    updateToken.ThrowIfCancellationRequested();
                     await updater.CheckAsync().ConfigureAwait(false);
                 }
             }
