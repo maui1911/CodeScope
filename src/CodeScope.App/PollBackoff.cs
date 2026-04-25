@@ -9,7 +9,7 @@ namespace NoScope.CodeScope.App;
 /// on a single poller thread, so no locking. Equality uses <see cref="object.Equals(object?, object?)"/>.
 /// </para>
 /// </summary>
-internal sealed class PollBackoff<T> where T : class
+public sealed class PollBackoff<T> where T : class
 {
     public T? Last;
     public int TicksUntilNextPoll;
