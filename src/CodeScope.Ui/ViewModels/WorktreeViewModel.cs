@@ -47,6 +47,21 @@ public sealed partial class WorktreeViewModel : ObservableObject
 
     public string DisplayBranch => Worktree.Branch ?? (Worktree.IsPrimary ? "main" : "(no branch)");
 
+    /// <summary>
+    /// Stable, human-readable id for UIA automation. Combines project id with the
+    /// branch name so two worktrees in different projects on the same branch don't
+    /// collide. Wpf-cli snapshots will show e.g. <c>a:Worktree_codescope__main</c>.
+    /// </summary>
+    public string AutomationId
+        => $"Worktree_{SafeToken(ProjectId)}__{SafeToken(DisplayBranch)}";
+
+    private static string SafeToken(string? s)
+    {
+        if (string.IsNullOrWhiteSpace(s)) { return "unknown"; }
+        var token = new string([.. s.Select(c => char.IsLetterOrDigit(c) ? c : '_')]).Trim('_');
+        return string.IsNullOrEmpty(token) ? "unknown" : token;
+    }
+
     public ObservableCollection<SessionTabViewModel> Sessions { get; }
 
     [ObservableProperty]
@@ -185,6 +200,10 @@ public sealed partial class WorktreeViewModel : ObservableObject
         Worktree = worktree;
         OnPropertyChanged(nameof(DisplayBranch));
         OnPropertyChanged(nameof(Path));
+        // AutomationId is derived from DisplayBranch — a rename invalidates any wpf-cli
+        // ref that resolved to the old token, so notify or the test layer keeps pointing
+        // at a stale slug until something else triggers a snapshot.
+        OnPropertyChanged(nameof(AutomationId));
     }
 
     /// <summary>Applies a refreshed <see cref="NoScope.CodeScope.Core.Models.WorktreeStatus"/> from the poller.</summary>
@@ -200,6 +219,7 @@ public sealed partial class WorktreeViewModel : ObservableObject
         {
             Worktree = Worktree with { Branch = b };
             OnPropertyChanged(nameof(DisplayBranch));
+            OnPropertyChanged(nameof(AutomationId));
         }
         OnPropertyChanged(nameof(DirtyGlyph));
         OnPropertyChanged(nameof(AheadBehindText));

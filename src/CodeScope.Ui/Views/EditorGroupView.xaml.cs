@@ -44,6 +44,24 @@ public partial class EditorGroupView : UserControl
     /// <summary>Any mouse-down in this group transfers focus to it so the global strip flips.</summary>
     private void OnGroupPreviewMouseDown(object sender, MouseButtonEventArgs e)
     {
+        FocusOwningGroup();
+    }
+
+    /// <summary>
+    /// Backstop for clicks that land inside the terminal's <c>HwndHost</c> child — those
+    /// clicks never reach <see cref="OnGroupPreviewMouseDown"/> because the native window
+    /// captures the mouse message before WPF's input system sees it. They DO move keyboard
+    /// focus into the HwndHost, however, and WPF raises <c>GotKeyboardFocus</c> on every
+    /// ancestor up the visual tree — including this UserControl. So whenever any element
+    /// inside this group acquires keyboard focus, flip the focused group.
+    /// </summary>
+    private void OnGroupGotKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
+    {
+        FocusOwningGroup();
+    }
+
+    private void FocusOwningGroup()
+    {
         if (DataContext is not EditorGroupViewModel group) { return; }
         if (Application.Current?.MainWindow?.DataContext is not MainViewModel main) { return; }
         if (ReferenceEquals(main.FocusedGroup, group)) { return; }

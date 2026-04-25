@@ -9,6 +9,7 @@
     xmlns:conv="clr-namespace:NoScope.CodeScope.Ui.Converters;assembly=CodeScope.Ui"
     xmlns:views="clr-namespace:NoScope.CodeScope.Ui.Views;assembly=CodeScope.Ui"
     xmlns:app="clr-namespace:NoScope.CodeScope.App"
+    xmlns:toasts="clr-namespace:NoScope.CodeScope.App.Toasts"
     mc:Ignorable="d"
     Title="{Binding WindowTitle}"
     Icon="pack://application:,,,/assets/codescope.ico"
@@ -361,15 +362,17 @@
             Grid.Row="2"
             Grid.ColumnSpan="3" />
 
-        <!-- Overlay: non-blocking when empty; draws over every row+col. -->
-        <ui:SnackbarPresenter
-            x:Name="SnackbarHost"
-            Grid.Row="0"
-            Grid.RowSpan="3"
-            Grid.Column="0"
-            Grid.ColumnSpan="3"
-            HorizontalAlignment="Right"
-            VerticalAlignment="Bottom"
-            Margin="0,0,16,28" />
+        <!-- Toast host: a hidden 0×0 anchor that owns a top-level Popup. The Popup is
+             a separate HWND so toasts render above the Microsoft.Terminal.Wpf HwndHost
+             children that fill the workspace. A WPF SnackbarPresenter sits on the WPF
+             visual tree and gets clipped behind those native HWNDs (airspace bug). -->
+        <toasts:ToastHostView x:Name="ToastHost"
+                              Grid.Row="0"
+                              Grid.RowSpan="3"
+                              Grid.Column="0"
+                              Grid.ColumnSpan="3"
+                              Width="0" Height="0"
+                              HorizontalAlignment="Right"
+                              VerticalAlignment="Bottom" />
     </Grid>
 </ui:FluentWindow>

@@ -78,11 +78,18 @@ public partial class SessionTabView : UserControl
         }
         else if (e.Key == Key.V)
         {
+            // ALWAYS mark the key handled — even when our paste finds no text. With
+            // Win32InputMode=True, the inner terminal still processes WM_KEYDOWN via the
+            // native message pump after WPF, which triggers its OWN paste path against a
+            // separate, often stale buffer (terminal's right-click-to-paste shares the
+            // same internal stack). Letting that double-fire is what makes pastes look
+            // like "something else weird" — the user sees whatever the terminal cached
+            // last, not what they just copied. Swallowing the event here keeps the WPF
+            // path authoritative.
+            e.Handled = true;
             var text = TryGetClipboardText();
             if (string.IsNullOrEmpty(text)) { return; }
-            var normalised = text.Replace("\r\n", "\r").Replace("\n", "\r");
-            Terminal.ConPTYTerm?.WriteToTerm(normalised.AsSpan());
-            e.Handled = true;
+            BracketedPaste(text);
         }
         else if (e.Key == Key.O && shift)
         {
@@ -115,6 +122,41 @@ public partial class SessionTabView : UserControl
         }
     }
 
+
+    /// <summary>
+    /// Emit a bracketed-paste sequence (xterm DEC: <c>ESC[200~ … ESC[201~</c>) so the
+    /// receiving program can recognise the chunk as a single paste event instead of
+    /// per-line keystrokes.
+    ///
+    /// <para>Why bracketed paste instead of normalising newlines to a single <c>\r</c>:
+    /// the older approach (collapse <c>\r\n</c> → <c>\r</c>) makes multi-line pastes work
+    /// for plain pwsh/bash by emitting one Enter per line — but every Enter submits the
+    /// current line. That's the right thing for a shell building a multi-line command,
+    /// but the wrong thing for full-screen TUIs like Claude Code or Codex where the
+    /// user wants the paste to land in the editor as a single multi-line message and
+    /// hit "send" only when they explicitly press Enter. Bracketed paste mode is the
+    /// xterm-standard way to express "this is one paste event, please don't treat
+    /// embedded newlines as Enter": modern PSReadLine, GNU readline, fish, claude
+    /// code, codex, etc. all enable it (they send <c>ESC[?2004h</c> on init) and route
+    /// bracketed text into their input buffer rather than the line-submit path.</para>
+    ///
+    /// <para>Newlines inside the bracket are kept as <c>\r</c> (a paste-mode-aware
+    /// receiver normalises this internally; raw cmd.exe — which does NOT enable
+    /// bracketed paste — would see the literal <c>200~…201~</c> as junk, but raw
+    /// cmd.exe is a vanishingly rare paste target in this app).</para>
+    /// </summary>
+    private void BracketedPaste(string text)
+    {
+        // Normalise to \r so any TUI that doesn't strip \r\n itself doesn't see
+        // double line breaks. Bracketed-paste-aware programs do their own
+        // normalisation; this is just a defensive prep.
+        var normalised = text.Replace("\r\n", "\r").Replace("\n", "\r");
+        var pty = Terminal.ConPTYTerm;
+        if (pty is null) { return; }
+        pty.WriteToTerm("\x1b[200~".AsSpan());
+        pty.WriteToTerm(normalised.AsSpan());
+        pty.WriteToTerm("\x1b[201~".AsSpan());
+    }
 
     private static void TrySetClipboard(string text)
     {

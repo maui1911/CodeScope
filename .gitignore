@@ -54,6 +54,7 @@ appsettings.Local.json
 # tooling output that shouldn't ship. docs/screenshots/ is the tracked
 # home for README imagery — only that folder is published.
 scratch/
+.scratch/
 
 # Tool-state directories surfaced by AI / automation runners
 .claude/

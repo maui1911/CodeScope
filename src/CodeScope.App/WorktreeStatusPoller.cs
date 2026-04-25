@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.IO;
 using NoScope.CodeScope.Core.Models;
 using NoScope.CodeScope.Core.Services;
+using NoScope.CodeScope.Ui.Services;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -18,17 +19,31 @@ public sealed class WorktreeStatusPoller : BackgroundService
     private static readonly TimeSpan Cadence = TimeSpan.FromSeconds(3);
     private const int MaxSkipTicks = 15; // 3 s tick * (MaxSkipTicks + 1) ≈ 48 s cap
 
+    /// <summary>
+    /// Poll-tick threshold for treating a missing path as "user intentionally deleted
+    /// it" rather than a transient filesystem hiccup (network drive going away briefly,
+    /// AV moving a file). Two consecutive misses ≈ 6 s before the entry is dropped.
+    /// </summary>
+    private const int MissingPathTicksBeforePrune = 2;
+
     private readonly ConcurrentDictionary<string, PollBackoff<WorktreeStatus>> _states = new();
+    private readonly ConcurrentDictionary<string, int> _missingTicks = new();
 
     private readonly ISessionStore _store;
     private readonly IGitService _git;
+    private readonly IToastService? _toasts;
     private readonly ILogger<WorktreeStatusPoller> _logger;
 
-    public WorktreeStatusPoller(ISessionStore store, IGitService git, ILogger<WorktreeStatusPoller> logger)
+    public WorktreeStatusPoller(
+        ISessionStore store,
+        IGitService git,
+        ILogger<WorktreeStatusPoller> logger,
+        IToastService? toasts = null)
     {
         _store = store;
         _git = git;
         _logger = logger;
+        _toasts = toasts;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -74,8 +89,53 @@ public sealed class WorktreeStatusPoller : BackgroundService
                 if (ct.IsCancellationRequested) { return; }
                 if (string.IsNullOrWhiteSpace(worktree.Path) || !Directory.Exists(worktree.Path))
                 {
+                    // Path missing — likely deleted by the user outside the app. Wait
+                    // MissingPathTicksBeforePrune consecutive misses before removing
+                    // (Directory.Exists is reliable on Windows, but we still want a
+                    // small buffer for transient filesystem oddities). Primary worktrees
+                    // never auto-prune — their absence means the project itself is broken
+                    // and the user has to remove the project.
+                    if (worktree.IsPrimary) { continue; }
+
+                    var misses = _missingTicks.AddOrUpdate(worktree.Id, 1, (_, n) => n + 1);
+                    if (misses >= MissingPathTicksBeforePrune)
+                    {
+                        _logger.LogInformation(
+                            "Pruning worktree {Worktree} — path {Path} no longer exists ({Misses} misses)",
+                            worktree.Id, worktree.Path, misses);
+                        try
+                        {
+                            var pruned = await _store.PruneMissingWorktreeAsync(project.Id, worktree.Id, ct).ConfigureAwait(false);
+                            if (pruned.IsFailure)
+                            {
+                                _logger.LogWarning("Prune failed for {Worktree}: {Error}", worktree.Id, pruned.Error);
+                            }
+                            else
+                            {
+                                _missingTicks.TryRemove(worktree.Id, out _);
+                                _states.TryRemove(worktree.Id, out _);
+                                // User-visible heads-up that the entry vanished — silent removal
+                                // is confusing when the sidebar count just changes by one without
+                                // any acknowledgment that "the folder you deleted is also gone here".
+                                var branchLabel = worktree.Branch ?? System.IO.Path.GetFileName(worktree.Path.TrimEnd('\\', '/'));
+                                _toasts?.Show(new ToastRequest(
+                                    ToastSeverity.Warn,
+                                    "Worktree removed",
+                                    $"'{branchLabel}' was pruned because its folder no longer exists.",
+                                    Id: $"prune-{worktree.Id}"));
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Prune threw for {Worktree}", worktree.Id);
+                        }
+                    }
                     continue;
                 }
+
+                // Reset the miss counter once a poll sees the path again — covers the
+                // user re-creating the directory before we decide to prune.
+                _missingTicks.TryRemove(worktree.Id, out _);
 
                 var state = _states.GetOrAdd(worktree.Id, _ => new PollBackoff<WorktreeStatus>());
                 if (state.TicksUntilNextPoll > 0)

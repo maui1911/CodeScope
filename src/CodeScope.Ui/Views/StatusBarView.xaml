@@ -243,6 +243,7 @@
                 <Rectangle Style="{StaticResource SbSep}" Margin="10,0,10,0"
                            Visibility="{Binding Notifications, Converter={StaticResource NullToVisibility}}" />
                 <Button x:Name="BellButton"
+                        AutomationProperties.AutomationId="BellButton"
                         Background="Transparent"
                         BorderThickness="0"
                         Padding="4,4"
@@ -314,7 +315,8 @@
                                            FontSize="12" FontWeight="Medium"
                                            Foreground="#FFFFFFFF"
                                            VerticalAlignment="Center" />
-                                <Button HorizontalAlignment="Right"
+                                <Button AutomationProperties.AutomationId="NotificationsClearAllBtn"
+                                        HorizontalAlignment="Right"
                                         VerticalAlignment="Center"
                                         Background="Transparent"
                                         BorderThickness="0"
@@ -357,7 +359,8 @@
                                 <ItemsControl ItemsSource="{Binding Notifications.Entries}">
                                     <ItemsControl.ItemTemplate>
                                         <DataTemplate>
-                                            <Button Background="Transparent"
+                                            <Button AutomationProperties.AutomationId="{Binding Id, StringFormat='Notification_{0}'}"
+                                                    Background="Transparent"
                                                     BorderThickness="0,1,0,0"
                                                     BorderBrush="{DynamicResource Surface.Border}"
                                                     HorizontalContentAlignment="Stretch"

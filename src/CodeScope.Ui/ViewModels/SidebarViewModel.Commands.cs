@@ -1,7 +1,7 @@
 using NoScope.CodeScope.Core.Models;
+using NoScope.CodeScope.Ui.Services;
 using CommunityToolkit.Mvvm.Input;
 using Microsoft.Extensions.Logging;
-using Wpf.Ui.Controls;
 
 namespace NoScope.CodeScope.Ui.ViewModels;
 
@@ -30,7 +30,7 @@ public sealed partial class SidebarViewModel
         var r = await _store.AddProjectAsync(folder, displayName: null).ConfigureAwait(true);
         if (r.IsSuccess)
         {
-            Toast("Project added", r.Value.Name, ControlAppearance.Success);
+            Toast("Project added", r.Value.Name, ToastSeverity.Ok);
         }
         else
         {
@@ -105,7 +105,7 @@ public sealed partial class SidebarViewModel
         var label = string.IsNullOrEmpty(request.AgentId)
             ? "(global default)"
             : request.AgentId;
-        Toast("Default agent updated", $"{request.Project.Name} → {label}", ControlAppearance.Info);
+        Toast("Default agent updated", $"{request.Project.Name} → {label}", ToastSeverity.Info);
     }
 
     [RelayCommand]
@@ -115,12 +115,12 @@ public sealed partial class SidebarViewModel
         var r = await _git.FetchAllAsync(project.Path).ConfigureAwait(true);
         if (r.IsSuccess)
         {
-            Toast("Fetch complete", project.Name, ControlAppearance.Success);
+            Toast("Fetch complete", project.Name, ToastSeverity.Ok);
         }
         else
         {
             _logger.LogDebug("Fetch failed: {Error}", r.Error);
-            Toast("Fetch failed", r.Error, ControlAppearance.Danger);
+            ErrToast("Fetch failed", r.Error, retry: () => FetchAllAsync(project));
         }
     }
 
@@ -131,12 +131,12 @@ public sealed partial class SidebarViewModel
         var r = await _git.PullAsync(worktree.Path).ConfigureAwait(true);
         if (r.IsSuccess)
         {
-            Toast("Pull complete", $"{worktree.DisplayBranch} fast-forwarded", ControlAppearance.Success);
+            Toast("Pull complete", $"{worktree.DisplayBranch} fast-forwarded", ToastSeverity.Ok);
         }
         else
         {
             _logger.LogDebug("Pull failed: {Error}", r.Error);
-            Toast("Pull failed", r.Error, ControlAppearance.Danger);
+            ErrToast("Pull failed", r.Error, retry: () => PullAsync(worktree));
         }
     }
 
@@ -157,12 +157,14 @@ public sealed partial class SidebarViewModel
         var r = await _git.RebaseOntoAsync(worktree.Path, baseRef).ConfigureAwait(true);
         if (r.IsSuccess)
         {
-            Toast("Rebase complete", $"{worktree.DisplayBranch} ↻ {baseRef}", ControlAppearance.Success);
+            Toast("Rebase complete", $"{worktree.DisplayBranch} ↻ {baseRef}", ToastSeverity.Ok);
         }
         else
         {
             _logger.LogWarning("Rebase failed: {Error}", r.Error);
-            Toast("Rebase failed or has conflicts", r.Error, ControlAppearance.Danger);
+            // Rebase failure usually means conflicts the user has to resolve manually,
+            // so a blind retry would re-fail. Copy-only is the right affordance here.
+            ErrToast("Rebase failed or has conflicts", r.Error);
         }
     }
 
@@ -179,12 +181,12 @@ public sealed partial class SidebarViewModel
         var r = await _git.DiscardChangesAsync(worktree.Path).ConfigureAwait(true);
         if (r.IsSuccess)
         {
-            Toast("Changes discarded", worktree.DisplayBranch, ControlAppearance.Success);
+            Toast("Changes discarded", worktree.DisplayBranch, ToastSeverity.Ok);
         }
         else
         {
             _logger.LogWarning("DiscardChanges failed: {Error}", r.Error);
-            Toast("Discard failed", r.Error, ControlAppearance.Danger);
+            ErrToast("Discard failed", r.Error);
         }
     }
 
@@ -214,7 +216,7 @@ public sealed partial class SidebarViewModel
         try
         {
             System.Windows.Clipboard.SetText(path);
-            Toast("Path copied", path, ControlAppearance.Info);
+            Toast("Path copied", path, ToastSeverity.Info);
         }
         catch (Exception ex)
         {
@@ -262,7 +264,7 @@ public sealed partial class SidebarViewModel
         try
         {
             System.Windows.Clipboard.SetText(branch);
-            Toast("Branch copied", branch, ControlAppearance.Info);
+            Toast("Branch copied", branch, ToastSeverity.Info);
         }
         catch (Exception ex)
         {
@@ -278,7 +280,7 @@ public sealed partial class SidebarViewModel
         try
         {
             System.Windows.Clipboard.SetText(url);
-            Toast("PR URL copied", url, ControlAppearance.Info);
+            Toast("PR URL copied", url, ToastSeverity.Info);
         }
         catch (Exception ex)
         {
@@ -311,7 +313,8 @@ public sealed partial class SidebarViewModel
         if (result.IsFailure)
         {
             _logger.LogWarning("CreatePR failed: {Error}", result.Error);
-            Toast("Create pull request failed", result.Error, ControlAppearance.Danger);
+            ErrToast("Create pull request failed", result.Error,
+                retry: () => CreatePullRequestAsync(worktree));
             return;
         }
 
@@ -320,7 +323,7 @@ public sealed partial class SidebarViewModel
         Toast(
             pr.Number > 0 ? $"Pull request #{pr.Number} created" : "Pull request created",
             $"{project.Name} · {worktree.DisplayBranch}",
-            ControlAppearance.Success);
+            ToastSeverity.Ok);
     }
 
     [RelayCommand]
@@ -338,7 +341,7 @@ public sealed partial class SidebarViewModel
         var parent = System.IO.Path.GetDirectoryName(worktree.Path.TrimEnd('\\', '/'));
         if (string.IsNullOrWhiteSpace(parent))
         {
-            Toast("Rename failed", "Could not determine parent folder", ControlAppearance.Danger);
+            ErrToast("Rename failed", "Could not determine parent folder");
             return;
         }
         var newPath = System.IO.Path.Combine(parent, newLeaf);
@@ -346,12 +349,12 @@ public sealed partial class SidebarViewModel
         var r = await _store.RenameWorktreeAsync(worktree.ProjectId, worktree.Id, newPath).ConfigureAwait(true);
         if (r.IsSuccess)
         {
-            Toast("Worktree renamed", $"{currentLeaf} → {newLeaf}", ControlAppearance.Success);
+            Toast("Worktree renamed", $"{currentLeaf} → {newLeaf}", ToastSeverity.Ok);
         }
         else
         {
             _logger.LogWarning("RenameWorktree failed: {Error}", r.Error);
-            Toast("Rename failed", r.Error, ControlAppearance.Danger);
+            ErrToast("Rename failed", r.Error);
         }
     }
 
@@ -384,7 +387,7 @@ public sealed partial class SidebarViewModel
         var r = await _store.RemoveWorktreeAsync(worktree.ProjectId, worktree.Id).ConfigureAwait(true);
         if (r.IsSuccess)
         {
-            Toast("Worktree removed", worktree.DisplayBranch, ControlAppearance.Success);
+            Toast("Worktree removed", worktree.DisplayBranch, ToastSeverity.Ok);
             return;
         }
 
@@ -400,20 +403,20 @@ public sealed partial class SidebarViewModel
         if (!retry)
         {
             await InvokeRollbackAsync(rollback).ConfigureAwait(true);
-            Toast("Remove failed", r.Error, ControlAppearance.Danger);
+            ErrToast("Remove failed", r.Error);
             return;
         }
 
         var forced = await _store.RemoveWorktreeAsync(worktree.ProjectId, worktree.Id, force: true).ConfigureAwait(true);
         if (forced.IsSuccess)
         {
-            Toast("Worktree force-removed", worktree.DisplayBranch, ControlAppearance.Success);
+            Toast("Worktree force-removed", worktree.DisplayBranch, ToastSeverity.Ok);
         }
         else
         {
             _logger.LogWarning("Force RemoveWorktree failed: {Error}", forced.Error);
             await InvokeRollbackAsync(rollback).ConfigureAwait(true);
-            Toast("Remove failed", forced.Error, ControlAppearance.Danger);
+            ErrToast("Remove failed", forced.Error);
         }
     }
 

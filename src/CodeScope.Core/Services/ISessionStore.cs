@@ -59,6 +59,17 @@ public interface ISessionStore
     Task<Result<bool>> RemoveWorktreeAsync(string projectId, string worktreeId, bool force = false, CancellationToken ct = default);
 
     /// <summary>
+    /// Drops a worktree entry whose working directory is gone (user ran <c>rm -rf</c>
+    /// outside the app). Skips git's <c>worktree remove</c> entirely — git can't operate
+    /// on a path that no longer exists, and the .git/worktrees/&lt;name&gt; metadata is
+    /// harmless ghost data that <c>git worktree prune</c> sweeps the next time the user
+    /// runs anything under the project. Primary worktrees are rejected (their absence
+    /// means the whole project is broken; the user has to remove the project itself).
+    /// Cascades through <see cref="Session.WorktreeId"/> so orphaned sessions disappear too.
+    /// </summary>
+    Task<Result<bool>> PruneMissingWorktreeAsync(string projectId, string worktreeId, CancellationToken ct = default);
+
+    /// <summary>
     /// Runs <c>git worktree move</c> to relocate the worktree folder, then cascades the new path
     /// into every <see cref="Session.WorktreePath"/> referencing the moved worktree and persists.
     /// The worktree id is preserved. Primary worktrees are rejected.

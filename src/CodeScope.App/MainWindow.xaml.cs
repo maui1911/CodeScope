@@ -2,9 +2,9 @@ using System.Collections.Specialized;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using NoScope.CodeScope.App.Toasts;
 using NoScope.CodeScope.Ui.ViewModels;
 using NoScope.CodeScope.Ui.Views;
-using Wpf.Ui;
 using Wpf.Ui.Controls;
 
 namespace NoScope.CodeScope.App;
@@ -13,7 +13,7 @@ namespace NoScope.CodeScope.App;
 public partial class MainWindow : FluentWindow
 {
     private readonly MainViewModel _viewModel;
-    private readonly ISnackbarService _snackbar;
+    private readonly ToastService _toasts;
 
     // Cached per-VM view instances. Re-created EditorGroupViews would force the hosted
     // EasyTerminalControl HWND to tear down and respawn pwsh, so we hold on to them for
@@ -31,16 +31,17 @@ public partial class MainWindow : FluentWindow
     // CaptionButton style in MainWindow.xaml.
     private const double CaptionClusterWidth = 4 * 46.0;
 
-    public MainWindow(MainViewModel viewModel, ISnackbarService snackbar)
+    public MainWindow(MainViewModel viewModel, ToastService toasts)
     {
         _viewModel = viewModel;
-        _snackbar = snackbar;
+        _toasts = toasts;
         DataContext = viewModel;
 
         InitializeComponent();
 
-        // Presenter only exists after InitializeComponent; hook it up now.
-        _snackbar.SetSnackbarPresenter(SnackbarHost);
+        // The toast host binds Items off the service; the service is the single
+        // dispatcher-marshalled owner of the visible-toast collection.
+        ToastHost.DataContext = _toasts;
 
         // Apply persisted geometry (size, position, maximised state) before the window renders.
         WindowGeometryStore.Apply(this, WindowGeometryStore.Load());
@@ -76,6 +77,16 @@ public partial class MainWindow : FluentWindow
             // Regardless, a rebuild now gives a single authoritative layout.
             RebuildGroupLayout();
             await _viewModel.InitializeAsync();
+
+            // Opt-in toast sampler — surfaces one of each severity ~600ms after the
+            // first render so the design QA workflow (wpf-cli screenshot vs. Playwright
+            // screenshot of the spec HTML) doesn't need to drive a git operation to see
+            // a toast. Set CODESCOPE_TOAST_SAMPLE=1 alongside CODESCOPE_DEV=1 to fire it.
+            if (NoScope.CodeScope.Core.AppPaths.IsDevMode
+                && Environment.GetEnvironmentVariable("CODESCOPE_TOAST_SAMPLE") == "1")
+            {
+                _ = SeedDevToastsAsync();
+            }
         }
         catch (Exception ex)
         {
@@ -296,4 +307,35 @@ public partial class MainWindow : FluentWindow
         => WindowState = WindowState == WindowState.Maximized ? WindowState.Normal : WindowState.Maximized;
 
     private void OnCaptionClose(object sender, System.Windows.RoutedEventArgs e) => Close();
+
+    private async Task SeedDevToastsAsync()
+    {
+        await Task.Delay(600).ConfigureAwait(true);
+        _toasts.Show(new NoScope.CodeScope.Ui.Services.ToastRequest(
+            NoScope.CodeScope.Ui.Services.ToastSeverity.Info,
+            "Switching to claude-opus-4",
+            "Current turn finishes on sonnet-4-5, then swaps."));
+        await Task.Delay(150).ConfigureAwait(true);
+        _toasts.Show(new NoScope.CodeScope.Ui.Services.ToastRequest(
+            NoScope.CodeScope.Ui.Services.ToastSeverity.Ok,
+            "Branch pushed",
+            "feat/reporting → origin/feat/reporting · 3 commits.",
+            Actions: [new NoScope.CodeScope.Ui.Services.ToastAction("Open PR", () => { }, IsPrimary: true)]));
+        await Task.Delay(150).ConfigureAwait(true);
+        _toasts.Show(new NoScope.CodeScope.Ui.Services.ToastRequest(
+            NoScope.CodeScope.Ui.Services.ToastSeverity.Warn,
+            "Context near cap",
+            "186k / 200k on feat/reporting. Compact or branch off the next message.",
+            Actions: [new NoScope.CodeScope.Ui.Services.ToastAction("Compact now", () => { }, IsPrimary: true)]));
+        await Task.Delay(150).ConfigureAwait(true);
+        _toasts.Show(new NoScope.CodeScope.Ui.Services.ToastRequest(
+            NoScope.CodeScope.Ui.Services.ToastSeverity.Err,
+            "Push failed",
+            "origin rejected: non-fast-forward. Pull main and rebase before pushing again.",
+            Actions:
+            [
+                new NoScope.CodeScope.Ui.Services.ToastAction("View output", () => { }, IsPrimary: true),
+                new NoScope.CodeScope.Ui.Services.ToastAction("Retry", () => { }),
+            ]));
+    }
 }

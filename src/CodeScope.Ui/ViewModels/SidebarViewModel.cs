@@ -3,9 +3,8 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using NoScope.CodeScope.Core.Models;
 using NoScope.CodeScope.Core.Services;
 using NoScope.CodeScope.Ui.Dialogs;
+using NoScope.CodeScope.Ui.Services;
 using Microsoft.Extensions.Logging;
-using Wpf.Ui;
-using Wpf.Ui.Controls;
 
 namespace NoScope.CodeScope.Ui.ViewModels;
 
@@ -21,7 +20,7 @@ public sealed partial class SidebarViewModel : ObservableObject
 {
     private readonly ISessionStore _store;
     private readonly IPullRequestService? _pullRequests;
-    private readonly ISnackbarService? _snackbar;
+    private readonly IToastService? _toasts;
     private readonly IAgentRegistry? _agents;
     private readonly IGitService? _git;
     private readonly ILogger<SidebarViewModel> _logger;
@@ -34,13 +33,13 @@ public sealed partial class SidebarViewModel : ObservableObject
         Func<string?>? pickFolder = null,
         Func<NewWorktreeRequest, NewWorktreeResult?>? pickNewWorktree = null,
         IPullRequestService? pullRequests = null,
-        ISnackbarService? snackbar = null,
+        IToastService? toasts = null,
         IAgentRegistry? agents = null,
         IGitService? git = null)
     {
         _store = store;
         _pullRequests = pullRequests;
-        _snackbar = snackbar;
+        _toasts = toasts;
         _agents = agents;
         _git = git;
         _logger = logger;
@@ -109,9 +108,52 @@ public sealed partial class SidebarViewModel : ObservableObject
     /// </summary>
     public Func<string, string, Task<Func<Task>>>? CloseWorktreeSessionsAsync { get; set; }
 
-    private void Toast(string title, string message, ControlAppearance appearance)
+    private void Toast(string title, string message, ToastSeverity severity)
     {
-        if (_snackbar is null) { return; }
-        _snackbar.Show(title, message, appearance, icon: null, TimeSpan.FromSeconds(4));
+        if (_toasts is null) { return; }
+        _toasts.Show(new ToastRequest(severity, title, message));
+    }
+
+    /// <summary>
+    /// Variant that accepts inline actions (e.g. Retry / Copy). Errors get a Copy
+    /// action by default — the message is usually the raw stderr from git/gh which
+    /// the user wants to paste into a bug report or chat. Pass <paramref name="retry"/>
+    /// to add a primary "Retry" button that re-runs the failed command. The retry
+    /// task is awaited inside a try/catch so a thrown retry doesn't disappear into a
+    /// fire-and-forget — without this wrapper, callers had to remember to do
+    /// <c>_ = SomeAsync()</c> and any thrown exception was lost on the floor.
+    /// </summary>
+    private void ErrToast(string title, string message, Func<Task>? retry = null)
+    {
+        if (_toasts is null) { return; }
+        var actions = new List<ToastAction>(2);
+        if (retry is not null)
+        {
+            actions.Add(new ToastAction("Retry", () =>
+            {
+                _ = RunRetryAsync(retry, title);
+            }, IsPrimary: true));
+        }
+        actions.Add(new ToastAction("Copy", () =>
+        {
+            try { System.Windows.Clipboard.SetText(message); }
+            catch (Exception ex) { _logger.LogDebug(ex, "Toast copy failed"); }
+        }));
+        _toasts.Show(new ToastRequest(ToastSeverity.Err, title, message, Actions: actions));
+    }
+
+    private async Task RunRetryAsync(Func<Task> retry, string label)
+    {
+        try { await retry().ConfigureAwait(true); }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Retry of {Label} threw", label);
+            // Surface the failure so the user knows the retry itself died — silent
+            // task faults inside a "Retry" button are the worst kind of UX bug.
+            _toasts?.Show(new ToastRequest(
+                ToastSeverity.Err,
+                $"{label}: retry failed",
+                ex.Message));
+        }
     }
 }

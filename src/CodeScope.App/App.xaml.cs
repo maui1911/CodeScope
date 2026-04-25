@@ -84,7 +84,12 @@ public partial class App : Application
                     return AgentRegistry.FromConfig(cfg.IsSuccess ? cfg.Value : new ProjectsConfig());
                 });
                 services.AddSingleton<IGitService, GitService>();
-                services.AddSingleton<Wpf.Ui.ISnackbarService, Wpf.Ui.SnackbarService>();
+                // Custom toast service — hosted in a top-level Popup HWND inside MainWindow
+                // so toasts render above the Microsoft.Terminal.Wpf HwndHost children that
+                // fill the workspace. See CodeScope.App/Toasts/ToastHostView.xaml.cs.
+                services.AddSingleton<NoScope.CodeScope.App.Toasts.ToastService>();
+                services.AddSingleton<NoScope.CodeScope.Ui.Services.IToastService>(
+                    sp => sp.GetRequiredService<NoScope.CodeScope.App.Toasts.ToastService>());
                 services.AddSingleton<IGitHubPullRequestService, GitHubPullRequestService>();
                 services.AddSingleton<IGiteaPullRequestService, GiteaPullRequestService>();
                 services.AddSingleton<IPullRequestService, PullRequestService>();
@@ -105,7 +110,7 @@ public partial class App : Application
                     PickFolder,
                     PickNewWorktree,
                     sp.GetRequiredService<IPullRequestService>(),
-                    sp.GetRequiredService<Wpf.Ui.ISnackbarService>(),
+                    sp.GetRequiredService<NoScope.CodeScope.Ui.Services.IToastService>(),
                     sp.GetRequiredService<IAgentRegistry>(),
                     sp.GetRequiredService<IGitService>()));
                 services.AddSingleton<DiffPanelViewModel>();

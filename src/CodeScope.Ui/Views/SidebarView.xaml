@@ -193,6 +193,10 @@
                     <Setter Property="Padding" Value="0" />
                     <Setter Property="HorizontalContentAlignment" Value="Stretch" />
                     <Setter Property="Background" Value="Transparent" />
+                    <!-- Bound off the data item: ProjectViewModel.AutomationId or
+                         WorktreeViewModel.AutomationId (both expose the property). Wpf-cli
+                         snapshots resolve to a:Project_<name> / a:Worktree_<id>__<branch>. -->
+                    <Setter Property="AutomationProperties.AutomationId" Value="{Binding AutomationId}" />
                     <Setter Property="Template">
                         <Setter.Value>
                             <ControlTemplate TargetType="TreeViewItem">

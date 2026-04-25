@@ -62,6 +62,9 @@
                                 <Setter Property="MinWidth" Value="140" />
                                 <Setter Property="MaxWidth" Value="280" />
                                 <Setter Property="VerticalContentAlignment" Value="Stretch" />
+                                <!-- SessionTabViewModel.AutomationId — wpf-cli snapshots
+                                     resolve to a:Tab_<displayName> instead of the VM type. -->
+                                <Setter Property="AutomationProperties.AutomationId" Value="{Binding AutomationId}" />
                                 <Setter Property="Template">
                                     <Setter.Value>
                                         <ControlTemplate TargetType="ListBoxItem">
