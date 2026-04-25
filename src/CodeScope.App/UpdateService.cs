@@ -21,6 +21,9 @@ public sealed class UpdateService
 
     private readonly ILogger<UpdateService> _logger;
     private readonly IToastService _toasts;
+    // Tracks the version we've already staged + announced this process lifetime so the
+    // periodic 3-hour re-check doesn't re-download or re-toast the same release.
+    private string? _stagedVersion;
 
     public UpdateService(ILogger<UpdateService> logger, IToastService toasts)
     {
@@ -62,11 +65,18 @@ public sealed class UpdateService
                 return;
             }
 
-            _logger.LogInformation("UpdateService: downloading update {Version}", info.TargetFullRelease.Version);
+            var version = info.TargetFullRelease.Version.ToString();
+            if (string.Equals(_stagedVersion, version, System.StringComparison.Ordinal))
+            {
+                _logger.LogDebug("UpdateService: {Version} already staged this session, skipping", version);
+                return;
+            }
+
+            _logger.LogInformation("UpdateService: downloading update {Version}", version);
             await mgr.DownloadUpdatesAsync(info).ConfigureAwait(false);
 
-            var version = info.TargetFullRelease.Version.ToString();
             ShowUpdateReadyToast(mgr, info, version);
+            _stagedVersion = version;
         }
         catch (System.Exception ex)
         {

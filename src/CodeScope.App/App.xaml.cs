@@ -150,12 +150,13 @@ public partial class App : Application
         MainWindow = window;
         window.Show();
 
-        // Kick off the auto-update check 10s after the window is visible. The delay keeps it
-        // off the startup-critical path (no network blocking first paint) and gives the host
-        // loggers a moment to wire up so we see any check failures in the console. Fire-and-
-        // forget by design: UpdateService swallows its own exceptions. The CancellationToken
-        // is cancelled in OnExit so the check is aborted if the user closes the app within
-        // the 10s delay — prevents hitting disposed services.
+        // Kick off the auto-update check 10s after the window is visible, then re-check every
+        // 3 hours so long-running sessions still pick up newly published releases without a
+        // restart. The 10s initial delay keeps the first check off the startup-critical path
+        // (no network blocking first paint) and gives the host loggers a moment to wire up.
+        // Fire-and-forget by design: UpdateService swallows its own exceptions. The
+        // CancellationToken is cancelled in OnExit so any in-flight check or pending delay
+        // is aborted on shutdown — prevents hitting disposed services.
         _updateCts = new CancellationTokenSource();
         var updateToken = _updateCts.Token;
         var updater = _host.Services.GetRequiredService<UpdateService>();
@@ -164,7 +165,14 @@ public partial class App : Application
             try
             {
                 await System.Threading.Tasks.Task.Delay(System.TimeSpan.FromSeconds(10), updateToken).ConfigureAwait(false);
+                updateToken.ThrowIfCancellationRequested();
                 await updater.CheckAsync().ConfigureAwait(false);
+                while (!updateToken.IsCancellationRequested)
+                {
+                    await System.Threading.Tasks.Task.Delay(System.TimeSpan.FromHours(3), updateToken).ConfigureAwait(false);
+                    updateToken.ThrowIfCancellationRequested();
+                    await updater.CheckAsync().ConfigureAwait(false);
+                }
             }
             catch (System.OperationCanceledException) { }
         });
