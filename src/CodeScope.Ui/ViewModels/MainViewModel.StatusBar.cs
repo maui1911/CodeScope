@@ -1,6 +1,7 @@
 using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Linq;
+using NoScope.CodeScope.Core.Models;
 
 namespace NoScope.CodeScope.Ui.ViewModels;
 
@@ -125,6 +126,18 @@ public sealed partial class MainViewModel
         OnPropertyChanged(nameof(StatusAgentSummaryVisible));
         OnPropertyChanged(nameof(StatusGroupCountText));
         OnPropertyChanged(nameof(StatusGroupCountVisible));
+        OnPropertyChanged(nameof(StatusWorktreeCount));
+        OnPropertyChanged(nameof(StatusWorktreeCountText));
+        OnPropertyChanged(nameof(StatusWorkspaceVisible));
+        OnPropertyChanged(nameof(StatusDirtyCount));
+        OnPropertyChanged(nameof(StatusDirtyCountText));
+        OnPropertyChanged(nameof(StatusDirtyVisible));
+        OnPropertyChanged(nameof(StatusPrCount));
+        OnPropertyChanged(nameof(StatusPrCountText));
+        OnPropertyChanged(nameof(StatusPrVisible));
+        OnPropertyChanged(nameof(StatusCiFailCount));
+        OnPropertyChanged(nameof(StatusCiFailCountText));
+        OnPropertyChanged(nameof(StatusCiFailVisible));
         OnPropertyChanged(nameof(StatusEmptyMessage));
         OnPropertyChanged(nameof(StatusEmptyVisible));
         OnPropertyChanged(nameof(StatusTurnCountText));
@@ -224,6 +237,32 @@ public sealed partial class MainViewModel
 
     public bool StatusGroupCountVisible => Groups.Count > 1;
     public string StatusGroupCountText => $"{Groups.Count} groups";
+
+    /// <summary>Total worktree count across all tracked projects, used for the workspace summary.</summary>
+    public int StatusWorktreeCount
+        => Sidebar is null ? 0 : Sidebar.Projects.Sum(p => p.Worktrees.Count);
+    public bool StatusWorkspaceVisible => StatusWorktreeCount > 0;
+    public string StatusWorktreeCountText
+        => $"{StatusWorktreeCount} worktree{(StatusWorktreeCount == 1 ? "" : "s")}";
+
+    /// <summary>Number of dirty worktrees (uncommitted changes) across all projects.</summary>
+    public int StatusDirtyCount
+        => Sidebar is null ? 0 : Sidebar.Projects.Sum(p => p.Worktrees.Count(w => w.IsDirty));
+    public bool StatusDirtyVisible => StatusDirtyCount > 0;
+    public string StatusDirtyCountText => $"{StatusDirtyCount} dirty";
+
+    /// <summary>Number of worktrees with an open pull request.</summary>
+    public int StatusPrCount
+        => Sidebar is null ? 0 : Sidebar.Projects.Sum(p => p.Worktrees.Count(w => w.HasPullRequest));
+    public bool StatusPrVisible => StatusPrCount > 0;
+    public string StatusPrCountText => $"{StatusPrCount} PR{(StatusPrCount == 1 ? "" : "s")}";
+
+    /// <summary>Number of worktrees whose PR has a failing CI status.</summary>
+    public int StatusCiFailCount => Sidebar is null
+        ? 0
+        : Sidebar.Projects.Sum(p => p.Worktrees.Count(w => w.PullRequest?.CiStatus == CiStatus.Failure));
+    public bool StatusCiFailVisible => StatusCiFailCount > 0;
+    public string StatusCiFailCountText => $"{StatusCiFailCount} CI failing";
 
     /// <summary>Tab count — simple proxy for "turns" while runtime wall-clock isn't wired.</summary>
     public int StatusTurnCount => AllTabs.Count();

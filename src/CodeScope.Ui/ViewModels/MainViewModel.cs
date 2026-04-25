@@ -624,55 +624,16 @@ public sealed partial class MainViewModel : ObservableObject
             {
                 if (Application.Current?.Dispatcher is { } d)
                 {
-                    d.BeginInvoke(() => { OnPropertyChanged(nameof(StatusBarText)); RaiseStatusBarChanged(); });
+                    d.BeginInvoke(RaiseStatusBarChanged);
                 }
                 else
                 {
-                    OnPropertyChanged(nameof(StatusBarText));
                     RaiseStatusBarChanged();
                 }
             }
         };
 
         HookStatusBarSources();
-    }
-
-    /// <summary>
-    /// Live status bar: "N dirty · M PRs · K CI failing" aggregated across all tracked worktrees.
-    /// Empty-case shows a humble tagline so the bar isn't blank.
-    /// </summary>
-    public string StatusBarText
-    {
-        get
-        {
-            if (Sidebar is null) { return string.Empty; }
-
-            var dirty = 0; var prs = 0; var ciFail = 0; var wts = 0;
-            foreach (var p in Sidebar.Projects)
-            {
-                foreach (var w in p.Worktrees)
-                {
-                    wts++;
-                    if (w.IsDirty) { dirty++; }
-                    if (w.HasPullRequest) { prs++; }
-                    if (w.PullRequest?.CiStatus == CiStatus.Failure) { ciFail++; }
-                }
-            }
-
-            // Empty state: the status bar's LEFT column already shows StatusEmptyMessage;
-            // returning empty here avoids the same sentence rendering twice (once on each side).
-            if (wts == 0) { return string.Empty; }
-
-            var parts = new List<string>
-            {
-                $"{wts} worktree{(wts == 1 ? "" : "s")}",
-            };
-            if (dirty > 0)   { parts.Add($"{dirty} dirty"); }
-            if (prs > 0)     { parts.Add($"{prs} PR{(prs == 1 ? "" : "s")}"); }
-            if (ciFail > 0)  { parts.Add($"{ciFail} CI failing"); }
-            if (Groups.Count > 1) { parts.Add($"{Groups.Count} groups"); }
-            return string.Join(" · ", parts);
-        }
     }
 
     public async Task InitializeAsync(CancellationToken ct = default)
@@ -839,31 +800,13 @@ public sealed partial class MainViewModel : ObservableObject
             }
         }
 
-        // Resolve agent / shell. Priority: explicit arg → project's DefaultAgentId → global default.
-        var useShell = string.Equals(agentId, ShellSentinel, StringComparison.OrdinalIgnoreCase);
-        AgentProfile? agent;
-        if (useShell)
-        {
-            agent = null;
-        }
-        else if (!string.IsNullOrEmpty(agentId))
-        {
-            agent = _agents.GetById(agentId);
-        }
-        else if (!string.IsNullOrEmpty(project.DefaultAgentId)
-                 && !string.Equals(project.DefaultAgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase))
-        {
-            agent = _agents.GetById(project.DefaultAgentId) ?? _agents.GetDefault();
-        }
-        else if (string.Equals(project.DefaultAgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase))
-        {
-            useShell = true;
-            agent = null;
-        }
-        else
-        {
-            agent = _agents.GetDefault();
-        }
+        // Resolve agent / shell from the same priority used above (explicit arg → project default
+        // → global default). resolvedAgentId == ShellSentinel selects the shell; null falls back
+        // to the global default profile when no agent matched the requested id.
+        var useShell = string.Equals(resolvedAgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase);
+        var agent = useShell
+            ? null
+            : (resolvedAgentId is { Length: > 0 } id ? _agents.GetById(id) : null) ?? _agents.GetDefault();
         var targetFolder = folder;
         // Claude Code (and any agent with SessionIdFlag) gets a CodeScope-minted UUID up
         // front so we can later resume with `--resume <id>` instead of `--continue`.

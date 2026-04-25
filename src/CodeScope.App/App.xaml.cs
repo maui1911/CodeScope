@@ -62,6 +62,16 @@ public partial class App : Application
         _appKiller = new ProcessTreeKiller();
         _appKiller.Adopt(System.Diagnostics.Process.GetCurrentProcess().Handle);
 
+        // One-time async bootstrap before HostBuilder: load persisted ProjectsConfig and
+        // construct the AgentRegistry from it. Doing this here (vs. inside an
+        // AddSingleton factory) keeps GetAwaiter().GetResult() off the DI critical path
+        // and prevents any future blocking-during-resolution surprises.
+        var bootstrapLoggerFactory = LoggerFactory.Create(b => b.AddDebug());
+        var bootstrapStore = new ProjectStore(bootstrapLoggerFactory.CreateLogger<ProjectStore>());
+        var bootstrapCfg = bootstrapStore.LoadAsync().GetAwaiter().GetResult();
+        var agentRegistry = AgentRegistry.FromConfig(
+            bootstrapCfg.IsSuccess ? bootstrapCfg.Value : new ProjectsConfig());
+
         _host = Host.CreateDefaultBuilder()
             .ConfigureLogging(log =>
             {
@@ -76,13 +86,8 @@ public partial class App : Application
             .ConfigureServices(services =>
             {
                 services.AddSingleton<IProjectStore, ProjectStore>();
-                services.AddSingleton<IAgentRegistry>(sp =>
-                {
-                    // Bootstrap agents from persisted config; defaults fill in if empty/missing.
-                    var store = sp.GetRequiredService<IProjectStore>();
-                    var cfg = store.LoadAsync().GetAwaiter().GetResult();
-                    return AgentRegistry.FromConfig(cfg.IsSuccess ? cfg.Value : new ProjectsConfig());
-                });
+                // Pre-built from the bootstrap above; keeps the DI graph free of sync-over-async.
+                services.AddSingleton<IAgentRegistry>(agentRegistry);
                 services.AddSingleton<IGitService, GitService>();
                 // Custom toast service — hosted in a top-level Popup HWND inside MainWindow
                 // so toasts render above the Microsoft.Terminal.Wpf HwndHost children that
@@ -177,6 +182,7 @@ public partial class App : Application
             catch (System.OperationCanceledException)
             {
                 // Expected on app shutdown — _updateCts was cancelled.
+                System.Diagnostics.Debug.WriteLine("[App] Update poll loop cancelled.");
             }
         });
     }
@@ -187,6 +193,7 @@ public partial class App : Application
         catch (System.ObjectDisposedException)
         {
             // CTS already disposed on a previous shutdown attempt — nothing to cancel.
+            System.Diagnostics.Debug.WriteLine("[App] OnExit: update CTS already disposed.");
         }
         _updateCts?.Dispose();
         _updateCts = null;
