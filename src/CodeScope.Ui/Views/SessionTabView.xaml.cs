@@ -78,11 +78,21 @@ public partial class SessionTabView : UserControl
         }
         else if (e.Key == Key.V)
         {
+            // ALWAYS mark the key handled — even when our paste finds no text. With
+            // Win32InputMode=True, the inner terminal still processes WM_KEYDOWN via the
+            // native message pump after WPF, which triggers its OWN paste path against a
+            // separate, often stale buffer (terminal's right-click-to-paste shares the
+            // same internal stack). Letting that double-fire is what makes pastes look
+            // like "something else weird" — the user sees whatever the terminal cached
+            // last, not what they just copied. Swallowing the event here keeps the WPF
+            // path authoritative.
+            e.Handled = true;
             var text = TryGetClipboardText();
             if (string.IsNullOrEmpty(text)) { return; }
+            // Each CR is one Enter to the shell. \r\n would emit a blank line between
+            // every pasted line; collapse to a single \r per line.
             var normalised = text.Replace("\r\n", "\r").Replace("\n", "\r");
             Terminal.ConPTYTerm?.WriteToTerm(normalised.AsSpan());
-            e.Handled = true;
         }
         else if (e.Key == Key.O && shift)
         {
