@@ -123,10 +123,22 @@ public partial class ConfirmDialog : Window
         Size size,
         Window? owner)
     {
-        var dlg = new ConfirmDialog(flavor, size, title, body, confirmLabel, cancelLabel, hint)
+        var dlg = new ConfirmDialog(flavor, size, title, body, confirmLabel, cancelLabel, hint);
+
+        // Resolve the owner *after* construction, never inside the object initializer:
+        //   a) WPF promotes the first shown Window to Application.Current.MainWindow.
+        //      During very-early-startup scenarios (e.g. the single-instance branch in
+        //      App.OnStartup, before the real MainWindow is shown) the only candidate
+        //      MainWindow becomes the dialog itself once ShowDialog runs — assigning
+        //      Owner = dlg throws "Cannot set Owner property to itself" and the app
+        //      exits silently with no user-visible message.
+        //   b) Setting Owner=null is invalid; keep it unassigned in that case.
+        var candidate = owner ?? Application.Current?.MainWindow;
+        if (candidate is not null && !ReferenceEquals(candidate, dlg))
         {
-            Owner = owner ?? Application.Current?.MainWindow,
-        };
+            dlg.Owner = candidate;
+        }
+
         return dlg.ShowDialog() == true;
     }
 
