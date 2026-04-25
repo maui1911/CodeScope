@@ -6,7 +6,10 @@
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     xmlns:term="clr-namespace:EasyWindowsTerminalControl;assembly=EasyWindowsTerminalControl"
     mc:Ignorable="d"
-    Background="#FF0A0A0A">
+    Background="#FF0A0A0A"
+    KeyboardNavigation.TabNavigation="None"
+    KeyboardNavigation.ControlTabNavigation="None"
+    KeyboardNavigation.DirectionalNavigation="None">
     <Grid>
         <term:EasyTerminalControl
             x:Name="Terminal"

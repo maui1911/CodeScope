@@ -60,8 +60,29 @@ public partial class SessionTabView : UserControl
     private void OnTerminalPreviewKeyDown(object sender, KeyEventArgs e)
     {
         var ctrl = (Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control;
-        if (!ctrl) { return; }
         var shift = (Keyboard.Modifiers & ModifierKeys.Shift) == ModifierKeys.Shift;
+        var alt = (Keyboard.Modifiers & ModifierKeys.Alt) == ModifierKeys.Alt;
+
+        // WPF eats bare Tab (and Shift+Tab) as focus traversal *before* the inner HwndHost
+        // sees WM_KEYDOWN, so claude / codex / pwsh autocomplete never reaches the shell.
+        // EasyTerminalControl's `InputCapture="TabKey"` does not override the WPF traversal
+        // path, and `KeyboardNavigation.TabNavigation="None"` on the UserControl only stops
+        // *outgoing* navigation — WPF still marks the keystroke handled. Forward Tab as
+        // ASCII 0x09 and Shift+Tab as the xterm CSI-Z back-tab sequence directly into the
+        // ConPTY input. Ctrl+Tab is reserved by MainWindow.InputBindings (NextTab) and
+        // must not be intercepted here, so it falls through to the WPF KeyBinding path.
+        if (e.Key == Key.Tab && !ctrl && !alt)
+        {
+            var pty = Terminal.ConPTYTerm;
+            if (pty is not null)
+            {
+                pty.WriteToTerm((shift ? "\x1b[Z" : "\t").AsSpan());
+                e.Handled = true;
+            }
+            return;
+        }
+
+        if (!ctrl) { return; }
 
         if (e.Key == Key.C)
         {
