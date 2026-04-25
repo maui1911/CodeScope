@@ -486,6 +486,12 @@ public sealed partial class MainViewModel : ObservableObject
             var stored = FindStoredSession(value);
             if (stored?.AgentSessionId is { Length: > 0 } sid) { _notifications.MarkSessionRead(sid); }
         }
+        // Sidebar selection follows the focused tab — when the user clicks a terminal
+        // in another split-group, the blue rail in the sidebar should jump to the
+        // worktree that owns that tab. Without this, sidebar selection got "stuck"
+        // on whatever the user last clicked in the tree even though their attention
+        // had moved to a tab in a different worktree.
+        SyncSidebarToTab(value);
         // Status dot is window-global: only the focused-group's selected tab gets Active;
         // every other tab (including selected tabs in other groups) drops to Idle unless
         // it's still waiting (Wait survives focus changes per top-bar spec §3).
@@ -1104,6 +1110,42 @@ public sealed partial class MainViewModel : ObservableObject
     /// </summary>
     private static bool AgentSupportsSessionId(AgentProfile? agent)
         => !string.IsNullOrEmpty(agent?.SessionIdFlag);
+
+    /// <summary>
+    /// Maps the focused tab back to the worktree row that owns it and updates the
+    /// sidebar's <see cref="SidebarViewModel.SelectedWorktree"/>. Prefers the stored
+    /// Session's <c>WorktreeId</c>; falls back to matching by <c>WorktreePath</c> for
+    /// pre-Phase 3 sessions and for transient tabs that haven't persisted yet (their
+    /// descriptor's <c>WorkingDirectory</c> is the same path).
+    /// </summary>
+    private void SyncSidebarToTab(SessionTabViewModel? tab)
+    {
+        if (tab is null || Sidebar is null) { return; }
+
+        WorktreeViewModel? match = null;
+        var stored = FindStoredSession(tab);
+        if (stored?.WorktreeId is { Length: > 0 } wid)
+        {
+            match = Sidebar.Projects
+                .SelectMany(p => p.Worktrees)
+                .FirstOrDefault(w => w.Id == wid);
+        }
+        if (match is null)
+        {
+            var path = stored?.WorktreePath ?? tab.Descriptor.WorkingDirectory;
+            if (!string.IsNullOrWhiteSpace(path))
+            {
+                match = Sidebar.Projects
+                    .SelectMany(p => p.Worktrees)
+                    .FirstOrDefault(w => string.Equals(w.Path, path, StringComparison.OrdinalIgnoreCase));
+            }
+        }
+
+        if (match is not null && !ReferenceEquals(Sidebar.SelectedWorktree, match))
+        {
+            Sidebar.SelectedWorktree = match;
+        }
+    }
 
     /// <summary>
     /// Walks the store for the persisted <see cref="Session"/> backing <paramref name="tab"/>.
