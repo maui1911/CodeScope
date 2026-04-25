@@ -420,21 +420,23 @@ public sealed class SessionStore : ISessionStore
         }
 
         // Skip the git step intentionally — see XML doc on PruneMissingWorktreeAsync.
-        // Mutate-then-persist with explicit rollback: keep a snapshot of the original
-        // Project record so a failed SaveSnapshotAsync (disk full, AV lock, anything
-        // weird) can put the in-memory store back exactly where it was. Without this,
-        // a save failure left the store inconsistent — UI would show the worktree as
-        // removed but the next reload would resurrect it from disk.
-        Project? rollbackProject = null;
-        int rollbackIndex = -1;
+        // Mutate-then-persist with explicit *narrow* rollback: only re-add the pruned
+        // worktree + its sessions on failure, instead of restoring the entire Project
+        // record. Restoring the whole project would clobber any concurrent mutation
+        // (e.g. AddWorktreeAsync running in parallel) that landed during the await.
+        Worktree? rollbackWorktree = null;
+        List<Session> rollbackSessions = [];
         lock (_lock)
         {
-            rollbackIndex = _projects.FindIndex(p => p.Id == projectId);
-            rollbackProject = _projects[rollbackIndex];
-            _projects[rollbackIndex] = rollbackProject with
+            var idx = _projects.FindIndex(p => p.Id == projectId);
+            if (idx < 0) { return Result<bool>.Fail("Project disappeared mid-flight"); }
+            var p = _projects[idx];
+            rollbackWorktree = p.Worktrees.FirstOrDefault(w => w.Id == worktreeId);
+            rollbackSessions = [.. p.Sessions.Where(s => s.WorktreeId == worktreeId)];
+            _projects[idx] = p with
             {
-                Worktrees = rollbackProject.Worktrees.Where(w => w.Id != worktreeId).ToList(),
-                Sessions = rollbackProject.Sessions.Where(s => s.WorktreeId != worktreeId).ToList(),
+                Worktrees = p.Worktrees.Where(w => w.Id != worktreeId).ToList(),
+                Sessions = p.Sessions.Where(s => s.WorktreeId != worktreeId).ToList(),
             };
         }
 
@@ -443,9 +445,19 @@ public sealed class SessionStore : ISessionStore
         {
             lock (_lock)
             {
-                if (rollbackIndex >= 0 && rollbackIndex < _projects.Count && rollbackProject is not null)
+                var idx = _projects.FindIndex(p => p.Id == projectId);
+                if (idx >= 0 && rollbackWorktree is not null)
                 {
-                    _projects[rollbackIndex] = rollbackProject;
+                    var p = _projects[idx];
+                    // Re-attach iff still missing — a concurrent re-add would have
+                    // replaced it under a different reference; don't double-insert.
+                    var wts = p.Worktrees.Any(w => w.Id == worktreeId)
+                        ? p.Worktrees
+                        : [.. p.Worktrees, rollbackWorktree];
+                    var existingSessionIds = new HashSet<string>(p.Sessions.Select(s => s.Id));
+                    var sessions = p.Sessions.Concat(
+                        rollbackSessions.Where(s => !existingSessionIds.Contains(s.Id))).ToList();
+                    _projects[idx] = p with { Worktrees = wts, Sessions = sessions };
                 }
             }
             return saved;

@@ -102,61 +102,10 @@
                         <ItemsControl.ItemTemplate>
                             <DataTemplate>
                                 <Button Command="{Binding InvokeCommand}"
+                                        Style="{StaticResource Fig.Style.Button.ToastAction}"
                                         Margin="0,0,8,0"
-                                        Padding="10,0"
-                                        Height="24"
-                                        MinWidth="0"
-                                        FontFamily="Inter, Segoe UI"
-                                        FontSize="11.5"
-                                        FontWeight="Medium"
-                                        Cursor="Hand"
-                                        SnapsToDevicePixels="True"
                                         AutomationProperties.AutomationId="{Binding Label, StringFormat='ToastAction_{0}'}"
                                         AutomationProperties.Name="{Binding Label}">
-                                    <Button.Style>
-                                        <Style TargetType="Button">
-                                            <!-- Default: ghost / secondary. Primary swaps to accent via DataTrigger. -->
-                                            <Setter Property="Foreground" Value="{StaticResource Text.Primary}" />
-                                            <Setter Property="BorderBrush" Value="{StaticResource Toast.Border}" />
-                                            <Setter Property="BorderThickness" Value="1" />
-                                            <Setter Property="Background" Value="{StaticResource Surface.Elev}" />
-                                            <Setter Property="Template">
-                                                <Setter.Value>
-                                                    <ControlTemplate TargetType="Button">
-                                                        <Border x:Name="Bd"
-                                                                Background="{TemplateBinding Background}"
-                                                                BorderBrush="{TemplateBinding BorderBrush}"
-                                                                BorderThickness="{TemplateBinding BorderThickness}"
-                                                                CornerRadius="4">
-                                                            <ContentPresenter HorizontalAlignment="Center"
-                                                                              VerticalAlignment="Center"
-                                                                              Margin="{TemplateBinding Padding}"
-                                                                              TextElement.Foreground="{TemplateBinding Foreground}"
-                                                                              TextElement.FontFamily="{TemplateBinding FontFamily}"
-                                                                              TextElement.FontSize="{TemplateBinding FontSize}"
-                                                                              TextElement.FontWeight="{TemplateBinding FontWeight}" />
-                                                        </Border>
-                                                        <ControlTemplate.Triggers>
-                                                            <Trigger Property="IsMouseOver" Value="True">
-                                                                <Setter TargetName="Bd" Property="Background" Value="{StaticResource Fig.Brush.GlassLight}" />
-                                                            </Trigger>
-                                                        </ControlTemplate.Triggers>
-                                                    </ControlTemplate>
-                                                </Setter.Value>
-                                            </Setter>
-                                            <Style.Triggers>
-                                                <DataTrigger Binding="{Binding IsPrimary}" Value="True">
-                                                    <!-- Primary action: accent border + accent text + soft accent fill.
-                                                         Colors flow from the toast's severity so an Err's "Retry" reads
-                                                         red, a Warn's primary action reads orange, etc — keeps the
-                                                         action visually anchored to the message it acts on. -->
-                                                    <Setter Property="BorderBrush" Value="{Binding Severity, Converter={StaticResource SevBrush}, ConverterParameter=Border}" />
-                                                    <Setter Property="Foreground" Value="{Binding Severity, Converter={StaticResource SevBrush}, ConverterParameter=Fg}" />
-                                                    <Setter Property="Background" Value="{Binding Severity, Converter={StaticResource SevBrush}, ConverterParameter=Bg}" />
-                                                </DataTrigger>
-                                            </Style.Triggers>
-                                        </Style>
-                                    </Button.Style>
                                     <TextBlock Text="{Binding Label}" />
                                 </Button>
                             </DataTemplate>

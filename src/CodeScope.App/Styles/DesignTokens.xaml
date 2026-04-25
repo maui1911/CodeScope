@@ -16,7 +16,8 @@
 <ResourceDictionary
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    xmlns:sys="clr-namespace:System;assembly=mscorlib">
+    xmlns:sys="clr-namespace:System;assembly=mscorlib"
+    xmlns:toasts="clr-namespace:NoScope.CodeScope.App.Toasts">
 
     <!-- ========================================================================= -->
     <!-- §2 COLOR PALETTE                                                           -->
@@ -501,6 +502,62 @@
     <Style x:Key="Fig.Style.Pill" TargetType="Border">
         <Setter Property="CornerRadius" Value="{StaticResource Fig.Radius.Pill}" />
         <Setter Property="Padding"      Value="10,4" />
+    </Style>
+
+    <!-- ========================================================================= -->
+    <!-- TOAST ACTION BUTTON — small chip-style action used inside toasts.          -->
+    <!-- Distinct from Fig.Style.Button.* (those are 100/40px-radius CTAs); spec   -->
+    <!-- §02 wants a 24px-tall radius-4 chip. Severity-aware primary swap lives    -->
+    <!-- in the consuming template (DataContext = ToastActionViewModel).           -->
+    <!-- ========================================================================= -->
+    <toasts:SeverityBrushConverter x:Key="ToastSeverityBrush" />
+
+    <Style x:Key="Fig.Style.Button.ToastAction" TargetType="Button">
+        <Setter Property="Foreground"      Value="{StaticResource Text.Primary}" />
+        <Setter Property="BorderBrush"     Value="{StaticResource Toast.Border}" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="Background"      Value="{StaticResource Surface.Elev}" />
+        <Setter Property="Height"          Value="24" />
+        <Setter Property="MinWidth"        Value="0" />
+        <Setter Property="Padding"         Value="10,0" />
+        <Setter Property="FontFamily"      Value="{StaticResource Fig.Font.Sans}" />
+        <Setter Property="FontSize"        Value="11.5" />
+        <Setter Property="FontWeight"      Value="Medium" />
+        <Setter Property="Cursor"          Value="Hand" />
+        <Setter Property="SnapsToDevicePixels" Value="True" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Button">
+                    <Border x:Name="Bd"
+                            Background="{TemplateBinding Background}"
+                            BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="{TemplateBinding BorderThickness}"
+                            CornerRadius="4">
+                        <ContentPresenter HorizontalAlignment="Center"
+                                          VerticalAlignment="Center"
+                                          Margin="{TemplateBinding Padding}"
+                                          TextElement.Foreground="{TemplateBinding Foreground}"
+                                          TextElement.FontFamily="{TemplateBinding FontFamily}"
+                                          TextElement.FontSize="{TemplateBinding FontSize}"
+                                          TextElement.FontWeight="{TemplateBinding FontWeight}" />
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Bd" Property="Background" Value="{StaticResource Fig.Brush.GlassLight}" />
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+        <Style.Triggers>
+            <!-- Primary action: accent border/text/fill driven by the toast's severity
+                 (DataContext = ToastActionViewModel exposes Severity + IsPrimary). -->
+            <DataTrigger Binding="{Binding IsPrimary}" Value="True">
+                <Setter Property="BorderBrush" Value="{Binding Severity, Converter={StaticResource ToastSeverityBrush}, ConverterParameter=Border}" />
+                <Setter Property="Foreground" Value="{Binding Severity, Converter={StaticResource ToastSeverityBrush}, ConverterParameter=Fg}" />
+                <Setter Property="Background" Value="{Binding Severity, Converter={StaticResource ToastSeverityBrush}, ConverterParameter=Bg}" />
+            </DataTrigger>
+        </Style.Triggers>
     </Style>
 
 </ResourceDictionary>

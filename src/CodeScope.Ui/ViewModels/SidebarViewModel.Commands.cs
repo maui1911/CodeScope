@@ -120,7 +120,7 @@ public sealed partial class SidebarViewModel
         else
         {
             _logger.LogDebug("Fetch failed: {Error}", r.Error);
-            ErrToast("Fetch failed", r.Error, retry: () => _ = FetchAllAsync(project));
+            ErrToast("Fetch failed", r.Error, retry: () => FetchAllAsync(project));
         }
     }
 
@@ -136,7 +136,7 @@ public sealed partial class SidebarViewModel
         else
         {
             _logger.LogDebug("Pull failed: {Error}", r.Error);
-            ErrToast("Pull failed", r.Error, retry: () => _ = PullAsync(worktree));
+            ErrToast("Pull failed", r.Error, retry: () => PullAsync(worktree));
         }
     }
 
@@ -314,7 +314,7 @@ public sealed partial class SidebarViewModel
         {
             _logger.LogWarning("CreatePR failed: {Error}", result.Error);
             ErrToast("Create pull request failed", result.Error,
-                retry: () => _ = CreatePullRequestAsync(worktree));
+                retry: () => CreatePullRequestAsync(worktree));
             return;
         }
 

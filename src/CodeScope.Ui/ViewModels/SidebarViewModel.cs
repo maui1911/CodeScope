@@ -118,15 +118,21 @@ public sealed partial class SidebarViewModel : ObservableObject
     /// Variant that accepts inline actions (e.g. Retry / Copy). Errors get a Copy
     /// action by default — the message is usually the raw stderr from git/gh which
     /// the user wants to paste into a bug report or chat. Pass <paramref name="retry"/>
-    /// to add a primary "Retry" button that re-runs the failed command.
+    /// to add a primary "Retry" button that re-runs the failed command. The retry
+    /// task is awaited inside a try/catch so a thrown retry doesn't disappear into a
+    /// fire-and-forget — without this wrapper, callers had to remember to do
+    /// <c>_ = SomeAsync()</c> and any thrown exception was lost on the floor.
     /// </summary>
-    private void ErrToast(string title, string message, Action? retry = null)
+    private void ErrToast(string title, string message, Func<Task>? retry = null)
     {
         if (_toasts is null) { return; }
         var actions = new List<ToastAction>(2);
         if (retry is not null)
         {
-            actions.Add(new ToastAction("Retry", retry, IsPrimary: true));
+            actions.Add(new ToastAction("Retry", () =>
+            {
+                _ = RunRetryAsync(retry, title);
+            }, IsPrimary: true));
         }
         actions.Add(new ToastAction("Copy", () =>
         {
@@ -134,5 +140,20 @@ public sealed partial class SidebarViewModel : ObservableObject
             catch (Exception ex) { _logger.LogDebug(ex, "Toast copy failed"); }
         }));
         _toasts.Show(new ToastRequest(ToastSeverity.Err, title, message, Actions: actions));
+    }
+
+    private async Task RunRetryAsync(Func<Task> retry, string label)
+    {
+        try { await retry().ConfigureAwait(true); }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Retry of {Label} threw", label);
+            // Surface the failure so the user knows the retry itself died — silent
+            // task faults inside a "Retry" button are the worst kind of UX bug.
+            _toasts?.Show(new ToastRequest(
+                ToastSeverity.Err,
+                $"{label}: retry failed",
+                ex.Message));
+        }
     }
 }
