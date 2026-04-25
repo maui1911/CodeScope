@@ -11,73 +11,9 @@ namespace NoScope.CodeScope.Ui.Views;
 
 public partial class SidebarView : UserControl
 {
-    private SidebarViewModel? _wiredVm;
-
     public SidebarView()
     {
         InitializeComponent();
-        DataContextChanged += OnDataContextChanged;
-        Unloaded += (_, _) =>
-        {
-            if (_wiredVm is not null)
-            {
-                _wiredVm.WorktreeSelected -= OnWorktreeSelectedFromVm;
-                _wiredVm = null;
-            }
-        };
-    }
-
-    private void OnDataContextChanged(object sender, DependencyPropertyChangedEventArgs e)
-    {
-        // Subscribe to the active VM's selection event so external callers (MainViewModel
-        // syncing sidebar to the focused tab) can drive the visual tree selection. The
-        // SidebarViewModel only wires the *visual → VM* direction via OnTreeSelectionChanged;
-        // the reverse used to be a no-op, which is why programmatic SelectedWorktree
-        // changes never moved the blue rail.
-        if (_wiredVm is not null)
-        {
-            _wiredVm.WorktreeSelected -= OnWorktreeSelectedFromVm;
-        }
-        _wiredVm = e.NewValue as SidebarViewModel;
-        if (_wiredVm is not null)
-        {
-            _wiredVm.WorktreeSelected += OnWorktreeSelectedFromVm;
-        }
-    }
-
-    private void OnWorktreeSelectedFromVm(object? sender, WorktreeViewModel? wt)
-    {
-        if (wt is null) { return; }
-        // Defer to the dispatcher's ContextIdle so containers generated lazily by the
-        // TreeView (e.g. on first reveal of a project's children) have time to materialize
-        // before we look them up.
-        Dispatcher.BeginInvoke(new Action(() => SelectTreeItemForWorktree(wt)),
-            System.Windows.Threading.DispatcherPriority.ContextIdle);
-    }
-
-    private void SelectTreeItemForWorktree(WorktreeViewModel wt)
-    {
-        if (Tree is null) { return; }
-        // The owning project must be expanded for the worktree's TreeViewItem to exist.
-        // Walk projects → matching project → expand if needed → then resolve the worktree
-        // container and toggle IsSelected.
-        foreach (var pObj in Tree.Items)
-        {
-            if (pObj is not ProjectViewModel proj) { continue; }
-            if (proj.Worktrees.All(w => !ReferenceEquals(w, wt))) { continue; }
-            if (Tree.ItemContainerGenerator.ContainerFromItem(proj) is not TreeViewItem projTvi) { return; }
-            if (!projTvi.IsExpanded)
-            {
-                projTvi.IsExpanded = true;
-                projTvi.UpdateLayout();
-            }
-            if (projTvi.ItemContainerGenerator.ContainerFromItem(wt) is TreeViewItem wtTvi)
-            {
-                if (!wtTvi.IsSelected) { wtTvi.IsSelected = true; }
-                wtTvi.BringIntoView();
-            }
-            return;
-        }
     }
 
     /// <summary>No-op now that the inline filter is gone — kept so MainViewModel's Ctrl+F
