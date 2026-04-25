@@ -56,9 +56,11 @@ public sealed partial class WorktreeViewModel : ObservableObject
         => $"Worktree_{SafeToken(ProjectId)}__{SafeToken(DisplayBranch)}";
 
     private static string SafeToken(string? s)
-        => string.IsNullOrWhiteSpace(s)
-            ? "unknown"
-            : new string([.. s.Select(c => char.IsLetterOrDigit(c) ? c : '_')]).Trim('_');
+    {
+        if (string.IsNullOrWhiteSpace(s)) { return "unknown"; }
+        var token = new string([.. s.Select(c => char.IsLetterOrDigit(c) ? c : '_')]).Trim('_');
+        return string.IsNullOrEmpty(token) ? "unknown" : token;
+    }
 
     public ObservableCollection<SessionTabViewModel> Sessions { get; }
 

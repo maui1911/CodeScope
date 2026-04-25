@@ -17,6 +17,14 @@ public partial class SidebarView : UserControl
     {
         InitializeComponent();
         DataContextChanged += OnDataContextChanged;
+        Unloaded += (_, _) =>
+        {
+            if (_wiredVm is not null)
+            {
+                _wiredVm.WorktreeSelected -= OnWorktreeSelectedFromVm;
+                _wiredVm = null;
+            }
+        };
     }
 
     private void OnDataContextChanged(object sender, DependencyPropertyChangedEventArgs e)

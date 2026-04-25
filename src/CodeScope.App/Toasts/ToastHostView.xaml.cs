@@ -92,8 +92,8 @@ public partial class ToastHostView : UserControl
     /// </summary>
     private static CustomPopupPlacement[] PlaceBottomRight(Size popupSize, Size targetSize, Point offset)
     {
-        var x = targetSize.Width - popupSize.Width - Inset;
-        var y = targetSize.Height - popupSize.Height - Inset;
+        var x = Math.Max(0, targetSize.Width - popupSize.Width - Inset);
+        var y = Math.Max(0, targetSize.Height - popupSize.Height - Inset);
         return [new CustomPopupPlacement(new Point(x, y), PopupPrimaryAxis.None)];
     }
 }

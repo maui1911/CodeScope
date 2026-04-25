@@ -89,12 +89,14 @@ public sealed partial class SessionTabViewModel : ObservableObject
     /// snapshots will show e.g. <c>a:Tab_main</c> instead of the VM type name.
     /// </summary>
     public string AutomationId
-        => $"Tab_{(string.IsNullOrWhiteSpace(DisplayName) ? Descriptor.Id : SafeToken(DisplayName))}";
+        => $"Tab_{SafeToken(string.IsNullOrWhiteSpace(DisplayName) ? Descriptor.Id : DisplayName)}";
 
-    private static string SafeToken(string s)
-        => string.IsNullOrWhiteSpace(s)
-            ? "unknown"
-            : new string([.. s.Select(c => char.IsLetterOrDigit(c) ? c : '_')]).Trim('_');
+    private static string SafeToken(string? s)
+    {
+        if (string.IsNullOrWhiteSpace(s)) { return "unknown"; }
+        var token = new string([.. s.Select(c => char.IsLetterOrDigit(c) ? c : '_')]).Trim('_');
+        return string.IsNullOrEmpty(token) ? "unknown" : token;
+    }
 
     partial void OnDisplayNameChanged(string value)
     {

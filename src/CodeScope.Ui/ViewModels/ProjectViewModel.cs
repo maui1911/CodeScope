@@ -55,10 +55,12 @@ public sealed partial class ProjectViewModel : ObservableObject
     /// </summary>
     public string AutomationId => $"Project_{SafeToken(Name)}";
 
-    private static string SafeToken(string s)
-        => string.IsNullOrWhiteSpace(s)
-            ? "unknown"
-            : new string([.. s.Select(c => char.IsLetterOrDigit(c) ? c : '_')]).Trim('_');
+    private static string SafeToken(string? s)
+    {
+        if (string.IsNullOrWhiteSpace(s)) { return "unknown"; }
+        var token = new string([.. s.Select(c => char.IsLetterOrDigit(c) ? c : '_')]).Trim('_');
+        return string.IsNullOrEmpty(token) ? "unknown" : token;
+    }
 
     public string? DefaultAgentId => Project.DefaultAgentId;
 
