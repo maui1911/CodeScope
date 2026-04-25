@@ -1,4 +1,4 @@
-namespace NoScope.CodeScope.App;
+namespace NoScope.CodeScope.App.Polling;
 
 /// <summary>
 /// Per-item poll state with exponential back-off. Used by <see cref="WorktreeStatusPoller"/>

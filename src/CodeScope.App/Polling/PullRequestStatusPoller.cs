@@ -2,7 +2,7 @@ using NoScope.CodeScope.Core.Models;
 using NoScope.CodeScope.Core.Services;
 using Microsoft.Extensions.Logging;
 
-namespace NoScope.CodeScope.App;
+namespace NoScope.CodeScope.App.Polling;
 
 /// <summary>
 /// Background timer that refreshes each worktree's open-PR state (number + CI rollup).

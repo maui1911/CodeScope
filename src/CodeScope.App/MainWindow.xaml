@@ -9,6 +9,7 @@
     xmlns:conv="clr-namespace:NoScope.CodeScope.Ui.Converters;assembly=CodeScope.Ui"
     xmlns:views="clr-namespace:NoScope.CodeScope.Ui.Views;assembly=CodeScope.Ui"
     xmlns:app="clr-namespace:NoScope.CodeScope.App"
+    xmlns:upd="clr-namespace:NoScope.CodeScope.App.Updates"
     xmlns:toasts="clr-namespace:NoScope.CodeScope.App.Toasts"
     mc:Ignorable="d"
     Title="{Binding WindowTitle}"
@@ -175,7 +176,7 @@
                 <!-- Version slug, right-aligned, mono small-caps. -->
                 <TextBlock
                     Grid.Column="3"
-                    Text="{x:Static app:VersionInfo.Display}"
+                    Text="{x:Static upd:VersionInfo.Display}"
                     VerticalAlignment="Center"
                     FontFamily="{DynamicResource Fig.Font.Mono}"
                     FontSize="10"

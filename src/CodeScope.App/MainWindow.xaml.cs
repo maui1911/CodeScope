@@ -2,6 +2,7 @@ using System.Collections.Specialized;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using NoScope.CodeScope.App.Persistence;
 using NoScope.CodeScope.App.Toasts;
 using NoScope.CodeScope.Ui.ViewModels;
 using NoScope.CodeScope.Ui.Views;

@@ -2,6 +2,8 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows;
+using NoScope.CodeScope.App.Polling;
+using NoScope.CodeScope.App.Updates;
 using NoScope.CodeScope.Core.Interop;
 using NoScope.CodeScope.Core.Models;
 using NoScope.CodeScope.Core.Services;

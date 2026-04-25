@@ -1,7 +1,7 @@
 using System.IO;
 using System.Text.Json;
 
-namespace NoScope.CodeScope.App;
+namespace NoScope.CodeScope.App.Persistence;
 
 /// <summary>
 /// Persists the multi-group layout to <c>%LocalAppData%/CodeScope/layout.json</c>:

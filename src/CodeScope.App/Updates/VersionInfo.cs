@@ -1,6 +1,6 @@
 using System.Reflection;
 
-namespace NoScope.CodeScope.App;
+namespace NoScope.CodeScope.App.Updates;
 
 /// <summary>
 /// Exposes the product version for UI binding. The value is baked into the

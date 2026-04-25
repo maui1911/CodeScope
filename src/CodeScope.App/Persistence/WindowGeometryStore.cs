@@ -2,7 +2,7 @@ using System.IO;
 using System.Text.Json;
 using System.Windows;
 
-namespace NoScope.CodeScope.App;
+namespace NoScope.CodeScope.App.Persistence;
 
 /// <summary>
 /// Persists the main window's bounds + state to <c>%LocalAppData%/CodeScope/window.json</c>.

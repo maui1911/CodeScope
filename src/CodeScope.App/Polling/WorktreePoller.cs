@@ -5,7 +5,7 @@ using NoScope.CodeScope.Core.Services;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
-namespace NoScope.CodeScope.App;
+namespace NoScope.CodeScope.App.Polling;
 
 /// <summary>
 /// Base for hosted services that walk every worktree in <see cref="ISessionStore"/> on a

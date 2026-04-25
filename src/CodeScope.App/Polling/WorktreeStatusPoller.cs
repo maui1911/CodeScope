@@ -5,7 +5,7 @@ using NoScope.CodeScope.Core.Services;
 using NoScope.CodeScope.Ui.Services;
 using Microsoft.Extensions.Logging;
 
-namespace NoScope.CodeScope.App;
+namespace NoScope.CodeScope.App.Polling;
 
 /// <summary>
 /// Background timer that walks every worktree in the store and refreshes its
