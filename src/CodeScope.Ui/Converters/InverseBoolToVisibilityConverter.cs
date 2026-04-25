@@ -2,7 +2,7 @@ using System.Globalization;
 using System.Windows;
 using System.Windows.Data;
 
-namespace NoScope.CodeScope.Ui.Dialogs;
+namespace NoScope.CodeScope.Ui.Converters;
 
 /// <summary>
 /// Maps <c>true → Collapsed</c>, <c>false → Visible</c>. Used by NewWorktreeDialog's popup to

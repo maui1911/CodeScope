@@ -42,7 +42,7 @@ Dependency direction is strict: `App -> Ui -> Core`. `Core` has zero UI referenc
 
 A tab hosts `pwsh.exe`, which spawns agent children (`claude.exe`, etc.). Killing the parent pwsh does not reliably kill its children. Fix: associate the whole launched process with a Win32 **job object** flagged `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. When the job handle is closed (on tab dispose), Windows terminates the entire tree.
 
-See `CodeScope.Core/Process/ProcessTreeKiller.cs`.
+See `CodeScope.Core/Interop/ProcessTreeKiller.cs`.
 
 ## Config schema
 

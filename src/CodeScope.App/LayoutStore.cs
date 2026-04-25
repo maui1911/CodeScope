@@ -18,15 +18,10 @@ public static class LayoutStore
         Dictionary<string, int> SessionToGroup,
         double[]? GroupWidths = null);
 
-    private static string FilePath
-    {
-        get
-        {
-            var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), NoScope.CodeScope.Core.AppPaths.AppFolderName);
-            Directory.CreateDirectory(dir);
-            return Path.Combine(dir, "layout.json");
-        }
-    }
+    private static string FilePath { get; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        NoScope.CodeScope.Core.AppPaths.AppFolderName,
+        "layout.json");
 
     public static Layout? Load()
     {
@@ -48,9 +43,10 @@ public static class LayoutStore
         try
         {
             if (layout.GroupCount < 1) { return; }
+            Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
             File.WriteAllText(FilePath, JsonSerializer.Serialize(layout));
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is IOException or JsonException)
         {
             // Best-effort — a write failure here shouldn't block shutdown, but we want it in traces.
             System.Diagnostics.Debug.WriteLine($"[LayoutStore] Save: {ex.Message}");
