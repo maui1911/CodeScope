@@ -75,6 +75,7 @@ public sealed partial class SidebarViewModel
         if (r.IsFailure)
         {
             _logger.LogWarning("AddWorktree failed: {Error}", r.Error);
+            ErrToast("New worktree failed", r.Error, retry: () => AddWorktreeAsync(project));
             return;
         }
 
@@ -392,6 +393,16 @@ public sealed partial class SidebarViewModel
         }
 
         _logger.LogWarning("RemoveWorktree failed: {Error}", r.Error);
+
+        // Residual-directory case: store state is already clean (worktree gone from sidebar,
+        // git no longer knows about it), only the on-disk directory remains. Surfacing the
+        // error is enough; offering force-retry would just hit "Project or worktree not found".
+        if (r.Error.StartsWith(NoScope.CodeScope.Core.Services.SessionStore.RemoveWorktreeResidualDirPrefix, StringComparison.Ordinal))
+        {
+            var msg = r.Error.Substring(NoScope.CodeScope.Core.Services.SessionStore.RemoveWorktreeResidualDirPrefix.Length);
+            ErrToast("Worktree directory left on disk", msg);
+            return;
+        }
 
         // Offer --force when the normal remove is rejected — typically dirty worktree or
         // a lingering lock. Force still can't beat a live Windows file lock, but it covers
