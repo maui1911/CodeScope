@@ -102,6 +102,7 @@ public partial class GroupStripView : UserControl
             TabRail.Width = targetWidth;
             TabRail.Opacity = 1;
             _railInitialised = true;
+            VerifyRailAfterLayout(item, targetLeft, targetWidth);
             return;
         }
 
@@ -118,6 +119,45 @@ public partial class GroupStripView : UserControl
             EasingFunction = RailEasing,
         });
         TabRail.Opacity = 1;
+        // Verify after the next layout pass — see VerifyRailAfterLayout.
+        VerifyRailAfterLayout(item, targetLeft, targetWidth);
+    }
+
+    /// <summary>
+    /// One-shot post-layout snap. SelectionChanged often fires while the strip is still
+    /// measuring (a tab was just added/removed/dragged) — the selected ListBoxItem's
+    /// <c>ActualWidth</c> at that moment can be a transient value smaller than the final
+    /// rendered width, leaving the rail visibly shorter than the tab. Hook
+    /// <see cref="UIElement.LayoutUpdated"/> once and re-snap if the item's geometry has
+    /// shifted by more than half a pixel.
+    /// </summary>
+    private void VerifyRailAfterLayout(ListBoxItem item, double initialLeft, double initialWidth)
+    {
+        EventHandler? handler = null;
+        handler = (_, _) =>
+        {
+            item.LayoutUpdated -= handler;
+            if (StripList is null || TabRail is null) { return; }
+            // Bail if selection moved on between sets — the new selection's UpdateRail
+            // will hook its own verifier.
+            var current = StripList.SelectedIndex < 0
+                ? null
+                : StripList.ItemContainerGenerator.ContainerFromIndex(StripList.SelectedIndex) as ListBoxItem;
+            if (!ReferenceEquals(current, item)) { return; }
+
+            var origin = item.TranslatePoint(new Point(0, 0), StripList);
+            var nowLeft = origin.X;
+            var nowWidth = item.ActualWidth;
+            if (Math.Abs(nowLeft - initialLeft) <= 0.5 && Math.Abs(nowWidth - initialWidth) <= 0.5) { return; }
+
+            // Snap (no animation) — animating to "fix a rail that's already in motion to
+            // a wrong target" looks worse than a one-frame jump.
+            TabRail.BeginAnimation(Canvas.LeftProperty, null);
+            TabRail.BeginAnimation(FrameworkElement.WidthProperty, null);
+            Canvas.SetLeft(TabRail, nowLeft);
+            TabRail.Width = nowWidth;
+        };
+        item.LayoutUpdated += handler;
     }
 
     private void OnAgentDropdownClick(object sender, RoutedEventArgs e)

@@ -67,6 +67,13 @@ public sealed partial class MainViewModel
                     {
                         GroupWidths.Insert(Math.Min(start + i, GroupWidths.Count), 1.0);
                     }
+                    // Redistribute: a fresh split should evenly divide the workspace
+                    // (1/2, 1/3, 1/4 ... per group). If a previous splitter-drag had
+                    // skewed [3.0, 1.0], the new group would otherwise inherit a
+                    // sliver. PrepareLayoutFromPersistence runs after this and rewrites
+                    // GroupWidths from disk for the hydration path, so we don't
+                    // clobber persisted layouts.
+                    for (var i = 0; i < GroupWidths.Count; i++) { GroupWidths[i] = 1.0; }
                     break;
                 }
             case System.Collections.Specialized.NotifyCollectionChangedAction.Remove:

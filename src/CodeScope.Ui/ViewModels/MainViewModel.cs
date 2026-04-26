@@ -877,15 +877,22 @@ public sealed partial class MainViewModel : ObservableObject
 
         sourceGroup.Tabs.Remove(tab);
 
-        // Fix the source selection BEFORE the target adopts the view. If
-        // sourceGroup.SelectedTab still points at the moved tab, the source
-        // EditorGroupView never raises a SelectedTab-changed event and never
-        // clears its own ContentControl.Content — when the target then assigns
-        // the same SessionTabView to its slot, WPF throws because the view
-        // still has a logical parent. Always re-resolve when the moved tab was
-        // the source's selection; otherwise leave it alone (a non-selected tab
-        // was dragged).
-        if (ReferenceEquals(sourceGroup.SelectedTab, tab))
+        // Fix the source selection BEFORE the target adopts the view. Two paths
+        // collapse to the same fix:
+        //   (a) the GroupStripView ListBox's two-way SelectedItem binding nulled
+        //       sourceGroup.SelectedTab when its current item left the collection
+        //       (Selector default behaviour). Source would otherwise render blank
+        //       even though more tabs remain.
+        //   (b) the binding didn't fire (e.g. a non-selected tab was dragged but
+        //       SelectedTab still happened to be the moved tab) — without a fresh
+        //       value, the source EditorGroupView never raises a SelectedTab-changed
+        //       event and its ContentControl.Content stays pinned to the moved view.
+        //       The target's attach would then throw "element already has a logical
+        //       parent". (Pool.Acquire defends against this anyway, but fixing it
+        //       here keeps the source slot from looking stale for a frame.)
+        // Always re-pick the last remaining tab in source unless source genuinely
+        // selected a different non-removed tab.
+        if (sourceGroup.SelectedTab is null || ReferenceEquals(sourceGroup.SelectedTab, tab))
         {
             sourceGroup.SelectedTab = sourceGroup.Tabs.Count > 0 ? sourceGroup.Tabs[^1] : null;
         }
