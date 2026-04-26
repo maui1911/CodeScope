@@ -120,9 +120,8 @@ public sealed partial class MainViewModel
         OnPropertyChanged(nameof(StatusHasRemoteDelta));
         OnPropertyChanged(nameof(StatusAheadBehindText));
         OnPropertyChanged(nameof(StatusModelName));
-        OnPropertyChanged(nameof(StatusAgentActive));
-        OnPropertyChanged(nameof(StatusAgentIdle));
-        OnPropertyChanged(nameof(StatusAgentWait));
+        OnPropertyChanged(nameof(StatusAgentBusy));
+        OnPropertyChanged(nameof(StatusAgentReady));
         OnPropertyChanged(nameof(StatusAgentSummaryVisible));
         OnPropertyChanged(nameof(StatusGroupCountText));
         OnPropertyChanged(nameof(StatusGroupCountVisible));
@@ -189,12 +188,11 @@ public sealed partial class MainViewModel
         }
     }
 
-    /// <summary>"active" / "idle" / "wait" — mirrors the focused tab's <see cref="TabStatus"/>.</summary>
+    /// <summary>"busy" / "ready" — mirrors the focused tab's <see cref="TabStatus"/>.</summary>
     public string StatusDotState => SelectedTab?.Status switch
     {
-        TabStatus.Active => "active",
-        TabStatus.Wait => "wait",
-        _ => "idle",
+        TabStatus.Busy => "busy",
+        _ => "ready",
     };
 
     public bool StatusIsDirty => ResolveFocusedWorktree()?.IsDirty ?? false;
@@ -230,9 +228,8 @@ public sealed partial class MainViewModel
         }
     }
 
-    public int StatusAgentActive => AllTabs.Count(t => t.Status == TabStatus.Active);
-    public int StatusAgentIdle => AllTabs.Count(t => t.Status == TabStatus.Idle);
-    public int StatusAgentWait => AllTabs.Count(t => t.Status == TabStatus.Wait);
+    public int StatusAgentBusy => AllTabs.Count(t => t.Status == TabStatus.Busy);
+    public int StatusAgentReady => AllTabs.Count(t => t.Status == TabStatus.Ready);
     public bool StatusAgentSummaryVisible => AllTabs.Any();
 
     public bool StatusGroupCountVisible => Groups.Count > 1;

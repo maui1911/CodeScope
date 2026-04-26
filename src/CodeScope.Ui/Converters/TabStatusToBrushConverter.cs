@@ -7,19 +7,14 @@ using NoScope.CodeScope.Ui.ViewModels;
 namespace NoScope.CodeScope.Ui.Converters;
 
 /// <summary>
-/// <see cref="TabStatus"/> → brush. Looks up <c>Accent.Primary</c> / <c>Signal.Ok</c> / <c>Signal.Warn</c>
-/// from app resources so the tab-strip status dot tracks the design tokens without hardcoding colors.
+/// <see cref="TabStatus"/> → brush. <c>Busy</c> → <c>Signal.Warn</c> (red, agent working);
+/// <c>Ready</c> → <c>Signal.Ok</c> (green, awaiting your input).
 /// </summary>
 public sealed class TabStatusToBrushConverter : IValueConverter
 {
     public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
     {
-        var key = value switch
-        {
-            TabStatus.Active => "Accent.Primary",
-            TabStatus.Wait   => "Signal.Warn",
-            _                => "Signal.Ok",
-        };
+        var key = value is TabStatus.Busy ? "Signal.Warn" : "Signal.Ok";
         return (Application.Current?.TryFindResource(key) as Brush) ?? Brushes.Transparent;
     }
 

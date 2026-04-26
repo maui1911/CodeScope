@@ -51,11 +51,11 @@ public sealed partial class SessionTabViewModel : ObservableObject
 
     /// <summary>
     /// Semantic session state driving the status dot on the tab row.
-    /// Active = focused and streaming, Idle = last response delivered, Wait = agent paused on a question.
-    /// Wait-state detection still needs pty-output wiring; for now callers only flip Active ↔ Idle.
+    /// <c>Busy</c> = agent is composing or running a tool, <c>Ready</c> = turn finished, awaiting your input.
+    /// Default is <c>Ready</c> so shell sessions (no telemetry) sit calm out of the box.
     /// </summary>
     [ObservableProperty]
-    private TabStatus _status = TabStatus.Idle;
+    private TabStatus _status = TabStatus.Ready;
 
     /// <summary>Cumulative billable tokens for this session (input + output + cache-creation).</summary>
     [ObservableProperty]

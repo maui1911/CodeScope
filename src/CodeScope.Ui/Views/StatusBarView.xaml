@@ -12,21 +12,13 @@
         <BooleanToVisibilityConverter x:Key="BoolVisible" />
         <conv:NullToVisibilityConverter x:Key="NullToVisibility" />
 
-        <!-- 6px session-state dot. Brush swaps on status; wait pulses the halo. -->
+        <!-- 6px session-state dot. Green by default (Ready); flips red when Busy. -->
         <Style x:Key="SbDot" TargetType="{x:Type Ellipse}">
             <Setter Property="Width" Value="6" />
             <Setter Property="Height" Value="6" />
             <Setter Property="Fill" Value="{DynamicResource Signal.Ok}" />
             <Style.Triggers>
-                <DataTrigger Binding="{Binding StatusDotState}" Value="active">
-                    <Setter Property="Fill" Value="{DynamicResource Accent.Primary}" />
-                    <Setter Property="Effect">
-                        <Setter.Value>
-                            <DropShadowEffect Color="#0099FF" BlurRadius="10" Opacity="0.6" ShadowDepth="0" />
-                        </Setter.Value>
-                    </Setter>
-                </DataTrigger>
-                <DataTrigger Binding="{Binding StatusDotState}" Value="wait">
+                <DataTrigger Binding="{Binding StatusDotState}" Value="busy">
                     <Setter Property="Fill" Value="{DynamicResource Signal.Warn}" />
                 </DataTrigger>
             </Style.Triggers>
@@ -202,26 +194,20 @@
                 <Rectangle Style="{StaticResource SbSep}" Margin="0,0,14,0"
                            Visibility="{Binding StatusAgentSummaryVisible, Converter={StaticResource BoolVisible}}" />
 
-                <!-- 10. Agent rollup (workspace-wide) -->
+                <!-- 10. Agent rollup (workspace-wide) — Busy / Ready counts only. -->
                 <StackPanel Style="{StaticResource SbItem}"
                             Margin="0,0,14,0"
                             Visibility="{Binding StatusAgentSummaryVisible, Converter={StaticResource BoolVisible}}">
-                    <Ellipse Width="6" Height="6" Fill="{DynamicResource Accent.Primary}" Margin="0,0,4,0" VerticalAlignment="Center" />
+                    <Ellipse Width="6" Height="6" Fill="{DynamicResource Signal.Warn}" Margin="0,0,4,0" VerticalAlignment="Center" />
                     <TextBlock Style="{StaticResource SbText}">
-                        <Run Foreground="#FFFFFFFF" Text="{Binding StatusAgentActive, Mode=OneWay}" />
-                        <Run Text=" active" />
+                        <Run Foreground="#FFFFFFFF" Text="{Binding StatusAgentBusy, Mode=OneWay}" />
+                        <Run Text=" busy" />
                     </TextBlock>
                     <TextBlock Style="{StaticResource SbTextMeta}" Margin="6,0" Text="·" />
                     <Ellipse Width="6" Height="6" Fill="{DynamicResource Signal.Ok}" Margin="0,0,4,0" VerticalAlignment="Center" />
                     <TextBlock Style="{StaticResource SbText}">
-                        <Run Foreground="#FFFFFFFF" Text="{Binding StatusAgentIdle, Mode=OneWay}" />
-                        <Run Text=" idle" />
-                    </TextBlock>
-                    <TextBlock Style="{StaticResource SbTextMeta}" Margin="6,0" Text="·" />
-                    <Ellipse Width="6" Height="6" Fill="{DynamicResource Signal.Warn}" Margin="0,0,4,0" VerticalAlignment="Center" />
-                    <TextBlock Style="{StaticResource SbText}">
-                        <Run Foreground="#FFFFFFFF" Text="{Binding StatusAgentWait, Mode=OneWay}" />
-                        <Run Text=" wait" />
+                        <Run Foreground="#FFFFFFFF" Text="{Binding StatusAgentReady, Mode=OneWay}" />
+                        <Run Text=" ready" />
                     </TextBlock>
                 </StackPanel>
 

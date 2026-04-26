@@ -308,9 +308,9 @@
                                 <Ellipse.Style>
                                     <Style TargetType="Ellipse">
                                         <Style.Triggers>
-                                            <DataTrigger Binding="{Binding DotState}" Value="wait">
+                                            <DataTrigger Binding="{Binding DotState}" Value="busy">
                                                 <DataTrigger.EnterActions>
-                                                    <BeginStoryboard Name="WaitPulse">
+                                                    <BeginStoryboard Name="BusyPulse">
                                                         <Storyboard RepeatBehavior="Forever" Duration="0:0:1.4">
                                                             <DoubleAnimationUsingKeyFrames Storyboard.TargetProperty="Opacity">
                                                                 <LinearDoubleKeyFrame KeyTime="0:0:0" Value="0.55" />
@@ -331,7 +331,7 @@
                                                     </BeginStoryboard>
                                                 </DataTrigger.EnterActions>
                                                 <DataTrigger.ExitActions>
-                                                    <StopStoryboard BeginStoryboardName="WaitPulse" />
+                                                    <StopStoryboard BeginStoryboardName="BusyPulse" />
                                                 </DataTrigger.ExitActions>
                                             </DataTrigger>
                                         </Style.Triggers>
@@ -339,22 +339,19 @@
                                 </Ellipse.Style>
                             </Ellipse>
 
-                            <!-- the dot itself -->
+                            <!-- the dot itself — selection chrome lives on the row (bg + bold + rail);
+                                 the dot is reserved for agent state so it never disappears under selection. -->
                             <Ellipse Width="6" Height="6" HorizontalAlignment="Center" VerticalAlignment="Center">
                                 <Ellipse.Style>
                                     <Style TargetType="Ellipse">
                                         <!-- Rest: dim dot on the tree border color -->
                                         <Setter Property="Fill" Value="#FF2A2A2A" />
                                         <Style.Triggers>
-                                            <DataTrigger Binding="{Binding DotState}" Value="idle">
+                                            <DataTrigger Binding="{Binding DotState}" Value="ready">
                                                 <Setter Property="Fill" Value="{DynamicResource Signal.Ok}" />
                                             </DataTrigger>
-                                            <DataTrigger Binding="{Binding DotState}" Value="wait">
+                                            <DataTrigger Binding="{Binding DotState}" Value="busy">
                                                 <Setter Property="Fill" Value="{DynamicResource Signal.Warn}" />
-                                            </DataTrigger>
-                                            <!-- Selected row supersedes idle/rest with the accent "active" state. -->
-                                            <DataTrigger Binding="{Binding Path=IsSelected, RelativeSource={RelativeSource AncestorType=TreeViewItem}}" Value="True">
-                                                <Setter Property="Fill" Value="{DynamicResource Accent.Primary}" />
                                             </DataTrigger>
                                         </Style.Triggers>
                                     </Style>
@@ -466,14 +463,14 @@
                             TextTrimming="CharacterEllipsis" />
 
                         <!-- Sidebar spec §9: collapsed project surfaces a red dot next to its
-                             count when any child worktree is in wait state. -->
+                             count when any child worktree's session is busy (agent working). -->
                         <Ellipse
                             Grid.Column="3"
                             Width="6" Height="6"
                             Margin="8,0,0,0"
                             VerticalAlignment="Center"
                             Fill="{DynamicResource Signal.Warn}"
-                            Visibility="{Binding HasWaitingChild, Converter={StaticResource BoolVisible}}" />
+                            Visibility="{Binding HasBusyChild, Converter={StaticResource BoolVisible}}" />
 
                         <TextBlock
                             Grid.Column="4"

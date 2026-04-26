@@ -230,19 +230,9 @@ public sealed partial class MainViewModel : ObservableObject
             var stored = FindStoredSession(value);
             if (stored?.AgentSessionId is { Length: > 0 } sid) { _notifications.MarkSessionRead(sid); }
         }
-        // Status dot is window-global: only the focused-group's selected tab gets Active;
-        // every other tab (including selected tabs in other groups) drops to Idle unless
-        // it's still waiting (Wait survives focus changes per top-bar spec §3).
-        // IsActive is per-group and is set by EditorGroupViewModel.OnSelectedTabChanged —
-        // do NOT touch it here, or selecting an empty group hides every terminal.
-        foreach (var t in AllTabs)
-        {
-            var isWindowSelected = ReferenceEquals(t, value);
-            if (t.Status != TabStatus.Wait)
-            {
-                t.Status = isWindowSelected ? TabStatus.Active : TabStatus.Idle;
-            }
-        }
+        // Tab.Status is purely a function of agent activity now — selection no longer
+        // overrides it. The focused-tab visual treatment (pill bg + font weight) is
+        // driven separately by ListBoxItem.IsSelected in the strip template.
     }
 
     [ObservableProperty]
@@ -1190,12 +1180,11 @@ public sealed partial class MainViewModel : ObservableObject
 
     private void ApplyActivityToStatus(SessionTabViewModel tab, ClaudeActivityState activity)
     {
-        var isSelected = ReferenceEquals(tab, SelectedTab);
         tab.Status = activity switch
         {
-            ClaudeActivityState.PendingToolUse => TabStatus.Wait,
-            ClaudeActivityState.Idle => TabStatus.Idle,
-            ClaudeActivityState.Composing => isSelected ? TabStatus.Active : TabStatus.Idle,
+            ClaudeActivityState.Composing => TabStatus.Busy,
+            ClaudeActivityState.PendingToolUse => TabStatus.Busy,
+            ClaudeActivityState.Idle => TabStatus.Ready,
             _ => tab.Status,
         };
     }

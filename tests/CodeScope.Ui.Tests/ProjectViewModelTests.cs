@@ -97,6 +97,6 @@ public sealed class ProjectViewModelTests
         vm.Worktrees.Add(MakeWorktreeVm("a"));
 
         changed.Should().Contain(nameof(ProjectViewModel.CountBadge));
-        changed.Should().Contain(nameof(ProjectViewModel.HasWaitingChild));
+        changed.Should().Contain(nameof(ProjectViewModel.HasBusyChild));
     }
 }

@@ -12,10 +12,8 @@ public sealed partial class ProjectViewModel : ObservableObject
         Project = project;
         _isExpanded = true;
         Worktrees = [];
-        // Propagate wait-state upward: a collapsed project row needs to show the red
-        // dot when any child worktree flips to "wait" (§9 "attention propagates"). Hook
-        // child DotState changes — covers PR-CI failure, dirty-with-nothing-else, and
-        // now live session Wait too.
+        // Propagate busy-state upward: a collapsed project row shows a red dot when any
+        // child worktree's session is in TabStatus.Busy. Hook child DotState changes.
         Worktrees.CollectionChanged += (_, e) =>
         {
             if (e.NewItems is not null)
@@ -25,7 +23,7 @@ public sealed partial class ProjectViewModel : ObservableObject
                     w.PropertyChanged += OnChildWorktreePropertyChanged;
                 }
             }
-            OnPropertyChanged(nameof(HasWaitingChild));
+            OnPropertyChanged(nameof(HasBusyChild));
             OnPropertyChanged(nameof(CountBadge));
             OnPropertyChanged(nameof(HasNoWorktrees));
         };
@@ -35,7 +33,7 @@ public sealed partial class ProjectViewModel : ObservableObject
     {
         if (e.PropertyName == nameof(WorktreeViewModel.DotState))
         {
-            OnPropertyChanged(nameof(HasWaitingChild));
+            OnPropertyChanged(nameof(HasBusyChild));
         }
     }
 
@@ -89,11 +87,11 @@ public sealed partial class ProjectViewModel : ObservableObject
     public string CountBadge => Worktrees.Count > 0 ? Worktrees.Count.ToString() : string.Empty;
 
     /// <summary>
-    /// True when any child worktree is in <c>wait</c> state. Surfaces as a small red dot
+    /// True when any child worktree is in <c>busy</c> state. Surfaces as a small red dot
     /// next to the count on the project row (spec §9 "attention propagates"), so a
-    /// collapsed project still tells you it needs attention.
+    /// collapsed project still tells you something is running.
     /// </summary>
-    public bool HasWaitingChild => Worktrees.Any(w => w.DotState == "wait");
+    public bool HasBusyChild => Worktrees.Any(w => w.DotState == "busy");
 
     /// <summary>
     /// True when this project has zero worktrees — drives the "(no worktrees)" placeholder row
@@ -106,7 +104,7 @@ public sealed partial class ProjectViewModel : ObservableObject
     {
         OnPropertyChanged(nameof(Summary));
         OnPropertyChanged(nameof(CountBadge));
-        OnPropertyChanged(nameof(HasWaitingChild));
+        OnPropertyChanged(nameof(HasBusyChild));
     }
 
     [ObservableProperty]
