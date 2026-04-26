@@ -102,14 +102,27 @@ public partial class SidebarView : UserControl
     {
         if (e.OriginalSource is not DependencyObject origin) { return; }
         var item = FindAncestor<TreeViewItem>(origin);
-        if (item?.DataContext is not WorktreeViewModel wt) { return; }
-        if (wt.Sessions.FirstOrDefault() is not { } first) { return; }
+        if (item is null) { return; }
         if (Application.Current?.MainWindow?.DataContext is not MainViewModel main) { return; }
 
-        var tab = main.AllTabs.FirstOrDefault(t => t.Descriptor.Id == first.Descriptor.Id);
-        if (tab is null) { return; }
-        main.SelectedTab = tab;
-        e.Handled = true;
+        switch (item.DataContext)
+        {
+            case WorktreeViewModel wt:
+                if (wt.Sessions.FirstOrDefault() is { } first
+                    && main.AllTabs.FirstOrDefault(t => t.Descriptor.Id == first.Descriptor.Id) is { } tab)
+                {
+                    main.SelectedTab = tab;
+                }
+                e.Handled = true;
+                return;
+            case SessionTabViewModel session when session.ClosedAt is not null:
+                if (main.ReopenClosedSessionCommand.CanExecute(session.Descriptor.Id))
+                {
+                    main.ReopenClosedSessionCommand.Execute(session.Descriptor.Id);
+                }
+                e.Handled = true;
+                return;
+        }
     }
 
     private void OnTreeSelectionChanged(object sender, RoutedPropertyChangedEventArgs<object> e)
@@ -145,6 +158,9 @@ public partial class SidebarView : UserControl
                 break;
             case WorktreeViewModel wt:
                 BuildWorktreeMenu(vm, wt);
+                break;
+            case SessionTabViewModel session when session.ClosedAt is not null:
+                BuildHistorySessionMenu(vm, session);
                 break;
             case SessionTabViewModel session:
                 BuildSessionMenu(vm, session);
@@ -444,6 +460,31 @@ public partial class SidebarView : UserControl
             }));
         close.Tag = "danger";
         TreeContextMenu.Items.Add(close);
+    }
+
+    private void BuildHistorySessionMenu(SidebarViewModel vm, SessionTabViewModel session)
+    {
+        TreeContextMenu.Items.Add(BuildContextHeader(
+            "Accent.Primary", session.DisplayName ?? "(closed session)", session.AgentId ?? "shell"));
+
+        TreeContextMenu.Items.Add(BuildGroupLabel("History"));
+
+        var reopen = BuildItem(
+            "Reopen", "Ctx.Icon.Terminal", "↵",
+            () => WithMainVm(main => main.ReopenClosedSessionCommand.Execute(session.Descriptor.Id)));
+        reopen.Tag = "primary";
+        TreeContextMenu.Items.Add(reopen);
+
+        TreeContextMenu.Items.Add(BuildItem(
+            "Rename…", "Ctx.Icon.Pencil", "F2",
+            () => vm.RenameSessionCommand.Execute(session)));
+
+        TreeContextMenu.Items.Add(BuildSeparator());
+        var remove = BuildItem(
+            "Remove from history", "Ctx.Icon.Trash", "Del",
+            () => vm.RemoveSessionFromHistoryCommand.Execute(session));
+        remove.Tag = "danger";
+        TreeContextMenu.Items.Add(remove);
     }
 
     // ─────────────────────────── menu helpers ───────────────────────────

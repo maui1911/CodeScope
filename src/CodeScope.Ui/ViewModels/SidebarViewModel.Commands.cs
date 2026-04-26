@@ -431,6 +431,24 @@ public sealed partial class SidebarViewModel
         }
     }
 
+    [RelayCommand]
+    private async Task RenameSessionAsync(SessionTabViewModel? row)
+    {
+        if (row is null) { return; }
+        var newName = Dialogs.RenameDialog.Prompt(row.DisplayName);
+        if (string.IsNullOrWhiteSpace(newName) || string.Equals(newName, row.DisplayName, StringComparison.Ordinal)) { return; }
+        var result = await _store.RenameSessionAsync(row.Descriptor.Id, newName.Trim()).ConfigureAwait(true);
+        if (result.IsFailure) { Toast("Rename failed", result.Error, ToastSeverity.Err); }
+    }
+
+    [RelayCommand]
+    private async Task RemoveSessionFromHistoryAsync(SessionTabViewModel? row)
+    {
+        if (row is null) { return; }
+        var result = await _store.RemoveSessionAsync(row.Descriptor.Id).ConfigureAwait(true);
+        if (result.IsFailure) { Toast("Remove failed", result.Error, ToastSeverity.Err); }
+    }
+
     private async Task InvokeRollbackAsync(Func<Task>? rollback)
     {
         if (rollback is null) { return; }
