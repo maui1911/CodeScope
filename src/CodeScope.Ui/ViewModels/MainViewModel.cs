@@ -532,22 +532,13 @@ public sealed partial class MainViewModel : ObservableObject
     }
 
     /// <summary>
-    /// Restores a soft-closed session: clears <see cref="Session.ClosedAt"/> in the store,
-    /// spawns a resume-flavoured descriptor (<c>--resume &lt;AgentSessionId&gt;</c> via
-    /// <see cref="SessionManager.CreateAgentSession"/> with <c>resume: true</c>), adds the tab,
-    /// and kicks off Claude adoption so telemetry follows across the rotation. Returns
-    /// <c>false</c> when the restore couldn't be persisted or the agent profile has vanished.
+    /// Restores a soft-closed session: clears <see cref="Session.ClosedAt"/> in the store and
+    /// spawns a tab. Resumable agents (Claude/Codex) get a <c>--resume &lt;id&gt;</c> descriptor;
+    /// shells respawn pwsh in the original cwd. Returns <c>false</c> only when the store
+    /// rejects the restore.
     /// </summary>
     private async Task<bool> TryRestoreSessionAsync(Project project, Worktree worktree, Session closed)
     {
-        if (string.IsNullOrEmpty(closed.AgentId)
-            || string.Equals(closed.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-        var agent = _agents.GetById(closed.AgentId);
-        if (agent is null) { return false; }
-
         var restored = await _store.RestoreSessionAsync(closed.Id).ConfigureAwait(true);
         if (restored.IsFailure)
         {
@@ -555,19 +546,29 @@ public sealed partial class MainViewModel : ObservableObject
             return false;
         }
 
-        var descriptor = _sessionManager.CreateAgentSession(
-            worktree.Path, agent, closed.Id, resume: true, agentSessionId: closed.AgentSessionId);
+        var useShell = string.IsNullOrEmpty(closed.AgentId)
+            || string.Equals(closed.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase);
+        var agent = useShell ? null : _agents.GetById(closed.AgentId!);
+
+        SessionDescriptor descriptor;
+        if (agent is null)
+        {
+            descriptor = _sessionManager.CreateShellSession(worktree.Path, closed.Id);
+        }
+        else
+        {
+            descriptor = _sessionManager.CreateAgentSession(
+                worktree.Path, agent, closed.Id, resume: true, agentSessionId: closed.AgentSessionId);
+        }
         if (worktree.Branch is { Length: > 0 } branch)
         {
             descriptor = descriptor with { Title = $"{project.Name} · {branch}" };
         }
 
-        var vm = new SessionTabViewModel(descriptor, project.Id, closed.AgentId, closed.DisplayName, agent.Icon);
+        var vm = new SessionTabViewModel(descriptor, project.Id, closed.AgentId, closed.DisplayName, agent?.Icon);
         FocusedGroup.Tabs.Add(vm);
         SelectedTab = vm;
-        // Eager telemetry seed — same reasoning as the hydrate path: `claude --resume <id>`
-        // reuses the existing jsonl, so the adoption watch won't fire until the next turn
-        // and the status bar would stay frozen on the just-restored tab.
+
         if (string.Equals(closed.AgentId, "claude", StringComparison.OrdinalIgnoreCase)
             && closed.AgentSessionId is { Length: > 0 } sid)
         {
@@ -577,6 +578,27 @@ public sealed partial class MainViewModel : ObservableObject
         OnPropertyChanged(nameof(CanCloseGroup));
         CloseGroupCommand.NotifyCanExecuteChanged();
         return true;
+    }
+
+    /// <summary>
+    /// Public entry-point for reopening a closed session from the sidebar history surface.
+    /// Looks up the parent project + worktree by id, then delegates to
+    /// <see cref="TryRestoreSessionAsync"/>. No-op when the session is no longer in the
+    /// store (e.g. removed from history between right-click and click).
+    /// </summary>
+    [RelayCommand]
+    private async Task ReopenClosedSessionAsync(string? sessionId)
+    {
+        if (string.IsNullOrEmpty(sessionId)) { return; }
+        var hit = _store.Projects
+            .SelectMany(p => p.Sessions.Select(s => (project: p, session: s)))
+            .FirstOrDefault(x => x.session.Id == sessionId);
+        if (hit.session is null || hit.session.ClosedAt is null) { return; }
+        var worktree = hit.project.Worktrees.FirstOrDefault(w => w.Id == hit.session.WorktreeId)
+                       ?? hit.project.Worktrees.FirstOrDefault(w => w.IsPrimary)
+                       ?? hit.project.Worktrees.FirstOrDefault();
+        if (worktree is null) { return; }
+        await TryRestoreSessionAsync(hit.project, worktree, hit.session).ConfigureAwait(true);
     }
 
     /// <summary>
