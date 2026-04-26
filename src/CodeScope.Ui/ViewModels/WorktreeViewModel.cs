@@ -13,7 +13,7 @@ public sealed partial class WorktreeViewModel : ObservableObject
     {
         ProjectId = projectId;
         Worktree = worktree;
-        _isExpanded = true;
+        _isExpanded = false;
         Sessions = [];
         History = [];
         // History items intentionally do NOT subscribe to per-item PropertyChanged (unlike Sessions):
@@ -73,9 +73,6 @@ public sealed partial class WorktreeViewModel : ObservableObject
     /// disclosure is hidden when <see cref="HasHistory"/> is false.
     /// </summary>
     public ObservableCollection<SessionTabViewModel> History { get; }
-
-    [ObservableProperty]
-    private bool _isHistoryExpanded;
 
     public bool HasHistory => History.Count > 0;
 

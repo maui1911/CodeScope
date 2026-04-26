@@ -24,11 +24,10 @@ public interface ISessionStore
 
     /// <summary>
     /// Marks a session as closed without discarding it — persists a <see cref="Session.ClosedAt"/>
-    /// timestamp so the next <c>New session</c> on the same worktree + agent can resume it via
-    /// <c>--resume &lt;AgentSessionId&gt;</c>. Raises <see cref="SessionStoreChange.SessionSoftClosed"/>
-    /// (carrying the closed Session) so listeners can route it to a history surface without
-    /// re-querying store state; <see cref="RestoreSessionAsync"/> brings it back via
-    /// <see cref="SessionStoreChange.SessionAdded"/>.
+    /// timestamp so the row is preserved in the store and appears in the per-worktree history
+    /// surface for explicit reopen via <see cref="RestoreSessionAsync"/>. Raises
+    /// <see cref="SessionStoreChange.SessionSoftClosed"/> (carrying the closed Session) so
+    /// listeners can route it to a history surface without re-querying store state.
     /// </summary>
     Task<Result<bool>> SoftCloseSessionAsync(string sessionId, CancellationToken ct = default);
 

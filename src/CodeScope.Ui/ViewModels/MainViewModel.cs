@@ -915,10 +915,9 @@ public sealed partial class MainViewModel : ObservableObject
         if (tab is null) { return; }
 
         await DuplicateTabAsync(tab).ConfigureAwait(true);
-        // Hard-remove: Restart is "throw away the old conversation and start fresh" — without
-        // hardRemove the old row would linger as a soft-closed entry and get resumed the next
-        // time the user clicks New session on this worktree, which is exactly the opposite of
-        // what Restart means.
+        // Hard-remove so the old row doesn't linger in history: restart semantically discards
+        // prior conversation state, so the closed session must not appear in the explicit
+        // history surface where the user would otherwise reopen it via RestoreSessionAsync.
         await CloseTabAsync(tab, hardRemove: true).ConfigureAwait(true);
     }
 
