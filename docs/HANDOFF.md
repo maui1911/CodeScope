@@ -5,23 +5,54 @@
 > **Intent:** cursor + last 1–2 sessions in depth, everything else a one-liner.
 > Old detail lives in `git log` — don't duplicate it here.
 
-**Last updated:** 2026-04-24 (session 20)
-**Branch:** `bugfix/post-v0.1.0` — 5 commits ahead of `origin/main`, pushed to origin.
-**Head:** `bd882eb` — `fix(telemetry): keep adoption watch alive across /clear rotations`
+**Last updated:** 2026-04-26 (session 21)
+**Branch:** `feature/session-history-per-worktree` — 9 commits ahead of `main`, not yet pushed to origin.
+**Head:** see session 21 below (HANDOFF commit is the tip after `aef072a`)
 **Release:** `v0.1.0` shipped via GitHub Actions — https://github.com/maui1911/CodeScope/releases/tag/v0.1.0
-**Build status:** ✅ `dotnet build` clean. `dotnet test` 147/147 green.
+**Build status:** ✅ `dotnet build` clean. `dotnet test` 280/281 green; 1 pre-existing FSWatcher flake (`Callback_Fires_For_Each_New_Jsonl_So_Clear_Rotations_Are_Adopted`) — confirmed flaky on `main` too, not a regression.
 **Uncommitted work:** none.
-**Unpushed commits:** none — branch is up to date with `origin/bugfix/post-v0.1.0`; no PR opened yet.
+**Unpushed commits:** entire `feature/session-history-per-worktree` branch (9 feature commits + this HANDOFF commit) — no PR opened yet.
 
 ---
 
 ## Cursor — current focus
 
-**Post-v0.1.0 bugfix pass.** Session 20 shipped six fixes hit in daily use
-of the v0.1.0 install, plus a dev-mode env var so a debug build can run
-alongside the installed app. Branch `bugfix/post-v0.1.0` is pushed; next
-concrete step is a PR to `main`. After merge, bump the tag to `v0.1.1`
-and let the Session-19 release pipeline cut the update.
+**Per-worktree session history surface.** Session 21 shipped a full
+soft-close gate + history UI: every session (agent and shell) now soft-closes
+on tab-close, auto-resume on "New session" was removed, and a collapsible
+history disclosure appears under each worktree in the sidebar (only when
+`count > 0`). Users reopen past sessions via double-click / right-click on a
+history row, or via the worktree context-menu shortcut "Reopen most recent
+closed session". Branch `feature/session-history-per-worktree` is local-only;
+next step is push + PR to `main`.
+
+### Session 21 — per-worktree session history surface (shipped)
+
+Spec: `docs/superpowers/specs/2026-04-26-session-history-design.md`
+Plan: `docs/superpowers/plans/2026-04-26-session-history-per-worktree.md`
+ADR: `docs/DECISIONS.md` § ADR-0013 — auto-resume removed in favour of explicit history.
+
+**Behaviour change for users:** "New session" always mints a fresh terminal —
+it no longer auto-resumes the previous agent session. Past sessions accumulate
+in a per-worktree history list (collapsed by default, shown only when
+`count > 0`) in the sidebar disclosure row. Reopen options:
+  - Double-click or right-click → "Reopen" on a history row.
+  - Worktree context menu → "Reopen most recent closed session" (keyboard-friendly shortcut).
+
+Commits (oldest → newest):
+
+- `52f944d` — **Soft-close every session, including shells.** `SessionStore.CloseSessionAsync` moves the session to `ClosedSessions`; all tab-close paths (single close, group close, worktree cascade) now call it. Shell sessions participate in soft-close alongside agent sessions.
+- `ca3833a` — **Remove implicit auto-resume on New session.** `SessionManager.CreateSessionAsync` no longer injects `--resume <id>`; each new session is a blank slate. Enables predictable history accumulation.
+- `b412046` — **WorktreeViewModel.History collection scaffold.** Adds `ObservableCollection<ClosedSessionViewModel>` to `WorktreeViewModel`, wired from `ISessionStore.ClosedSessions` via the existing projection loop.
+- `c6745b6` — **Project closed sessions into WorktreeViewModel.History.** Sidebar VM projection maps `ISessionStore.ClosedSessions` onto the owning worktree's `History` list; handles add/remove change notifications.
+- `975ca53` — **Render closed-session history under each worktree.** Sidebar `DataTemplate` gains a collapsible `Expander` disclosure row (hidden when `History.Count == 0`) with dim styling; each history row shows agent icon, display name, and close timestamp.
+- `3fbe388` — **ReopenClosedSessionAsync command + shell-aware restore.** `MainViewModel` command that pulls the `ClosedSession` record, picks the right agent profile (shell vs. agent), spawns the tab in the worktree's group with `--resume` where applicable, and removes the entry from history.
+- `bb22c8a` — **Double-click + right-click reopen + manage closed sessions.** History row in sidebar responds to double-click (reopen) and right-click context menu ("Reopen" / "Remove from history"). Drag-between-groups verified untouched — different code path, explicitly re-tested per spec requirement.
+- `aef072a` — **Worktree menu shortcut for most-recent reopen.** Worktree context menu gains "Reopen most recent closed session" entry (visible only when `History.Count > 0`); bound to `ReopenMostRecentClosedSessionCommand`.
+
+**Test coverage added/updated this session:**
+- `52f944d` — `test(session-store): cover cascade-removal of closed sessions` (new `SessionStoreTests` covering soft-close, cascade on worktree removal, and re-open removal)
+- Total 280/281 green (281 tests; 1 pre-existing FSWatcher flake on `main` — not a regression)
 
 ### Session 20 — post-v0.1.0 bugfixes + dev-mode side-by-side (shipped)
 
@@ -258,7 +289,9 @@ src/
                        Dialogs: RenameDialog, NewWorktreeDialog,
                                 CommandPaletteDialog
 tests/
-  CodeScope.Core.Tests 116 passing — Core only; no UI tests by convention
+  CodeScope.Core.Tests 156 passing (1 FSWatcher flake) — Core only; no UI tests by convention
+  CodeScope.Ui.Tests   108 passing
+  CodeScope.App.Tests   17 passing
 docs/
   DECISIONS.md (12 ADRs), design/DESIGN.md
   HANDOFF.md (this file)
@@ -278,6 +311,7 @@ docs/
 
 ## Known rough edges
 
+- **"Remove from history" has no confirm dialog** — the action is destructive (entry cannot be recovered) but currently fires immediately on click. A follow-up should add a small inline confirm or an Undo toast. Low priority until the history feature is user-tested.
 - **Gitea CI rollup is always `None`** — `tea pulls status`/REST integration deferred.
 - **Session-exit toasts deferred** — `SessionManager` starts pwsh with `-NoExit`; detecting agent exit needs `SessionManager` refactor or pty-output parsing.
 - **Drag tab between groups loses scroll buffer** — pwsh respawns because WPF unloads the `SessionTabView` (HWND lifecycle) when the VM leaves its group. As of session 20 Claude resumes its conversation via `claude --resume <id>` and telemetry keeps tracking (same jsonl), but the terminal scrollback is gone. Fix still needs a shared `SessionTabView` host pool — see `memory/project_terminal_lifecycle.md`.
@@ -327,6 +361,11 @@ dotnet publish src/CodeScope.App -c Release -r win-x64 `
 ```
 
 ## Next — suggested entry points
+
+**Immediate:**
+
+- **Push + PR for `feature/session-history-per-worktree`** — branch is local-only; 9 feature commits + HANDOFF ready. `git push -u origin feature/session-history-per-worktree` then open PR to `main`.
+- **"Remove from history" confirm** — add an inline confirm or Undo toast so the destructive action is recoverable (see rough edges above).
 
 **Multi-group / chrome polish:**
 
