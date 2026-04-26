@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-26
 **Branch target:** new feature branch off `main`
-**Status:** approved, ready for implementation plan
+**Status:** implemented on `feature/session-history-per-worktree`; the *Problem* section describes pre-implementation state (auto-resume since removed — see ADR-0013).
 
 ## Problem
 
