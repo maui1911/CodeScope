@@ -13,8 +13,18 @@ public sealed partial class WorktreeViewModel : ObservableObject
     {
         ProjectId = projectId;
         Worktree = worktree;
-        _isExpanded = true;
+        _isExpanded = false;
         Sessions = [];
+        History = [];
+        // History items intentionally do NOT subscribe to per-item PropertyChanged (unlike Sessions):
+        // closed rows have no live Status to propagate, and rows can be removed (rename/remove/cascade)
+        // so a per-item subscription would leak.
+        History.CollectionChanged += (_, _) =>
+        {
+            OnPropertyChanged(nameof(HasHistory));
+            OnPropertyChanged(nameof(HistoryCount));
+            OnPropertyChanged(nameof(HistoryHeader));
+        };
         // Sessions.Count drives HasActiveSession and DotState — raise both when the
         // collection mutates so the accent bar + 6px dot update without a full rebuild.
         // Additionally subscribe to per-session Status changes so the pulse lights up
@@ -56,6 +66,20 @@ public sealed partial class WorktreeViewModel : ObservableObject
         => $"Worktree_{AutomationIds.SafeToken(ProjectId)}__{AutomationIds.SafeToken(DisplayBranch)}";
 
     public ObservableCollection<SessionTabViewModel> Sessions { get; }
+
+    /// <summary>
+    /// Soft-closed sessions belonging to this worktree. Sorted by store-projection logic
+    /// (most-recent <c>ClosedAt</c> first). Empty for fresh worktrees; the sidebar history
+    /// disclosure is hidden when <see cref="HasHistory"/> is false.
+    /// </summary>
+    public ObservableCollection<SessionTabViewModel> History { get; }
+
+    public bool HasHistory => History.Count > 0;
+
+    public int HistoryCount => History.Count;
+
+    /// <summary>"History (3)" — bound by the sidebar disclosure header.</summary>
+    public string HistoryHeader => $"History ({HistoryCount})";
 
     [ObservableProperty]
     private bool _isExpanded;

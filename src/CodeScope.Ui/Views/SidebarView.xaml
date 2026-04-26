@@ -187,8 +187,11 @@
             PreviewKeyDown="OnTreeKeyDown">
             <TreeView.ItemContainerStyle>
                 <Style TargetType="TreeViewItem">
-                    <Setter Property="Visibility" Value="{Binding IsVisible, Converter={StaticResource BoolVisible}}" />
-                    <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
+                    <!-- FallbackValue ensures no binding errors for SessionTabViewModel children
+                         (history rows) which don't expose IsVisible or IsExpanded. Project/Worktree
+                         nodes supply both; leaf session rows fall back to Visible/False silently. -->
+                    <Setter Property="Visibility" Value="{Binding IsVisible, Converter={StaticResource BoolVisible}, FallbackValue=Visible}" />
+                    <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay, FallbackValue=False}" />
                     <Setter Property="Foreground" Value="{DynamicResource Fig.Brush.Ink}" />
                     <Setter Property="Padding" Value="0" />
                     <Setter Property="HorizontalContentAlignment" Value="Stretch" />
@@ -247,13 +250,51 @@
             <!-- Disable horizontal scrolling; rows should always fit the sidebar column. -->
             <ScrollViewer.HorizontalScrollBarVisibility>Disabled</ScrollViewer.HorizontalScrollBarVisibility>
             <TreeView.Resources>
+                <!-- Closed-session row inside a worktree's History disclosure. Dim opacity, outline dot,
+                     relative-time suffix. Bound to SessionTabViewModel — same VM type as live rows, but
+                     parented under WorktreeViewModel.History so the binding resolves to this template. -->
+                <DataTemplate DataType="{x:Type vm:SessionTabViewModel}">
+                    <Grid Height="24" Opacity="0.55">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="36" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+
+                        <Ellipse Grid.Column="1"
+                                 Width="6" Height="6"
+                                 Margin="0,0,8,0"
+                                 VerticalAlignment="Center"
+                                 Stroke="{DynamicResource Text.Faint}"
+                                 StrokeThickness="1"
+                                 Fill="Transparent" />
+
+                        <TextBlock Grid.Column="2"
+                                   Text="{Binding DisplayName}"
+                                   FontFamily="{DynamicResource Fig.Font.Mono}"
+                                   FontSize="11"
+                                   VerticalAlignment="Center"
+                                   Foreground="{DynamicResource Text.Secondary}"
+                                   TextTrimming="CharacterEllipsis" />
+
+                        <TextBlock Grid.Column="3"
+                                   Margin="8,0,12,0"
+                                   Text="{Binding ClosedAtRelative}"
+                                   FontFamily="{DynamicResource Fig.Font.Mono}"
+                                   FontSize="10"
+                                   VerticalAlignment="Center"
+                                   Foreground="{DynamicResource Text.Faint}" />
+                    </Grid>
+                </DataTemplate>
+
                 <!-- Worktree row — matches codescope-shared.css .wt:
                        * 2px accent bar on the left when the worktree has sessions
                        * mono branch name
                        * right-aligned status slug ("chg" / "idle" / "wait" / "↑N ↓N") -->
-                <!-- Worktrees are leaves — sessions live in the tab bar, not nested in the sidebar.
-                     Matches the spec's two-level tree (project → worktree). -->
-                <DataTemplate DataType="{x:Type vm:WorktreeViewModel}">
+                <HierarchicalDataTemplate
+                    DataType="{x:Type vm:WorktreeViewModel}"
+                    ItemsSource="{Binding History}">
                     <Grid Height="28">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="Auto" />  <!-- 2px session rail, flush at x=0 -->
@@ -261,6 +302,7 @@
                             <ColumnDefinition Width="Auto" />  <!-- 6px status dot -->
                             <ColumnDefinition Width="*" />     <!-- branch name -->
                             <ColumnDefinition Width="Auto" />  <!-- right-aligned meta -->
+                            <ColumnDefinition Width="Auto" />  <!-- history-count badge -->
                         </Grid.ColumnDefinitions>
 
                         <!-- Sidebar spec §5 — full-height 2px accent bar on the left edge whenever
@@ -389,8 +431,54 @@
                             FontSize="10"
                             VerticalAlignment="Center"
                             Foreground="{DynamicResource Text.Faint}" />
+                        <!-- Disclosure chevron — only visual hint that this worktree has history.
+                             Rotates 0→90° based on the ancestor TreeViewItem's IsExpanded.
+                             Hidden when there is no history. Wrapped in a transparent Border so
+                             clicking the chevron toggles expand/collapse (mirrors the project
+                             chevron pattern); the Path itself stays IsHitTestVisible=False. -->
+                        <Border
+                            Grid.Column="5"
+                            Background="Transparent"
+                            Cursor="Hand"
+                            ToolTip="Expand / collapse history"
+                            Margin="8,0,12,0"
+                            VerticalAlignment="Center"
+                            Visibility="{Binding HasHistory, Converter={StaticResource BoolToVisibility}}"
+                            PreviewMouseLeftButtonDown="OnChevronClick">
+                            <Path
+                                Width="8" Height="8"
+                                Stretch="Uniform"
+                                Data="M3 1.5 L6 4 L3 6.5"
+                                Stroke="{DynamicResource Text.Faint}"
+                                StrokeThickness="1.2"
+                                StrokeStartLineCap="Round"
+                                StrokeEndLineCap="Round"
+                                StrokeLineJoin="Round"
+                                VerticalAlignment="Center"
+                                IsHitTestVisible="False"
+                                RenderTransformOrigin="0.5,0.5">
+                                <Path.Style>
+                                    <Style TargetType="Path">
+                                        <Setter Property="RenderTransform">
+                                            <Setter.Value>
+                                                <RotateTransform Angle="0" />
+                                            </Setter.Value>
+                                        </Setter>
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding Path=IsExpanded, RelativeSource={RelativeSource AncestorType=TreeViewItem}}" Value="True">
+                                                <Setter Property="RenderTransform">
+                                                    <Setter.Value>
+                                                        <RotateTransform Angle="90" />
+                                                    </Setter.Value>
+                                                </Setter>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Path.Style>
+                            </Path>
+                        </Border>
                     </Grid>
-                </DataTemplate>
+                </HierarchicalDataTemplate>
 
                 <!-- Project row — matches codescope-shared.css .proj:
                        * bold name on the left

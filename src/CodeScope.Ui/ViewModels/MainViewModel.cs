@@ -5,6 +5,7 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using NoScope.CodeScope.Core.Models;
 using NoScope.CodeScope.Core.Services;
+using NoScope.CodeScope.Ui.Services;
 using Microsoft.Extensions.Logging;
 
 namespace NoScope.CodeScope.Ui.ViewModels;
@@ -26,6 +27,7 @@ public sealed partial class MainViewModel : ObservableObject
     private readonly IClaudeTelemetryService? _telemetry;
     private readonly INotificationService? _notifications;
     private readonly IClaudeSessionDiscovery? _discovery;
+    private readonly IToastService? _toasts;
     private readonly Dictionary<string, ClaudeActivityState> _lastActivity = [];
     // Per-tab discovery watcher — disposed on adoption or tab close.
     private readonly Dictionary<string, IDisposable> _discoveryWatches = [];
@@ -39,7 +41,8 @@ public sealed partial class MainViewModel : ObservableObject
         Func<CancellationToken, Task>? refresh = null,
         IClaudeTelemetryService? telemetry = null,
         INotificationService? notifications = null,
-        IClaudeSessionDiscovery? discovery = null)
+        IClaudeSessionDiscovery? discovery = null,
+        IToastService? toasts = null)
     {
         _sessionManager = sessionManager;
         _store = store;
@@ -50,6 +53,7 @@ public sealed partial class MainViewModel : ObservableObject
         _telemetry = telemetry;
         _notifications = notifications;
         _discovery = discovery;
+        _toasts = toasts;
         if (_telemetry is not null) { _telemetry.Updated += OnTelemetryUpdated; }
         if (_notifications is not null)
         {
@@ -362,26 +366,7 @@ public sealed partial class MainViewModel : ObservableObject
 
         if (project is null) { return; }
 
-        // Soft-close resume — if this worktree has a closed session that would match the agent
-        // the user is about to spawn, restore it instead of minting a new one. Restart is the
-        // explicit "start fresh" escape hatch; New session gives you back whatever was live
-        // last time. Keeps the 1-session-per-worktree invariant (we match on WorktreeId +
-        // resolved agent id).
         var resolvedAgentId = ResolveAgentIdForNewSession(project, agentId);
-        if (worktree is not null
-            && resolvedAgentId is not null
-            && !string.Equals(resolvedAgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase))
-        {
-            var closed = project.Sessions.FirstOrDefault(s =>
-                s.ClosedAt is not null
-                && string.Equals(s.WorktreeId, worktree.Id, StringComparison.Ordinal)
-                && string.Equals(s.AgentId, resolvedAgentId, StringComparison.OrdinalIgnoreCase)
-                && s.AgentSessionId is { Length: > 0 });
-            if (closed is not null && await TryRestoreSessionAsync(project, worktree, closed).ConfigureAwait(true))
-            {
-                return;
-            }
-        }
 
         // Resolve agent / shell from the same priority used above (explicit arg → project default
         // → global default). resolvedAgentId == ShellSentinel selects the shell; null falls back
@@ -432,9 +417,10 @@ public sealed partial class MainViewModel : ObservableObject
 
     /// <summary>
     /// Resolves the agent id that <see cref="NewSessionAsync"/> would end up using, mirroring
-    /// its priority (explicit arg → project default → global default). Used to look up a
-    /// matching soft-closed session *before* we spawn anything. Returns null for the global
-    /// default when no profile is registered — caller treats null as "no resume candidate".
+    /// its priority (explicit arg → project default → global default). Returns
+    /// <see cref="ShellSentinel"/> when the user explicitly picked the shell, the registered
+    /// agent id when one matches, or <c>null</c> when no profile matches and no global default
+    /// is registered. Reused by the explicit-reopen command in a later task.
     /// </summary>
     private string? ResolveAgentIdForNewSession(Project project, string? explicitAgentId)
     {
@@ -550,21 +536,42 @@ public sealed partial class MainViewModel : ObservableObject
     }
 
     /// <summary>
-    /// Restores a soft-closed session: clears <see cref="Session.ClosedAt"/> in the store,
-    /// spawns a resume-flavoured descriptor (<c>--resume &lt;AgentSessionId&gt;</c> via
-    /// <see cref="SessionManager.CreateAgentSession"/> with <c>resume: true</c>), adds the tab,
-    /// and kicks off Claude adoption so telemetry follows across the rotation. Returns
-    /// <c>false</c> when the restore couldn't be persisted or the agent profile has vanished.
+    /// Restores a soft-closed session: clears <see cref="Session.ClosedAt"/> in the store and
+    /// spawns a tab. Resumable agents (Claude/Codex) get a <c>--resume &lt;id&gt;</c> descriptor;
+    /// shells respawn pwsh in the original cwd.
+    /// Returns <c>false</c> when:
+    /// <list type="bullet">
+    ///   <item>the agent profile is no longer registered (non-shell session with unknown AgentId),</item>
+    ///   <item>the worktree directory no longer exists on disk, or</item>
+    ///   <item>the store rejects the restore (e.g. session id not found).</item>
+    /// </list>
     /// </summary>
     private async Task<bool> TryRestoreSessionAsync(Project project, Worktree worktree, Session closed)
     {
-        if (string.IsNullOrEmpty(closed.AgentId)
-            || string.Equals(closed.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase))
+        // Resolve agent / shell before touching the store so we never clear ClosedAt on a
+        // session we can't actually reopen.
+        var useShell = string.IsNullOrEmpty(closed.AgentId)
+            || string.Equals(closed.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase);
+        var agent = useShell ? null : _agents.GetById(closed.AgentId!);
+
+        // Fix 2: non-shell AgentId with no matching profile — keep closed, do not create a
+        // shell session with stale metadata.
+        if (!useShell && agent is null)
         {
+            _logger.LogWarning(
+                "ReopenClosedSession: agent profile '{AgentId}' is no longer registered; " +
+                "session '{SessionId}' kept closed.", closed.AgentId, closed.Id);
             return false;
         }
-        var agent = _agents.GetById(closed.AgentId);
-        if (agent is null) { return false; }
+
+        // Fix 4: guard against a missing worktree directory — log and bail without clearing ClosedAt.
+        if (!Directory.Exists(worktree.Path))
+        {
+            _logger.LogWarning(
+                "ReopenClosedSession: worktree path '{Path}' no longer exists; " +
+                "session '{SessionId}' kept closed.", worktree.Path, closed.Id);
+            return false;
+        }
 
         var restored = await _store.RestoreSessionAsync(closed.Id).ConfigureAwait(true);
         if (restored.IsFailure)
@@ -573,19 +580,25 @@ public sealed partial class MainViewModel : ObservableObject
             return false;
         }
 
-        var descriptor = _sessionManager.CreateAgentSession(
-            worktree.Path, agent, closed.Id, resume: true, agentSessionId: closed.AgentSessionId);
+        SessionDescriptor descriptor;
+        if (agent is null)
+        {
+            descriptor = _sessionManager.CreateShellSession(worktree.Path, closed.Id);
+        }
+        else
+        {
+            descriptor = _sessionManager.CreateAgentSession(
+                worktree.Path, agent, closed.Id, resume: true, agentSessionId: closed.AgentSessionId);
+        }
         if (worktree.Branch is { Length: > 0 } branch)
         {
             descriptor = descriptor with { Title = $"{project.Name} · {branch}" };
         }
 
-        var vm = new SessionTabViewModel(descriptor, project.Id, closed.AgentId, closed.DisplayName, agent.Icon);
+        var vm = new SessionTabViewModel(descriptor, project.Id, closed.AgentId, closed.DisplayName, agent?.Icon);
         FocusedGroup.Tabs.Add(vm);
         SelectedTab = vm;
-        // Eager telemetry seed — same reasoning as the hydrate path: `claude --resume <id>`
-        // reuses the existing jsonl, so the adoption watch won't fire until the next turn
-        // and the status bar would stay frozen on the just-restored tab.
+
         if (string.Equals(closed.AgentId, "claude", StringComparison.OrdinalIgnoreCase)
             && closed.AgentSessionId is { Length: > 0 } sid)
         {
@@ -595,6 +608,87 @@ public sealed partial class MainViewModel : ObservableObject
         OnPropertyChanged(nameof(CanCloseGroup));
         CloseGroupCommand.NotifyCanExecuteChanged();
         return true;
+    }
+
+    /// <summary>
+    /// Public entry-point for reopening a closed session from the sidebar history surface.
+    /// Looks up the parent project + worktree by id, does pre-flight checks (agent profile
+    /// present, worktree directory exists), toasts on each failure, then delegates to
+    /// <see cref="TryRestoreSessionAsync"/>. No-op when the session is no longer in the
+    /// store (e.g. removed from history between right-click and click).
+    /// </summary>
+    [RelayCommand]
+    private async Task ReopenClosedSessionAsync(string? sessionId)
+    {
+        if (string.IsNullOrEmpty(sessionId)) { return; }
+        var hit = _store.Projects
+            .SelectMany(p => p.Sessions.Select(s => (project: p, session: s)))
+            .FirstOrDefault(x => x.session.Id == sessionId);
+        if (hit.session is null || hit.session.ClosedAt is null) { return; }
+        var worktree = hit.project.Worktrees.FirstOrDefault(w => w.Id == hit.session.WorktreeId)
+                       ?? hit.project.Worktrees.FirstOrDefault(w => w.IsPrimary)
+                       ?? hit.project.Worktrees.FirstOrDefault();
+        if (worktree is null) { return; }
+
+        // Pre-flight: agent profile check.
+        var useShell = string.IsNullOrEmpty(hit.session.AgentId)
+            || string.Equals(hit.session.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase);
+        if (!useShell && _agents.GetById(hit.session.AgentId!) is null)
+        {
+            ErrToast(
+                "Cannot reopen session",
+                $"The '{hit.session.AgentId}' agent is no longer registered. " +
+                "Remove this entry from history or restore the agent profile.");
+            return;
+        }
+
+        // Pre-flight: directory check uses the session's stored WorktreePath, not the fallback
+        // worktree's path. If the original directory is gone (deleted worktree, moved repo, etc.)
+        // toast and bail regardless of which worktree object we resolved above.
+        var sessionDir = hit.session.WorktreePath;
+        if (!Directory.Exists(sessionDir))
+        {
+            ErrToast(
+                "Cannot reopen session",
+                $"Session directory '{sessionDir}' is gone. Remove this entry from history.");
+            return;
+        }
+
+        // If the worktree's stored path differs from the session's WorktreePath (i.e. we fell
+        // back to the primary/first worktree), use a synthetic Worktree with the correct path
+        // so TryRestoreSessionAsync spawns the shell/agent in the right directory.
+        var effectiveWorktree = string.Equals(worktree.Path, sessionDir, StringComparison.OrdinalIgnoreCase)
+            ? worktree
+            : worktree with { Path = sessionDir };
+
+        var ok = await TryRestoreSessionAsync(hit.project, effectiveWorktree, hit.session).ConfigureAwait(true);
+        if (!ok)
+        {
+            // TryRestoreSessionAsync returns false only when the store itself rejects the
+            // restore (the two pre-flight paths above are caught above). Surface the failure
+            // so the user knows the click wasn't a no-op.
+            ErrToast("Reopen failed", "The session could not be restored. Check the log for details.");
+        }
+    }
+
+    private void Toast(string title, string message, ToastSeverity severity)
+    {
+        if (_toasts is null) { return; }
+        _toasts.Show(new ToastRequest(severity, title, message));
+    }
+
+    private void ErrToast(string title, string message)
+    {
+        if (_toasts is null) { return; }
+        var actions = new List<ToastAction>
+        {
+            new("Copy", () =>
+            {
+                try { System.Windows.Clipboard.SetText(message); }
+                catch (Exception ex) { _logger.LogDebug(ex, "Toast copy failed"); }
+            }),
+        };
+        _toasts.Show(new ToastRequest(ToastSeverity.Err, title, message, Actions: actions));
     }
 
     /// <summary>
@@ -653,10 +747,11 @@ public sealed partial class MainViewModel : ObservableObject
 
     /// <summary>
     /// Closes a tab. When <paramref name="hardRemove"/> is <c>false</c> (default) the session is
-    /// <em>soft-closed</em> for agents that can resume (<see cref="AgentProfile.ResumeByIdArgs"/> +
-    /// persisted <see cref="Session.AgentSessionId"/>) — next <c>New session</c> on the same worktree
-    /// restores the conversation. Shells and agents without resume support are always hard-removed.
-    /// Callers that definitely want the session gone (Restart, worktree cascade) pass <c>true</c>.
+    /// <em>soft-closed</em> — the row stays in the store with <see cref="Session.ClosedAt"/> set,
+    /// reachable from the worktree's history surface. Reopen logic in
+    /// <c>ReopenClosedSessionAsync</c> resumes resumable agents via <c>--resume &lt;id&gt;</c> and
+    /// respawns shells (and other non-resumable agents) in the original cwd. Callers that want
+    /// the row gone for good (Restart) pass <c>true</c>.
     /// </summary>
     private async Task CloseTabAsync(SessionTabViewModel? tab, bool hardRemove)
     {
@@ -678,14 +773,14 @@ public sealed partial class MainViewModel : ObservableObject
         if (storedForTab?.AgentSessionId is { Length: > 0 } tsid) { _telemetry?.Unregister(tsid); }
         StopClaudeAdoption(tab.Descriptor.Id);
 
-        // Resumable = agent with ResumeByIdArgs and a persisted AgentSessionId.
-        var resumable = !hardRemove
-            && storedForTab?.AgentSessionId is { Length: > 0 }
-            && !string.IsNullOrEmpty(storedForTab.AgentId)
-            && !string.Equals(storedForTab.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase)
-            && _agents.GetById(storedForTab.AgentId!)?.ResumeByIdArgs.Count > 0;
-
-        if (resumable)
+        // History: every closed session is preserved (soft-close) unless the caller asks for a
+        // hard remove (Restart is the only such caller today). Reopen handles three buckets:
+        // shells respawn pwsh in the original cwd; agents with ResumeByIdArgs + AgentSessionId
+        // resume via --resume <id>; agents without resume support also respawn fresh.
+        // Sessions whose store row vanished mid-flight (storedForTab is null) fall through to
+        // RemoveSessionAsync — there is nothing to soft-close.
+        var canSoftClose = !hardRemove && storedForTab is not null;
+        if (canSoftClose)
         {
             await _store.SoftCloseSessionAsync(tab.Descriptor.Id).ConfigureAwait(true);
         }
@@ -835,10 +930,9 @@ public sealed partial class MainViewModel : ObservableObject
         if (tab is null) { return; }
 
         await DuplicateTabAsync(tab).ConfigureAwait(true);
-        // Hard-remove: Restart is "throw away the old conversation and start fresh" — without
-        // hardRemove the old row would linger as a soft-closed entry and get resumed the next
-        // time the user clicks New session on this worktree, which is exactly the opposite of
-        // what Restart means.
+        // Hard-remove so the old row doesn't linger in history: restart semantically discards
+        // prior conversation state, so the closed session must not appear in the explicit
+        // history surface where the user would otherwise reopen it via RestoreSessionAsync.
         await CloseTabAsync(tab, hardRemove: true).ConfigureAwait(true);
     }
 
@@ -876,6 +970,11 @@ public sealed partial class MainViewModel : ObservableObject
     {
         void Apply()
         {
+            // SessionAdded/SessionRenamed are intentionally not handled here. Tab membership is owned by
+            // MainViewModel — NewSessionAsync, DuplicateTabAsync, TryRestoreSessionAsync, and
+            // RestoreClosedWorktreeSessionsAsync each add their VM directly to FocusedGroup.Tabs and the
+            // store mutation is the side-effect, not the source of truth. The sidebar projection
+            // (SidebarViewModel.StoreSync) consumes those events for its own tree.
             switch (change)
             {
                 case SessionStoreChange.Loaded loaded:
@@ -938,9 +1037,9 @@ public sealed partial class MainViewModel : ObservableObject
         {
             foreach (var s in p.Sessions)
             {
-                // Soft-closed sessions are kept on disk for resume-on-next-NewSession but
-                // don't materialise as tabs at startup — they'd spawn dozens of ghost pwsh
-                // children otherwise.
+                // Closed sessions are kept on disk for explicit reopen via the sidebar
+                // history surface — they don't materialise as tabs at startup so we don't
+                // spawn dozens of ghost pwsh children.
                 if (s.ClosedAt is not null) { continue; }
                 if (!Directory.Exists(s.WorktreePath)) { continue; }
                 var agent = string.IsNullOrEmpty(s.AgentId) || string.Equals(s.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase)

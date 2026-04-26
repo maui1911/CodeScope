@@ -603,7 +603,7 @@ public sealed class SessionStoreTests
     }
 
     [Fact]
-    public async Task SoftCloseSessionAsync_Marks_Closed_And_Emits_Removed()
+    public async Task SoftCloseSessionAsync_Marks_Closed_And_Emits_SoftClosed()
     {
         var (store, _, _) = Make();
         var project = (await store.AddProjectAsync(@"C:\demo", "D")).Value;
@@ -623,7 +623,12 @@ public sealed class SessionStoreTests
         var after = store.Projects.SelectMany(p => p.Sessions).Single(s => s.Id == sid);
         after.ClosedAt.Should().NotBeNull();
         after.AgentSessionId.Should().Be("abc", "the resume id must survive soft-close");
-        events.OfType<SessionStoreChange.SessionRemoved>().Should().ContainSingle();
+        // SoftCloseSessionAsync now raises SessionSoftClosed (not SessionRemoved) so
+        // sidebar listeners receive the closed Session payload without re-querying the store.
+        events.OfType<SessionStoreChange.SessionSoftClosed>().Should().ContainSingle()
+            .Which.Session.Id.Should().Be(sid);
+        events.OfType<SessionStoreChange.SessionRemoved>().Should().BeEmpty(
+            "soft-close must not raise SessionRemoved; only hard-remove does");
     }
 
     [Fact]
@@ -669,7 +674,7 @@ public sealed class SessionStoreTests
         var second = await store.SoftCloseSessionAsync(sid);
 
         second.IsSuccess.Should().BeTrue();
-        events.OfType<SessionStoreChange.SessionRemoved>().Should().BeEmpty("re-close should not emit a second event");
+        events.OfType<SessionStoreChange.SessionSoftClosed>().Should().BeEmpty("re-close should not emit a second event");
     }
 
     [Fact]
@@ -693,5 +698,47 @@ public sealed class SessionStoreTests
 
         store.Projects.Single(p => p.Id == project.Id)
             .Sessions.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task RemoveWorktree_Cascades_Over_Open_And_Closed_Sessions()
+    {
+        // Both open and soft-closed sessions on the removed worktree must be purged.
+        // Regression guard: ensures the history feature cannot strand orphaned closed
+        // sessions when the worktree they belong to is deleted.
+        var (store, _, _) = Make();
+        var project = (await store.AddProjectAsync(@"C:\repo", "repo")).Value;
+        var wt = (await store.AddWorktreeAsync(project.Id, @"C:\repo-feat", "feat")).Value;
+
+        var openSession = new Session
+        {
+            Id = "open-1",
+            WorktreePath = wt.Path,
+            WorktreeId = wt.Id,
+            AgentId = "claude",
+            AgentSessionId = "agent-open",
+        };
+        var closedSession = new Session
+        {
+            Id = "closed-1",
+            WorktreePath = wt.Path,
+            WorktreeId = wt.Id,
+            AgentId = "claude",
+            AgentSessionId = "agent-closed",
+        };
+
+        (await store.AddSessionAsync(project.Id, openSession)).IsSuccess.Should().BeTrue();
+        (await store.AddSessionAsync(project.Id, closedSession)).IsSuccess.Should().BeTrue();
+        (await store.SoftCloseSessionAsync(closedSession.Id)).IsSuccess.Should().BeTrue();
+
+        var removed = await store.RemoveWorktreeAsync(project.Id, wt.Id);
+
+        removed.IsSuccess.Should().BeTrue();
+        var afterProject = store.Projects.Single(p => p.Id == project.Id);
+        afterProject.Worktrees.Should().NotContain(w => w.Id == wt.Id);
+        afterProject.Sessions.Should().NotContain(s => s.Id == openSession.Id,
+            because: "open sessions on a removed worktree must cascade-delete");
+        afterProject.Sessions.Should().NotContain(s => s.Id == closedSession.Id,
+            because: "soft-closed sessions on a removed worktree must cascade-delete");
     }
 }

@@ -146,3 +146,33 @@ the VM into `LayoutStore` directly. Tracking under the mid_level_elegance review
 **Consequences:**
 - Fresh contributors grep for `<Name>.Commands.cs` to find a context-menu action; this is the convention.
 - Reviewers should not flag a single-file VM under the threshold as "inconsistent with the split" — size matters.
+
+---
+
+## ADR-0013 — Auto-resume on `New session` removed; per-worktree history is the explicit surface
+
+**Date:** 2026-04-26
+**Status:** Accepted
+
+`MainViewModel.NewSessionAsync` previously matched any soft-closed session for
+`(worktree, agent)` and restored it transparently in place of minting a fresh
+session. The implicit behaviour shipped because there was no UI to see closed
+sessions. Side-effect: a second closed conversation on the same worktree was
+shadowed by `FirstOrDefault`.
+
+**Decision:** Drop the auto-resume block. *New session* always mints fresh. Reopening a
+closed session is an explicit action driven by the per-worktree history
+surface (sidebar disclosure under each worktree + a "Reopen most recent
+closed session" item in the worktree context menu).
+
+**Consequences:**
+- Returning users learn one new affordance (history disclosure) and the
+  one-keystroke worktree-context-menu shortcut for the most-recent-closed
+  case.
+- The `TryRestoreSessionAsync` helper stays as the implementation of explicit
+  reopen.
+- The drag-between-groups path (`MoveTabToGroup`) is unaffected — it never
+  routed through the auto-resume block.
+- `projects.json` now accumulates `Session` entries for closed shells too;
+  pre-this-change, shells were always hard-removed on close so `projects.json`
+  never carried shell rows.
