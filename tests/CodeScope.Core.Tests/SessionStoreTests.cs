@@ -268,6 +268,110 @@ public sealed class SessionStoreTests
     }
 
     [Fact]
+    public async Task RemoveWorktreeAsync_Recovers_When_Git_Already_Orphaned_Admin_Entry()
+    {
+        // Simulates the Windows partial-remove: `git worktree remove` failed (e.g. could not
+        // delete dir), but the admin entry was already gone. ListWorktreesAsync confirms the
+        // path is no longer registered, so the store should drop its entry and return Ok.
+        var (store, _, git) = Make();
+        var project = (await store.AddProjectAsync(@"C:\demo", "D")).Value;
+        var wt = (await store.AddWorktreeAsync(project.Id, @"C:\demo.wt\feat-x", "feat/x")).Value;
+
+        git.RemoveWorktreeAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<bool>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(Result<bool>.Fail("fatal: '...' is not a working tree")));
+        // Re-query: only the primary remains, the secondary's admin entry is gone.
+        git.ListWorktreesAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(Result<IReadOnlyList<Worktree>>.Ok(
+                new List<Worktree> { new() { Id = "primary", Path = @"C:\demo", IsPrimary = true } })));
+
+        var result = await store.RemoveWorktreeAsync(project.Id, wt.Id);
+
+        result.IsSuccess.Should().BeTrue();
+        store.Projects.Single().Worktrees.Should().ContainSingle(w => w.IsPrimary);
+    }
+
+    [Fact]
+    public async Task RemoveWorktreeAsync_Returns_Original_Error_When_Git_Still_Lists_Path()
+    {
+        // git failed and the entry is still registered — recovery is not appropriate, the
+        // user should see the actual error so they can act on it (e.g. close locking process).
+        var (store, _, git) = Make();
+        var project = (await store.AddProjectAsync(@"C:\demo", "D")).Value;
+        var wt = (await store.AddWorktreeAsync(project.Id, @"C:\demo.wt\feat-x", "feat/x")).Value;
+
+        git.RemoveWorktreeAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<bool>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(Result<bool>.Fail("fatal: contains modified or untracked files")));
+        git.ListWorktreesAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(Result<IReadOnlyList<Worktree>>.Ok(
+                new List<Worktree>
+                {
+                    new() { Id = "primary", Path = @"C:\demo", IsPrimary = true },
+                    new() { Id = wt.Id, Path = wt.Path, IsPrimary = false },
+                })));
+
+        var result = await store.RemoveWorktreeAsync(project.Id, wt.Id);
+
+        result.IsFailure.Should().BeTrue();
+        result.Error.Should().Contain("untracked");
+        // Worktree still in store — the user can retry / force.
+        store.Projects.Single().Worktrees.Should().ContainSingle(w => !w.IsPrimary);
+    }
+
+    [Fact]
+    public async Task RemoveWorktreeAsync_Recovery_Path_Match_Is_Case_Insensitive_And_Slash_Tolerant()
+    {
+        // git's worktree list output may differ in casing or trailing-slash from what we
+        // recorded; the recovery path comparison must normalise both sides.
+        var (store, _, git) = Make();
+        var project = (await store.AddProjectAsync(@"C:\Demo", "D")).Value;
+        var wt = (await store.AddWorktreeAsync(project.Id, @"C:\Demo.wt\Feat-X", "feat/x")).Value;
+
+        git.RemoveWorktreeAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<bool>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(Result<bool>.Fail("not a working tree")));
+        // Same admin entry still listed but with different casing + trailing slash → should
+        // be detected as still-registered and the original error returned.
+        git.ListWorktreesAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(Result<IReadOnlyList<Worktree>>.Ok(
+                new List<Worktree>
+                {
+                    new() { Id = "primary", Path = @"C:\Demo", IsPrimary = true },
+                    new() { Id = wt.Id, Path = @"c:\demo.wt\feat-x\", IsPrimary = false },
+                })));
+
+        var result = await store.RemoveWorktreeAsync(project.Id, wt.Id);
+
+        result.IsFailure.Should().BeTrue();
+        store.Projects.Single().Worktrees.Should().Contain(w => w.Id == wt.Id);
+    }
+
+    [Fact]
+    public async Task RemoveWorktreeAsync_Concurrent_Calls_For_Same_Worktree_Reject_The_Second()
+    {
+        // Two parallel callers must not both enter the recovery path. The second one is
+        // rejected immediately; the first proceeds normally.
+        var (store, _, git) = Make();
+        var project = (await store.AddProjectAsync(@"C:\demo", "D")).Value;
+        var wt = (await store.AddWorktreeAsync(project.Id, @"C:\demo.wt\feat-x", "feat/x")).Value;
+
+        var gate = new TaskCompletionSource<Result<bool>>();
+        git.RemoveWorktreeAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<bool>(), Arg.Any<CancellationToken>())
+            .Returns(_ => gate.Task);
+
+        var first = store.RemoveWorktreeAsync(project.Id, wt.Id);
+        // Give the first call a chance to enter and register itself in _removalsInFlight.
+        await Task.Delay(50);
+        var second = store.RemoveWorktreeAsync(project.Id, wt.Id);
+
+        var secondResult = await second;
+        secondResult.IsFailure.Should().BeTrue();
+        secondResult.Error.Should().Contain("already in progress");
+
+        gate.SetResult(Result<bool>.Ok(true));
+        var firstResult = await first;
+        firstResult.IsSuccess.Should().BeTrue();
+    }
+
+    [Fact]
     public async Task RenameWorktreeAsync_Shells_Git_Move_And_Updates_Path_And_Sessions()
     {
         var (store, _, git) = Make();
