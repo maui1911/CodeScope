@@ -110,7 +110,11 @@ public sealed partial class SidebarViewModel
             ShellArgs = [],
             Title = s.DisplayName ?? s.AgentId ?? System.IO.Path.GetFileName(s.WorktreePath),
         };
-        return new SessionTabViewModel(descriptor, projectId, s.AgentId, s.DisplayName) { IsActive = false };
+        return new SessionTabViewModel(descriptor, projectId, s.AgentId, s.DisplayName)
+        {
+            IsActive = false,
+            ClosedAt = s.ClosedAt,
+        };
     }
 
     private void RemoveProjectVM(string projectId)

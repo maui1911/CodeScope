@@ -50,6 +50,30 @@ public sealed partial class SessionTabViewModel : ObservableObject
     private bool _isActive;
 
     /// <summary>
+    /// When this row is a closed-session entry in a worktree's history, holds the
+    /// ClosedAt timestamp. Null for live tabs. Set by <see cref="SidebarViewModel"/>
+    /// projection (BuildSessionRow) when the source <see cref="Session"/> has a
+    /// non-null <c>ClosedAt</c>.
+    /// </summary>
+    public DateTimeOffset? ClosedAt { get; init; }
+
+    /// <summary>"2h ago" / "yesterday" / "3d ago" / "Mar 14" — empty for live rows.</summary>
+    public string ClosedAtRelative
+    {
+        get
+        {
+            if (ClosedAt is not { } when_) { return string.Empty; }
+            var delta = DateTimeOffset.UtcNow - when_;
+            if (delta < TimeSpan.FromMinutes(1)) { return "just now"; }
+            if (delta < TimeSpan.FromHours(1))   { return $"{(int)delta.TotalMinutes}m ago"; }
+            if (delta < TimeSpan.FromHours(24))  { return $"{(int)delta.TotalHours}h ago"; }
+            if (delta < TimeSpan.FromDays(2))    { return "yesterday"; }
+            if (delta < TimeSpan.FromDays(7))    { return $"{(int)delta.TotalDays}d ago"; }
+            return when_.LocalDateTime.ToString("MMM d");
+        }
+    }
+
+    /// <summary>
     /// Semantic session state driving the status dot on the tab row.
     /// <c>Busy</c> = agent is composing or running a tool, <c>Idle</c> = turn finished, awaiting your input.
     /// Default is <c>Idle</c> so shell sessions (no telemetry) sit calm out of the box.
