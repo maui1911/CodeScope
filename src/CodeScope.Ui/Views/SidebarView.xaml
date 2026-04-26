@@ -428,54 +428,43 @@
                             FontSize="10"
                             VerticalAlignment="Center"
                             Foreground="{DynamicResource Text.Faint}" />
-                        <StackPanel
+                        <!-- Disclosure chevron — only visual hint that this worktree has history.
+                             Rotates 0→90° based on the ancestor TreeViewItem's IsExpanded.
+                             Hidden when there is no history. -->
+                        <Path
                             Grid.Column="5"
+                            Width="8" Height="8"
                             Margin="8,0,12,0"
-                            Orientation="Horizontal"
+                            Stretch="Uniform"
+                            Data="M3 1.5 L6 4 L3 6.5"
+                            Stroke="{DynamicResource Text.Faint}"
+                            StrokeThickness="1.2"
+                            StrokeStartLineCap="Round"
+                            StrokeEndLineCap="Round"
+                            StrokeLineJoin="Round"
                             VerticalAlignment="Center"
+                            IsHitTestVisible="False"
+                            RenderTransformOrigin="0.5,0.5"
                             Visibility="{Binding HasHistory, Converter={StaticResource BoolToVisibility}}">
-                            <!-- Disclosure chevron — rotates 0→90° when the worktree expands so it's
-                                 visible that "History (N)" is clickable. Matches the project-row chevron
-                                 pattern. Bound to the ancestor TreeViewItem's IsExpanded. -->
-                            <Path
-                                Width="8" Height="8"
-                                Margin="0,0,4,0"
-                                Stretch="Uniform"
-                                Data="M3 1.5 L6 4 L3 6.5"
-                                Stroke="{DynamicResource Text.Faint}"
-                                StrokeThickness="1.2"
-                                StrokeStartLineCap="Round"
-                                StrokeEndLineCap="Round"
-                                StrokeLineJoin="Round"
-                                VerticalAlignment="Center"
-                                IsHitTestVisible="False"
-                                RenderTransformOrigin="0.5,0.5">
-                                <Path.Style>
-                                    <Style TargetType="Path">
-                                        <Setter Property="RenderTransform">
-                                            <Setter.Value>
-                                                <RotateTransform Angle="0" />
-                                            </Setter.Value>
-                                        </Setter>
-                                        <Style.Triggers>
-                                            <DataTrigger Binding="{Binding Path=IsExpanded, RelativeSource={RelativeSource AncestorType=TreeViewItem}}" Value="True">
-                                                <Setter Property="RenderTransform">
-                                                    <Setter.Value>
-                                                        <RotateTransform Angle="90" />
-                                                    </Setter.Value>
-                                                </Setter>
-                                            </DataTrigger>
-                                        </Style.Triggers>
-                                    </Style>
-                                </Path.Style>
-                            </Path>
-                            <TextBlock
-                                Text="{Binding HistoryHeader}"
-                                FontFamily="{DynamicResource Fig.Font.Mono}"
-                                FontSize="10"
-                                VerticalAlignment="Center"
-                                Foreground="{DynamicResource Text.Faint}" />
-                        </StackPanel>
+                            <Path.Style>
+                                <Style TargetType="Path">
+                                    <Setter Property="RenderTransform">
+                                        <Setter.Value>
+                                            <RotateTransform Angle="0" />
+                                        </Setter.Value>
+                                    </Setter>
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding Path=IsExpanded, RelativeSource={RelativeSource AncestorType=TreeViewItem}}" Value="True">
+                                            <Setter Property="RenderTransform">
+                                                <Setter.Value>
+                                                    <RotateTransform Angle="90" />
+                                                </Setter.Value>
+                                            </Setter>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </Path.Style>
+                        </Path>
                     </Grid>
                 </HierarchicalDataTemplate>
 
