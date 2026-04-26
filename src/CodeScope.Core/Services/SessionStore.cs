@@ -377,9 +377,23 @@ public sealed class SessionStore : ISessionStore
         }
 
         var gitResult = await _git.RemoveWorktreeAsync(project.Path, worktree.Path, force, ct).ConfigureAwait(false);
+        string? residualDirError = null;
         if (gitResult.IsFailure)
         {
-            return Result<bool>.Fail(gitResult.Error);
+            // `git worktree remove` is not atomic on Windows: it can delete the admin entry
+            // under .git/worktrees/<name> but then fail to delete the working tree directory
+            // itself when a process still holds a handle (e.g. ConPTY pwsh that hasn't fully
+            // exited yet, AV indexer). git exits non-zero, our state stays, and a retry hits
+            // "fatal: '<path>' is not a working tree". Detect that orphaned-admin case by
+            // re-querying `git worktree list`: if our path is gone, finish the removal
+            // ourselves — best-effort directory delete + drop our state so the user isn't
+            // stuck on a worktree git no longer knows about.
+            var stillRegistered = await IsStillRegisteredAsync(project.Path, worktree.Path, ct).ConfigureAwait(false);
+            if (stillRegistered)
+            {
+                return Result<bool>.Fail(gitResult.Error);
+            }
+            residualDirError = TryDeleteDirectory(worktree.Path);
         }
 
         lock (_lock)
@@ -397,7 +411,67 @@ public sealed class SessionStore : ISessionStore
         if (saved.IsFailure) { return saved; }
 
         Raise(new SessionStoreChange.WorktreeRemoved(projectId, worktreeId));
+        if (residualDirError is not null)
+        {
+            // Worktree is gone from git and from our store, but the directory itself
+            // couldn't be deleted (typically a Windows file lock from a process we don't
+            // own). Don't fail the operation — that'd loop the VM into a force-retry
+            // dialog on already-clean state. Log so the user can investigate.
+            _logger.LogWarning(
+                "RemoveWorktree: directory residue at {Path} after admin entry was unregistered: {Error}",
+                worktree.Path, residualDirError);
+        }
         return Result<bool>.Ok(true);
+    }
+
+    private async Task<bool> IsStillRegisteredAsync(string repoPath, string worktreePath, CancellationToken ct)
+    {
+        var listed = await _git.ListWorktreesAsync(repoPath, ct).ConfigureAwait(false);
+        if (listed.IsFailure)
+        {
+            // If we can't tell, assume still registered — keeps the original failure as the
+            // user-visible error rather than masking it with a speculative recovery.
+            return true;
+        }
+        var target = NormalizePath(worktreePath);
+        foreach (var w in listed.Value)
+        {
+            if (string.Equals(NormalizePath(w.Path), target, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static string NormalizePath(string path)
+    {
+        try { return Path.GetFullPath(path).TrimEnd('\\', '/'); }
+        catch { return path.TrimEnd('\\', '/'); }
+    }
+
+    private static string? TryDeleteDirectory(string path)
+    {
+        if (!Directory.Exists(path)) { return null; }
+        // One short retry buys time for ConPTY child teardown / AV handle release.
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            try
+            {
+                Directory.Delete(path, recursive: true);
+                return null;
+            }
+            catch (Exception ex) when (attempt < 2)
+            {
+                _ = ex;
+                Thread.Sleep(150);
+            }
+            catch (Exception ex)
+            {
+                return ex.Message;
+            }
+        }
+        return null;
     }
 
     public async Task<Result<bool>> PruneMissingWorktreeAsync(string projectId, string worktreeId, CancellationToken ct = default)
