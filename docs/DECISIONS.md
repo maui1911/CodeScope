@@ -176,3 +176,50 @@ closed session" item in the worktree context menu).
 - `projects.json` now accumulates `Session` entries for closed shells too;
   pre-this-change, shells were always hard-removed on close so `projects.json`
   never carried shell rows.
+
+---
+
+## ADR-0014 — Shared `SessionTabView` host pool for cross-group drag
+
+**Date:** 2026-04-26
+**Status:** Accepted
+
+Dragging a session tab between editor groups used to respawn the underlying
+ConPTY child. Root cause was a WPF lifecycle interaction, not a terminal-control
+limitation: each `EditorGroupView` bound an `ItemsControl` to
+`EditorGroupViewModel.Tabs` with a `DataTemplate` for `SessionTabViewModel`. A
+cross-group VM move destroyed the source `ContentPresenter`, which unloaded
+`SessionTabView`, which destroyed the inner `EasyTerminalControl` HwndHost,
+which killed pwsh / claude / codex along with the scrollback.
+
+**Decision:** Introduce `ISessionViewHostPool` (UI-singleton) that owns one
+`SessionTabView` per session id. Each `EditorGroupView` is a single
+`ContentControl` whose `Content` is resolved from the pool keyed by
+`SelectedTab.Descriptor.Id`. Reparenting the *same* `SessionTabView` between
+two `ContentControl`s preserves the inner HwndHost (WPF documents this:
+"removed HwndHost is not destroyed, just reparented under a non-visible
+window"). The pool calls a renamed `SessionTabView.Teardown()` on `Release`
+(close / restart / cascade) — we removed the `Unloaded` teardown hook because
+it fires on every reparent, which is the exact bug we were fixing.
+
+**Decision considered and rejected:**
+- *TermPTY-only transfer* (`DisconnectConPTYTerm` → assign to a fresh
+  `EasyTerminalControl`'s `ConPTYTerm` property): preserves the process and
+  agent state but the renderer's scrollback lives in the
+  `Microsoft.Terminal.Wpf` HWND, not in TermPTY. The new HWND boots empty. A
+  replay buffer would be approximate at best for full-screen TUIs.
+- *Win32 `SetParent` on the inner ConPTY HWND*: HwndHost has no supported way
+  to swap its child HWND between two host instances. Workarounds are fragile
+  across `Microsoft.Terminal.Wpf` versions.
+
+**Consequences:**
+- `MoveTabToGroup` lost ~25 lines of agent-resume / telemetry-rebind plumbing
+  that existed to mask the respawn — no respawn now, no need to mask.
+- `SessionTabView` is no longer free to manage its own ConPTY lifecycle; the
+  pool is the single owner. Any new code path that closes a session must call
+  `pool.Release(id)` (otherwise pwsh lingers and locks its cwd, breaking
+  `git worktree remove`).
+- Pool is UI-only (lives in `CodeScope.Ui.Services`); `Core` knows nothing
+  about it. Dispatcher-affined, no locking.
+- Spec: `docs/superpowers/specs/2026-04-26-cross-group-terminal-drag-design.md`
+- Plan: `docs/superpowers/plans/2026-04-26-cross-group-terminal-drag.md`

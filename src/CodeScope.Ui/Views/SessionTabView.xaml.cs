@@ -26,6 +26,14 @@ public partial class SessionTabView : UserControl
 {
     private bool _started;
     private bool _isLoaded;
+    /// <summary>
+    /// Bumped on every <see cref="Teardown"/>. <see cref="TryStartShell"/> captures the value
+    /// at start; the <c>TermReady</c> dispatcher callback compares it before wiring the new
+    /// <c>TermPTY</c> in. Without this, a <c>term.Start</c> still negotiating in background
+    /// when the pool releases us would land its <c>TermReady</c> later and reconnect a stale
+    /// ConPTY to a torn-down view (orphaning the child process).
+    /// </summary>
+    private int _generation;
 
     public SessionTabView()
     {
@@ -33,7 +41,12 @@ public partial class SessionTabView : UserControl
         Terminal.Theme = BuildTheme();
         DataContextChanged += (_, _) => TryStartShell();
         Loaded += (_, _) => { _isLoaded = true; TryStartShell(); };
-        Unloaded += (_, _) => TeardownShell();
+        // No Unloaded → TeardownShell hook: this view is owned by ISessionViewHostPool and
+        // gets reparented across editor groups on drag-between-groups. Unloaded fires on
+        // every reparent — running ConPTY teardown there would kill the terminal child on
+        // every drag, which is exactly the bug the pool was introduced to fix.
+        // The pool calls Teardown() on Release (close / restart / worktree-cascade); see
+        // SessionViewHostPool.Release.
         // Tunneling preview so we win over the inner TerminalControl's Win32 input path.
         // Keyboard events tunnel through WPF fine even with Win32InputMode=True, but mouse
         // events are another story: the Microsoft.Terminal.Wpf HwndHost child captures
@@ -204,14 +217,21 @@ public partial class SessionTabView : UserControl
     }
 
     /// <summary>
-    /// Kills the ConPTY child + pipes when the hosting tab is removed. Without this the pwsh
-    /// process lingers (ref'd only via the local <c>term</c> captured in <see cref="TryStartShell"/>)
-    /// and keeps a Windows file lock on its cwd — which breaks <c>git worktree remove</c>
-    /// downstream when the user deletes the worktree the session was pinned to.
+    /// Kills the ConPTY child + pipes. Called by <see cref="NoScope.CodeScope.Ui.Services.SessionViewHostPool.Release"/>
+    /// on tab close, restart, or worktree-cascade — never on a drag-between-groups, because
+    /// the pool keeps the same view alive across reparent.
+    ///
+    /// <para>Without an explicit teardown the pwsh process would linger (ref'd only via the
+    /// <c>term</c> captured in <see cref="TryStartShell"/>) and keep a Windows file lock on
+    /// its cwd, which breaks <c>git worktree remove</c> downstream when the user deletes a
+    /// worktree the session was pinned to.</para>
     /// </summary>
-    private void TeardownShell()
+    internal void Teardown()
     {
         if (!_started) { return; }
+        // Invalidate any in-flight TermReady from a still-negotiating term.Start —
+        // see the _generation field doc.
+        _generation++;
         var term = Terminal.DisconnectConPTYTerm();
         try { term?.CloseStdinToApp(); }
         catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"[SessionTabView] Teardown CloseStdin: {ex.Message}"); }
@@ -252,8 +272,20 @@ public partial class SessionTabView : UserControl
         catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"[SessionTabView] StopExternalTermOnly: {ex.Message}"); }
 
         var term = new TermPTY();
+        var startGeneration = _generation;
         term.TermReady += (_, _) => Dispatcher.Invoke(() =>
         {
+            // Drop the late TermReady if Teardown bumped the generation after we
+            // started — the pool released us mid-launch (rapid open-then-close, or
+            // a worktree-cascade). Tear down the orphan so we don't leak a ConPTY.
+            if (startGeneration != _generation)
+            {
+                try { term.CloseStdinToApp(); }
+                catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"[SessionTabView] Stale TermReady CloseStdin: {ex.Message}"); }
+                try { term.StopExternalTermOnly(); }
+                catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"[SessionTabView] Stale TermReady StopExternal: {ex.Message}"); }
+                return;
+            }
             Terminal.ConPTYTerm = term;
             Terminal.Focus();
         });

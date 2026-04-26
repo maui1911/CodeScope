@@ -109,6 +109,11 @@ public partial class App : Application
                 services.AddSingleton<IClaudeTelemetryService, ClaudeTelemetryService>();
                 services.AddSingleton<IClaudeSessionDiscovery, ClaudeSessionDiscovery>();
                 services.AddSingleton<INotificationService, NotificationService>();
+                // Owns SessionTabView lifecycle so the inner HwndHost survives reparent on
+                // drag-between-groups. See spec
+                // docs/superpowers/specs/2026-04-26-cross-group-terminal-drag-design.md.
+                services.AddSingleton<NoScope.CodeScope.Ui.Services.ISessionViewHostPool,
+                    NoScope.CodeScope.Ui.Services.SessionViewHostPool>();
                 // Pollers are registered as singletons so the Refresh command can resolve them
                 // from DI; the hosted-service indirection re-uses the same instance.
                 services.AddSingleton<WorktreeStatusPoller>();
@@ -142,7 +147,8 @@ public partial class App : Application
                         sp.GetRequiredService<IClaudeTelemetryService>(),
                         sp.GetRequiredService<INotificationService>(),
                         sp.GetRequiredService<IClaudeSessionDiscovery>(),
-                        sp.GetRequiredService<NoScope.CodeScope.Ui.Services.IToastService>());
+                        sp.GetRequiredService<NoScope.CodeScope.Ui.Services.IToastService>(),
+                        sp.GetRequiredService<NoScope.CodeScope.Ui.Services.ISessionViewHostPool>());
                     var sidebar = sp.GetRequiredService<SidebarViewModel>();
                     vm.AttachSidebar(sidebar);
                     var diff = sp.GetRequiredService<DiffPanelViewModel>();
