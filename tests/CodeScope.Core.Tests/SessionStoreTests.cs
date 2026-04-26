@@ -603,7 +603,7 @@ public sealed class SessionStoreTests
     }
 
     [Fact]
-    public async Task SoftCloseSessionAsync_Marks_Closed_And_Emits_Removed()
+    public async Task SoftCloseSessionAsync_Marks_Closed_And_Emits_SoftClosed()
     {
         var (store, _, _) = Make();
         var project = (await store.AddProjectAsync(@"C:\demo", "D")).Value;
@@ -623,7 +623,12 @@ public sealed class SessionStoreTests
         var after = store.Projects.SelectMany(p => p.Sessions).Single(s => s.Id == sid);
         after.ClosedAt.Should().NotBeNull();
         after.AgentSessionId.Should().Be("abc", "the resume id must survive soft-close");
-        events.OfType<SessionStoreChange.SessionRemoved>().Should().ContainSingle();
+        // SoftCloseSessionAsync now raises SessionSoftClosed (not SessionRemoved) so
+        // sidebar listeners receive the closed Session payload without re-querying the store.
+        events.OfType<SessionStoreChange.SessionSoftClosed>().Should().ContainSingle()
+            .Which.Session.Id.Should().Be(sid);
+        events.OfType<SessionStoreChange.SessionRemoved>().Should().BeEmpty(
+            "soft-close must not raise SessionRemoved; only hard-remove does");
     }
 
     [Fact]
@@ -669,7 +674,7 @@ public sealed class SessionStoreTests
         var second = await store.SoftCloseSessionAsync(sid);
 
         second.IsSuccess.Should().BeTrue();
-        events.OfType<SessionStoreChange.SessionRemoved>().Should().BeEmpty("re-close should not emit a second event");
+        events.OfType<SessionStoreChange.SessionSoftClosed>().Should().BeEmpty("re-close should not emit a second event");
     }
 
     [Fact]

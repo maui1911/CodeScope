@@ -539,16 +539,37 @@ public sealed partial class MainViewModel : ObservableObject
     /// </summary>
     private async Task<bool> TryRestoreSessionAsync(Project project, Worktree worktree, Session closed)
     {
+        // Resolve agent / shell before touching the store so we never clear ClosedAt on a
+        // session we can't actually reopen.
+        var useShell = string.IsNullOrEmpty(closed.AgentId)
+            || string.Equals(closed.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase);
+        var agent = useShell ? null : _agents.GetById(closed.AgentId!);
+
+        // Fix 2: non-shell AgentId with no matching profile — keep closed, do not create a
+        // shell session with stale metadata.
+        if (!useShell && agent is null)
+        {
+            _logger.LogWarning(
+                "ReopenClosedSession: agent profile '{AgentId}' is no longer registered; " +
+                "session '{SessionId}' kept closed.", closed.AgentId, closed.Id);
+            return false;
+        }
+
+        // Fix 4: guard against a missing worktree directory — log and bail without clearing ClosedAt.
+        if (!Directory.Exists(worktree.Path))
+        {
+            _logger.LogWarning(
+                "ReopenClosedSession: worktree path '{Path}' no longer exists; " +
+                "session '{SessionId}' kept closed.", worktree.Path, closed.Id);
+            return false;
+        }
+
         var restored = await _store.RestoreSessionAsync(closed.Id).ConfigureAwait(true);
         if (restored.IsFailure)
         {
             _logger.LogWarning("RestoreSession: {Error}", restored.Error);
             return false;
         }
-
-        var useShell = string.IsNullOrEmpty(closed.AgentId)
-            || string.Equals(closed.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase);
-        var agent = useShell ? null : _agents.GetById(closed.AgentId!);
 
         SessionDescriptor descriptor;
         if (agent is null)

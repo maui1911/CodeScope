@@ -50,6 +50,9 @@ public sealed partial class SidebarViewModel
                 case SessionStoreChange.SessionRemoved sRemoved:
                     RemoveSession(sRemoved.SessionId);
                     break;
+                case SessionStoreChange.SessionSoftClosed sSoftClosed:
+                    SoftCloseSession(sSoftClosed.ProjectId, sSoftClosed.Session);
+                    break;
                 case SessionStoreChange.SessionRenamed sRenamed:
                     RenameSession(sRenamed.SessionId, sRenamed.NewName);
                     break;
@@ -90,10 +93,17 @@ public sealed partial class SidebarViewModel
         var primary = pvm.Worktrees.FirstOrDefault(w => w.IsPrimary) ?? pvm.Worktrees.FirstOrDefault();
         if (primary is not null)
         {
-            foreach (var s in p.Sessions.Where(x => x.WorktreeId is null
-                || pvm.Worktrees.All(w => w.Id != x.WorktreeId)))
+            var orphanCandidates = p.Sessions.Where(x => x.WorktreeId is null
+                || pvm.Worktrees.All(w => w.Id != x.WorktreeId)).ToList();
+            foreach (var s in orphanCandidates.Where(x => x.ClosedAt is null))
             {
                 primary.Sessions.Add(BuildSessionRow(p.Id, primary.Id, s));
+            }
+            foreach (var s in orphanCandidates
+                .Where(x => x.ClosedAt is not null)
+                .OrderByDescending(x => x.ClosedAt))
+            {
+                primary.History.Add(BuildSessionRow(p.Id, primary.Id, s));
             }
         }
         return pvm;
@@ -214,33 +224,45 @@ public sealed partial class SidebarViewModel
         }
     }
 
+    /// <summary>
+    /// Hard-remove: drops the session row from whichever collection (Sessions or History)
+    /// holds it. Only called for <see cref="SessionStoreChange.SessionRemoved"/> — the
+    /// permanent delete path (<see cref="ISessionStore.RemoveSessionAsync"/>). Soft-close
+    /// is handled by <see cref="SoftCloseSession"/> via <see cref="SessionStoreChange.SessionSoftClosed"/>.
+    /// </summary>
     private void RemoveSession(string sessionId)
     {
-        // Determine soft-close vs hard-remove by peeking the store. Soft-closed → move the
-        // session row from Sessions to History (insert at top to honour ClosedAt-desc order).
-        // Hard-removed → drop from whichever collection it's in.
-        var stored = _store.Projects
-            .SelectMany(p => p.Sessions.Select(s => (project: p, session: s)))
-            .FirstOrDefault(x => x.session.Id == sessionId);
-
         foreach (var p in Projects)
         {
             foreach (var w in p.Worktrees)
             {
                 var live = w.Sessions.FirstOrDefault(x => x.Descriptor.Id == sessionId);
-                if (live is not null)
-                {
-                    w.Sessions.Remove(live);
-                    if (stored.session is { ClosedAt: not null })
-                    {
-                        // Re-issue a fresh row instead of reusing `live` so its IsActive flag
-                        // and any tab-bar bindings reset cleanly to the dead-row state.
-                        w.History.Insert(0, BuildSessionRow(p.Id, w.Id, stored.session));
-                    }
-                    return;
-                }
+                if (live is not null) { w.Sessions.Remove(live); return; }
                 var dead = w.History.FirstOrDefault(x => x.Descriptor.Id == sessionId);
                 if (dead is not null) { w.History.Remove(dead); return; }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Soft-close: demotes the session row from Sessions to History using the payload
+    /// carried by <see cref="SessionStoreChange.SessionSoftClosed"/>. No store peek —
+    /// the closed Session is provided directly to avoid a race with a concurrent restore.
+    /// </summary>
+    private void SoftCloseSession(string projectId, Session closed)
+    {
+        var pvm = Projects.FirstOrDefault(p => p.Id == projectId);
+        if (pvm is null) { return; }
+        foreach (var w in pvm.Worktrees)
+        {
+            var live = w.Sessions.FirstOrDefault(x => x.Descriptor.Id == closed.Id);
+            if (live is not null)
+            {
+                w.Sessions.Remove(live);
+                // Re-issue a fresh row instead of reusing `live` so its IsActive flag
+                // and any tab-bar bindings reset cleanly to the dead-row state.
+                w.History.Insert(0, BuildSessionRow(projectId, w.Id, closed));
+                return;
             }
         }
     }

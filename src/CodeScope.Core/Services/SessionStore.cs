@@ -184,6 +184,8 @@ public sealed class SessionStore : ISessionStore
     public async Task<Result<bool>> SoftCloseSessionAsync(string sessionId, CancellationToken ct = default)
     {
         var changed = false;
+        Session? closedSession = null;
+        string? projectId = null;
         lock (_lock)
         {
             for (var i = 0; i < _projects.Count; i++)
@@ -195,6 +197,8 @@ public sealed class SessionStore : ISessionStore
                 // Idempotent — re-closing an already-closed session is a no-op, not an error.
                 if (sessions[idx].ClosedAt is not null) { return Result<bool>.Ok(true); }
                 sessions[idx] = sessions[idx] with { ClosedAt = DateTimeOffset.UtcNow };
+                closedSession = sessions[idx];
+                projectId = p.Id;
                 _projects[i] = p with { Sessions = sessions };
                 changed = true;
                 break;
@@ -221,8 +225,10 @@ public sealed class SessionStore : ISessionStore
             }
             return saved;
         }
-        // Fire SessionRemoved so the sidebar/tab strip drop the row — restore emits SessionAdded.
-        Raise(new SessionStoreChange.SessionRemoved(sessionId));
+        // Fire SessionSoftClosed carrying the closed Session payload so sidebar listeners
+        // can demote the row to History without re-querying store state (race-free).
+        // Hard-remove (RemoveSessionAsync) still raises SessionRemoved unchanged.
+        Raise(new SessionStoreChange.SessionSoftClosed(projectId!, closedSession!));
         return Result<bool>.Ok(true);
     }
 

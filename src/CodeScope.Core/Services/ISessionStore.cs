@@ -25,8 +25,10 @@ public interface ISessionStore
     /// <summary>
     /// Marks a session as closed without discarding it — persists a <see cref="Session.ClosedAt"/>
     /// timestamp so the next <c>New session</c> on the same worktree + agent can resume it via
-    /// <c>--resume &lt;AgentSessionId&gt;</c>. Raises <see cref="SessionStoreChange.SessionRemoved"/>
-    /// so listeners drop their tab/row; <see cref="RestoreSessionAsync"/> brings it back.
+    /// <c>--resume &lt;AgentSessionId&gt;</c>. Raises <see cref="SessionStoreChange.SessionSoftClosed"/>
+    /// (carrying the closed Session) so listeners can route it to a history surface without
+    /// re-querying store state; <see cref="RestoreSessionAsync"/> brings it back via
+    /// <see cref="SessionStoreChange.SessionAdded"/>.
     /// </summary>
     Task<Result<bool>> SoftCloseSessionAsync(string sessionId, CancellationToken ct = default);
 
@@ -112,6 +114,12 @@ public abstract record SessionStoreChange
     public sealed record ProjectRemoved(string ProjectId) : SessionStoreChange;
     public sealed record SessionAdded(string ProjectId, Session Session) : SessionStoreChange;
     public sealed record SessionRemoved(string SessionId) : SessionStoreChange;
+    /// <summary>
+    /// A session was soft-closed (kept on disk with ClosedAt set). The full
+    /// closed Session is included so consumers can route to a history surface
+    /// without needing to re-query store state.
+    /// </summary>
+    public sealed record SessionSoftClosed(string ProjectId, Session Session) : SessionStoreChange;
     public sealed record SessionRenamed(string SessionId, string? NewName) : SessionStoreChange;
     public sealed record Loaded(IReadOnlyList<Project> Projects) : SessionStoreChange;
     public sealed record WorktreeAdded(string ProjectId, Worktree Worktree) : SessionStoreChange;
