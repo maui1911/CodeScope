@@ -362,26 +362,7 @@ public sealed partial class MainViewModel : ObservableObject
 
         if (project is null) { return; }
 
-        // Soft-close resume — if this worktree has a closed session that would match the agent
-        // the user is about to spawn, restore it instead of minting a new one. Restart is the
-        // explicit "start fresh" escape hatch; New session gives you back whatever was live
-        // last time. Keeps the 1-session-per-worktree invariant (we match on WorktreeId +
-        // resolved agent id).
         var resolvedAgentId = ResolveAgentIdForNewSession(project, agentId);
-        if (worktree is not null
-            && resolvedAgentId is not null
-            && !string.Equals(resolvedAgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase))
-        {
-            var closed = project.Sessions.FirstOrDefault(s =>
-                s.ClosedAt is not null
-                && string.Equals(s.WorktreeId, worktree.Id, StringComparison.Ordinal)
-                && string.Equals(s.AgentId, resolvedAgentId, StringComparison.OrdinalIgnoreCase)
-                && s.AgentSessionId is { Length: > 0 });
-            if (closed is not null && await TryRestoreSessionAsync(project, worktree, closed).ConfigureAwait(true))
-            {
-                return;
-            }
-        }
 
         // Resolve agent / shell from the same priority used above (explicit arg → project default
         // → global default). resolvedAgentId == ShellSentinel selects the shell; null falls back
@@ -432,9 +413,10 @@ public sealed partial class MainViewModel : ObservableObject
 
     /// <summary>
     /// Resolves the agent id that <see cref="NewSessionAsync"/> would end up using, mirroring
-    /// its priority (explicit arg → project default → global default). Used to look up a
-    /// matching soft-closed session *before* we spawn anything. Returns null for the global
-    /// default when no profile is registered — caller treats null as "no resume candidate".
+    /// its priority (explicit arg → project default → global default). Returns
+    /// <see cref="ShellSentinel"/> when the user explicitly picked the shell, the registered
+    /// agent id when one matches, or <c>null</c> when no profile matches and no global default
+    /// is registered. Reused by the explicit-reopen command in a later task.
     /// </summary>
     private string? ResolveAgentIdForNewSession(Project project, string? explicitAgentId)
     {
