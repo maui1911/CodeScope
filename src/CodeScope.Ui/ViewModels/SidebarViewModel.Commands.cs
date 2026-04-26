@@ -75,6 +75,7 @@ public sealed partial class SidebarViewModel
         if (r.IsFailure)
         {
             _logger.LogWarning("AddWorktree failed: {Error}", r.Error);
+            ErrToast("New worktree failed", r.Error, retry: () => AddWorktreeAsync(project));
             return;
         }
 
