@@ -51,11 +51,11 @@ public sealed partial class SessionTabViewModel : ObservableObject
 
     /// <summary>
     /// Semantic session state driving the status dot on the tab row.
-    /// <c>Busy</c> = agent is composing or running a tool, <c>Ready</c> = turn finished, awaiting your input.
-    /// Default is <c>Ready</c> so shell sessions (no telemetry) sit calm out of the box.
+    /// <c>Busy</c> = agent is composing or running a tool, <c>Idle</c> = turn finished, awaiting your input.
+    /// Default is <c>Idle</c> so shell sessions (no telemetry) sit calm out of the box.
     /// </summary>
     [ObservableProperty]
-    private TabStatus _status = TabStatus.Ready;
+    private TabStatus _status = TabStatus.Idle;
 
     /// <summary>Cumulative billable tokens for this session (input + output + cache-creation).</summary>
     [ObservableProperty]

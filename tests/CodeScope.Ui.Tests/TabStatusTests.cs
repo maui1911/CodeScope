@@ -11,17 +11,17 @@ public sealed class TabStatusTests
     }
 
     [Fact]
-    public void Enum_ReadyIsDefaultZero()
+    public void Enum_IdleIsDefaultZero()
     {
-        // SessionTabViewModel and ApplyStatus rely on default(TabStatus) == Ready (calm rest state).
+        // SessionTabViewModel and ApplyStatus rely on default(TabStatus) == Idle (calm rest state).
         ((int)default(TabStatus)).Should().Be(0);
-        default(TabStatus).Should().Be(TabStatus.Ready);
+        default(TabStatus).Should().Be(TabStatus.Idle);
     }
 
     [Fact]
     public void Enum_NameRoundtrip()
     {
-        Enum.Parse<TabStatus>("Ready").Should().Be(TabStatus.Ready);
+        Enum.Parse<TabStatus>("Idle").Should().Be(TabStatus.Idle);
         Enum.Parse<TabStatus>("Busy").Should().Be(TabStatus.Busy);
     }
 }

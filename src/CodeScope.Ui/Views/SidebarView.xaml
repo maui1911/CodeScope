@@ -347,7 +347,7 @@
                                         <!-- Rest: dim dot on the tree border color -->
                                         <Setter Property="Fill" Value="#FF2A2A2A" />
                                         <Style.Triggers>
-                                            <DataTrigger Binding="{Binding DotState}" Value="ready">
+                                            <DataTrigger Binding="{Binding DotState}" Value="idle">
                                                 <Setter Property="Fill" Value="{DynamicResource Signal.Ok}" />
                                             </DataTrigger>
                                             <DataTrigger Binding="{Binding DotState}" Value="busy">

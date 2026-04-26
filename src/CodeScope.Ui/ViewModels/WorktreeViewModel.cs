@@ -130,7 +130,7 @@ public sealed partial class WorktreeViewModel : ObservableObject
 
     /// <summary>
     /// Session-state classifier for the 6px dot on the sidebar worktree row.
-    /// <c>rest</c> = no session, <c>ready</c> = has session, agent awaiting input,
+    /// <c>rest</c> = no session, <c>idle</c> = has session, agent awaiting input,
     /// <c>busy</c> = agent is working (Composing or PendingToolUse — pulses red).
     /// Selection visuals live on the row chrome, not on the dot.
     /// </summary>
@@ -139,7 +139,7 @@ public sealed partial class WorktreeViewModel : ObservableObject
         get
         {
             if (HasBusySession) { return "busy"; }
-            if (HasActiveSession) { return "ready"; }
+            if (HasActiveSession) { return "idle"; }
             return "rest";
         }
     }

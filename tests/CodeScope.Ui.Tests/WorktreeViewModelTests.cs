@@ -49,11 +49,11 @@ public sealed class WorktreeViewModelTests
     }
 
     [Fact]
-    public void DotState_WithReadySession_IsReady()
+    public void DotState_WithIdleSession_IsIdle()
     {
         var vm = MakeVm();
-        vm.Sessions.Add(MakeSessionTab(TabStatus.Ready));
-        vm.DotState.Should().Be("ready");
+        vm.Sessions.Add(MakeSessionTab(TabStatus.Idle));
+        vm.DotState.Should().Be("idle");
     }
 
     [Fact]

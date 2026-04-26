@@ -240,7 +240,7 @@
                 <Rectangle Style="{StaticResource SbSep}" Margin="0,0,14,0"
                            Visibility="{Binding StatusAgentSummaryVisible, Converter={StaticResource BoolVisible}}" />
 
-                <!-- 10. Agent rollup (workspace-wide) — Busy / Ready counts only. -->
+                <!-- 10. Agent rollup (workspace-wide) — Busy / Idle counts only. -->
                 <StackPanel Style="{StaticResource SbItem}"
                             Margin="0,0,14,0"
                             Visibility="{Binding StatusAgentSummaryVisible, Converter={StaticResource BoolVisible}}">
@@ -252,8 +252,8 @@
                     <TextBlock Style="{StaticResource SbTextMeta}" Margin="6,0" Text="·" />
                     <Ellipse Width="6" Height="6" Fill="{DynamicResource Signal.Ok}" Margin="0,0,4,0" VerticalAlignment="Center" />
                     <TextBlock Style="{StaticResource SbText}">
-                        <Run Foreground="#FFFFFFFF" Text="{Binding StatusAgentReady, Mode=OneWay}" />
-                        <Run Text=" ready" />
+                        <Run Foreground="#FFFFFFFF" Text="{Binding StatusAgentIdle, Mode=OneWay}" />
+                        <Run Text=" idle" />
                     </TextBlock>
                 </StackPanel>
 

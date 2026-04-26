@@ -1,5 +1,11 @@
 # Status-dots bugfix pass — design
 
+> **Update during implementation:** the green state was originally drafted as
+> `Ready`; renamed to `Idle` after a quick UX pass — the word matches the
+> existing `StatusLabel` slug and is the conventional term for "not doing
+> anything." `Busy` (red) is unchanged.
+
+
 ## Problem
 
 The status dots in the sidebar, tab strip, and bottom bar don't read coherently:
@@ -32,14 +38,14 @@ The status dots in the sidebar, tab strip, and bottom bar don't read coherently:
 |---|---|---|---|
 | `Rest` | dim grey `#FF2A2A2A` | no | no session attached (sidebar only) |
 | `Busy` | `Signal.Warn` (red) | yes | `Composing` **or** `PendingToolUse` |
-| `Ready` | `Signal.Ok` (green) | no | `Idle` (turn finished, awaiting your input) |
+| `Idle` | `Signal.Ok` (green) | no | `Idle` (turn finished, awaiting your input) |
 
 Pulse timing: existing 1.4s halo storyboard, retargeted from `wait` to `busy`.
 
 ### Renames
 
 - `TabStatus.Active`, `TabStatus.Wait` → **deleted**.
-- `TabStatus.Idle` → renamed to `TabStatus.Ready` (semantic flip — "ready for your input").
+- `TabStatus.Idle` is kept as the green state name (covers "turn finished, awaiting your input").
 - `TabStatus.Busy` → new value (covers former Active + Wait).
 
 ### Activity → status mapping (`MainViewModel.ApplyActivityToStatus`)
@@ -47,7 +53,7 @@ Pulse timing: existing 1.4s halo storyboard, retargeted from `wait` to `busy`.
 ```
 ClaudeActivityState.Composing      → TabStatus.Busy
 ClaudeActivityState.PendingToolUse → TabStatus.Busy
-ClaudeActivityState.Idle           → TabStatus.Ready
+ClaudeActivityState.Idle           → TabStatus.Idle
 ClaudeActivityState.Unknown        → unchanged (preserves prior status)
 ```
 
@@ -77,7 +83,7 @@ Drops the `isSelected` branch. A background tab that is composing now also reads
 
 **Status bar (`MainViewModel.StatusBar.cs:233-235` + `StatusBarView.xaml`)** —
 - `StatusAgentActive` → removed.
-- `StatusAgentIdle` → `StatusAgentReady`.
+- `StatusAgentIdle` count is kept (re-mapped to `t.Status == TabStatus.Idle`).
 - `StatusAgentWait` → `StatusAgentBusy`.
 - The activity-state slug helper at `MainViewModel.StatusBar.cs:195` collapses to `Busy → "busy"`, default → `"ready"`.
 

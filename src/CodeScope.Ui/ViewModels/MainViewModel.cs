@@ -1174,7 +1174,7 @@ public sealed partial class MainViewModel : ObservableObject
         {
             ClaudeActivityState.Composing => TabStatus.Busy,
             ClaudeActivityState.PendingToolUse => TabStatus.Busy,
-            ClaudeActivityState.Idle => TabStatus.Ready,
+            ClaudeActivityState.Idle => TabStatus.Idle,
             _ => tab.Status,
         };
     }
