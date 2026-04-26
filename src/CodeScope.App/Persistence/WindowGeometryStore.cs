@@ -2,7 +2,7 @@ using System.IO;
 using System.Text.Json;
 using System.Windows;
 
-namespace NoScope.CodeScope.App;
+namespace NoScope.CodeScope.App.Persistence;
 
 /// <summary>
 /// Persists the main window's bounds + state to <c>%LocalAppData%/CodeScope/window.json</c>.
@@ -13,15 +13,10 @@ public static class WindowGeometryStore
 {
     public sealed record WindowGeometry(double Left, double Top, double Width, double Height, string State);
 
-    private static string FilePath
-    {
-        get
-        {
-            var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), NoScope.CodeScope.Core.AppPaths.AppFolderName);
-            Directory.CreateDirectory(dir);
-            return Path.Combine(dir, "window.json");
-        }
-    }
+    private static string FilePath { get; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        NoScope.CodeScope.Core.AppPaths.AppFolderName,
+        "window.json");
 
     public static WindowGeometry? Load()
     {
@@ -49,9 +44,10 @@ public static class WindowGeometryStore
             if (rect.Width < 400 || rect.Height < 300) { return; } // sanity: don't save a collapsed rect.
 
             var geo = new WindowGeometry(rect.Left, rect.Top, rect.Width, rect.Height, w.WindowState.ToString());
+            Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
             File.WriteAllText(FilePath, JsonSerializer.Serialize(geo));
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is IOException or JsonException)
         {
             // Persistence is best-effort; a write failure here shouldn't block shutdown, but trace it.
             System.Diagnostics.Debug.WriteLine($"[WindowGeometryStore] Save: {ex.Message}");

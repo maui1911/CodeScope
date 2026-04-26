@@ -1,9 +1,7 @@
 using NoScope.CodeScope.Core;
 using NoScope.CodeScope.Core.Models;
 using NoScope.CodeScope.Core.Services;
-using FluentAssertions;
 using Microsoft.Extensions.Logging.Abstractions;
-using Xunit;
 
 namespace NoScope.CodeScope.Core.Tests;
 

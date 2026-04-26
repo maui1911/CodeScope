@@ -1,6 +1,4 @@
 using NoScope.CodeScope.Core.Services;
-using FluentAssertions;
-using Xunit;
 
 namespace NoScope.CodeScope.Core.Tests;
 

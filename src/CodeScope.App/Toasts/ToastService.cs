@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.Windows;
 using NoScope.CodeScope.Ui.Services;
+using NoScope.CodeScope.Ui.ViewModels;
 
 namespace NoScope.CodeScope.App.Toasts;
 

@@ -1,7 +1,5 @@
 using NoScope.CodeScope.Core.Models;
 using NoScope.CodeScope.Core.Services;
-using FluentAssertions;
-using Xunit;
 
 namespace NoScope.CodeScope.Core.Tests;
 

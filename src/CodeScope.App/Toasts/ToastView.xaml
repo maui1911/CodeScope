@@ -8,6 +8,7 @@
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:t="clr-namespace:NoScope.CodeScope.App.Toasts"
+             xmlns:conv="clr-namespace:NoScope.CodeScope.Ui.Converters;assembly=CodeScope.Ui"
              Width="380"
              Background="Transparent"
              SnapsToDevicePixels="True"
@@ -16,9 +17,9 @@
              AutomationProperties.Name="{Binding Title}"
              AutomationProperties.HelpText="{Binding Message}">
     <UserControl.Resources>
-        <t:SeverityBrushConverter x:Key="SevBrush" />
-        <t:SeverityIconConverter x:Key="SevIcon" />
-        <t:ProgressToWidthConverter x:Key="ProgressToWidth" />
+        <conv:SeverityBrushConverter x:Key="SevBrush" />
+        <conv:SeverityIconConverter x:Key="SevIcon" />
+        <conv:ProgressToWidthConverter x:Key="ProgressToWidth" />
         <BooleanToVisibilityConverter x:Key="BoolVis" />
     </UserControl.Resources>
 

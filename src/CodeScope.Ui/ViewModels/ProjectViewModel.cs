@@ -53,14 +53,7 @@ public sealed partial class ProjectViewModel : ObservableObject
     /// instead of an opaque hash. Whitespace/punctuation collapse to underscores so
     /// the value is safe to use as a ref token.
     /// </summary>
-    public string AutomationId => $"Project_{SafeToken(Name)}";
-
-    private static string SafeToken(string? s)
-    {
-        if (string.IsNullOrWhiteSpace(s)) { return "unknown"; }
-        var token = new string([.. s.Select(c => char.IsLetterOrDigit(c) ? c : '_')]).Trim('_');
-        return string.IsNullOrEmpty(token) ? "unknown" : token;
-    }
+    public string AutomationId => $"Project_{AutomationIds.SafeToken(Name)}";
 
     public string? DefaultAgentId => Project.DefaultAgentId;
 

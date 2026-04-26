@@ -234,10 +234,39 @@
                            Margin="0,0,14,0"
                            Visibility="{Binding StatusGroupCountVisible, Converter={StaticResource BoolVisible}}" />
 
-                <!-- Legacy aggregate — kept for the rest of the workspace summary (dirty/PRs/CI) -->
+                <!-- Workspace summary: worktree count + dirty/PR/CI breakdown.
+                     Per-field bindings let the segments hide individually when zero. -->
                 <TextBlock Style="{StaticResource SbTextMeta}"
-                           Text="{Binding StatusBarText}"
-                           Typography.Capitals="AllSmallCaps" />
+                           Text="{Binding StatusWorktreeCountText}"
+                           Typography.Capitals="AllSmallCaps"
+                           Visibility="{Binding StatusWorkspaceVisible, Converter={StaticResource BoolVisible}}" />
+                <TextBlock Style="{StaticResource SbTextMeta}"
+                           Margin="6,0,0,0"
+                           Text="·"
+                           Visibility="{Binding StatusDirtyVisible, Converter={StaticResource BoolVisible}}" />
+                <TextBlock Style="{StaticResource SbTextMeta}"
+                           Margin="6,0,0,0"
+                           Text="{Binding StatusDirtyCountText}"
+                           Typography.Capitals="AllSmallCaps"
+                           Visibility="{Binding StatusDirtyVisible, Converter={StaticResource BoolVisible}}" />
+                <TextBlock Style="{StaticResource SbTextMeta}"
+                           Margin="6,0,0,0"
+                           Text="·"
+                           Visibility="{Binding StatusPrVisible, Converter={StaticResource BoolVisible}}" />
+                <TextBlock Style="{StaticResource SbTextMeta}"
+                           Margin="6,0,0,0"
+                           Text="{Binding StatusPrCountText}"
+                           Typography.Capitals="AllSmallCaps"
+                           Visibility="{Binding StatusPrVisible, Converter={StaticResource BoolVisible}}" />
+                <TextBlock Style="{StaticResource SbTextMeta}"
+                           Margin="6,0,0,0"
+                           Text="·"
+                           Visibility="{Binding StatusCiFailVisible, Converter={StaticResource BoolVisible}}" />
+                <TextBlock Style="{StaticResource SbTextMeta}"
+                           Margin="6,0,0,0"
+                           Text="{Binding StatusCiFailCountText}"
+                           Typography.Capitals="AllSmallCaps"
+                           Visibility="{Binding StatusCiFailVisible, Converter={StaticResource BoolVisible}}" />
 
                 <!-- 11. Notifications — bell glyph + 4px blue unread dot + popover -->
                 <Rectangle Style="{StaticResource SbSep}" Margin="10,0,10,0"

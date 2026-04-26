@@ -4,10 +4,10 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using NoScope.CodeScope.Ui.Services;
 
-namespace NoScope.CodeScope.App.Toasts;
+namespace NoScope.CodeScope.Ui.ViewModels;
 
 /// <summary>
-/// One row in <see cref="ToastService"/>'s observable collection. Owns the auto-dismiss
+/// One row in the toast service's observable collection. Owns the auto-dismiss
 /// <see cref="DispatcherTimer"/> and the meter progress (0..1, drives the 2px strip
 /// at the bottom of the toast). Hover pauses the timer for the entire stack — the
 /// host wires <see cref="Pause"/> / <see cref="Resume"/> from a single MouseEnter /
@@ -109,11 +109,11 @@ public sealed partial class ToastItemViewModel : ObservableObject
     }
 
     /// <summary>
-    /// Stops the timer without invoking <see cref="DismissCommand"/>. Used by
-    /// <see cref="ToastService.Dismiss(string)"/> and the cap eviction so externally-
-    /// removed toasts don't keep ticking and re-firing dismissal on a detached VM.
+    /// Stops the timer without invoking <see cref="DismissCommand"/>. Used by the toast
+    /// service's Dismiss/cap-eviction paths so externally-removed toasts don't keep
+    /// ticking and re-firing dismissal on a detached VM.
     /// </summary>
-    internal void StopTimer() => _ticker?.Stop();
+    public void StopTimer() => _ticker?.Stop();
 
     [RelayCommand]
     private void Dismiss()
@@ -146,14 +146,7 @@ public sealed partial class ToastActionViewModel : ObservableObject
     public ToastSeverity Severity => _owner.Severity;
     /// <summary>Stable, sanitized UIA id — includes the owning toast's id so "Retry" buttons
     /// on two different error toasts don't collide in the automation tree.</summary>
-    public string AutomationId => $"ToastAction_{Sanitize(_model.Label)}_{_owner.Id}";
-
-    private static string Sanitize(string s)
-    {
-        if (string.IsNullOrWhiteSpace(s)) { return "unknown"; }
-        var token = new string([.. s.Select(c => char.IsLetterOrDigit(c) ? c : '_')]).Trim('_');
-        return string.IsNullOrEmpty(token) ? "unknown" : token;
-    }
+    public string AutomationId => $"ToastAction_{AutomationIds.SafeToken(_model.Label)}_{_owner.Id}";
 
     [RelayCommand]
     private void Invoke()

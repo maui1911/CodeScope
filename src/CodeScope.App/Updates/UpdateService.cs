@@ -4,7 +4,7 @@ using NoScope.CodeScope.Ui.Services;
 using Velopack;
 using Velopack.Sources;
 
-namespace NoScope.CodeScope.App;
+namespace NoScope.CodeScope.App.Updates;
 
 /// <summary>
 /// Background updater backed by Velopack + GitHub releases (the same channel the release.yml

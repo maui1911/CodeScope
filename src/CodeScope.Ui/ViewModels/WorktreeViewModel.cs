@@ -53,14 +53,7 @@ public sealed partial class WorktreeViewModel : ObservableObject
     /// collide. Wpf-cli snapshots will show e.g. <c>a:Worktree_codescope__main</c>.
     /// </summary>
     public string AutomationId
-        => $"Worktree_{SafeToken(ProjectId)}__{SafeToken(DisplayBranch)}";
-
-    private static string SafeToken(string? s)
-    {
-        if (string.IsNullOrWhiteSpace(s)) { return "unknown"; }
-        var token = new string([.. s.Select(c => char.IsLetterOrDigit(c) ? c : '_')]).Trim('_');
-        return string.IsNullOrEmpty(token) ? "unknown" : token;
-    }
+        => $"Worktree_{AutomationIds.SafeToken(ProjectId)}__{AutomationIds.SafeToken(DisplayBranch)}";
 
     public ObservableCollection<SessionTabViewModel> Sessions { get; }
 

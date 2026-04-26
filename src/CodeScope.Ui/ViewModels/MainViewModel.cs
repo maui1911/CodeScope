@@ -75,267 +75,6 @@ public sealed partial class MainViewModel : ObservableObject
     }
 
     /// <summary>
-    /// Keeps <see cref="GroupWidths"/> parallel to <see cref="Groups"/> whenever the
-    /// collection mutates (split, close-group, auto-collapse, hydrate, drag-between).
-    /// Centralising here means individual mutation sites don't need to remember to
-    /// touch the widths list — they just drive <see cref="Groups"/> and the shape follows.
-    /// </summary>
-    private void OnGroupsCollectionChanged(object? sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
-    {
-        switch (e.Action)
-        {
-            case System.Collections.Specialized.NotifyCollectionChangedAction.Add:
-                {
-                    var start = e.NewStartingIndex;
-                    if (start < 0) { start = GroupWidths.Count; }
-                    for (var i = 0; i < (e.NewItems?.Count ?? 0); i++)
-                    {
-                        GroupWidths.Insert(Math.Min(start + i, GroupWidths.Count), 1.0);
-                    }
-                    break;
-                }
-            case System.Collections.Specialized.NotifyCollectionChangedAction.Remove:
-                {
-                    var idx = e.OldStartingIndex;
-                    var count = e.OldItems?.Count ?? 0;
-                    for (var i = 0; i < count; i++)
-                    {
-                        if (idx >= 0 && idx < GroupWidths.Count) { GroupWidths.RemoveAt(idx); }
-                    }
-                    break;
-                }
-            case System.Collections.Specialized.NotifyCollectionChangedAction.Move:
-                {
-                    var from = e.OldStartingIndex;
-                    var to = e.NewStartingIndex;
-                    if (from >= 0 && to >= 0 && from < GroupWidths.Count && to < GroupWidths.Count)
-                    {
-                        var v = GroupWidths[from];
-                        GroupWidths.RemoveAt(from);
-                        GroupWidths.Insert(to, v);
-                    }
-                    break;
-                }
-            case System.Collections.Specialized.NotifyCollectionChangedAction.Reset:
-                GroupWidths.Clear();
-                for (var i = 0; i < Groups.Count; i++) { GroupWidths.Add(1.0); }
-                break;
-        }
-        RaiseGroupWidthsReset();
-    }
-
-    /// <summary>
-    /// Forwards a group's SelectedTab changes into MainViewModel.SelectedTab when the
-    /// group is focused — keeps WindowTitle, per-tab IsActive bookkeeping, and the
-    /// diff panel in sync regardless of which group the user clicked.
-    /// </summary>
-    private void HookGroupSelection(EditorGroupViewModel group)
-    {
-        group.PropertyChanged += (_, e) =>
-        {
-            if (e.PropertyName != nameof(EditorGroupViewModel.SelectedTab)) { return; }
-            if (!ReferenceEquals(group, FocusedGroup)) { return; }
-            if (ReferenceEquals(SelectedTab, group.SelectedTab)) { return; }
-            SelectedTab = group.SelectedTab;
-        };
-    }
-
-    /// <summary>Editor groups; every group owns a tab strip and a workspace region.</summary>
-    public ObservableCollection<EditorGroupViewModel> Groups { get; }
-
-    [ObservableProperty]
-    private EditorGroupViewModel _focusedGroup;
-
-    partial void OnFocusedGroupChanged(EditorGroupViewModel? oldValue, EditorGroupViewModel newValue)
-    {
-        if (oldValue is not null) { oldValue.IsFocused = false; }
-        newValue.IsFocused = true;
-        // Pull the newly-focused group's selection up to the window-global SelectedTab
-        // so the title bar + diff panel react to the group switch.
-        SelectedTab = newValue.SelectedTab;
-        OnPropertyChanged(nameof(CanCloseGroup));
-        CloseGroupCommand.NotifyCanExecuteChanged();
-    }
-
-    /// <summary>Flattened view of tabs across every group — used by sidebar lookups and Overview.</summary>
-    public IEnumerable<SessionTabViewModel> AllTabs => Groups.SelectMany(g => g.Tabs);
-
-    // Populated by LayoutStore before InitializeAsync runs. HydrateFromLoaded consults this
-    // to route each restored session to its saved group, so no cross-group re-parent /
-    // terminal respawn happens on cold start.
-    private IReadOnlyDictionary<string, int>? _pendingSessionToGroup;
-    private int _pendingFocusedIndex;
-
-    /// <summary>
-    /// Star-weight per group, parallel to <see cref="Groups"/>. Drives the workspace
-    /// ColumnDefinitions in MainWindow; persisted across restarts via LayoutStore.
-    /// The view captures drag ratios back into this list on splitter DragCompleted.
-    /// </summary>
-    public List<double> GroupWidths { get; } = [1.0];
-
-    /// <summary>
-    /// Raised after <see cref="GroupWidths"/> changes in bulk (hydrate / group add / remove)
-    /// so the view can rebuild ColumnDefinitions. Splitter-drag updates write into the list
-    /// directly and do NOT raise this — the view already owns the authoritative column widths
-    /// at that point.
-    /// </summary>
-    public event EventHandler? GroupWidthsReset;
-
-    private void RaiseGroupWidthsReset() => GroupWidthsReset?.Invoke(this, EventArgs.Empty);
-
-    /// <summary>
-    /// Pre-allocates enough groups to hold a persisted layout and stashes the session→group
-    /// mapping used during the next hydration. Call on window load, before
-    /// <see cref="InitializeAsync"/>. Does nothing if <paramref name="groupCount"/> is invalid.
-    /// </summary>
-    public void PrepareLayoutFromPersistence(
-        int groupCount,
-        int focusedIndex,
-        IReadOnlyDictionary<string, int> sessionToGroup,
-        double[]? groupWidths = null)
-    {
-        if (groupCount < 1) { return; }
-        while (Groups.Count < groupCount)
-        {
-            var g = new EditorGroupViewModel();
-            HookGroupSelection(g);
-            Groups.Add(g);
-        }
-        _pendingSessionToGroup = sessionToGroup;
-        _pendingFocusedIndex = Math.Clamp(focusedIndex, 0, Groups.Count - 1);
-
-        GroupWidths.Clear();
-        for (var i = 0; i < Groups.Count; i++)
-        {
-            var w = groupWidths is not null && i < groupWidths.Length && groupWidths[i] > 0
-                ? groupWidths[i]
-                : 1.0;
-            GroupWidths.Add(w);
-        }
-        RaiseGroupWidthsReset();
-    }
-
-    /// <summary>
-    /// Snapshots the current group layout — how many groups exist, which one has focus,
-    /// which group each session belongs to, and the per-group star widths.
-    /// Used by <c>LayoutStore.Save</c> at shutdown.
-    /// </summary>
-    public (int GroupCount, int FocusedIndex, Dictionary<string, int> SessionToGroup, double[] GroupWidths) CaptureLayout()
-    {
-        var map = new Dictionary<string, int>();
-        for (var i = 0; i < Groups.Count; i++)
-        {
-            foreach (var tab in Groups[i].Tabs)
-            {
-                map[tab.Descriptor.Id] = i;
-            }
-        }
-        var focused = Math.Max(0, Groups.IndexOf(FocusedGroup));
-        var widths = new double[Groups.Count];
-        for (var i = 0; i < widths.Length; i++)
-        {
-            widths[i] = i < GroupWidths.Count && GroupWidths[i] > 0 ? GroupWidths[i] : 1.0;
-        }
-        return (Groups.Count, focused, map, widths);
-    }
-
-    public bool CanCloseGroup => Groups.Count > 1;
-
-    /// <summary>
-    /// Adds a fresh empty group to the right of the focused group and shifts focus to it,
-    /// so the next <c>NewSession</c> lands there. Bound to <c>Ctrl+\</c>.
-    /// </summary>
-    [RelayCommand]
-    private void SplitRight()
-    {
-        var insertAt = Math.Max(0, Groups.IndexOf(FocusedGroup) + 1);
-        var group = new EditorGroupViewModel();
-        HookGroupSelection(group);
-        Groups.Insert(insertAt, group);
-        FocusedGroup = group;
-        OnPropertyChanged(nameof(CanCloseGroup));
-        OnPropertyChanged(nameof(AllTabs));
-        CloseGroupCommand.NotifyCanExecuteChanged();
-    }
-
-    /// <summary>
-    /// Closes the focused group. No-op when only one group exists. For v1 the group must
-    /// be empty; session evacuation to a neighbour ships in a follow-up so we don't
-    /// disturb long-running pwsh processes mid-flight.
-    /// </summary>
-    [RelayCommand(CanExecute = nameof(CanCloseGroupAndEmpty))]
-    private void CloseGroup()
-    {
-        if (Groups.Count < 2) { return; }
-        if (FocusedGroup.Tabs.Count > 0) { return; }
-        var idx = Groups.IndexOf(FocusedGroup);
-        var doomed = FocusedGroup;
-        var neighbour = Groups[idx == 0 ? 1 : idx - 1];
-        Groups.Remove(doomed);
-        FocusedGroup = neighbour;
-        OnPropertyChanged(nameof(CanCloseGroup));
-        OnPropertyChanged(nameof(AllTabs));
-    }
-
-    private bool CanCloseGroupAndEmpty() => Groups.Count > 1 && FocusedGroup.Tabs.Count == 0;
-
-    /// <summary>Transfers focus to <paramref name="group"/> (typically called from the view on click).</summary>
-    [RelayCommand]
-    private void FocusGroup(EditorGroupViewModel? group)
-    {
-        if (group is null || !Groups.Contains(group)) { return; }
-        FocusedGroup = group;
-    }
-
-    /// <summary>Alt+Right: cycle focus to the next group (wraps around).</summary>
-    [RelayCommand]
-    private void FocusNextGroup() => CycleFocus(+1);
-
-    /// <summary>Alt+Left: cycle focus to the previous group (wraps around).</summary>
-    [RelayCommand]
-    private void FocusPrevGroup() => CycleFocus(-1);
-
-    private void CycleFocus(int delta)
-    {
-        if (Groups.Count < 2) { return; }
-        var idx = Groups.IndexOf(FocusedGroup);
-        if (idx < 0) { return; }
-        var next = (idx + delta + Groups.Count) % Groups.Count;
-        FocusedGroup = Groups[next];
-    }
-
-    /// <summary>
-    /// Splits a fresh empty group to the right of the focused one and spawns a new
-    /// session for the sidebar's currently-selected worktree in that group. Wired to
-    /// the worktree context menu's <i>Open in new group</i> entry and to Ctrl+Shift+Enter.
-    /// </summary>
-    [RelayCommand]
-    private async Task OpenInNewGroupAsync(WorktreeViewModel? worktree)
-    {
-        await OpenInNewGroupWithAgentAsync(worktree, null).ConfigureAwait(true);
-    }
-
-    /// <summary>
-    /// Overload: split right + spawn a session of a specific agent. Invoked from the
-    /// sidebar's "Open in new group ▸ &lt;agent&gt;" submenu.
-    /// </summary>
-    [RelayCommand]
-    private async Task OpenInNewGroupWithAgentAsync((WorktreeViewModel? Worktree, string? AgentId) args)
-    {
-        await OpenInNewGroupWithAgentAsync(args.Worktree, args.AgentId).ConfigureAwait(true);
-    }
-
-    private async Task OpenInNewGroupWithAgentAsync(WorktreeViewModel? worktree, string? agentId)
-    {
-        if (worktree is not null && Sidebar is not null && !ReferenceEquals(Sidebar.SelectedWorktree, worktree))
-        {
-            Sidebar.SelectedWorktree = worktree;
-        }
-        SplitRight();
-        await NewSessionAsync(agentId).ConfigureAwait(true);
-    }
-
-    /// <summary>
     /// Ctrl+1..8 → Tabs[0..7]; Ctrl+9 → last tab. Mirrors the browser convention.
     /// Parameter is a string because XAML CommandParameter literals are strings; it's parsed here.
     /// No-op if the requested index doesn't exist yet.
@@ -387,7 +126,12 @@ public sealed partial class MainViewModel : ObservableObject
         }
     }
 
-    public SidebarViewModel Sidebar { get; private set; } = null!;
+    /// <summary>
+    /// Sidebar view-model. Set exactly once via <see cref="AttachSidebar"/> during host
+    /// startup (after DI resolution but before the first XAML binding fires); nullable so
+    /// the contract is honest. Bindings that access it before attach see the empty state.
+    /// </summary>
+    public SidebarViewModel? Sidebar { get; private set; }
 
     /// <summary>Notification queue projection for the status-bar bell cluster (spec §11).</summary>
     public NotificationsViewModel? Notifications { get; }
@@ -509,6 +253,15 @@ public sealed partial class MainViewModel : ObservableObject
         Sidebar = sidebar;
         OnPropertyChanged(nameof(Sidebar));
 
+        WireOverview(sidebar);
+        WireSidebarCallbacks(sidebar);
+        WireStoreChangedToStatusBar();
+        HookStatusBarSources();
+    }
+
+    /// <summary>Builds the OverviewViewModel and wires its focus/back signals to the main window.</summary>
+    private void WireOverview(SidebarViewModel sidebar)
+    {
         Overview = new OverviewViewModel(sidebar, Groups, _agents);
         Overview.FocusSessionRequested += (_, session) =>
         {
@@ -517,7 +270,11 @@ public sealed partial class MainViewModel : ObservableObject
         };
         Overview.BackRequested += (_, _) => IsOverviewVisible = false;
         OnPropertyChanged(nameof(Overview));
+    }
 
+    /// <summary>Hooks sidebar-driven callbacks (spawn-session, close-worktree-sessions).</summary>
+    private void WireSidebarCallbacks(SidebarViewModel sidebar)
+    {
         // Dialog → "Spawn session on creation" — fires after the store has inserted the
         // new worktree and the sidebar has selected it. NewSessionAsync() picks up the
         // current selection and uses the project's default agent.
@@ -527,91 +284,14 @@ public sealed partial class MainViewModel : ObservableObject
         };
 
         // Worktree deletion needs every tab pinned to that worktree closed first so the
-        // pwsh children release their Windows cwd lock. Match via the persisted Session
-        // (authoritative WorktreeId link); tabs without a stored session are transient
-        // and tear themselves down on group removal anyway.
-        sidebar.CloseWorktreeSessionsAsync = async (projectId, worktreeId) =>
-        {
-            var targetSessionIds = _store.Projects
-                .FirstOrDefault(p => p.Id == projectId)?.Sessions
-                .Where(s => s.WorktreeId == worktreeId && s.ClosedAt is null)
-                .Select(s => s.Id)
-                .ToHashSet() ?? [];
-            if (targetSessionIds.Count == 0) { return () => Task.CompletedTask; }
+        // pwsh children release their Windows cwd lock. Snapshot/close/rollback choreography
+        // lives in CloseWorktreeSessionsAsync / RestoreClosedWorktreeSessionsAsync.
+        sidebar.CloseWorktreeSessionsAsync = CloseWorktreeSessionsAsync;
+    }
 
-            // Snapshot each target tab's (stored state · group · groupIndex · indexInGroup) so
-            // a failed remove can reinsert them in place. FindStoredSession is called *before*
-            // CloseTabAsync since soft-close erases the AgentSessionId from memory state the
-            // restore needs. groupIndex is captured now because CloseTabAsync can auto-remove a
-            // group that ends up empty — on rollback we use that index to re-insert the group.
-            var snapshots = new List<(Session stored, EditorGroupViewModel group, int groupIndex, int indexInGroup)>();
-            for (var gi = 0; gi < Groups.Count; gi++)
-            {
-                var group = Groups[gi];
-                for (var i = 0; i < group.Tabs.Count; i++)
-                {
-                    var tab = group.Tabs[i];
-                    if (!targetSessionIds.Contains(tab.Descriptor.Id)) { continue; }
-                    if (FindStoredSession(tab) is { } stored)
-                    {
-                        snapshots.Add((stored, group, gi, i));
-                    }
-                }
-            }
-
-            foreach (var (stored, _, _, _) in snapshots)
-            {
-                var tab = Groups.SelectMany(g => g.Tabs).FirstOrDefault(t => t.Descriptor.Id == stored.Id);
-                if (tab is not null) { await CloseTabAsync(tab).ConfigureAwait(true); }
-            }
-
-            // Rollback lambda: only touches sessions that are *still* soft-closed at rollback
-            // time (a user might have already resumed one manually between close and failure).
-            return async () =>
-            {
-                // Group-level roll-back: CloseTabAsync auto-removes a now-empty non-focused group,
-                // which orphans that EditorGroupViewModel. Re-insert any such group at its original
-                // index before we start re-adding tabs — otherwise the restored tabs land in a
-                // detached group that isn't in `Groups` and effectively disappear.
-                foreach (var (_, group, groupIndex, _) in snapshots)
-                {
-                    if (Groups.Contains(group)) { continue; }
-                    var targetIndex = Math.Clamp(groupIndex, 0, Groups.Count);
-                    Groups.Insert(targetIndex, group);
-                }
-
-                foreach (var (stored, group, _, indexInGroup) in snapshots)
-                {
-                    var current = FindStoredSessionById(stored.Id);
-                    if (current is null || current.ClosedAt is null) { continue; }
-                    var restored = await _store.RestoreSessionAsync(stored.Id).ConfigureAwait(true);
-                    if (restored.IsFailure) { continue; }
-
-                    var agent = string.IsNullOrEmpty(stored.AgentId)
-                        || string.Equals(stored.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase)
-                        ? null
-                        : _agents.GetById(stored.AgentId!);
-                    var descriptor = agent is null
-                        ? _sessionManager.CreateShellSession(stored.WorktreePath, stored.Id)
-                        : _sessionManager.CreateAgentSession(stored.WorktreePath, agent, stored.Id,
-                            resume: true, agentSessionId: stored.AgentSessionId);
-                    var vm = new SessionTabViewModel(descriptor, projectId, stored.AgentId, stored.DisplayName, agent?.Icon);
-                    var insertAt = Math.Clamp(indexInGroup, 0, group.Tabs.Count);
-                    group.Tabs.Insert(insertAt, vm);
-
-                    if (string.Equals(stored.AgentId, "claude", StringComparison.OrdinalIgnoreCase)
-                        && stored.AgentSessionId is { Length: > 0 } sid)
-                    {
-                        _telemetry?.Register(sid, stored.WorktreePath);
-                    }
-                    BeginClaudeAdoption(descriptor.Id, stored.AgentId, stored.WorktreePath, DateTimeOffset.UtcNow);
-                }
-                CloseGroupCommand.NotifyCanExecuteChanged();
-                OnPropertyChanged(nameof(CanCloseGroup));
-            };
-        };
-
-        // Status-bar metrics recompute on any worktree status / PR event.
+    /// <summary>Recomputes status-bar metrics on every worktree-status / PR-state event.</summary>
+    private void WireStoreChangedToStatusBar()
+    {
         _store.Changed += (_, change) =>
         {
             if (change is SessionStoreChange.WorktreeStatusUpdated
@@ -624,145 +304,19 @@ public sealed partial class MainViewModel : ObservableObject
             {
                 if (Application.Current?.Dispatcher is { } d)
                 {
-                    d.BeginInvoke(() => { OnPropertyChanged(nameof(StatusBarText)); RaiseStatusBarChanged(); });
+                    d.BeginInvoke(RaiseStatusBarChanged);
                 }
                 else
                 {
-                    OnPropertyChanged(nameof(StatusBarText));
                     RaiseStatusBarChanged();
                 }
             }
         };
-
-        HookStatusBarSources();
-    }
-
-    /// <summary>
-    /// Live status bar: "N dirty · M PRs · K CI failing" aggregated across all tracked worktrees.
-    /// Empty-case shows a humble tagline so the bar isn't blank.
-    /// </summary>
-    public string StatusBarText
-    {
-        get
-        {
-            if (Sidebar is null) { return string.Empty; }
-
-            var dirty = 0; var prs = 0; var ciFail = 0; var wts = 0;
-            foreach (var p in Sidebar.Projects)
-            {
-                foreach (var w in p.Worktrees)
-                {
-                    wts++;
-                    if (w.IsDirty) { dirty++; }
-                    if (w.HasPullRequest) { prs++; }
-                    if (w.PullRequest?.CiStatus == CiStatus.Failure) { ciFail++; }
-                }
-            }
-
-            // Empty state: the status bar's LEFT column already shows StatusEmptyMessage;
-            // returning empty here avoids the same sentence rendering twice (once on each side).
-            if (wts == 0) { return string.Empty; }
-
-            var parts = new List<string>
-            {
-                $"{wts} worktree{(wts == 1 ? "" : "s")}",
-            };
-            if (dirty > 0)   { parts.Add($"{dirty} dirty"); }
-            if (prs > 0)     { parts.Add($"{prs} PR{(prs == 1 ? "" : "s")}"); }
-            if (ciFail > 0)  { parts.Add($"{ciFail} CI failing"); }
-            if (Groups.Count > 1) { parts.Add($"{Groups.Count} groups"); }
-            return string.Join(" · ", parts);
-        }
     }
 
     public async Task InitializeAsync(CancellationToken ct = default)
     {
         await _store.LoadAsync(ct).ConfigureAwait(true);
-    }
-
-    /// <summary>
-    /// Ctrl+K action: assembles the palette from current state and dispatches the pick.
-    /// Built each time so per-worktree "Create PR" entries stay fresh against the latest sidebar tree.
-    /// </summary>
-    [RelayCommand]
-    private async Task OpenCommandPaletteAsync()
-    {
-        var actions = BuildPaletteActions();
-        var picked = Dialogs.CommandPaletteDialog.Prompt(actions);
-        if (picked is null) { return; }
-        await picked.Execute().ConfigureAwait(true);
-    }
-
-    internal IReadOnlyList<PaletteAction> BuildPaletteActions()
-    {
-        var list = new List<PaletteAction>
-        {
-            new("New session",       "Ctrl+T",         () => { NewSessionCommand.Execute(null); return Task.CompletedTask; }, Icon: "▶"),
-            new("Close current tab", "Ctrl+W",         () => { CloseTabCommand.Execute(null); return Task.CompletedTask; }, Icon: "×"),
-            new("Next tab",          "Ctrl+Tab",       () => { NextTabCommand.Execute(null); return Task.CompletedTask; }, Icon: "→"),
-            new("Previous tab",      "Ctrl+Shift+Tab", () => { PrevTabCommand.Execute(null); return Task.CompletedTask; }, Icon: "←"),
-            new("Rename session",    "F2",             () => { RenameSessionCommand.Execute(null); return Task.CompletedTask; }, Icon: "✎"),
-            new("Toggle diff panel", "Ctrl+D",         () => { ToggleDiffPanelCommand.Execute(null); return Task.CompletedTask; }, Icon: "≡"),
-            new("Focus sidebar filter", "Ctrl+F",      () => { FocusSidebarFilterCommand.Execute(null); return Task.CompletedTask; }, Icon: "⌕"),
-            new("Refresh all",          "F5",          () => { RefreshAllCommand.Execute(null); return Task.CompletedTask; }, Icon: "↻"),
-            new("Overview · all sessions", "Ctrl+Shift+O", () => { ToggleOverviewCommand.Execute(null); return Task.CompletedTask; }, Icon: "▦"),
-        };
-
-        // Open tab rows: quick-switch without reaching for the mouse.
-        foreach (var tab in Tabs)
-        {
-            var local = tab;
-            list.Add(new PaletteAction(
-                $"Switch to: {local.DisplayName}",
-                local.Descriptor.WorkingDirectory,
-                () => { SelectedTab = local; return Task.CompletedTask; },
-                Icon: "◉"));
-        }
-
-        if (Sidebar is not null)
-        {
-            list.Add(new PaletteAction("Add project", "pick a folder",
-                () => { Sidebar.AddProjectCommand.Execute(null); return Task.CompletedTask; }, Icon: "+"));
-
-            foreach (var project in Sidebar.Projects)
-            {
-                foreach (var wt in project.Worktrees)
-                {
-                    var branch = wt.DisplayBranch;
-
-                    list.Add(new PaletteAction(
-                        $"Reveal: {project.Name} · {branch}",
-                        wt.Path,
-                        () => { Sidebar.RevealInExplorerCommand.Execute(wt); return Task.CompletedTask; },
-                        Icon: "📁"));
-
-                    list.Add(new PaletteAction(
-                        $"Open in new group: {project.Name} · {branch}",
-                        "Ctrl+Shift+↵",
-                        () => { OpenInNewGroupCommand.Execute(wt); return Task.CompletedTask; },
-                        Icon: "⫎"));
-
-                    if (wt.HasPullRequest)
-                    {
-                        list.Add(new PaletteAction(
-                            $"Open pull request {wt.PrBadgeText}",
-                            $"{project.Name} · {branch}",
-                            () => { wt.OpenPullRequestCommand.Execute(null); return Task.CompletedTask; },
-                            Icon: wt.CiGlyph));
-                    }
-                    else if (!string.IsNullOrWhiteSpace(wt.Worktree.Branch))
-                    {
-                        list.Add(new PaletteAction(
-                            "Create pull request",
-                            $"{project.Name} · {branch}",
-                            () => { Sidebar.CreatePullRequestCommand.Execute(wt); return Task.CompletedTask; },
-                            Icon: "◎"));
-                    }
-                }
-            }
-        }
-
-        return list;
     }
 
     [RelayCommand]
@@ -839,31 +393,13 @@ public sealed partial class MainViewModel : ObservableObject
             }
         }
 
-        // Resolve agent / shell. Priority: explicit arg → project's DefaultAgentId → global default.
-        var useShell = string.Equals(agentId, ShellSentinel, StringComparison.OrdinalIgnoreCase);
-        AgentProfile? agent;
-        if (useShell)
-        {
-            agent = null;
-        }
-        else if (!string.IsNullOrEmpty(agentId))
-        {
-            agent = _agents.GetById(agentId);
-        }
-        else if (!string.IsNullOrEmpty(project.DefaultAgentId)
-                 && !string.Equals(project.DefaultAgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase))
-        {
-            agent = _agents.GetById(project.DefaultAgentId) ?? _agents.GetDefault();
-        }
-        else if (string.Equals(project.DefaultAgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase))
-        {
-            useShell = true;
-            agent = null;
-        }
-        else
-        {
-            agent = _agents.GetDefault();
-        }
+        // Resolve agent / shell from the same priority used above (explicit arg → project default
+        // → global default). resolvedAgentId == ShellSentinel selects the shell; null falls back
+        // to the global default profile when no agent matched the requested id.
+        var useShell = string.Equals(resolvedAgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase);
+        var agent = useShell
+            ? null
+            : (resolvedAgentId is { Length: > 0 } id ? _agents.GetById(id) : null) ?? _agents.GetDefault();
         var targetFolder = folder;
         // Claude Code (and any agent with SessionIdFlag) gets a CodeScope-minted UUID up
         // front so we can later resume with `--resume <id>` instead of `--continue`.
@@ -927,6 +463,100 @@ public sealed partial class MainViewModel : ObservableObject
             return _agents.GetById(project.DefaultAgentId!)?.Id ?? _agents.GetDefault()?.Id;
         }
         return _agents.GetDefault()?.Id;
+    }
+
+    /// <summary>
+    /// Closes every open tab pinned to <paramref name="worktreeId"/> so its pwsh children
+    /// release the Windows cwd lock before the worktree is deleted. Returns a rollback
+    /// <see cref="Func{Task}"/> the caller invokes if the deletion itself fails — the rollback
+    /// re-inserts each soft-closed session in its original group/index.
+    /// </summary>
+    private async Task<Func<Task>> CloseWorktreeSessionsAsync(string projectId, string worktreeId)
+    {
+        var targetSessionIds = _store.Projects
+            .FirstOrDefault(p => p.Id == projectId)?.Sessions
+            .Where(s => s.WorktreeId == worktreeId && s.ClosedAt is null)
+            .Select(s => s.Id)
+            .ToHashSet() ?? [];
+        if (targetSessionIds.Count == 0) { return () => Task.CompletedTask; }
+
+        // Snapshot each target tab's (stored state · group · groupIndex · indexInGroup) so a
+        // failed remove can reinsert them in place. FindStoredSession is called *before*
+        // CloseTabAsync since soft-close erases the AgentSessionId from memory state the
+        // restore needs. groupIndex is captured now because CloseTabAsync can auto-remove an
+        // empty non-focused group — on rollback we use that index to re-insert the group.
+        var snapshots = new List<(Session stored, EditorGroupViewModel group, int groupIndex, int indexInGroup)>();
+        for (var gi = 0; gi < Groups.Count; gi++)
+        {
+            var group = Groups[gi];
+            for (var i = 0; i < group.Tabs.Count; i++)
+            {
+                var tab = group.Tabs[i];
+                if (!targetSessionIds.Contains(tab.Descriptor.Id)) { continue; }
+                if (FindStoredSession(tab) is { } stored)
+                {
+                    snapshots.Add((stored, group, gi, i));
+                }
+            }
+        }
+
+        foreach (var (stored, _, _, _) in snapshots)
+        {
+            var tab = Groups.SelectMany(g => g.Tabs).FirstOrDefault(t => t.Descriptor.Id == stored.Id);
+            if (tab is not null) { await CloseTabAsync(tab).ConfigureAwait(true); }
+        }
+
+        return () => RestoreClosedWorktreeSessionsAsync(projectId, snapshots);
+    }
+
+    /// <summary>
+    /// Rollback partner of <see cref="CloseWorktreeSessionsAsync"/>. Only touches sessions that
+    /// are *still* soft-closed at rollback time (a user might have manually resumed one between
+    /// close and failure). Re-inserts any group that <see cref="CloseTabAsync"/> auto-removed.
+    /// </summary>
+    private async Task RestoreClosedWorktreeSessionsAsync(
+        string projectId,
+        List<(Session stored, EditorGroupViewModel group, int groupIndex, int indexInGroup)> snapshots)
+    {
+        // Group-level roll-back: CloseTabAsync auto-removes a now-empty non-focused group,
+        // which orphans that EditorGroupViewModel. Re-insert any such group at its original
+        // index before we start re-adding tabs — otherwise the restored tabs land in a
+        // detached group that isn't in `Groups` and effectively disappear.
+        foreach (var (_, group, groupIndex, _) in snapshots)
+        {
+            if (Groups.Contains(group)) { continue; }
+            var targetIndex = Math.Clamp(groupIndex, 0, Groups.Count);
+            Groups.Insert(targetIndex, group);
+        }
+
+        foreach (var (stored, group, _, indexInGroup) in snapshots)
+        {
+            var current = FindStoredSessionById(stored.Id);
+            if (current is null || current.ClosedAt is null) { continue; }
+            var restored = await _store.RestoreSessionAsync(stored.Id).ConfigureAwait(true);
+            if (restored.IsFailure) { continue; }
+
+            var agent = string.IsNullOrEmpty(stored.AgentId)
+                || string.Equals(stored.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase)
+                ? null
+                : _agents.GetById(stored.AgentId!);
+            var descriptor = agent is null
+                ? _sessionManager.CreateShellSession(stored.WorktreePath, stored.Id)
+                : _sessionManager.CreateAgentSession(stored.WorktreePath, agent, stored.Id,
+                    resume: true, agentSessionId: stored.AgentSessionId);
+            var vm = new SessionTabViewModel(descriptor, projectId, stored.AgentId, stored.DisplayName, agent?.Icon);
+            var insertAt = Math.Clamp(indexInGroup, 0, group.Tabs.Count);
+            group.Tabs.Insert(insertAt, vm);
+
+            if (string.Equals(stored.AgentId, "claude", StringComparison.OrdinalIgnoreCase)
+                && stored.AgentSessionId is { Length: > 0 } sid)
+            {
+                _telemetry?.Register(sid, stored.WorktreePath);
+            }
+            BeginClaudeAdoption(descriptor.Id, stored.AgentId, stored.WorktreePath, DateTimeOffset.UtcNow);
+        }
+        CloseGroupCommand.NotifyCanExecuteChanged();
+        OnPropertyChanged(nameof(CanCloseGroup));
     }
 
     /// <summary>
