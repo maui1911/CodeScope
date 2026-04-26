@@ -72,12 +72,17 @@ public sealed partial class SidebarViewModel
         foreach (var wt in p.Worktrees)
         {
             var wvm = new WorktreeViewModel(p.Id, wt);
-            // Soft-closed sessions persist on disk but have no live tab — skip them in the tree
-            // so the worktree row reflects "no active session" and offers New session (which
-            // will resume the soft-closed conversation transparently).
+            // Open sessions → live row; soft-closed sessions → history (sorted most-recent first).
+            // Both collections live on the worktree VM; the sidebar template hides History when empty.
             foreach (var s in p.Sessions.Where(x => x.WorktreeId == wt.Id && x.ClosedAt is null))
             {
                 wvm.Sessions.Add(BuildSessionRow(p.Id, wt.Id, s));
+            }
+            foreach (var s in p.Sessions
+                .Where(x => x.WorktreeId == wt.Id && x.ClosedAt is not null)
+                .OrderByDescending(x => x.ClosedAt))
+            {
+                wvm.History.Add(BuildSessionRow(p.Id, wt.Id, s));
             }
             pvm.Worktrees.Add(wvm);
         }
@@ -189,17 +194,49 @@ public sealed partial class SidebarViewModel
             ?? pvm.Worktrees.FirstOrDefault(w => w.IsPrimary)
             ?? pvm.Worktrees.FirstOrDefault();
         if (wvm is null) { return; }
-        wvm.Sessions.Add(BuildSessionRow(projectId, wvm.Id, session));
+
+        // SessionAdded fires for both a brand-new live session AND for a restore (ClosedAt
+        // cleared by RestoreSessionAsync). On restore, also clear any stale history row for
+        // the same id so the session doesn't appear twice.
+        if (session.ClosedAt is null)
+        {
+            var stale = wvm.History.FirstOrDefault(x => x.Descriptor.Id == session.Id);
+            if (stale is not null) { wvm.History.Remove(stale); }
+            wvm.Sessions.Add(BuildSessionRow(projectId, wvm.Id, session));
+        }
+        else
+        {
+            wvm.History.Insert(0, BuildSessionRow(projectId, wvm.Id, session));
+        }
     }
 
     private void RemoveSession(string sessionId)
     {
+        // Determine soft-close vs hard-remove by peeking the store. Soft-closed → move the
+        // session row from Sessions to History (insert at top to honour ClosedAt-desc order).
+        // Hard-removed → drop from whichever collection it's in.
+        var stored = _store.Projects
+            .SelectMany(p => p.Sessions.Select(s => (project: p, session: s)))
+            .FirstOrDefault(x => x.session.Id == sessionId);
+
         foreach (var p in Projects)
         {
             foreach (var w in p.Worktrees)
             {
-                var s = w.Sessions.FirstOrDefault(x => x.Descriptor.Id == sessionId);
-                if (s is not null) { w.Sessions.Remove(s); return; }
+                var live = w.Sessions.FirstOrDefault(x => x.Descriptor.Id == sessionId);
+                if (live is not null)
+                {
+                    w.Sessions.Remove(live);
+                    if (stored.session is { ClosedAt: not null })
+                    {
+                        // Re-issue a fresh row instead of reusing `live` so its IsActive flag
+                        // and any tab-bar bindings reset cleanly to the dead-row state.
+                        w.History.Insert(0, BuildSessionRow(p.Id, w.Id, stored.session));
+                    }
+                    return;
+                }
+                var dead = w.History.FirstOrDefault(x => x.Descriptor.Id == sessionId);
+                if (dead is not null) { w.History.Remove(dead); return; }
             }
         }
     }
@@ -210,8 +247,10 @@ public sealed partial class SidebarViewModel
         {
             foreach (var w in p.Worktrees)
             {
-                var s = w.Sessions.FirstOrDefault(x => x.Descriptor.Id == sessionId);
-                if (s is not null) { s.DisplayName = newName ?? s.Descriptor.Title; return; }
+                var live = w.Sessions.FirstOrDefault(x => x.Descriptor.Id == sessionId);
+                if (live is not null) { live.DisplayName = newName ?? live.Descriptor.Title; return; }
+                var dead = w.History.FirstOrDefault(x => x.Descriptor.Id == sessionId);
+                if (dead is not null) { dead.DisplayName = newName ?? dead.Descriptor.Title; return; }
             }
         }
     }
