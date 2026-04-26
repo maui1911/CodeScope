@@ -653,10 +653,11 @@ public sealed partial class MainViewModel : ObservableObject
 
     /// <summary>
     /// Closes a tab. When <paramref name="hardRemove"/> is <c>false</c> (default) the session is
-    /// <em>soft-closed</em> for agents that can resume (<see cref="AgentProfile.ResumeByIdArgs"/> +
-    /// persisted <see cref="Session.AgentSessionId"/>) — next <c>New session</c> on the same worktree
-    /// restores the conversation. Shells and agents without resume support are always hard-removed.
-    /// Callers that definitely want the session gone (Restart, worktree cascade) pass <c>true</c>.
+    /// <em>soft-closed</em> — the row stays in the store with <see cref="Session.ClosedAt"/> set,
+    /// reachable from the worktree's history surface. Reopen logic in
+    /// <c>ReopenClosedSessionAsync</c> resumes resumable agents via <c>--resume &lt;id&gt;</c> and
+    /// respawns shells (and other non-resumable agents) in the original cwd. Callers that want
+    /// the row gone for good (Restart) pass <c>true</c>.
     /// </summary>
     private async Task CloseTabAsync(SessionTabViewModel? tab, bool hardRemove)
     {
@@ -678,14 +679,14 @@ public sealed partial class MainViewModel : ObservableObject
         if (storedForTab?.AgentSessionId is { Length: > 0 } tsid) { _telemetry?.Unregister(tsid); }
         StopClaudeAdoption(tab.Descriptor.Id);
 
-        // Resumable = agent with ResumeByIdArgs and a persisted AgentSessionId.
-        var resumable = !hardRemove
-            && storedForTab?.AgentSessionId is { Length: > 0 }
-            && !string.IsNullOrEmpty(storedForTab.AgentId)
-            && !string.Equals(storedForTab.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase)
-            && _agents.GetById(storedForTab.AgentId!)?.ResumeByIdArgs.Count > 0;
-
-        if (resumable)
+        // History: every closed session is preserved (soft-close) unless the caller asks for a
+        // hard remove (Restart is the only such caller today). Reopen handles three buckets:
+        // shells respawn pwsh in the original cwd; agents with ResumeByIdArgs + AgentSessionId
+        // resume via --resume <id>; agents without resume support also respawn fresh.
+        // Sessions whose store row vanished mid-flight (storedForTab is null) fall through to
+        // RemoveSessionAsync — there is nothing to soft-close.
+        var canSoftClose = !hardRemove && storedForTab is not null;
+        if (canSoftClose)
         {
             await _store.SoftCloseSessionAsync(tab.Descriptor.Id).ConfigureAwait(true);
         }
