@@ -42,6 +42,14 @@ minting a fresh one. This means:
 
 ### Architecture (UI-only — no Core changes)
 
+> **Implementation note:** during implementation a new
+> `SessionStoreChange.SessionSoftClosed` event was added to `CodeScope.Core`
+> to give `SidebarViewModel.RemoveSession` a race-free signal that
+> distinguishes a soft-close demotion from a hard-remove. The original design
+> re-queried the store inside the `SessionRemoved` handler, which opened a
+> small race window; the dedicated event closes it. All other claims below
+> remain accurate.
+
 All the data plumbing already exists:
 `Session.ClosedAt`, `SessionStore.SoftCloseSessionAsync` /
 `RestoreSessionAsync`, persisted via `ProjectStore`, with cascading
@@ -52,10 +60,10 @@ Changes are confined to `CodeScope.Ui`:
 - **`SidebarViewModel.StoreSync`** — alongside the existing
   `where ClosedAt is null` projection, add a second projection that maps the
   soft-closed sessions onto a new `WorktreeViewModel.History`
-  `ObservableCollection<HistorySessionViewModel>`. The existing
-  `SessionAdded` / `SessionRemoved` events already cover what's needed
-  (soft-close fires `SessionRemoved`, restore fires `SessionAdded`); no new
-  event types.
+  `ObservableCollection<HistorySessionViewModel>`. The `SessionAdded` /
+  `SessionRemoved` events handle restore and hard-remove; a new
+  `SessionSoftClosed` event (added to Core during implementation) handles
+  demotion from live to history race-free.
 - **`WorktreeViewModel`** — new `History` collection plus
   `IsHistoryExpanded` (default `false`).
 - **`SidebarView.xaml`** — extra disclosure level inside the worktree row,

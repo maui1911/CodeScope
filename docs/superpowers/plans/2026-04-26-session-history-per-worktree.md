@@ -4,7 +4,7 @@
 
 **Goal:** Surface soft-closed sessions per-worktree in the sidebar with explicit reopen, replacing the implicit auto-resume on *New session*.
 
-**Architecture:** UI-only — `Session.ClosedAt` and `SoftCloseSessionAsync` / `RestoreSessionAsync` already exist in `CodeScope.Core`. Plan adds a `History` collection on `WorktreeViewModel`, projects closed sessions into it from the existing `SessionAdded` / `SessionRemoved` event stream, renders a collapsible disclosure in `SidebarView.xaml`, and wires reopen + rename + hard-delete actions. The auto-resume block in `MainViewModel.NewSessionAsync` is removed; reopen becomes explicit.
+**Architecture:** UI-only — `Session.ClosedAt` and `SoftCloseSessionAsync` / `RestoreSessionAsync` already exist in `CodeScope.Core`. Plan adds a `History` collection on `WorktreeViewModel`, projects closed sessions into it from the existing `SessionAdded` / `SessionRemoved` event stream, renders a collapsible disclosure in `SidebarView.xaml`, and wires reopen + rename + hard-delete actions. The auto-resume block in `MainViewModel.NewSessionAsync` is removed; reopen becomes explicit. During implementation a `SessionStoreChange.SessionSoftClosed` event was introduced in Core to give `SidebarViewModel.RemoveSession` a race-free signal distinguishing a soft-close demotion from a hard-remove, avoiding a store re-query race window.
 
 **Tech stack:** .NET 10, C# 14, WPF, CommunityToolkit.Mvvm, NSubstitute (tests), FluentAssertions (tests).
 

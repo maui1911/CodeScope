@@ -112,8 +112,9 @@ public partial class SidebarView : UserControl
                     && main.AllTabs.FirstOrDefault(t => t.Descriptor.Id == first.Descriptor.Id) is { } tab)
                 {
                     main.SelectedTab = tab;
+                    e.Handled = true;
                 }
-                e.Handled = true;
+                // No live sessions: don't handle — let WPF toggle IsExpanded for history disclosure.
                 return;
             case SessionTabViewModel session when session.ClosedAt is not null:
                 if (main.ReopenClosedSessionCommand.CanExecute(session.Descriptor.Id))

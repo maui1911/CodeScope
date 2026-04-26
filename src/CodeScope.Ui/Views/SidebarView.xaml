@@ -187,8 +187,11 @@
             PreviewKeyDown="OnTreeKeyDown">
             <TreeView.ItemContainerStyle>
                 <Style TargetType="TreeViewItem">
-                    <Setter Property="Visibility" Value="{Binding IsVisible, Converter={StaticResource BoolVisible}}" />
-                    <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
+                    <!-- FallbackValue ensures no binding errors for SessionTabViewModel children
+                         (history rows) which don't expose IsVisible or IsExpanded. Project/Worktree
+                         nodes supply both; leaf session rows fall back to Visible/False silently. -->
+                    <Setter Property="Visibility" Value="{Binding IsVisible, Converter={StaticResource BoolVisible}, FallbackValue=Visible}" />
+                    <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay, FallbackValue=False}" />
                     <Setter Property="Foreground" Value="{DynamicResource Fig.Brush.Ink}" />
                     <Setter Property="Padding" Value="0" />
                     <Setter Property="HorizontalContentAlignment" Value="Stretch" />
@@ -430,41 +433,50 @@
                             Foreground="{DynamicResource Text.Faint}" />
                         <!-- Disclosure chevron — only visual hint that this worktree has history.
                              Rotates 0→90° based on the ancestor TreeViewItem's IsExpanded.
-                             Hidden when there is no history. -->
-                        <Path
+                             Hidden when there is no history. Wrapped in a transparent Border so
+                             clicking the chevron toggles expand/collapse (mirrors the project
+                             chevron pattern); the Path itself stays IsHitTestVisible=False. -->
+                        <Border
                             Grid.Column="5"
-                            Width="8" Height="8"
+                            Background="Transparent"
+                            Cursor="Hand"
+                            ToolTip="Expand / collapse history"
                             Margin="8,0,12,0"
-                            Stretch="Uniform"
-                            Data="M3 1.5 L6 4 L3 6.5"
-                            Stroke="{DynamicResource Text.Faint}"
-                            StrokeThickness="1.2"
-                            StrokeStartLineCap="Round"
-                            StrokeEndLineCap="Round"
-                            StrokeLineJoin="Round"
                             VerticalAlignment="Center"
-                            IsHitTestVisible="False"
-                            RenderTransformOrigin="0.5,0.5"
-                            Visibility="{Binding HasHistory, Converter={StaticResource BoolToVisibility}}">
-                            <Path.Style>
-                                <Style TargetType="Path">
-                                    <Setter Property="RenderTransform">
-                                        <Setter.Value>
-                                            <RotateTransform Angle="0" />
-                                        </Setter.Value>
-                                    </Setter>
-                                    <Style.Triggers>
-                                        <DataTrigger Binding="{Binding Path=IsExpanded, RelativeSource={RelativeSource AncestorType=TreeViewItem}}" Value="True">
-                                            <Setter Property="RenderTransform">
-                                                <Setter.Value>
-                                                    <RotateTransform Angle="90" />
-                                                </Setter.Value>
-                                            </Setter>
-                                        </DataTrigger>
-                                    </Style.Triggers>
-                                </Style>
-                            </Path.Style>
-                        </Path>
+                            Visibility="{Binding HasHistory, Converter={StaticResource BoolToVisibility}}"
+                            PreviewMouseLeftButtonDown="OnChevronClick">
+                            <Path
+                                Width="8" Height="8"
+                                Stretch="Uniform"
+                                Data="M3 1.5 L6 4 L3 6.5"
+                                Stroke="{DynamicResource Text.Faint}"
+                                StrokeThickness="1.2"
+                                StrokeStartLineCap="Round"
+                                StrokeEndLineCap="Round"
+                                StrokeLineJoin="Round"
+                                VerticalAlignment="Center"
+                                IsHitTestVisible="False"
+                                RenderTransformOrigin="0.5,0.5">
+                                <Path.Style>
+                                    <Style TargetType="Path">
+                                        <Setter Property="RenderTransform">
+                                            <Setter.Value>
+                                                <RotateTransform Angle="0" />
+                                            </Setter.Value>
+                                        </Setter>
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding Path=IsExpanded, RelativeSource={RelativeSource AncestorType=TreeViewItem}}" Value="True">
+                                                <Setter Property="RenderTransform">
+                                                    <Setter.Value>
+                                                        <RotateTransform Angle="90" />
+                                                    </Setter.Value>
+                                                </Setter>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Path.Style>
+                            </Path>
+                        </Border>
                     </Grid>
                 </HierarchicalDataTemplate>
 

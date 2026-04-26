@@ -538,8 +538,13 @@ public sealed partial class MainViewModel : ObservableObject
     /// <summary>
     /// Restores a soft-closed session: clears <see cref="Session.ClosedAt"/> in the store and
     /// spawns a tab. Resumable agents (Claude/Codex) get a <c>--resume &lt;id&gt;</c> descriptor;
-    /// shells respawn pwsh in the original cwd. Returns <c>false</c> only when the store
-    /// rejects the restore.
+    /// shells respawn pwsh in the original cwd.
+    /// Returns <c>false</c> when:
+    /// <list type="bullet">
+    ///   <item>the agent profile is no longer registered (non-shell session with unknown AgentId),</item>
+    ///   <item>the worktree directory no longer exists on disk, or</item>
+    ///   <item>the store rejects the restore (e.g. session id not found).</item>
+    /// </list>
     /// </summary>
     private async Task<bool> TryRestoreSessionAsync(Project project, Worktree worktree, Session closed)
     {
@@ -637,16 +642,26 @@ public sealed partial class MainViewModel : ObservableObject
             return;
         }
 
-        // Pre-flight: worktree directory check.
-        if (!Directory.Exists(worktree.Path))
+        // Pre-flight: directory check uses the session's stored WorktreePath, not the fallback
+        // worktree's path. If the original directory is gone (deleted worktree, moved repo, etc.)
+        // toast and bail regardless of which worktree object we resolved above.
+        var sessionDir = hit.session.WorktreePath;
+        if (!Directory.Exists(sessionDir))
         {
             ErrToast(
                 "Cannot reopen session",
-                $"Worktree directory '{worktree.Path}' is gone. Remove this entry from history.");
+                $"Session directory '{sessionDir}' is gone. Remove this entry from history.");
             return;
         }
 
-        var ok = await TryRestoreSessionAsync(hit.project, worktree, hit.session).ConfigureAwait(true);
+        // If the worktree's stored path differs from the session's WorktreePath (i.e. we fell
+        // back to the primary/first worktree), use a synthetic Worktree with the correct path
+        // so TryRestoreSessionAsync spawns the shell/agent in the right directory.
+        var effectiveWorktree = string.Equals(worktree.Path, sessionDir, StringComparison.OrdinalIgnoreCase)
+            ? worktree
+            : worktree with { Path = sessionDir };
+
+        var ok = await TryRestoreSessionAsync(hit.project, effectiveWorktree, hit.session).ConfigureAwait(true);
         if (!ok)
         {
             // TryRestoreSessionAsync returns false only when the store itself rejects the

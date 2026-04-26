@@ -111,4 +111,46 @@ public sealed class SessionTabViewModelTests
         vm.CommandLine.Should().Be("pwsh.exe -B -C");
         fired.Should().BeTrue();
     }
+
+    // ──── ClosedAtRelative time-bucket tests ─────────────────────────────
+
+    private static SessionTabViewModel MakeClosedVm(int minutesAgo)
+        => new(MakeDescriptor(), "proj", null, null)
+        {
+            ClosedAt = DateTimeOffset.UtcNow.AddMinutes(-minutesAgo),
+        };
+
+    [Fact]
+    public void ClosedAtRelative_IsEmpty_ForLiveRows()
+    {
+        var vm = new SessionTabViewModel(MakeDescriptor(), null, null, null);
+        // ClosedAt is null — live tab
+        vm.ClosedAtRelative.Should().BeEmpty();
+    }
+
+    [Theory]
+    [InlineData(0, "just now")]    // < 1 minute
+    [InlineData(5, "5m ago")]      // 5 minutes
+    [InlineData(120, "2h ago")]    // 2 hours
+    [InlineData(1500, "yesterday")] // 25 hours — between 24 h and 48 h → "yesterday"
+    [InlineData(4320, "3d ago")]   // 3 days (< 7 days)
+    public void ClosedAtRelative_Returns_Expected_Bucket(int minutesAgo, string expected)
+    {
+        var vm = MakeClosedVm(minutesAgo);
+        vm.ClosedAtRelative.Should().Be(expected);
+    }
+
+    [Fact]
+    public void ClosedAtRelative_Returns_MonthDay_ForOldSessions()
+    {
+        // More than 7 days ago — should produce a "MMM d" formatted string (e.g. "Jan 5").
+        var closedAt = new DateTimeOffset(2025, 1, 5, 12, 0, 0, TimeSpan.Zero);
+        var vm = new SessionTabViewModel(MakeDescriptor(), "proj", null, null)
+        {
+            ClosedAt = closedAt,
+        };
+        // The result is formatted via LocalDateTime so we compare against the expected local representation.
+        var expected = closedAt.LocalDateTime.ToString("MMM d");
+        vm.ClosedAtRelative.Should().Be(expected);
+    }
 }
