@@ -599,14 +599,15 @@ public partial class SidebarView : UserControl
     }
 
     /// <summary>
-    /// Maps a worktree's derived state to the accent brush key used by the context-header dot.
-    /// Mirrors <c>OverviewCardState</c> mapping: failing PR CI → Signal.Warn (waiting on user),
-    /// dirty tree → Accent.Primary (agent editing), otherwise Signal.Ok (idle).
+    /// Brush key for the worktree context-menu header dot. Tracks the same two-state agent
+    /// model as the row dot: any busy session or failing PR CI → Signal.Warn (red),
+    /// otherwise Signal.Ok (green). Dirty-tree no longer pulls a distinct accent — selection
+    /// blue is gone from the dot system.
     /// </summary>
     private static string WorktreeDotKey(WorktreeViewModel wt)
     {
+        if (wt.HasBusySession) { return "Signal.Warn"; }
         if (wt.PullRequest is { CiStatus: CiStatus.Failure }) { return "Signal.Warn"; }
-        if (wt.IsDirty) { return "Accent.Primary"; }
         return "Signal.Ok";
     }
 }

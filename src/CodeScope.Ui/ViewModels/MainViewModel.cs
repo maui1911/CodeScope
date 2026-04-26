@@ -1120,16 +1120,6 @@ public sealed partial class MainViewModel : ObservableObject
     }
 
     /// <summary>
-    /// Projects <see cref="ClaudeActivityState"/> onto <see cref="TabStatus"/>:
-    /// <list type="bullet">
-    ///   <item>PendingToolUse → Wait (pulse; in auto-accept this flickers on tool calls,
-    ///     but is a true "paused for permission" signal in manual mode).</item>
-    ///   <item>Idle → Idle (overrides the selection-based Active flip so a focused-but-quiet
-    ///     tab reads as idle rather than active).</item>
-    ///   <item>Composing → Active if the tab is the window-selected one, else Idle.</item>
-    /// </list>
-    /// </summary>
-    /// <summary>
     /// Emits notification entries on semantic transitions of a session's activity FSM:
     /// <list type="bullet">
     ///   <item>* → <c>PendingToolUse</c> → "Needs attention" (Wait pulse is visual-only; this persists).</item>
