@@ -42,7 +42,8 @@ public sealed partial class MainViewModel : ObservableObject
         IClaudeTelemetryService? telemetry = null,
         INotificationService? notifications = null,
         IClaudeSessionDiscovery? discovery = null,
-        IToastService? toasts = null)
+        IToastService? toasts = null,
+        ISessionViewHostPool? sessionViewPool = null)
     {
         _sessionManager = sessionManager;
         _store = store;
@@ -54,6 +55,7 @@ public sealed partial class MainViewModel : ObservableObject
         _notifications = notifications;
         _discovery = discovery;
         _toasts = toasts;
+        SessionViewPool = sessionViewPool;
         if (_telemetry is not null) { _telemetry.Updated += OnTelemetryUpdated; }
         if (_notifications is not null)
         {
@@ -109,6 +111,14 @@ public sealed partial class MainViewModel : ObservableObject
     }
 
     public ObservableCollection<SessionTabViewModel> Tabs { get; }
+
+    /// <summary>
+    /// Owns the lifecycle of <see cref="Views.SessionTabView"/> instances so a single view
+    /// (and its inner HwndHost / ConPTY child) survives reparent across editor groups on
+    /// drag-between-groups. May be null in unit tests / design-time; <c>EditorGroupView</c>
+    /// degrades to per-group construction when null.
+    /// </summary>
+    public ISessionViewHostPool? SessionViewPool { get; }
 
     public IAgentRegistry Agents => _agents;
 
@@ -772,6 +782,9 @@ public sealed partial class MainViewModel : ObservableObject
         var storedForTab = FindStoredSession(tab);
         if (storedForTab?.AgentSessionId is { Length: > 0 } tsid) { _telemetry?.Unregister(tsid); }
         StopClaudeAdoption(tab.Descriptor.Id);
+        // The pool owns the SessionTabView; release here so ConPTY teardown actually runs.
+        // (Removed Unloaded teardown on the view itself — see SessionTabView ctor.)
+        SessionViewPool?.Release(tab.Descriptor.Id);
 
         // History: every closed session is preserved (soft-close) unless the caller asks for a
         // hard remove (Restart is the only such caller today). Reopen handles three buckets:
@@ -840,13 +853,13 @@ public sealed partial class MainViewModel : ObservableObject
     /// Transfers <paramref name="tab"/> from its current group into <paramref name="targetGroup"/>.
     /// Called from <c>EditorGroupView</c>'s drop handler.
     ///
-    /// <para><b>Known v1 limitation:</b> the underlying pwsh process restarts. The source
-    /// group's <c>ItemsControl</c> destroys its <c>ContentPresenter</c> for the tab when
-    /// the VM leaves its <c>Tabs</c>, which unloads the hosted <c>EasyTerminalControl</c>
-    /// and tears down the native HWND; the target group then creates a fresh one. The
-    /// tab's title and worktree persist, but agent state resets. Preserving the HWND
-    /// across groups needs a shared hosting pool — see the follow-up note in
-    /// <c>docs/HANDOFF.md</c>.</para>
+    /// <para>Cross-group moves preserve the underlying ConPTY child + scrollback: the
+    /// <see cref="Views.SessionTabView"/> for the tab is owned by <see cref="ISessionViewHostPool"/>,
+    /// and both groups' <c>ContentControl</c> resolve their content from that same pool. Moving
+    /// the VM between <c>Tabs</c> collections triggers each group's <c>SelectedTab</c>-changed
+    /// handler, which re-acquires the same view from the pool — WPF reparents the existing
+    /// HwndHost (and the inner native HWND) under the new <c>ContentControl</c> rather than
+    /// destroying it. No descriptor rebind, no agent resume, no telemetry hiccup.</para>
     /// </summary>
     public void MoveTabToGroup(SessionTabViewModel tab, EditorGroupViewModel targetGroup, int targetIndex = -1)
     {
@@ -862,33 +875,21 @@ public sealed partial class MainViewModel : ObservableObject
             return;
         }
 
-        // Cross-group moves force the terminal to respawn (HWND lifecycle — see doc comment
-        // above). Rebind the descriptor to use ResumeArgs so Claude Code / codex / OpenCode
-        // pick up the previous conversation in this working directory instead of starting
-        // fresh. Shell-only tabs need no rebinding.
-        var agent = string.IsNullOrEmpty(tab.AgentId)
-                    || string.Equals(tab.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase)
-            ? null
-            : _agents.GetById(tab.AgentId);
-        if (agent is not null)
+        sourceGroup.Tabs.Remove(tab);
+
+        // Fix the source selection BEFORE the target adopts the view. If
+        // sourceGroup.SelectedTab still points at the moved tab, the source
+        // EditorGroupView never raises a SelectedTab-changed event and never
+        // clears its own ContentControl.Content — when the target then assigns
+        // the same SessionTabView to its slot, WPF throws because the view
+        // still has a logical parent. Always re-resolve when the moved tab was
+        // the source's selection; otherwise leave it alone (a non-selected tab
+        // was dragged).
+        if (ReferenceEquals(sourceGroup.SelectedTab, tab))
         {
-            var old = tab.Descriptor;
-            var storedAgentId = FindStoredSession(tab)?.AgentSessionId;
-            var resumed = _sessionManager.CreateAgentSession(old.WorkingDirectory, agent, id: old.Id, resume: true, agentSessionId: storedAgentId)
-                with { Title = old.Title };
-            tab.Rebind(resumed);
-            // Resume-by-id (e.g. `claude --resume <id>`) appends to the existing jsonl, so the
-            // telemetry watcher keeps tracking the same file across the pwsh respawn. Only when
-            // we can't resume by id do we need to tear the tail down and rediscover a fresh one.
-            var resumesById = storedAgentId is { Length: > 0 } && agent.ResumeByIdArgs.Count > 0;
-            if (!resumesById)
-            {
-                if (storedAgentId is { Length: > 0 } oldId) { _telemetry?.Unregister(oldId); }
-                BeginClaudeAdoption(tab.Descriptor.Id, agent.Id, old.WorkingDirectory, DateTimeOffset.UtcNow);
-            }
+            sourceGroup.SelectedTab = sourceGroup.Tabs.Count > 0 ? sourceGroup.Tabs[^1] : null;
         }
 
-        sourceGroup.Tabs.Remove(tab);
         if (targetIndex < 0 || targetIndex > targetGroup.Tabs.Count)
         {
             targetGroup.Tabs.Add(tab);
@@ -898,12 +899,6 @@ public sealed partial class MainViewModel : ObservableObject
             targetGroup.Tabs.Insert(targetIndex, tab);
         }
 
-        // Fix up selections: source falls back to its last remaining tab, target
-        // adopts the moved one + takes window focus.
-        if (sourceGroup.SelectedTab is null && sourceGroup.Tabs.Count > 0)
-        {
-            sourceGroup.SelectedTab = sourceGroup.Tabs[^1];
-        }
         targetGroup.SelectedTab = tab;
 
         // Auto-collapse the source if it became empty — matches the CloseTab rule so
@@ -1011,6 +1006,12 @@ public sealed partial class MainViewModel : ObservableObject
                             break;
                         }
                     }
+                    // External removal (e.g. cascade in SessionStore) must also release the
+                    // pooled view — otherwise the ConPTY child lingers, holds its cwd, and
+                    // breaks the next `git worktree remove`.
+                    SessionViewPool?.Release(removed.SessionId);
+                    if (removed.SessionId is { Length: > 0 } sid) { _telemetry?.Unregister(sid); }
+                    StopClaudeAdoption(removed.SessionId);
                     CloseGroupCommand.NotifyCanExecuteChanged();
                     break;
             }

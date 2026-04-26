@@ -20,10 +20,11 @@ public sealed partial class SessionTabViewModel : ObservableObject
     public SessionDescriptor Descriptor { get; private set; }
 
     /// <summary>
-    /// Swaps the backing descriptor (e.g. flipping a fresh-session launch to a
-    /// <c>--continue</c> resume when a tab is moved across groups and its terminal
-    /// has to respawn). Raises property-change on <see cref="CommandLine"/> so the
-    /// XAML <c>StartupCommandLine</c> binding picks up the new args on reload.
+    /// Swaps the backing descriptor and raises property-change on <see cref="CommandLine"/>.
+    /// Cross-group drag no longer calls this — since the SessionViewHostPool keeps the same
+    /// SessionTabView (and its ConPTY child) alive across reparent, there is no respawn to
+    /// flip the args for. Retained for any future flow that legitimately needs to reseat the
+    /// descriptor without disposing the VM (none today).
     /// </summary>
     public void Rebind(SessionDescriptor descriptor)
     {

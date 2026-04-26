@@ -5,9 +5,9 @@
 > **Intent:** cursor + last 1–2 sessions in depth, everything else a one-liner.
 > Old detail lives in `git log` — don't duplicate it here.
 
-**Last updated:** 2026-04-26 (session 21)
-**Branch:** `feature/session-history-per-worktree` — 9 commits ahead of `main`, not yet pushed to origin.
-**Head:** see session 21 below (HANDOFF commit is the tip after `aef072a`)
+**Last updated:** 2026-04-26 (session 22)
+**Branch:** `feature/session-history-per-worktree` — adds the cross-group drag pool on top of session 21's history work; PR pending.
+**Head:** see session 22 below (cross-group terminal drag pool)
 **Release:** `v0.1.0` shipped via GitHub Actions — https://github.com/maui1911/CodeScope/releases/tag/v0.1.0
 **Build status:** ✅ `dotnet build` clean. `dotnet test` 280/281 green; 1 pre-existing FSWatcher flake (`Callback_Fires_For_Each_New_Jsonl_So_Clear_Rotations_Are_Adopted`) — confirmed flaky on `main` too, not a regression.
 **Uncommitted work:** none.
@@ -16,6 +16,56 @@
 ---
 
 ## Cursor — current focus
+
+**Cross-group terminal drag without restart — shipped (session 22).** A new
+`ISessionViewHostPool` (UI-singleton) owns one `SessionTabView` per session id;
+each `EditorGroupView` is a single `ContentControl` that pulls its content
+from the pool. Dragging a tab between groups now reparents the *same* view
+under the new `ContentControl`, preserving the inner `EasyTerminalControl`
+HwndHost — pwsh / claude / codex stay alive, scrollback intact, telemetry
+uninterrupted. The agent-resume / telemetry-rebind hack in `MoveTabToGroup`
+that masked the old respawn was deleted (~25 lines). Spec
+`docs/superpowers/specs/2026-04-26-cross-group-terminal-drag-design.md`,
+plan `docs/superpowers/plans/2026-04-26-cross-group-terminal-drag.md`,
+ADR-0014. The "Drag tab between groups loses scroll buffer" rough edge is
+closed.
+
+### Session 22 — cross-group terminal drag pool (shipped)
+
+User-visible: drag a tab from group A to group B → no flash, no respawn,
+scrollback retained, prompt and agent state untouched. Hand-tested by the
+user against the dev build; works.
+
+Files touched:
+- `src/CodeScope.Ui/Services/ISessionViewHostPool.cs` (new)
+- `src/CodeScope.Ui/Services/SessionViewHostPool.cs` (new)
+- `src/CodeScope.Ui/Views/SessionTabView.xaml.cs` — drop `Unloaded` teardown
+  hook; rename `TeardownShell` → `internal Teardown`. Doc the why (Unloaded
+  fires on every reparent — pool calls Teardown on Release instead).
+- `src/CodeScope.Ui/Views/EditorGroupView.xaml` — replace per-tab
+  `ItemsControl` with a single `ContentControl x:Name="ActiveSlot"`.
+- `src/CodeScope.Ui/Views/EditorGroupView.xaml.cs` — subscribe to
+  `EditorGroupViewModel.SelectedTab` change, resolve view via pool, set as
+  `ActiveSlot.Content`. Detach (clear `Content`) on Unloaded — never tear
+  down the view itself; the pool owns it.
+- `src/CodeScope.Ui/ViewModels/MainViewModel.cs` — accept
+  `ISessionViewHostPool?` ctor param; expose as `SessionViewPool`. Drop the
+  agent-resume / telemetry-rebind block in `MoveTabToGroup`. Call
+  `SessionViewPool?.Release(tab.Descriptor.Id)` in `CloseTabAsync` (covers
+  soft-close, hard-remove, restart, and worktree-cascade since cascade routes
+  through `CloseTabAsync`).
+- `src/CodeScope.App/App.xaml.cs` — register
+  `ISessionViewHostPool → SessionViewHostPool` singleton; pass to
+  `MainViewModel`.
+- `docs/DECISIONS.md` — ADR-0014.
+
+Build/tests: `dotnet build` clean; `dotnet test` 288/288 green (no test
+changes needed — `Core` doesn't see UI; `Ui.Tests` doesn't exercise
+`MainViewModel`). The pool itself is a 30-line dictionary wrapper; relying
+on the smoke test (the actual win is HWND survival, which only a real WPF
+process can validate).
+
+### Session 21 — per-worktree session history surface (shipped)
 
 **Per-worktree session history surface.** Session 21 shipped a full
 soft-close gate + history UI: every session (agent and shell) now soft-closes
@@ -314,7 +364,6 @@ docs/
 - **"Remove from history" has no confirm dialog** — the action is destructive (entry cannot be recovered) but currently fires immediately on click. A follow-up should add a small inline confirm or an Undo toast. Low priority until the history feature is user-tested.
 - **Gitea CI rollup is always `None`** — `tea pulls status`/REST integration deferred.
 - **Session-exit toasts deferred** — `SessionManager` starts pwsh with `-NoExit`; detecting agent exit needs `SessionManager` refactor or pty-output parsing.
-- **Drag tab between groups loses scroll buffer** — pwsh respawns because WPF unloads the `SessionTabView` (HWND lifecycle) when the VM leaves its group. As of session 20 Claude resumes its conversation via `claude --resume <id>` and telemetry keeps tracking (same jsonl), but the terminal scrollback is gone. Fix still needs a shared `SessionTabView` host pool — see `memory/project_terminal_lifecycle.md`.
 - **Terminal right-click opens no context menu** — parked for a dedicated
   research pass. Short version: `Microsoft.Terminal.Wpf` hosts a native
   Win32 child HWND (`TerminalContainer : HwndHost`) that intercepts
@@ -369,8 +418,6 @@ dotnet publish src/CodeScope.App -c Release -r win-x64 `
 
 **Multi-group / chrome polish:**
 
-- **Preserve terminal HWND across drag-between-groups** — shared
-  SessionTabView host pool.
 - **Tab drag-reorder motion spec** — `docs/design/html/CodeScope - Tab Drag.html`.
 
 **Fase 7 — remaining design token / mock consumption:**

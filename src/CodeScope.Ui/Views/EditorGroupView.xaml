@@ -5,7 +5,6 @@
     xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     xmlns:vm="clr-namespace:NoScope.CodeScope.Ui.ViewModels"
-    xmlns:views="clr-namespace:NoScope.CodeScope.Ui.Views"
     mc:Ignorable="d"
     d:DataContext="{d:DesignInstance Type=vm:EditorGroupViewModel}">
     <UserControl.Resources>
@@ -15,7 +14,13 @@
         One editor group's workspace column. The tab strip is window-global (hosted in
         Row 0 of MainWindow, bound to FocusedGroup.Tabs) — this view is just the
         per-group terminal overlay + a drop target for drag-between-groups.
-        Clicking anywhere transfers focus so the global strip flips to this group's tabs.
+
+        IMPORTANT: the active SessionTabView is NOT instantiated by a DataTemplate here —
+        it is pulled from ISessionViewHostPool keyed by SelectedTab.Id. That keeps the
+        same SessionTabView (and its inner HwndHost / ConPTY child / scrollback) alive
+        when a tab is dragged from one group to another. See
+        Services/SessionViewHostPool.cs and the spec at
+        docs/superpowers/specs/2026-04-26-cross-group-terminal-drag-design.md.
     -->
     <Border
         x:Name="GroupRoot"
@@ -37,35 +42,13 @@
                 Fill="{DynamicResource Accent.Primary}"
                 Visibility="{Binding IsFocused, Converter={StaticResource BoolVisible}}" />
 
-            <!-- Per-tab SessionTabView stacked; only the group's selected tab is visible
-                 so each one keeps its own long-lived pwsh process. -->
-            <ItemsControl
-                ItemsSource="{Binding Tabs}"
-                Margin="0,2,0,0">
-                <ItemsControl.ItemsPanel>
-                    <ItemsPanelTemplate>
-                        <Grid />
-                    </ItemsPanelTemplate>
-                </ItemsControl.ItemsPanel>
-                <ItemsControl.ItemContainerStyle>
-                    <Style TargetType="ContentPresenter">
-                        <Setter Property="Visibility" Value="Collapsed" />
-                        <!-- Mirrors the tab strip's item id so a tab and its workspace pane
-                             resolve to the same a:Tab_* ref under different parents. -->
-                        <Setter Property="AutomationProperties.AutomationId" Value="{Binding AutomationId}" />
-                        <Style.Triggers>
-                            <DataTrigger Binding="{Binding IsActive}" Value="True">
-                                <Setter Property="Visibility" Value="Visible" />
-                            </DataTrigger>
-                        </Style.Triggers>
-                    </Style>
-                </ItemsControl.ItemContainerStyle>
-                <ItemsControl.ItemTemplate>
-                    <DataTemplate DataType="{x:Type vm:SessionTabViewModel}">
-                        <views:SessionTabView />
-                    </DataTemplate>
-                </ItemsControl.ItemTemplate>
-            </ItemsControl>
+            <!-- Single slot for the currently-selected SessionTabView. Code-behind sets
+                 ActiveSlot.Content to the pool-resolved view whenever SelectedTab changes
+                 (or on first DataContext attach). -->
+            <ContentControl
+                x:Name="ActiveSlot"
+                Margin="0,2,0,0"
+                Focusable="False" />
         </Grid>
     </Border>
 </UserControl>
