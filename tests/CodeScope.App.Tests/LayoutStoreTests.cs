@@ -46,14 +46,14 @@ public sealed class LayoutStoreTests
     }
 
     [Fact]
-    public void Layout_IsValueEquatable()
+    public void Layout_ScalarFields_MatchAcrossIdenticalInstances()
     {
         var a = new LayoutStore.Layout(2, 0, new Dictionary<string, int> { ["x"] = 1 });
         var b = new LayoutStore.Layout(2, 0, new Dictionary<string, int> { ["x"] = 1 });
 
-        // Records are reference-equal by default for collection members; identity check.
         a.GroupCount.Should().Be(b.GroupCount);
         a.FocusedGroupIndex.Should().Be(b.FocusedGroupIndex);
+        a.SessionToGroup.Should().BeEquivalentTo(b.SessionToGroup);
     }
 
     [Fact]

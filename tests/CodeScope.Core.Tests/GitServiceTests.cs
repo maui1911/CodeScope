@@ -5,16 +5,10 @@ namespace NoScope.CodeScope.Core.Tests;
 
 public sealed class GitServiceTests
 {
-    [Fact]
+    [SkippableFact]
     public async Task GetVersion_Returns_Success_When_Git_On_Path()
     {
-        // Probe PATH before asserting — CI runners and minimal sandboxes may not have git
-        // installed. Skipping is honest; failing here would be PATH-fragility, not a real
-        // service defect. Sibling tests already cover the missing-binary path explicitly.
-        if (!IsGitOnPath())
-        {
-            return;
-        }
+        Skip.If(!IsGitOnPath(), "git is not on PATH — skipping rather than false-passing");
 
         var service = new GitService(NullLogger<GitService>.Instance);
 
