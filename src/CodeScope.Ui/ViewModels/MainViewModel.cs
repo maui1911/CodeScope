@@ -881,6 +881,11 @@ public sealed partial class MainViewModel : ObservableObject
     {
         void Apply()
         {
+            // SessionAdded/SessionRenamed are intentionally not handled here. Tab membership is owned by
+            // MainViewModel — NewSessionAsync, DuplicateTabAsync, TryRestoreSessionAsync, and
+            // RestoreClosedWorktreeSessionsAsync each add their VM directly to FocusedGroup.Tabs and the
+            // store mutation is the side-effect, not the source of truth. The sidebar projection
+            // (SidebarViewModel.StoreSync) consumes those events for its own tree.
             switch (change)
             {
                 case SessionStoreChange.Loaded loaded:
@@ -943,9 +948,9 @@ public sealed partial class MainViewModel : ObservableObject
         {
             foreach (var s in p.Sessions)
             {
-                // Soft-closed sessions are kept on disk for resume-on-next-NewSession but
-                // don't materialise as tabs at startup — they'd spawn dozens of ghost pwsh
-                // children otherwise.
+                // Closed sessions are kept on disk for explicit reopen via the sidebar
+                // history surface — they don't materialise as tabs at startup so we don't
+                // spawn dozens of ghost pwsh children.
                 if (s.ClosedAt is not null) { continue; }
                 if (!Directory.Exists(s.WorktreePath)) { continue; }
                 var agent = string.IsNullOrEmpty(s.AgentId) || string.Equals(s.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase)

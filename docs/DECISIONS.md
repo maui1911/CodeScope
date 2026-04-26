@@ -173,3 +173,6 @@ closed session" item in the worktree context menu).
   reopen.
 - The drag-between-groups path (`MoveTabToGroup`) is unaffected — it never
   routed through the auto-resume block.
+- `projects.json` now accumulates `Session` entries for closed shells too;
+  pre-this-change, shells were always hard-removed on close so `projects.json`
+  never carried shell rows.

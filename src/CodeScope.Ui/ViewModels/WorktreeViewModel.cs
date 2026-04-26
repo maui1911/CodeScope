@@ -16,6 +16,9 @@ public sealed partial class WorktreeViewModel : ObservableObject
         _isExpanded = true;
         Sessions = [];
         History = [];
+        // History items intentionally do NOT subscribe to per-item PropertyChanged (unlike Sessions):
+        // closed rows have no live Status to propagate, and rows can be removed (rename/remove/cascade)
+        // so a per-item subscription would leak.
         History.CollectionChanged += (_, _) =>
         {
             OnPropertyChanged(nameof(HasHistory));
