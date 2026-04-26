@@ -277,6 +277,20 @@ public partial class SidebarView : UserControl
             }
         }
 
+        if (wt.HasHistory)
+        {
+            var reopenLast = BuildItem(
+                "Reopen most recent closed session", "Ctx.Icon.Restart", null,
+                () => WithMainVm(main =>
+                {
+                    if (wt.History.FirstOrDefault() is { } first)
+                    {
+                        main.ReopenClosedSessionCommand.Execute(first.Descriptor.Id);
+                    }
+                }));
+            TreeContextMenu.Items.Add(reopenLast);
+        }
+
         // ── GIT ──
         TreeContextMenu.Items.Add(BuildSeparator());
         TreeContextMenu.Items.Add(BuildGroupLabel("Git"));
