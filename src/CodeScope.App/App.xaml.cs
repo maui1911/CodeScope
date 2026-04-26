@@ -141,7 +141,8 @@ public partial class App : Application
                         RefreshAll,
                         sp.GetRequiredService<IClaudeTelemetryService>(),
                         sp.GetRequiredService<INotificationService>(),
-                        sp.GetRequiredService<IClaudeSessionDiscovery>());
+                        sp.GetRequiredService<IClaudeSessionDiscovery>(),
+                        sp.GetRequiredService<NoScope.CodeScope.Ui.Services.IToastService>());
                     var sidebar = sp.GetRequiredService<SidebarViewModel>();
                     vm.AttachSidebar(sidebar);
                     var diff = sp.GetRequiredService<DiffPanelViewModel>();

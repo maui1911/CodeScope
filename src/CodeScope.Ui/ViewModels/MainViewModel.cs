@@ -5,6 +5,7 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using NoScope.CodeScope.Core.Models;
 using NoScope.CodeScope.Core.Services;
+using NoScope.CodeScope.Ui.Services;
 using Microsoft.Extensions.Logging;
 
 namespace NoScope.CodeScope.Ui.ViewModels;
@@ -26,6 +27,7 @@ public sealed partial class MainViewModel : ObservableObject
     private readonly IClaudeTelemetryService? _telemetry;
     private readonly INotificationService? _notifications;
     private readonly IClaudeSessionDiscovery? _discovery;
+    private readonly IToastService? _toasts;
     private readonly Dictionary<string, ClaudeActivityState> _lastActivity = [];
     // Per-tab discovery watcher — disposed on adoption or tab close.
     private readonly Dictionary<string, IDisposable> _discoveryWatches = [];
@@ -39,7 +41,8 @@ public sealed partial class MainViewModel : ObservableObject
         Func<CancellationToken, Task>? refresh = null,
         IClaudeTelemetryService? telemetry = null,
         INotificationService? notifications = null,
-        IClaudeSessionDiscovery? discovery = null)
+        IClaudeSessionDiscovery? discovery = null,
+        IToastService? toasts = null)
     {
         _sessionManager = sessionManager;
         _store = store;
@@ -50,6 +53,7 @@ public sealed partial class MainViewModel : ObservableObject
         _telemetry = telemetry;
         _notifications = notifications;
         _discovery = discovery;
+        _toasts = toasts;
         if (_telemetry is not null) { _telemetry.Updated += OnTelemetryUpdated; }
         if (_notifications is not null)
         {
@@ -603,7 +607,8 @@ public sealed partial class MainViewModel : ObservableObject
 
     /// <summary>
     /// Public entry-point for reopening a closed session from the sidebar history surface.
-    /// Looks up the parent project + worktree by id, then delegates to
+    /// Looks up the parent project + worktree by id, does pre-flight checks (agent profile
+    /// present, worktree directory exists), toasts on each failure, then delegates to
     /// <see cref="TryRestoreSessionAsync"/>. No-op when the session is no longer in the
     /// store (e.g. removed from history between right-click and click).
     /// </summary>
@@ -619,7 +624,56 @@ public sealed partial class MainViewModel : ObservableObject
                        ?? hit.project.Worktrees.FirstOrDefault(w => w.IsPrimary)
                        ?? hit.project.Worktrees.FirstOrDefault();
         if (worktree is null) { return; }
-        await TryRestoreSessionAsync(hit.project, worktree, hit.session).ConfigureAwait(true);
+
+        // Pre-flight: agent profile check.
+        var useShell = string.IsNullOrEmpty(hit.session.AgentId)
+            || string.Equals(hit.session.AgentId, ShellSentinel, StringComparison.OrdinalIgnoreCase);
+        if (!useShell && _agents.GetById(hit.session.AgentId!) is null)
+        {
+            ErrToast(
+                "Cannot reopen session",
+                $"The '{hit.session.AgentId}' agent is no longer registered. " +
+                "Remove this entry from history or restore the agent profile.");
+            return;
+        }
+
+        // Pre-flight: worktree directory check.
+        if (!Directory.Exists(worktree.Path))
+        {
+            ErrToast(
+                "Cannot reopen session",
+                $"Worktree directory '{worktree.Path}' is gone. Remove this entry from history.");
+            return;
+        }
+
+        var ok = await TryRestoreSessionAsync(hit.project, worktree, hit.session).ConfigureAwait(true);
+        if (!ok)
+        {
+            // TryRestoreSessionAsync returns false only when the store itself rejects the
+            // restore (the two pre-flight paths above are caught above). Surface the failure
+            // so the user knows the click wasn't a no-op.
+            ErrToast("Reopen failed", "The session could not be restored. Check the log for details.");
+        }
+    }
+
+    private void Toast(string title, string message, ToastSeverity severity)
+    {
+        if (_toasts is null) { return; }
+        _toasts.Show(new ToastRequest(severity, title, message));
+    }
+
+    private void ErrToast(string title, string message)
+    {
+        if (_toasts is null) { return; }
+        var actions = new List<ToastAction>
+        {
+            new("Copy", () =>
+            {
+                try { System.Windows.Clipboard.SetText(message); }
+                catch (Exception ex) { _logger.LogDebug(ex, "Toast copy failed"); }
+            }),
+        };
+        _toasts.Show(new ToastRequest(ToastSeverity.Err, title, message, Actions: actions));
     }
 
     /// <summary>
