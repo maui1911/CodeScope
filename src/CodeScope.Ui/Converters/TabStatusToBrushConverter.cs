@@ -8,7 +8,7 @@ namespace NoScope.CodeScope.Ui.Converters;
 
 /// <summary>
 /// <see cref="TabStatus"/> → brush. <c>Busy</c> → <c>Signal.Warn</c> (red, agent working);
-/// <c>Ready</c> → <c>Signal.Ok</c> (green, awaiting your input).
+/// <c>Idle</c> → <c>Signal.Ok</c> (green, awaiting your input).
 /// </summary>
 public sealed class TabStatusToBrushConverter : IValueConverter
 {

@@ -67,17 +67,17 @@ Drops the `isSelected` branch. A background tab that is composing now also reads
 
 **`SidebarView.xaml` worktree dot** —
 - Remove the `IsSelected → Accent.Primary` trigger (lines ~356–358).
-- States become `rest` / `ready` / `busy`. `busy` keeps the pulsing halo (color stays `Signal.Warn`).
+- States become `rest` / `idle` / `busy`. `busy` keeps the pulsing halo (color stays `Signal.Warn`).
 - Selection styling on the row (bold text, `#141414` bg, accent rail) is unchanged.
 
 **`WorktreeViewModel`** —
-- `DotState` returns `rest` / `ready` / `busy`. `HasWaitingSession` → `HasBusySession` (any child whose `Status == TabStatus.Busy`). PR CI failure no longer bumps the dot — it gets its own slug below.
+- `DotState` returns `rest` / `idle` / `busy`. `HasWaitingSession` → `HasBusySession` (any child whose `Status == TabStatus.Busy`). PR CI failure no longer bumps the dot — it gets its own slug below.
 - `StatusLabel` slug rules:
   - any session Busy → `"busy"`
   - PR CI failure → `"ci!"` (was folded into "wait")
   - dirty → `"chg"`
   - ahead/behind → `"↑N ↓N"` form
-  - else → `"idle"` (slug text — separate from the dot's `ready` state, kept because "ready" reads weird in a 4-char right-aligned slug)
+  - else → `"idle"`
 
 **`ProjectViewModel.HasWaitingChild`** → `HasBusyChild`. The collapsed-project rollup dot keeps its red color and `Signal.Warn` fill; only the property name changes.
 
@@ -85,7 +85,7 @@ Drops the `isSelected` branch. A background tab that is composing now also reads
 - `StatusAgentActive` → removed.
 - `StatusAgentIdle` count is kept (re-mapped to `t.Status == TabStatus.Idle`).
 - `StatusAgentWait` → `StatusAgentBusy`.
-- The activity-state slug helper at `MainViewModel.StatusBar.cs:195` collapses to `Busy → "busy"`, default → `"ready"`.
+- The activity-state slug helper at `MainViewModel.StatusBar.cs:195` collapses to `Busy → "busy"`, default → `"idle"`.
 
 ### Tests
 

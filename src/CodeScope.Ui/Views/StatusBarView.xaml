@@ -12,7 +12,7 @@
         <BooleanToVisibilityConverter x:Key="BoolVisible" />
         <conv:NullToVisibilityConverter x:Key="NullToVisibility" />
 
-        <!-- 6px session-state dot. Green by default (Ready); flips red when Busy. -->
+        <!-- 6px session-state dot. Green by default (Idle); flips red when Busy. -->
         <Style x:Key="SbDot" TargetType="{x:Type Ellipse}">
             <Setter Property="Width" Value="6" />
             <Setter Property="Height" Value="6" />
