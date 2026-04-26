@@ -230,19 +230,9 @@ public sealed partial class MainViewModel : ObservableObject
             var stored = FindStoredSession(value);
             if (stored?.AgentSessionId is { Length: > 0 } sid) { _notifications.MarkSessionRead(sid); }
         }
-        // Status dot is window-global: only the focused-group's selected tab gets Active;
-        // every other tab (including selected tabs in other groups) drops to Idle unless
-        // it's still waiting (Wait survives focus changes per top-bar spec §3).
-        // IsActive is per-group and is set by EditorGroupViewModel.OnSelectedTabChanged —
-        // do NOT touch it here, or selecting an empty group hides every terminal.
-        foreach (var t in AllTabs)
-        {
-            var isWindowSelected = ReferenceEquals(t, value);
-            if (t.Status != TabStatus.Wait)
-            {
-                t.Status = isWindowSelected ? TabStatus.Active : TabStatus.Idle;
-            }
-        }
+        // Tab.Status is purely a function of agent activity now — selection no longer
+        // overrides it. The focused-tab visual treatment (pill bg + font weight) is
+        // driven separately by ListBoxItem.IsSelected in the strip template.
     }
 
     [ObservableProperty]
@@ -1130,16 +1120,6 @@ public sealed partial class MainViewModel : ObservableObject
     }
 
     /// <summary>
-    /// Projects <see cref="ClaudeActivityState"/> onto <see cref="TabStatus"/>:
-    /// <list type="bullet">
-    ///   <item>PendingToolUse → Wait (pulse; in auto-accept this flickers on tool calls,
-    ///     but is a true "paused for permission" signal in manual mode).</item>
-    ///   <item>Idle → Idle (overrides the selection-based Active flip so a focused-but-quiet
-    ///     tab reads as idle rather than active).</item>
-    ///   <item>Composing → Active if the tab is the window-selected one, else Idle.</item>
-    /// </list>
-    /// </summary>
-    /// <summary>
     /// Emits notification entries on semantic transitions of a session's activity FSM:
     /// <list type="bullet">
     ///   <item>* → <c>PendingToolUse</c> → "Needs attention" (Wait pulse is visual-only; this persists).</item>
@@ -1190,12 +1170,11 @@ public sealed partial class MainViewModel : ObservableObject
 
     private void ApplyActivityToStatus(SessionTabViewModel tab, ClaudeActivityState activity)
     {
-        var isSelected = ReferenceEquals(tab, SelectedTab);
         tab.Status = activity switch
         {
-            ClaudeActivityState.PendingToolUse => TabStatus.Wait,
+            ClaudeActivityState.Composing => TabStatus.Busy,
+            ClaudeActivityState.PendingToolUse => TabStatus.Busy,
             ClaudeActivityState.Idle => TabStatus.Idle,
-            ClaudeActivityState.Composing => isSelected ? TabStatus.Active : TabStatus.Idle,
             _ => tab.Status,
         };
     }

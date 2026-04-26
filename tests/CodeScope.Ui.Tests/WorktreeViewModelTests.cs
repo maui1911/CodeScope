@@ -49,7 +49,7 @@ public sealed class WorktreeViewModelTests
     }
 
     [Fact]
-    public void DotState_WithSession_IsIdle()
+    public void DotState_WithIdleSession_IsIdle()
     {
         var vm = MakeVm();
         vm.Sessions.Add(MakeSessionTab(TabStatus.Idle));
@@ -57,19 +57,21 @@ public sealed class WorktreeViewModelTests
     }
 
     [Fact]
-    public void DotState_WaitingSession_IsWait()
+    public void DotState_BusySession_IsBusy()
     {
         var vm = MakeVm();
-        vm.Sessions.Add(MakeSessionTab(TabStatus.Wait));
-        vm.DotState.Should().Be("wait");
+        vm.Sessions.Add(MakeSessionTab(TabStatus.Busy));
+        vm.DotState.Should().Be("busy");
     }
 
     [Fact]
-    public void DotState_FailingCi_IsWaitEvenWithoutSessions()
+    public void DotState_FailingCiAlone_DoesNotSurfaceOnAgentDot()
     {
+        // Agent dot is reserved for agent state; CI failure shows up via the StatusLabel
+        // slug ("ci!") instead so the two state machines never collide.
         var vm = MakeVm();
         vm.PullRequest = MakePr(CiStatus.Failure);
-        vm.DotState.Should().Be("wait");
+        vm.DotState.Should().Be("rest");
     }
 
     // ---------- DirtyGlyph ----------
@@ -238,12 +240,22 @@ public sealed class WorktreeViewModelTests
     }
 
     [Fact]
-    public void StatusLabel_FailingCi_OverridesEverything()
+    public void StatusLabel_FailingCi_ShowsCiSlug()
     {
         var vm = MakeVm();
         vm.IsDirty = true;
         vm.PullRequest = MakePr(CiStatus.Failure);
-        vm.StatusLabel.Should().Be("wait");
+        vm.StatusLabel.Should().Be("ci!");
+    }
+
+    [Fact]
+    public void StatusLabel_BusySession_OverridesDirtyAndCi()
+    {
+        var vm = MakeVm();
+        vm.IsDirty = true;
+        vm.PullRequest = MakePr(CiStatus.Failure);
+        vm.Sessions.Add(MakeSessionTab(TabStatus.Busy));
+        vm.StatusLabel.Should().Be("busy");
     }
 
     // ---------- ApplyStatus ----------

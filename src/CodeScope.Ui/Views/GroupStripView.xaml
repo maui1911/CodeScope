@@ -128,13 +128,13 @@
                                         <ColumnDefinition Width="*" />
                                         <ColumnDefinition Width="Auto" />
                                     </Grid.ColumnDefinitions>
-                                    <!-- 6px status dot + optional pulsing halo when Status == Wait
-                                         (mirrors the sidebar dot; top-bar spec §3). The halo is a
-                                         second Ellipse that only renders when waiting — animated
-                                         via Storyboard triggered on the tab Status value. -->
+                                    <!-- 6px status dot + optional pulsing halo when Status == Busy
+                                         (mirrors the sidebar dot). The halo is a second Ellipse
+                                         that only renders when busy — animated via Storyboard
+                                         triggered on the tab Status value. -->
                                     <Grid Grid.Column="0" Width="6" Height="6"
                                           VerticalAlignment="Center" Margin="0,0,8,0">
-                                        <Ellipse x:Name="TabWaitHalo"
+                                        <Ellipse x:Name="TabBusyHalo"
                                                  Width="6" Height="6"
                                                  Stroke="{DynamicResource Signal.Warn}"
                                                  StrokeThickness="1"
@@ -221,24 +221,24 @@
                                     <DataTrigger Binding="{Binding RelativeSource={RelativeSource AncestorType=ListBoxItem}, Path=IsMouseOver}" Value="True">
                                         <Setter TargetName="CloseButton" Property="Visibility" Value="Visible" />
                                     </DataTrigger>
-                                    <!-- Wait-state halo pulse (top-bar spec §3): 1.4s loop scaling
-                                         1→2.4× while fading opacity .55→0. Same timing as the
-                                         sidebar pulse so the two dots read as one system. -->
-                                    <DataTrigger Binding="{Binding Status}" Value="Wait">
+                                    <!-- Busy-state halo pulse: 1.4s loop scaling 1→2.4× while
+                                         fading opacity .55→0. Same timing as the sidebar pulse
+                                         so the two dots read as one system. -->
+                                    <DataTrigger Binding="{Binding Status}" Value="Busy">
                                         <DataTrigger.EnterActions>
-                                            <BeginStoryboard Name="TabWaitPulse">
+                                            <BeginStoryboard Name="TabBusyPulse">
                                                 <Storyboard RepeatBehavior="Forever" Duration="0:0:1.4">
-                                                    <DoubleAnimationUsingKeyFrames Storyboard.TargetName="TabWaitHalo" Storyboard.TargetProperty="Opacity">
+                                                    <DoubleAnimationUsingKeyFrames Storyboard.TargetName="TabBusyHalo" Storyboard.TargetProperty="Opacity">
                                                         <LinearDoubleKeyFrame KeyTime="0:0:0" Value="0.55" />
                                                         <LinearDoubleKeyFrame KeyTime="0:0:1" Value="0" />
                                                         <LinearDoubleKeyFrame KeyTime="0:0:1.4" Value="0" />
                                                     </DoubleAnimationUsingKeyFrames>
-                                                    <DoubleAnimationUsingKeyFrames Storyboard.TargetName="TabWaitHalo" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)">
+                                                    <DoubleAnimationUsingKeyFrames Storyboard.TargetName="TabBusyHalo" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)">
                                                         <LinearDoubleKeyFrame KeyTime="0:0:0" Value="1" />
                                                         <LinearDoubleKeyFrame KeyTime="0:0:1" Value="2.4" />
                                                         <LinearDoubleKeyFrame KeyTime="0:0:1.4" Value="2.4" />
                                                     </DoubleAnimationUsingKeyFrames>
-                                                    <DoubleAnimationUsingKeyFrames Storyboard.TargetName="TabWaitHalo" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)">
+                                                    <DoubleAnimationUsingKeyFrames Storyboard.TargetName="TabBusyHalo" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)">
                                                         <LinearDoubleKeyFrame KeyTime="0:0:0" Value="1" />
                                                         <LinearDoubleKeyFrame KeyTime="0:0:1" Value="2.4" />
                                                         <LinearDoubleKeyFrame KeyTime="0:0:1.4" Value="2.4" />
@@ -247,7 +247,7 @@
                                             </BeginStoryboard>
                                         </DataTrigger.EnterActions>
                                         <DataTrigger.ExitActions>
-                                            <StopStoryboard BeginStoryboardName="TabWaitPulse" />
+                                            <StopStoryboard BeginStoryboardName="TabBusyPulse" />
                                         </DataTrigger.ExitActions>
                                     </DataTrigger>
                                 </DataTemplate.Triggers>

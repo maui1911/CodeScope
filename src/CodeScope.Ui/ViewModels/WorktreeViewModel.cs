@@ -18,8 +18,8 @@ public sealed partial class WorktreeViewModel : ObservableObject
         // Sessions.Count drives HasActiveSession and DotState — raise both when the
         // collection mutates so the accent bar + 6px dot update without a full rebuild.
         // Additionally subscribe to per-session Status changes so the pulse lights up
-        // when any child session flips to TabStatus.Wait (e.g. Claude paused on a tool
-        // call). No unsubscribe needed: sessions live for the lifetime of their row.
+        // when any child session flips to TabStatus.Busy (Claude composing or paused on
+        // a tool call). No unsubscribe needed: sessions live for the lifetime of their row.
         Sessions.CollectionChanged += (_, e) =>
         {
             if (e.NewItems is not null)
@@ -130,30 +130,28 @@ public sealed partial class WorktreeViewModel : ObservableObject
 
     /// <summary>
     /// Session-state classifier for the 6px dot on the sidebar worktree row.
-    /// Semantics from the sidebar spec (§7): <c>rest</c> = no session, <c>idle</c> = has session
-    /// but nothing demanding attention, <c>wait</c> = needs user (red, pulses). The <c>active</c>
-    /// (selected) state is owned by the <see cref="System.Windows.Controls.TreeViewItem"/> itself
-    /// and resolved in XAML via IsSelected triggers.
+    /// <c>rest</c> = no session, <c>idle</c> = has session, agent awaiting input,
+    /// <c>busy</c> = agent is working (Composing or PendingToolUse — pulses red).
+    /// Selection visuals live on the row chrome, not on the dot.
     /// </summary>
     public string DotState
     {
         get
         {
-            if (PullRequest?.CiStatus == CiStatus.Failure) { return "wait"; }
-            if (HasWaitingSession) { return "wait"; }
+            if (HasBusySession) { return "busy"; }
             if (HasActiveSession) { return "idle"; }
             return "rest";
         }
     }
 
-    /// <summary>True when any of this worktree's sessions is paused on a tool call / waiting for the user.</summary>
-    public bool HasWaitingSession => Sessions.Any(s => s.Status == TabStatus.Wait);
+    /// <summary>True when any of this worktree's sessions is in the agent-working <see cref="TabStatus.Busy"/> state.</summary>
+    public bool HasBusySession => Sessions.Any(s => s.Status == TabStatus.Busy);
 
     private void OnChildSessionPropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
     {
         if (e.PropertyName == nameof(SessionTabViewModel.Status))
         {
-            OnPropertyChanged(nameof(HasWaitingSession));
+            OnPropertyChanged(nameof(HasBusySession));
             OnPropertyChanged(nameof(DotState));
             OnPropertyChanged(nameof(StatusLabel));
         }
@@ -161,18 +159,18 @@ public sealed partial class WorktreeViewModel : ObservableObject
 
     /// <summary>
     /// Short right-aligned status slug used by the sidebar worktree row.
-    ///   "wait" — PR open with failing CI (user review needed)
+    ///   "busy" — at least one session has the agent working (Composing or PendingToolUse)
+    ///   "ci!"  — PR open with failing CI
     ///   "chg"  — working tree is dirty
     ///   "↑N"/"↓N"/"↑N ↓N" — clean but out of sync with upstream
     ///   "idle" — clean + in sync
-    /// Matches the "idle"/"wait"/"3 chg" labels in the Overview reference mock.
     /// </summary>
     public string StatusLabel
     {
         get
         {
-            if (HasWaitingSession) { return "wait"; }
-            if (PullRequest?.CiStatus == CiStatus.Failure) { return "wait"; }
+            if (HasBusySession) { return "busy"; }
+            if (PullRequest?.CiStatus == CiStatus.Failure) { return "ci!"; }
             if (IsDirty) { return "chg"; }
             if (Ahead > 0 || Behind > 0) { return AheadBehindText; }
             return "idle";
@@ -262,7 +260,6 @@ public sealed partial class WorktreeViewModel : ObservableObject
         OnPropertyChanged(nameof(PrBadgeText));
         OnPropertyChanged(nameof(CiGlyph));
         OnPropertyChanged(nameof(StatusLabel));
-        OnPropertyChanged(nameof(DotState));
         OpenPullRequestCommand.NotifyCanExecuteChanged();
     }
 }
