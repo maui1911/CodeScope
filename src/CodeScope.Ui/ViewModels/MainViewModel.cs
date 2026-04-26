@@ -1017,7 +1017,13 @@ public sealed partial class MainViewModel : ObservableObject
                     // pooled view — otherwise the ConPTY child lingers, holds its cwd, and
                     // breaks the next `git worktree remove`.
                     SessionViewPool?.Release(removed.SessionId);
-                    if (removed.SessionId is { Length: > 0 } sid) { _telemetry?.Unregister(sid); }
+                    // Note: _telemetry?.Unregister is NOT called here because telemetry is
+                    // keyed by AgentSessionId, not SessionDescriptor.Id, and the store
+                    // change payload only carries SessionDescriptor.Id. The normal close
+                    // path (CloseTabAsync) already Unregisters using the correct key before
+                    // this handler fires; the external-only path (store removes without
+                    // CloseTabAsync) is a fire-and-forget edge case that can't recover the
+                    // AgentSessionId without an extra lookup.
                     StopClaudeAdoption(removed.SessionId);
                     CloseGroupCommand.NotifyCanExecuteChanged();
                     break;

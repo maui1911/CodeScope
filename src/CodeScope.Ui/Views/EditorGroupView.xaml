@@ -48,7 +48,8 @@
             <ContentControl
                 x:Name="ActiveSlot"
                 Margin="0,2,0,0"
-                Focusable="False" />
+                Focusable="False"
+                AutomationProperties.AutomationId="{Binding SelectedTab.AutomationId}" />
         </Grid>
     </Border>
 </UserControl>

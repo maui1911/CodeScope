@@ -217,7 +217,7 @@ public partial class SessionTabView : UserControl
     }
 
     /// <summary>
-    /// Kills the ConPTY child + pipes. Called by <see cref="Services.SessionViewHostPool.Release"/>
+    /// Kills the ConPTY child + pipes. Called by <see cref="NoScope.CodeScope.Ui.Services.SessionViewHostPool.Release"/>
     /// on tab close, restart, or worktree-cascade — never on a drag-between-groups, because
     /// the pool keeps the same view alive across reparent.
     ///
