@@ -510,6 +510,10 @@ public sealed class SessionStore : ISessionStore
                 Directory.Delete(path, recursive: true);
                 return null;
             }
+            catch (DirectoryNotFoundException)
+            {
+                return null;
+            }
             catch (Exception) when (attempt < 2)
             {
                 try { await Task.Delay(150, ct).ConfigureAwait(false); }
