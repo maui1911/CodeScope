@@ -32,6 +32,7 @@ public sealed partial class MainViewModel : ObservableObject
     private readonly IPiSessionDiscovery? _piDiscovery;
     private readonly IOpenCodeTelemetryService? _opencodeTelemetry;
     private readonly IOpenCodeSessionDiscovery? _opencodeDiscovery;
+    private readonly IIdleToastNotifier? _idleNotifier;
     private readonly Dictionary<string, ClaudeActivityState> _lastActivity = [];
     // Per-tab discovery watcher — disposed on adoption or tab close.
     private readonly Dictionary<string, IDisposable> _discoveryWatches = [];
@@ -51,7 +52,8 @@ public sealed partial class MainViewModel : ObservableObject
         IPiTelemetryService? piTelemetry = null,
         IPiSessionDiscovery? piDiscovery = null,
         IOpenCodeTelemetryService? opencodeTelemetry = null,
-        IOpenCodeSessionDiscovery? opencodeDiscovery = null)
+        IOpenCodeSessionDiscovery? opencodeDiscovery = null,
+        IIdleToastNotifier? idleNotifier = null)
     {
         _sessionManager = sessionManager;
         _store = store;
@@ -67,6 +69,7 @@ public sealed partial class MainViewModel : ObservableObject
         _piDiscovery = piDiscovery;
         _opencodeTelemetry = opencodeTelemetry;
         _opencodeDiscovery = opencodeDiscovery;
+        _idleNotifier = idleNotifier;
         SessionViewPool = sessionViewPool;
         if (_telemetry is not null) { _telemetry.Updated += OnTelemetryUpdated; }
         // All telemetry backends emit ClaudeSessionTelemetry — same handler routes any source
@@ -843,6 +846,18 @@ public sealed partial class MainViewModel : ObservableObject
         => Groups.FirstOrDefault(g => g.Tabs.Contains(tab));
 
     /// <summary>
+    /// Selects the tab whose persisted session has the given agent-side session id (Claude
+    /// UUID etc.). Called by the host after a Windows toast click so the right tab is in
+    /// front when the window restores. No-op if no live tab matches.
+    /// </summary>
+    public void ActivateSessionByAgentSessionId(string agentSessionId)
+    {
+        if (string.IsNullOrEmpty(agentSessionId)) { return; }
+        var target = AllTabs.FirstOrDefault(t => FindStoredSession(t)?.AgentSessionId == agentSessionId);
+        if (target is not null) { SelectedTab = target; }
+    }
+
+    /// <summary>
     /// True when <paramref name="agent"/> accepts a caller-supplied session id on launch
     /// — i.e. has a <see cref="AgentProfile.SessionIdFlag"/>. Drives whether
     /// <c>NewSessionAsync</c> / <c>DuplicateTabAsync</c> mint a UUID to persist.
@@ -1329,10 +1344,27 @@ public sealed partial class MainViewModel : ObservableObject
     /// </summary>
     private void PushActivityNotification(SessionTabViewModel tab, ClaudeSessionTelemetry snap)
     {
-        if (_notifications is null) { return; }
         var prev = _lastActivity.TryGetValue(snap.SessionId, out var p) ? p : ClaudeActivityState.Unknown;
         _lastActivity[snap.SessionId] = snap.Activity;
         if (prev == snap.Activity) { return; }
+
+        // Windows Action-Center toast on turn-complete — visible while the whole app is
+        // minimized (which is the only time it actually fires; the notifier owns the
+        // WindowState.Minimized gate). Independent of the in-app bell's SelectedTab
+        // suppression: a minimized window means the user can't see the tab no matter which
+        // one it is. AgentSessionId is the click-routing key.
+        if (snap.Activity == ClaudeActivityState.Idle
+            && prev is ClaudeActivityState.PendingToolUse or ClaudeActivityState.Composing
+            && _idleNotifier is not null
+            && !string.IsNullOrEmpty(snap.SessionId))
+        {
+            var detailLine = snap.LastTurnDuration is { } dur
+                ? $"Turn complete · {FormatDuration(dur.TotalSeconds)}"
+                : "Turn complete.";
+            _idleNotifier.NotifyTurnComplete(snap.SessionId, tab.DisplayName, detailLine);
+        }
+
+        if (_notifications is null) { return; }
         // Don't pester the user about the tab they're actively staring at.
         if (ReferenceEquals(tab, SelectedTab)) { return; }
 
