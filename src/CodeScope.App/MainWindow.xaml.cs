@@ -4,6 +4,7 @@ using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using NoScope.CodeScope.App.Persistence;
 using NoScope.CodeScope.App.Toasts;
+using NoScope.CodeScope.Ui.Services;
 using NoScope.CodeScope.Ui.ViewModels;
 using NoScope.CodeScope.Ui.Views;
 using Wpf.Ui.Controls;
@@ -15,6 +16,7 @@ public partial class MainWindow : FluentWindow
 {
     private readonly MainViewModel _viewModel;
     private readonly ToastService _toasts;
+    private readonly IIdleToastNotifier _idleNotifier;
 
     // Cached per-VM view instances. Re-created EditorGroupViews would force the hosted
     // EasyTerminalControl HWND to tear down and respawn pwsh, so we hold on to them for
@@ -32,13 +34,20 @@ public partial class MainWindow : FluentWindow
     // CaptionButton style in MainWindow.xaml.
     private const double CaptionClusterWidth = 4 * 46.0;
 
-    public MainWindow(MainViewModel viewModel, ToastService toasts)
+    public MainWindow(MainViewModel viewModel, ToastService toasts, IIdleToastNotifier idleNotifier)
     {
         _viewModel = viewModel;
         _toasts = toasts;
+        _idleNotifier = idleNotifier;
         DataContext = viewModel;
 
         InitializeComponent();
+
+        // Click on a "turn complete" Action-Center toast → restore the window and select
+        // the session it pointed at. Activated is already dispatcher-marshalled by the
+        // notifier, so we can touch UI directly.
+        _idleNotifier.Activated += OnIdleToastActivated;
+        Closed += (_, _) => _idleNotifier.Activated -= OnIdleToastActivated;
 
         // The toast host binds Items off the service; the service is the single
         // dispatcher-marshalled owner of the visible-toast collection.
@@ -299,6 +308,15 @@ public partial class MainWindow : FluentWindow
             // Mouse released before DragMove latched — expected race, trace for diagnostics.
             System.Diagnostics.Debug.WriteLine($"[MainWindow] DragMove: {ex.Message}");
         }
+    }
+
+    private void OnIdleToastActivated(object? sender, string agentSessionId)
+    {
+        // Toast click grants the app foreground rights, so a plain Activate() reliably
+        // promotes us above other top-levels — no SetForegroundWindow / Topmost dance.
+        if (WindowState == WindowState.Minimized) { WindowState = WindowState.Normal; }
+        Activate();
+        _viewModel.ActivateSessionByAgentSessionId(agentSessionId);
     }
 
     private void OnCaptionMinimize(object sender, System.Windows.RoutedEventArgs e)

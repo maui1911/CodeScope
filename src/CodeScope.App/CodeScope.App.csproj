@@ -2,7 +2,15 @@
 
     <PropertyGroup>
         <OutputType>WinExe</OutputType>
-        <TargetFramework>net10.0-windows</TargetFramework>
+        <!--
+            10.0.19041.0 (Win10 2004) is the floor for the WinRT toast projection used by
+            Microsoft.Toolkit.Uwp.Notifications. Bumping only the App TFM keeps Core/Ui as
+            plain net10.0-windows (no WinRT surface), which preserves the "UI-free Core"
+            invariant and keeps the Ui project free of platform-version coupling.
+        -->
+        <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+        <!-- Match the TFM SDK so the WinRT analyzer doesn't flag 1903+ APIs (e.g. ToastNotification.ExpiresOnReboot). -->
+        <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
         <UseWPF>true</UseWPF>
         <RootNamespace>NoScope.CodeScope.App</RootNamespace>
         <AssemblyName>CodeScope</AssemblyName>
@@ -50,6 +58,7 @@
         <PackageReference Include="Microsoft.Extensions.Logging" Version="9.0.0" />
         <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="9.0.0" />
         <PackageReference Include="Microsoft.Extensions.Logging.Debug" Version="9.0.0" />
+        <PackageReference Include="Microsoft.Toolkit.Uwp.Notifications" Version="7.1.3" />
         <PackageReference Include="Velopack" Version="0.0.1298" />
         <PackageReference Include="WPF-UI" Version="4.2.0" />
     </ItemGroup>

@@ -113,6 +113,12 @@ public partial class App : Application
                 services.AddSingleton<IOpenCodeTelemetryService, OpenCodeTelemetryService>();
                 services.AddSingleton<IOpenCodeSessionDiscovery, OpenCodeSessionDiscovery>();
                 services.AddSingleton<INotificationService, NotificationService>();
+                // Native Windows Action-Center toast on agent turn-complete. Fires only
+                // when the main window is minimized (gate lives in the implementation).
+                // The compat layer auto-registers an AUMID + COM activator on first use,
+                // so unpackaged WPF gets real Win10/11 toasts without a manual shortcut.
+                services.AddSingleton<NoScope.CodeScope.Ui.Services.IIdleToastNotifier,
+                    NoScope.CodeScope.App.Notifications.WindowsIdleToastNotifier>();
                 // Owns SessionTabView lifecycle so the inner HwndHost survives reparent on
                 // drag-between-groups. See spec
                 // docs/superpowers/specs/2026-04-26-cross-group-terminal-drag-design.md.
@@ -156,7 +162,8 @@ public partial class App : Application
                         sp.GetRequiredService<IPiTelemetryService>(),
                         sp.GetRequiredService<IPiSessionDiscovery>(),
                         sp.GetRequiredService<IOpenCodeTelemetryService>(),
-                        sp.GetRequiredService<IOpenCodeSessionDiscovery>());
+                        sp.GetRequiredService<IOpenCodeSessionDiscovery>(),
+                        sp.GetRequiredService<NoScope.CodeScope.Ui.Services.IIdleToastNotifier>());
                     var sidebar = sp.GetRequiredService<SidebarViewModel>();
                     vm.AttachSidebar(sidebar);
                     var diff = sp.GetRequiredService<DiffPanelViewModel>();
