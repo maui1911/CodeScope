@@ -6,12 +6,34 @@ namespace NoScope.CodeScope.Core.Tests;
 public sealed class AgentRegistryTests
 {
     [Fact]
-    public void Default_Set_Includes_Claude_Codex_Opencode()
+    public void Default_Set_Includes_Claude_Codex_Opencode_Pi()
     {
         var registry = new AgentRegistry();
 
         var ids = registry.GetAll().Select(a => a.Id).ToList();
-        ids.Should().Contain(["claude", "codex", "opencode"]);
+        ids.Should().Contain(["claude", "codex", "opencode", "pi"]);
+    }
+
+    [Fact]
+    public void Pi_Profile_Has_Resume_Continue_And_SessionFlag()
+    {
+        var pi = new AgentRegistry().GetById("pi")!;
+        pi.Command.Should().Be("pi");
+        pi.ResumeArgs.Should().BeEquivalentTo(["-c"]);
+        pi.ResumeByIdArgs.Should().BeEquivalentTo(["--session"]);
+        pi.SessionIdFlag.Should().BeNull();
+        pi.IsDefault.Should().BeFalse();
+    }
+
+    [Fact]
+    public void OpenCode_Profile_Has_Resume_Continue_And_SessionFlag()
+    {
+        var oc = new AgentRegistry().GetById("opencode")!;
+        oc.Command.Should().Be("opencode-cli");
+        oc.ResumeArgs.Should().BeEquivalentTo(["--continue"]);
+        oc.ResumeByIdArgs.Should().BeEquivalentTo(["--session"]);
+        oc.SessionIdFlag.Should().BeNull();
+        oc.IsDefault.Should().BeFalse();
     }
 
     [Fact]
@@ -54,7 +76,7 @@ public sealed class AgentRegistryTests
     public void FromConfig_Empty_Falls_Back_To_Defaults()
     {
         var registry = AgentRegistry.FromConfig(new ProjectsConfig());
-        registry.GetAll().Select(a => a.Id).Should().Contain(["claude", "codex", "opencode"]);
+        registry.GetAll().Select(a => a.Id).Should().Contain(["claude", "codex", "opencode", "pi"]);
     }
 
     [Fact]

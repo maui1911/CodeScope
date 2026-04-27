@@ -108,6 +108,10 @@ public partial class App : Application
                 services.AddSingleton<ISessionStore, SessionStore>();
                 services.AddSingleton<IClaudeTelemetryService, ClaudeTelemetryService>();
                 services.AddSingleton<IClaudeSessionDiscovery, ClaudeSessionDiscovery>();
+                services.AddSingleton<IPiTelemetryService, PiTelemetryService>();
+                services.AddSingleton<IPiSessionDiscovery, PiSessionDiscovery>();
+                services.AddSingleton<IOpenCodeTelemetryService, OpenCodeTelemetryService>();
+                services.AddSingleton<IOpenCodeSessionDiscovery, OpenCodeSessionDiscovery>();
                 services.AddSingleton<INotificationService, NotificationService>();
                 // Owns SessionTabView lifecycle so the inner HwndHost survives reparent on
                 // drag-between-groups. See spec
@@ -148,7 +152,11 @@ public partial class App : Application
                         sp.GetRequiredService<INotificationService>(),
                         sp.GetRequiredService<IClaudeSessionDiscovery>(),
                         sp.GetRequiredService<NoScope.CodeScope.Ui.Services.IToastService>(),
-                        sp.GetRequiredService<NoScope.CodeScope.Ui.Services.ISessionViewHostPool>());
+                        sp.GetRequiredService<NoScope.CodeScope.Ui.Services.ISessionViewHostPool>(),
+                        sp.GetRequiredService<IPiTelemetryService>(),
+                        sp.GetRequiredService<IPiSessionDiscovery>(),
+                        sp.GetRequiredService<IOpenCodeTelemetryService>(),
+                        sp.GetRequiredService<IOpenCodeSessionDiscovery>());
                     var sidebar = sp.GetRequiredService<SidebarViewModel>();
                     vm.AttachSidebar(sidebar);
                     var diff = sp.GetRequiredService<DiffPanelViewModel>();
