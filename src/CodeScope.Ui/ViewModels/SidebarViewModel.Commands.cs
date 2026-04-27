@@ -226,6 +226,82 @@ public sealed partial class SidebarViewModel
     }
 
     [RelayCommand]
+    private async Task OpenRemoteRepositoryAsync(object? target)
+    {
+        var path = ResolvePath(target);
+        if (string.IsNullOrWhiteSpace(path) || _git is null) { return; }
+
+        var r = await _git.GetRemoteUrlAsync(path).ConfigureAwait(true);
+        if (r.IsFailure || string.IsNullOrWhiteSpace(r.Value))
+        {
+            ErrToast("No remote", r.IsFailure ? r.Error : "No 'origin' remote configured");
+            return;
+        }
+
+        var webUrl = ToRemoteWebUrl(r.Value!);
+        if (string.IsNullOrWhiteSpace(webUrl))
+        {
+            ErrToast("Open repository failed", $"Could not derive web URL from '{r.Value}'");
+            return;
+        }
+
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(webUrl)
+            {
+                UseShellExecute = true,
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "OpenRemoteRepository failed for {Url}", webUrl);
+            ErrToast("Open repository failed", ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Convert a git remote (SCP-style <c>git@host:owner/repo.git</c>, <c>ssh://git@host/owner/repo.git</c>,
+    /// or <c>https://host/owner/repo.git</c>) into a browser URL by stripping the trailing
+    /// <c>.git</c> and rewriting SSH forms to HTTPS. Returns <c>null</c> when the remote does
+    /// not look like an HTTP-reachable repository.
+    /// </summary>
+    internal static string? ToRemoteWebUrl(string remoteUrl)
+    {
+        var url = remoteUrl.Trim();
+        if (url.Length == 0) { return null; }
+
+        if (url.StartsWith("git@", StringComparison.OrdinalIgnoreCase))
+        {
+            var at = url.IndexOf('@');
+            var colon = url.IndexOf(':', at);
+            if (colon < 0) { return null; }
+            var host = url.Substring(at + 1, colon - at - 1);
+            var rest = url.Substring(colon + 1);
+            url = $"https://{host}/{rest}";
+        }
+        else if (url.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase))
+        {
+            var rest = url.Substring("ssh://".Length);
+            var slash = rest.IndexOf('/');
+            if (slash < 0) { return null; }
+            var hostPart = rest.Substring(0, slash);
+            var at = hostPart.IndexOf('@');
+            var host = at >= 0 ? hostPart.Substring(at + 1) : hostPart;
+            url = $"https://{host}{rest.Substring(slash)}";
+        }
+
+        if (url.EndsWith(".git", StringComparison.OrdinalIgnoreCase))
+        {
+            url = url.Substring(0, url.Length - 4);
+        }
+
+        return url.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+            || url.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
+            ? url
+            : null;
+    }
+
+    [RelayCommand]
     private void OpenInWindowsTerminal(object? target)
     {
         var path = ResolvePath(target);

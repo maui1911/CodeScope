@@ -350,6 +350,12 @@ public partial class SidebarView : UserControl
         TreeContextMenu.Items.Add(BuildItem(
             "Open in Windows Terminal", "Ctx.Icon.WinTerminal", null,
             () => vm.OpenInWindowsTerminalCommand.Execute(wt)));
+        if (HasOriginRemote(owner?.Path))
+        {
+            TreeContextMenu.Items.Add(BuildItem(
+                "Open remote in browser", "Ctx.Icon.Link", null,
+                () => vm.OpenRemoteRepositoryCommand.Execute(wt)));
+        }
 
         // Copy → submenu
         var copyRoot = new MenuItem { Header = "Copy", Icon = IconFor("Ctx.Icon.Clipboard") };
@@ -438,6 +444,12 @@ public partial class SidebarView : UserControl
         TreeContextMenu.Items.Add(BuildItem(
             "Open in Windows Terminal", "Ctx.Icon.WinTerminal", null,
             () => vm.OpenInWindowsTerminalCommand.Execute(proj)));
+        if (HasOriginRemote(proj.Path))
+        {
+            TreeContextMenu.Items.Add(BuildItem(
+                "Open remote in browser", "Ctx.Icon.Link", null,
+                () => vm.OpenRemoteRepositoryCommand.Execute(proj)));
+        }
         TreeContextMenu.Items.Add(BuildItem(
             "Copy path", "Ctx.Icon.Clipboard", "Ctrl+Alt+C",
             () => vm.CopyPathCommand.Execute(proj)));
@@ -612,6 +624,29 @@ public partial class SidebarView : UserControl
     }
 
     private static Separator BuildSeparator() => new();
+
+    /// <summary>
+    /// Cheap, synchronous probe for an <c>origin</c> remote on a project. Reads <c>.git/config</c>
+    /// directly so the menu builder doesn't have to spawn <c>git remote get-url</c> on every right
+    /// click. Returns false when the path is missing, the config can't be read, or the file
+    /// contains no <c>[remote "origin"]</c> section. Worktrees share the project's config so the
+    /// caller passes the project path, not the worktree path.
+    /// </summary>
+    private static bool HasOriginRemote(string? projectPath)
+    {
+        if (string.IsNullOrWhiteSpace(projectPath)) { return false; }
+        try
+        {
+            var configPath = System.IO.Path.Combine(projectPath, ".git", "config");
+            if (!System.IO.File.Exists(configPath)) { return false; }
+            var text = System.IO.File.ReadAllText(configPath);
+            return text.Contains("[remote \"origin\"]", StringComparison.Ordinal);
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
     /// <summary>Runs <paramref name="action"/> with the main-window view-model if present.
     /// Replaces the `Application.Current?.MainWindow?.DataContext is MainViewModel main` guard
