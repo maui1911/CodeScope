@@ -19,8 +19,6 @@ namespace NoScope.CodeScope.App.Notifications;
 public sealed class WindowsIdleToastNotifier : IIdleToastNotifier, IDisposable
 {
     private const string ArgKey = "agentSessionId";
-    private const string ActionKey = "action";
-    private const string ActionFocus = "focus";
     private static readonly TimeSpan DedupeWindow = TimeSpan.FromSeconds(2);
 
     private readonly ILogger<WindowsIdleToastNotifier> _logger;
@@ -47,21 +45,28 @@ public sealed class WindowsIdleToastNotifier : IIdleToastNotifier, IDisposable
         if (!IsMainWindowMinimized()) { return; }
 
         // De-dupe: telemetry transitions fire from FSWatcher *and* the poll fallback
-        // (~100–500 ms apart) and would otherwise stack two identical toasts.
+        // (~100–500 ms apart) and would otherwise stack two identical toasts. Anything
+        // older than the de-dupe window can no longer suppress a future toast, so we
+        // prune in-place — the dict stays bounded to "sessions seen in the last 2 s",
+        // a handful of entries at most.
         lock (_gate)
         {
-            if (_lastFiredBySession.TryGetValue(agentSessionId, out var last)
-                && DateTimeOffset.UtcNow - last < DedupeWindow)
+            var now = DateTimeOffset.UtcNow;
+            var cutoff = now - DedupeWindow;
+            foreach (var staleKey in _lastFiredBySession
+                         .Where(kv => kv.Value < cutoff)
+                         .Select(kv => kv.Key)
+                         .ToList())
             {
-                return;
+                _lastFiredBySession.Remove(staleKey);
             }
-            _lastFiredBySession[agentSessionId] = DateTimeOffset.UtcNow;
+            if (_lastFiredBySession.ContainsKey(agentSessionId)) { return; }
+            _lastFiredBySession[agentSessionId] = now;
         }
 
         try
         {
             new ToastContentBuilder()
-                .AddArgument(ActionKey, ActionFocus)
                 .AddArgument(ArgKey, agentSessionId)
                 .AddText(sessionTitle)
                 .AddText(detail)

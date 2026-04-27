@@ -16,7 +16,10 @@ public interface IIdleToastNotifier
 {
     /// <summary>
     /// Shows a "turn complete" toast for the given session if the host window is
-    /// minimized; otherwise no-op. Safe to call from any thread.
+    /// minimized; otherwise no-op. Must be called on the WPF dispatcher — the
+    /// implementation reads <c>Application.Current.MainWindow.WindowState</c>, which
+    /// is dispatcher-affined. Existing call sites (<c>MainViewModel.PushActivityNotification</c>
+    /// → <c>ApplyTelemetry</c>) already marshal onto the dispatcher before invoking.
     /// </summary>
     /// <param name="agentSessionId">
     /// The agent-side session id (Claude UUID etc.) — embedded in the toast as the
