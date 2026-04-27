@@ -85,14 +85,18 @@ public sealed class OpenCodeTelemetryService : IOpenCodeTelemetryService
     private void OnFileEvent(object? _, FileSystemEventArgs e)
     {
         // Path layout: <root>/project/<slug>/storage/message/<sessionId>/<file>.json
-        // Pull the parent directory name as the candidate session id.
-        var sid = Path.GetFileName(Path.GetDirectoryName(e.FullPath) ?? string.Empty);
+        // Validate the grandparent dir is `message` so a stray `msg_*.json` outside the
+        // canonical layout (manual test file, future extensions) can't accidentally bind
+        // to a registered session id and corrupt its telemetry.
+        var messageDir = Path.GetDirectoryName(e.FullPath);
+        if (string.IsNullOrEmpty(messageDir)) { return; }
+        var grandparent = Path.GetFileName(Path.GetDirectoryName(messageDir) ?? string.Empty);
+        if (!string.Equals(grandparent, "message", StringComparison.OrdinalIgnoreCase)) { return; }
+
+        var sid = Path.GetFileName(messageDir);
         if (string.IsNullOrEmpty(sid)) { return; }
         if (!_watches.TryGetValue(sid, out var watch)) { return; }
-        if (watch.MessageDir is null)
-        {
-            watch.MessageDir = Path.GetDirectoryName(e.FullPath);
-        }
+        if (watch.MessageDir is null) { watch.MessageDir = messageDir; }
         Recompute(watch);
     }
 

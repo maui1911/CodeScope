@@ -13,7 +13,7 @@
 **Uncommitted work:** none beyond this HANDOFF update.
 **Unpushed commits:** entire `feature/pi-and-opencode-agents` branch (1 implementation commit + this HANDOFF commit) — no PR opened yet.
 
-### Session 23 — pi.dev agent support (uncommitted)
+### Session 23 — pi.dev agent support (committed in `26586d0`)
 
 User-visible: a fourth agent ("π  Pi") in the new-session menu that launches
 `@mariozechner/pi-coding-agent`, with the same busy/idle status dot, token
@@ -69,10 +69,10 @@ Open follow-ups:
 - `ContextWindowTokens` for Pi is left at 0 (model-agnostic CLI). The status
   bar's percent indicator stays blank for Pi until we surface a per-tab cap
   override, which is its own design problem.
-- No `git commit` taken — user asked for full implementation, not the merge
-  plan. Diff is `git status -s` clean except for these new + modified files.
+- Committed in `26586d0` together with session 23b (shared files in
+  AgentRegistry/MainViewModel/App.xaml.cs couldn't be split cleanly).
 
-### Session 23b — opencode-cli telemetry parity (uncommitted)
+### Session 23b — opencode-cli telemetry parity (committed in `26586d0`)
 
 User-visible: the OpenCode tab now gets the same status-dot + token + turn
 read-out the Claude / Pi tabs have. Resume-by-id wired through the existing

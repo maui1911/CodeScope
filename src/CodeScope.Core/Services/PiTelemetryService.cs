@@ -192,7 +192,14 @@ public sealed class PiTelemetryService : IPiTelemetryService
                     if (entry.Role is "user" or "toolResult")
                     {
                         activity = ClaudeActivityState.Composing;
-                        if (entry.Timestamp is { } userTs) { watch.LastUserTurnAt = userTs; }
+                        // Only a fresh user turn anchors LastUserTurnAt — toolResult marks the
+                        // mid-turn return of a tool call, so resetting here would cut the
+                        // measured turn-duration short. Mirrors ClaudeTelemetryService's
+                        // `!entry.UserCarriesToolResult` guard.
+                        if (entry.Role == "user" && entry.Timestamp is { } userTs)
+                        {
+                            watch.LastUserTurnAt = userTs;
+                        }
                         changed = true;
                         continue;
                     }

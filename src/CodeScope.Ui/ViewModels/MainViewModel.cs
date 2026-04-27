@@ -436,7 +436,7 @@ public sealed partial class MainViewModel : ObservableObject
         var vm = new SessionTabViewModel(descriptor, project.Id, session.AgentId, session.DisplayName, agent?.Icon);
         FocusedGroup.Tabs.Add(vm);
         SelectedTab = vm;
-        BeginClaudeAdoption(descriptor.Id, agent?.Id, targetFolder, DateTimeOffset.UtcNow);
+        BeginAgentAdoption(descriptor.Id, agent?.Id, targetFolder, DateTimeOffset.UtcNow);
         OnPropertyChanged(nameof(CanCloseGroup));
         CloseGroupCommand.NotifyCanExecuteChanged();
     }
@@ -554,7 +554,7 @@ public sealed partial class MainViewModel : ObservableObject
             {
                 RegisterAgentTelemetry(stored.AgentId, sid, stored.WorktreePath);
             }
-            BeginClaudeAdoption(descriptor.Id, stored.AgentId, stored.WorktreePath, DateTimeOffset.UtcNow);
+            BeginAgentAdoption(descriptor.Id, stored.AgentId, stored.WorktreePath, DateTimeOffset.UtcNow);
         }
         CloseGroupCommand.NotifyCanExecuteChanged();
         OnPropertyChanged(nameof(CanCloseGroup));
@@ -628,7 +628,7 @@ public sealed partial class MainViewModel : ObservableObject
         {
             RegisterAgentTelemetry(closed.AgentId, sid, worktree.Path);
         }
-        BeginClaudeAdoption(descriptor.Id, closed.AgentId, worktree.Path, DateTimeOffset.UtcNow);
+        BeginAgentAdoption(descriptor.Id, closed.AgentId, worktree.Path, DateTimeOffset.UtcNow);
         OnPropertyChanged(nameof(CanCloseGroup));
         CloseGroupCommand.NotifyCanExecuteChanged();
         return true;
@@ -762,7 +762,7 @@ public sealed partial class MainViewModel : ObservableObject
         var vm = new SessionTabViewModel(descriptor, project.Id, session.AgentId, session.DisplayName, agent?.Icon);
         FocusedGroup.Tabs.Add(vm);
         SelectedTab = vm;
-        BeginClaudeAdoption(descriptor.Id, agent?.Id, folder, DateTimeOffset.UtcNow);
+        BeginAgentAdoption(descriptor.Id, agent?.Id, folder, DateTimeOffset.UtcNow);
         CloseGroupCommand.NotifyCanExecuteChanged();
     }
 
@@ -798,7 +798,7 @@ public sealed partial class MainViewModel : ObservableObject
         {
             UnregisterAgentTelemetry(storedForTab.AgentId, tsid);
         }
-        StopClaudeAdoption(tab.Descriptor.Id);
+        StopAgentAdoption(tab.Descriptor.Id);
         // The pool owns the SessionTabView; release here so ConPTY teardown actually runs.
         // (Removed Unloaded teardown on the view itself — see SessionTabView ctor.)
         SessionViewPool?.Release(tab.Descriptor.Id);
@@ -1041,7 +1041,7 @@ public sealed partial class MainViewModel : ObservableObject
                     // this handler fires; the external-only path (store removes without
                     // CloseTabAsync) is a fire-and-forget edge case that can't recover the
                     // AgentSessionId without an extra lookup.
-                    StopClaudeAdoption(removed.SessionId);
+                    StopAgentAdoption(removed.SessionId);
                     CloseGroupCommand.NotifyCanExecuteChanged();
                     break;
             }
@@ -1153,19 +1153,19 @@ public sealed partial class MainViewModel : ObservableObject
                 {
                     RegisterAgentTelemetry(s.AgentId, sid, s.WorktreePath);
                 }
-                BeginClaudeAdoption(s.Id, s.AgentId, s.WorktreePath, now);
+                BeginAgentAdoption(s.Id, s.AgentId, s.WorktreePath, now);
             }
         }
     }
 
     /// <summary>
-    /// Starts a discovery watch on <paramref name="workingDir"/> and, on first new jsonl,
-    /// persists the adopted id onto <paramref name="storedSessionId"/> and registers the
-    /// matching telemetry tail. Routes by <paramref name="agentId"/> to either Claude or
-    /// Pi backends; no-op for other agents or when the relevant services aren't wired
-    /// (tests / headless).
+    /// Starts a discovery watch on <paramref name="workingDir"/> and, on first adoption-worthy
+    /// transcript event, persists the adopted id onto <paramref name="storedSessionId"/> and
+    /// registers the matching telemetry tail. Routes by <paramref name="agentId"/> to the
+    /// Claude, Pi, or OpenCode backend; no-op for other agents or when the relevant services
+    /// aren't wired (tests / headless).
     /// </summary>
-    private void BeginClaudeAdoption(string storedSessionId, string? agentId, string workingDir, DateTimeOffset since)
+    private void BeginAgentAdoption(string storedSessionId, string? agentId, string workingDir, DateTimeOffset since)
     {
         if (string.IsNullOrWhiteSpace(workingDir)) { return; }
 
@@ -1196,14 +1196,15 @@ public sealed partial class MainViewModel : ObservableObject
         }
 
         if (handle is null) { return; }
-        StopClaudeAdoption(storedSessionId);
+        StopAgentAdoption(storedSessionId);
         _discoveryWatches[storedSessionId] = handle;
     }
 
     /// <summary>
-    /// Adoption callback shared by Claude + Pi: persist the new id onto the store row and
-    /// (re-)register the matching telemetry tail. Marshals onto the dispatcher because the
-    /// discovery callback fires on a watcher thread.
+    /// Adoption callback shared by every supported agent backend (Claude, Pi, OpenCode):
+    /// persist the new id onto the store row and (re-)register the matching telemetry
+    /// tail. Marshals onto the dispatcher because the discovery callback fires on a
+    /// watcher thread.
     /// </summary>
     private void ApplyAdoption(string storedSessionId, string adoptedId, string? agentId, string workingDir)
     {
@@ -1293,12 +1294,12 @@ public sealed partial class MainViewModel : ObservableObject
         return null;
     }
 
-    private void StopClaudeAdoption(string storedSessionId)
+    private void StopAgentAdoption(string storedSessionId)
     {
         if (_discoveryWatches.Remove(storedSessionId, out var handle))
         {
             try { handle.Dispose(); }
-            catch (Exception ex) { _logger.LogTrace(ex, "StopClaudeAdoption: dispose threw for {SessionId}", storedSessionId); }
+            catch (Exception ex) { _logger.LogTrace(ex, "StopAgentAdoption: dispose threw for {SessionId}", storedSessionId); }
         }
     }
 
