@@ -625,20 +625,49 @@ public partial class SidebarView : UserControl
 
     private static Separator BuildSeparator() => new();
 
-    /// <summary>
-    /// Cheap, synchronous probe for an <c>origin</c> remote on a project. Reads <c>.git/config</c>
-    /// directly so the menu builder doesn't have to spawn <c>git remote get-url</c> on every right
-    /// click. Returns false when the path is missing, the config can't be read, or the file
-    /// contains no <c>[remote "origin"]</c> section. Worktrees share the project's config so the
-    /// caller passes the project path, not the worktree path.
-    /// </summary>
+    private static bool TryGetGitConfigPath(string? projectPath, out string? configPath)
+    {
+        configPath = null;
+        if (string.IsNullOrWhiteSpace(projectPath)) { return false; }
+
+        var gitPath = System.IO.Path.Combine(projectPath, ".git");
+
+        if (System.IO.Directory.Exists(gitPath))
+        {
+            var directConfigPath = System.IO.Path.Combine(gitPath, "config");
+            if (System.IO.File.Exists(directConfigPath))
+            {
+                configPath = directConfigPath;
+                return true;
+            }
+            return false;
+        }
+
+        if (!System.IO.File.Exists(gitPath)) { return false; }
+
+        var gitPointer = System.IO.File.ReadAllText(gitPath).Trim();
+        const string gitDirPrefix = "gitdir:";
+        if (!gitPointer.StartsWith(gitDirPrefix, StringComparison.OrdinalIgnoreCase)) { return false; }
+
+        var gitDir = gitPointer[gitDirPrefix.Length..].Trim();
+        if (string.IsNullOrWhiteSpace(gitDir)) { return false; }
+
+        var resolvedGitDir = System.IO.Path.IsPathRooted(gitDir)
+            ? gitDir
+            : System.IO.Path.GetFullPath(System.IO.Path.Combine(projectPath, gitDir));
+
+        var resolvedConfigPath = System.IO.Path.Combine(resolvedGitDir, "config");
+        if (!System.IO.File.Exists(resolvedConfigPath)) { return false; }
+
+        configPath = resolvedConfigPath;
+        return true;
+    }
+
     private static bool HasOriginRemote(string? projectPath)
     {
-        if (string.IsNullOrWhiteSpace(projectPath)) { return false; }
         try
         {
-            var configPath = System.IO.Path.Combine(projectPath, ".git", "config");
-            if (!System.IO.File.Exists(configPath)) { return false; }
+            if (!TryGetGitConfigPath(projectPath, out var configPath) || configPath is null) { return false; }
             var text = System.IO.File.ReadAllText(configPath);
             return text.Contains("[remote \"origin\"]", StringComparison.Ordinal);
         }

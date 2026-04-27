@@ -234,7 +234,7 @@ public sealed partial class SidebarViewModel
         var r = await _git.GetRemoteUrlAsync(path).ConfigureAwait(true);
         if (r.IsFailure || string.IsNullOrWhiteSpace(r.Value))
         {
-            ErrToast("No remote", r.IsFailure ? r.Error : "No 'origin' remote configured");
+            ErrToast("No remote", r.IsFailure ? r.Error : "Could not obtain 'origin' remote URL");
             return;
         }
 
