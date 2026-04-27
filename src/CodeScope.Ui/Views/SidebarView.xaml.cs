@@ -350,6 +350,12 @@ public partial class SidebarView : UserControl
         TreeContextMenu.Items.Add(BuildItem(
             "Open in Windows Terminal", "Ctx.Icon.WinTerminal", null,
             () => vm.OpenInWindowsTerminalCommand.Execute(wt)));
+        if (HasOriginRemote(owner?.Path))
+        {
+            TreeContextMenu.Items.Add(BuildItem(
+                "Open remote in browser", "Ctx.Icon.Link", null,
+                () => vm.OpenRemoteRepositoryCommand.Execute(wt)));
+        }
 
         // Copy → submenu
         var copyRoot = new MenuItem { Header = "Copy", Icon = IconFor("Ctx.Icon.Clipboard") };
@@ -438,6 +444,12 @@ public partial class SidebarView : UserControl
         TreeContextMenu.Items.Add(BuildItem(
             "Open in Windows Terminal", "Ctx.Icon.WinTerminal", null,
             () => vm.OpenInWindowsTerminalCommand.Execute(proj)));
+        if (HasOriginRemote(proj.Path))
+        {
+            TreeContextMenu.Items.Add(BuildItem(
+                "Open remote in browser", "Ctx.Icon.Link", null,
+                () => vm.OpenRemoteRepositoryCommand.Execute(proj)));
+        }
         TreeContextMenu.Items.Add(BuildItem(
             "Copy path", "Ctx.Icon.Clipboard", "Ctrl+Alt+C",
             () => vm.CopyPathCommand.Execute(proj)));
@@ -612,6 +624,58 @@ public partial class SidebarView : UserControl
     }
 
     private static Separator BuildSeparator() => new();
+
+    private static bool TryGetGitConfigPath(string? projectPath, out string? configPath)
+    {
+        configPath = null;
+        if (string.IsNullOrWhiteSpace(projectPath)) { return false; }
+
+        var gitPath = System.IO.Path.Combine(projectPath, ".git");
+
+        if (System.IO.Directory.Exists(gitPath))
+        {
+            var directConfigPath = System.IO.Path.Combine(gitPath, "config");
+            if (System.IO.File.Exists(directConfigPath))
+            {
+                configPath = directConfigPath;
+                return true;
+            }
+            return false;
+        }
+
+        if (!System.IO.File.Exists(gitPath)) { return false; }
+
+        var gitPointer = System.IO.File.ReadAllText(gitPath).Trim();
+        const string gitDirPrefix = "gitdir:";
+        if (!gitPointer.StartsWith(gitDirPrefix, StringComparison.OrdinalIgnoreCase)) { return false; }
+
+        var gitDir = gitPointer[gitDirPrefix.Length..].Trim();
+        if (string.IsNullOrWhiteSpace(gitDir)) { return false; }
+
+        var resolvedGitDir = System.IO.Path.IsPathRooted(gitDir)
+            ? gitDir
+            : System.IO.Path.GetFullPath(System.IO.Path.Combine(projectPath, gitDir));
+
+        var resolvedConfigPath = System.IO.Path.Combine(resolvedGitDir, "config");
+        if (!System.IO.File.Exists(resolvedConfigPath)) { return false; }
+
+        configPath = resolvedConfigPath;
+        return true;
+    }
+
+    private static bool HasOriginRemote(string? projectPath)
+    {
+        try
+        {
+            if (!TryGetGitConfigPath(projectPath, out var configPath) || configPath is null) { return false; }
+            var text = System.IO.File.ReadAllText(configPath);
+            return text.Contains("[remote \"origin\"]", StringComparison.Ordinal);
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
     /// <summary>Runs <paramref name="action"/> with the main-window view-model if present.
     /// Replaces the `Application.Current?.MainWindow?.DataContext is MainViewModel main` guard
