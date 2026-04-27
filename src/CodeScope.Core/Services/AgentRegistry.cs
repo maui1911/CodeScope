@@ -65,10 +65,37 @@ public sealed class AgentRegistry : IAgentRegistry
         {
             Id = "opencode",
             DisplayName = "OpenCode",
-            Command = "opencode",
+            // Windows ships the binary as `opencode-cli.exe` (npm `opencode-ai` package
+            // installs that name on Win to dodge a Windows reserved/conflicting name).
+            // macOS/Linux use `opencode`; flip this default if we ever cross-compile.
+            Command = "opencode-cli",
+            // `opencode -c` (= `--continue`) resumes the most recent session in the cwd.
+            // `opencode --session <id>` (= `-s <id>`) resumes a specific id; we adopt that
+            // id from the message-file watcher once OpenCode has written its first assistant
+            // turn (the message JSON's metadata.assistant.path.cwd is the canonical record).
+            // SessionIdFlag stays null — OpenCode mints its own ids, doesn't accept caller-minted.
             ResumeArgs = ["--continue"],
             NewSessionArgs = [],
+            SessionIdFlag = null,
+            ResumeByIdArgs = ["--session"],
             Icon = "◈",
+        },
+        new AgentProfile
+        {
+            Id = "pi",
+            DisplayName = "Pi",
+            Command = "pi",
+            // Fresh launches: bare `pi`. Pi mints its own UUID + writes a session-jsonl whose
+            // header carries the cwd, which `IPiSessionDiscovery` matches to adopt the id.
+            // Resume-by-id: `pi --session <uuid>` — Pi resolves the latest session file with
+            // that UUID suffix anywhere under `~/.pi/agent/sessions/`. Continue-most-recent:
+            // `pi -c` (used as the bare ResumeArgs fallback when we don't have a stored id).
+            // SessionIdFlag stays null because Pi doesn't accept caller-minted ids on launch.
+            ResumeArgs = ["-c"],
+            NewSessionArgs = [],
+            SessionIdFlag = null,
+            ResumeByIdArgs = ["--session"],
+            Icon = "π",
         },
     ];
 }

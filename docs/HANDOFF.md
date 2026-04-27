@@ -5,13 +5,125 @@
 > **Intent:** cursor + last 1–2 sessions in depth, everything else a one-liner.
 > Old detail lives in `git log` — don't duplicate it here.
 
-**Last updated:** 2026-04-26 (session 22)
-**Branch:** `feature/session-history-per-worktree` — adds the cross-group drag pool on top of session 21's history work; PR pending.
-**Head:** see session 22 below (cross-group terminal drag pool)
+**Last updated:** 2026-04-27 (session 23)
+**Branch:** `feature/pi-and-opencode-agents` (off `main`); pi.dev + opencode-cli telemetry committed as `26586d0`.
+**Head:** `26586d0` — see sessions 23 + 23b below.
 **Release:** `v0.1.0` shipped via GitHub Actions — https://github.com/maui1911/CodeScope/releases/tag/v0.1.0
-**Build status:** ✅ `dotnet build` clean. `dotnet test` 280/281 green; 1 pre-existing FSWatcher flake (`Callback_Fires_For_Each_New_Jsonl_So_Clear_Rotations_Are_Adopted`) — confirmed flaky on `main` too, not a regression.
-**Uncommitted work:** none.
-**Unpushed commits:** entire `feature/session-history-per-worktree` branch (9 feature commits + this HANDOFF commit) — no PR opened yet.
+**Build status:** ✅ `dotnet build` clean. Full solution `dotnet test` 334/334 green (Core 202, Ui 115, App 17).
+**Uncommitted work:** none beyond this HANDOFF update.
+**Unpushed commits:** entire `feature/pi-and-opencode-agents` branch (1 implementation commit + this HANDOFF commit) — no PR opened yet.
+
+### Session 23 — pi.dev agent support (committed in `26586d0`)
+
+User-visible: a fourth agent ("π  Pi") in the new-session menu that launches
+`@mariozechner/pi-coding-agent`, with the same busy/idle status dot, token
+progress, and turn-duration read-out the Claude tab gets. Resume-by-id wires
+through the existing `--resume`-style plumbing (Pi flag is `--session <uuid>`,
+fallback `pi -c` for "continue most recent").
+
+How: Pi's on-disk session-jsonl format is structurally similar to Claude's but
+under `~/.pi/agent/sessions/--<encoded-cwd>--/<timestamp>_<uuid>.jsonl` and
+with different field names (`message.usage.{input,output,cacheRead,cacheWrite}`,
+`stopReason ∈ {stop, tool_use}`, `role ∈ {user, assistant, toolResult}`). Each
+file's first line is a `session` header carrying the canonical `cwd`, so
+discovery matches by header (canonicalised path comparison) instead of trying
+to predict Pi's directory-naming scheme on Windows.
+
+Files added:
+- `src/CodeScope.Core/Services/PiTranscriptParser.cs` — pure parser; mirrors
+  ClaudeTranscriptParser's contract. Includes `ExtractSessionIdFromFileName`
+  that pulls the trailing UUID out of `<ts>_<uuid>.jsonl` names.
+- `src/CodeScope.Core/Services/IPiTelemetryService.cs` + `PiTelemetryService.cs`
+  — single recursive `FileSystemWatcher` over the entire sessions root so a
+  fresh-launch race (Register before pi has written its first line) still
+  picks up the file. Token + activity FSM identical to Claude's.
+- `src/CodeScope.Core/Services/IPiSessionDiscovery.cs` + `PiSessionDiscovery.cs`
+  — header-cwd matching with cross-platform path canonicalisation so
+  `C:\dev\x` and `/c/dev/x` collapse to the same key. `since` filter, poll
+  fallback, dispose semantics — all mirror `ClaudeSessionDiscovery`.
+- 3 test files: `PiTranscriptParserTests` (10), `PiTelemetryServiceTests` (7),
+  `PiSessionDiscoveryTests` (7) — all green.
+
+Files touched:
+- `src/CodeScope.Core/Services/AgentRegistry.cs` — Pi profile in `BuildDefaults`:
+  `Command="pi"`, `ResumeArgs=["-c"]`, `ResumeByIdArgs=["--session"]`,
+  `SessionIdFlag=null`, `Icon="π"`. Default agent stays Claude.
+- `src/CodeScope.App/App.xaml.cs` — register `IPiTelemetryService` +
+  `IPiSessionDiscovery`; pass to `MainViewModel`.
+- `src/CodeScope.Ui/ViewModels/MainViewModel.cs`:
+  - Optional `IPiTelemetryService` / `IPiSessionDiscovery` ctor params; both
+    services emit `ClaudeSessionTelemetry` so `OnTelemetryUpdated` doesn't care.
+  - `BeginClaudeAdoption` now branches on agent id (claude vs pi) and uses the
+    appropriate discovery service. Same handle-management as before.
+  - `ApplyAdoption` is the shared callback that persists the new id + (re-)
+    registers the right telemetry tail.
+  - `RegisterAgentTelemetry` / `UnregisterAgentTelemetry` route by agent id;
+    callers (`HydrateFromLoaded`, `RestoreClosedWorktreeSessionsAsync`,
+    `TryRestoreSessionAsync`, `CloseTabAsync`) no longer hard-code Claude.
+- `tests/CodeScope.Core.Tests/AgentRegistryTests.cs` — Pi assertions added.
+
+Open follow-ups:
+- Pi's path-encoding on Windows is genuinely undocumented; we sidestep the
+  problem by content-matching the header. If Pi ever drops the header line,
+  this whole approach falls over — file an issue at that point, not before.
+- `ContextWindowTokens` for Pi is left at 0 (model-agnostic CLI). The status
+  bar's percent indicator stays blank for Pi until we surface a per-tab cap
+  override, which is its own design problem.
+- Committed in `26586d0` together with session 23b (shared files in
+  AgentRegistry/MainViewModel/App.xaml.cs couldn't be split cleanly).
+
+### Session 23b — opencode-cli telemetry parity (committed in `26586d0`)
+
+User-visible: the OpenCode tab now gets the same status-dot + token + turn
+read-out the Claude / Pi tabs have. Resume-by-id wired through the existing
+descriptor plumbing (`opencode --session <id>`).
+
+Why per-message JSON instead of JSONL: OpenCode persists each message as its
+own file under `%USERPROFILE%\.local\share\opencode\project\<slug>\storage\
+message\<sessionId>\msg_<id>.json`. The schema is upstream-defined in
+`packages/opencode/src/session/message.ts` (Effect Schema.Struct):
+`metadata.assistant.{tokens.{input,output,reasoning,cache.{read,write}}, modelID,
+providerID, path.{cwd,root}, cost}` + `metadata.time.{created,completed?}`.
+Tool-pending state flows from a part with `type:"tool-invocation"` whose
+`toolInvocation.state` is `call` or `partial-call`.
+
+Files added:
+- `src/CodeScope.Core/Services/OpenCodeMessageParser.cs` — pure parser with
+  `ExtractMessageIdFromFileName` for `msg_*.json` names and pending-tool
+  detection on the `parts` array.
+- `src/CodeScope.Core/Services/IOpenCodeTelemetryService.cs` +
+  `OpenCodeTelemetryService.cs` — recursive root watcher; locates the right
+  `message/<sessionId>/` dir via path-segment match (parent must be `message`),
+  re-aggregates every Recompute by sorting in-memory entries on
+  `metadata.time.created`. Activity FSM: latest message role/state drives
+  Composing / PendingToolUse / Idle.
+- `src/CodeScope.Core/Services/IOpenCodeSessionDiscovery.cs` +
+  `OpenCodeSessionDiscovery.cs` — header-cwd matching reuses
+  `PiSessionDiscovery.CanonicalizePath` (same cross-platform path problem).
+  Adoption fires once per session id, on the first assistant message because
+  that's where `metadata.assistant.path.cwd` first appears.
+- 3 test files: `OpenCodeMessageParserTests` (8), `OpenCodeTelemetryServiceTests`
+  (6), `OpenCodeSessionDiscoveryTests` (6) — all green.
+
+Files touched:
+- `AgentRegistry.cs` — opencode profile gains `ResumeByIdArgs=["--session"]`
+  (was missing); Command/Icon/ResumeArgs unchanged.
+- `App.xaml.cs` — register `IOpenCodeTelemetryService` +
+  `IOpenCodeSessionDiscovery`; pass to `MainViewModel`.
+- `MainViewModel.cs` — `BeginClaudeAdoption` gains an `opencode` branch;
+  `RegisterAgentTelemetry` / `UnregisterAgentTelemetry` route opencode too.
+  Same `ApplyAdoption` shared-callback shape as Claude/Pi.
+- `AgentRegistryTests.cs` — opencode profile assertion added.
+
+Open follow-ups:
+- The Effect Schema upstream uses Unix-ms numbers for `time.created/completed`;
+  the parser handles those as `DateTimeOffset.FromUnixTimeMilliseconds`. If
+  OpenCode ever switches to ISO strings, parser returns null timestamps but
+  the rest still works.
+- OpenCode session-list browser (`opencode session list`) isn't surfaced in
+  CodeScope — the user can still hit it from inside the tab via `/sessions`.
+- Same `ContextWindowTokens` caveat as Pi (model-agnostic CLI), unless a
+  Claude/known model lights up `ClaudeModelCatalog`.
 
 ---
 
