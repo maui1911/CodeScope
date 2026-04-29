@@ -64,5 +64,6 @@ dev-mode separation keeps working.
 - Read `docs/DECISIONS.md` before proposing architecture changes
 - Write the test first for `Core` services (TDD for logic, not UI)
 - Keep commits focused; one concern per commit
+- Never commit new work directly to `main` — always create a feature branch and open a PR (even for small changes). `main` is protected; pushing to it bypasses review
 - At the **end** of every working session, update `docs/HANDOFF.md` with the new cursor, commit SHAs, and anything a fresh session would need
 - Never leave `TODO` / `FIXME` without a linked issue number

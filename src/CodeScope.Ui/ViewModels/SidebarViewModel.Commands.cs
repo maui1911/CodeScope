@@ -409,7 +409,7 @@ public sealed partial class SidebarViewModel
         if (worktree is null || worktree.IsPrimary) { return; }
 
         var currentLeaf = System.IO.Path.GetFileName(worktree.Path.TrimEnd('\\', '/'));
-        var newLeaf = Dialogs.RenameDialog.Prompt(currentLeaf);
+        var newLeaf = Dialogs.RenameDialog.Prompt(currentLeaf, "Rename worktree");
         if (string.IsNullOrWhiteSpace(newLeaf) || string.Equals(newLeaf, currentLeaf, StringComparison.Ordinal))
         {
             return;

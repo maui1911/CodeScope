@@ -69,25 +69,10 @@
                                     <Setter.Value>
                                         <ControlTemplate TargetType="ListBoxItem">
                                             <Grid MouseDown="OnTabMouseDown">
-                                                <Grid.ContextMenu>
-                                                    <ContextMenu>
-                                                        <MenuItem
-                                                            AutomationProperties.AutomationId="TabCtx_Rename"
-                                                            Header="Rename…"
-                                                            Command="{Binding DataContext.RenameSessionCommand, RelativeSource={RelativeSource AncestorType=Window}}"
-                                                            CommandParameter="{Binding}" />
-                                                        <MenuItem
-                                                            AutomationProperties.AutomationId="TabCtx_Duplicate"
-                                                            Header="Duplicate"
-                                                            Command="{Binding DataContext.DuplicateTabCommand, RelativeSource={RelativeSource AncestorType=Window}}"
-                                                            CommandParameter="{Binding}" />
-                                                        <MenuItem
-                                                            AutomationProperties.AutomationId="TabCtx_Close"
-                                                            Header="Close"
-                                                            Command="{Binding DataContext.CloseTabCommand, RelativeSource={RelativeSource AncestorType=Window}}"
-                                                            CommandParameter="{Binding}" />
-                                                    </ContextMenu>
-                                                </Grid.ContextMenu>
+                                                <!-- Right-click context menu (Rename / Duplicate / Close) was removed
+                                                     with issue #21: tab labels auto-follow the worktree's branch, so
+                                                     manual rename is gone, and Duplicate/Close are reachable from the
+                                                     sidebar tree menu (and Close from the tab's middle-click + ✕). -->
                                                 <Border
                                                     x:Name="TabPill"
                                                     Background="Transparent"

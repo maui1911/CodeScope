@@ -25,7 +25,6 @@ public sealed partial class MainViewModel
             new("Close current tab", "Ctrl+W",         () => { CloseTabCommand.Execute(null); return Task.CompletedTask; }, Icon: "×"),
             new("Next tab",          "Ctrl+Tab",       () => { NextTabCommand.Execute(null); return Task.CompletedTask; }, Icon: "→"),
             new("Previous tab",      "Ctrl+Shift+Tab", () => { PrevTabCommand.Execute(null); return Task.CompletedTask; }, Icon: "←"),
-            new("Rename session",    "F2",             () => { RenameSessionCommand.Execute(null); return Task.CompletedTask; }, Icon: "✎"),
             new("Toggle diff panel", "Ctrl+D",         () => { ToggleDiffPanelCommand.Execute(null); return Task.CompletedTask; }, Icon: "≡"),
             new("Focus sidebar filter", "Ctrl+F",      () => { FocusSidebarFilterCommand.Execute(null); return Task.CompletedTask; }, Icon: "⌕"),
             new("Refresh all",          "F5",          () => { RefreshAllCommand.Execute(null); return Task.CompletedTask; }, Icon: "↻"),

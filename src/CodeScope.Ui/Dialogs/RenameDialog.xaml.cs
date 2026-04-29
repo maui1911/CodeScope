@@ -12,17 +12,19 @@ public partial class RenameDialog : Window
 
     public string? ResultName { get; private set; }
 
-    private RenameDialog(string current)
+    private RenameDialog(string current, string title)
     {
         InitializeComponent();
+        Title = title;
+        HeaderText.Text = title;
         NameBox.Text = current;
         NameBox.Focus();
         NameBox.SelectAll();
     }
 
-    public static string? Prompt(string current)
+    public static string? Prompt(string current, string title = "Rename session")
     {
-        var dlg = new RenameDialog(current) { Owner = Application.Current?.MainWindow };
+        var dlg = new RenameDialog(current, title) { Owner = Application.Current?.MainWindow };
         return dlg.ShowDialog() == true ? dlg.ResultName : null;
     }
 

@@ -85,7 +85,6 @@
         <KeyBinding Key="W" Modifiers="Control" Command="{Binding CloseTabCommand}" />
         <KeyBinding Key="Tab" Modifiers="Control" Command="{Binding NextTabCommand}" />
         <KeyBinding Key="Tab" Modifiers="Control+Shift" Command="{Binding PrevTabCommand}" />
-        <KeyBinding Key="F2" Command="{Binding RenameSessionCommand}" />
         <KeyBinding Key="K" Modifiers="Control" Command="{Binding OpenCommandPaletteCommand}" />
         <KeyBinding Key="P" Modifiers="Control+Shift" Command="{Binding OpenCommandPaletteCommand}" />
         <KeyBinding Key="O" Modifiers="Control+Shift" Command="{Binding ToggleOverviewCommand}" />
