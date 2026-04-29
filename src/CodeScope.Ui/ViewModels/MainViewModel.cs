@@ -445,7 +445,7 @@ public sealed partial class MainViewModel : ObservableObject
 
         // Tab labels always follow the worktree's current branch (§4); we do not pass
         // session.DisplayName as an override. Sidebar history rows still honor it.
-        var vm = new SessionTabViewModel(descriptor, project.Id, session.AgentId, displayNameOverride: null, agent?.Icon);
+        var vm = new SessionTabViewModel(descriptor, project.Id, session.AgentId, displayNameOverride: null, icon: agent?.Icon);
         FocusedGroup.Tabs.Add(vm);
         SelectedTab = vm;
         BeginAgentAdoption(descriptor.Id, agent?.Id, targetFolder, DateTimeOffset.UtcNow);
@@ -773,7 +773,7 @@ public sealed partial class MainViewModel : ObservableObject
 
         // Tab labels always follow the worktree's current branch (§4); we do not pass
         // session.DisplayName as an override. Sidebar history rows still honor it.
-        var vm = new SessionTabViewModel(descriptor, project.Id, session.AgentId, displayNameOverride: null, agent?.Icon);
+        var vm = new SessionTabViewModel(descriptor, project.Id, session.AgentId, displayNameOverride: null, icon: agent?.Icon);
         FocusedGroup.Tabs.Add(vm);
         SelectedTab = vm;
         BeginAgentAdoption(descriptor.Id, agent?.Id, folder, DateTimeOffset.UtcNow);
@@ -1015,7 +1015,9 @@ public sealed partial class MainViewModel : ObservableObject
         if (worktree is null) { return; }
 
         var branch = string.IsNullOrWhiteSpace(worktree.Branch)
-            ? (worktree.IsPrimary ? "main" : "(no branch)")
+            ? (worktree.IsPrimary
+                ? (string.IsNullOrWhiteSpace(project.DefaultBranch) ? "main" : project.DefaultBranch)
+                : "(no branch)")
             : worktree.Branch;
         var title = $"{project.Name} · {branch}";
 
@@ -1052,9 +1054,9 @@ public sealed partial class MainViewModel : ObservableObject
                     RefreshTabTitlesForWorktree(wtStatus.ProjectId, wtStatus.WorktreeId);
                     break;
                 case SessionStoreChange.WorktreeRenamed wtRenamed:
-                    // Worktree path rename doesn't usually shift the branch, but the project name we
-                    // splice into the title might be derived from the worktree, and a fresh recompute
-                    // is cheap.
+                    // A worktree rename is a cheap trigger to recompute titles so the tab strip stays
+                    // consistent with the latest worktree state, even when the effective title is
+                    // unchanged.
                     RefreshTabTitlesForWorktree(wtRenamed.ProjectId, wtRenamed.WorktreeId);
                     break;
                 case SessionStoreChange.SessionRemoved removed:
