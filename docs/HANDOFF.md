@@ -5,13 +5,61 @@
 > **Intent:** cursor + last 1–2 sessions in depth, everything else a one-liner.
 > Old detail lives in `git log` — don't duplicate it here.
 
-**Last updated:** 2026-04-27 (session 23)
-**Branch:** `feature/pi-and-opencode-agents` (off `main`); pi.dev + opencode-cli telemetry committed as `26586d0`.
-**Head:** `26586d0` — see sessions 23 + 23b below.
+**Last updated:** 2026-04-29 (session 24)
+**Branch:** `feat/20-clone-from-url` (off `main`); add-project-from-git-url shipped as `f5b39de`.
+**Head:** `f5b39de` — see session 24 below.
 **Release:** `v0.1.0` shipped via GitHub Actions — https://github.com/maui1911/CodeScope/releases/tag/v0.1.0
-**Build status:** ✅ `dotnet build` clean. Full solution `dotnet test` 334/334 green (Core 202, Ui 115, App 17).
+**Build status:** ✅ `dotnet build` clean. Full solution `dotnet test` 379/379 (Core 233, Ui 129, App 17), modulo two known FSWatcher flakes (`ClaudeSessionDiscoveryTests.Callback_Fires_For_Each_New_Jsonl…` and `PiSessionDiscoveryTests.Discovers_New_Session_File_With_Matching_Cwd`).
 **Uncommitted work:** none beyond this HANDOFF update.
-**Unpushed commits:** entire `feature/pi-and-opencode-agents` branch (1 implementation commit + this HANDOFF commit) — no PR opened yet.
+**Unpushed commits:** entire `feat/20-clone-from-url` branch — spec + plan + 2 implementation commits + this HANDOFF — no PR opened yet.
+
+### Session 24 — Add project from a git URL (#20, shipped in `f5b39de`)
+
+User-visible: the "Add project" entry-point now opens a `NewProjectDialog`
+with two modes — *Existing folder* (today's behaviour) and *Clone from URL*.
+Clone mode shows an inline indeterminate spinner + "Cloning…" caption while
+`git clone` runs, and lets the user Cancel mid-flight (cancels the
+`CancellationToken`, kills git, cleans the partial target). On failure the
+dialog re-enables and renders git's stderr inline beneath the URL field — no
+toast, the user is still looking at the dialog.
+
+How:
+- `IGitService.CloneAsync(url, parentDir, folderName, ct)` shells out to
+  `git -C <parent> clone -- <url> <name>` via the existing `ProcessRunner`.
+  Pre-validates empty inputs, refuses non-existent parents, refuses non-empty
+  targets. `OperationCanceledException` propagates (consistent with every other
+  method on the service). 4 tests in `GitServiceCloneTests.cs`.
+- `NewProjectDialog` is a self-contained WPF Window mirroring `NewWorktreeDialog`'s
+  style. Owns its `CancellationTokenSource` for the duration of the clone;
+  Cancel during clone cancels without closing, Cancel when idle closes with
+  `DialogResult = false`. Failed/cancelled clones run a best-effort
+  `TryDeleteDir` so a retry isn't blocked by the destination-exists check.
+- `SidebarViewModel.AddProjectAsync` rewired through the dialog. New helper
+  `DefaultCloneParent()` walks recent-project parent → `%USERPROFILE%\source\repos`
+  → `%USERPROFILE%`. Drag-drop path (`AddProjectByPathAsync`) untouched.
+- `App.xaml.cs` registration of `SidebarViewModel` switched to named args
+  (positional was getting fragile with four picker/service params); the new
+  `pickNewProject` lambda captures `IGitService` once at registration.
+
+Spec: `docs/superpowers/specs/2026-04-29-add-project-from-git-url-design.md`.
+Plan: `docs/superpowers/plans/2026-04-29-add-project-from-git-url.md`.
+
+Files added/touched:
+- `src/CodeScope.Core/Services/IGitService.cs` (CloneAsync signature)
+- `src/CodeScope.Core/Services/GitService.cs` (CloneAsync implementation)
+- `tests/CodeScope.Core.Tests/GitServiceCloneTests.cs` (4 tests)
+- `src/CodeScope.Ui/Dialogs/NewProjectRequest.cs` (records)
+- `src/CodeScope.Ui/Dialogs/NewProjectDialog.xaml` + `.xaml.cs` (dialog)
+- `src/CodeScope.Ui/ViewModels/SidebarViewModel.cs` + `.Commands.cs` (wiring)
+- `src/CodeScope.App/App.xaml.cs` (registration + named args)
+
+Open follow-ups:
+- Smoke-test the dev build manually before merging the PR — clone a real public
+  repo, a deliberately-bad URL (verify inline error), and a slow clone with
+  Cancel mid-flight (verify partial cleanup). The plan's Task 8 step 5 has the
+  exact recipe.
+- Out of scope (deliberate, can be follow-ups): submodule/shallow/branch options,
+  streaming clone progress (objects/deltas %), credential prompts.
 
 ### Session 23 — pi.dev agent support (committed in `26586d0`)
 
