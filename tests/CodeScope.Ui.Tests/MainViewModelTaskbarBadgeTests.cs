@@ -7,10 +7,10 @@ namespace NoScope.CodeScope.Ui.Tests;
 
 /// <summary>
 /// Unit tests for the <see cref="MainViewModel"/> taskbar-badge aggregation logic.
-/// The production path fires via <see cref="MainViewModel.RaiseStatusBarChanged"/> →
-/// <c>RecomputeTaskbarBadge</c>; tests use the internal
-/// <see cref="MainViewModel.RecomputeTaskbarBadgeForTests"/> bypass so we don't need a
-/// full sidebar/HookStatusBarSources wiring.
+/// Most cases drive recompute directly via <c>RecomputeTaskbarBadgeForTests</c> to keep
+/// the count assertions tight; <see cref="StatusFlip_TriggersRecompute_ViaProductionHook"/>
+/// exercises the real <see cref="MainViewModel.HookStatusBarSources"/> →
+/// <c>RaiseStatusBarChanged</c> → <c>RecomputeTaskbarBadge</c> wiring end-to-end.
 /// </summary>
 public sealed class MainViewModelTaskbarBadgeTests
 {
@@ -29,7 +29,10 @@ public sealed class MainViewModelTaskbarBadgeTests
     /// <summary>
     /// Creates an agent tab (non-empty, non-"shell" AgentId).
     /// </summary>
-    private static SessionTabViewModel AgentTab(string agentId = "claude", string id = "s1", TabStatus status = TabStatus.Idle) =>
+    private static SessionTabViewModel AgentTab(
+        string agentId = "claude",
+        string id = "s1",
+        TabStatus status = TabStatus.Idle) =>
         new(MakeDescriptor(id), projectId: null, agentId: agentId, displayNameOverride: agentId)
         {
             Status = status,
@@ -137,23 +140,20 @@ public sealed class MainViewModelTaskbarBadgeTests
     }
 
     [Fact]
-    public void StatusFlip_TriggersRecompute()
+    public void StatusFlip_TriggersRecompute_ViaProductionHook()
     {
-        // NOTE: This test manually calls RecomputeTaskbarBadgeForTests() instead of relying on
-        // the HookStatusBarSources/PropertyChanged pipeline. The production wiring fires via
-        // RaiseStatusBarChanged (which is only hooked after HookStatusBarSources is called from
-        // MainWindow.Loaded), so in a unit test without a real sidebar we drive recompute directly.
-        // The production wiring is covered by the existing StatusBar integration hooks.
+        // Drives the same path as production: HookStatusBarSources subscribes to per-tab
+        // Status PropertyChanged; flipping Status fires RaiseStatusBarChanged which calls
+        // RecomputeTaskbarBadge. Sidebar isn't needed — that branch in HookStatusBarSources
+        // is gated by `Sidebar is not null`.
         var badge = Substitute.For<ITaskbarBadgeService>();
         var tab = AgentTab("claude", "s1", TabStatus.Idle);
         var vm = MakeVm(badge, tab);
-
-        vm.RecomputeTaskbarBadgeForTests();
-        badge.Received(1).Apply(0, 1);
+        vm.HookStatusBarSources();
+        badge.ClearReceivedCalls();
 
         tab.Status = TabStatus.Busy;
-        vm.RecomputeTaskbarBadgeForTests();
 
-        badge.Received(1).Apply(1, 1);
+        badge.Received().Apply(1, 1);
     }
 }
