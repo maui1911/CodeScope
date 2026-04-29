@@ -1,4 +1,5 @@
 using NoScope.CodeScope.Core.Models;
+using NoScope.CodeScope.Ui.Dialogs;
 using NoScope.CodeScope.Ui.Services;
 using CommunityToolkit.Mvvm.Input;
 using Microsoft.Extensions.Logging;
@@ -14,10 +15,42 @@ public sealed partial class SidebarViewModel
     [RelayCommand]
     private async Task AddProjectAsync()
     {
-        var folder = _pickFolder();
-        if (string.IsNullOrWhiteSpace(folder)) { return; }
-        var r = await _store.AddProjectAsync(folder, displayName: null).ConfigureAwait(true);
-        if (r.IsFailure) { _logger.LogWarning("AddProject failed: {Error}", r.Error); }
+        var request = new NewProjectRequest(DefaultCloneParent());
+        var picked = await _pickNewProject(request).ConfigureAwait(true);
+        if (picked is null) { return; }
+
+        var path = picked.ExistingFolder ?? picked.ClonedPath;
+        if (string.IsNullOrWhiteSpace(path)) { return; }
+
+        var r = await _store.AddProjectAsync(path, displayName: null).ConfigureAwait(true);
+        if (r.IsFailure)
+        {
+            _logger.LogWarning("AddProject failed: {Error}", r.Error);
+            ErrToast(picked.WasCloned ? "Cloned, but project add failed" : "Add project failed", r.Error);
+            return;
+        }
+
+        if (picked.WasCloned)
+        {
+            Toast("Project cloned", r.Value.Name, ToastSeverity.Ok);
+        }
+    }
+
+    private string DefaultCloneParent()
+    {
+        // Most-recently-added project's parent → user's source-repos folder → home.
+        var recent = _store.Projects.LastOrDefault(p => !string.IsNullOrWhiteSpace(p.Path));
+        if (recent is not null)
+        {
+            var parent = System.IO.Path.GetDirectoryName(recent.Path.TrimEnd('\\', '/'));
+            if (!string.IsNullOrWhiteSpace(parent) && System.IO.Directory.Exists(parent))
+            {
+                return parent;
+            }
+        }
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var fallback = System.IO.Path.Combine(home, "source", "repos");
+        return System.IO.Directory.Exists(fallback) ? fallback : home;
     }
 
     /// <summary>
