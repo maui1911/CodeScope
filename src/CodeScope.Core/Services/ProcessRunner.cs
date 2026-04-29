@@ -50,6 +50,18 @@ public static class ProcessRunner
             using var process = Process.Start(psi)
                 ?? throw new InvalidOperationException($"Process.Start returned null for {toolLabel}");
 
+            // Cancellation contract: when the caller cancels, kill the child immediately so it
+            // can't keep running in the background after the awaits below throw OCE.
+            // `entireProcessTree: true` ensures git's underlying ssh/credential helpers also die.
+            // The static lambda + state arg avoids capturing `process` into a closure, which
+            // would otherwise hold a reference past the `using var process` disposal.
+            using var killOnCancel = ct.Register(static state =>
+            {
+                var p = (Process)state!;
+                try { if (!p.HasExited) { p.Kill(entireProcessTree: true); } }
+                catch { /* race: process exited between HasExited check and Kill, or already disposed */ }
+            }, process);
+
             var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
             var stderrTask = process.StandardError.ReadToEndAsync(ct);
 

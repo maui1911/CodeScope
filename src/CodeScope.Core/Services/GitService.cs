@@ -232,8 +232,9 @@ public sealed class GitService : IGitService
         }
 
         // Quote both arguments and use `--` so URLs/folder names that start with a dash
-        // can't be parsed as flags.
-        var args = $"-C \"{parentDir}\" clone -- \"{url}\" \"{folderName}\"";
+        // can't be parsed as flags. QuoteArg escapes inner double-quotes so we don't rely
+        // on UI-side input filtering at the service boundary.
+        var args = $"-C {ProcessRunner.QuoteArg(parentDir)} clone -- {ProcessRunner.QuoteArg(url)} {ProcessRunner.QuoteArg(folderName)}";
         var result = await RunAsync(cwd: null, args, ct).ConfigureAwait(false);
         return result.IsSuccess
             ? Result<string>.Ok(target)

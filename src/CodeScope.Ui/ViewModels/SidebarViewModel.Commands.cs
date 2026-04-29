@@ -49,6 +49,12 @@ public sealed partial class SidebarViewModel
             }
         }
         var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (string.IsNullOrWhiteSpace(home) || !System.IO.Directory.Exists(home))
+        {
+            // Locked-down sandboxes / malformed profile env: GetTempPath() always returns
+            // an existing directory, so the dialog never has to deal with a bogus default.
+            return System.IO.Path.GetTempPath();
+        }
         var fallback = System.IO.Path.Combine(home, "source", "repos");
         return System.IO.Directory.Exists(fallback) ? fallback : home;
     }
