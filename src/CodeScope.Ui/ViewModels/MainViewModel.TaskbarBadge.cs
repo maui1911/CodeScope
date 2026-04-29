@@ -1,31 +1,48 @@
-using System.Linq;
 using NoScope.CodeScope.Ui.Services;
 
 namespace NoScope.CodeScope.Ui.ViewModels;
 
 /// <summary>
-/// Window-level aggregation that drives <see cref="ITaskbarBadgeService"/>. Reuses the
-/// existing tab-status hooks in <see cref="MainViewModel"/>.<see cref="HookStatusBarSources"/>;
-/// the call site lives inside <see cref="RaiseStatusBarChanged"/> so we don't subscribe twice
-/// to the same <see cref="SessionTabViewModel.Status"/> events.
+/// Window-level aggregation that drives <see cref="ITaskbarBadgeService"/>. The recompute
+/// fires from <see cref="RaiseStatusBarChanged"/>, which already runs on every per-tab
+/// <see cref="SessionTabViewModel.Status"/> change and every <see cref="EditorGroupViewModel.Tabs"/>
+/// mutation — no separate subscription needed.
 /// </summary>
 public sealed partial class MainViewModel
 {
-    public int BusyAgentCount => AllTabs.Count(IsAgentBusy);
-    public int AgentTabCount => AllTabs.Count(IsAgentTab);
+    private int _busyAgentCount;
+    private int _agentTabCount;
+
+    public int BusyAgentCount => _busyAgentCount;
+    public int AgentTabCount => _agentTabCount;
 
     private static bool IsAgentTab(SessionTabViewModel t)
         => !string.IsNullOrEmpty(t.AgentId)
            && !string.Equals(t.AgentId, ShellSentinel, System.StringComparison.OrdinalIgnoreCase);
 
-    private static bool IsAgentBusy(SessionTabViewModel t)
-        => IsAgentTab(t) && t.Status == TabStatus.Busy;
-
     private void RecomputeTaskbarBadge()
     {
-        _taskbarBadge?.Apply(BusyAgentCount, AgentTabCount);
-        OnPropertyChanged(nameof(BusyAgentCount));
-        OnPropertyChanged(nameof(AgentTabCount));
+        var busy = 0;
+        var agents = 0;
+        foreach (var tab in AllTabs)
+        {
+            if (!IsAgentTab(tab)) { continue; }
+            agents++;
+            if (tab.Status == TabStatus.Busy) { busy++; }
+        }
+
+        if (agents != _agentTabCount)
+        {
+            _agentTabCount = agents;
+            OnPropertyChanged(nameof(AgentTabCount));
+        }
+        if (busy != _busyAgentCount)
+        {
+            _busyAgentCount = busy;
+            OnPropertyChanged(nameof(BusyAgentCount));
+        }
+
+        _taskbarBadge?.Apply(busy, agents);
     }
 
     /// <summary>Test-only entry point — production path runs through <c>RaiseStatusBarChanged</c>.</summary>
