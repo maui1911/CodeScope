@@ -5,15 +5,105 @@
 > **Intent:** cursor + last 1–2 sessions in depth, everything else a one-liner.
 > Old detail lives in `git log` — don't duplicate it here.
 
-**Last updated:** 2026-04-29 (session 24)
-**Branch:** `feat/20-clone-from-url` (off `main`); add-project-from-git-url shipped as `f5b39de`.
-**Head:** `f5b39de` — see session 24 below.
+**Last updated:** 2026-04-30 (session 25)
+**Branch:** `iconbubbely` (off `main`); taskbar overlay badge feature, rebased onto `main` after #22 + #23 merged. PR #25 open.
+**Head:** `51229ee` (will bump after this HANDOFF update commits) — see session 25 below.
 **Release:** `v0.1.0` shipped via GitHub Actions — https://github.com/maui1911/CodeScope/releases/tag/v0.1.0
-**Build status:** ✅ `dotnet build` clean. Full solution `dotnet test` 379/379 (Core 233, Ui 129, App 17), modulo two known FSWatcher flakes (`ClaudeSessionDiscoveryTests.Callback_Fires_For_Each_New_Jsonl…` and `PiSessionDiscoveryTests.Discovers_New_Session_File_With_Matching_Cwd`).
-**Uncommitted work:** none beyond this HANDOFF update.
-**Unpushed commits:** entire `feat/20-clone-from-url` branch — spec + plan + 2 implementation commits + this HANDOFF — no PR opened yet.
+**Build status:** ✅ `dotnet build CodeScope.sln` clean. Full solution `dotnet test` 385/385 green (Core 233, Ui 135, App 17), modulo two known FSWatcher flakes (`ClaudeSessionDiscoveryTests.Callback_Fires_For_Each_New_Jsonl…` and `PiSessionDiscoveryTests.Discovers_New_Session_File_With_Matching_Cwd` — pass in isolation).
+**Uncommitted work:** this HANDOFF cursor tweak.
+**Unpushed commits:** `iconbubbely` rebased onto `origin/main` (10 commits, all post-`e1ee4ea`); needs `git push --force-with-lease` because the rebase rewrote SHAs. PR #25 will pick up the new tip automatically.
 
-### Session 24 — Add project from a git URL (#20, shipped in `f5b39de`)
+### Session 25 — taskbar overlay badge (#18, PR #25)
+
+User-visible: the Windows taskbar icon now carries a small overlay that
+reflects aggregate agent activity across the whole app — green dot when ≥1
+agent tab is registered and all idle, red disc with the busy count digit
+otherwise. 10+ busy renders `9` with a small superscript `+` so the badge
+stays one digit wide. No overlay when the workspace has zero agent tabs (or
+only shell tabs). `Description` text is set in parallel for screen readers
+(`"All agents idle"` / `"3 agents working"` / empty). Hand-verified against
+the dev build; user-confirmed the green-idle state and the
+top-right-of-icon position (Windows positions the overlay closest to screen
+content, so a top-of-screen taskbar gets the badge anchored top-right of
+the icon — that placement is Windows-controlled, not configurable).
+
+How:
+
+- New `ITaskbarBadgeService` (UI singleton) owns
+  `Window.TaskbarItemInfo.Overlay` + `.Description` on the active main
+  window. Default impl `TaskbarBadgeService` rasterises a 16×16
+  `BitmapSource` via `DrawingVisual` + `RenderTargetBitmap`: filled disc
+  (radius 7), 1 px contrast ring (radius 7.5, 40 % black) for legibility on
+  light AND dark taskbars, optional centred white digit (Segoe UI Variable,
+  weight 700, em 10) and optional super-scripted "+" (em 6) at top-right.
+  Brushes resolve from theme (`Signal.Ok` / `Signal.Warn`) — same tokens
+  the in-app status dots use; `Brushes.Red` defensive fallback.
+- New `MainViewModel.TaskbarBadge.cs` partial: `BusyAgentCount`,
+  `AgentTabCount` derived properties + private `RecomputeTaskbarBadge`.
+  `IsAgentTab` excludes shell sentinel (case-insensitive); shell-only tabs
+  and soft-closed history rows don't move the badge. The recompute fires
+  from `RaiseStatusBarChanged()` — every per-tab `Status` change and every
+  `Tabs.CollectionChanged` already hits that path, so no new subscriptions.
+  Backing fields initialise to `-1` so the first recompute always fires;
+  subsequent calls early-out via a change flag, so the rasteriser is **not**
+  invoked on token/turn telemetry ticks (fixed in review).
+- DI + XAML wiring in `App.xaml.cs` (singleton registration + ctor arg
+  passthrough to `MainViewModel`) and `MainWindow.xaml` (declares
+  `<TaskbarItemInfo />` once so the property is non-null on first paint).
+
+Files added:
+- `src/CodeScope.Ui/Services/ITaskbarBadgeService.cs`
+- `src/CodeScope.Ui/Services/TaskbarBadgeService.cs`
+- `src/CodeScope.Ui/ViewModels/MainViewModel.TaskbarBadge.cs`
+- `tests/CodeScope.Ui.Tests/MainViewModelTaskbarBadgeTests.cs` — 6 tests:
+  empty workspace, idle agent, 2-busy-of-3, 12-busy raw count, shell
+  exclusion, and a status-flip case that drives the real
+  `HookStatusBarSources → RaiseStatusBarChanged → RecomputeTaskbarBadge`
+  pipeline (not the test bypass). `Apply` rasteriser is hand-verified
+  per project convention (no UI tests).
+
+Files touched:
+- `src/CodeScope.Ui/ViewModels/MainViewModel.cs` — new field + optional
+  `ITaskbarBadgeService? taskbarBadge` ctor param.
+- `src/CodeScope.Ui/ViewModels/MainViewModel.StatusBar.cs` — single
+  `RecomputeTaskbarBadge();` call appended to `RaiseStatusBarChanged()`.
+- `src/CodeScope.App/MainWindow.xaml` — `<ui:FluentWindow.TaskbarItemInfo>`
+  block.
+- `src/CodeScope.App/App.xaml.cs` — singleton registration; new ctor arg
+  on the `MainViewModel` factory.
+
+Spec / plan: `docs/superpowers/specs/2026-04-29-taskbar-overlay-badge-design.md`,
+`docs/superpowers/plans/2026-04-29-taskbar-overlay-badge.md`. Visual mockup
+locked at `scratch/badge-mockup.html` (gitignored — re-render with the
+HTTP-server route in the spec if tweaking the design).
+
+Three review passes (in order), all fed back into the same branch:
+1. Internal review found a perf nit — counts walked `AllTabs` twice per tick
+   and fired `PropertyChanged` on every recompute. Fixed with a single
+   `foreach` and change-only notifications.
+2. `/codex:review` flagged the `StatusFlip_TriggersRecompute` test as
+   verifying the test bypass instead of the production wiring it claimed.
+   Replaced with a version that calls `HookStatusBarSources()` and asserts
+   on the real `PropertyChanged → RaiseStatusBarChanged` pipeline.
+3. GitHub `copilot-pull-request-reviewer` flagged that `Apply()` was firing
+   on every `RaiseStatusBarChanged` tick (incl. token/turn telemetry) even
+   when counts hadn't moved → redundant rasterisation. Fixed by gating
+   `Apply()` behind a change flag inside `RecomputeTaskbarBadge`.
+
+Open follow-ups:
+- **Concern flagged but accepted as design**: `TaskbarBadgeService` resolves
+  `Application.Current.MainWindow` on every call; if the app ever spawns a
+  modal/splash that becomes the foreground window, the badge could be
+  applied to the wrong window. Single-window app today; revisit when adding
+  a real splash screen.
+- **High-DPI `9⁺` legibility** unverified — only exercised at 100 % scaling.
+  If blurry on a 200 %+ taskbar, follow-up is a 32×32 super-sample render
+  (the bitmap stays 16×16 logical; we just render at twice the resolution
+  and let Windows downscale).
+- **Bonus matrix item** (10+ concurrently busy → `9⁺`) not yet hand-tested
+  in production; covered by unit tests but visual-only.
+
+### Session 24 — Add project from a git URL (#20, shipped in `e1ee4ea`)
 
 User-visible: the "Add project" entry-point now opens a `NewProjectDialog`
 with two modes — *Existing folder* (today's behaviour) and *Clone from URL*.
@@ -52,14 +142,6 @@ Files added/touched:
 - `src/CodeScope.Ui/Dialogs/NewProjectDialog.xaml` + `.xaml.cs` (dialog)
 - `src/CodeScope.Ui/ViewModels/SidebarViewModel.cs` + `.Commands.cs` (wiring)
 - `src/CodeScope.App/App.xaml.cs` (registration + named args)
-
-Open follow-ups:
-- Smoke-test the dev build manually before merging the PR — clone a real public
-  repo, a deliberately-bad URL (verify inline error), and a slow clone with
-  Cancel mid-flight (verify partial cleanup). The plan's Task 8 step 5 has the
-  exact recipe.
-- Out of scope (deliberate, can be follow-ups): submodule/shallow/branch options,
-  streaming clone progress (objects/deltas %), credential prompts.
 
 ### Session 23 — pi.dev agent support (committed in `26586d0`)
 

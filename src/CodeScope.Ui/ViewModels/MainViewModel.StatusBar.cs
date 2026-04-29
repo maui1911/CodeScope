@@ -149,6 +149,7 @@ public sealed partial class MainViewModel
         OnPropertyChanged(nameof(StatusTurnsVisible));
         OnPropertyChanged(nameof(StatusTurnDurationText));
         OnPropertyChanged(nameof(StatusTurnDurationVisible));
+        RecomputeTaskbarBadge();
     }
 
     private WorktreeViewModel? ResolveFocusedWorktree()

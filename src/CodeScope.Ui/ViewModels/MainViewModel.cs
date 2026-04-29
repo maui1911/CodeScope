@@ -35,6 +35,7 @@ public sealed partial class MainViewModel : ObservableObject
     private readonly ICopilotTelemetryService? _copilotTelemetry;
     private readonly ICopilotSessionDiscovery? _copilotDiscovery;
     private readonly IIdleToastNotifier? _idleNotifier;
+    private readonly ITaskbarBadgeService? _taskbarBadge;
     private readonly Dictionary<string, ClaudeActivityState> _lastActivity = [];
     // Per-tab discovery watcher — disposed on adoption or tab close.
     private readonly Dictionary<string, IDisposable> _discoveryWatches = [];
@@ -57,7 +58,8 @@ public sealed partial class MainViewModel : ObservableObject
         IOpenCodeSessionDiscovery? opencodeDiscovery = null,
         ICopilotTelemetryService? copilotTelemetry = null,
         ICopilotSessionDiscovery? copilotDiscovery = null,
-        IIdleToastNotifier? idleNotifier = null)
+        IIdleToastNotifier? idleNotifier = null,
+        ITaskbarBadgeService? taskbarBadge = null)
     {
         _sessionManager = sessionManager;
         _store = store;
@@ -76,6 +78,7 @@ public sealed partial class MainViewModel : ObservableObject
         _copilotTelemetry = copilotTelemetry;
         _copilotDiscovery = copilotDiscovery;
         _idleNotifier = idleNotifier;
+        _taskbarBadge = taskbarBadge;
         SessionViewPool = sessionViewPool;
         if (_telemetry is not null) { _telemetry.Updated += OnTelemetryUpdated; }
         // All telemetry backends emit ClaudeSessionTelemetry — same handler routes any source

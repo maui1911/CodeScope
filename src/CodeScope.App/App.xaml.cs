@@ -126,6 +126,8 @@ public partial class App : Application
                 // docs/superpowers/specs/2026-04-26-cross-group-terminal-drag-design.md.
                 services.AddSingleton<NoScope.CodeScope.Ui.Services.ISessionViewHostPool,
                     NoScope.CodeScope.Ui.Services.SessionViewHostPool>();
+                services.AddSingleton<NoScope.CodeScope.Ui.Services.ITaskbarBadgeService,
+                    NoScope.CodeScope.Ui.Services.TaskbarBadgeService>();
                 // Pollers are registered as singletons so the Refresh command can resolve them
                 // from DI; the hosted-service indirection re-uses the same instance.
                 services.AddSingleton<WorktreeStatusPoller>();
@@ -174,7 +176,8 @@ public partial class App : Application
                         sp.GetRequiredService<IOpenCodeSessionDiscovery>(),
                         sp.GetRequiredService<ICopilotTelemetryService>(),
                         sp.GetRequiredService<ICopilotSessionDiscovery>(),
-                        sp.GetRequiredService<NoScope.CodeScope.Ui.Services.IIdleToastNotifier>());
+                        sp.GetRequiredService<NoScope.CodeScope.Ui.Services.IIdleToastNotifier>(),
+                        sp.GetRequiredService<NoScope.CodeScope.Ui.Services.ITaskbarBadgeService>());
                     var sidebar = sp.GetRequiredService<SidebarViewModel>();
                     vm.AttachSidebar(sidebar);
                     var diff = sp.GetRequiredService<DiffPanelViewModel>();
