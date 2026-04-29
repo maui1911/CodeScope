@@ -443,7 +443,9 @@ public sealed partial class MainViewModel : ObservableObject
             return;
         }
 
-        var vm = new SessionTabViewModel(descriptor, project.Id, session.AgentId, session.DisplayName, agent?.Icon);
+        // Tab labels always follow the worktree's current branch (§4); we do not pass
+        // session.DisplayName as an override. Sidebar history rows still honor it.
+        var vm = new SessionTabViewModel(descriptor, project.Id, session.AgentId, displayNameOverride: null, agent?.Icon);
         FocusedGroup.Tabs.Add(vm);
         SelectedTab = vm;
         BeginAgentAdoption(descriptor.Id, agent?.Id, targetFolder, DateTimeOffset.UtcNow);
@@ -769,7 +771,9 @@ public sealed partial class MainViewModel : ObservableObject
         var added = await _store.AddSessionAsync(project.Id, session).ConfigureAwait(true);
         if (added.IsFailure) { _logger.LogWarning("DuplicateTab AddSession: {Error}", added.Error); return; }
 
-        var vm = new SessionTabViewModel(descriptor, project.Id, session.AgentId, session.DisplayName, agent?.Icon);
+        // Tab labels always follow the worktree's current branch (§4); we do not pass
+        // session.DisplayName as an override. Sidebar history rows still honor it.
+        var vm = new SessionTabViewModel(descriptor, project.Id, session.AgentId, displayNameOverride: null, agent?.Icon);
         FocusedGroup.Tabs.Add(vm);
         SelectedTab = vm;
         BeginAgentAdoption(descriptor.Id, agent?.Id, folder, DateTimeOffset.UtcNow);
@@ -997,50 +1001,61 @@ public sealed partial class MainViewModel : ObservableObject
         SelectedTab = tabs[(idx - 1 + tabs.Count) % tabs.Count];
     }
 
-    [RelayCommand]
-    private async Task RenameSessionAsync(SessionTabViewModel? tab)
+    /// <summary>
+    /// Recompute the "Project · branch" label for every tab whose session lives in the given
+    /// worktree. Source of truth is the freshly-mutated <see cref="Worktree.Branch"/> on the
+    /// store — the same value the sidebar reads, which is why the sidebar already kept up while
+    /// the tabs went stale (issue #21).
+    /// </summary>
+    private void RefreshTabTitlesForWorktree(string projectId, string worktreeId)
     {
-        tab ??= SelectedTab;
-        if (tab is null) { return; }
-        var newName = Dialogs.RenameDialog.Prompt(tab.DisplayName);
-        if (newName is null) { return; }
-        await _store.RenameSessionAsync(tab.Descriptor.Id, newName).ConfigureAwait(true);
+        var project = _store.Projects.FirstOrDefault(p => p.Id == projectId);
+        if (project is null) { return; }
+        var worktree = project.Worktrees.FirstOrDefault(w => w.Id == worktreeId);
+        if (worktree is null) { return; }
+
+        var branch = string.IsNullOrWhiteSpace(worktree.Branch)
+            ? (worktree.IsPrimary ? "main" : "(no branch)")
+            : worktree.Branch;
+        var title = $"{project.Name} · {branch}";
+
+        foreach (var tab in AllTabs)
+        {
+            if (tab.ProjectId != projectId) { continue; }
+            var session = project.Sessions.FirstOrDefault(s => s.Id == tab.Descriptor.Id);
+            if (session?.WorktreeId != worktreeId) { continue; }
+            tab.DisplayName = title;
+        }
     }
 
     private void OnStoreChanged(object? sender, SessionStoreChange change)
     {
         void Apply()
         {
-            // SessionAdded/SessionRenamed are intentionally not handled here. Tab membership is owned by
-            // MainViewModel — NewSessionAsync, DuplicateTabAsync, TryRestoreSessionAsync, and
+            // SessionAdded/SessionRenamed/Soft-close are intentionally not handled here. Tab membership is
+            // owned by MainViewModel — NewSessionAsync, DuplicateTabAsync, TryRestoreSessionAsync, and
             // RestoreClosedWorktreeSessionsAsync each add their VM directly to FocusedGroup.Tabs and the
-            // store mutation is the side-effect, not the source of truth. The sidebar projection
-            // (SidebarViewModel.StoreSync) consumes those events for its own tree.
+            // store mutation is the side-effect, not the source of truth. SessionRenamed is also ignored:
+            // tab titles always follow the worktree's current branch (§4), so any manual rename done
+            // through the sidebar (closed-session history) only affects the sidebar label. The sidebar
+            // projection (SidebarViewModel.StoreSync) consumes the rename event for its own tree.
             switch (change)
             {
                 case SessionStoreChange.Loaded loaded:
                     HydrateFromLoaded(loaded);
                     break;
-                case SessionStoreChange.SessionRenamed renamed:
-                    var t = AllTabs.FirstOrDefault(x => x.Descriptor.Id == renamed.SessionId);
-                    if (t is not null)
-                    {
-                        t.DisplayName = renamed.NewName ?? t.Descriptor.Title;
-                    }
-                    break;
                 case SessionStoreChange.WorktreeStatusUpdated wtStatus:
-                    // Reflect dirty state on tab titles bound to this worktree.
-                    foreach (var tab in AllTabs)
-                    {
-                        var p = _store.Projects.FirstOrDefault(x => x.Id == tab.ProjectId);
-                        var session = p?.Sessions.FirstOrDefault(s => s.Id == tab.Descriptor.Id);
-                        if (session?.WorktreeId != wtStatus.WorktreeId) { continue; }
-
-                        // Top-bar spec §4: tab label is just "Project · branch". Dirty state
-                        // is carried by the sidebar ("chg" slug) and the status dot — no glyph
-                        // suffixing the title.
-                        tab.DisplayName = tab.Descriptor.Title;
-                    }
+                    // Branch can change underneath us — `git checkout other`, `git branch -m`, or the
+                    // status poll picking up an externally-renamed branch — so we recompute the
+                    // "Project · branch" label every time. Top-bar spec §4: dirty state is carried by
+                    // the sidebar dot, not by the tab label.
+                    RefreshTabTitlesForWorktree(wtStatus.ProjectId, wtStatus.WorktreeId);
+                    break;
+                case SessionStoreChange.WorktreeRenamed wtRenamed:
+                    // Worktree path rename doesn't usually shift the branch, but the project name we
+                    // splice into the title might be derived from the worktree, and a fresh recompute
+                    // is cheap.
+                    RefreshTabTitlesForWorktree(wtRenamed.ProjectId, wtRenamed.WorktreeId);
                     break;
                 case SessionStoreChange.SessionRemoved removed:
                     foreach (var g in Groups)
@@ -1113,7 +1128,7 @@ public sealed partial class MainViewModel : ObservableObject
                     descriptor = descriptor with { Title = $"{p.Name} · {branch}" };
                 }
 
-                var vm = new SessionTabViewModel(descriptor, p.Id, s.AgentId, s.DisplayName);
+                var vm = new SessionTabViewModel(descriptor, p.Id, s.AgentId, displayNameOverride: null);
                 var targetIdx = 0;
                 if (_pendingSessionToGroup is not null
                     && _pendingSessionToGroup.TryGetValue(s.Id, out var saved)
