@@ -4,7 +4,7 @@ namespace NoScope.CodeScope.Core.Services;
 
 /// <summary>
 /// In-memory registry backed by a list passed at construction time.
-/// Built defaults cover Claude Code, Codex and OpenCode.
+/// Built defaults cover Claude Code, Codex, OpenCode, Copilot CLI and Pi.
 /// </summary>
 public sealed class AgentRegistry : IAgentRegistry
 {
@@ -79,6 +79,22 @@ public sealed class AgentRegistry : IAgentRegistry
             SessionIdFlag = null,
             ResumeByIdArgs = ["--session"],
             Icon = "◈",
+        },
+        new AgentProfile
+        {
+            Id = "copilot",
+            DisplayName = "Copilot CLI",
+            Command = "copilot",
+            // `copilot --continue` resumes the most recent session.
+            // `copilot --resume=<id>` resumes a specific session by UUID / name / id-prefix.
+            // The `=` suffix on the last ResumeByIdArgs entry tells SessionManager to concat
+            // the id directly (Copilot's optional-value flag requires `=` syntax, not a space).
+            // SessionIdFlag stays null — Copilot mints its own ids; callers don't supply them.
+            ResumeArgs = ["--continue"],
+            NewSessionArgs = [],
+            SessionIdFlag = null,
+            ResumeByIdArgs = ["--resume="],
+            Icon = "⊛",
         },
         new AgentProfile
         {

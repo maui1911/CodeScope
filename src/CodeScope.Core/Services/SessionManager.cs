@@ -62,11 +62,15 @@ public sealed class SessionManager : ISessionManager
         //   fresh + agentSessionId + SessionIdFlag  →  "<flag> <uuid>" + NewSessionArgs
         //   resume + agentSessionId + ResumeByIdArgs →  ResumeByIdArgs + "<uuid>"
         //   else                                    →  ResumeArgs / NewSessionArgs verbatim
+        //
+        // When the last entry in ResumeByIdArgs ends with '=' (e.g. "--resume=") the id is
+        // concatenated directly instead of appended as a separate arg. This covers CLIs
+        // like Copilot whose optional-value flags require the `=` syntax.
         IReadOnlyList<string> argList;
         if (resume)
         {
             argList = agentSessionId is { Length: > 0 } rid && agent.ResumeByIdArgs.Count > 0
-                ? [.. agent.ResumeByIdArgs, rid]
+                ? JoinResumeByIdArgs(agent.ResumeByIdArgs, rid)
                 : agent.ResumeArgs;
         }
         else
@@ -119,6 +123,26 @@ public sealed class SessionManager : ISessionManager
     /// </summary>
     private static string Quote(string value) =>
         value.Length > 0 && value[0] == '"' ? value : $"\"{value}\"";
+
+    /// <summary>
+    /// Combines <paramref name="resumeByIdArgs"/> with <paramref name="sessionId"/>.
+    /// When the last element ends with <c>=</c> the id is concatenated directly
+    /// (e.g. <c>["--resume="]</c> + <c>"abc"</c> → <c>["--resume=abc"]</c>).
+    /// Otherwise the id is appended as a separate arg.
+    /// </summary>
+    private static IReadOnlyList<string> JoinResumeByIdArgs(IReadOnlyList<string> resumeByIdArgs, string sessionId)
+    {
+        var last = resumeByIdArgs[^1];
+        if (last.EndsWith('='))
+        {
+            var result = new List<string>(resumeByIdArgs.Count);
+            for (var i = 0; i < resumeByIdArgs.Count - 1; i++)
+                result.Add(resumeByIdArgs[i]);
+            result.Add($"{last}{sessionId}");
+            return result;
+        }
+        return [.. resumeByIdArgs, sessionId];
+    }
 
     private static string ResolveShell()
     {

@@ -176,4 +176,24 @@ public sealed class SessionManagerTests
         payload.Should().NotContain("--session-id");
         payload.Should().NotContain("ignored-because-no-flag");
     }
+
+    [Fact]
+    public void CreateAgentSession_Resume_With_EqualsSuffix_Concatenates_Id()
+    {
+        var manager = new SessionManager(NullLogger<SessionManager>.Instance);
+        var agent = new NoScope.CodeScope.Core.Models.AgentProfile
+        {
+            Id = "copilot", DisplayName = "Copilot CLI", Command = "copilot",
+            ResumeArgs = ["--continue"],
+            ResumeByIdArgs = ["--resume="],
+        };
+        var uuid = "0cb916db-26aa-40f2-86b5-1ba81b225fd2";
+
+        var d = manager.CreateAgentSession(Path.GetTempPath(), agent, resume: true, agentSessionId: uuid);
+
+        var payload = string.Join(' ', d.ShellArgs);
+        // Must produce "--resume=<id>" (concatenated), NOT "--resume= <id>" (space-separated).
+        payload.Should().Contain($"--resume={uuid}");
+        payload.Should().NotContain("--continue");
+    }
 }

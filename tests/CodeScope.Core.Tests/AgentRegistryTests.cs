@@ -6,12 +6,12 @@ namespace NoScope.CodeScope.Core.Tests;
 public sealed class AgentRegistryTests
 {
     [Fact]
-    public void Default_Set_Includes_Claude_Codex_Opencode_Pi()
+    public void Default_Set_Includes_Claude_Codex_Opencode_Copilot_Pi()
     {
         var registry = new AgentRegistry();
 
         var ids = registry.GetAll().Select(a => a.Id).ToList();
-        ids.Should().Contain(["claude", "codex", "opencode", "pi"]);
+        ids.Should().Contain(["claude", "codex", "opencode", "copilot", "pi"]);
     }
 
     [Fact]
@@ -23,6 +23,17 @@ public sealed class AgentRegistryTests
         pi.ResumeByIdArgs.Should().BeEquivalentTo(["--session"]);
         pi.SessionIdFlag.Should().BeNull();
         pi.IsDefault.Should().BeFalse();
+    }
+
+    [Fact]
+    public void Copilot_Profile_Has_Resume_Continue_And_EqualsSyntax()
+    {
+        var copilot = new AgentRegistry().GetById("copilot")!;
+        copilot.Command.Should().Be("copilot");
+        copilot.ResumeArgs.Should().BeEquivalentTo(["--continue"]);
+        copilot.ResumeByIdArgs.Should().BeEquivalentTo(["--resume="]);
+        copilot.SessionIdFlag.Should().BeNull();
+        copilot.IsDefault.Should().BeFalse();
     }
 
     [Fact]
@@ -76,7 +87,7 @@ public sealed class AgentRegistryTests
     public void FromConfig_Empty_Falls_Back_To_Defaults()
     {
         var registry = AgentRegistry.FromConfig(new ProjectsConfig());
-        registry.GetAll().Select(a => a.Id).Should().Contain(["claude", "codex", "opencode", "pi"]);
+        registry.GetAll().Select(a => a.Id).Should().Contain(["claude", "codex", "opencode", "copilot", "pi"]);
     }
 
     [Fact]
