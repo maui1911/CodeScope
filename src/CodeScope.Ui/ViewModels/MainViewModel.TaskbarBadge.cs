@@ -10,8 +10,8 @@ namespace NoScope.CodeScope.Ui.ViewModels;
 /// </summary>
 public sealed partial class MainViewModel
 {
-    private int _busyAgentCount;
-    private int _agentTabCount;
+    private int _busyAgentCount = -1;
+    private int _agentTabCount = -1;
 
     public int BusyAgentCount => _busyAgentCount;
     public int AgentTabCount => _agentTabCount;
@@ -31,18 +31,21 @@ public sealed partial class MainViewModel
             if (tab.Status == TabStatus.Busy) { busy++; }
         }
 
+        var changed = false;
         if (agents != _agentTabCount)
         {
             _agentTabCount = agents;
             OnPropertyChanged(nameof(AgentTabCount));
+            changed = true;
         }
         if (busy != _busyAgentCount)
         {
             _busyAgentCount = busy;
             OnPropertyChanged(nameof(BusyAgentCount));
+            changed = true;
         }
 
-        _taskbarBadge?.Apply(busy, agents);
+        if (changed) { _taskbarBadge?.Apply(busy, agents); }
     }
 
     /// <summary>Test-only entry point — production path runs through <c>RaiseStatusBarChanged</c>.</summary>
