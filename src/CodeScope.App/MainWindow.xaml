@@ -79,6 +79,9 @@
         </Style>
     </ui:FluentWindow.Resources>
 
+    <ui:FluentWindow.TaskbarItemInfo>
+        <TaskbarItemInfo />
+    </ui:FluentWindow.TaskbarItemInfo>
 
     <ui:FluentWindow.InputBindings>
         <KeyBinding Key="T" Modifiers="Control" Command="{Binding NewSessionCommand}" />
