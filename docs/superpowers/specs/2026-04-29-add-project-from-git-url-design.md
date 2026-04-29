@@ -13,11 +13,12 @@ Today the only way to add a project is to point CodeScope at an existing local f
 In:
 - A new `NewProjectDialog` with two modes: *Existing folder* (current behaviour) and *Clone from URL*.
 - A `git clone` shell-out on `IGitService`.
-- `SidebarViewModel.AddProjectAsync` rewired through the dialog; clone failures abort cleanly.
+- An inline busy state inside the dialog (spinner + "Cloning…") so the user sees progress on big repos.
+- `SidebarViewModel.AddProjectAsync` rewired through the dialog; clone failures surface inline.
 
 Out (YAGNI):
 - Auth prompts — rely on the OS git credential manager (same as every other git op in the app).
-- Streaming clone progress / cancellation — single shell-out + toast lifecycle, like `FetchAllAsync`.
+- Streaming clone progress (objects/deltas %) — an indeterminate spinner is enough for the "is it still working?" question. Real progress would need parsing `--progress` output on a separate stderr pump.
 - Submodule / shallow / branch / sparse options — can be added later if requested.
 
 ## UX
@@ -32,6 +33,15 @@ The "+" button (and the empty-state CTA) opens `NewProjectDialog`:
   - **Folder name** — text input. Auto-derived from the URL's repo segment on URL change (strip trailing `.git`); user-editable; must not already exist under the chosen parent.
 - "Add" is disabled until the active mode validates.
 
+When the user clicks **Add** in *Clone from URL* mode the dialog stays open and switches to a **busy state**:
+
+- Inputs and the mode toggle are disabled.
+- "Add" is replaced by an indeterminate spinner (`ProgressBar IsIndeterminate="True"`) plus the caption *"Cloning &lt;repo&gt;…"*.
+- "Cancel" stays enabled and aborts the clone via `CancellationToken` (kills the `git` process); the dialog returns to the editable state.
+- On success, the dialog closes with the result. On failure, the dialog returns to the editable state and renders the git error inline beneath the URL field — no toast, since the user is still looking at the dialog.
+
+*Existing folder* mode never shows the busy state; the dialog closes immediately and the store call is fast.
+
 Drag-drop of a folder onto the sidebar keeps using `AddProjectByPathAsync` — that path is unchanged.
 
 ## Components
@@ -42,18 +52,18 @@ Drag-drop of a folder onto the sidebar keeps using `AddProjectByPathAsync` — t
 public sealed record NewProjectRequest(string DefaultCloneParent);
 
 public sealed record NewProjectResult(
-    string? ExistingFolder,        // set when mode == Existing
-    string? CloneUrl,              // set when mode == Clone
-    string? CloneParent,
-    string? CloneFolderName);
+    string? ExistingFolder,   // set when user picked "Existing folder"
+    string? ClonedPath,       // set when the dialog successfully cloned
+    bool WasCloned);
 ```
 
-Exactly one of `ExistingFolder` or `CloneUrl` is non-null — the dialog's caller switches on which.
+Exactly one of `ExistingFolder` or `ClonedPath` is non-null. `WasCloned` is just for the caller's success-toast wording.
 
 ### `NewProjectDialog` (`Dialogs/NewProjectDialog.xaml[.cs]`)
 
-- Hosted in `App.xaml.cs` via a `Func<NewProjectRequest, NewProjectResult?> PickNewProject` delegate, registered alongside `PickFolder` and `PickNewWorktree`.
+- Hosted in `App.xaml.cs` via a `Func<NewProjectRequest, Task<NewProjectResult?>> PickNewProject` delegate, registered alongside `PickFolder` and `PickNewWorktree`. Async because the dialog awaits the clone before returning.
 - Reuses the existing folder-picker (the dialog accepts a `Func<string?> pickFolder` ctor argument so the WPF folder dialog stays in `App`).
+- Accepts an `IGitService gitService` ctor argument so the busy state can drive `CloneAsync` directly. The dialog owns the `CancellationTokenSource` for the clone — Cancel cancels it; closing the window cancels it.
 - Dialog styling follows `NewWorktreeDialog` (same shell, same buttons, same window-chrome treatment).
 
 ### `IGitService.CloneAsync`
@@ -71,20 +81,19 @@ Implementation: `git -C <parentDir> clone -- <url> <folderName>`, then return `P
 ### `SidebarViewModel.AddProjectAsync`
 
 ```
-result = _pickNewProject(new NewProjectRequest(DefaultCloneParent()))
-if result is null: return
+result = await _pickNewProject(new NewProjectRequest(DefaultCloneParent()))
+if result is null: return  // user cancelled
 
-if result.ExistingFolder is set:
-    _store.AddProjectAsync(result.ExistingFolder, displayName: null)
-else:
-    Toast("Cloning…", "<url>", ToastSeverity.Info)
-    cloned = await _git.CloneAsync(result.CloneUrl!, result.CloneParent!, result.CloneFolderName!)
-    if cloned.IsFailure:
-        ErrToast("Clone failed", cloned.Error, retry: () => AddProjectAsync())
-        return
-    _store.AddProjectAsync(cloned.Value, displayName: null)
-    Toast("Project cloned", folderName, ToastSeverity.Ok)
+// Clone (if any) already ran inside the dialog — result carries the resolved local path.
+var path = result.ExistingFolder ?? result.ClonedPath!
+var add = await _store.AddProjectAsync(path, displayName: null)
+if add.IsFailure:
+    ErrToast(result.WasCloned ? "Clone added but project add failed" : "Add project failed", add.Error)
+else if result.WasCloned:
+    Toast("Project cloned", add.Value.Name, ToastSeverity.Ok)
 ```
+
+`NewProjectResult` therefore carries the resolved local path (`ClonedPath` set after a successful clone) plus a `WasCloned` flag for the success-toast wording. The dialog is the only place that calls `IGitService.CloneAsync`.
 
 `DefaultCloneParent()` reads the most-recent project's parent off `_store.Projects`; falls back to `%USERPROFILE%\source\repos`.
 
@@ -104,8 +113,9 @@ Validation errors render inline under the offending field; "Add" stays disabled.
 
 ## Error handling
 
-- Clone failure → `ErrToast` with git's stderr text. The dialog has already closed; offering a retry that re-opens the dialog with the same inputs is overkill — the toast's "retry" simply re-runs `AddProjectAsync()` (re-opens an empty dialog), matching existing patterns.
-- If clone succeeds but `AddProjectAsync` fails (duplicate path, etc.) → log + toast; the clone is left on disk for the user to inspect.
+- Clone failure → dialog returns to editable state with git's stderr rendered inline beneath the URL field. User can edit and retry without re-typing anything. No toast.
+- Clone cancellation → dialog returns to editable state silently. The partially-cloned target directory is removed on a best-effort basis (`Directory.Delete(target, recursive: true)` swallowed) so a retry isn't blocked by the "target exists" check.
+- If clone succeeds but `_store.AddProjectAsync` fails (duplicate path, etc.) → toast + log; the clone is left on disk for the user to inspect.
 
 ## Tests (Core only, per project convention)
 
@@ -114,6 +124,7 @@ Validation errors render inline under the offending field; "Add" stays disabled.
 1. **Happy path** — `git init --bare` a local source, clone it via `CloneAsync`, assert `Result.IsSuccess` and that the returned path is a valid worktree (`HEAD` exists).
 2. **Target already exists** — pre-create the target directory, expect `Result.Failure`.
 3. **Invalid URL** — pass garbage, expect `Result.Failure` with non-empty error text.
+4. **Cancellation** — start a clone with an already-cancelled token, expect `Result.Failure` and no orphan target directory.
 
 No UI/dialog tests — same posture as `NewWorktreeDialog`.
 
