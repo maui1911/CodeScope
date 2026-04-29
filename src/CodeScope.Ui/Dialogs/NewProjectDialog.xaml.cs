@@ -1,7 +1,9 @@
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Input;
+using System.Windows.Media;
 using NoScope.CodeScope.Core;
 using NoScope.CodeScope.Core.Services;
 
@@ -116,7 +118,8 @@ public partial class NewProjectDialog : Window
             || u.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
             || u.StartsWith("ssh://", StringComparison.OrdinalIgnoreCase))
         {
-            return u.Length > 8;
+            var afterScheme = u.IndexOf("://", StringComparison.Ordinal) + 3;
+            return afterScheme < u.Length;
         }
         if (u.StartsWith("git@", StringComparison.OrdinalIgnoreCase))
         {
@@ -132,15 +135,17 @@ public partial class NewProjectDialog : Window
         if (IsCloneMode)
         {
             var urlOk = IsValidGitUrl(UrlBox.Text);
-            var parentOk = !string.IsNullOrWhiteSpace(ParentBox.Text) && Directory.Exists(ParentBox.Text);
-            var nameOk = !string.IsNullOrWhiteSpace(NameBox.Text)
-                && NameBox.Text.IndexOfAny(Path.GetInvalidFileNameChars()) < 0;
+            var parent = ParentBox.Text?.Trim() ?? string.Empty;
+            var name = NameBox.Text?.Trim() ?? string.Empty;
+            var parentOk = !string.IsNullOrWhiteSpace(parent) && Directory.Exists(parent);
+            var nameOk = !string.IsNullOrWhiteSpace(name)
+                && name.IndexOfAny(Path.GetInvalidFileNameChars()) < 0;
             AddBtn.IsEnabled = urlOk && parentOk && nameOk;
 
             // Footer summary — empty values render as "…" placeholders.
-            var url = string.IsNullOrWhiteSpace(UrlBox.Text) ? "…" : UrlBox.Text.Trim();
-            var name = string.IsNullOrWhiteSpace(NameBox.Text) ? "…" : NameBox.Text.Trim();
-            FootMeta.Text = $"git clone · {url} → {name}";
+            var urlDisplay = string.IsNullOrWhiteSpace(UrlBox.Text) ? "…" : UrlBox.Text.Trim();
+            var nameDisplay = string.IsNullOrEmpty(name) ? "…" : name;
+            FootMeta.Text = $"git clone · {urlDisplay} → {nameDisplay}";
         }
         else
         {
@@ -177,7 +182,7 @@ public partial class NewProjectDialog : Window
 
         if (!IsCloneMode)
         {
-            _result = new NewProjectResult(ExistingFolder: ExistingPathBox.Text.Trim(), ClonedPath: null, WasCloned: false);
+            _result = new NewProjectResult(ExistingFolder: ExistingPathBox.Text.Trim(), ClonedPath: null);
             DialogResult = true;
             Close();
             return;
@@ -201,6 +206,14 @@ public partial class NewProjectDialog : Window
         {
             result = await _git.CloneAsync(url, parent, name, _cloneCts.Token).ConfigureAwait(true);
         }
+        catch (OperationCanceledException)
+        {
+            _cloneCts.Dispose();
+            _cloneCts = null;
+            TryDeleteDir(target);
+            SetBusy(false, null);
+            return; // silent return to editable state
+        }
         // Broad catch is intentional: OnAdd is async void (WPF event handler),
         // so an uncaught exception here would crash the AppDomain.
         catch (Exception ex)
@@ -209,13 +222,13 @@ public partial class NewProjectDialog : Window
         }
         finally
         {
-            _cloneCts.Dispose();
+            _cloneCts?.Dispose();
             _cloneCts = null;
         }
 
         if (result.IsSuccess)
         {
-            _result = new NewProjectResult(ExistingFolder: null, ClonedPath: result.Value, WasCloned: true);
+            _result = new NewProjectResult(ExistingFolder: null, ClonedPath: result.Value);
             DialogResult = true;
             Close();
             return;
@@ -242,7 +255,27 @@ public partial class NewProjectDialog : Window
 
     private void OnChromeDrag(object sender, MouseButtonEventArgs e)
     {
-        if (e.ChangedButton == MouseButton.Left) { DragMove(); }
+        if (e.ChangedButton != MouseButton.Left) { return; }
+        if (e.OriginalSource is DependencyObject d && IsInInteractive(d)) { return; }
+        DragMove();
+    }
+
+    private static bool IsInInteractive(DependencyObject node)
+    {
+        for (var cur = node; cur is not null; cur = VisualTreeHelper.GetParent(cur))
+        {
+            if (cur is TextBox or Button or Popup or ListBox or ListBoxItem) { return true; }
+        }
+        return false;
+    }
+
+    protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
+    {
+        if (_cloneCts is { } cts)
+        {
+            try { cts.Cancel(); } catch { }
+        }
+        base.OnClosing(e);
     }
 
     private void SetBusy(bool busy, string? text)

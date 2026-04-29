@@ -141,7 +141,6 @@ public partial class App : Application
                     return new SidebarViewModel(
                         store: sp.GetRequiredService<ISessionStore>(),
                         logger: sp.GetRequiredService<ILogger<SidebarViewModel>>(),
-                        pickFolder: PickFolder,
                         pickNewWorktree: PickNewWorktree,
                         pickNewProject: PickNewProject,
                         pullRequests: sp.GetRequiredService<IPullRequestService>(),

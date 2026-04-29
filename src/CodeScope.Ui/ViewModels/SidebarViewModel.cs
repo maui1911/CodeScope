@@ -24,14 +24,12 @@ public sealed partial class SidebarViewModel : ObservableObject
     private readonly IAgentRegistry? _agents;
     private readonly IGitService? _git;
     private readonly ILogger<SidebarViewModel> _logger;
-    private readonly Func<string?> _pickFolder;
     private readonly Func<NewWorktreeRequest, NewWorktreeResult?> _pickNewWorktree;
     private readonly Func<NewProjectRequest, Task<NewProjectResult?>> _pickNewProject;
 
     public SidebarViewModel(
         ISessionStore store,
         ILogger<SidebarViewModel> logger,
-        Func<string?>? pickFolder = null,
         Func<NewWorktreeRequest, NewWorktreeResult?>? pickNewWorktree = null,
         Func<NewProjectRequest, Task<NewProjectResult?>>? pickNewProject = null,
         IPullRequestService? pullRequests = null,
@@ -45,7 +43,6 @@ public sealed partial class SidebarViewModel : ObservableObject
         _agents = agents;
         _git = git;
         _logger = logger;
-        _pickFolder = pickFolder ?? (() => null);
         _pickNewWorktree = pickNewWorktree ?? (_ => null);
         _pickNewProject = pickNewProject ?? (_ => Task.FromResult<NewProjectResult?>(null));
         Projects = [];

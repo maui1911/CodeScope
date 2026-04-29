@@ -29,7 +29,7 @@ The "+" button (and the empty-state CTA) opens `NewProjectDialog`:
 - *Existing folder* mode: a single "Browse…" button → standard folder picker. Mirrors today's flow exactly.
 - *Clone from URL* mode shows three fields:
   - **Git URL** — text input. Validated against `https?://…`, `ssh://…`, or SCP-style `git@host:owner/repo.git`.
-  - **Parent folder** — read-only text + "Browse…" button. Defaults to the parent of the most recently added project (read off `IProjectStore`); falls back to `%USERPROFILE%\source\repos`.
+  - **Parent folder** — editable text input + "Browse…" button. Defaults to the parent of the most recently added project (read off `IProjectStore`); falls back to `%USERPROFILE%\source\repos`.
   - **Folder name** — text input. Auto-derived from the URL's repo segment on URL change (strip trailing `.git`); user-editable; must not already exist under the chosen parent.
 - "Add" is disabled until the active mode validates.
 
@@ -101,11 +101,7 @@ The drag-drop helper `AddProjectByPathAsync` and the palette command are not tou
 
 ## Validation rules
 
-- **URL:** non-empty, trimmed; matches one of:
-  - `^https?://\S+`
-  - `^ssh://\S+`
-  - `^git@\S+:\S+`
-  Anything else → "Enter a valid git URL".
+- **URL:** non-empty, trimmed; must match a supported scheme (http(s)://, ssh://, git@host:owner/repo). Invalid URLs disable the Add button; there is no dedicated inline error message — malformed or unreachable URLs that pass the basic scheme check are surfaced by the clone attempt itself.
 - **Parent folder:** must exist and be writable.
 - **Folder name:** non-empty, no `\\`/`/`, no path-invalid chars, and `Path.Combine(parent, name)` must not exist (or must be an empty directory — git refuses non-empty targets anyway, so we mirror that).
 
@@ -114,7 +110,7 @@ Validation errors render inline under the offending field; "Add" stays disabled.
 ## Error handling
 
 - Clone failure → dialog returns to editable state with git's stderr rendered inline beneath the URL field. User can edit and retry without re-typing anything. No toast.
-- Clone cancellation → dialog returns to editable state silently. The partially-cloned target directory is removed on a best-effort basis (`Directory.Delete(target, recursive: true)` swallowed) so a retry isn't blocked by the "target exists" check.
+- Clone cancellation → dialog returns to editable state silently. The partially-cloned target directory is removed on a best-effort basis.
 - If clone succeeds but `_store.AddProjectAsync` fails (duplicate path, etc.) → toast + log; the clone is left on disk for the user to inspect.
 
 ## Tests (Core only, per project convention)

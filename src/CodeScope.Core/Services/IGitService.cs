@@ -75,10 +75,12 @@ public interface IGitService
 
     /// <summary>
     /// Runs <c>git -C &lt;parentDir&gt; clone -- &lt;url&gt; &lt;folderName&gt;</c>. Returns the
-    /// absolute path of the resulting working tree on success. Fails verbatim with git's stderr
+    /// absolute path of the resulting working tree on success. Returns a failure message that
+    /// includes git's stderr (formatted by ProcessRunner, not raw stderr verbatim)
     /// on auth errors, network errors, "destination already exists", etc. Cancellation kills
-    /// the git process; partially-cloned target directories are NOT auto-removed by this method
-    /// (callers can clean up if they want — see <c>NewProjectDialog</c> for the pattern).
+    /// the git process tree via ProcessRunner; partially-cloned target directories are NOT
+    /// auto-removed by this method (callers can clean up if they want — see
+    /// <c>NewProjectDialog</c> for the pattern).
     /// </summary>
     Task<Result<string>> CloneAsync(string url, string parentDir, string folderName, CancellationToken ct = default);
 

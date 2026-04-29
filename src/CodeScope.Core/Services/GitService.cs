@@ -220,12 +220,22 @@ public sealed class GitService : IGitService
             return Result<string>.Fail("Folder name is empty");
         }
 
+        if (folderName.Contains(Path.DirectorySeparatorChar) || folderName.Contains(Path.AltDirectorySeparatorChar) || folderName is ".." or ".")
+        {
+            return Result<string>.Fail($"Folder name must be a single directory name, not a path: {folderName}");
+        }
+
         if (!Directory.Exists(parentDir))
         {
             return Result<string>.Fail($"Parent directory does not exist: {parentDir}");
         }
 
-        var target = Path.Combine(parentDir, folderName);
+        var target = Path.GetFullPath(Path.Combine(parentDir, folderName));
+        if (!target.StartsWith(Path.GetFullPath(parentDir) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+        {
+            return Result<string>.Fail($"Folder name resolves outside parent directory: {folderName}");
+        }
+
         if (Directory.Exists(target) && Directory.EnumerateFileSystemEntries(target).Any())
         {
             return Result<string>.Fail($"Destination already exists and is not empty: {target}");
