@@ -45,7 +45,9 @@ public sealed class CopilotTelemetryServiceTests : IDisposable
         snap.Should().NotBeNull();
         snap!.SessionId.Should().Be(sid);
         snap.TurnCount.Should().Be(1);
-        snap.ContextTokens.Should().Be(150);
+        // Copilot doesn't expose accurate per-turn context usage, so we deliberately leave
+        // ContextTokens at 0 — the status bar hides the token cell when it's 0.
+        snap.ContextTokens.Should().Be(0);
         snap.Activity.Should().Be(ClaudeActivityState.Idle);
         snap.ModelId.Should().Be("claude-opus-4.6");
     }
@@ -96,7 +98,7 @@ public sealed class CopilotTelemetryServiceTests : IDisposable
     }
 
     [Fact]
-    public void Shutdown_Event_Updates_ContextTokens()
+    public void Shutdown_Event_Leaves_ContextTokens_Hidden()
     {
         var sid = Guid.NewGuid().ToString();
         var dir = Path.Combine(_root, sid);
@@ -113,8 +115,9 @@ public sealed class CopilotTelemetryServiceTests : IDisposable
         _sut.Register(sid, @"d:\test");
         var snap = _sut.GetSnapshot(sid);
         snap.Should().NotBeNull();
-        // Shutdown's currentTokens replaces accumulated outputTokens.
-        snap!.ContextTokens.Should().Be(27417);
+        // Shutdown carries currentTokens, but we deliberately don't surface it: by then the
+        // session is over, and during the session we have no accurate live count anyway.
+        snap!.ContextTokens.Should().Be(0);
         snap.Activity.Should().Be(ClaudeActivityState.Idle);
     }
 

@@ -183,9 +183,11 @@ public sealed class CopilotTelemetryService : ICopilotTelemetryService
 
                             if (entry.OutputTokens > 0)
                             {
-                                // Copilot only provides outputTokens per assistant.message.
-                                // Accumulate across the session for the status bar.
-                                contextTokens += entry.OutputTokens;
+                                // Copilot only exposes outputTokens per assistant.message — no input
+                                // or cache breakdown until session.shutdown — so a running sum is a
+                                // misleading "context used" indicator. Track turn count and timing
+                                // (still useful) but leave contextTokens at 0 so the status bar
+                                // hides the token cell entirely for Copilot sessions.
                                 turns += 1;
                                 if (entry.Timestamp is { } ts)
                                 {
@@ -218,12 +220,9 @@ public sealed class CopilotTelemetryService : ICopilotTelemetryService
                             break;
 
                         case "session.shutdown":
-                            // Extract full usage from shutdown event for accurate final token counts.
-                            var shutdown = CopilotTranscriptParser.ParseShutdownUsage(line);
-                            if (shutdown is not null && shutdown.CurrentTokens > 0)
-                            {
-                                contextTokens = shutdown.CurrentTokens;
-                            }
+                            // Copilot exposes a real currentTokens here, but by the time shutdown
+                            // fires the session is gone — surfacing it in the status bar at that
+                            // moment is noise. Keep contextTokens at 0; the cell stays hidden.
                             activity = ClaudeActivityState.Idle;
                             changed = true;
                             break;
