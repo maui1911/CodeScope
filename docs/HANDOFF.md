@@ -7,11 +7,11 @@
 
 **Last updated:** 2026-04-30 (session 25)
 **Branch:** `iconbubbely` (off `main`); taskbar overlay badge feature, rebased onto `main` after #22 + #23 merged. PR #25 open.
-**Head:** see session 25 — head SHA bumps after the rebase + remaining review-fix commits replay.
+**Head:** `51229ee` (will bump after this HANDOFF update commits) — see session 25 below.
 **Release:** `v0.1.0` shipped via GitHub Actions — https://github.com/maui1911/CodeScope/releases/tag/v0.1.0
-**Build status:** ✅ `dotnet build CodeScope.sln` clean. Full solution `dotnet test` ~385 green (Core 233 inc. clone tests; Ui 135 — 129 pre-rebase + 6 new in `MainViewModelTaskbarBadgeTests`; App 17), modulo two known FSWatcher flakes (`ClaudeSessionDiscoveryTests.Callback_Fires_For_Each_New_Jsonl…` and `PiSessionDiscoveryTests.Discovers_New_Session_File_With_Matching_Cwd` — pass in isolation).
-**Uncommitted work:** this HANDOFF entry.
-**Unpushed commits:** `iconbubbely` rebased onto `origin/main`; needs `git push --force-with-lease` after the rebase finishes and tests confirm green. PR #25 will pick up the new tip.
+**Build status:** ✅ `dotnet build CodeScope.sln` clean. Full solution `dotnet test` 385/385 green (Core 233, Ui 135, App 17), modulo two known FSWatcher flakes (`ClaudeSessionDiscoveryTests.Callback_Fires_For_Each_New_Jsonl…` and `PiSessionDiscoveryTests.Discovers_New_Session_File_With_Matching_Cwd` — pass in isolation).
+**Uncommitted work:** this HANDOFF cursor tweak.
+**Unpushed commits:** `iconbubbely` rebased onto `origin/main` (10 commits, all post-`e1ee4ea`); needs `git push --force-with-lease` because the rebase rewrote SHAs. PR #25 will pick up the new tip automatically.
 
 ### Session 25 — taskbar overlay badge (#18, PR #25)
 
