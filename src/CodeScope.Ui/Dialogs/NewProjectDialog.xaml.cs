@@ -13,6 +13,7 @@ public partial class NewProjectDialog : Window
     private readonly IGitService _git;
     private CancellationTokenSource? _cloneCts;
     private NewProjectResult? _result;
+    private bool _isCloneMode;
 
     private NewProjectDialog(NewProjectRequest req, Func<string?> pickFolder, IGitService git)
     {
@@ -45,11 +46,20 @@ public partial class NewProjectDialog : Window
         return Task.FromResult(ok == true ? dlg._result : null);
     }
 
-    private bool IsCloneMode => ModeClone.IsChecked == true;
+    private bool IsCloneMode => _isCloneMode;
 
-    private void OnModeChanged(object sender, RoutedEventArgs e)
+    private void OnModeExistingClick(object sender, RoutedEventArgs e)
     {
-        if (!IsLoaded) { return; }
+        if (_isCloneMode == false) { return; }
+        _isCloneMode = false;
+        ApplyMode();
+        RefreshAddEnabled();
+    }
+
+    private void OnModeCloneClick(object sender, RoutedEventArgs e)
+    {
+        if (_isCloneMode) { return; }
+        _isCloneMode = true;
         ApplyMode();
         RefreshAddEnabled();
     }
@@ -59,6 +69,11 @@ public partial class NewProjectDialog : Window
         ExistingPanel.Visibility = IsCloneMode ? Visibility.Collapsed : Visibility.Visible;
         ClonePanel.Visibility = IsCloneMode ? Visibility.Visible : Visibility.Collapsed;
         ErrorText.Visibility = Visibility.Collapsed;
+
+        // Drive the segmented-toggle visual via Tag (consumed by NP.SegBtn style triggers).
+        ModeExistingBtn.Tag = IsCloneMode ? null : "active";
+        ModeCloneBtn.Tag = IsCloneMode ? "active" : null;
+
         if (IsCloneMode) { UrlBox.Focus(); } else { /* leave focus alone */ }
     }
 
@@ -121,10 +136,18 @@ public partial class NewProjectDialog : Window
             var nameOk = !string.IsNullOrWhiteSpace(NameBox.Text)
                 && NameBox.Text.IndexOfAny(Path.GetInvalidFileNameChars()) < 0;
             AddBtn.IsEnabled = urlOk && parentOk && nameOk;
+
+            // Footer summary — empty values render as "…" placeholders.
+            var url = string.IsNullOrWhiteSpace(UrlBox.Text) ? "…" : UrlBox.Text.Trim();
+            var name = string.IsNullOrWhiteSpace(NameBox.Text) ? "…" : NameBox.Text.Trim();
+            FootMeta.Text = $"git clone · {url} → {name}";
         }
         else
         {
             AddBtn.IsEnabled = !string.IsNullOrWhiteSpace(ExistingPathBox.Text) && Directory.Exists(ExistingPathBox.Text);
+
+            var path = string.IsNullOrWhiteSpace(ExistingPathBox.Text) ? "…" : ExistingPathBox.Text.Trim();
+            FootMeta.Text = $"add project · {path}";
         }
     }
 
@@ -225,11 +248,11 @@ public partial class NewProjectDialog : Window
     private void SetBusy(bool busy, string? text)
     {
         BusyPanel.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;
+        FootMeta.Visibility = busy ? Visibility.Collapsed : Visibility.Visible;
         BusyText.Text = text ?? string.Empty;
-        AddBtn.IsEnabled = !busy && AddBtn.IsEnabled;
         AddBtn.Visibility = busy ? Visibility.Collapsed : Visibility.Visible;
-        ModeExisting.IsEnabled = !busy;
-        ModeClone.IsEnabled = !busy;
+        ModeExistingBtn.IsEnabled = !busy;
+        ModeCloneBtn.IsEnabled = !busy;
         UrlBox.IsEnabled = !busy;
         ParentBox.IsEnabled = !busy;
         NameBox.IsEnabled = !busy;

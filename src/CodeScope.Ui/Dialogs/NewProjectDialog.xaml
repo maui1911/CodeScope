@@ -3,7 +3,7 @@
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     Title="Add project"
-    Width="540"
+    Width="580"
     SizeToContent="Height"
     ResizeMode="NoResize"
     WindowStartupLocation="CenterOwner"
@@ -15,6 +15,24 @@
     TextElement.FontFamily="{DynamicResource Fig.Font.Sans}"
     TextElement.FontSize="{DynamicResource Fig.Size.Body}">
     <Window.Resources>
+        <!-- Dialog-local styles mirroring NewWorktreeDialog so the visual language matches. -->
+
+        <!-- Eyebrow: mono, small, accent, tracked caps. -->
+        <Style x:Key="NP.Eyebrow" TargetType="TextBlock">
+            <Setter Property="FontFamily" Value="{DynamicResource Fig.Font.Mono}" />
+            <Setter Property="FontSize" Value="10" />
+            <Setter Property="Foreground" Value="{DynamicResource Accent.Primary}" />
+            <Setter Property="TextOptions.TextFormattingMode" Value="Ideal" />
+        </Style>
+
+        <!-- Field label row. -->
+        <Style x:Key="NP.FieldLabel" TargetType="TextBlock">
+            <Setter Property="FontSize" Value="11" />
+            <Setter Property="FontWeight" Value="Medium" />
+            <Setter Property="Foreground" Value="{DynamicResource Fig.Brush.InkMuted}" />
+        </Style>
+
+        <!-- 36px field chrome. -->
         <Style x:Key="NP.FieldChrome" TargetType="Border">
             <Setter Property="Height" Value="36" />
             <Setter Property="Background" Value="{DynamicResource Fig.Brush.GlassDark}" />
@@ -22,174 +40,519 @@
             <Setter Property="BorderThickness" Value="1" />
             <Setter Property="CornerRadius" Value="6" />
         </Style>
+
+        <!-- Borderless mono TextBox that sits inside a field chrome. -->
         <Style x:Key="NP.InnerMonoBox" TargetType="TextBox">
             <Setter Property="FontFamily" Value="{DynamicResource Fig.Font.Mono}" />
             <Setter Property="FontSize" Value="13" />
+            <Setter Property="FontWeight" Value="Medium" />
             <Setter Property="Foreground" Value="{DynamicResource Fig.Brush.Ink}" />
+            <Setter Property="CaretBrush" Value="{DynamicResource Framer.Brush.Blue}" />
+            <Setter Property="SelectionBrush" Value="{DynamicResource Framer.Brush.Blue}" />
             <Setter Property="Background" Value="Transparent" />
             <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Padding" Value="0" />
             <Setter Property="VerticalContentAlignment" Value="Center" />
-            <Setter Property="Padding" Value="12,0" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TextBox">
+                        <ScrollViewer x:Name="PART_ContentHost" VerticalAlignment="Center" />
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
         </Style>
-        <Style x:Key="NP.FieldLabel" TargetType="TextBlock">
-            <Setter Property="FontSize" Value="11" />
-            <Setter Property="FontWeight" Value="Medium" />
+
+        <!-- Close (×) button: 24px circle. -->
+        <Style x:Key="NP.CloseBtn" TargetType="Button">
+            <Setter Property="Width" Value="24" />
+            <Setter Property="Height" Value="24" />
+            <Setter Property="Background" Value="Transparent" />
             <Setter Property="Foreground" Value="{DynamicResource Fig.Brush.InkMuted}" />
-            <Setter Property="Margin" Value="0,0,0,6" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bg"
+                                Background="{TemplateBinding Background}"
+                                CornerRadius="12">
+                            <Path x:Name="Glyph"
+                                  Data="M 0,0 L 8,8 M 8,0 L 0,8"
+                                  Stroke="{TemplateBinding Foreground}"
+                                  StrokeThickness="1.4"
+                                  StrokeStartLineCap="Round"
+                                  StrokeEndLineCap="Round"
+                                  HorizontalAlignment="Center"
+                                  VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bg" Property="Background" Value="#1F1F1F" />
+                                <Setter Property="Foreground" Value="{DynamicResource Fig.Brush.Ink}" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
         </Style>
+
+        <!-- Ghost footer button. -->
+        <Style x:Key="NP.GhostBtn" TargetType="Button">
+            <Setter Property="Height" Value="32" />
+            <Setter Property="Padding" Value="14,0" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="Foreground" Value="{DynamicResource Fig.Brush.InkMuted}" />
+            <Setter Property="FontFamily" Value="{DynamicResource Fig.Font.Sans}" />
+            <Setter Property="FontSize" Value="13" />
+            <Setter Property="FontWeight" Value="Medium" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bg"
+                                Background="{TemplateBinding Background}"
+                                CornerRadius="6"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bg" Property="Background" Value="#1F1F1F" />
+                                <Setter Property="Foreground" Value="{DynamicResource Fig.Brush.Ink}" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Primary footer button: Framer Blue, 32px, with kbd chip. -->
         <Style x:Key="NP.PrimaryBtn" TargetType="Button">
             <Setter Property="Height" Value="32" />
             <Setter Property="Padding" Value="14,0" />
             <Setter Property="Background" Value="{DynamicResource Accent.Primary}" />
-            <Setter Property="Foreground" Value="White" />
-            <Setter Property="FontWeight" Value="Medium" />
+            <Setter Property="Foreground" Value="{DynamicResource Fig.Brush.Canvas}" />
+            <Setter Property="FontFamily" Value="{DynamicResource Fig.Font.Sans}" />
+            <Setter Property="FontSize" Value="13" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="BorderThickness" Value="0" />
             <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bg"
+                                Background="{TemplateBinding Background}"
+                                CornerRadius="6"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bg" Property="Background" Value="#29A8FF" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="Bg" Property="Background" Value="#1F1F1F" />
+                                <Setter Property="Foreground" Value="{DynamicResource Fig.Brush.InkDim}" />
+                                <Setter Property="Cursor" Value="Arrow" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
         </Style>
-        <Style x:Key="NP.GhostBtn" TargetType="Button" BasedOn="{StaticResource NP.PrimaryBtn}">
+
+        <!-- Segmented mode-toggle button. Tag="active" flips to accent fill. -->
+        <Style x:Key="NP.SegBtn" TargetType="Button">
+            <Setter Property="Height" Value="28" />
             <Setter Property="Background" Value="Transparent" />
             <Setter Property="Foreground" Value="{DynamicResource Fig.Brush.InkMuted}" />
+            <Setter Property="FontFamily" Value="{DynamicResource Fig.Font.Sans}" />
+            <Setter Property="FontSize" Value="12.5" />
+            <Setter Property="FontWeight" Value="Medium" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bg"
+                                Background="{TemplateBinding Background}"
+                                CornerRadius="4">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bg" Property="Background" Value="#1F1F1F" />
+                                <Setter Property="Foreground" Value="{DynamicResource Fig.Brush.Ink}" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Style.Triggers>
+                <Trigger Property="Tag" Value="active">
+                    <Setter Property="Background" Value="{DynamicResource Accent.Primary}" />
+                    <Setter Property="Foreground" Value="{DynamicResource Fig.Brush.Canvas}" />
+                    <Setter Property="FontWeight" Value="SemiBold" />
+                </Trigger>
+            </Style.Triggers>
         </Style>
     </Window.Resources>
 
-    <Border Background="{DynamicResource Surface.Panel}"
-            CornerRadius="10"
-            BorderBrush="{DynamicResource Surface.Border}"
+    <!-- Outer wrap keeps the drop-shadow margin; actual surface is the inner Border. -->
+    <Grid Margin="30">
+        <Border
+            x:Name="DialogSurface"
+            Background="#0A0A0A"
+            BorderBrush="#1F1F1F"
             BorderThickness="1"
-            Padding="0">
-        <Grid Margin="20,16,20,16">
-            <Grid.RowDefinitions>
-                <RowDefinition Height="Auto" />
-                <RowDefinition Height="Auto" />
-                <RowDefinition Height="Auto" />
-                <RowDefinition Height="Auto" />
-                <RowDefinition Height="Auto" />
-                <RowDefinition Height="Auto" />
-            </Grid.RowDefinitions>
+            CornerRadius="{DynamicResource Fig.Radius.Medium}"
+            Effect="{DynamicResource Shadow.Dialog}"
+            ClipToBounds="True"
+            MouseLeftButtonDown="OnChromeDrag">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <!-- head -->
+                    <RowDefinition Height="Auto" />
+                    <!-- body -->
+                    <RowDefinition Height="Auto" />
+                    <!-- foot -->
+                </Grid.RowDefinitions>
 
-            <!-- Chrome bar: title left + close right; whole row is drag-handle. -->
-            <Grid Grid.Row="0" Margin="0,0,0,16" MouseLeftButtonDown="OnChromeDrag">
-                <TextBlock Text="ADD PROJECT"
-                           FontFamily="{DynamicResource Fig.Font.Mono}"
-                           FontSize="10"
-                           Foreground="{DynamicResource Accent.Primary}" />
-                <Button x:Name="CloseBtn"
-                        Content="×"
-                        Width="24" Height="24"
-                        HorizontalAlignment="Right"
-                        Background="Transparent"
-                        BorderThickness="0"
-                        Foreground="{DynamicResource Fig.Brush.InkMuted}"
-                        Cursor="Hand"
+                <!-- ===== HEAD ===== -->
+                <Grid Grid.Row="0" Margin="24,20,24,16">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+
+                    <StackPanel Grid.Column="0" Orientation="Vertical">
+                        <TextBlock
+                            Style="{StaticResource NP.Eyebrow}"
+                            Text="ADD PROJECT"
+                            Margin="0,0,0,6" />
+                        <TextBlock
+                            FontSize="20"
+                            FontWeight="SemiBold"
+                            Foreground="{DynamicResource Fig.Brush.Ink}"
+                            Text="Add a project" />
+                        <TextBlock
+                            Margin="0,4,0,0"
+                            FontSize="12"
+                            Foreground="{DynamicResource Fig.Brush.InkMuted}"
+                            Text="Bring a folder in, or clone a repo straight in." />
+                    </StackPanel>
+
+                    <Button
+                        Grid.Column="1"
+                        AutomationProperties.AutomationId="NewProjectCloseBtn"
+                        Style="{StaticResource NP.CloseBtn}"
+                        VerticalAlignment="Top"
+                        IsCancel="True"
                         Click="OnCancel" />
-            </Grid>
-
-            <!-- Mode toggle: two radio buttons. -->
-            <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,16">
-                <RadioButton x:Name="ModeExisting"
-                             Content="Existing folder"
-                             GroupName="NPMode"
-                             IsChecked="True"
-                             Margin="0,0,16,0"
-                             Checked="OnModeChanged" />
-                <RadioButton x:Name="ModeClone"
-                             Content="Clone from URL"
-                             GroupName="NPMode"
-                             Checked="OnModeChanged" />
-            </StackPanel>
-
-            <!-- Existing-folder panel. -->
-            <StackPanel x:Name="ExistingPanel" Grid.Row="2">
-                <TextBlock Text="FOLDER" Style="{StaticResource NP.FieldLabel}" />
-                <Grid>
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="Auto" />
-                    </Grid.ColumnDefinitions>
-                    <Border Grid.Column="0" Style="{StaticResource NP.FieldChrome}">
-                        <TextBox x:Name="ExistingPathBox"
-                                 Style="{StaticResource NP.InnerMonoBox}"
-                                 IsReadOnly="True" />
-                    </Border>
-                    <Button Grid.Column="1"
-                            Content="Browse…"
-                            Style="{StaticResource NP.GhostBtn}"
-                            Margin="8,0,0,0"
-                            Click="OnPickExisting" />
-                </Grid>
-            </StackPanel>
-
-            <!-- Clone panel. -->
-            <StackPanel x:Name="ClonePanel" Grid.Row="3" Visibility="Collapsed">
-                <TextBlock Text="GIT URL" Style="{StaticResource NP.FieldLabel}" />
-                <Border Style="{StaticResource NP.FieldChrome}" Margin="0,0,0,12">
-                    <TextBox x:Name="UrlBox" Style="{StaticResource NP.InnerMonoBox}" />
-                </Border>
-
-                <TextBlock Text="PARENT FOLDER" Style="{StaticResource NP.FieldLabel}" />
-                <Grid Margin="0,0,0,12">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="Auto" />
-                    </Grid.ColumnDefinitions>
-                    <Border Grid.Column="0" Style="{StaticResource NP.FieldChrome}">
-                        <TextBox x:Name="ParentBox" Style="{StaticResource NP.InnerMonoBox}" />
-                    </Border>
-                    <Button Grid.Column="1"
-                            Content="Browse…"
-                            Style="{StaticResource NP.GhostBtn}"
-                            Margin="8,0,0,0"
-                            Click="OnPickParent" />
                 </Grid>
 
-                <TextBlock Text="FOLDER NAME" Style="{StaticResource NP.FieldLabel}" />
-                <Border Style="{StaticResource NP.FieldChrome}">
-                    <TextBox x:Name="NameBox" Style="{StaticResource NP.InnerMonoBox}" />
-                </Border>
-            </StackPanel>
+                <!-- ===== BODY ===== -->
+                <StackPanel Grid.Row="1" Margin="24,0,24,16">
 
-            <!-- Inline error (used by clone failures). -->
-            <TextBlock x:Name="ErrorText"
-                       Grid.Row="4"
-                       Margin="0,12,0,0"
-                       TextWrapping="Wrap"
-                       FontFamily="{DynamicResource Fig.Font.Mono}"
-                       FontSize="11"
-                       Foreground="{DynamicResource Severity.Err}"
-                       Visibility="Collapsed" />
+                    <!-- Segmented mode toggle. -->
+                    <Border Background="{DynamicResource Fig.Brush.GlassDark}"
+                            CornerRadius="6"
+                            Padding="2"
+                            Margin="0,0,0,16">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Button x:Name="ModeExistingBtn"
+                                    Grid.Column="0"
+                                    AutomationProperties.AutomationId="NewProjectModeExistingBtn"
+                                    Style="{StaticResource NP.SegBtn}"
+                                    Content="Existing folder"
+                                    Click="OnModeExistingClick" />
+                            <Button x:Name="ModeCloneBtn"
+                                    Grid.Column="1"
+                                    AutomationProperties.AutomationId="NewProjectModeCloneBtn"
+                                    Style="{StaticResource NP.SegBtn}"
+                                    Content="Clone from URL"
+                                    Click="OnModeCloneClick" />
+                        </Grid>
+                    </Border>
 
-            <!-- Buttons row. -->
-            <Grid Grid.Row="5" Margin="0,20,0,0">
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="Auto" />
-                </Grid.ColumnDefinitions>
+                    <!-- Existing-folder panel. -->
+                    <Grid x:Name="ExistingPanel">
+                        <StackPanel>
+                            <TextBlock Style="{StaticResource NP.FieldLabel}"
+                                       Text="FOLDER"
+                                       Margin="0,0,0,6" />
+                            <Border Style="{StaticResource NP.FieldChrome}">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock
+                                        Grid.Column="0"
+                                        Margin="12,0,10,0"
+                                        VerticalAlignment="Center"
+                                        FontFamily="{DynamicResource Fig.Font.Mono}"
+                                        FontSize="12"
+                                        Foreground="{DynamicResource Accent.Primary}"
+                                        Text="$" />
+                                    <TextBox
+                                        Grid.Column="1"
+                                        x:Name="ExistingPathBox"
+                                        AutomationProperties.AutomationId="NewProjectExistingPathBox"
+                                        Style="{StaticResource NP.InnerMonoBox}"
+                                        Margin="0,0,10,0"
+                                        IsReadOnly="True" />
+                                    <Button
+                                        Grid.Column="2"
+                                        AutomationProperties.AutomationId="NewProjectPickExistingBtn"
+                                        Click="OnPickExisting"
+                                        Cursor="Hand"
+                                        FocusVisualStyle="{x:Null}"
+                                        Background="Transparent"
+                                        BorderThickness="0"
+                                        Padding="0">
+                                        <Button.Template>
+                                            <ControlTemplate TargetType="Button">
+                                                <Border x:Name="Seg"
+                                                        Background="{TemplateBinding Background}"
+                                                        BorderBrush="#1F1F1F"
+                                                        BorderThickness="1,0,0,0"
+                                                        Padding="10,0,12,0">
+                                                    <ContentPresenter VerticalAlignment="Center" HorizontalAlignment="Center" />
+                                                </Border>
+                                                <ControlTemplate.Triggers>
+                                                    <Trigger Property="IsMouseOver" Value="True">
+                                                        <Setter TargetName="Seg" Property="Background" Value="#1F1F1F" />
+                                                    </Trigger>
+                                                </ControlTemplate.Triggers>
+                                            </ControlTemplate>
+                                        </Button.Template>
+                                        <TextBlock
+                                            VerticalAlignment="Center"
+                                            FontFamily="{DynamicResource Fig.Font.Mono}"
+                                            FontSize="10"
+                                            Foreground="{DynamicResource Fig.Brush.InkDim}"
+                                            Text="Browse" />
+                                    </Button>
+                                </Grid>
+                            </Border>
+                        </StackPanel>
+                    </Grid>
 
-                <!-- Busy indicator (visible only while cloning). -->
-                <StackPanel x:Name="BusyPanel"
-                            Grid.Column="0"
-                            Orientation="Horizontal"
-                            Visibility="Collapsed">
-                    <ProgressBar Width="120" Height="4" IsIndeterminate="True" Margin="0,0,10,0" />
-                    <TextBlock x:Name="BusyText"
-                               VerticalAlignment="Center"
+                    <!-- Clone-from-URL panel. -->
+                    <Grid x:Name="ClonePanel" Visibility="Collapsed">
+                        <StackPanel>
+                            <!-- GIT URL -->
+                            <TextBlock Style="{StaticResource NP.FieldLabel}"
+                                       Text="GIT URL"
+                                       Margin="0,0,0,6" />
+                            <Border Style="{StaticResource NP.FieldChrome}" Margin="0,0,0,12">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock
+                                        Grid.Column="0"
+                                        Margin="12,0,8,0"
+                                        VerticalAlignment="Center"
+                                        FontFamily="{DynamicResource Fig.Font.Mono}"
+                                        FontSize="12"
+                                        Foreground="{DynamicResource Accent.Primary}"
+                                        Text="&#x29C9;" />
+                                    <TextBox
+                                        Grid.Column="1"
+                                        x:Name="UrlBox"
+                                        AutomationProperties.AutomationId="NewProjectUrlBox"
+                                        Style="{StaticResource NP.InnerMonoBox}"
+                                        Margin="0,0,12,0" />
+                                </Grid>
+                            </Border>
+
+                            <!-- PARENT FOLDER -->
+                            <TextBlock Style="{StaticResource NP.FieldLabel}"
+                                       Text="PARENT FOLDER"
+                                       Margin="0,0,0,6" />
+                            <Border Style="{StaticResource NP.FieldChrome}" Margin="0,0,0,12">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock
+                                        Grid.Column="0"
+                                        Margin="12,0,10,0"
+                                        VerticalAlignment="Center"
+                                        FontFamily="{DynamicResource Fig.Font.Mono}"
+                                        FontSize="12"
+                                        Foreground="{DynamicResource Accent.Primary}"
+                                        Text="$" />
+                                    <TextBox
+                                        Grid.Column="1"
+                                        x:Name="ParentBox"
+                                        AutomationProperties.AutomationId="NewProjectParentBox"
+                                        Style="{StaticResource NP.InnerMonoBox}"
+                                        Margin="0,0,10,0" />
+                                    <Button
+                                        Grid.Column="2"
+                                        AutomationProperties.AutomationId="NewProjectPickParentBtn"
+                                        Click="OnPickParent"
+                                        Cursor="Hand"
+                                        FocusVisualStyle="{x:Null}"
+                                        Background="Transparent"
+                                        BorderThickness="0"
+                                        Padding="0">
+                                        <Button.Template>
+                                            <ControlTemplate TargetType="Button">
+                                                <Border x:Name="Seg"
+                                                        Background="{TemplateBinding Background}"
+                                                        BorderBrush="#1F1F1F"
+                                                        BorderThickness="1,0,0,0"
+                                                        Padding="10,0,12,0">
+                                                    <ContentPresenter VerticalAlignment="Center" HorizontalAlignment="Center" />
+                                                </Border>
+                                                <ControlTemplate.Triggers>
+                                                    <Trigger Property="IsMouseOver" Value="True">
+                                                        <Setter TargetName="Seg" Property="Background" Value="#1F1F1F" />
+                                                    </Trigger>
+                                                </ControlTemplate.Triggers>
+                                            </ControlTemplate>
+                                        </Button.Template>
+                                        <TextBlock
+                                            VerticalAlignment="Center"
+                                            FontFamily="{DynamicResource Fig.Font.Mono}"
+                                            FontSize="10"
+                                            Foreground="{DynamicResource Fig.Brush.InkDim}"
+                                            Text="Browse" />
+                                    </Button>
+                                </Grid>
+                            </Border>
+
+                            <!-- FOLDER NAME -->
+                            <TextBlock Style="{StaticResource NP.FieldLabel}"
+                                       Text="FOLDER NAME"
+                                       Margin="0,0,0,6" />
+                            <Border Style="{StaticResource NP.FieldChrome}">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock
+                                        Grid.Column="0"
+                                        Margin="12,0,8,0"
+                                        VerticalAlignment="Center"
+                                        FontFamily="{DynamicResource Fig.Font.Mono}"
+                                        FontSize="12"
+                                        Foreground="{DynamicResource Fig.Brush.InkDim}"
+                                        Text="/" />
+                                    <TextBox
+                                        Grid.Column="1"
+                                        x:Name="NameBox"
+                                        AutomationProperties.AutomationId="NewProjectNameBox"
+                                        Style="{StaticResource NP.InnerMonoBox}"
+                                        Margin="0,0,12,0" />
+                                </Grid>
+                            </Border>
+                        </StackPanel>
+                    </Grid>
+
+                    <!-- Inline error (used by clone failures). -->
+                    <TextBlock x:Name="ErrorText"
+                               Margin="0,12,0,0"
+                               TextWrapping="Wrap"
                                FontFamily="{DynamicResource Fig.Font.Mono}"
                                FontSize="11"
-                               Foreground="{DynamicResource Fig.Brush.InkMuted}" />
+                               Foreground="{DynamicResource Severity.Err}"
+                               Visibility="Collapsed" />
                 </StackPanel>
 
-                <StackPanel Grid.Column="1" Orientation="Horizontal">
-                    <Button x:Name="CancelBtn"
-                            Content="Cancel"
+                <!-- ===== FOOT ===== -->
+                <Border
+                    Grid.Row="2"
+                    Background="#080808"
+                    BorderBrush="#1F1F1F"
+                    BorderThickness="0,1,0,0">
+                    <Grid Margin="24,14,24,18">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+
+                        <!-- Meta caption (left). Replaced by BusyPanel during clone. -->
+                        <TextBlock
+                            Grid.Column="0"
+                            x:Name="FootMeta"
+                            VerticalAlignment="Center"
+                            FontFamily="{DynamicResource Fig.Font.Mono}"
+                            FontSize="10.5"
+                            Foreground="{DynamicResource Fig.Brush.InkDim}"
+                            TextTrimming="CharacterEllipsis"
+                            Text="add project · …" />
+
+                        <StackPanel
+                            Grid.Column="0"
+                            x:Name="BusyPanel"
+                            Orientation="Horizontal"
+                            VerticalAlignment="Center"
+                            Visibility="Collapsed">
+                            <ProgressBar Width="80" Height="3" IsIndeterminate="True" Margin="0,0,10,0" />
+                            <TextBlock x:Name="BusyText"
+                                       VerticalAlignment="Center"
+                                       FontFamily="{DynamicResource Fig.Font.Mono}"
+                                       FontSize="10.5"
+                                       Foreground="{DynamicResource Fig.Brush.InkMuted}" />
+                        </StackPanel>
+
+                        <Button
+                            Grid.Column="1"
+                            x:Name="CancelBtn"
+                            AutomationProperties.AutomationId="NewProjectCancelBtn"
                             Style="{StaticResource NP.GhostBtn}"
+                            Content="Cancel"
+                            Margin="0,0,8,0"
+                            IsCancel="True"
                             Click="OnCancel" />
-                    <Button x:Name="AddBtn"
-                            Content="Add"
+
+                        <Button
+                            Grid.Column="2"
+                            x:Name="AddBtn"
+                            AutomationProperties.AutomationId="NewProjectAddBtn"
                             Style="{StaticResource NP.PrimaryBtn}"
-                            Margin="8,0,0,0"
                             IsDefault="True"
-                            Click="OnAdd" />
-                </StackPanel>
+                            IsEnabled="False"
+                            Click="OnAdd">
+                            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                <TextBlock Text="Add" VerticalAlignment="Center" />
+                                <Border
+                                    Margin="8,0,0,0"
+                                    Background="#26000000"
+                                    CornerRadius="3"
+                                    Padding="5,2,5,2">
+                                    <TextBlock
+                                        FontFamily="{DynamicResource Fig.Font.Mono}"
+                                        FontSize="10"
+                                        Foreground="#B3000000"
+                                        Text="&#x21B5;" />
+                                </Border>
+                            </StackPanel>
+                        </Button>
+                    </Grid>
+                </Border>
             </Grid>
-        </Grid>
-    </Border>
+        </Border>
+    </Grid>
 </Window>
