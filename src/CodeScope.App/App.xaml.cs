@@ -132,15 +132,22 @@ public partial class App : Application
                 services.AddHostedService(sp => sp.GetRequiredService<WorktreeStatusPoller>());
                 services.AddSingleton<PullRequestStatusPoller>();
                 services.AddHostedService(sp => sp.GetRequiredService<PullRequestStatusPoller>());
-                services.AddSingleton<SidebarViewModel>(sp => new SidebarViewModel(
-                    sp.GetRequiredService<ISessionStore>(),
-                    sp.GetRequiredService<ILogger<SidebarViewModel>>(),
-                    PickFolder,
-                    PickNewWorktree,
-                    sp.GetRequiredService<IPullRequestService>(),
-                    sp.GetRequiredService<NoScope.CodeScope.Ui.Services.IToastService>(),
-                    sp.GetRequiredService<IAgentRegistry>(),
-                    sp.GetRequiredService<IGitService>()));
+                services.AddSingleton<SidebarViewModel>(sp =>
+                {
+                    var git = sp.GetRequiredService<IGitService>();
+                    Task<NoScope.CodeScope.Ui.Dialogs.NewProjectResult?> PickNewProject(NoScope.CodeScope.Ui.Dialogs.NewProjectRequest request)
+                        => NoScope.CodeScope.Ui.Dialogs.NewProjectDialog.PromptAsync(request, PickFolder, git);
+
+                    return new SidebarViewModel(
+                        store: sp.GetRequiredService<ISessionStore>(),
+                        logger: sp.GetRequiredService<ILogger<SidebarViewModel>>(),
+                        pickNewWorktree: PickNewWorktree,
+                        pickNewProject: PickNewProject,
+                        pullRequests: sp.GetRequiredService<IPullRequestService>(),
+                        toasts: sp.GetRequiredService<NoScope.CodeScope.Ui.Services.IToastService>(),
+                        agents: sp.GetRequiredService<IAgentRegistry>(),
+                        git: git);
+                });
                 services.AddSingleton<DiffPanelViewModel>();
                 services.AddSingleton<MainViewModel>(sp =>
                 {

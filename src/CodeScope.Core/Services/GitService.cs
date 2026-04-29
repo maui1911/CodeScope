@@ -205,6 +205,52 @@ public sealed class GitService : IGitService
     public Task<Result<string>> FetchAllAsync(string workingDirectory, CancellationToken ct = default)
         => RunAsync(workingDirectory, "fetch --all --prune", ct);
 
+    public async Task<Result<string>> CloneAsync(string url, string parentDir, string folderName, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return Result<string>.Fail("URL is empty");
+        }
+        if (string.IsNullOrWhiteSpace(parentDir))
+        {
+            return Result<string>.Fail("Parent directory is empty");
+        }
+        if (string.IsNullOrWhiteSpace(folderName))
+        {
+            return Result<string>.Fail("Folder name is empty");
+        }
+
+        if (folderName.Contains(Path.DirectorySeparatorChar) || folderName.Contains(Path.AltDirectorySeparatorChar) || folderName is ".." or ".")
+        {
+            return Result<string>.Fail($"Folder name must be a single directory name, not a path: {folderName}");
+        }
+
+        if (!Directory.Exists(parentDir))
+        {
+            return Result<string>.Fail($"Parent directory does not exist: {parentDir}");
+        }
+
+        var target = Path.GetFullPath(Path.Combine(parentDir, folderName));
+        if (!target.StartsWith(Path.GetFullPath(parentDir) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+        {
+            return Result<string>.Fail($"Folder name resolves outside parent directory: {folderName}");
+        }
+
+        if (Directory.Exists(target) && Directory.EnumerateFileSystemEntries(target).Any())
+        {
+            return Result<string>.Fail($"Destination already exists and is not empty: {target}");
+        }
+
+        // Quote both arguments and use `--` so URLs/folder names that start with a dash
+        // can't be parsed as flags. QuoteArg escapes inner double-quotes so we don't rely
+        // on UI-side input filtering at the service boundary.
+        var args = $"-C {ProcessRunner.QuoteArg(parentDir)} clone -- {ProcessRunner.QuoteArg(url)} {ProcessRunner.QuoteArg(folderName)}";
+        var result = await RunAsync(cwd: null, args, ct).ConfigureAwait(false);
+        return result.IsSuccess
+            ? Result<string>.Ok(target)
+            : Result<string>.Fail(result.Error);
+    }
+
     public async Task<Result<string>> DiscardChangesAsync(string workingDirectory, CancellationToken ct = default)
     {
         var reset = await RunAsync(workingDirectory, "reset --hard HEAD", ct).ConfigureAwait(false);
