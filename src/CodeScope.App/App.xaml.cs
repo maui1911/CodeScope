@@ -112,6 +112,8 @@ public partial class App : Application
                 services.AddSingleton<IPiSessionDiscovery, PiSessionDiscovery>();
                 services.AddSingleton<IOpenCodeTelemetryService, OpenCodeTelemetryService>();
                 services.AddSingleton<IOpenCodeSessionDiscovery, OpenCodeSessionDiscovery>();
+                services.AddSingleton<ICopilotTelemetryService, CopilotTelemetryService>();
+                services.AddSingleton<ICopilotSessionDiscovery, CopilotSessionDiscovery>();
                 services.AddSingleton<INotificationService, NotificationService>();
                 // Native Windows Action-Center toast on agent turn-complete. Fires only
                 // when the main window is minimized (gate lives in the implementation).
@@ -163,6 +165,8 @@ public partial class App : Application
                         sp.GetRequiredService<IPiSessionDiscovery>(),
                         sp.GetRequiredService<IOpenCodeTelemetryService>(),
                         sp.GetRequiredService<IOpenCodeSessionDiscovery>(),
+                        sp.GetRequiredService<ICopilotTelemetryService>(),
+                        sp.GetRequiredService<ICopilotSessionDiscovery>(),
                         sp.GetRequiredService<NoScope.CodeScope.Ui.Services.IIdleToastNotifier>());
                     var sidebar = sp.GetRequiredService<SidebarViewModel>();
                     vm.AttachSidebar(sidebar);

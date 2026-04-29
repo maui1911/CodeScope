@@ -32,6 +32,8 @@ public sealed partial class MainViewModel : ObservableObject
     private readonly IPiSessionDiscovery? _piDiscovery;
     private readonly IOpenCodeTelemetryService? _opencodeTelemetry;
     private readonly IOpenCodeSessionDiscovery? _opencodeDiscovery;
+    private readonly ICopilotTelemetryService? _copilotTelemetry;
+    private readonly ICopilotSessionDiscovery? _copilotDiscovery;
     private readonly IIdleToastNotifier? _idleNotifier;
     private readonly Dictionary<string, ClaudeActivityState> _lastActivity = [];
     // Per-tab discovery watcher — disposed on adoption or tab close.
@@ -53,6 +55,8 @@ public sealed partial class MainViewModel : ObservableObject
         IPiSessionDiscovery? piDiscovery = null,
         IOpenCodeTelemetryService? opencodeTelemetry = null,
         IOpenCodeSessionDiscovery? opencodeDiscovery = null,
+        ICopilotTelemetryService? copilotTelemetry = null,
+        ICopilotSessionDiscovery? copilotDiscovery = null,
         IIdleToastNotifier? idleNotifier = null)
     {
         _sessionManager = sessionManager;
@@ -69,6 +73,8 @@ public sealed partial class MainViewModel : ObservableObject
         _piDiscovery = piDiscovery;
         _opencodeTelemetry = opencodeTelemetry;
         _opencodeDiscovery = opencodeDiscovery;
+        _copilotTelemetry = copilotTelemetry;
+        _copilotDiscovery = copilotDiscovery;
         _idleNotifier = idleNotifier;
         SessionViewPool = sessionViewPool;
         if (_telemetry is not null) { _telemetry.Updated += OnTelemetryUpdated; }
@@ -76,6 +82,7 @@ public sealed partial class MainViewModel : ObservableObject
         // through ApplyTelemetry, which keys by AgentSessionId so backend identity doesn't matter.
         if (_piTelemetry is not null) { _piTelemetry.Updated += OnTelemetryUpdated; }
         if (_opencodeTelemetry is not null) { _opencodeTelemetry.Updated += OnTelemetryUpdated; }
+        if (_copilotTelemetry is not null) { _copilotTelemetry.Updated += OnTelemetryUpdated; }
         if (_notifications is not null)
         {
             Notifications = new NotificationsViewModel(_notifications);
@@ -1209,6 +1216,14 @@ public sealed partial class MainViewModel : ObservableObject
             handle = _opencodeDiscovery.Watch(workingDir, since, (adoptedId, _path) =>
                 ApplyAdoption(storedSessionId, adoptedId, agentId, workingDir));
         }
+        else if (string.Equals(agentId, "copilot", StringComparison.OrdinalIgnoreCase) && _copilotDiscovery is not null)
+        {
+            // Copilot CLI stores each session in its own UUID-named directory under
+            // ~/.copilot/session-state/. Adoption matches by cwd from workspace.yaml
+            // or the session.start event in events.jsonl.
+            handle = _copilotDiscovery.Watch(workingDir, since, (adoptedId, _path) =>
+                ApplyAdoption(storedSessionId, adoptedId, agentId, workingDir));
+        }
 
         if (handle is null) { return; }
         StopAgentAdoption(storedSessionId);
@@ -1216,7 +1231,7 @@ public sealed partial class MainViewModel : ObservableObject
     }
 
     /// <summary>
-    /// Adoption callback shared by every supported agent backend (Claude, Pi, OpenCode):
+    /// Adoption callback shared by every supported agent backend (Claude, Pi, OpenCode, Copilot):
     /// persist the new id onto the store row and (re-)register the matching telemetry
     /// tail. Marshals onto the dispatcher because the discovery callback fires on a
     /// watcher thread.
@@ -1269,6 +1284,10 @@ public sealed partial class MainViewModel : ObservableObject
         {
             _opencodeTelemetry?.Register(sessionId, workingDir);
         }
+        else if (string.Equals(agentId, "copilot", StringComparison.OrdinalIgnoreCase))
+        {
+            _copilotTelemetry?.Register(sessionId, workingDir);
+        }
     }
 
     /// <summary>Routes telemetry unregister to the right backend. Idempotent — calls all when agent unknown.</summary>
@@ -1281,6 +1300,7 @@ public sealed partial class MainViewModel : ObservableObject
             _telemetry?.Unregister(sessionId);
             _piTelemetry?.Unregister(sessionId);
             _opencodeTelemetry?.Unregister(sessionId);
+            _copilotTelemetry?.Unregister(sessionId);
             return;
         }
         if (string.Equals(agentId, "claude", StringComparison.OrdinalIgnoreCase))
@@ -1294,6 +1314,10 @@ public sealed partial class MainViewModel : ObservableObject
         else if (string.Equals(agentId, "opencode", StringComparison.OrdinalIgnoreCase))
         {
             _opencodeTelemetry?.Unregister(sessionId);
+        }
+        else if (string.Equals(agentId, "copilot", StringComparison.OrdinalIgnoreCase))
+        {
+            _copilotTelemetry?.Unregister(sessionId);
         }
     }
 
