@@ -235,6 +235,18 @@ public partial class SessionTabView : UserControl
         var term = Terminal.DisconnectConPTYTerm();
         try { term?.CloseStdinToApp(); }
         catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"[SessionTabView] Teardown CloseStdin: {ex.Message}"); }
+        // Kill the entire process tree (pwsh + agent child) instead of just the direct child.
+        // StopExternalTermOnly() calls Process.Kill() without EntireProcessTree, which leaves
+        // the agent (claude, copilot, etc.) alive as an orphan. We use the Process property
+        // directly to kill the tree, then fall through to StopExternalTermOnly for cleanup.
+        try
+        {
+            if (term?.Process is { HasExited: false } proc)
+            {
+                proc.Kill(EntireProcessTree: true);
+            }
+        }
+        catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"[SessionTabView] Teardown KillTree: {ex.Message}"); }
         try { term?.StopExternalTermOnly(); }
         catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"[SessionTabView] Teardown StopExternal: {ex.Message}"); }
         _started = false;
