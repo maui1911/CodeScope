@@ -100,12 +100,9 @@ public abstract class WorktreePoller<TState> : BackgroundService
         // worktrees are gone. WorktreeStatusPoller has its own prune path that already
         // calls TryRemove, but reconciliation here makes the cleanup uniform across all
         // pollers (notably PullRequestStatusPoller, which had no equivalent path).
-        if (States.Count > seen.Count)
+        foreach (var key in States.Keys)
         {
-            foreach (var key in States.Keys)
-            {
-                if (!seen.Contains(key)) { States.TryRemove(key, out _); }
-            }
+            if (!seen.Contains(key)) { States.TryRemove(key, out _); }
         }
     }
 }

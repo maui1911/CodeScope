@@ -66,6 +66,25 @@ public sealed class WorktreePollerStateReconciliationTests
         poller.StateKeysSnapshot().Should().BeEquivalentTo(["a", "b"]);
     }
 
+    [Fact]
+    public async Task Refresh_DropsStaleEntryWhenSwappedWithNew()
+    {
+        // Regression: remove "b" and add "c" between ticks — States.Count stays at 2
+        // so a count-based guard would skip reconciliation entirely.
+        var store = Substitute.For<ISessionStore>();
+        store.Projects.Returns([Project("p1", Worktree("a"), Worktree("b"))]);
+
+        var poller = new TestPoller(store);
+
+        await poller.RefreshAsync();
+        poller.StateKeysSnapshot().Should().BeEquivalentTo(["a", "b"]);
+
+        store.Projects.Returns([Project("p1", Worktree("a"), Worktree("c"))]);
+
+        await poller.RefreshAsync();
+        poller.StateKeysSnapshot().Should().BeEquivalentTo(["a", "c"]);
+    }
+
     private static Project Project(string id, params Worktree[] worktrees) =>
         new() { Id = id, Name = id, Path = $@"C:\repo\{id}", Worktrees = worktrees };
 

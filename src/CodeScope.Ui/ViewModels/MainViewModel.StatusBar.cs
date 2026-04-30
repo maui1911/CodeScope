@@ -20,7 +20,7 @@ public sealed partial class MainViewModel
             {
                 foreach (var g in e.NewItems.OfType<EditorGroupViewModel>()) { HookGroupForStatusBar(g); }
             }
-            if (e.OldItems is not null)
+            if (IsRemoval(e.Action) && e.OldItems is not null)
             {
                 foreach (var g in e.OldItems.OfType<EditorGroupViewModel>())
                 {
@@ -41,7 +41,7 @@ public sealed partial class MainViewModel
                 {
                     foreach (var p in e.NewItems.OfType<ProjectViewModel>()) { HookProjectForStatusBar(p); }
                 }
-                if (e.OldItems is not null)
+                if (IsRemoval(e.Action) && e.OldItems is not null)
                 {
                     foreach (var p in e.OldItems.OfType<ProjectViewModel>())
                     {
@@ -61,7 +61,7 @@ public sealed partial class MainViewModel
             {
                 foreach (var w in e.NewItems.OfType<WorktreeViewModel>()) { HookWorktreeForStatusBar(w); }
             }
-            if (e.OldItems is not null)
+            if (IsRemoval(e.Action) && e.OldItems is not null)
             {
                 foreach (var w in e.OldItems.OfType<WorktreeViewModel>()) { _statusBarHookedWts.Remove(w); }
             }
@@ -101,13 +101,18 @@ public sealed partial class MainViewModel
             {
                 foreach (var t in e.NewItems.OfType<SessionTabViewModel>()) { HookTabForStatusBar(t); }
             }
-            if (e.OldItems is not null)
+            if (IsRemoval(e.Action) && e.OldItems is not null)
             {
                 foreach (var t in e.OldItems.OfType<SessionTabViewModel>()) { _statusBarHookedTabs.Remove(t); }
             }
             RaiseStatusBarChanged();
         };
     }
+
+    // Move populates OldItems too — gating on Remove/Replace prevents false eviction
+    // during same-group tab reorder.
+    private static bool IsRemoval(NotifyCollectionChangedAction action)
+        => action is NotifyCollectionChangedAction.Remove or NotifyCollectionChangedAction.Replace;
 
     private readonly HashSet<SessionTabViewModel> _statusBarHookedTabs = [];
     private void HookTabForStatusBar(SessionTabViewModel t)

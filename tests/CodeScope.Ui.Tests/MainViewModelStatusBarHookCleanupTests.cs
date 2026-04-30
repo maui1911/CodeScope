@@ -61,6 +61,25 @@ public sealed class MainViewModelStatusBarHookCleanupTests
         vm.StatusBarHookedTabCountForTests.Should().Be(0);
     }
 
+    [Fact]
+    public void MovingTab_DoesNotEvict()
+    {
+        // ObservableCollection.Move fires CollectionChanged with OldItems set.
+        // Eviction must NOT fire on Move — only on Remove/Replace — otherwise
+        // reordering tabs within a group would drop the entry and re-hook a
+        // duplicate PropertyChanged handler.
+        var vm = MakeVmWithStatusBarHooks();
+        vm.Tabs.Add(MakeTab("s1"));
+        vm.Tabs.Add(MakeTab("s2"));
+        vm.Tabs.Add(MakeTab("s3"));
+
+        vm.StatusBarHookedTabCountForTests.Should().Be(3);
+
+        vm.Tabs.Move(0, 2);
+
+        vm.StatusBarHookedTabCountForTests.Should().Be(3);
+    }
+
     private static MainViewModel MakeVmWithStatusBarHooks()
     {
         var store = Substitute.For<ISessionStore>();
