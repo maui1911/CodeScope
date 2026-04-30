@@ -80,6 +80,82 @@ public sealed class MainViewModelStatusBarHookCleanupTests
         vm.StatusBarHookedTabCountForTests.Should().Be(3);
     }
 
+    [Fact]
+    public void ClearingTabs_RemovesAllEntries()
+    {
+        // ObservableCollection.Clear raises CollectionChanged with action=Reset and
+        // OldItems=null, so the reconcile path (not the OldItems path) must handle it.
+        var vm = MakeVmWithStatusBarHooks();
+        vm.Tabs.Add(MakeTab("s1"));
+        vm.Tabs.Add(MakeTab("s2"));
+        vm.Tabs.Add(MakeTab("s3"));
+
+        vm.StatusBarHookedTabCountForTests.Should().Be(3);
+
+        vm.Tabs.Clear();
+
+        vm.StatusBarHookedTabCountForTests.Should().Be(0);
+    }
+
+    [Fact]
+    public void CrossGroupMove_KeepsExactlyOneHandler()
+    {
+        // MoveTabToGroup transfers the same SessionTabViewModel between groups via
+        // Remove + Add. A naive HashSet<VM> would Remove on source, then Add returns
+        // true on target → a second PropertyChanged handler is attached, doubling
+        // every status-bar recompute for that tab. The dict-based hook stores the
+        // handler instance and unsubscribes precisely on eviction — but the eviction
+        // must skip the Remove because the tab is still alive in another group.
+        var vm = MakeVmWithStatusBarHooks();
+        var sourceGroup = vm.FocusedGroup;
+        vm.SplitRightCommand.Execute(null);
+        var targetGroup = vm.Groups.Last(g => !ReferenceEquals(g, sourceGroup));
+
+        var tab = MakeTab("s1");
+        sourceGroup.Tabs.Add(tab);
+        vm.StatusBarHookedTabCountForTests.Should().Be(1);
+
+        // Cross-group move: same VM removed from source, re-added to target.
+        sourceGroup.Tabs.Remove(tab);
+        targetGroup.Tabs.Add(tab);
+
+        vm.StatusBarHookedTabCountForTests.Should().Be(1);
+
+        // And only ONE handler should be attached — drive a single property change
+        // and assert the recompute count via badge service hooks.
+        var badge = Substitute.For<NoScope.CodeScope.Ui.Services.ITaskbarBadgeService>();
+        var vm2 = MakeVmWithBadge(badge);
+        var srcG = vm2.FocusedGroup;
+        vm2.SplitRightCommand.Execute(null);
+        var dstG = vm2.Groups.Last(g => !ReferenceEquals(g, srcG));
+        var tab2 = MakeTab("s2");
+        srcG.Tabs.Add(tab2);
+        srcG.Tabs.Remove(tab2);
+        dstG.Tabs.Add(tab2);
+        badge.ClearReceivedCalls();
+
+        tab2.Status = TabStatus.Busy;
+
+        // Exactly one badge.Apply call would fire from one PropertyChanged handler.
+        badge.Received(1).Apply(Arg.Any<int>(), Arg.Any<int>());
+    }
+
+    private static MainViewModel MakeVmWithBadge(NoScope.CodeScope.Ui.Services.ITaskbarBadgeService badge)
+    {
+        var store = Substitute.For<ISessionStore>();
+        store.Projects.Returns([]);
+        var manager = Substitute.For<ISessionManager>();
+        var agents = Substitute.For<IAgentRegistry>();
+        agents.GetAll().Returns([]);
+        var vm = new MainViewModel(
+            manager, store, agents,
+            NullLogger<MainViewModel>.Instance,
+            pickFolder: () => null,
+            taskbarBadge: badge);
+        vm.HookStatusBarSources();
+        return vm;
+    }
+
     private static MainViewModel MakeVmWithStatusBarHooks()
     {
         var store = Substitute.For<ISessionStore>();
