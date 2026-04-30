@@ -43,7 +43,7 @@
         both `dotnet build` and `dotnet publish` drop it beside CodeScope.exe.
     -->
     <ItemGroup>
-        <Content Include="$(NuGetPackageRoot)ci.microsoft.windows.console.conpty\*\runtimes\win10-x64\native\conpty.dll">
+        <Content Include="$(NuGetPackageRoot)\ci.microsoft.windows.console.conpty\*\runtimes\win10-x64\native\conpty.dll">
             <Link>conpty.dll</Link>
             <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
             <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
