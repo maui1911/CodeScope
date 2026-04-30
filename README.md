@@ -2,7 +2,7 @@
 
 **A native Windows command center for AI coding agents.**
 
-CodeScope runs Claude Code, Codex, OpenCode and any other CLI agent as parallel, worktree-isolated sessions inside a single WPF window — with tabbed terminals, split editor groups, a live git overview, and a keyboard-first command palette.
+CodeScope runs Claude Code, Codex, Copilot, OpenCode, Pi and any other CLI agent as parallel, worktree-isolated sessions inside a single WPF window — with tabbed terminals, split editor groups, a live git overview, and a keyboard-first command palette.
 
 ![CodeScope main window](docs/screenshots/hero.png)
 
@@ -44,18 +44,29 @@ Snap a worktree into its own workspace with `Ctrl+\`. Two agents, side by side, 
 - **Notifications deck** — agent "waiting on user" states surface as Windows toasts; unread counter in the status bar.
 - **Multi-pane layout persisted** — groups, tabs, widths, focus — all restored on restart.
 
-## Quick start
+## Install
+
+Grab the latest release from the [**Releases page**](https://github.com/maui1911/CodeScope/releases/latest):
+
+| Asset | What |
+|---|---|
+| **`CodeScope-win-Setup.exe`** | One-click installer (recommended). Installs to `%LocalAppData%\CodeScope`, auto-updates via Velopack. |
+| **`CodeScope-win-Portable.zip`** | Standalone zip — extract and run `CodeScope.exe`. No install, no auto-update. |
 
 ### Requirements
 
 - Windows 10 22H2+ or Windows 11
-- [.NET 10 SDK](https://dotnet.microsoft.com/download) (10.0.100 or newer)
 - `git` on `PATH`
-- At least one agent CLI on `PATH` (`claude`, `codex`, etc.)
+- At least one agent CLI on `PATH` (`claude`, `codex`, `copilot`, `opencode`, `pi`, etc.)
 
-### Build and run
+> **No .NET SDK needed** — the release is self-contained.
+
+## Build from source
+
+Only needed if you want to contribute or hack on CodeScope itself.
 
 ```pwsh
+# Prerequisites: .NET 10 SDK (10.0.100+), git
 dotnet restore
 dotnet build
 dotnet run --project src/CodeScope.App
