@@ -20,6 +20,13 @@ public sealed partial class MainViewModel
             {
                 foreach (var g in e.NewItems.OfType<EditorGroupViewModel>()) { HookGroupForStatusBar(g); }
             }
+            if (e.OldItems is not null)
+            {
+                foreach (var g in e.OldItems.OfType<EditorGroupViewModel>())
+                {
+                    foreach (var t in g.Tabs) { _statusBarHookedTabs.Remove(t); }
+                }
+            }
             RaiseStatusBarChanged();
         };
         foreach (var g in Groups) { HookGroupForStatusBar(g); }
@@ -27,7 +34,6 @@ public sealed partial class MainViewModel
 
         if (Sidebar is not null)
         {
-            Sidebar.Projects.CollectionChanged += (_, _) => RaiseStatusBarChanged();
             foreach (var p in Sidebar.Projects) { HookProjectForStatusBar(p); }
             Sidebar.Projects.CollectionChanged += (_, e) =>
             {
@@ -35,6 +41,14 @@ public sealed partial class MainViewModel
                 {
                     foreach (var p in e.NewItems.OfType<ProjectViewModel>()) { HookProjectForStatusBar(p); }
                 }
+                if (e.OldItems is not null)
+                {
+                    foreach (var p in e.OldItems.OfType<ProjectViewModel>())
+                    {
+                        foreach (var w in p.Worktrees) { _statusBarHookedWts.Remove(w); }
+                    }
+                }
+                RaiseStatusBarChanged();
             };
         }
     }
@@ -47,11 +61,19 @@ public sealed partial class MainViewModel
             {
                 foreach (var w in e.NewItems.OfType<WorktreeViewModel>()) { HookWorktreeForStatusBar(w); }
             }
+            if (e.OldItems is not null)
+            {
+                foreach (var w in e.OldItems.OfType<WorktreeViewModel>()) { _statusBarHookedWts.Remove(w); }
+            }
             RaiseStatusBarChanged();
         };
         foreach (var w in p.Worktrees) { HookWorktreeForStatusBar(w); }
     }
 
+    // Tracks which Worktree/SessionTab VMs already have a PropertyChanged handler attached.
+    // Entries must be evicted when the source collection raises Remove — otherwise this
+    // singleton would pin every worktree/tab ever observed, defeating GC for closed sessions
+    // and removed worktrees.
     private readonly HashSet<WorktreeViewModel> _statusBarHookedWts = [];
     private void HookWorktreeForStatusBar(WorktreeViewModel w)
     {
@@ -79,6 +101,10 @@ public sealed partial class MainViewModel
             {
                 foreach (var t in e.NewItems.OfType<SessionTabViewModel>()) { HookTabForStatusBar(t); }
             }
+            if (e.OldItems is not null)
+            {
+                foreach (var t in e.OldItems.OfType<SessionTabViewModel>()) { _statusBarHookedTabs.Remove(t); }
+            }
             RaiseStatusBarChanged();
         };
     }
@@ -100,6 +126,11 @@ public sealed partial class MainViewModel
             }
         };
     }
+
+    // Test-seam — exposes the tracking-set sizes so unit tests can assert that closed
+    // tabs / removed worktrees are evicted instead of accumulating forever.
+    internal int StatusBarHookedTabCountForTests => _statusBarHookedTabs.Count;
+    internal int StatusBarHookedWorktreeCountForTests => _statusBarHookedWts.Count;
 
     private void RaiseStatusBarChanged()
     {
