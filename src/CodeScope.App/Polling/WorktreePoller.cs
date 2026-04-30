@@ -73,11 +73,13 @@ public abstract class WorktreePoller<TState> : BackgroundService
     private async Task PollAllAsync(CancellationToken ct)
     {
         var snapshot = Store.Projects;
+        var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var project in snapshot)
         {
             foreach (var worktree in project.Worktrees)
             {
                 if (ct.IsCancellationRequested) { return; }
+                seen.Add(worktree.Id);
                 if (!await TryAcceptWorktreeAsync(project, worktree, ct).ConfigureAwait(false)) { continue; }
 
                 var state = States.GetOrAdd(worktree.Id, _ => new PollBackoff<TState>());
@@ -89,6 +91,18 @@ public abstract class WorktreePoller<TState> : BackgroundService
 
                 await ProbeAsync(project, worktree, state, ct).ConfigureAwait(false);
             }
+        }
+
+        // Reconcile: worktrees and projects can be removed between ticks (RemoveWorktree,
+        // RemoveProject, prune-on-missing). Without sweeping stale ids the per-worktree
+        // PollBackoff entries pile up across the lifetime of the process — visible on
+        // long-running installs as ever-growing dictionary churn even after the source
+        // worktrees are gone. WorktreeStatusPoller has its own prune path that already
+        // calls TryRemove, but reconciliation here makes the cleanup uniform across all
+        // pollers (notably PullRequestStatusPoller, which had no equivalent path).
+        foreach (var key in States.Keys)
+        {
+            if (!seen.Contains(key)) { States.TryRemove(key, out _); }
         }
     }
 }

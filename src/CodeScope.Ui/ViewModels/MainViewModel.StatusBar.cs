@@ -14,29 +14,55 @@ public sealed partial class MainViewModel
     /// <summary>Hooks once Sidebar is attached — wires per-tab Status subscriptions and worktree dirty/ahead change propagation.</summary>
     internal void HookStatusBarSources()
     {
-        Groups.CollectionChanged += (_, e) =>
-        {
-            if (e.NewItems is not null)
-            {
-                foreach (var g in e.NewItems.OfType<EditorGroupViewModel>()) { HookGroupForStatusBar(g); }
-            }
-            RaiseStatusBarChanged();
-        };
+        Groups.CollectionChanged += OnGroupsForStatusBarChanged;
         foreach (var g in Groups) { HookGroupForStatusBar(g); }
         foreach (var t in AllTabs) { HookTabForStatusBar(t); }
 
         if (Sidebar is not null)
         {
-            Sidebar.Projects.CollectionChanged += (_, _) => RaiseStatusBarChanged();
             foreach (var p in Sidebar.Projects) { HookProjectForStatusBar(p); }
-            Sidebar.Projects.CollectionChanged += (_, e) =>
-            {
-                if (e.NewItems is not null)
-                {
-                    foreach (var p in e.NewItems.OfType<ProjectViewModel>()) { HookProjectForStatusBar(p); }
-                }
-            };
+            Sidebar.Projects.CollectionChanged += OnSidebarProjectsChanged;
         }
+    }
+
+    private void OnGroupsForStatusBarChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        if (e.NewItems is not null)
+        {
+            foreach (var g in e.NewItems.OfType<EditorGroupViewModel>()) { HookGroupForStatusBar(g); }
+        }
+        if (e.Action == NotifyCollectionChangedAction.Reset)
+        {
+            ReconcileTabHooks();
+        }
+        else if (IsRemoval(e.Action) && e.OldItems is not null)
+        {
+            foreach (var g in e.OldItems.OfType<EditorGroupViewModel>())
+            {
+                foreach (var t in g.Tabs) { TryUnhookTabIfOrphaned(t); }
+            }
+        }
+        RaiseStatusBarChanged();
+    }
+
+    private void OnSidebarProjectsChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        if (e.NewItems is not null)
+        {
+            foreach (var p in e.NewItems.OfType<ProjectViewModel>()) { HookProjectForStatusBar(p); }
+        }
+        if (e.Action == NotifyCollectionChangedAction.Reset)
+        {
+            ReconcileWorktreeHooks();
+        }
+        else if (IsRemoval(e.Action) && e.OldItems is not null)
+        {
+            foreach (var p in e.OldItems.OfType<ProjectViewModel>())
+            {
+                foreach (var w in p.Worktrees) { TryUnhookWorktreeIfOrphaned(w); }
+            }
+        }
+        RaiseStatusBarChanged();
     }
 
     private void HookProjectForStatusBar(ProjectViewModel p)
@@ -47,16 +73,29 @@ public sealed partial class MainViewModel
             {
                 foreach (var w in e.NewItems.OfType<WorktreeViewModel>()) { HookWorktreeForStatusBar(w); }
             }
+            if (e.Action == NotifyCollectionChangedAction.Reset)
+            {
+                ReconcileWorktreeHooks();
+            }
+            else if (IsRemoval(e.Action) && e.OldItems is not null)
+            {
+                foreach (var w in e.OldItems.OfType<WorktreeViewModel>()) { TryUnhookWorktreeIfOrphaned(w); }
+            }
             RaiseStatusBarChanged();
         };
         foreach (var w in p.Worktrees) { HookWorktreeForStatusBar(w); }
     }
 
-    private readonly HashSet<WorktreeViewModel> _statusBarHookedWts = [];
+    // Tracks PropertyChanged handlers attached to each worktree/tab VM. We store the actual
+    // delegate instance (not just the VM) so eviction can `-=` precisely. A plain HashSet
+    // has two failure modes: never evicting pins every VM forever, and evicting then re-adding
+    // the same VM (cross-group MoveTabToGroup is Remove+Add of the same SessionTabViewModel)
+    // attaches a second handler — one VM ends up firing the status-bar recompute twice.
+    private readonly Dictionary<WorktreeViewModel, PropertyChangedEventHandler> _statusBarHookedWts = [];
     private void HookWorktreeForStatusBar(WorktreeViewModel w)
     {
-        if (!_statusBarHookedWts.Add(w)) { return; }
-        w.PropertyChanged += (_, e) =>
+        if (_statusBarHookedWts.ContainsKey(w)) { return; }
+        PropertyChangedEventHandler handler = (_, e) =>
         {
             if (e.PropertyName is nameof(WorktreeViewModel.IsDirty)
                 or nameof(WorktreeViewModel.Ahead)
@@ -69,6 +108,8 @@ public sealed partial class MainViewModel
                 RaiseStatusBarChanged();
             }
         };
+        w.PropertyChanged += handler;
+        _statusBarHookedWts[w] = handler;
     }
 
     private void HookGroupForStatusBar(EditorGroupViewModel g)
@@ -79,15 +120,29 @@ public sealed partial class MainViewModel
             {
                 foreach (var t in e.NewItems.OfType<SessionTabViewModel>()) { HookTabForStatusBar(t); }
             }
+            if (e.Action == NotifyCollectionChangedAction.Reset)
+            {
+                ReconcileTabHooks();
+            }
+            else if (IsRemoval(e.Action) && e.OldItems is not null)
+            {
+                foreach (var t in e.OldItems.OfType<SessionTabViewModel>()) { TryUnhookTabIfOrphaned(t); }
+            }
             RaiseStatusBarChanged();
         };
     }
 
-    private readonly HashSet<SessionTabViewModel> _statusBarHookedTabs = [];
+    // Move populates OldItems too — gating on Remove/Replace prevents false eviction
+    // during same-group tab reorder. Reset is handled separately via the reconcile path
+    // because ObservableCollection.Clear raises Reset with OldItems = null.
+    private static bool IsRemoval(NotifyCollectionChangedAction action)
+        => action is NotifyCollectionChangedAction.Remove or NotifyCollectionChangedAction.Replace;
+
+    private readonly Dictionary<SessionTabViewModel, PropertyChangedEventHandler> _statusBarHookedTabs = [];
     private void HookTabForStatusBar(SessionTabViewModel t)
     {
-        if (!_statusBarHookedTabs.Add(t)) { return; }
-        t.PropertyChanged += (_, e) =>
+        if (_statusBarHookedTabs.ContainsKey(t)) { return; }
+        PropertyChangedEventHandler handler = (_, e) =>
         {
             if (e.PropertyName == nameof(SessionTabViewModel.Status)
                 || e.PropertyName == nameof(SessionTabViewModel.DisplayName)
@@ -99,7 +154,57 @@ public sealed partial class MainViewModel
                 RaiseStatusBarChanged();
             }
         };
+        t.PropertyChanged += handler;
+        _statusBarHookedTabs[t] = handler;
     }
+
+    // Cross-group move (MoveTabToGroup) fires Remove on the source then Add on the target
+    // with the same VM — by the time we look here the Add may not have landed, so check
+    // the live set explicitly instead of evicting blindly.
+    private void TryUnhookTabIfOrphaned(SessionTabViewModel t)
+    {
+        if (AllTabs.Contains(t)) { return; }
+        if (_statusBarHookedTabs.Remove(t, out var handler)) { t.PropertyChanged -= handler; }
+    }
+
+    private void TryUnhookWorktreeIfOrphaned(WorktreeViewModel w)
+    {
+        if (Sidebar is not null && Sidebar.Projects.Any(p => p.Worktrees.Contains(w))) { return; }
+        if (_statusBarHookedWts.Remove(w, out var handler)) { w.PropertyChanged -= handler; }
+    }
+
+    // Reset path: ObservableCollection.Clear raises CollectionChanged with OldItems = null,
+    // so eviction can't be driven from the event payload. Reconcile against the live set
+    // — drop and unsubscribe everything not currently reachable, leave the rest alone.
+    private void ReconcileTabHooks()
+    {
+        var live = new HashSet<SessionTabViewModel>(AllTabs);
+        foreach (var t in _statusBarHookedTabs.Keys.ToArray())
+        {
+            if (!live.Contains(t) && _statusBarHookedTabs.Remove(t, out var handler))
+            {
+                t.PropertyChanged -= handler;
+            }
+        }
+    }
+
+    private void ReconcileWorktreeHooks()
+    {
+        if (Sidebar is null) { return; }
+        var live = new HashSet<WorktreeViewModel>(Sidebar.Projects.SelectMany(p => p.Worktrees));
+        foreach (var w in _statusBarHookedWts.Keys.ToArray())
+        {
+            if (!live.Contains(w) && _statusBarHookedWts.Remove(w, out var handler))
+            {
+                w.PropertyChanged -= handler;
+            }
+        }
+    }
+
+    // Test-seam — exposes the tracking-dict sizes so unit tests can assert that closed
+    // tabs / removed worktrees are evicted instead of accumulating forever.
+    internal int StatusBarHookedTabCountForTests => _statusBarHookedTabs.Count;
+    internal int StatusBarHookedWorktreeCountForTests => _statusBarHookedWts.Count;
 
     private void RaiseStatusBarChanged()
     {
