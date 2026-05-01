@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using NoScope.CodeScope.Core.Services;
@@ -60,8 +59,10 @@ public sealed class MemoryWatchdog(ILogger<MemoryWatchdog> logger, ISessionStore
     {
         try
         {
-            var proc = Process.GetCurrentProcess();
-            var ws = proc.WorkingSet64;
+            // Environment.WorkingSet returns the same value as Process.WorkingSet64 without
+            // allocating a Process instance (which holds an unmanaged handle that would leak
+            // every tick if not disposed).
+            var ws = Environment.WorkingSet;
             var sessionCount = store.Projects.Sum(p => p.Sessions.Count(s => s.ClosedAt is null));
             var deltaBytes = lastWorkingSet == 0 ? 0 : ws - lastWorkingSet;
             var wsMb = ws / (1024.0 * 1024.0);
