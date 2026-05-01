@@ -68,7 +68,7 @@ public sealed class SessionRetentionPolicyTests
         var sessions = new List<Session>();
         for (var i = 0; i < SessionRetentionPolicy.MaxPerWorktree + 25; i++)
         {
-            // Older indices = older ClosedAt — i=0 is the oldest.
+            // Lower indices = newer ClosedAt — i=0 is the newest, i=124 is the oldest.
             sessions.Add(ClosedAt($"s{i:D3}", "w", now - TimeSpan.FromHours(i)));
         }
 
@@ -253,5 +253,38 @@ public sealed class SessionRetentionPolicyTests
         var kept = store.Projects.Single().Sessions;
         kept.Count(s => s.WorktreeId == "wA").Should().Be(SessionRetentionPolicy.MaxPerWorktree);
         kept.Count(s => s.WorktreeId == "wB").Should().Be(3, "wB was nowhere near the cap");
+    }
+
+    [Fact]
+    public async Task Retention_Treats_Null_WorktreeId_As_Single_Orphan_Bucket()
+    {
+        // Legacy / pre-migration rows can have WorktreeId = null. The retention policy
+        // collapses those into a single orphan bucket so the cap still enforces. Without
+        // this, every null-id row would be its own implicit bucket and the cap would never
+        // trigger for legacy state. Issue #33 follow-up — explicit guard against regression.
+        var now = DateTimeOffset.UtcNow;
+        var sessions = new List<Session>();
+        for (var i = 0; i < SessionRetentionPolicy.MaxPerWorktree + 25; i++)
+        {
+            // All null WorktreeId. Lower index = newer.
+            sessions.Add(ClosedAt($"orphan{i:D3}", null, now - TimeSpan.FromHours(i)));
+        }
+
+        var cfg = new ProjectsConfig
+        {
+            Projects = [new Project { Id = "p", Name = "P", Path = @"C:\p", Sessions = sessions }],
+        };
+
+        var (store, _) = Make(cfg);
+        await store.LoadAsync();
+
+        var kept = store.Projects.Single().Sessions;
+        kept.Count.Should().Be(SessionRetentionPolicy.MaxPerWorktree,
+            "null-WorktreeId rows must collapse into a single bucket so the cap applies");
+        // The newest MaxPerWorktree (orphan000..orphan099) survive; the older 25 drop.
+        for (var i = 0; i < SessionRetentionPolicy.MaxPerWorktree; i++)
+        {
+            kept.Should().Contain(s => s.Id == $"orphan{i:D3}");
+        }
     }
 }

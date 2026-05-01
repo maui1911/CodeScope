@@ -201,9 +201,16 @@ public sealed class SessionStore : ISessionStore
 
     public async Task<Result<bool>> SoftCloseSessionAsync(string sessionId, CancellationToken ct = default)
     {
+        // Apply close mutation AND retention sweep in the same lock window, then persist
+        // once. Otherwise every close that pushes a worktree past the cap would issue two
+        // back-to-back saves, AND a save2 failure would leave on-disk state diverged from
+        // in-memory state (the close persisted, the prune didn't) — self-healing on next
+        // load but messy. Single save, single atomic rollback.
         var changed = false;
         Session? closedSession = null;
         string? projectId = null;
+        List<Project>? projectsBefore = null;
+        List<string> prunedSessionIds = [];
         lock (_lock)
         {
             for (var i = 0; i < _projects.Count; i++)
@@ -214,6 +221,10 @@ public sealed class SessionStore : ISessionStore
                 if (idx < 0) { continue; }
                 // Idempotent — re-closing an already-closed session is a no-op, not an error.
                 if (sessions[idx].ClosedAt is not null) { return Result<bool>.Ok(true); }
+                // Snapshot pre-mutation projects so a save failure can roll back BOTH the
+                // close and the retention sweep atomically. List<Project> is mutable but
+                // Project is a record, so a shallow ToList preserves the original entries.
+                projectsBefore = _projects.ToList();
                 sessions[idx] = sessions[idx] with { ClosedAt = DateTimeOffset.UtcNow };
                 closedSession = sessions[idx];
                 projectId = p.Id;
@@ -221,53 +232,35 @@ public sealed class SessionStore : ISessionStore
                 changed = true;
                 break;
             }
+            if (!changed) { return Result<bool>.Fail($"Session '{sessionId}' not found"); }
+
+            // Apply retention scoped to the affected project — sweeping every project on
+            // every close is wasteful when a SoftClose only shifted one project's bucket
+            // counts. Done inside the same lock so the persisted snapshot reflects both.
+            prunedSessionIds = ApplyRetentionPolicyLocked(projectFilter: projectId);
         }
-        if (!changed) { return Result<bool>.Fail($"Session '{sessionId}' not found"); }
+
         var saved = await SaveSnapshotAsync(ct).ConfigureAwait(false);
         if (saved.IsFailure)
         {
-            // Rollback the in-memory mutation so a retry doesn't hit the idempotency guard
-            // and silently succeed without ever persisting.
+            // Atomic rollback — restore the pre-mutation projects so a retry doesn't hit
+            // the idempotency guard, and pruned sessions don't vanish from the in-memory
+            // state when disk hasn't been updated.
             lock (_lock)
             {
-                for (var i = 0; i < _projects.Count; i++)
-                {
-                    var p = _projects[i];
-                    var sessions = p.Sessions.ToList();
-                    var idx = sessions.FindIndex(s => s.Id == sessionId);
-                    if (idx < 0) { continue; }
-                    sessions[idx] = sessions[idx] with { ClosedAt = null };
-                    _projects[i] = p with { Sessions = sessions };
-                    break;
-                }
+                _projects.Clear();
+                _projects.AddRange(projectsBefore!);
             }
             return saved;
         }
+
         // Fire SessionSoftClosed carrying the closed Session payload so sidebar listeners
         // can demote the row to History without re-querying store state (race-free).
         // Hard-remove (RemoveSessionAsync) still raises SessionRemoved unchanged.
         Raise(new SessionStoreChange.SessionSoftClosed(projectId!, closedSession!));
-
-        // Apply retention immediately on every soft-close so the cap stays enforced as new
-        // entries land. Scoped to the affected project — sweeping every project on every
-        // close is wasteful when a SoftClose only shifted one project's bucket counts. Each
-        // pruned row gets a SessionRemoved event so VM History rows disappear in lockstep.
-        // Persistence happens once for the whole batch.
-        List<string> prunedSessionIds;
-        lock (_lock) { prunedSessionIds = ApplyRetentionPolicyLocked(projectFilter: projectId); }
-        if (prunedSessionIds.Count > 0)
+        foreach (var pruned in prunedSessionIds)
         {
-            var saved2 = await SaveSnapshotAsync(ct).ConfigureAwait(false);
-            if (saved2.IsFailure)
-            {
-                _logger.LogWarning(
-                    "SessionStore: failed to persist post-softclose retention sweep ({N} pruned): {Error}",
-                    prunedSessionIds.Count, saved2.Error);
-            }
-            foreach (var pruned in prunedSessionIds)
-            {
-                Raise(new SessionStoreChange.SessionRemoved(pruned));
-            }
+            Raise(new SessionStoreChange.SessionRemoved(pruned));
         }
 
         return Result<bool>.Ok(true);
