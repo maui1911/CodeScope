@@ -249,10 +249,12 @@ public sealed class SessionStore : ISessionStore
         Raise(new SessionStoreChange.SessionSoftClosed(projectId!, closedSession!));
 
         // Apply retention immediately on every soft-close so the cap stays enforced as new
-        // entries land. Each pruned row gets a SessionRemoved event so VM History rows
-        // disappear in lockstep. Persistence happens once for the whole batch.
+        // entries land. Scoped to the affected project — sweeping every project on every
+        // close is wasteful when a SoftClose only shifted one project's bucket counts. Each
+        // pruned row gets a SessionRemoved event so VM History rows disappear in lockstep.
+        // Persistence happens once for the whole batch.
         List<string> prunedSessionIds;
-        lock (_lock) { prunedSessionIds = ApplyRetentionPolicyLocked(); }
+        lock (_lock) { prunedSessionIds = ApplyRetentionPolicyLocked(projectFilter: projectId); }
         if (prunedSessionIds.Count > 0)
         {
             var saved2 = await SaveSnapshotAsync(ct).ConfigureAwait(false);
@@ -272,19 +274,48 @@ public sealed class SessionStore : ISessionStore
     }
 
     /// <summary>
-    /// Applies the closed-session retention policy across every project's session list.
-    /// Caller must hold <see cref="_lock"/>. Returns the ids of sessions dropped from
-    /// in-memory state so the caller can persist + raise <c>SessionRemoved</c> events.
-    /// Idempotent: re-running on already-pruned state returns an empty list. See #33.
+    /// Applies the closed-session retention policy. Caller must hold <see cref="_lock"/>.
+    /// Returns the ids of sessions dropped from in-memory state so the caller can persist
+    /// + raise <c>SessionRemoved</c> events. Idempotent: re-running on already-pruned
+    /// state returns an empty list. See #33.
+    /// <para>
+    /// Pass a <paramref name="projectFilter"/> to scope the sweep — used by
+    /// <see cref="SoftCloseSessionAsync"/> so we don't walk every project's sessions just
+    /// because one project gained a single closed row. <c>null</c> sweeps everything,
+    /// matching the one-time migration sweep on <see cref="LoadAsync"/>.
+    /// </para>
     /// </summary>
-    private List<string> ApplyRetentionPolicyLocked()
+    private List<string> ApplyRetentionPolicyLocked(string? projectFilter = null)
     {
-        var pruned = new List<string>();
         var now = DateTimeOffset.UtcNow;
+        var ttlCutoff = now - SessionRetentionPolicy.MaxAge;
 
+        // Pre-flight pass — cheap allocation-free scan to short-circuit when nothing
+        // needs pruning. Counts closed-per-bucket as we go; bails as soon as the first
+        // out-of-policy row is seen. Most SoftCloses on a healthy install land here.
+        var anyPrune = false;
+        Dictionary<(int projectIdx, string bucket), int>? bucketCounts = null;
+        for (var i = 0; i < _projects.Count && !anyPrune; i++)
+        {
+            var p = _projects[i];
+            if (projectFilter is not null && p.Id != projectFilter) { continue; }
+            foreach (var s in p.Sessions)
+            {
+                if (s.ClosedAt is not { } closedAt) { continue; }
+                if (closedAt < ttlCutoff) { anyPrune = true; break; }
+                bucketCounts ??= new();
+                var key = (i, s.WorktreeId ?? string.Empty);
+                bucketCounts[key] = bucketCounts.TryGetValue(key, out var c) ? c + 1 : 1;
+                if (bucketCounts[key] > SessionRetentionPolicy.MaxPerWorktree) { anyPrune = true; break; }
+            }
+        }
+        if (!anyPrune) { return []; }
+
+        var pruned = new List<string>();
         for (var i = 0; i < _projects.Count; i++)
         {
             var p = _projects[i];
+            if (projectFilter is not null && p.Id != projectFilter) { continue; }
             var keep = new List<Session>(p.Sessions.Count);
             var perWorktreeSurvivors = new Dictionary<string, List<Session>>(StringComparer.Ordinal);
 
@@ -298,7 +329,7 @@ public sealed class SessionStore : ISessionStore
                 }
 
                 // TTL pass — drop anything older than the retention window.
-                if (now - s.ClosedAt.Value > SessionRetentionPolicy.MaxAge)
+                if (s.ClosedAt.Value < ttlCutoff)
                 {
                     pruned.Add(s.Id);
                     continue;
