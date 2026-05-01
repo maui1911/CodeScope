@@ -17,18 +17,49 @@ public sealed class ToastService : IToastService
     /// <summary>Bottom-up, newest-first stack. Cap matches spec §04 "max 3 visible".</summary>
     private const int MaxVisible = 3;
 
+    /// <summary>
+    /// Hard cap on visible error toasts. Errors are persistent (no auto-dismiss) so a
+    /// recurring poller-driven failure (e.g. <c>gh</c> not on PATH, FS-watcher race) can
+    /// stack VMs + their associated commands until the user dismisses each one manually.
+    /// Beyond this cap we drop the oldest visible error to keep the visible stack and
+    /// command-list bounded — the user still sees the latest <c>MaxVisibleErr</c> errors.
+    /// Issue #34. The first defence remains stable <c>Id</c>-dedupe at every poller call
+    /// site; this is the safety net for unstable-id stragglers.
+    /// </summary>
+    private const int MaxVisibleErr = 20;
+
     public ObservableCollection<ToastItemViewModel> Items { get; } = [];
 
     public void Show(ToastRequest request)
     {
         var dispatcher = Application.Current?.Dispatcher;
-        if (dispatcher is null) { return; }
-        if (!dispatcher.CheckAccess())
+        if (dispatcher is not null && !dispatcher.CheckAccess())
         {
             dispatcher.BeginInvoke(() => Show(request));
             return;
         }
 
+        ShowCore(request);
+    }
+
+    public void Dismiss(string id)
+    {
+        var dispatcher = Application.Current?.Dispatcher;
+        if (dispatcher is not null && !dispatcher.CheckAccess())
+        {
+            dispatcher.BeginInvoke(() => Dismiss(id));
+            return;
+        }
+
+        DismissCore(id);
+    }
+
+    /// <summary>
+    /// Dispatcher-bound mutation of <see cref="Items"/>. Split out from <see cref="Show"/>
+    /// so tests can drive the cap/dedupe logic without spinning up a WPF dispatcher.
+    /// </summary>
+    internal void ShowCore(ToastRequest request)
+    {
         var duration = request.Duration ?? DefaultDuration(request.Severity);
 
         // De-dupe by id — same id within visible lifetime replaces in place. Kills the
@@ -48,9 +79,6 @@ public sealed class ToastService : IToastService
 
         // Cap at MaxVisible BUT errors never auto-fold (spec §04 "errors never fold")
         // — count only non-error toasts against the cap and only evict from that pool.
-        // If everything visible is an error and the user keeps stacking errors, we let
-        // the stack grow past MaxVisible so the user sees them all rather than silently
-        // dropping the oldest critical message on the floor.
         while (Items.Count(i => i.Severity != ToastSeverity.Err) > MaxVisible)
         {
             var victim = Items.FirstOrDefault(i => i.Severity != ToastSeverity.Err);
@@ -58,18 +86,19 @@ public sealed class ToastService : IToastService
             victim.StopTimer();
             Items.Remove(victim);
         }
+
+        // Hard cap on persistent error toasts (issue #34) — drop oldest beyond MaxVisibleErr.
+        while (Items.Count(i => i.Severity == ToastSeverity.Err) > MaxVisibleErr)
+        {
+            var victim = Items.FirstOrDefault(i => i.Severity == ToastSeverity.Err);
+            if (victim is null) { break; }
+            victim.StopTimer();
+            Items.Remove(victim);
+        }
     }
 
-    public void Dismiss(string id)
+    internal void DismissCore(string id)
     {
-        var dispatcher = Application.Current?.Dispatcher;
-        if (dispatcher is null) { return; }
-        if (!dispatcher.CheckAccess())
-        {
-            dispatcher.BeginInvoke(() => Dismiss(id));
-            return;
-        }
-
         var match = Items.FirstOrDefault(i => i.Id == id);
         if (match is null) { return; }
         match.StopTimer();

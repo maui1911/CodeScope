@@ -108,10 +108,10 @@ public sealed partial class SidebarViewModel : ObservableObject
     /// </summary>
     public Func<string, string, Task<Func<Task>>>? CloseWorktreeSessionsAsync { get; set; }
 
-    private void Toast(string title, string message, ToastSeverity severity)
+    private void Toast(string title, string message, ToastSeverity severity, string? id = null)
     {
         if (_toasts is null) { return; }
-        _toasts.Show(new ToastRequest(severity, title, message));
+        _toasts.Show(new ToastRequest(severity, title, message, Id: id));
     }
 
     /// <summary>

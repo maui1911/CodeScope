@@ -187,13 +187,16 @@ public sealed partial class SidebarViewModel
         if (previous is null || pr is null || previous.CiStatus == pr.CiStatus) { return; }
 
         var label = pvm is not null ? $"{pvm.Name} · {wvm.DisplayBranch}" : wvm.DisplayBranch;
+        // Stable id keyed on worktree+PR so a flapping CI replaces the existing toast in
+        // place rather than stacking — see #34.
+        var ciId = $"ci-{worktreeId}-{pr.Number}";
         switch (pr.CiStatus)
         {
             case CiStatus.Success:
-                Toast($"CI passed on #{pr.Number}", label, ToastSeverity.Ok);
+                Toast($"CI passed on #{pr.Number}", label, ToastSeverity.Ok, id: ciId);
                 break;
             case CiStatus.Failure:
-                Toast($"CI failed on #{pr.Number}", label, ToastSeverity.Err);
+                Toast($"CI failed on #{pr.Number}", label, ToastSeverity.Err, id: ciId);
                 break;
         }
     }
