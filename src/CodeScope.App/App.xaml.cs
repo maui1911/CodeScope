@@ -134,6 +134,14 @@ public partial class App : Application
                 services.AddHostedService(sp => sp.GetRequiredService<WorktreeStatusPoller>());
                 services.AddSingleton<PullRequestStatusPoller>();
                 services.AddHostedService(sp => sp.GetRequiredService<PullRequestStatusPoller>());
+
+                // Dev-only memory watchdog — surfaces working-set creep + live-session count
+                // every 5 min so per-session scrollback retention regressions (issue #35)
+                // don't go unnoticed during long dev runs. Never registered in production.
+                if (NoScope.CodeScope.Core.AppPaths.IsDevMode)
+                {
+                    services.AddHostedService<NoScope.CodeScope.App.Diagnostics.MemoryWatchdog>();
+                }
                 services.AddSingleton<SidebarViewModel>(sp =>
                 {
                     var git = sp.GetRequiredService<IGitService>();

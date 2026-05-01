@@ -303,6 +303,12 @@ public partial class SessionTabView : UserControl
         });
 
         var cmd = vm.CommandLine;
+        // No scrollback cap parameter is available — Microsoft.Terminal.Wpf 1.22 doesn't
+        // expose the underlying renderer's history-line setting on its public API, and
+        // EasyWindowsTerminalControl's `term.Start` only takes width/height/logOutput.
+        // Per-session scrollback dominates working set at scale (issue #35); we surface
+        // creep via MemoryWatchdog in dev mode rather than try to cap it here. Revisit if
+        // upstream surfaces an API.
         _ = Task.Run(() =>
         {
             try { term.Start(cmd, consoleWidth: 120, consoleHeight: 32, logOutput: false); }
