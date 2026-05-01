@@ -270,3 +270,45 @@ disappear in lockstep. Live sessions (`ClosedAt is null`) are never touched.
 - A future "Clear history" UX (mentioned as a complementary action in #33)
   doesn't conflict with this policy; it'd just be a manual variant of the
   automatic sweep.
+
+---
+
+## ADR-0016 — Diff panel removed entirely
+
+**Date:** 2026-05-01
+**Status:** Accepted
+
+The bottom-docked diff panel (`Ctrl+D`) was never used in practice — every
+real review surface (status bar git stats, sidebar dirty markers, in-terminal
+`git diff`, the agent CLI's own diff view) covers the same ground better. The
+panel had a known memory issue (#32: triples large patches in memory + bursts
+duplicate work on every selection change) that we'd otherwise have had to fix.
+Cheaper to drop than to maintain.
+
+**Removed:**
+- `DiffPanelViewModel`, `DiffPanelView` (`.xaml` + `.xaml.cs`)
+- `IGitService.GetDiffAsync` + the `git diff --no-color HEAD` runner in
+  `GitService` (no other consumers)
+- DI registration in `App.xaml.cs`, the `MainViewModel.Diff` property +
+  `AttachDiffPanel` + `ToggleDiffPanel` command
+- `MainWindow.xaml`: `Ctrl+D` `KeyBinding`, the `GridSplitter` + panel mount,
+  the now-unused `BoolVisible` window-resource converter (other Views
+  redeclare it locally), and the `WorkspaceLayer` Grid's row definitions
+  (single child, no rows needed)
+- `SidebarViewModel.WorktreeSelected` event (only consumer was the
+  diff-panel bridge)
+- Command palette entry "Toggle diff panel"
+- `README.md` `Ctrl+D` row
+- `docs/design/html/CodeScope - Diff Panel.html`
+
+**Decision considered and rejected:**
+- *Keep the panel and fix #32*: investment without a user; the panel was
+  never integrated into anyone's actual review flow.
+- *Replace with an inline diff-on-hover affordance*: out of scope; no
+  current demand and would re-introduce the same per-selection work.
+
+**Consequences:**
+- Closes #37 (this ADR) and supersedes #32 (the perf fix is moot once the
+  feature is gone).
+- One fewer `IGitService` surface for tests/mocks to track.
+- `Ctrl+D` is now free for future bindings.

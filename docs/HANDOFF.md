@@ -574,10 +574,9 @@ src/
                        Interop/ProcessTreeKiller (Win32 job)
   CodeScope.Ui         VMs: Main(+StatusBar partial), Sidebar, Project,
                             Worktree, SessionTab, CommandPalette,
-                            Overview*, EditorGroup, DiffPanel
-                       Views: SidebarView, SessionTabView, DiffPanelView,
-                              OverviewView, GroupStripView, StatusBarView,
-                              EditorGroupView
+                            Overview*, EditorGroup
+                       Views: SidebarView, SessionTabView, OverviewView,
+                              GroupStripView, StatusBarView, EditorGroupView
                        Dialogs: RenameDialog, NewWorktreeDialog,
                                 CommandPaletteDialog
 tests/
@@ -664,18 +663,12 @@ dotnet publish src/CodeScope.App -c Release -r win-x64 `
 
 **Fase 7 — remaining design token / mock consumption:**
 
-- **Diff Panel right-side dock** — current panel is bottom-docked with
-  full width; mock has it right-docked at ~400 px replacing the terminal.
-  Requires MainWindow layout rework (swap a `RowDefinition` for a
-  `ColumnDefinition` in the workspace Grid) + new splitter wiring.
-- **Diff Panel Unified/Split toggle + file tabs + Stage/Revert** —
-  feature work on top of the polish that landed in `39d2786`.
 - **Tab Drag — floating drag chip adorner** — custom `Adorner` that
   follows the cursor, renders the tab replica with a −1.5 ° rotation +
   blue outer glow. 3 px blue drop-indicator between tabs needs a
   `DragOver` calc + dynamic `Rectangle` in the strip's ItemsPanel.
-  (Session 15 closed: Empty State polish `5239ea0`, Diff Panel polish
-  `39d2786`, Tab Motion single rail `071da29`.)
+  (Session 15 closed: Empty State polish `5239ea0`, Tab Motion single
+  rail `071da29`. Diff Panel removed entirely — see ADR-0016 / #37.)
 
 **Deferred / longer-horizon:**
 

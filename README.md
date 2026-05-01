@@ -97,7 +97,6 @@ dotnet publish src/CodeScope.App -c Release -r win-x64 `
 | `Ctrl+1`…`Ctrl+9` | Jump to tab by index |
 | `Ctrl+K`, `Ctrl+Shift+P` | Command palette |
 | `Ctrl+Shift+O` | Toggle overview |
-| `Ctrl+D` | Toggle diff panel |
 | `Ctrl+F` | Focus sidebar filter |
 | `Ctrl+Shift+Enter` | Open selected worktree in a new group |
 | `F2` | Rename session / worktree |

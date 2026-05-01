@@ -30,7 +30,6 @@
     d:DataContext="{d:DesignInstance Type=vm:MainViewModel}">
 
     <ui:FluentWindow.Resources>
-        <BooleanToVisibilityConverter x:Key="BoolVisible" />
         <conv:TabStatusToBrushConverter x:Key="TabDotBrush" />
 
         <!-- Shared look for caption buttons: 46×full titlebar, transparent bg, icon
@@ -91,7 +90,6 @@
         <KeyBinding Key="K" Modifiers="Control" Command="{Binding OpenCommandPaletteCommand}" />
         <KeyBinding Key="P" Modifiers="Control+Shift" Command="{Binding OpenCommandPaletteCommand}" />
         <KeyBinding Key="O" Modifiers="Control+Shift" Command="{Binding ToggleOverviewCommand}" />
-        <KeyBinding Key="D" Modifiers="Control" Command="{Binding ToggleDiffPanelCommand}" />
         <KeyBinding Key="F" Modifiers="Control" Command="{Binding FocusSidebarFilterCommand}" />
         <KeyBinding Key="F5" Command="{Binding RefreshAllCommand}" />
         <KeyBinding Key="OemPipe" Modifiers="Control" Command="{Binding SplitRightCommand}" />
@@ -317,36 +315,15 @@
                             </Style.Triggers>
                         </Style>
                     </Grid.Style>
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="*" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" />
-                    </Grid.RowDefinitions>
-
-                <!--
-                    Multi-group workspace: populated in MainWindow.xaml.cs with one
-                    EditorGroupView per group + 1px GridSplitters in between. View
-                    instances are cached by VM so terminals survive Groups mutations.
-                    Drag a splitter to repartition — ratios persist via LayoutStore.
-                -->
-                <Grid
-                    x:Name="WorkspacesHost"
-                    Grid.Row="0"
-                    AutomationProperties.AutomationId="EditorGroups" />
-
-                <!-- Diff panel: hidden by default, toggled via Ctrl+D. -->
-                <GridSplitter
-                    Grid.Row="1"
-                    Height="4"
-                    HorizontalAlignment="Stretch"
-                    VerticalAlignment="Stretch"
-                    Background="{DynamicResource DividerStrokeColorDefaultBrush}"
-                    Visibility="{Binding Diff.IsVisible, Converter={StaticResource BoolVisible}}" />
-                    <views:DiffPanelView
-                        Grid.Row="2"
-                        Height="260"
-                        DataContext="{Binding Diff}"
-                        Visibility="{Binding IsVisible, Converter={StaticResource BoolVisible}}" />
+                    <!--
+                        Multi-group workspace: populated in MainWindow.xaml.cs with one
+                        EditorGroupView per group + 1px GridSplitters in between. View
+                        instances are cached by VM so terminals survive Groups mutations.
+                        Drag a splitter to repartition — ratios persist via LayoutStore.
+                    -->
+                    <Grid
+                        x:Name="WorkspacesHost"
+                        AutomationProperties.AutomationId="EditorGroups" />
                 </Grid>
 
                 <!-- Overview layer. Shown when IsOverviewVisible is true; sibling of

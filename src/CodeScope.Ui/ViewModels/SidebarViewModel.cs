@@ -79,12 +79,6 @@ public sealed partial class SidebarViewModel : ObservableObject
     [ObservableProperty]
     private WorktreeViewModel? _selectedWorktree;
 
-    partial void OnSelectedWorktreeChanged(WorktreeViewModel? value)
-        => WorktreeSelected?.Invoke(this, value);
-
-    /// <summary>Raised whenever the user selects a new worktree in the sidebar.</summary>
-    public event EventHandler<WorktreeViewModel?>? WorktreeSelected;
-
     /// <summary>
     /// Raised when the "Spawn session on creation" toggle is on in the New Worktree dialog
     /// and the worktree has landed in the store. <see cref="MainViewModel"/> subscribes and
