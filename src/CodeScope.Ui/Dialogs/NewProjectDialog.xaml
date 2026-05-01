@@ -13,7 +13,11 @@
     Background="Transparent"
     TextElement.Foreground="{DynamicResource Fig.Brush.Ink}"
     TextElement.FontFamily="{DynamicResource Fig.Font.Sans}"
-    TextElement.FontSize="{DynamicResource Fig.Size.Body}">
+    TextElement.FontSize="{DynamicResource Fig.Size.Body}"
+    SnapsToDevicePixels="True"
+    UseLayoutRounding="True"
+    TextOptions.TextFormattingMode="Display"
+    TextOptions.TextRenderingMode="ClearType">
     <Window.Resources>
         <!-- Dialog-local styles mirroring NewWorktreeDialog so the visual language matches. -->
 
@@ -22,7 +26,6 @@
             <Setter Property="FontFamily" Value="{DynamicResource Fig.Font.Mono}" />
             <Setter Property="FontSize" Value="10" />
             <Setter Property="Foreground" Value="{DynamicResource Accent.Primary}" />
-            <Setter Property="TextOptions.TextFormattingMode" Value="Ideal" />
         </Style>
 
         <!-- Field label row. -->
