@@ -174,6 +174,60 @@ public sealed class SessionRetentionPolicyTests
     }
 
     [Fact]
+    public async Task SoftCloseSessionAsync_Sweep_Stays_Scoped_To_Affected_Project()
+    {
+        // Regression guard: SoftClose on project A must NOT prune anything from project B,
+        // even when both projects are independently over-cap. The sweep is project-scoped
+        // for perf (avoid walking unrelated state); confirm the filter is honoured.
+        var now = DateTimeOffset.UtcNow;
+
+        // Project A — at cap, with one live session about to be closed (the trigger).
+        var sessionsA = new List<Session>();
+        for (var i = 0; i < SessionRetentionPolicy.MaxPerWorktree; i++)
+        {
+            sessionsA.Add(ClosedAt($"a{i:D3}", "wA", now - TimeSpan.FromHours(i + 1)));
+        }
+        sessionsA.Add(Live("victim-a", "wA"));
+
+        var cfg = new ProjectsConfig
+        {
+            Projects =
+            [
+                new Project { Id = "pA", Name = "A", Path = @"C:\a", Sessions = sessionsA },
+                new Project { Id = "pB", Name = "B", Path = @"C:\b" },
+            ],
+        };
+
+        var (store, _) = Make(cfg);
+        await store.LoadAsync();
+
+        // After Load, project B is empty. Add an over-cap closed row directly via
+        // AddSessionAsync (bypasses the SoftClose path so no migration sweep is triggered).
+        await store.AddSessionAsync("pB", new Session
+        {
+            Id = "b-overflow",
+            WorktreeId = "wB",
+            WorktreePath = @"C:\b",
+            ClosedAt = now,
+        });
+        store.Projects.Single(p => p.Id == "pB").Sessions.Should().HaveCount(1);
+
+        // SoftClose on project A — A's bucket goes from cap to cap+1, triggering A's prune.
+        // The scoped sweep must NOT visit project B even though B has a closed session
+        // (which would survive in B anyway, but the contract is that scoped means scoped).
+        var events = new List<SessionStoreChange>();
+        store.Changed += (_, c) => events.Add(c);
+
+        var result = await store.SoftCloseSessionAsync("victim-a");
+        result.IsSuccess.Should().BeTrue();
+
+        store.Projects.Single(p => p.Id == "pA").Sessions
+            .Count(s => s.ClosedAt is not null).Should().Be(SessionRetentionPolicy.MaxPerWorktree);
+        store.Projects.Single(p => p.Id == "pB").Sessions.Should().ContainSingle(s => s.Id == "b-overflow",
+            "scoped sweep must not touch the unrelated project");
+    }
+
+    [Fact]
     public async Task Retention_Buckets_Are_PerWorktree_Not_PerProject()
     {
         var now = DateTimeOffset.UtcNow;
