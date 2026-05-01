@@ -198,34 +198,76 @@ public sealed class OpenCodeTelemetryService : IOpenCodeTelemetryService
         {
             try
             {
-                // OpenCode never modifies a message file once written — files are appended to the
-                // directory only. So we only parse files we haven't seen yet, then re-aggregate
-                // the in-memory entry list to derive the snapshot.
+                // OpenCode never modifies a message file once written, so each file is parsed at
+                // most once. Files are filtered by mtime against a watermark; same-tick siblings
+                // are disambiguated by a tiny set holding only files at the watermark instant.
+                // No per-message retention — three running aggregates cover the whole snapshot:
+                // last-by-CreatedAt overall (activity FSM), last user (turn duration), last
+                // assistant-with-usage (tokens + model + lastTurnAt). Issue #31.
+                var anyNewParsed = false;
                 foreach (var file in Directory.EnumerateFiles(watch.MessageDir, "msg_*.json"))
                 {
-                    if (watch.SeenFiles.Contains(file)) { continue; }
+                    FileInfo info;
+                    try { info = new FileInfo(file); }
+                    catch (Exception ex)
+                    {
+                        _logger.LogTrace(ex, "OpenCode telemetry: stat failed for {Path}", file);
+                        continue;
+                    }
+                    if (!info.Exists) { continue; }
+
+                    var lwt = info.LastWriteTimeUtc;
+                    if (lwt < watch.MtimeWatermark) { continue; }
+                    if (lwt == watch.MtimeWatermark && watch.SeenAtWatermark.Contains(file)) { continue; }
+
                     string content;
                     try { content = File.ReadAllText(file); }
                     catch (IOException) { continue; } // mid-write race — pick it up next poll
+
                     var entry = OpenCodeMessageParser.ParseContent(content);
                     if (entry is null) { continue; }
-                    watch.SeenFiles.Add(file);
-                    watch.Entries.Add(entry);
+
+                    if (lwt > watch.MtimeWatermark)
+                    {
+                        watch.MtimeWatermark = lwt;
+                        watch.SeenAtWatermark.Clear();
+                    }
+                    watch.SeenAtWatermark.Add(file);
+
+                    // Update the three CreatedAt-keyed aggregates. Files can land out of disk-order
+                    // (filesystem semantics, not OpenCode's fault), so each candidate is the entry
+                    // with the largest CreatedAt for its slice — not just "the last one we saw."
+                    var ec = entry.CreatedAt ?? DateTimeOffset.MinValue;
+                    if (watch.LastEntry is null || ec > (watch.LastEntry.CreatedAt ?? DateTimeOffset.MinValue))
+                    {
+                        watch.LastEntry = entry;
+                    }
+                    if (entry.Role == "user" &&
+                        (watch.LastUser is null || ec > (watch.LastUser.CreatedAt ?? DateTimeOffset.MinValue)))
+                    {
+                        watch.LastUser = entry;
+                    }
+                    if (entry.HasUsage)
+                    {
+                        if (watch.LastAssistantWithUsage is null ||
+                            ec > (watch.LastAssistantWithUsage.CreatedAt ?? DateTimeOffset.MinValue))
+                        {
+                            watch.LastAssistantWithUsage = entry;
+                        }
+                        watch.TurnCount += 1;
+                    }
+                    anyNewParsed = true;
                 }
 
-                if (watch.Entries.Count == 0) { return; }
+                if (watch.LastEntry is null) { return; }
+                if (!anyNewParsed && watch.Snapshot is not null) { return; }
 
-                // Order canonically by metadata.time.created so file-system enumeration order
-                // doesn't skew the activity FSM.
-                watch.Entries.Sort((a, b) =>
-                    Nullable.Compare(a.CreatedAt, b.CreatedAt));
-
-                var lastAssistantWithUsage = watch.Entries.LastOrDefault(e => e.HasUsage);
-                var lastEntry = watch.Entries[^1];
-                var lastUser = watch.Entries.LastOrDefault(e => e.Role == "user");
+                var lastAssistantWithUsage = watch.LastAssistantWithUsage;
+                var lastEntry = watch.LastEntry;
+                var lastUser = watch.LastUser;
 
                 var contextTokens = lastAssistantWithUsage?.ContextTokens ?? 0;
-                var turns = watch.Entries.Count(e => e.HasUsage);
+                var turns = watch.TurnCount;
                 var lastTurnAt = lastAssistantWithUsage?.CompletedAt ?? lastAssistantWithUsage?.CreatedAt;
                 TimeSpan? lastDuration = null;
                 if (lastAssistantWithUsage is not null && lastUser?.CreatedAt is { } userCreated
@@ -285,12 +327,29 @@ public sealed class OpenCodeTelemetryService : IOpenCodeTelemetryService
     {
         public string SessionId { get; } = sessionId;
         public string? MessageDir { get; set; }
+
         // UTC ticks of the last failed TryLocateMessageDir attempt; 0 = never missed.
         // Stored as a long so Register and PollAll can write/read atomically via
         // Interlocked operations (DateTimeOffset? is >8 bytes and not torn-read safe).
         public long LastLocateMissAtTicks;
-        public readonly HashSet<string> SeenFiles = new(StringComparer.OrdinalIgnoreCase);
-        public readonly List<OpenCodeMessageEntry> Entries = [];
+
+        // mtime-based "have we seen this file" gate — replaces the unbounded SeenFiles HashSet.
+        // OpenCode never modifies a written file, so file mtime is stable and a watermark is
+        // sufficient. SeenAtWatermark holds only files at exactly the watermark instant
+        // (same-tick siblings on coarse-resolution clocks); it resets whenever the watermark
+        // advances, so its size is bounded by the number of messages written within one mtime
+        // tick — vanishingly small in practice.
+        public DateTime MtimeWatermark = DateTime.MinValue;
+        public readonly HashSet<string> SeenAtWatermark = new(StringComparer.OrdinalIgnoreCase);
+
+        // Running aggregates — replaces the per-file Entries list. Each candidate is the entry
+        // with the largest metadata.time.created within its slice (overall / role=user /
+        // assistant-with-usage). TurnCount is incremented on every newly-parsed HasUsage entry.
+        public OpenCodeMessageEntry? LastEntry;
+        public OpenCodeMessageEntry? LastUser;
+        public OpenCodeMessageEntry? LastAssistantWithUsage;
+        public int TurnCount;
+
         public ClaudeSessionTelemetry? Snapshot;
         public readonly object ReadLock = new();
 
