@@ -193,11 +193,32 @@ public sealed class OpenCodeTelemetryService : IOpenCodeTelemetryService
 
     private void Recompute(Watch watch)
     {
-        if (watch.MessageDir is null || !Directory.Exists(watch.MessageDir)) { return; }
+        if (watch.MessageDir is null) { return; }
+        DirectoryInfo dirInfo;
+        try { dirInfo = new DirectoryInfo(watch.MessageDir); }
+        catch (Exception ex)
+        {
+            _logger.LogTrace(ex, "OpenCode telemetry: dir stat failed for {Path}", watch.MessageDir);
+            return;
+        }
+        if (!dirInfo.Exists) { return; }
+        var dirMtime = dirInfo.LastWriteTimeUtc;
+
         lock (watch.ReadLock)
         {
             try
             {
+                // Quiet-tick short-circuit: OpenCode bumps the directory's mtime whenever a new
+                // message file is created. If the directory's mtime hasn't moved since our last
+                // walk AND we already produced a snapshot, there can't be anything new to parse.
+                // Skips the per-tick `EnumerateFiles` + per-file `FileInfo` syscalls on idle
+                // sessions (the dominant case). Capture the mtime BEFORE the walk so a file
+                // that lands between this check and our enumerate is still picked up next tick.
+                if (dirMtime <= watch.LastWalkedDirMtime && watch.Snapshot is not null)
+                {
+                    return;
+                }
+
                 // OpenCode never modifies a message file once written, so each file is parsed at
                 // most once. Files are filtered by mtime against a watermark; same-tick siblings
                 // are disambiguated by a tiny set holding only files at the watermark instant.
@@ -258,6 +279,11 @@ public sealed class OpenCodeTelemetryService : IOpenCodeTelemetryService
                     }
                     anyNewParsed = true;
                 }
+
+                // Record the dir mtime captured before the walk — next tick can short-circuit
+                // unless the dir has changed again. Done unconditionally (even when the walk
+                // produced nothing new) so a "no-change" tick still updates the bar.
+                watch.LastWalkedDirMtime = dirMtime;
 
                 if (watch.LastEntry is null) { return; }
                 if (!anyNewParsed && watch.Snapshot is not null) { return; }
@@ -341,6 +367,10 @@ public sealed class OpenCodeTelemetryService : IOpenCodeTelemetryService
         // tick — vanishingly small in practice.
         public DateTime MtimeWatermark = DateTime.MinValue;
         public readonly HashSet<string> SeenAtWatermark = new(StringComparer.OrdinalIgnoreCase);
+
+        // Directory mtime captured at the start of the most recent successful Recompute walk.
+        // Used to short-circuit subsequent quiet-tick walks when no new file has appeared.
+        public DateTime LastWalkedDirMtime = DateTime.MinValue;
 
         // Running aggregates — replaces the per-file Entries list. Each candidate is the entry
         // with the largest metadata.time.created within its slice (overall / role=user /
