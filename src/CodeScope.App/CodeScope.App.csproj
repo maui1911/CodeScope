@@ -34,6 +34,10 @@
         <ProjectReference Include="..\CodeScope.Ui\CodeScope.Ui.csproj" />
     </ItemGroup>
 
+    <ItemGroup>
+        <InternalsVisibleTo Include="CodeScope.App.Tests" />
+    </ItemGroup>
+
     <!--
         conpty.dll ships under runtimes/win10-x64/native in the Ci.Microsoft.Windows.Console.ConPTY
         package. The package only publishes win10-* RID assets and .NET 10 no longer falls back
