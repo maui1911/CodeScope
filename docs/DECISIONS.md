@@ -223,3 +223,50 @@ it fires on every reparent, which is the exact bug we were fixing.
   about it. Dispatcher-affined, no locking.
 - Spec: `docs/superpowers/specs/2026-04-26-cross-group-terminal-drag-design.md`
 - Plan: `docs/superpowers/plans/2026-04-26-cross-group-terminal-drag.md`
+
+---
+
+## ADR-0015 — Closed-session retention policy: 100 per worktree, 90-day TTL
+
+**Date:** 2026-05-01
+**Status:** Accepted
+**Issue:** #33
+
+Soft-closed sessions accumulate in `projects.json` and in the sidebar History
+disclosure for the lifetime of an install. Without a bound, long-running
+installs grew hundreds of closed sessions per worktree, slowing config load
+and growing the sidebar tree. ADR-0013 introduced the explicit history surface
+but deliberately deferred the retention policy.
+
+**Decision:** Two complementary cuts, applied per-worktree on every prune sweep:
+
+1. **TTL** — sessions whose `ClosedAt` is older than 90 days are dropped.
+2. **Cap** — if the per-worktree closed count is still above 100, the oldest
+   entries beyond the cap are dropped (newest-first ordering preserved).
+
+Pruning runs on `LoadAsync` (one-time migration of pre-policy state) and on
+every `SoftCloseSessionAsync` (so the cap stays enforced as new closes arrive).
+Each pruned row emits `SessionStoreChange.SessionRemoved` so VM History rows
+disappear in lockstep. Live sessions (`ClosedAt is null`) are never touched.
+
+**Decision considered and rejected:**
+- *Manual purge only* (per-worktree "Clear history" action): accumulates
+  silently between user actions and never bounds the long tail. Useful as a
+  complementary affordance but not a sufficient policy on its own.
+- *Per-project retention* instead of per-worktree: a project with one busy
+  worktree would crowd out the closed-session history of its quieter siblings.
+
+**Consequences:**
+- Constants live in `SessionRetentionPolicy` (`MaxPerWorktree = 100`,
+  `MaxAge = 90 days`). Bumping them requires a code change + new ADR amendment;
+  not user-configurable for now.
+- Behaviour change: on first launch after this lands, any pre-existing closed
+  session older than 90 days OR beyond the cap-100 of its worktree is
+  irrecoverably dropped. The migration is logged as a warning if persistence
+  fails so the user can re-run.
+- Live sessions, sessions with `ClosedAt = null`, and orphan sessions
+  (`WorktreeId = null`) are still bounded — orphans collapse into a single
+  "no-worktree" bucket so the cap still bounds them.
+- A future "Clear history" UX (mentioned as a complementary action in #33)
+  doesn't conflict with this policy; it'd just be a manual variant of the
+  automatic sweep.

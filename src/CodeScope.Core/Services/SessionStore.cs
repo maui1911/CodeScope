@@ -46,10 +46,28 @@ public sealed class SessionStore : ISessionStore
             return;
         }
 
+        List<string> prunedSessionIds;
         lock (_lock)
         {
             _projects.Clear();
             _projects.AddRange(result.Value.Projects);
+            // Migration sweep — applies the retention policy to whatever was on disk before
+            // #33 landed. Persists below if anything actually changed so the next load
+            // doesn't re-prune the same rows.
+            prunedSessionIds = ApplyRetentionPolicyLocked();
+        }
+
+        if (prunedSessionIds.Count > 0)
+        {
+            var saved = await SaveSnapshotAsync(ct).ConfigureAwait(false);
+            if (saved.IsFailure)
+            {
+                _logger.LogWarning(
+                    "SessionStore: failed to persist post-load retention sweep ({N} pruned): {Error}",
+                    prunedSessionIds.Count, saved.Error);
+                // The in-memory state is still pruned — emitting Loaded with the post-prune
+                // snapshot keeps VMs honest; the failed save will retry on the next mutation.
+            }
         }
 
         Raise(new SessionStoreChange.Loaded(Projects));
@@ -229,7 +247,99 @@ public sealed class SessionStore : ISessionStore
         // can demote the row to History without re-querying store state (race-free).
         // Hard-remove (RemoveSessionAsync) still raises SessionRemoved unchanged.
         Raise(new SessionStoreChange.SessionSoftClosed(projectId!, closedSession!));
+
+        // Apply retention immediately on every soft-close so the cap stays enforced as new
+        // entries land. Each pruned row gets a SessionRemoved event so VM History rows
+        // disappear in lockstep. Persistence happens once for the whole batch.
+        List<string> prunedSessionIds;
+        lock (_lock) { prunedSessionIds = ApplyRetentionPolicyLocked(); }
+        if (prunedSessionIds.Count > 0)
+        {
+            var saved2 = await SaveSnapshotAsync(ct).ConfigureAwait(false);
+            if (saved2.IsFailure)
+            {
+                _logger.LogWarning(
+                    "SessionStore: failed to persist post-softclose retention sweep ({N} pruned): {Error}",
+                    prunedSessionIds.Count, saved2.Error);
+            }
+            foreach (var pruned in prunedSessionIds)
+            {
+                Raise(new SessionStoreChange.SessionRemoved(pruned));
+            }
+        }
+
         return Result<bool>.Ok(true);
+    }
+
+    /// <summary>
+    /// Applies the closed-session retention policy across every project's session list.
+    /// Caller must hold <see cref="_lock"/>. Returns the ids of sessions dropped from
+    /// in-memory state so the caller can persist + raise <c>SessionRemoved</c> events.
+    /// Idempotent: re-running on already-pruned state returns an empty list. See #33.
+    /// </summary>
+    private List<string> ApplyRetentionPolicyLocked()
+    {
+        var pruned = new List<string>();
+        var now = DateTimeOffset.UtcNow;
+
+        for (var i = 0; i < _projects.Count; i++)
+        {
+            var p = _projects[i];
+            var keep = new List<Session>(p.Sessions.Count);
+            var perWorktreeSurvivors = new Dictionary<string, List<Session>>(StringComparer.Ordinal);
+
+            foreach (var s in p.Sessions)
+            {
+                // Live sessions are never pruned; they always survive intact.
+                if (s.ClosedAt is null)
+                {
+                    keep.Add(s);
+                    continue;
+                }
+
+                // TTL pass — drop anything older than the retention window.
+                if (now - s.ClosedAt.Value > SessionRetentionPolicy.MaxAge)
+                {
+                    pruned.Add(s.Id);
+                    continue;
+                }
+
+                // Bucket the survivor by worktree id (null collapses to a single orphan
+                // bucket so cap enforcement still works on legacy rows without WorktreeId).
+                var bucketKey = s.WorktreeId ?? string.Empty;
+                if (!perWorktreeSurvivors.TryGetValue(bucketKey, out var bucket))
+                {
+                    bucket = [];
+                    perWorktreeSurvivors[bucketKey] = bucket;
+                }
+                bucket.Add(s);
+            }
+
+            // Cap pass — keep newest N closed per worktree, drop the older overflow.
+            foreach (var bucket in perWorktreeSurvivors.Values)
+            {
+                if (bucket.Count <= SessionRetentionPolicy.MaxPerWorktree)
+                {
+                    keep.AddRange(bucket);
+                    continue;
+                }
+
+                bucket.Sort((a, b) =>
+                    Nullable.Compare(b.ClosedAt, a.ClosedAt)); // newest first
+                for (var k = 0; k < bucket.Count; k++)
+                {
+                    if (k < SessionRetentionPolicy.MaxPerWorktree) { keep.Add(bucket[k]); }
+                    else { pruned.Add(bucket[k].Id); }
+                }
+            }
+
+            if (keep.Count != p.Sessions.Count)
+            {
+                _projects[i] = p with { Sessions = keep };
+            }
+        }
+
+        return pruned;
     }
 
     public async Task<Result<Session>> RestoreSessionAsync(string sessionId, CancellationToken ct = default)
