@@ -8,10 +8,20 @@ public sealed class OpenCodeTelemetryService : IOpenCodeTelemetryService
 {
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(350);
 
+    /// <summary>
+    /// How long to skip the recursive <see cref="TryLocateMessageDir"/> scan after a
+    /// "not found" result. Without this, every poll (350 ms) re-runs a recursive
+    /// directory walk over the entire opencode data root for sessions whose message dir
+    /// hasn't materialised yet — visible CPU on warm sessions. Issue #36.
+    /// </summary>
+    private static readonly TimeSpan LocateNotFoundTtl = TimeSpan.FromSeconds(2);
+
     private readonly ILogger<OpenCodeTelemetryService> _logger;
     private readonly string _dataRoot;
     private readonly ConcurrentDictionary<string, Watch> _watches = new();
     private readonly Timer? _pollTimer;
+    private readonly object _timerLock = new();
+    private bool _timerArmed;
     private FileSystemWatcher? _rootWatcher;
 
     public OpenCodeTelemetryService(ILogger<OpenCodeTelemetryService> logger)
@@ -28,7 +38,8 @@ public sealed class OpenCodeTelemetryService : IOpenCodeTelemetryService
         _dataRoot = dataRoot;
         if (enablePolling)
         {
-            _pollTimer = new Timer(_ => PollAll(), null, PollInterval, PollInterval);
+            // Start paused — armed on first Register, disarmed on last Unregister. Issue #36.
+            _pollTimer = new Timer(_ => PollAll(), null, Timeout.Infinite, Timeout.Infinite);
         }
 
         try
@@ -61,12 +72,40 @@ public sealed class OpenCodeTelemetryService : IOpenCodeTelemetryService
         _watches[sessionId] = watch;
 
         watch.MessageDir = TryLocateMessageDir(sessionId);
+        if (watch.MessageDir is null)
+        {
+            // Atomic 8-byte write — Register and PollAll both touch this field, so a plain
+            // DateTimeOffset? assignment would race (the struct is >8 bytes, not atomic).
+            Interlocked.Exchange(ref watch.LastLocateMissAtTicks, DateTimeOffset.UtcNow.UtcTicks);
+        }
         Recompute(watch);
+
+        RefreshTimerArmed();
     }
 
     public void Unregister(string sessionId)
     {
         if (_watches.TryRemove(sessionId, out var watch)) { watch.Dispose(); }
+        RefreshTimerArmed();
+    }
+
+    private void RefreshTimerArmed()
+    {
+        if (_pollTimer is null) { return; }
+        lock (_timerLock)
+        {
+            var shouldBeArmed = !_watches.IsEmpty;
+            if (shouldBeArmed == _timerArmed) { return; }
+            _pollTimer.Change(
+                shouldBeArmed ? PollInterval : Timeout.InfiniteTimeSpan,
+                shouldBeArmed ? PollInterval : Timeout.InfiniteTimeSpan);
+            _timerArmed = shouldBeArmed;
+        }
+    }
+
+    internal bool IsPollTimerArmedForTest
+    {
+        get { lock (_timerLock) { return _timerArmed; } }
     }
 
     public ClaudeSessionTelemetry? GetSnapshot(string sessionId) =>
@@ -102,14 +141,28 @@ public sealed class OpenCodeTelemetryService : IOpenCodeTelemetryService
 
     private void PollAll()
     {
+        var now = DateTimeOffset.UtcNow;
         foreach (var watch in _watches.Values)
         {
             try
             {
                 if (watch.MessageDir is null)
                 {
+                    // Throttle the recursive scan — the directory only appears once opencode
+                    // writes its first message file, and a 350 ms recursive walk over the
+                    // entire data root every tick is wasteful. Issue #36.
+                    var missTicks = Interlocked.Read(ref watch.LastLocateMissAtTicks);
+                    if (missTicks != 0 && now.UtcTicks - missTicks < LocateNotFoundTtl.Ticks)
+                    {
+                        continue;
+                    }
                     watch.MessageDir = TryLocateMessageDir(watch.SessionId);
-                    if (watch.MessageDir is null) { continue; }
+                    if (watch.MessageDir is null)
+                    {
+                        Interlocked.Exchange(ref watch.LastLocateMissAtTicks, now.UtcTicks);
+                        continue;
+                    }
+                    Interlocked.Exchange(ref watch.LastLocateMissAtTicks, 0);
                 }
                 Recompute(watch);
             }
@@ -232,6 +285,10 @@ public sealed class OpenCodeTelemetryService : IOpenCodeTelemetryService
     {
         public string SessionId { get; } = sessionId;
         public string? MessageDir { get; set; }
+        // UTC ticks of the last failed TryLocateMessageDir attempt; 0 = never missed.
+        // Stored as a long so Register and PollAll can write/read atomically via
+        // Interlocked operations (DateTimeOffset? is >8 bytes and not torn-read safe).
+        public long LastLocateMissAtTicks;
         public readonly HashSet<string> SeenFiles = new(StringComparer.OrdinalIgnoreCase);
         public readonly List<OpenCodeMessageEntry> Entries = [];
         public ClaudeSessionTelemetry? Snapshot;
