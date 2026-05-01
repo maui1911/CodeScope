@@ -126,6 +126,83 @@ public sealed class OpenCodeTelemetryServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task Recompute_Aggregates_Are_Incremental_Across_Many_Messages()
+    {
+        // Issue #31: retention is bounded by three CreatedAt-keyed candidates + a turn count,
+        // not the previous unbounded Entries list. Writing 100 messages and then one more must
+        // produce TurnCount == 51 — if the watermark/SeenAtWatermark gating is wrong, the new
+        // file would re-trigger a parse of every prior file (turn count would balloon).
+        var sid = "ses-many";
+        var dir = MessageDirFor("repo", sid);
+
+        for (var i = 0; i < 50; i++)
+        {
+            File.WriteAllText(Path.Combine(dir, $"msg_u_{i:D3}.json"), UserJson($"u_{i}", sid, 1000 + i * 2));
+            File.WriteAllText(Path.Combine(dir, $"msg_a_{i:D3}.json"),
+                AssistantJson($"a_{i}", sid, 1000 + i * 2 + 1, completed: 1000 + i * 2 + 1,
+                    input: 1, output: 1, cacheRead: 0, cacheWrite: 0, model: "x"));
+        }
+
+        using var svc = new OpenCodeTelemetryService(
+            NullLogger<OpenCodeTelemetryService>.Instance, _root, enablePolling: true);
+        svc.Register(sid, @"C:\repo");
+
+        svc.GetSnapshot(sid)!.TurnCount.Should().Be(50);
+
+        // Add one more turn — count must increment to 51, never re-counting prior files.
+        var newCreated = 1000 + 50 * 2 + 100;
+        await File.WriteAllTextAsync(Path.Combine(dir, "msg_a_extra.json"),
+            AssistantJson("a_extra", sid, newCreated, completed: newCreated + 1,
+                input: 1, output: 1, cacheRead: 0, cacheWrite: 0, model: "x"));
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (DateTime.UtcNow < deadline && (svc.GetSnapshot(sid)?.TurnCount ?? 0) < 51)
+        {
+            await Task.Delay(100);
+        }
+
+        svc.GetSnapshot(sid)!.TurnCount.Should().Be(51);
+    }
+
+    [Fact]
+    public void OutOfOrder_Mtimes_Are_All_Parsed_In_Single_Walk()
+    {
+        // Issue #31 follow-up: Directory.EnumerateFiles is not mtime-ordered. If the watermark
+        // were advanced mid-loop, an older sibling returned later in the iteration would be
+        // filtered against the freshly-bumped watermark and skipped permanently — its
+        // CreatedAt entry never reaching LastUser/LastEntry/TurnCount. This test forces that
+        // exact ordering by writing the assistant file FIRST (so it sorts first by name) and
+        // then back-dating the user file's LastWriteTimeUtc to a strictly earlier instant.
+        var sid = "ses-ooo";
+        var dir = MessageDirFor("repo", sid);
+
+        // Assistant file enumerated first (alphabetical: msg_a < msg_u). Newest mtime wins.
+        var assistantPath = Path.Combine(dir, "msg_a.json");
+        File.WriteAllText(assistantPath,
+            AssistantJson("msg_a", sid, 200, completed: 300, input: 7, output: 9, cacheRead: 0, cacheWrite: 0, model: "x"));
+        var userPath = Path.Combine(dir, "msg_u.json");
+        File.WriteAllText(userPath, UserJson("msg_u", sid, 100));
+
+        // Force out-of-order mtimes: assistant strictly NEWER than user, but enumerated first.
+        var now = DateTime.UtcNow;
+        File.SetLastWriteTimeUtc(userPath, now - TimeSpan.FromSeconds(10));
+        File.SetLastWriteTimeUtc(assistantPath, now);
+
+        using var svc = new OpenCodeTelemetryService(NullLogger<OpenCodeTelemetryService>.Instance, _root);
+        svc.Register(sid, @"C:\repo");
+
+        var snap = svc.GetSnapshot(sid);
+        snap.Should().NotBeNull();
+        // Both files must contribute: TurnCount=1 (assistant has usage), and the user→assistant
+        // pair must produce a non-null LastTurnDuration. If the user file is skipped, LastUser
+        // stays null and LastTurnDuration stays null even though the assistant was parsed.
+        snap!.TurnCount.Should().Be(1);
+        snap.LastTurnDuration.Should().NotBeNull(
+            "the user file (older mtime, enumerated second) must still be parsed so the user→assistant pair yields a duration");
+        snap.Activity.Should().Be(ClaudeActivityState.Idle);
+    }
+
+    [Fact]
     public void Unregister_Drops_Snapshot()
     {
         var sid = "ses-drop";
