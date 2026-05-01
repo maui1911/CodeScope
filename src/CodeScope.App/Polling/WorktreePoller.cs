@@ -16,6 +16,8 @@ namespace NoScope.CodeScope.App.Polling;
 public abstract class WorktreePoller<TState> : BackgroundService
     where TState : class
 {
+    private readonly SemaphoreSlim _pollGate = new(1, 1);
+
     protected ConcurrentDictionary<string, PollBackoff<TState>> States { get; } = new();
     protected ISessionStore Store { get; }
     protected ILogger Logger { get; }
@@ -52,11 +54,25 @@ public abstract class WorktreePoller<TState> : BackgroundService
     /// <summary>
     /// Forces an immediate poll of every worktree, bypassing the per-worktree back-off.
     /// Safe to call from the UI thread — work happens on the caller's continuation.
+    /// Serialised against the background timer via <see cref="_pollGate"/> so the
+    /// <see cref="PollBackoff{T}.TicksUntilNextPoll"/> reset can't race the timer's
+    /// read+decrement, and the same worktree never has two concurrent probes in flight.
     /// </summary>
-    public Task RefreshAsync(CancellationToken ct = default)
+    public async Task RefreshAsync(CancellationToken ct = default)
     {
-        foreach (var state in States.Values) { state.TicksUntilNextPoll = 0; }
-        return PollAllAsync(ct);
+        await _pollGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            foreach (var state in States.Values) { state.TicksUntilNextPoll = 0; }
+            await PollAllInternalAsync(ct).ConfigureAwait(false);
+        }
+        finally { _pollGate.Release(); }
+    }
+
+    public override void Dispose()
+    {
+        base.Dispose();
+        _pollGate.Dispose();
     }
 
     /// <summary>
@@ -71,6 +87,13 @@ public abstract class WorktreePoller<TState> : BackgroundService
     protected abstract Task ProbeAsync(Project project, Worktree worktree, PollBackoff<TState> state, CancellationToken ct);
 
     private async Task PollAllAsync(CancellationToken ct)
+    {
+        await _pollGate.WaitAsync(ct).ConfigureAwait(false);
+        try { await PollAllInternalAsync(ct).ConfigureAwait(false); }
+        finally { _pollGate.Release(); }
+    }
+
+    private async Task PollAllInternalAsync(CancellationToken ct)
     {
         var snapshot = Store.Projects;
         var seen = new HashSet<string>(StringComparer.Ordinal);
