@@ -15,6 +15,8 @@ public sealed class ClaudeTelemetryService : IClaudeTelemetryService
     private readonly string _projectsRoot;
     private readonly ConcurrentDictionary<string, Watch> _watches = new();
     private readonly Timer? _pollTimer;
+    private readonly object _timerLock = new();
+    private bool _timerArmed;
 
     public ClaudeTelemetryService(ILogger<ClaudeTelemetryService> logger)
         : this(logger, DefaultProjectsRoot(), enablePolling: true) { }
@@ -30,7 +32,10 @@ public sealed class ClaudeTelemetryService : IClaudeTelemetryService
         _projectsRoot = projectsRoot;
         if (enablePolling)
         {
-            _pollTimer = new Timer(_ => PollAll(), null, PollInterval, PollInterval);
+            // Start paused — RefreshTimerArmed() arms it on the first Register and disarms
+            // it on the last Unregister, so an idle CodeScope (no agent sessions) doesn't
+            // burn 4×/sec across the four telemetry services for nothing. Issue #36.
+            _pollTimer = new Timer(_ => PollAll(), null, Timeout.Infinite, Timeout.Infinite);
         }
     }
 
@@ -66,11 +71,37 @@ public sealed class ClaudeTelemetryService : IClaudeTelemetryService
 
         // Replay anything already on disk.
         TryRead(watch);
+
+        RefreshTimerArmed();
     }
 
     public void Unregister(string sessionId)
     {
         if (_watches.TryRemove(sessionId, out var watch)) { watch.Dispose(); }
+        RefreshTimerArmed();
+    }
+
+    /// <summary>
+    /// Arms the poll timer when at least one watch is registered, disarms it otherwise.
+    /// Prevents the 250 ms callback from firing continuously on an idle CodeScope.
+    /// </summary>
+    private void RefreshTimerArmed()
+    {
+        if (_pollTimer is null) { return; }
+        lock (_timerLock)
+        {
+            var shouldBeArmed = !_watches.IsEmpty;
+            if (shouldBeArmed == _timerArmed) { return; }
+            _pollTimer.Change(
+                shouldBeArmed ? PollInterval : Timeout.InfiniteTimeSpan,
+                shouldBeArmed ? PollInterval : Timeout.InfiniteTimeSpan);
+            _timerArmed = shouldBeArmed;
+        }
+    }
+
+    internal bool IsPollTimerArmedForTest
+    {
+        get { lock (_timerLock) { return _timerArmed; } }
     }
 
     public ClaudeSessionTelemetry? GetSnapshot(string sessionId) =>

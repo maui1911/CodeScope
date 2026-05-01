@@ -8,10 +8,20 @@ public sealed class OpenCodeTelemetryService : IOpenCodeTelemetryService
 {
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(350);
 
+    /// <summary>
+    /// How long to skip the recursive <see cref="TryLocateMessageDir"/> scan after a
+    /// "not found" result. Without this, every poll (350 ms) re-runs a recursive
+    /// directory walk over the entire opencode data root for sessions whose message dir
+    /// hasn't materialised yet — visible CPU on warm sessions. Issue #36.
+    /// </summary>
+    private static readonly TimeSpan LocateNotFoundTtl = TimeSpan.FromSeconds(2);
+
     private readonly ILogger<OpenCodeTelemetryService> _logger;
     private readonly string _dataRoot;
     private readonly ConcurrentDictionary<string, Watch> _watches = new();
     private readonly Timer? _pollTimer;
+    private readonly object _timerLock = new();
+    private bool _timerArmed;
     private FileSystemWatcher? _rootWatcher;
 
     public OpenCodeTelemetryService(ILogger<OpenCodeTelemetryService> logger)
@@ -28,7 +38,8 @@ public sealed class OpenCodeTelemetryService : IOpenCodeTelemetryService
         _dataRoot = dataRoot;
         if (enablePolling)
         {
-            _pollTimer = new Timer(_ => PollAll(), null, PollInterval, PollInterval);
+            // Start paused — armed on first Register, disarmed on last Unregister. Issue #36.
+            _pollTimer = new Timer(_ => PollAll(), null, Timeout.Infinite, Timeout.Infinite);
         }
 
         try
@@ -61,12 +72,35 @@ public sealed class OpenCodeTelemetryService : IOpenCodeTelemetryService
         _watches[sessionId] = watch;
 
         watch.MessageDir = TryLocateMessageDir(sessionId);
+        if (watch.MessageDir is null) { watch.LastLocateMissAt = DateTimeOffset.UtcNow; }
         Recompute(watch);
+
+        RefreshTimerArmed();
     }
 
     public void Unregister(string sessionId)
     {
         if (_watches.TryRemove(sessionId, out var watch)) { watch.Dispose(); }
+        RefreshTimerArmed();
+    }
+
+    private void RefreshTimerArmed()
+    {
+        if (_pollTimer is null) { return; }
+        lock (_timerLock)
+        {
+            var shouldBeArmed = !_watches.IsEmpty;
+            if (shouldBeArmed == _timerArmed) { return; }
+            _pollTimer.Change(
+                shouldBeArmed ? PollInterval : Timeout.InfiniteTimeSpan,
+                shouldBeArmed ? PollInterval : Timeout.InfiniteTimeSpan);
+            _timerArmed = shouldBeArmed;
+        }
+    }
+
+    internal bool IsPollTimerArmedForTest
+    {
+        get { lock (_timerLock) { return _timerArmed; } }
     }
 
     public ClaudeSessionTelemetry? GetSnapshot(string sessionId) =>
@@ -102,14 +136,27 @@ public sealed class OpenCodeTelemetryService : IOpenCodeTelemetryService
 
     private void PollAll()
     {
+        var now = DateTimeOffset.UtcNow;
         foreach (var watch in _watches.Values)
         {
             try
             {
                 if (watch.MessageDir is null)
                 {
+                    // Throttle the recursive scan — the directory only appears once opencode
+                    // writes its first message file, and a 350 ms recursive walk over the
+                    // entire data root every tick is wasteful. Issue #36.
+                    if (watch.LastLocateMissAt is { } missedAt && now - missedAt < LocateNotFoundTtl)
+                    {
+                        continue;
+                    }
                     watch.MessageDir = TryLocateMessageDir(watch.SessionId);
-                    if (watch.MessageDir is null) { continue; }
+                    if (watch.MessageDir is null)
+                    {
+                        watch.LastLocateMissAt = now;
+                        continue;
+                    }
+                    watch.LastLocateMissAt = null;
                 }
                 Recompute(watch);
             }
@@ -232,6 +279,7 @@ public sealed class OpenCodeTelemetryService : IOpenCodeTelemetryService
     {
         public string SessionId { get; } = sessionId;
         public string? MessageDir { get; set; }
+        public DateTimeOffset? LastLocateMissAt { get; set; }
         public readonly HashSet<string> SeenFiles = new(StringComparer.OrdinalIgnoreCase);
         public readonly List<OpenCodeMessageEntry> Entries = [];
         public ClaudeSessionTelemetry? Snapshot;

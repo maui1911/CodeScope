@@ -12,6 +12,8 @@ public sealed class CopilotTelemetryService : ICopilotTelemetryService
     private readonly string _sessionStateRoot;
     private readonly ConcurrentDictionary<string, Watch> _watches = new();
     private readonly Timer? _pollTimer;
+    private readonly object _timerLock = new();
+    private bool _timerArmed;
     private FileSystemWatcher? _rootWatcher;
 
     public CopilotTelemetryService(ILogger<CopilotTelemetryService> logger)
@@ -28,7 +30,8 @@ public sealed class CopilotTelemetryService : ICopilotTelemetryService
         _sessionStateRoot = sessionStateRoot;
         if (enablePolling)
         {
-            _pollTimer = new Timer(_ => PollAll(), null, PollInterval, PollInterval);
+            // Start paused — armed on first Register, disarmed on last Unregister. Issue #36.
+            _pollTimer = new Timer(_ => PollAll(), null, Timeout.Infinite, Timeout.Infinite);
         }
 
         // Single recursive watcher across the whole session-state root. Copilot creates
@@ -68,11 +71,33 @@ public sealed class CopilotTelemetryService : ICopilotTelemetryService
         {
             TryRead(watch);
         }
+
+        RefreshTimerArmed();
     }
 
     public void Unregister(string sessionId)
     {
         if (_watches.TryRemove(sessionId, out var watch)) { watch.Dispose(); }
+        RefreshTimerArmed();
+    }
+
+    private void RefreshTimerArmed()
+    {
+        if (_pollTimer is null) { return; }
+        lock (_timerLock)
+        {
+            var shouldBeArmed = !_watches.IsEmpty;
+            if (shouldBeArmed == _timerArmed) { return; }
+            _pollTimer.Change(
+                shouldBeArmed ? PollInterval : Timeout.InfiniteTimeSpan,
+                shouldBeArmed ? PollInterval : Timeout.InfiniteTimeSpan);
+            _timerArmed = shouldBeArmed;
+        }
+    }
+
+    internal bool IsPollTimerArmedForTest
+    {
+        get { lock (_timerLock) { return _timerArmed; } }
     }
 
     public ClaudeSessionTelemetry? GetSnapshot(string sessionId) =>
