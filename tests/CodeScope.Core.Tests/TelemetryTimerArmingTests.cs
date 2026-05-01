@@ -6,8 +6,8 @@ namespace NoScope.CodeScope.Core.Tests;
 /// <summary>
 /// Verifies the four telemetry services pause their poll timer when no watches are
 /// registered and re-arm it on the first <c>Register</c>. Without this, an idle
-/// CodeScope (no agent sessions) burns ~8 timer callbacks/sec across the four
-/// services for nothing. Issue #36.
+/// CodeScope (no agent sessions) burns ~4 callbacks/sec per service — ~15/sec across
+/// the four (3×250 ms + 1×350 ms) — for nothing. Issue #36.
 /// </summary>
 public sealed class TelemetryTimerArmingTests : IDisposable
 {

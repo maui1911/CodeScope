@@ -34,7 +34,8 @@ public sealed class ClaudeTelemetryService : IClaudeTelemetryService
         {
             // Start paused — RefreshTimerArmed() arms it on the first Register and disarms
             // it on the last Unregister, so an idle CodeScope (no agent sessions) doesn't
-            // burn 4×/sec across the four telemetry services for nothing. Issue #36.
+            // burn ~4 callbacks/sec per service (~15/sec across the four telemetry services
+            // combined: 3×250 ms + 1×350 ms) for nothing. Issue #36.
             _pollTimer = new Timer(_ => PollAll(), null, Timeout.Infinite, Timeout.Infinite);
         }
     }
