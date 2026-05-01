@@ -69,11 +69,12 @@ public abstract class WorktreePoller<TState> : BackgroundService
         finally { _pollGate.Release(); }
     }
 
-    public override void Dispose()
-    {
-        base.Dispose();
-        _pollGate.Dispose();
-    }
+    // Intentionally NOT overriding Dispose to dispose _pollGate. base.Dispose() cancels the
+    // stoppingToken but does not await an in-flight PollAllAsync — that runs on a threadpool
+    // thread and may be holding the gate or about to call Release. Disposing the semaphore
+    // synchronously here would race that Release into ObjectDisposedException. SemaphoreSlim
+    // only needs explicit Dispose if AvailableWaitHandle is accessed (we don't); otherwise
+    // GC reclaims the underlying state safely.
 
     /// <summary>
     /// Hook for subclasses to short-circuit the probe (e.g. prune missing paths). Returning
