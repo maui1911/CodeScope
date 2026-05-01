@@ -2,6 +2,7 @@ using System.Collections.Specialized;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using System.Windows.Media;
 using NoScope.CodeScope.App.Persistence;
 using NoScope.CodeScope.App.Toasts;
 using NoScope.CodeScope.Ui.Services;
@@ -292,6 +293,15 @@ public partial class MainWindow : FluentWindow
     /// (brand cell + strip host). Interactive children (tab strips, group buttons,
     /// TitleBar caption glyphs) handle their own clicks, so this bubble only fires
     /// when the user clicks empty caption space.
+    /// <para>
+    /// When the window is Maximized, dragging the title bar must un-maximize and
+    /// reposition the restored window under the cursor — that's the standard Win32
+    /// behavior every other app provides. WPF's <see cref="Window.DragMove"/> is a
+    /// no-op while Maximized, so we do it ourselves: capture the mouse-relative
+    /// fraction of the title-bar width, flip to Normal, place the restored window
+    /// so the cursor lands at the same horizontal fraction of the (smaller) title
+    /// bar, then continue with DragMove. Issue #24.
+    /// </para>
     /// </summary>
     private void OnCaptionDrag(object sender, System.Windows.Input.MouseButtonEventArgs e)
     {
@@ -302,6 +312,28 @@ public partial class MainWindow : FluentWindow
             e.Handled = true;
             return;
         }
+
+        if (WindowState == WindowState.Maximized)
+        {
+            // Capture cursor's horizontal fraction of the maximized title bar BEFORE
+            // restoring — the same fraction is reapplied to RestoreBounds.Width so the
+            // window jumps to a position that keeps the cursor over the title bar.
+            var pos = e.GetPosition(this);
+            var fraction = ActualWidth > 0 ? pos.X / ActualWidth : 0.5;
+            var mouseScreen = PointToScreen(pos);
+            var dpi = VisualTreeHelper.GetDpi(this);
+            var screenX = mouseScreen.X / dpi.DpiScaleX;
+            var screenY = mouseScreen.Y / dpi.DpiScaleY;
+
+            // RestoreBounds is the size we'll snap back to (the last Normal-state size).
+            // If for some reason it's empty (Window never sized in Normal mode), fall
+            // back to a reasonable default so the math still works.
+            var restoreWidth = RestoreBounds.Width > 0 ? RestoreBounds.Width : 1200;
+            WindowState = WindowState.Normal;
+            Left = screenX - (restoreWidth * fraction);
+            Top = screenY - (pos.Y); // keep the same vertical offset within the title bar
+        }
+
         try { DragMove(); }
         catch (InvalidOperationException ex)
         {
