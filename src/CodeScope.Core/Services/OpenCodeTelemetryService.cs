@@ -220,12 +220,20 @@ public sealed class OpenCodeTelemetryService : IOpenCodeTelemetryService
                 }
 
                 // OpenCode never modifies a message file once written, so each file is parsed at
-                // most once. Files are filtered by mtime against a watermark; same-tick siblings
-                // are disambiguated by a tiny set holding only files at the watermark instant.
-                // No per-message retention — three running aggregates cover the whole snapshot:
-                // last-by-CreatedAt overall (activity FSM), last user (turn duration), last
-                // assistant-with-usage (tokens + model + lastTurnAt). Issue #31.
+                // most once. Files are filtered by mtime against a watermark snapshotted at loop
+                // entry; same-tick siblings are disambiguated by a tiny set holding only files
+                // at the watermark instant. The watermark is advanced AFTER the walk because
+                // EnumerateFiles is not mtime-ordered: if we advanced mid-loop, an older sibling
+                // returned later in the iteration would be filtered against the freshly-bumped
+                // watermark and skipped permanently (its CreatedAt entry never reaching
+                // LastUser/LastEntry/TurnCount). No per-message retention — three running
+                // aggregates cover the whole snapshot: last-by-CreatedAt overall (activity FSM),
+                // last user (turn duration), last assistant-with-usage (tokens + model +
+                // lastTurnAt). Issue #31.
                 var anyNewParsed = false;
+                var entryWatermark = watch.MtimeWatermark;
+                var maxMtimeSeen = entryWatermark;
+                HashSet<string>? newSeenAtMax = null;
                 foreach (var file in Directory.EnumerateFiles(watch.MessageDir, "msg_*.json"))
                 {
                     FileInfo info;
@@ -238,8 +246,8 @@ public sealed class OpenCodeTelemetryService : IOpenCodeTelemetryService
                     if (!info.Exists) { continue; }
 
                     var lwt = info.LastWriteTimeUtc;
-                    if (lwt < watch.MtimeWatermark) { continue; }
-                    if (lwt == watch.MtimeWatermark && watch.SeenAtWatermark.Contains(file)) { continue; }
+                    if (lwt < entryWatermark) { continue; }
+                    if (lwt == entryWatermark && watch.SeenAtWatermark.Contains(file)) { continue; }
 
                     string content;
                     try { content = File.ReadAllText(file); }
@@ -248,12 +256,18 @@ public sealed class OpenCodeTelemetryService : IOpenCodeTelemetryService
                     var entry = OpenCodeMessageParser.ParseContent(content);
                     if (entry is null) { continue; }
 
-                    if (lwt > watch.MtimeWatermark)
+                    // Track the post-loop watermark + the set of files exactly at it. Files
+                    // strictly between entryWatermark and maxMtimeSeen don't need to be tracked
+                    // — next tick will filter them out by the new watermark anyway.
+                    if (lwt > maxMtimeSeen)
                     {
-                        watch.MtimeWatermark = lwt;
-                        watch.SeenAtWatermark.Clear();
+                        maxMtimeSeen = lwt;
+                        newSeenAtMax = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { file };
                     }
-                    watch.SeenAtWatermark.Add(file);
+                    else if (lwt == maxMtimeSeen)
+                    {
+                        (newSeenAtMax ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase)).Add(file);
+                    }
 
                     // Update the three CreatedAt-keyed aggregates. Files can land out of disk-order
                     // (filesystem semantics, not OpenCode's fault), so each candidate is the entry
@@ -278,6 +292,18 @@ public sealed class OpenCodeTelemetryService : IOpenCodeTelemetryService
                         watch.TurnCount += 1;
                     }
                     anyNewParsed = true;
+                }
+
+                // Commit the watermark only after the walk so mid-loop advances can't filter
+                // out older siblings returned later by EnumerateFiles.
+                if (newSeenAtMax is not null)
+                {
+                    if (maxMtimeSeen > entryWatermark)
+                    {
+                        watch.MtimeWatermark = maxMtimeSeen;
+                        watch.SeenAtWatermark.Clear();
+                    }
+                    foreach (var f in newSeenAtMax) { watch.SeenAtWatermark.Add(f); }
                 }
 
                 // Record the dir mtime captured before the walk — next tick can short-circuit
