@@ -22,8 +22,8 @@ public sealed class ToastServiceTests
         }
 
         svc.Items.Count(i => i.Severity == ToastSeverity.Info).Should().Be(3);
-        // Oldest dropped, newest retained — last three indices survive.
-        svc.Items.Select(i => i.Title).Should().BeEquivalentTo(["Info 2", "Info 3", "Info 4"]);
+        // Oldest dropped, newest retained — last three indices survive, in insertion order.
+        svc.Items.Select(i => i.Title).Should().Equal("Info 2", "Info 3", "Info 4");
     }
 
     [Fact]
@@ -37,8 +37,8 @@ public sealed class ToastServiceTests
         }
 
         svc.Items.Count.Should().Be(20);
-        // Oldest 5 dropped; 5..24 retained.
-        svc.Items.Select(i => i.Title).Should().BeEquivalentTo(
+        // Oldest 5 dropped; 5..24 retained, in insertion order.
+        svc.Items.Select(i => i.Title).Should().Equal(
             Enumerable.Range(5, 20).Select(i => $"Err {i}"));
     }
 

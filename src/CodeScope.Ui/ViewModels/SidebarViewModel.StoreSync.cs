@@ -187,9 +187,11 @@ public sealed partial class SidebarViewModel
         if (previous is null || pr is null || previous.CiStatus == pr.CiStatus) { return; }
 
         var label = pvm is not null ? $"{pvm.Name} · {wvm.DisplayBranch}" : wvm.DisplayBranch;
-        // Stable id keyed on worktree+PR so a flapping CI replaces the existing toast in
-        // place rather than stacking — see #34.
-        var ciId = $"ci-{worktreeId}-{pr.Number}";
+        // Stable id keyed on project+worktree+PR so a flapping CI replaces the existing
+        // toast in place rather than stacking. projectId is required because Worktree.Id
+        // ("primary" for every project's primary) is not globally unique — without it,
+        // CI toasts from different projects sharing a PR number would clobber each other.
+        var ciId = $"ci-{projectId}-{worktreeId}-{pr.Number}";
         switch (pr.CiStatus)
         {
             case CiStatus.Success:
