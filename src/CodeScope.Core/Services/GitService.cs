@@ -196,9 +196,6 @@ public sealed class GitService : IGitService
         };
     }
 
-    public Task<Result<string>> GetDiffAsync(string workingDirectory, CancellationToken ct = default)
-        => RunAsync(workingDirectory, "diff --no-color HEAD", ct);
-
     public Task<Result<string>> PullAsync(string workingDirectory, CancellationToken ct = default)
         => RunAsync(workingDirectory, "pull --ff-only", ct);
 

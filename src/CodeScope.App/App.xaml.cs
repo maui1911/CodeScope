@@ -158,7 +158,6 @@ public partial class App : Application
                         agents: sp.GetRequiredService<IAgentRegistry>(),
                         git: git);
                 });
-                services.AddSingleton<DiffPanelViewModel>();
                 services.AddSingleton<MainViewModel>(sp =>
                 {
                     var wtPoller = sp.GetRequiredService<WorktreeStatusPoller>();
@@ -188,10 +187,6 @@ public partial class App : Application
                         sp.GetRequiredService<NoScope.CodeScope.Ui.Services.ITaskbarBadgeService>());
                     var sidebar = sp.GetRequiredService<SidebarViewModel>();
                     vm.AttachSidebar(sidebar);
-                    var diff = sp.GetRequiredService<DiffPanelViewModel>();
-                    vm.AttachDiffPanel(diff);
-                    // Bridge sidebar selection → diff panel.
-                    sidebar.WorktreeSelected += (_, wt) => diff.AttachWorktree(wt);
                     return vm;
                 });
                 services.AddSingleton<MainWindow>();

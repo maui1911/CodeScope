@@ -61,12 +61,6 @@ public interface IGitService
     /// </summary>
     Task<Result<string?>> GetRemoteUrlAsync(string workingDirectory, string remote = "origin", CancellationToken ct = default);
 
-    /// <summary>
-    /// Runs <c>git diff --no-color HEAD</c> and returns the raw unified patch. Empty string when clean.
-    /// Not parsed — callers (like the diff panel) render it directly.
-    /// </summary>
-    Task<Result<string>> GetDiffAsync(string workingDirectory, CancellationToken ct = default);
-
     /// <summary>Runs <c>git pull --ff-only</c>; fails cleanly when diverged.</summary>
     Task<Result<string>> PullAsync(string workingDirectory, CancellationToken ct = default);
 

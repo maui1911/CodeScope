@@ -179,11 +179,7 @@ public sealed partial class MainViewModel : ObservableObject
     /// <summary>Notification queue projection for the status-bar bell cluster (spec §11).</summary>
     public NotificationsViewModel? Notifications { get; }
 
-    public DiffPanelViewModel? Diff { get; private set; }
-
     public OverviewViewModel? Overview { get; private set; }
-
-    public void AttachDiffPanel(DiffPanelViewModel diff) => Diff = diff;
 
     /// <summary>
     /// Toggles the session grid that takes over the right column when the user hits
@@ -231,14 +227,6 @@ public sealed partial class MainViewModel : ObservableObject
             if (nested is not null) { return nested; }
         }
         return null;
-    }
-
-    [RelayCommand]
-    private void ToggleDiffPanel()
-    {
-        if (Diff is null) { return; }
-        Diff.IsVisible = !Diff.IsVisible;
-        if (Diff.IsVisible && Sidebar?.SelectedWorktree is { } wt) { Diff.AttachWorktree(wt); }
     }
 
     [ObservableProperty]
