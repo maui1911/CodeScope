@@ -193,6 +193,15 @@ public sealed partial class MainViewModel : ObservableObject
     [ObservableProperty]
     private bool _isOverviewVisible;
 
+    /// <summary>
+    /// Mirror visibility into <see cref="OverviewViewModel.IsActive"/> so the Overview VM
+    /// suppresses the per-tick rebuild while it isn't on stage. Issue #30.
+    /// </summary>
+    partial void OnIsOverviewVisibleChanged(bool value)
+    {
+        if (Overview is { } o) { o.IsActive = value; }
+    }
+
     [RelayCommand]
     private void ToggleOverview() => IsOverviewVisible = !IsOverviewVisible;
 

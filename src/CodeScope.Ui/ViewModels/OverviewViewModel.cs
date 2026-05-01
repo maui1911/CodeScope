@@ -19,6 +19,21 @@ public sealed partial class OverviewViewModel : ObservableObject
     private readonly ObservableCollection<EditorGroupViewModel> _groups;
     private readonly IAgentRegistry? _agents;
 
+    /// <summary>
+    /// Tracks whether the Overview screen is currently visible. While hidden every status
+    /// tick (worktree poller every 3s, PR poller every 30s) and every Tabs/Projects mutation
+    /// would otherwise rebuild <see cref="Cards"/> + <see cref="FilteredCards"/> from
+    /// scratch — meaningful continuous GC churn behind a screen the user isn't even looking
+    /// at. We instead set <see cref="_dirty"/> when an event fires while hidden, and flush
+    /// a single rebuild on the hidden→visible transition. Subscriptions stay armed so the
+    /// dirty flag remains honest across the gap. Issue #30.
+    /// </summary>
+    // Default: hidden. Most sessions start with the workspace on stage; MainViewModel flips
+    // IsActive on when the user toggles IsOverviewVisible. The constructor's unconditional
+    // initial Rebuild() seeds Cards once; gated rebuilds take over from there.
+    private bool _isActive;
+    private bool _dirty;
+
     public OverviewViewModel(
         SidebarViewModel sidebar,
         ObservableCollection<EditorGroupViewModel> groups,
@@ -38,6 +53,26 @@ public sealed partial class OverviewViewModel : ObservableObject
         foreach (var p in _sidebar.Projects) { HookProject(p); }
 
         Rebuild();
+    }
+
+    /// <summary>
+    /// Set to <c>true</c> when the Overview is visible, <c>false</c> when hidden. Drives
+    /// the gate that suppresses rebuilds while the screen isn't on stage. The host
+    /// (<see cref="MainViewModel"/>) flips this in lockstep with <c>IsOverviewVisible</c>.
+    /// </summary>
+    public bool IsActive
+    {
+        get => _isActive;
+        set
+        {
+            if (_isActive == value) { return; }
+            _isActive = value;
+            if (value && _dirty)
+            {
+                _dirty = false;
+                RebuildOnUi();
+            }
+        }
     }
 
     private IEnumerable<SessionTabViewModel> AllTabs => _groups.SelectMany(g => g.Tabs);
@@ -121,10 +156,16 @@ public sealed partial class OverviewViewModel : ObservableObject
 
     /// <summary>
     /// Marshal the rebuild to the UI thread — store events fire from background pollers and we
-    /// touch ObservableCollections here.
+    /// touch ObservableCollections here. Gated on <see cref="IsActive"/> so hidden Overview
+    /// only sets the dirty flag and defers the rebuild to the next show.
     /// </summary>
     private void RebuildOnUi()
     {
+        if (!_isActive)
+        {
+            _dirty = true;
+            return;
+        }
         if (Application.Current?.Dispatcher is { } d && !d.CheckAccess())
         {
             d.BeginInvoke(Rebuild);
