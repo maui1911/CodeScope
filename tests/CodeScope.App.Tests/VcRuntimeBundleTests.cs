@@ -68,4 +68,39 @@ public sealed class VcRuntimeBundleTests
                 "on a machine with the latest VC++ Redistributable to regenerate.");
         }
     }
+
+    /// <summary>
+    /// Structural guard on CodeScope.App.csproj: the Content glob that bundles the
+    /// VC runtime must declare BOTH <c>CopyToOutputDirectory</c> AND
+    /// <c>CopyToPublishDirectory</c>. The build-output tests above cover the former,
+    /// but if <c>CopyToPublishDirectory</c> regresses while <c>CopyToOutputDirectory</c>
+    /// still works, CI stays green and the shipped Velopack package silently loses
+    /// the VC runtime — reintroducing the original black-screen bug. We assert the
+    /// project file directly because spinning up a `dotnet publish` inside an xUnit
+    /// run would balloon test time and pull in the full SDK.
+    /// </summary>
+    [Fact]
+    public void Csproj_Bundle_Sets_Both_CopyToOutput_And_CopyToPublish()
+    {
+        var testDir = Path.GetDirectoryName(typeof(VcRuntimeBundleTests).Assembly.Location)!;
+        var repoRoot = Path.GetFullPath(Path.Combine(testDir, "..", "..", "..", "..", ".."));
+        var csproj = Path.Combine(repoRoot, "src", "CodeScope.App", "CodeScope.App.csproj");
+        File.Exists(csproj).Should().BeTrue($"expected csproj at {csproj}");
+
+        var doc = System.Xml.Linq.XDocument.Load(csproj);
+        var bundleItem = doc.Descendants("Content")
+            .FirstOrDefault(e => (string?)e.Attribute("Include") is string inc
+                && inc.Replace('\\', '/').Contains("native/vcredist", StringComparison.OrdinalIgnoreCase));
+
+        bundleItem.Should().NotBeNull(
+            "CodeScope.App.csproj must contain a Content item that globs native/vcredist/*.dll. " +
+            "Without it the VC runtime never lands beside CodeScope.exe and fresh-install users get a black workspace.");
+
+        bundleItem!.Element("CopyToOutputDirectory")?.Value.Should().Be(
+            "PreserveNewest",
+            "CopyToOutputDirectory must be PreserveNewest so `dotnet build` drops the runtime DLLs.");
+        bundleItem.Element("CopyToPublishDirectory")?.Value.Should().Be(
+            "PreserveNewest",
+            "CopyToPublishDirectory must be PreserveNewest so `dotnet publish` (and therefore the Velopack package) ships the runtime DLLs. Losing this flag silently reintroduces the original black-screen bug for fresh installs.");
+    }
 }

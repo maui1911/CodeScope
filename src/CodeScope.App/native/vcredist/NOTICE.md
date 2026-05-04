@@ -27,15 +27,23 @@ Microsoft Visual C++ Redistributable was installed. This produces bit-identical
 binaries to the official redist payload — Microsoft updates System32 from the
 same MSI.
 
-To refresh, run:
+**Architecture safety:** the refresh script only runs on 64-bit (x64) Windows
+from a 64-bit PowerShell process. On ARM64 Windows or from a 32-bit PowerShell,
+`%SystemRoot%\System32` would hand back ARM64 or (via WoW64 redirection) x86
+DLLs with the same filenames — the script aborts with an explicit error in
+those cases so we never accidentally commit non-x64 runtimes into the win-x64
+release pipeline.
+
+To refresh, run from a 64-bit PowerShell on x64 Windows:
 
 ```pwsh
 pwsh tools/refresh-vcruntime.ps1
 ```
 
-The script copies the three DLLs from `%SystemRoot%\System32`, prints the
-new versions and SHA-256 hashes, and updates the table above is *not*
-automatic — bump the table by hand after a refresh.
+The script copies the three DLLs from `%SystemRoot%\System32`, then prints the
+new versions and SHA-256 hashes. **The table above is not updated
+automatically** — copy the printed values into this file by hand after a
+refresh.
 
 ## Redistribution license
 
