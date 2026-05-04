@@ -5,143 +5,74 @@
 > **Intent:** cursor + last 1–2 sessions in depth, everything else a one-liner.
 > Old detail lives in `git log` — don't duplicate it here.
 
-**Last updated:** 2026-04-30 (session 25)
-**Branch:** `iconbubbely` (off `main`); taskbar overlay badge feature, rebased onto `main` after #22 + #23 merged. PR #25 open.
-**Head:** `51229ee` (will bump after this HANDOFF update commits) — see session 25 below.
-**Release:** `v0.1.0` shipped via GitHub Actions — https://github.com/maui1911/CodeScope/releases/tag/v0.1.0
-**Build status:** ✅ `dotnet build CodeScope.sln` clean. Full solution `dotnet test` 385/385 green (Core 233, Ui 135, App 17), modulo two known FSWatcher flakes (`ClaudeSessionDiscoveryTests.Callback_Fires_For_Each_New_Jsonl…` and `PiSessionDiscoveryTests.Discovers_New_Session_File_With_Matching_Cwd` — pass in isolation).
-**Uncommitted work:** this HANDOFF cursor tweak.
-**Unpushed commits:** `iconbubbely` rebased onto `origin/main` (10 commits, all post-`e1ee4ea`); needs `git push --force-with-lease` because the rebase rewrote SHAs. PR #25 will pick up the new tip automatically.
+**Last updated:** 2026-05-04 (session 26)
+**Branch:** `main`
+**Head:** `bd6ba22` — fix: snap dialogs to device pixels (#49)
+**Release:** `v0.2.4` shipped — https://github.com/maui1911/CodeScope/releases/tag/v0.2.4
+**Build status:** ✅ `dotnet build CodeScope.sln` clean. Full solution `dotnet test` 420/420 green (Core 248, Ui 145, App 27), modulo two known FSWatcher flakes (`ClaudeSessionDiscoveryTests.Callback_Fires_For_Each_New_Jsonl…` and `PiSessionDiscoveryTests.Discovers_New_Session_File_With_Matching_Cwd` — pass in isolation).
+**Uncommitted work:** none.
+**All issues closed.** No open GitHub issues.
+
+### Sessions 26–28 — perf sweep, cleanup, UX fixes (PRs #38–#49)
+
+A batch of memory/perf fixes, one feature removal, and two UX fixes landed
+between sessions 25 and this update. All merged to `main` via PRs; no open
+branches. Releases v0.2.0 → v0.2.4 shipped.
+
+**Performance / memory (PRs #38–#46):**
+- `43c6ffd` (#38) — **Status-bar hook cleanup.** `_statusBarHookedTabs` /
+  `_statusBarHookedWts` HashSets now evict entries on `CollectionChanged.OldItems`
+  so closed tabs / removed worktrees are GC-eligible. `WorktreePoller` prune
+  path added for `PullRequestStatusPoller` parity.
+- `126c2c5` (#40) — **WorktreePoller serialisation.** `SemaphoreSlim(1,1)` gates
+  `RefreshAsync` vs. timer `PollAllAsync` to prevent double-probe or skip. Two
+  new tests.
+- `6057060` (#44) — **OverviewViewModel gating.** `IsActive` flag suppresses
+  `RebuildOnUi` while overview is hidden; dirty flag triggers one rebuild on
+  re-show. 120 lines of test coverage.
+- `b7d9eec` (#45) — **Dev-mode MemoryWatchdog.** 5 min `WorkingSet64` poll,
+  warns on ≥ 50 MB growth/tick. Scrollback-cap blocker documented (upstream
+  `Microsoft.Terminal.Wpf` doesn't expose the setting).
+- `d35191d` (#41) — **Error toast cap.** Hard-cap visible errors at 20; oldest
+  drops. CI toasts use stable `"ci-<wt>-<pr#>"` ids → replace-in-place. 82-line
+  test file.
+- `1882a9b` (#46) — **Session retention policy.** `SessionRetentionPolicy`
+  (100/worktree, 90-day TTL) enforced on load + after every soft-close. ADR-0015.
+  290-line test file.
+- `7349766` (#42) — **Telemetry timer arming.** Four telemetry services now start
+  paused; arm/disarm on Register/Unregister. OpenCode gains 2 s "not found" TTL
+  on `TryLocateMessageDir`. 89-line test file.
+- `15d8e76` (#43) — **OpenCode running aggregates.** Unbounded `List<>` + full
+  sort replaced with four running candidates (`LastEntry`, `LastUser`,
+  `LastAssistantWithUsage`, `TurnCount`). 77-line test file.
+
+**Feature removal (PR #48):**
+- `30070e2` — **Diff panel removed.** `DiffPanelViewModel`, `DiffPanelView`,
+  `IGitService.GetDiffAsync`, `Ctrl+D` binding, command palette entry, and the
+  HTML design mock all deleted. ADR-0016. No consumers remained.
+
+**UX fixes (PRs #47, #49):**
+- `39899e2` (#47) — **Un-maximize on title-bar drag.** Maximized window now
+  un-maximizes and follows cursor with correct horizontal fraction preserved.
+- `bd6ba22` (#49) — **Dialog pixel snap.** `SnapsToDevicePixels` +
+  `UseLayoutRounding` + `TextFormattingMode=Display` on NewWorktree,
+  NewProject, CommandPalette dialogs — crisp text at fractional DPI.
+
+**Other (already in session 25 handoff):**
+- `2c37645` (#27) — Process tree kill on tab close + conpty.dll glob fix.
+- `2437865` — README install-first rewrite.
 
 ### Session 25 — taskbar overlay badge (#18, PR #25)
 
-User-visible: the Windows taskbar icon now carries a small overlay that
-reflects aggregate agent activity across the whole app — green dot when ≥1
-agent tab is registered and all idle, red disc with the busy count digit
-otherwise. 10+ busy renders `9` with a small superscript `+` so the badge
-stays one digit wide. No overlay when the workspace has zero agent tabs (or
-only shell tabs). `Description` text is set in parallel for screen readers
-(`"All agents idle"` / `"3 agents working"` / empty). Hand-verified against
-the dev build; user-confirmed the green-idle state and the
-top-right-of-icon position (Windows positions the overlay closest to screen
-content, so a top-of-screen taskbar gets the badge anchored top-right of
-the icon — that placement is Windows-controlled, not configurable).
+Green/red taskbar overlay badge reflecting aggregate agent activity. ADR in
+session 25 detail below; `ITaskbarBadgeService`, `MainViewModel.TaskbarBadge.cs`
+partial, 6 tests. Shipped in `22f7982` (v0.2.3).
 
-How:
+### Session 24 — Add project from a git URL (#20, PR #23)
 
-- New `ITaskbarBadgeService` (UI singleton) owns
-  `Window.TaskbarItemInfo.Overlay` + `.Description` on the active main
-  window. Default impl `TaskbarBadgeService` rasterises a 16×16
-  `BitmapSource` via `DrawingVisual` + `RenderTargetBitmap`: filled disc
-  (radius 7), 1 px contrast ring (radius 7.5, 40 % black) for legibility on
-  light AND dark taskbars, optional centred white digit (Segoe UI Variable,
-  weight 700, em 10) and optional super-scripted "+" (em 6) at top-right.
-  Brushes resolve from theme (`Signal.Ok` / `Signal.Warn`) — same tokens
-  the in-app status dots use; `Brushes.Red` defensive fallback.
-- New `MainViewModel.TaskbarBadge.cs` partial: `BusyAgentCount`,
-  `AgentTabCount` derived properties + private `RecomputeTaskbarBadge`.
-  `IsAgentTab` excludes shell sentinel (case-insensitive); shell-only tabs
-  and soft-closed history rows don't move the badge. The recompute fires
-  from `RaiseStatusBarChanged()` — every per-tab `Status` change and every
-  `Tabs.CollectionChanged` already hits that path, so no new subscriptions.
-  Backing fields initialise to `-1` so the first recompute always fires;
-  subsequent calls early-out via a change flag, so the rasteriser is **not**
-  invoked on token/turn telemetry ticks (fixed in review).
-- DI + XAML wiring in `App.xaml.cs` (singleton registration + ctor arg
-  passthrough to `MainViewModel`) and `MainWindow.xaml` (declares
-  `<TaskbarItemInfo />` once so the property is non-null on first paint).
-
-Files added:
-- `src/CodeScope.Ui/Services/ITaskbarBadgeService.cs`
-- `src/CodeScope.Ui/Services/TaskbarBadgeService.cs`
-- `src/CodeScope.Ui/ViewModels/MainViewModel.TaskbarBadge.cs`
-- `tests/CodeScope.Ui.Tests/MainViewModelTaskbarBadgeTests.cs` — 6 tests:
-  empty workspace, idle agent, 2-busy-of-3, 12-busy raw count, shell
-  exclusion, and a status-flip case that drives the real
-  `HookStatusBarSources → RaiseStatusBarChanged → RecomputeTaskbarBadge`
-  pipeline (not the test bypass). `Apply` rasteriser is hand-verified
-  per project convention (no UI tests).
-
-Files touched:
-- `src/CodeScope.Ui/ViewModels/MainViewModel.cs` — new field + optional
-  `ITaskbarBadgeService? taskbarBadge` ctor param.
-- `src/CodeScope.Ui/ViewModels/MainViewModel.StatusBar.cs` — single
-  `RecomputeTaskbarBadge();` call appended to `RaiseStatusBarChanged()`.
-- `src/CodeScope.App/MainWindow.xaml` — `<ui:FluentWindow.TaskbarItemInfo>`
-  block.
-- `src/CodeScope.App/App.xaml.cs` — singleton registration; new ctor arg
-  on the `MainViewModel` factory.
-
-Spec / plan: `docs/superpowers/specs/2026-04-29-taskbar-overlay-badge-design.md`,
-`docs/superpowers/plans/2026-04-29-taskbar-overlay-badge.md`. Visual mockup
-locked at `scratch/badge-mockup.html` (gitignored — re-render with the
-HTTP-server route in the spec if tweaking the design).
-
-Three review passes (in order), all fed back into the same branch:
-1. Internal review found a perf nit — counts walked `AllTabs` twice per tick
-   and fired `PropertyChanged` on every recompute. Fixed with a single
-   `foreach` and change-only notifications.
-2. `/codex:review` flagged the `StatusFlip_TriggersRecompute` test as
-   verifying the test bypass instead of the production wiring it claimed.
-   Replaced with a version that calls `HookStatusBarSources()` and asserts
-   on the real `PropertyChanged → RaiseStatusBarChanged` pipeline.
-3. GitHub `copilot-pull-request-reviewer` flagged that `Apply()` was firing
-   on every `RaiseStatusBarChanged` tick (incl. token/turn telemetry) even
-   when counts hadn't moved → redundant rasterisation. Fixed by gating
-   `Apply()` behind a change flag inside `RecomputeTaskbarBadge`.
-
-Open follow-ups:
-- **Concern flagged but accepted as design**: `TaskbarBadgeService` resolves
-  `Application.Current.MainWindow` on every call; if the app ever spawns a
-  modal/splash that becomes the foreground window, the badge could be
-  applied to the wrong window. Single-window app today; revisit when adding
-  a real splash screen.
-- **High-DPI `9⁺` legibility** unverified — only exercised at 100 % scaling.
-  If blurry on a 200 %+ taskbar, follow-up is a 32×32 super-sample render
-  (the bitmap stays 16×16 logical; we just render at twice the resolution
-  and let Windows downscale).
-- **Bonus matrix item** (10+ concurrently busy → `9⁺`) not yet hand-tested
-  in production; covered by unit tests but visual-only.
-
-### Session 24 — Add project from a git URL (#20, shipped in `e1ee4ea`)
-
-User-visible: the "Add project" entry-point now opens a `NewProjectDialog`
-with two modes — *Existing folder* (today's behaviour) and *Clone from URL*.
-Clone mode shows an inline indeterminate spinner + "Cloning…" caption while
-`git clone` runs, and lets the user Cancel mid-flight (cancels the
-`CancellationToken`, kills git, cleans the partial target). On failure the
-dialog re-enables and renders git's stderr inline beneath the URL field — no
-toast, the user is still looking at the dialog.
-
-How:
-- `IGitService.CloneAsync(url, parentDir, folderName, ct)` shells out to
-  `git -C <parent> clone -- <url> <name>` via the existing `ProcessRunner`.
-  Pre-validates empty inputs, refuses non-existent parents, refuses non-empty
-  targets. `OperationCanceledException` propagates (consistent with every other
-  method on the service). 4 tests in `GitServiceCloneTests.cs`.
-- `NewProjectDialog` is a self-contained WPF Window mirroring `NewWorktreeDialog`'s
-  style. Owns its `CancellationTokenSource` for the duration of the clone;
-  Cancel during clone cancels without closing, Cancel when idle closes with
-  `DialogResult = false`. Failed/cancelled clones run a best-effort
-  `TryDeleteDir` so a retry isn't blocked by the destination-exists check.
-- `SidebarViewModel.AddProjectAsync` rewired through the dialog. New helper
-  `DefaultCloneParent()` walks recent-project parent → `%USERPROFILE%\source\repos`
-  → `%USERPROFILE%`. Drag-drop path (`AddProjectByPathAsync`) untouched.
-- `App.xaml.cs` registration of `SidebarViewModel` switched to named args
-  (positional was getting fragile with four picker/service params); the new
-  `pickNewProject` lambda captures `IGitService` once at registration.
-
-Spec: `docs/superpowers/specs/2026-04-29-add-project-from-git-url-design.md`.
-Plan: `docs/superpowers/plans/2026-04-29-add-project-from-git-url.md`.
-
-Files added/touched:
-- `src/CodeScope.Core/Services/IGitService.cs` (CloneAsync signature)
-- `src/CodeScope.Core/Services/GitService.cs` (CloneAsync implementation)
-- `tests/CodeScope.Core.Tests/GitServiceCloneTests.cs` (4 tests)
-- `src/CodeScope.Ui/Dialogs/NewProjectRequest.cs` (records)
-- `src/CodeScope.Ui/Dialogs/NewProjectDialog.xaml` + `.xaml.cs` (dialog)
-- `src/CodeScope.Ui/ViewModels/SidebarViewModel.cs` + `.Commands.cs` (wiring)
-- `src/CodeScope.App/App.xaml.cs` (registration + named args)
+"Add project" dialog with clone-from-URL mode; inline spinner + cancel +
+inline error. `IGitService.CloneAsync`, `NewProjectDialog`, 4 tests.
+Shipped in `e1ee4ea`.
 
 ### Session 23 — pi.dev agent support (committed in `26586d0`)
 
@@ -259,18 +190,17 @@ Open follow-ups:
 
 ## Cursor — current focus
 
-**Cross-group terminal drag without restart — shipped (session 22).** A new
-`ISessionViewHostPool` (UI-singleton) owns one `SessionTabView` per session id;
-each `EditorGroupView` is a single `ContentControl` that pulls its content
-from the pool. Dragging a tab between groups now reparents the *same* view
-under the new `ContentControl`, preserving the inner `EasyTerminalControl`
-HwndHost — pwsh / claude / codex stay alive, scrollback intact, telemetry
-uninterrupted. The agent-resume / telemetry-rebind hack in `MoveTabToGroup`
-that masked the old respawn was deleted (~25 lines). Spec
-`docs/superpowers/specs/2026-04-26-cross-group-terminal-drag-design.md`,
-plan `docs/superpowers/plans/2026-04-26-cross-group-terminal-drag.md`,
-ADR-0014. The "Drag tab between groups loses scroll buffer" rough edge is
-closed.
+**Performance sweep complete.** Sessions 26–28 landed a broad memory/perf
+pass (11 PRs, #38–#49): telemetry timers only arm when watches exist,
+closed-session retention is bounded (100/wt, 90-day TTL), overview rebuilds
+are gated on visibility, OpenCode telemetry uses running aggregates instead
+of unbounded lists, error toasts are hard-capped, status-bar hooks are
+cleaned up on tab/worktree removal, and WorktreePoller refresh is serialised.
+Diff panel removed entirely (ADR-0016). Two UX fixes: un-maximize on
+title-bar drag and dialog pixel snapping at fractional DPI.
+
+All open GitHub issues are closed. `main` is clean, 420 tests green,
+v0.2.4 released.
 
 ### Session 22 — cross-group terminal drag pool (shipped)
 
@@ -564,27 +494,32 @@ src/
   CodeScope.App        WPF host + DI + MainWindow + pollers
                        Styles/DesignTokens.xaml (Framer + Fig tokens)
                        Styles/ContextMenuStyles.xaml (sidebar ctx menu)
+                       Diagnostics/MemoryWatchdog (dev-mode only)
+                       Toasts/ToastService (hard-capped visible errors)
                        WindowGeometryStore, LayoutStore
   CodeScope.Core       ISessionStore, IGitService, IAgentRegistry,
                        IProjectStore, IPullRequestService (GH/Gitea/composite),
-                       ISessionManager, IClaudeTelemetryService
+                       ISessionManager, IClaudeTelemetryService,
+                       IPiTelemetryService, IOpenCodeTelemetryService,
+                       ICopilotTelemetryService, SessionRetentionPolicy
                        Models: Project, Worktree, Session, WorktreeStatus,
                                AgentProfile, PullRequestInfo, CiStatus,
                                BranchInfo, ClaudeActivityState
                        Interop/ProcessTreeKiller (Win32 job)
-  CodeScope.Ui         VMs: Main(+StatusBar partial), Sidebar, Project,
-                            Worktree, SessionTab, CommandPalette,
-                            Overview*, EditorGroup
+  CodeScope.Ui         VMs: Main(+StatusBar +TaskbarBadge +Palette partials),
+                            Sidebar, Project, Worktree, SessionTab,
+                            CommandPalette, Overview*, EditorGroup
                        Views: SidebarView, SessionTabView, OverviewView,
                               GroupStripView, StatusBarView, EditorGroupView
                        Dialogs: RenameDialog, NewWorktreeDialog,
-                                CommandPaletteDialog
+                                NewProjectDialog, CommandPaletteDialog
+                       Services: ITaskbarBadgeService, ISessionViewHostPool
 tests/
-  CodeScope.Core.Tests 156 passing (1 FSWatcher flake) — Core only; no UI tests by convention
-  CodeScope.Ui.Tests   108 passing
-  CodeScope.App.Tests   17 passing
+  CodeScope.Core.Tests 248 passing (1 FSWatcher flake) — Core only
+  CodeScope.Ui.Tests   145 passing
+  CodeScope.App.Tests   27 passing
 docs/
-  DECISIONS.md (12 ADRs), design/DESIGN.md
+  DECISIONS.md (16 ADRs), design/DESIGN.md
   HANDOFF.md (this file)
   screenshots/        README assets
   design/html/        HTML mocks + codescope-shared.css — pixel truth for design passes
@@ -605,30 +540,17 @@ docs/
 - **"Remove from history" has no confirm dialog** — the action is destructive (entry cannot be recovered) but currently fires immediately on click. A follow-up should add a small inline confirm or an Undo toast. Low priority until the history feature is user-tested.
 - **Gitea CI rollup is always `None`** — `tea pulls status`/REST integration deferred.
 - **Session-exit toasts deferred** — `SessionManager` starts pwsh with `-NoExit`; detecting agent exit needs `SessionManager` refactor or pty-output parsing.
+- **Terminal scrollback unbounded** — `Microsoft.Terminal.Wpf` 1.22 doesn't
+  expose a public scrollback-line cap. Long-running sessions grow
+  `WorkingSet64` without bound. `MemoryWatchdog` (dev-mode only) logs
+  warnings when growth ≥ 50 MB/tick. Upstream change or fork required.
 - **Terminal right-click opens no context menu** — parked for a dedicated
-  research pass. Short version: `Microsoft.Terminal.Wpf` hosts a native
-  Win32 child HWND (`TerminalContainer : HwndHost`) that intercepts
-  `WM_RBUTTONUP` at the native layer, so WPF's routed mouse events never
-  fire and `Grid.ContextMenu` / `PreviewMouseRightButtonUp` / the
-  top-level `HwndSource.AddHook` all see nothing. Tested three tunneling
-  routes via wpf-cli — the right-click instead pasted the clipboard into
-  pwsh (the terminal's own right-click-to-paste path). `PreviewKeyDown`
-  is unaffected because it rides tunneling at the keyboard layer, which
-  is why the current build ships `Ctrl+Shift+O` / `Ctrl+Shift+C` /
-  `Ctrl+Shift+V` via the keyboard handler in `SessionTabView.xaml.cs`.
-  Options to investigate later:
-  * Subclass the terminal's native HWND via `SetWindowLongPtr(GWLP_WNDPROC)`
-    to peek `WM_RBUTTONUP` and forward → most robust but fragile across
-    `Microsoft.Terminal.Wpf` versions; P/Invoke heavy.
-  * Flip `Win32InputMode="False"` and rebuild keyboard forwarding
-    ourselves → recovers WPF mouse events but is a big rewrite of the
-    keyboard path.
-  * Keyboard-only fallback: `Shift+F10` / Apps-key handler that opens a
-    WPF ContextMenu programmatically (small, but no mouse UX).
-  * Upstream a right-click event in `Microsoft.Terminal.Wpf` so no
-    subclassing is needed.
-  Context-menu XAML + click handlers were prototyped and reverted in
-  `3bef676` (see diff — can be resurrected once a reach route lands).
+  research pass. `Microsoft.Terminal.Wpf`'s HwndHost child captures
+  `WM_RBUTTONUP` at the native layer. Keyboard shortcuts (`Ctrl+Shift+O` /
+  `Ctrl+Shift+C` / `Ctrl+Shift+V`) are the supported surface.
+  Options: native HWND subclass, `Win32InputMode` flip, keyboard-only
+  fallback, or upstream event. Context-menu XAML prototyped and reverted
+  in `3bef676`.
 
 ## Dev loop quick-reference
 
@@ -654,21 +576,16 @@ dotnet publish src/CodeScope.App -c Release -r win-x64 `
 
 **Immediate:**
 
-- **Push + PR for `feature/session-history-per-worktree`** — branch is local-only; 9 feature commits + HANDOFF ready. `git push -u origin feature/session-history-per-worktree` then open PR to `main`.
-- **"Remove from history" confirm** — add an inline confirm or Undo toast so the destructive action is recoverable (see rough edges above).
+- **"Remove from history" confirm** — add an inline confirm or Undo toast so
+  the destructive action is recoverable (see rough edges below).
 
 **Multi-group / chrome polish:**
 
 - **Tab drag-reorder motion spec** — `docs/design/html/CodeScope - Tab Drag.html`.
-
-**Fase 7 — remaining design token / mock consumption:**
-
 - **Tab Drag — floating drag chip adorner** — custom `Adorner` that
-  follows the cursor, renders the tab replica with a −1.5 ° rotation +
+  follows the cursor, renders the tab replica with a −1.5° rotation +
   blue outer glow. 3 px blue drop-indicator between tabs needs a
   `DragOver` calc + dynamic `Rectangle` in the strip's ItemsPanel.
-  (Session 15 closed: Empty State polish `5239ea0`, Tab Motion single
-  rail `071da29`. Diff Panel removed entirely — see ADR-0016 / #37.)
 
 **Deferred / longer-horizon:**
 
@@ -681,3 +598,6 @@ dotnet publish src/CodeScope.App -c Release -r win-x64 `
   newer release is available, one-click apply via
   `ApplyUpdatesAndRestart`. The release pipeline is live — this is just
   wiring the client side to it.
+- **Terminal scrollback cap** — upstream `Microsoft.Terminal.Wpf` doesn't
+  expose a public scrollback-line limit; requires upstream change or fork
+  (documented in `SessionTabView.xaml.cs` and `MemoryWatchdog.cs`).
