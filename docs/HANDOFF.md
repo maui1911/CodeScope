@@ -6,14 +6,14 @@
 > Old detail lives in `git log` — don't duplicate it here.
 
 **Last updated:** 2026-05-04 (session 27)
-**Branch:** `fix/bundle-vcruntime` (PR open against `main`)
-**Head (main):** `bd6ba22` — fix: snap dialogs to device pixels (#49)
-**Release:** `v0.2.4` shipped — https://github.com/maui1911/CodeScope/releases/tag/v0.2.4
-**Build status:** ✅ `dotnet build CodeScope.sln` clean. Full solution `dotnet test` 424/424 green (Core 248, Ui 145, App 31 — +4 new VcRuntimeBundleTests), modulo the two known FSWatcher flakes (`ClaudeSessionDiscoveryTests.Callback_Fires_For_Each_New_Jsonl…` and `PiSessionDiscoveryTests.Discovers_New_Session_File_With_Matching_Cwd` — pass in isolation).
-**Uncommitted work:** none on the feature branch (all in PR).
-**Open issues:** none on GitHub yet — user-reported install bug fixed directly via PR.
+**Branch:** `main`
+**Head:** `14be35b` — fix: bundle Microsoft Visual C++ runtime DLLs app-local (#50)
+**Release:** `v0.2.5` shipped — https://github.com/maui1911/CodeScope/releases/tag/v0.2.5
+**Build status:** ✅ `dotnet build CodeScope.sln` clean. Full solution `dotnet test` 425/425 green (Core 248, Ui 145, App 32 — +5 new VcRuntimeBundleTests), modulo the two known FSWatcher flakes (`ClaudeSessionDiscoveryTests.Callback_Fires_For_Each_New_Jsonl…` and `PiSessionDiscoveryTests.Discovers_New_Session_File_With_Matching_Cwd` — pass in isolation).
+**Uncommitted work:** none.
+**Open issues:** none on GitHub.
 
-### Session 27 — fresh-install black-screen / no-terminals fix
+### Session 27 — fresh-install black-screen / no-terminals fix (PR #50, v0.2.5)
 
 **Symptom:** user installed v0.2.4 on a clean Windows box, saw a black
 workspace, and could not initialise any terminal. Same install on a dev box
@@ -24,28 +24,33 @@ worked fine.
 is built with MSVC and depends on the Visual C++ 2015–2022 Redistributable
 (`vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll`). Velopack does
 not bundle VCRedist, so on machines without it the native renderer silently
-fails to load → empty `HwndHost` → black workspace, no terminals.
+failed to load → empty `HwndHost` → black workspace, no terminals.
 
-**Fix (ADR-0017, branch `fix/bundle-vcruntime`):** ship the three DLLs
-(~709 KB total) app-local, beside `CodeScope.exe`. App-local DLL resolution
-wins over `System32`, so the bundle works whether or not VCRedist is
-installed and never interferes with system-wide installs.
+**Fix (ADR-0017, merged in `14be35b`, shipped as v0.2.5):** ship the three
+DLLs (~709 KB total) app-local, beside `CodeScope.exe`. App-local DLL
+resolution wins over `System32`, so the bundle works whether or not VCRedist
+is installed and never interferes with system-wide installs.
 
 - `src/CodeScope.App/native/vcredist/{vcruntime140,vcruntime140_1,msvcp140}.dll`
   committed (v14.50.35719.0). `NOTICE.md` next to them documents version,
   SHA-256, source, and Microsoft's redistribution license.
 - `tools/refresh-vcruntime.ps1` re-pulls from `%SystemRoot%\System32` and
-  prints fresh versions + hashes for the NOTICE table.
+  prints fresh versions + hashes. Hard-fails on non-x64 OS or 32-bit
+  PowerShell so wrong-arch DLLs never sneak into the win-x64 pipeline
+  (Copilot review catch). Uses `System.Security.Cryptography.SHA256`
+  directly so it works on stripped-down PS hosts without `Get-FileHash`.
 - `CodeScope.App.csproj`: Content glob (`native\vcredist\*.dll`) parallel
   to the existing `conpty.dll` glob — copies for both `dotnet build` and
   `dotnet publish`. Verified: DLLs land next to `CodeScope.exe` in both
-  Debug build and Release publish.
-- `tests/CodeScope.App.Tests/VcRuntimeBundleTests.cs` (4 tests) guards both
-  the source DLLs in the repo and the copied DLLs in the build output.
-  Silent regression on the Content glob is now a build break.
+  Debug build and Release publish output.
+- `tests/CodeScope.App.Tests/VcRuntimeBundleTests.cs` (5 tests) guards
+  source DLLs in the repo, copied DLLs in build output, AND the structural
+  csproj contract (`CopyToOutputDirectory` + `CopyToPublishDirectory` both
+  `PreserveNewest`). A publish-only regression now fails CI.
 
-**To ship:** PR review → merge to `main` → cut `v0.2.5` so the user can
-upgrade. No data-migration concerns; bundled DLLs are a pure additive payload.
+**Shipped:** v0.2.5 release workflow ran green, all assets attached
+(installer, portable, Velopack `full`/`delta` packages). Existing v0.2.4
+installs auto-update via Velopack delta; fresh installs work out of the box.
 
 ### Sessions 26–28 — perf sweep, cleanup, UX fixes (PRs #38–#49)
 
