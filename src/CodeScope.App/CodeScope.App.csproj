@@ -55,6 +55,25 @@
         </Content>
     </ItemGroup>
 
+    <!--
+        Bundle the three Microsoft Visual C++ 2015-2022 (x64) runtime DLLs app-local.
+        Microsoft.Terminal.Wpf's native renderer (Microsoft.Terminal.Control.dll under
+        runtimes/win-x64/native/) is built with MSVC and depends on these. On a fresh
+        Windows install without the VC++ Redistributable the native DLL silently fails
+        to load — the HwndHost stays empty, the user sees a black workspace, and no
+        terminal ever initialises. Shipping the runtime beside CodeScope.exe makes the
+        app self-contained. ~709 KB total. See native/vcredist/NOTICE.md for source +
+        license.
+    -->
+    <ItemGroup>
+        <Content Include="native\vcredist\*.dll">
+            <Link>%(Filename)%(Extension)</Link>
+            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+            <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+            <Visible>false</Visible>
+        </Content>
+    </ItemGroup>
+
     <ItemGroup>
         <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.0" />
         <PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.0" />

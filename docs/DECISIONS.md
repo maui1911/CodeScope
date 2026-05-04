@@ -312,3 +312,61 @@ Cheaper to drop than to maintain.
   feature is gone).
 - One fewer `IGitService` surface for tests/mocks to track.
 - `Ctrl+D` is now free for future bindings.
+
+---
+
+## ADR-0017 — Bundle Microsoft Visual C++ runtime DLLs app-local
+
+**Date:** 2026-05-04
+**Status:** Accepted
+
+A fresh-install user reported a black workspace and no terminals ever
+initialising. Root cause: `EasyWindowsTerminalControl` →
+`Microsoft.Terminal.Wpf.dll` → `Microsoft.Terminal.Control.dll` (in
+`runtimes/win-x64/native/`) is a native binary built with MSVC. It depends on
+`vcruntime140.dll`, `vcruntime140_1.dll`, and `msvcp140.dll`. On a Windows
+box without the Visual C++ 2015–2022 Redistributable installed, the native
+DLL silently fails to load — the `HwndHost` stays empty and every terminal
+tab is a black rectangle. Velopack does not bundle VCRedist.
+
+**Decision:** ship the three DLLs **app-local**, beside `CodeScope.exe`.
+App-local DLL resolution wins over `System32`, so the bundle works whether
+or not the user has VCRedist installed, and never interferes with the
+system-wide install for other apps.
+
+**Implementation:**
+- DLLs committed under `src/CodeScope.App/native/vcredist/` (~709 KB total —
+  `msvcp140.dll` 541 KB, `vcruntime140.dll` 121 KB, `vcruntime140_1.dll`
+  47 KB). Source: System32 on a developer box where the latest VCRedist is
+  installed (bit-identical to the redist payload).
+- `CodeScope.App.csproj` Content glob copies them to output + publish, in
+  the same style as the existing `conpty.dll` glob (ADR notes / PR #27).
+- `tools/refresh-vcruntime.ps1` re-pulls from `%SystemRoot%\System32` and
+  prints fresh versions + SHA-256s for `NOTICE.md`.
+- `VcRuntimeBundleTests` (4 tests) guards both the source DLLs in the repo
+  and the copied DLLs in the build output — silent regression if anyone
+  removes the Content glob is now a build break.
+- `NOTICE.md` next to the DLLs documents version, SHA-256, source, and the
+  Microsoft redistribution license terms.
+
+**Decisions considered and rejected:**
+- *Startup-probe + friendly download dialog*: shifts the work to the user,
+  doesn't help offline installs, and a black workspace is a brutal first
+  impression even with a dialog. Kept on the shelf as a possible additional
+  safety net but not needed once the runtime is bundled.
+- *Velopack prerequisite stage that installs VCRedist*: requires admin,
+  re-runs Microsoft's installer, ~25 MB download per fresh install, and
+  ties our installer flow to a third-party MSI. The bundled DLLs are
+  ~3% of that size, run with no admin, work offline.
+- *Pull DLLs from a NuGet package at build time*: no official Microsoft
+  package ships these for app-local redistribution; community packages
+  exist but are unmaintained. Committing the binaries is more honest about
+  what we depend on.
+
+**Consequences:**
+- Repo grows by ~709 KB of binary content. Acceptable — same order of
+  magnitude as the icon set, smaller than several screenshot assets.
+- The DLL versions need a manual refresh when Microsoft ships an important
+  security update to the VC runtime. The refresh script + NOTICE table
+  make this a 30-second operation.
+- Velopack installer payload grows by ~709 KB.
