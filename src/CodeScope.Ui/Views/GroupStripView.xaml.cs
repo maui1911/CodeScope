@@ -170,6 +170,109 @@ public partial class GroupStripView : UserControl
         }
     }
 
+    /// <summary>
+    /// Right-click on a tab opens a contextual menu mirroring the sidebar's worktree "Reveal"
+    /// section: Reveal in File Explorer / Open in Windows Terminal / Open remote / Copy
+    /// (path · branch · PR URL). The XAML setter wires an empty ContextMenu placeholder per
+    /// item so this event fires; we rebuild its Items each open so conditional rows (origin
+    /// remote, active PR, branch presence) reflect the current worktree state.
+    ///
+    /// Note: WPF shares a single ContextMenu instance across ListBoxItems that come from a
+    /// Style setter, but only one menu is ever open at a time, so the per-open rebuild is safe.
+    /// </summary>
+    private void OnTabContextMenuOpening(object sender, ContextMenuEventArgs e)
+    {
+        if (sender is not ListBoxItem { DataContext: SessionTabViewModel tab, ContextMenu: { } menu })
+        {
+            e.Handled = true;
+            return;
+        }
+
+        if (Application.Current?.MainWindow?.DataContext is not MainViewModel main || main.Sidebar is null)
+        {
+            e.Handled = true;
+            return;
+        }
+
+        PopulateTabContextMenu(menu, tab, main.Sidebar);
+        if (menu.Items.Count == 0)
+        {
+            e.Handled = true;
+        }
+    }
+
+    private static void PopulateTabContextMenu(ContextMenu menu, SessionTabViewModel tab, SidebarViewModel sidebar)
+    {
+        menu.Items.Clear();
+
+        // Locate the worktree that owns this session — Sidebar.Projects is the source of truth
+        // since worktrees track their own Sessions list. Fall back to descriptor cwd if the
+        // session isn't attached to any worktree (shouldn't happen but keeps the menu safe).
+        ProjectViewModel? project = null;
+        WorktreeViewModel? worktree = null;
+        foreach (var p in sidebar.Projects)
+        {
+            foreach (var w in p.Worktrees)
+            {
+                if (w.Sessions.Any(s => s.Descriptor.Id == tab.Descriptor.Id))
+                {
+                    project = p;
+                    worktree = w;
+                    break;
+                }
+            }
+            if (worktree is not null) { break; }
+        }
+
+        var workingDir = worktree?.Path ?? tab.Descriptor.WorkingDirectory;
+        if (string.IsNullOrWhiteSpace(workingDir)) { return; }
+
+        var titleLabel = !string.IsNullOrWhiteSpace(tab.DisplayName) ? tab.DisplayName : tab.Descriptor.Title;
+        var subtitle = project?.Name ?? string.Empty;
+        menu.Items.Add(ContextMenuFactory.BuildContextHeader("Accent.Primary", titleLabel, subtitle));
+
+        menu.Items.Add(ContextMenuFactory.BuildGroupLabel("Reveal"));
+        menu.Items.Add(ContextMenuFactory.BuildItem(
+            "Reveal in File Explorer", "Ctx.Icon.Folder", null,
+            () => sidebar.RevealInExplorerCommand.Execute(workingDir)));
+        menu.Items.Add(ContextMenuFactory.BuildItem(
+            "Open in Windows Terminal", "Ctx.Icon.WinTerminal", null,
+            () => sidebar.OpenInWindowsTerminalCommand.Execute(workingDir)));
+
+        if (ContextMenuFactory.HasOriginRemote(project?.Path))
+        {
+            // OpenRemoteRepository resolves its target via ResolvePath, which only handles
+            // ProjectViewModel/WorktreeViewModel/string — pass the worktree (preferred) or
+            // a string path so the lookup hits a known branch.
+            menu.Items.Add(ContextMenuFactory.BuildItem(
+                "Open remote in browser", "Ctx.Icon.Link", null,
+                () => sidebar.OpenRemoteRepositoryCommand.Execute(worktree ?? (object)workingDir)));
+        }
+
+        // Copy → submenu. Path is always available; branch/PR rows depend on the resolved worktree.
+        var copyRoot = new MenuItem
+        {
+            Header = "Copy",
+            Icon = ContextMenuFactory.IconFor("Ctx.Icon.Clipboard"),
+        };
+        copyRoot.Items.Add(ContextMenuFactory.BuildItem(
+            "Path", "Ctx.Icon.ClipboardPath", "Ctrl+Alt+C",
+            () => sidebar.CopyPathCommand.Execute(workingDir)));
+        if (worktree is not null && !string.IsNullOrWhiteSpace(worktree.Worktree.Branch))
+        {
+            copyRoot.Items.Add(ContextMenuFactory.BuildItem(
+                "Branch name", "Ctx.Icon.Branch", null,
+                () => sidebar.CopyBranchCommand.Execute(worktree)));
+        }
+        if (worktree?.HasPullRequest == true)
+        {
+            copyRoot.Items.Add(ContextMenuFactory.BuildItem(
+                "PR URL", "Ctx.Icon.Link", null,
+                () => sidebar.CopyPullRequestUrlCommand.Execute(worktree)));
+        }
+        menu.Items.Add(copyRoot);
+    }
+
     // ── Drag source ─────────────────────────────────────────────
     private Point _dragOrigin;
     private SessionTabViewModel? _dragCandidate;
