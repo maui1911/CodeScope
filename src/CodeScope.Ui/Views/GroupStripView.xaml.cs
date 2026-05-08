@@ -239,11 +239,8 @@ public partial class GroupStripView : UserControl
             "Open in Windows Terminal", "Ctx.Icon.WinTerminal", null,
             () => sidebar.OpenInWindowsTerminalCommand.Execute(workingDir)));
 
-        if (ContextMenuFactory.HasOriginRemote(project?.Path))
+        if (ContextMenuFactory.HasOriginRemote(workingDir))
         {
-            // OpenRemoteRepository resolves its target via ResolvePath, which only handles
-            // ProjectViewModel/WorktreeViewModel/string — pass the worktree (preferred) or
-            // a string path so the lookup hits a known branch.
             menu.Items.Add(ContextMenuFactory.BuildItem(
                 "Open remote in browser", "Ctx.Icon.Link", null,
                 () => sidebar.OpenRemoteRepositoryCommand.Execute(worktree ?? (object)workingDir)));
