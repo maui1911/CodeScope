@@ -1,0 +1,32 @@
+[workspace]
+members = ["terminal"]
+exclude = ["vendor/gpui-terminal"]
+
+[package]
+name = "codescope-rs-spike"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Spike: gpui window with one embedded terminal running pwsh."
+
+[[bin]]
+name = "spike"
+path = "src/main.rs"
+
+[[example]]
+name = "ptytest"
+path = "examples/ptytest.rs"
+
+[dependencies]
+gpui = "0.2.2"
+gpui-terminal = { path = "vendor/gpui-terminal" }
+portable-pty = "0.9"
+anyhow = "1"
+parking_lot = "0.12"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
