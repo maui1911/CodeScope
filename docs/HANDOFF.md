@@ -5,13 +5,101 @@
 > **Intent:** cursor + last 1–2 sessions in depth, everything else a one-liner.
 > Old detail lives in `git log` — don't duplicate it here.
 
-**Last updated:** 2026-05-04 (session 27)
-**Branch:** `main`
-**Head:** `14be35b` — fix: bundle Microsoft Visual C++ runtime DLLs app-local (#50)
+**Last updated:** 2026-05-08 (session 28)
+**Branch:** `feat/codescope-rs-terminal`
+**Head:** _uncommitted_ — `codescope-rs/` spike + terminal-crate scaffold
 **Release:** `v0.2.5` shipped — https://github.com/maui1911/CodeScope/releases/tag/v0.2.5
-**Build status:** ✅ `dotnet build CodeScope.sln` clean. Full solution `dotnet test` 425/425 green (Core 248, Ui 145, App 32 — +5 new VcRuntimeBundleTests), modulo the two known FSWatcher flakes (`ClaudeSessionDiscoveryTests.Callback_Fires_For_Each_New_Jsonl…` and `PiSessionDiscoveryTests.Discovers_New_Session_File_With_Matching_Cwd` — pass in isolation).
-**Uncommitted work:** none.
+**Build status:** ✅ C# side untouched, still green. Rust workspace at
+`codescope-rs/` builds (`cargo build --workspace --manifest-path codescope-rs/Cargo.toml`).
+**Uncommitted work:** entire `codescope-rs/` directory (3 commits planned).
 **Open issues:** none on GitHub.
+
+### Session 28 — Rust port direction set; spike validates stack; terminal crate scaffolded
+
+**Decision (this session):** start a Rust + gpui port of CodeScope. New work
+lives under `codescope-rs/` at the repo root, alongside the C# / WPF source
+which keeps shipping. UI/UX target inspired by Zed's editor (gpui's
+distinctive feel). The C# stack stays the production target until the Rust
+port reaches feature parity.
+
+**Spike (`codescope-rs/`, workspace root with member `terminal/`):**
+- One gpui window with one embedded terminal running `pwsh.exe` via
+  `portable-pty` (ConPTY on Windows). Built with `gpui = "0.2.2"` and
+  `zortax/gpui-terminal` (alacritty_terminal-based).
+- `src/main.rs` is the spike binary. `src/bin/ptytest.rs` is a console-only
+  diagnostic that validates portable-pty + ConPTY produce bytes from a
+  spawned shell.
+- `scripts/diagnose.ps1` enumerates VS installs, MSVC tool versions, and
+  Windows SDK Lib paths — used to root-cause an `LNK1104 msvcrt.lib` link
+  failure on this machine.
+- `scripts/build.ps1` wraps `cargo` in a `vcvars64.bat` env from the
+  VS 2022 BuildTools install. Was needed before adding the **C++ Desktop**
+  workload to the existing VS 2026 (v18) Community install; redundant on
+  this machine now but kept for portability.
+
+**Build prereqs** (Windows): rustup, MSVC v143 (VS 2022 BuildTools _or_ VS 2026
+Community with the **Desktop development with C++** workload), Windows 10/11
+SDK, CMake. Vulkan SDK not required on Windows — gpui targets DirectX 11.1.
+
+**Bug #1 (patched, in `codescope-rs/vendor/gpui-terminal/`):**
+`Event::PtyWrite` was silently dropped by `GpuiEventProxy` (comment said
+"handled internally by alacritty" — incorrect). alacritty emits this event
+when it has a response for the embedder to write _back_ to the PTY (DSR
+cursor-position responses, primary DA replies, etc.). Without the response,
+cmd.exe / pwsh.exe hang at startup waiting for `ESC[1;1R`. Patch threads a
+`PtyWriter` Arc into `GpuiEventProxy` and writes inline from `send_event`.
+~30-line diff in `event.rs` + `view.rs`. Local-only; no upstream PR
+(per `feedback_no_upstream_prs`).
+
+**Bug #2 (architectural — _not_ patched in vendor):** PSReadLine emits
+`ESC[<row>;<col>H` cursor-position sequences in conhost-screen coordinates,
+but pwsh's startup clear-screen dance scrolls the alacritty grid by
+~30 rows. Result: PSReadLine targets row 3 col 7 while the real prompt sits
+at row 29-30 → cursor lands far above the input line. Classic ConPTY
+conhost-vs-emulator scroll-sync problem; gpui-terminal makes no attempt
+to bridge it. Caught via byte-level PTY logging in
+`codescope-rs/src/main.rs` (`LoggingReader` / `LoggingWriter`).
+
+**Decision:** stop investing in `gpui-terminal` patches. Pivot to a
+roll-our-own terminal layer modeled on Zed's three-layer architecture
+(`Backend` → `View` → `Element`). `gpui-terminal` is single-maintainer,
+Linux-only-tested, missing scrollback, missing mouse selection, and now
+two known fundamental bugs in two days of poking. Owning the code is
+a multi-day investment but eliminates the patch-treadmill.
+
+**Scaffolded (`codescope-rs/terminal/`):**
+- Workspace member, crate name `codescope-terminal`.
+- `src/lib.rs` reserves the three-layer module surface (`backend`, plus
+  future `view` / `element`).
+- `src/backend.rs` is a stub `pub struct Backend;` so the workspace
+  compiles. Implementation lands next session.
+- Direct dep on `alacritty_terminal = "0.25"` (matching what Zed uses);
+  `portable-pty` stays only in the spike for now and may go away once
+  the backend uses `alacritty_terminal::tty` directly (Zed's pattern).
+
+**Spike status:** functional. `target/debug/spike.exe` opens, pwsh runs,
+output renders, basic typing works. Up-arrow history-recall is broken
+visually (Bug #2). Mouse selection and scrollback don't exist
+(gpui-terminal `Planned`). `claude.exe` in the spike: visually fine,
+keyboard interactions inherit Bug #2.
+
+### Suggested next entry points
+
+1. Implement `codescope-terminal::backend::Backend`:
+   - Wrap `alacritty_terminal::Term<L>` in `Arc<FairMutex<...>>`.
+   - Use alacritty's own `EventLoop` (executor-agnostic, runs on a worker
+     thread). Drives both PTY reads and writes.
+   - Track conhost scroll offset on Windows: subscribe to scroll events
+     from the grid, maintain a `screen_origin_row` so we can translate
+     incoming `ESC[<row>;<col>H` from conhost-coords to grid-coords.
+2. After backend works, build the View layer (gpui) with input handling.
+   The `keystroke_to_bytes` table from gpui-terminal is correct — the
+   surrounding plumbing was the bug. Reuse the table, redo the wiring.
+3. Element layer: batched-text-runs renderer, similar to Zed's
+   `BatchedTextRun`.
+4. Validate: pwsh + claude.exe must work cleanly with up-arrow history,
+   scroll, mouse selection, and clipboard copy before declaring the
+   terminal layer "done".
 
 ### Session 27 — fresh-install black-screen / no-terminals fix (PR #50, v0.2.5)
 
