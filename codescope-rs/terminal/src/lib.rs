@@ -14,5 +14,7 @@
 //! workspace can already declare a dependency and reserve the namespace.
 
 pub mod backend;
+pub mod event;
 
-pub use backend::Backend;
+pub use backend::{Backend, SpawnConfig, TerminalSize};
+pub use event::{BackendEvent, EventProxy};

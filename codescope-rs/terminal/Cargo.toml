@@ -8,4 +8,5 @@ description = "Terminal emulator component for CodeScope-rs."
 [dependencies]
 alacritty_terminal = "0.25"
 anyhow = "1"
+flume = { version = "0.11", default-features = false }
 parking_lot = "0.12"
