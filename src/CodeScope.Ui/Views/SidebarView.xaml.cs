@@ -541,16 +541,7 @@ public partial class SidebarView : UserControl
     }
 
     private static MenuItem BuildItem(string header, string iconKey, string? shortcut, Action onClick)
-    {
-        var mi = new MenuItem
-        {
-            Header = header,
-            Icon = IconFor(iconKey),
-            InputGestureText = shortcut ?? string.Empty,
-        };
-        mi.Click += (_, _) => onClick();
-        return mi;
-    }
+        => ContextMenuFactory.BuildItem(header, iconKey, shortcut, onClick);
 
     /// <summary>Icon-prefixed display name for a session inside the submenu (e.g. "✶ claude").</summary>
     private static string SessionMenuLabel(SessionTabViewModel s)
@@ -568,114 +559,15 @@ public partial class SidebarView : UserControl
         };
 
     /// <summary>Mono small-caps section label (SESSION / GIT / REVEAL). Non-interactive.</summary>
-    private static MenuItem BuildGroupLabel(string text)
-        => new()
-        {
-            Header = text,
-            Tag = "group",
-        };
+    private static MenuItem BuildGroupLabel(string text) => ContextMenuFactory.BuildGroupLabel(text);
 
     /// <summary>Contextual header row: status dot + branch + repo (muted, right-aligned).</summary>
     private static MenuItem BuildContextHeader(string dotBrushKey, string branch, string repo)
-    {
-        var grid = new Grid();
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        => ContextMenuFactory.BuildContextHeader(dotBrushKey, branch, repo);
 
-        var dot = new Ellipse
-        {
-            Width = 6,
-            Height = 6,
-            VerticalAlignment = VerticalAlignment.Center,
-            Fill = Application.Current?.TryFindResource(dotBrushKey) as Brush ?? Brushes.DeepSkyBlue,
-        };
-        Grid.SetColumn(dot, 0);
-        grid.Children.Add(dot);
+    private static Separator BuildSeparator() => ContextMenuFactory.BuildSeparator();
 
-        var branchText = new TextBlock
-        {
-            Text = branch,
-            Margin = new Thickness(8, 0, 0, 0),
-            VerticalAlignment = VerticalAlignment.Center,
-            FontFamily = (FontFamily?)Application.Current?.TryFindResource("Fig.Font.Mono") ?? new FontFamily("Consolas"),
-            FontSize = 11,
-            Foreground = (Brush?)Application.Current?.TryFindResource("Text.Primary") ?? Brushes.White,
-        };
-        Grid.SetColumn(branchText, 1);
-        grid.Children.Add(branchText);
-
-        var repoText = new TextBlock
-        {
-            Text = repo,
-            VerticalAlignment = VerticalAlignment.Center,
-            FontSize = 10,
-            Foreground = (Brush?)Application.Current?.TryFindResource("Text.Faint") ?? Brushes.Gray,
-        };
-        Grid.SetColumn(repoText, 3);
-        grid.Children.Add(repoText);
-
-        return new MenuItem
-        {
-            Header = grid,
-            Tag = "header",
-        };
-    }
-
-    private static Separator BuildSeparator() => new();
-
-    private static bool TryGetGitConfigPath(string? projectPath, out string? configPath)
-    {
-        configPath = null;
-        if (string.IsNullOrWhiteSpace(projectPath)) { return false; }
-
-        var gitPath = System.IO.Path.Combine(projectPath, ".git");
-
-        if (System.IO.Directory.Exists(gitPath))
-        {
-            var directConfigPath = System.IO.Path.Combine(gitPath, "config");
-            if (System.IO.File.Exists(directConfigPath))
-            {
-                configPath = directConfigPath;
-                return true;
-            }
-            return false;
-        }
-
-        if (!System.IO.File.Exists(gitPath)) { return false; }
-
-        var gitPointer = System.IO.File.ReadAllText(gitPath).Trim();
-        const string gitDirPrefix = "gitdir:";
-        if (!gitPointer.StartsWith(gitDirPrefix, StringComparison.OrdinalIgnoreCase)) { return false; }
-
-        var gitDir = gitPointer[gitDirPrefix.Length..].Trim();
-        if (string.IsNullOrWhiteSpace(gitDir)) { return false; }
-
-        var resolvedGitDir = System.IO.Path.IsPathRooted(gitDir)
-            ? gitDir
-            : System.IO.Path.GetFullPath(System.IO.Path.Combine(projectPath, gitDir));
-
-        var resolvedConfigPath = System.IO.Path.Combine(resolvedGitDir, "config");
-        if (!System.IO.File.Exists(resolvedConfigPath)) { return false; }
-
-        configPath = resolvedConfigPath;
-        return true;
-    }
-
-    private static bool HasOriginRemote(string? projectPath)
-    {
-        try
-        {
-            if (!TryGetGitConfigPath(projectPath, out var configPath) || configPath is null) { return false; }
-            var text = System.IO.File.ReadAllText(configPath);
-            return text.Contains("[remote \"origin\"]", StringComparison.Ordinal);
-        }
-        catch
-        {
-            return false;
-        }
-    }
+    private static bool HasOriginRemote(string? projectPath) => ContextMenuFactory.HasOriginRemote(projectPath);
 
     /// <summary>Runs <paramref name="action"/> with the main-window view-model if present.
     /// Replaces the `Application.Current?.MainWindow?.DataContext is MainViewModel main` guard
@@ -686,37 +578,8 @@ public partial class SidebarView : UserControl
     }
 
     /// <summary>Resolve an `Ctx.Icon.*` <see cref="StreamGeometry"/> resource into a Path element
-    /// sized for MenuItem.Icon (14×14, stroked 1.4px, no fill). <see cref="Path.Stroke"/> is bound
-    /// to the enclosing <see cref="ContentPresenter"/>'s <c>TextBlock.Foreground</c> attached
-    /// property so the Item/Danger/SubHeader/Primary templates can swap the icon colour by setting
-    /// that property on IconHost (hover → Accent.Primary, danger → Ctx.Danger, etc).</summary>
-    private static Path? IconFor(string geometryKey)
-    {
-        if (Application.Current?.TryFindResource(geometryKey) is not Geometry geom) { return null; }
-        var path = new Path
-        {
-            Data = geom,
-            Width = 14,
-            Height = 14,
-            Stretch = Stretch.None,
-            StrokeThickness = 1.4,
-            StrokeStartLineCap = PenLineCap.Round,
-            StrokeEndLineCap = PenLineCap.Round,
-            StrokeLineJoin = PenLineJoin.Round,
-            Fill = Brushes.Transparent,
-            SnapsToDevicePixels = true,
-        };
-        path.SetBinding(Path.StrokeProperty, new Binding
-        {
-            RelativeSource = new RelativeSource(RelativeSourceMode.FindAncestor)
-            {
-                AncestorType = typeof(ContentPresenter),
-            },
-            Path = new PropertyPath("(0)", TextBlock.ForegroundProperty),
-            FallbackValue = Application.Current?.TryFindResource("Text.Secondary") ?? Brushes.Gainsboro,
-        });
-        return path;
-    }
+    /// sized for MenuItem.Icon (14×14, stroked 1.4px, no fill).</summary>
+    private static Path? IconFor(string geometryKey) => ContextMenuFactory.IconFor(geometryKey);
 
     /// <summary>
     /// Brush key for the worktree context-menu header dot. Tracks the same two-state agent

@@ -65,14 +65,26 @@
                                 <!-- SessionTabViewModel.AutomationId — wpf-cli snapshots
                                      resolve to a:Tab_<displayName> instead of the VM type. -->
                                 <Setter Property="AutomationProperties.AutomationId" Value="{Binding AutomationId}" />
+                                <!-- Right-click context menu — placeholder is required for
+                                     ContextMenuOpening to fire; the handler in
+                                     GroupStripView.xaml.cs rebuilds the items per-tab on each
+                                     open (mirrors the sidebar's worktree Reveal block:
+                                     Reveal in Explorer / wt.exe / remote / Copy). -->
+                                <Setter Property="ContextMenu">
+                                    <Setter.Value>
+                                        <ContextMenu />
+                                    </Setter.Value>
+                                </Setter>
+                                <EventSetter Event="ContextMenuOpening" Handler="OnTabContextMenuOpening" />
                                 <Setter Property="Template">
                                     <Setter.Value>
                                         <ControlTemplate TargetType="ListBoxItem">
                                             <Grid MouseDown="OnTabMouseDown">
-                                                <!-- Right-click context menu (Rename / Duplicate / Close) was removed
-                                                     with issue #21: tab labels auto-follow the worktree's branch, so
-                                                     manual rename is gone, and Duplicate/Close are reachable from the
-                                                     sidebar tree menu (and Close from the tab's middle-click + ✕). -->
+                                                <!-- Right-click opens a Reveal context menu (built in
+                                                     GroupStripView.xaml.cs) with the worktree's
+                                                     Reveal-in-Explorer / Windows Terminal / remote /
+                                                     Copy bits. The Rename / Duplicate / Close items
+                                                     stay in the sidebar tree menu since #21. -->
                                                 <Border
                                                     x:Name="TabPill"
                                                     Background="Transparent"
