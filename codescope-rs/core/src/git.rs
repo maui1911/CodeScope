@@ -12,9 +12,12 @@
 //! per-session worktrees. Branch listing lands the day the new-
 //! session dialog needs it.
 //!
-//! Errors carry the stderr tail when `git` exits non-zero, so a
-//! UI dialog can surface "fatal: 'foo' is already checked out at
-//! '...'" without us having to guess the cause.
+//! Errors carry the trimmed stderr verbatim when `git` exits non-
+//! zero, so a UI dialog can surface "fatal: 'foo' is already checked
+//! out at '...'" without us having to guess the cause. We don't
+//! truncate — the failure modes in scope here (`worktree add/remove/
+//! list`) emit short messages, and clipping mid-sentence is worse
+//! UX than a slightly long line.
 
 use std::path::Path;
 use std::process::{Command, Output, Stdio};

@@ -11,9 +11,9 @@
 **Release:** `v0.2.5` shipped — https://github.com/maui1911/CodeScope/releases/tag/v0.2.5
 **Build status:** ✅ C# untouched. Rust workspace builds clean
 (`cargo build --workspace --manifest-path codescope-rs/Cargo.toml`).
-22 unit tests across `codescope-core` (16, +4 git porcelain parser
-+ Project::new) + `codescope-terminal` mouse-encoder (9). PR #54
-merged to main as `7ffe4f3`.
+27 unit tests across `codescope-core` (18: +4 git porcelain parser
++ 2 `Project::new` since session 31's 12) + `codescope-terminal`
+mouse-encoder (9). PR #54 merged to main as `7ffe4f3`.
 **Uncommitted work:** none.
 **Open issues:** none on GitHub.
 
@@ -43,9 +43,9 @@ in stacked commits on `feat/codescope-rs-window-state-save` (off main):
    to the system `git`. Pure-stdlib (no libgit2 — see CLAUDE.md
    technology decisions). Porcelain parser handles
    primary/branched/detached/locked stanzas. 4 unit tests on the
-   parser. Errors carry the trimmed stderr tail so a future error
-   dialog can surface "fatal: 'foo' is already checked out at
-   '...'" verbatim. Not yet wired to UI.
+   parser. Errors carry the trimmed stderr verbatim so a future
+   error dialog can surface "fatal: 'foo' is already checked out
+   at '...'" without guessing the cause. Not yet wired to UI.
 4. **Sidebar drives new-tab cwd** (`1d2163d`). AppShell reads
    `Sidebar::active_project()` at spawn time, threads `path`
    through `SpawnConfig.working_directory`, labels the tab with

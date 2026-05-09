@@ -71,13 +71,16 @@ impl Sidebar {
     }
 
     pub fn select(&mut self, idx: usize, cx: &mut Context<Self>) {
-        if idx < self.projects.projects.len() {
-            self.selected = Some(idx);
-            self.layout.selected_project_id =
-                Some(self.projects.projects[idx].id.clone());
-            self.save_layout();
-            cx.notify();
+        if idx >= self.projects.projects.len() || self.selected == Some(idx) {
+            // Out-of-range or re-clicking the active row — no-op,
+            // skip the synchronous `layout.json` write.
+            return;
         }
+        self.selected = Some(idx);
+        self.layout.selected_project_id =
+            Some(self.projects.projects[idx].id.clone());
+        self.save_layout();
+        cx.notify();
     }
 
     /// Persist `layout.json` after selection / sidebar-visibility
@@ -103,12 +106,10 @@ impl Sidebar {
         cx.notify();
     }
 
-    /// Open the platform "pick a folder" dialog. On confirm, append a
-    /// fresh [`Project`] and write `projects.json`. Any error is
-    /// logged to stderr — the sidebar stays consistent because we
-    /// only mutate state when the save succeeds. (Saved-but-stale
-    /// is preferable to in-memory-but-not-saved; see the C# build's
-    /// `ProjectsRepository` for the same trade-off.)
+    /// Open the platform "pick a folder" dialog. On confirm, hand the
+    /// path to [`Self::add_project`] which writes `projects.json`
+    /// before mutating in-memory state, so a save failure leaves both
+    /// the disk and the UI in their previous (consistent) state.
     pub fn open_add_project_picker(
         &mut self,
         _window: &mut Window,
@@ -146,26 +147,36 @@ impl Sidebar {
     /// Append a project at `path` and persist. Newly-added project
     /// becomes the selection — the user just chose it, so dropping
     /// them straight into it is what they expect.
+    ///
+    /// Save-then-commit ordering: we build a candidate `ProjectsConfig`,
+    /// write it to disk, and only swap it into `self.projects` (and
+    /// touch `selected` / `layout.json`) once the write succeeds. A
+    /// failed write therefore leaves both disk and UI in their
+    /// previous consistent state, instead of producing an in-memory
+    /// row that disappears on relaunch — and (worse) a `layout.json`
+    /// pointing at a project id that never made it to `projects.json`.
     pub fn add_project(&mut self, path: String, cx: &mut Context<Self>) {
         // Refuse exact duplicates by path. Two rows pointing at the
         // same directory would let a user "add" the same project
         // twice and then wonder why both rows behave identically.
-        if self.projects.projects.iter().any(|p| p.path == path) {
-            if let Some(idx) = self.projects.projects.iter().position(|p| p.path == path) {
-                self.selected = Some(idx);
-                cx.notify();
-            }
+        if let Some(idx) = self.projects.projects.iter().position(|p| p.path == path) {
+            self.select(idx, cx);
             return;
         }
         let project = Project::new(path);
         let new_id = project.id.clone();
-        self.projects.projects.push(project);
+        // Clone-then-save: failure leaves `self.projects` untouched.
+        let mut next = self.projects.clone();
+        next.projects.push(project);
+        if let Err(err) = next.save(&self.paths) {
+            eprintln!("warning: failed to save projects.json: {err:#}");
+            return;
+        }
+        // Disk is committed; now mirror the change in memory.
+        self.projects = next;
         let new_idx = self.projects.projects.len() - 1;
         self.selected = Some(new_idx);
         self.layout.selected_project_id = Some(new_id);
-        if let Err(err) = self.projects.save(&self.paths) {
-            eprintln!("warning: failed to save projects.json: {err:#}");
-        }
         self.save_layout();
         cx.notify();
     }
