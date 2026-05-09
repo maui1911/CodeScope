@@ -170,6 +170,56 @@ struct SidebarDrag {
     start_width: f32,
 }
 
+/// Payload for a tab drag-drop — the user is moving a tab from one
+/// group to another. We carry stable ids (not indices) because
+/// `groups` / `tabs` Vecs can mutate while the drag is in flight
+/// (closing another tab in another group, splitting, …) and indices
+/// would point at the wrong row by the time `on_drop` fires.
+#[derive(Clone, Debug)]
+struct TabDragData {
+    source_group_id: u64,
+    source_tab_id: u64,
+    /// Snapshotted at drag start. Currently unused — the preview
+    /// view captures its own copy in the `on_drag` constructor —
+    /// but keeping it on the payload means future drop targets
+    /// (e.g. status-bar history rows) can label the dropped tab
+    /// without going back through `self.groups`.
+    #[allow(dead_code)]
+    title: SharedString,
+}
+
+/// The little floating "card" the user drags around — gpui needs a
+/// `Render` entity to draw the drag image. We make it shape-light
+/// so it follows the cursor without lag and matches the active-tab
+/// styling so the user sees what they're moving.
+struct DraggedTab {
+    title: SharedString,
+    theme: Arc<Theme>,
+}
+
+impl Render for DraggedTab {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .h(px(32.0))
+            .min_w(px(140.0))
+            .max_w(px(240.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .px_3()
+            .gap_2()
+            .bg(theme::canvas(&self.theme))
+            .border_1()
+            .border_color(theme::accent(&self.theme))
+            .rounded_md()
+            .shadow_lg()
+            .text_size(px(13.0))
+            .text_color(theme::ink(&self.theme))
+            .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(theme::accent(&self.theme)))
+            .child(div().flex_grow().truncate().child(self.title.clone()))
+    }
+}
+
 pub struct AppShell {
     /// Flat list of tab groups laid out left-to-right. Always at
     /// least one entry — `close_tab` collapses an emptied group only
@@ -998,6 +1048,94 @@ impl AppShell {
         }
     }
 
+    /// Reparent a tab from one group to another by id. Triggered by
+    /// `on_drop` on a group's strip section after the user drags a
+    /// tab out. The terminal entity is moved unchanged — no
+    /// teardown / respawn — so the pty keeps running and any
+    /// agent (claude, …) keeps its session.
+    ///
+    /// Looking up by id (not index) keeps us robust to concurrent
+    /// list mutations between drag-start and drop. No-op when:
+    /// - source / target group can't be resolved
+    /// - source and target are the same group (within-group reorder
+    ///   isn't supported yet — the user can already pick the tab
+    ///   they want via click)
+    fn move_tab_to_group(
+        &mut self,
+        source_group_id: u64,
+        source_tab_id: u64,
+        target_group_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if source_group_id == target_group_id {
+            return;
+        }
+        let Some(source_idx) = self.groups.iter().position(|g| g.id == source_group_id)
+        else {
+            return;
+        };
+        let Some(target_idx) = self.groups.iter().position(|g| g.id == target_group_id)
+        else {
+            return;
+        };
+        let Some(tab_pos) = self.groups[source_idx]
+            .tabs
+            .iter()
+            .position(|t| t.id == source_tab_id)
+        else {
+            return;
+        };
+
+        let tab = self.groups[source_idx].tabs.remove(tab_pos);
+
+        // Slide the source group's `active_tab` down if we removed
+        // at-or-before it; if the source group is now empty, collapse
+        // it (mirrors `close_tab`'s collapse path) provided there's a
+        // sibling.
+        let source_now_empty = self.groups[source_idx].tabs.is_empty();
+        if !source_now_empty {
+            let g = &mut self.groups[source_idx];
+            if g.active_tab >= g.tabs.len() {
+                g.active_tab = g.tabs.len() - 1;
+            } else if g.active_tab > tab_pos {
+                g.active_tab -= 1;
+            }
+        }
+
+        // Find target index again — `source_idx` might have shifted
+        // if we collapsed below it (which we haven't yet, but be
+        // defensive). We re-resolve by id here.
+        let target_idx = self
+            .groups
+            .iter()
+            .position(|g| g.id == target_group_id)
+            .unwrap_or(target_idx.min(self.groups.len().saturating_sub(1)));
+        self.groups[target_idx].tabs.push(tab);
+        let new_active = self.groups[target_idx].tabs.len() - 1;
+        self.groups[target_idx].active_tab = new_active;
+
+        // Collapse the source group if it's empty and we have
+        // siblings. After this the target_idx may shift; re-resolve.
+        if source_now_empty && self.groups.len() > 1 {
+            self.groups.remove(source_idx);
+            if source_idx < self.group_weights.len() {
+                self.group_weights.remove(source_idx);
+            }
+        }
+
+        // Activate the moved tab in its new home so keyboard focus
+        // follows the user's intent.
+        let final_target_idx = self
+            .groups
+            .iter()
+            .position(|g| g.id == target_group_id)
+            .unwrap_or(0);
+        let final_active = self.groups[final_target_idx].tabs.len().saturating_sub(1);
+        self.activate_tab(final_target_idx, final_active, window, cx);
+        self.save_layout();
+    }
+
     /// Move focus to the group at `idx`. Routes keyboard focus to the
     /// group's currently-active tab so typing resumes in the right
     /// terminal. No-op when the index is out of range or the group is
@@ -1623,17 +1761,12 @@ impl AppShell {
         let accent = theme::accent(theme);
         let divider = theme::divider(theme);
 
+        let theme_for_drag = theme.clone();
         let tabs = gmeta.tabs.iter().map(|tmeta| {
             let tab_idx = tmeta.tab_idx;
             let tab_id = tmeta.tab_id;
             let title = tmeta.title.clone();
             let active = tab_idx == active_tab && is_focused;
-            // Tab styling follows the same shape as the single-group
-            // version — active tab gets a canvas-coloured "card" with
-            // an accent top border. In an unfocused group the active
-            // tab still shows as the selected card (so the user sees
-            // which tab will resume on focus) but without the accent
-            // top border.
             let card = tab_idx == active_tab;
             let bg = if card { canvas } else { gpui::transparent_black() };
             let text_color = if active { ink } else { ink_dim };
@@ -1643,6 +1776,16 @@ impl AppShell {
             } else {
                 ink_ghost
             };
+            // Drag payload — stable ids + the title so the drag
+            // preview can render without holding a borrow on
+            // `self.groups`.
+            let drag_payload = TabDragData {
+                source_group_id: group_id,
+                source_tab_id: tab_id,
+                title: title.clone(),
+            };
+            let title_for_drag = title.clone();
+            let theme_for_preview = theme_for_drag.clone();
             div()
                 .id(("tab", tab_id))
                 .h_full()
@@ -1666,6 +1809,16 @@ impl AppShell {
                         this.activate_tab(group_idx, tab_idx, window, cx);
                     }),
                 )
+                // Make the tab draggable. The constructor builds a
+                // fresh `DraggedTab` view that gpui paints attached
+                // to the cursor for the duration of the drag. The
+                // payload (`TabDragData`) is what `on_drop` sees on
+                // the target strip section.
+                .on_drag(drag_payload, move |_payload, _offset, _window, cx| {
+                    let theme = theme_for_preview.clone();
+                    let title = title_for_drag.clone();
+                    cx.new(|_| DraggedTab { title, theme })
+                })
                 .child(
                     div()
                         .w(px(8.0))
@@ -1728,12 +1881,14 @@ impl AppShell {
 
         // Strip section: tabs + "+" button. Click anywhere in the
         // remaining whitespace focuses the group so the next Ctrl+T
-        // lands here. The trailing `flex_grow` filler captures the
-        // empty area to the right of the rightmost tab.
+        // lands here. Drop a tab on it and the tab moves to this
+        // group (`on_drop` fires when the user releases a
+        // `TabDragData` over this hitbox).
         //
         // `flex_grow` is set via `style().flex_grow = Some(weight)`
         // because gpui's chainable `.flex_grow()` only sets the value
         // to 1.0 — we need arbitrary weights for the column layout.
+        let target_group_id = group_id;
         let mut strip = div()
             .id(("group-strip", group_id))
             .h_full()
@@ -1745,6 +1900,17 @@ impl AppShell {
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
                     this.focus_group(group_idx, window, cx);
+                }),
+            )
+            .on_drop(
+                cx.listener(move |this, payload: &TabDragData, window, cx| {
+                    this.move_tab_to_group(
+                        payload.source_group_id,
+                        payload.source_tab_id,
+                        target_group_id,
+                        window,
+                        cx,
+                    );
                 }),
             )
             .children(tabs)
