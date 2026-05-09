@@ -159,6 +159,16 @@ const MIN_GROUP_WEIGHT: f32 = 0.15;
 /// aiming.
 const SPLITTER_HIT_WIDTH: f32 = 6.0;
 
+/// Open right-click menu state for a tab. Identifies the target
+/// tab by id (not index) so the menu still hits the right tab if
+/// the list mutates between right-click and click. Position is in
+/// window coords for `anchored()`.
+struct TabMenu {
+    group_id: u64,
+    tab_id: u64,
+    position: gpui::Point<gpui::Pixels>,
+}
+
 /// Live state for an in-flight sidebar drag. Same shape as
 /// `SplitterDrag` — captured at mouse-down on the sidebar's right
 /// edge so we don't keep re-deriving from a moving target.
@@ -262,6 +272,8 @@ pub struct AppShell {
     /// In-flight sidebar drag, if any. Same shape as `splitter_drag`
     /// but specific to the sidebar's right edge.
     sidebar_drag: Option<SidebarDrag>,
+    /// Open tab right-click menu, if any.
+    tab_menu: Option<TabMenu>,
     /// Threading the on-disk path bundle through so `save_layout` can
     /// reach `paths.layout_file()` without us having to pull it from
     /// the sidebar every time.
@@ -473,6 +485,7 @@ impl AppShell {
             sidebar_width,
             sidebar_visible,
             sidebar_drag: None,
+            tab_menu: None,
             paths: paths.clone(),
             layout,
             next_group_id: group_count as u64,
@@ -1048,6 +1061,152 @@ impl AppShell {
         }
     }
 
+    /// Build the tab right-click menu when one is open. Returns
+    /// `None` when no menu is showing — caller uses `.children(...)`
+    /// so 0 / 1 children both work without splitting the chain.
+    fn render_tab_menu(
+        &self,
+        theme: &Arc<Theme>,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let menu = self.tab_menu.as_ref()?;
+        let group_id = menu.group_id;
+        let tab_id = menu.tab_id;
+        let position = menu.position;
+        // Compute "is there at least one other tab in this group?"
+        // and "is there at least one tab to the right?" so we can
+        // dim / hide the rows that would be no-ops.
+        let group = self.groups.iter().find(|g| g.id == group_id)?;
+        let pivot_pos = group.tabs.iter().position(|t| t.id == tab_id)?;
+        let has_others = group.tabs.len() > 1;
+        let has_right = pivot_pos + 1 < group.tabs.len();
+
+        let elevated = theme::elevated(theme);
+        let divider = theme::divider(theme);
+        let ink = theme::ink(theme);
+        let ink_dim = theme::ink_dim(theme);
+        let ink_ghost = theme::ink_ghost(theme);
+        let frost = theme::frost_10(theme);
+        let danger = theme::danger(theme);
+
+        type Action = Box<dyn Fn(&mut AppShell, &mut Window, &mut Context<AppShell>) + 'static>;
+        let item = |id: &'static str,
+                    label: &'static str,
+                    enabled: bool,
+                    danger_row: bool,
+                    on_click: Action|
+         -> gpui::Stateful<gpui::Div> {
+            // Disabled rows step down a tone to `ink_ghost` so the
+            // user sees the affordance is greyed-out without having
+            // to hover. Enabled rows keep the regular `ink_dim` /
+            // `danger` palette.
+            let base_color = if !enabled {
+                ink_ghost
+            } else if danger_row {
+                danger
+            } else {
+                ink_dim
+            };
+            let hover_color = if !enabled {
+                ink_ghost
+            } else if danger_row {
+                danger
+            } else {
+                ink
+            };
+            let frost_hover = frost;
+            let mut row = div()
+                .id(id)
+                .h(px(28.0))
+                .px_3()
+                .flex()
+                .flex_row()
+                .items_center()
+                .text_size(px(13.0))
+                .text_color(base_color)
+                .child(label);
+            if enabled {
+                row = row
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(frost_hover).text_color(hover_color))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            on_click(this, window, cx);
+                        }),
+                    );
+            }
+            row
+        };
+
+        let menu_body = div()
+            .flex()
+            .flex_col()
+            .py_1()
+            .min_w(px(200.0))
+            .bg(elevated)
+            .border_1()
+            .border_color(divider)
+            .rounded_md()
+            .shadow_lg()
+            .child(item(
+                "tab-menu-close",
+                "Close",
+                true,
+                false,
+                Box::new(move |this, window, cx| {
+                    let g_idx = this
+                        .groups
+                        .iter()
+                        .position(|g| g.id == group_id);
+                    if let Some(g_idx) = g_idx
+                        && let Some(t_idx) = this.groups[g_idx]
+                            .tabs
+                            .iter()
+                            .position(|t| t.id == tab_id)
+                    {
+                        this.close_tab_menu(cx);
+                        this.close_tab(g_idx, t_idx, window, cx);
+                    }
+                }),
+            ))
+            .child(item(
+                "tab-menu-close-others",
+                "Close others",
+                has_others,
+                false,
+                Box::new(move |this, window, cx| {
+                    this.close_other_tabs_in_group(group_id, tab_id, window, cx);
+                }),
+            ))
+            .child(item(
+                "tab-menu-close-right",
+                "Close all to the right",
+                has_right,
+                false,
+                Box::new(move |this, window, cx| {
+                    this.close_tabs_to_right_in_group(group_id, tab_id, window, cx);
+                }),
+            ))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_tab_menu(cx)));
+
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position(gpui::point(position.x, position.y))
+                    .anchor(gpui::Corner::TopLeft)
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(menu_body),
+            )
+            .into_any_element(),
+        )
+    }
+
     /// Build the bottom status bar (24 px). Compact line that
     /// surfaces the focused group, the focused tab's title, and
     /// counts so the user has a single place to verify "where am I"
@@ -1100,6 +1259,106 @@ impl AppShell {
             .child(div().child(tab_label))
             .child(div().w_px().h(px(12.0)).bg(theme::divider(theme)))
             .child(div().child(group_label))
+    }
+
+    /// Open the tab right-click menu at `position` for the tab
+    /// identified by `(group_id, tab_id)`.
+    fn open_tab_menu(
+        &mut self,
+        group_id: u64,
+        tab_id: u64,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.tab_menu = Some(TabMenu { group_id, tab_id, position });
+        cx.notify();
+    }
+
+    fn close_tab_menu(&mut self, cx: &mut Context<Self>) {
+        if self.tab_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Close every tab in `group_id` *except* the one identified by
+    /// `keep_tab_id`. Mirrors the C# build's "Close others" tab
+    /// menu row. The kept tab becomes the group's active one.
+    ///
+    /// Resolves `keep_tab_id` *before* mutating: if the tab vanished
+    /// between menu-open and click (rare but possible — concurrent
+    /// close, drag-out), we abort silently. Without this guard the
+    /// `retain` would drop every tab in the group and leave it in a
+    /// broken empty state (it wouldn't even auto-collapse — that
+    /// path lives in `close_tab`).
+    fn close_other_tabs_in_group(
+        &mut self,
+        group_id: u64,
+        keep_tab_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group_idx) = self.groups.iter().position(|g| g.id == group_id) else {
+            self.close_tab_menu(cx);
+            return;
+        };
+        // Refuse to mutate if the target tab is gone — preserves the
+        // existing tab list rather than wiping it via `retain`.
+        if !self.groups[group_idx].tabs.iter().any(|t| t.id == keep_tab_id) {
+            self.close_tab_menu(cx);
+            return;
+        }
+        self.groups[group_idx].tabs.retain(|t| t.id == keep_tab_id);
+        // Only the kept tab remains — pin the active selection to it.
+        let prev_focused = self.focused_group;
+        self.groups[group_idx].active_tab = 0;
+        self.activate_tab(group_idx, 0, window, cx);
+        self.close_tab_menu(cx);
+        // `activate_tab` only writes layout when focus changes. When
+        // the menu was triggered on the already-focused group it
+        // won't have saved, so we still need to here. When it *did*
+        // change focus, `activate_tab` already saved and another
+        // call would just be redundant disk I/O.
+        if prev_focused == group_idx {
+            self.save_layout();
+        }
+    }
+
+    /// Close every tab in `group_id` whose position is to the right
+    /// of `pivot_tab_id`. Mirrors the C# build's "Close all to the
+    /// right" tab menu row. The pivot stays put.
+    fn close_tabs_to_right_in_group(
+        &mut self,
+        group_id: u64,
+        pivot_tab_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group_idx) = self.groups.iter().position(|g| g.id == group_id) else {
+            self.close_tab_menu(cx);
+            return;
+        };
+        let Some(pivot_pos) = self.groups[group_idx]
+            .tabs
+            .iter()
+            .position(|t| t.id == pivot_tab_id)
+        else {
+            self.close_tab_menu(cx);
+            return;
+        };
+        self.groups[group_idx].tabs.truncate(pivot_pos + 1);
+        // Active tab shifts to the pivot if it was past the new end.
+        if self.groups[group_idx].active_tab > pivot_pos {
+            self.groups[group_idx].active_tab = pivot_pos;
+        }
+        let prev_focused = self.focused_group;
+        let active = self.groups[group_idx].active_tab;
+        self.activate_tab(group_idx, active, window, cx);
+        self.close_tab_menu(cx);
+        // Only save here if `activate_tab` didn't — same dedupe as
+        // `close_other_tabs_in_group`.
+        if prev_focused == group_idx {
+            self.save_layout();
+        }
     }
 
     /// Reparent a tab from one group to another by id. Triggered by
@@ -1798,6 +2057,7 @@ impl Render for AppShell {
             .child(tab_strip)
             .child(main_row)
             .child(self.render_status_bar(&theme))
+            .children(self.render_tab_menu(&theme, cx))
     }
 }
 
@@ -1900,6 +2160,15 @@ impl AppShell {
                     cx.listener(move |this, _, window, cx| {
                         this.activate_tab(group_idx, tab_idx, window, cx);
                     }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(
+                        move |this, event: &gpui::MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.open_tab_menu(group_id, tab_id, event.position, cx);
+                        },
+                    ),
                 )
                 // Make the tab draggable. The constructor builds a
                 // fresh `DraggedTab` view that gpui paints attached
