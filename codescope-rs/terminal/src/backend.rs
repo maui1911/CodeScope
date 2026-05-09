@@ -413,6 +413,13 @@ impl Backend {
                 }
             }
 
+            // Sweep each row for plain-text URLs (claude-code,
+            // `gh pr view`, `cargo --message-format json`, … emit
+            // them without OSC 8) and turn them into clickable runs.
+            // Existing OSC 8 hyperlinks are left alone; URL detection
+            // never overrides an explicit one.
+            inject_url_hyperlinks(&mut lines);
+
             // Cursor info: build now that we've captured the cell under
             // it. For block-style cursors, the renderer inverts colours
             // (cell.bg → text fg, palette.cursor → cursor bg). For beam
@@ -543,6 +550,117 @@ impl Backend {
     }
 }
 
+/// Post-processing pass that finds plain-text URLs (`https://…`,
+/// `http://…`, `file://…`, …) inside each line of styled runs and
+/// retro-tags the matching cells with a hyperlink, just like an OSC 8
+/// link would have done. Lets `claude-code` / `gh` / `cargo` output
+/// stay clickable even though they emit URLs as bare text.
+///
+/// Runs that already carry an OSC 8 hyperlink are left untouched —
+/// the explicit signal always wins. Runs containing wide chars (where
+/// `len_cols != chars().count()`) are skipped to keep splitting safe;
+/// real-world URLs are pure ASCII so this is rarely a constraint.
+fn inject_url_hyperlinks(lines: &mut [Vec<StyledRun>]) {
+    let finder = linkify::LinkFinder::new();
+    for line in lines.iter_mut() {
+        if line.is_empty() {
+            continue;
+        }
+        // Build column-aligned text. With ASCII content (URLs are
+        // always ASCII) the byte index inside `text` matches the
+        // column on screen, so linkify's byte ranges translate
+        // directly to columns. Wide-char runs throw the alignment
+        // off — `apply_url_to_line` skips runs in that case.
+        let mut text = String::new();
+        for run in line.iter() {
+            while text.chars().count() < run.start_col {
+                text.push(' ');
+            }
+            text.push_str(&run.text);
+        }
+        let urls: Vec<(usize, usize, Arc<str>)> = finder
+            .links(&text)
+            .filter(|link| link.kind() == &linkify::LinkKind::Url)
+            .map(|link| (link.start(), link.end(), Arc::from(link.as_str())))
+            .collect();
+        for (b_start, b_end, url) in urls {
+            let col_start = text[..b_start].chars().count();
+            let col_end = text[..b_end].chars().count();
+            apply_url_to_line(line, col_start, col_end, url);
+        }
+    }
+}
+
+fn apply_url_to_line(
+    line: &mut Vec<StyledRun>,
+    url_start: usize,
+    url_end: usize,
+    url: Arc<str>,
+) {
+    let mut new_runs: Vec<StyledRun> = Vec::with_capacity(line.len() + 2);
+    for run in line.drain(..) {
+        let r_start = run.start_col;
+        let r_end = run.start_col + run.len_cols;
+        // Run sits entirely outside the URL → keep as-is.
+        // Run already has its own (OSC 8) hyperlink → don't override.
+        // Run has wide chars → splitting on column boundaries gets
+        // ambiguous, skip the URL injection here.
+        if r_end <= url_start
+            || r_start >= url_end
+            || run.hyperlink.is_some()
+            || run.text.chars().count() != run.len_cols
+        {
+            new_runs.push(run);
+            continue;
+        }
+        let chars: Vec<char> = run.text.chars().collect();
+        let split_left = url_start.saturating_sub(r_start);
+        let split_right = (url_end - r_start).min(run.len_cols);
+
+        if split_left > 0 {
+            let pre: String = chars[..split_left].iter().collect();
+            new_runs.push(StyledRun {
+                text: pre,
+                start_col: r_start,
+                len_cols: split_left,
+                fg: run.fg,
+                bg: run.bg,
+                bold: run.bold,
+                italic: run.italic,
+                underline: run.underline,
+                hyperlink: None,
+            });
+        }
+        let mid: String = chars[split_left..split_right].iter().collect();
+        new_runs.push(StyledRun {
+            text: mid,
+            start_col: r_start + split_left,
+            len_cols: split_right - split_left,
+            fg: run.fg,
+            bg: run.bg,
+            bold: run.bold,
+            italic: run.italic,
+            underline: true,
+            hyperlink: Some(url.clone()),
+        });
+        if split_right < run.len_cols {
+            let post: String = chars[split_right..].iter().collect();
+            new_runs.push(StyledRun {
+                text: post,
+                start_col: r_start + split_right,
+                len_cols: run.len_cols - split_right,
+                fg: run.fg,
+                bg: run.bg,
+                bold: run.bold,
+                italic: run.italic,
+                underline: run.underline,
+                hyperlink: None,
+            });
+        }
+    }
+    *line = new_runs;
+}
+
 /// One contiguous run of cells with identical styling on a single row.
 /// `start_col` is the leftmost column the run occupies; `len_cols` is
 /// the cell width (each char contributes 1, wide chars contribute 2).
@@ -609,6 +727,21 @@ pub struct TerminalSnapshot {
     pub screen_lines: usize,
     pub default_fg: Hsla,
     pub default_bg: Hsla,
+}
+
+impl TerminalSnapshot {
+    /// Find the OSC 8 / detected-URL hyperlink at a viewport-relative
+    /// (row, col). Walks the row's runs for the one covering `col` —
+    /// O(runs-per-row), tiny in practice. The View uses this for
+    /// hover-cursor and Ctrl-click handling, so it doesn't have to
+    /// re-lock the live `Term` just to look up a URL.
+    pub fn hyperlink_at(&self, row: usize, col: usize) -> Option<Arc<str>> {
+        let line = self.lines.get(row)?;
+        line.iter()
+            .find(|r| col >= r.start_col && col < r.start_col + r.len_cols)?
+            .hyperlink
+            .clone()
+    }
 }
 
 impl Drop for Backend {

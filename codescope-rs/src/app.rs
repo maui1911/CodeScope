@@ -351,15 +351,20 @@ impl Render for AppShell {
 
         let new_tab_frost = theme::frost_10(&theme);
         let new_tab_accent = theme::accent(&theme);
+        // `h(40)` instead of `h_full()` because the strip's flex-row
+        // doesn't always resolve `h_full` to the parent's 40 px before
+        // hit-testing happens — the button looked the right size but
+        // its hit area collapsed to 0, killing both hover and click.
         let new_tab_button = div()
             .id("new-tab")
-            .h_full()
+            .h(px(40.0))
             .w(px(40.0))
             .flex()
             .items_center()
             .justify_center()
             .text_color(theme::ink_dim(&theme))
             .text_size(px(18.0))
+            .cursor_pointer()
             .hover(move |s| s.bg(new_tab_frost).text_color(new_tab_accent))
             .on_mouse_down(
                 MouseButton::Left,

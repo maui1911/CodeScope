@@ -126,6 +126,12 @@ pub struct TerminalView {
     /// A background timer toggles it every 530 ms; input handlers set
     /// it back to `true` so the cursor doesn't disappear under typing.
     blink_phase: Arc<Mutex<bool>>,
+    /// URI of the OSC 8 hyperlink currently under the mouse, if any.
+    /// Drives the pointer cursor — render reads this on every frame
+    /// and applies `cursor_pointer()` when set. Updated on
+    /// mouse-move; we only `cx.notify()` when the value flips so
+    /// motion across non-hyperlink cells doesn't repaint the world.
+    hovered_link: Option<Arc<str>>,
 }
 
 impl TerminalView {
@@ -235,6 +241,7 @@ impl TerminalView {
             bounds_cache: Arc::new(Mutex::new(None)),
             selecting: false,
             blink_phase,
+            hovered_link: None,
         }
     }
 
@@ -364,8 +371,8 @@ impl TerminalView {
         let modifier = event.modifiers.control || event.modifiers.platform;
         if modifier && !event.modifiers.shift {
             if let Some((row, col)) = self.visible_rc(event.position) {
-                if let Some(uri) = self.backend.hyperlink_at(row, col) {
-                    let _ = open::that_detached(&uri);
+                if let Some(uri) = self.snapshot.hyperlink_at(row, col) {
+                    let _ = open::that_detached(uri.as_ref());
                     return;
                 }
             }
@@ -383,6 +390,17 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Track hover-over-hyperlink so render can flip the cursor
+        // to a pointer. Only re-notify when the URI actually changes,
+        // otherwise every pointer wobble would force a repaint.
+        let next_link = self
+            .visible_rc(event.position)
+            .and_then(|(row, col)| self.snapshot.hyperlink_at(row, col));
+        if next_link.as_deref() != self.hovered_link.as_deref() {
+            self.hovered_link = next_link;
+            cx.notify();
+        }
+
         // Forward motion events to the TUI when it asked for them.
         // We only emit motion-with-button-held; pointer motion with
         // no button is rare and noisy, and `?1003h` apps that want
@@ -821,7 +839,9 @@ impl Render for TerminalView {
         )
         .size_full();
 
-        div()
+        let pointer_for_link = self.hovered_link.is_some();
+
+        let mut root = div()
             .track_focus(&self.focus_handle)
             .key_context("Terminal")
             .on_key_down(cx.listener(Self::on_key_down))
@@ -841,8 +861,11 @@ impl Render for TerminalView {
             .bg(bg)
             .font_family(self.font.family.clone())
             .text_size(self.font.size)
-            .size_full()
-            .child(canvas_element)
+            .size_full();
+        if pointer_for_link {
+            root = root.cursor_pointer();
+        }
+        root.child(canvas_element)
     }
 }
 
