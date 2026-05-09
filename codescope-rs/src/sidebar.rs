@@ -29,9 +29,9 @@ use std::sync::Arc;
 
 use codescope_core::{AppPaths, LayoutState, Project, ProjectsConfig, Theme};
 use gpui::{
-    ClipboardItem, Context, Corner, EventEmitter, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, PathPromptOptions, Pixels, Point, Render, SharedString, Styled,
-    Window, anchored, deferred, div, point, px,
+    AppContext, ClipboardItem, Context, Corner, EventEmitter, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, ParentElement, PathPromptOptions, Pixels, Point, Render,
+    SharedString, Styled, Window, anchored, deferred, div, point, px,
 };
 
 use crate::new_worktree_dialog::NewWorktreeDialogState;
@@ -45,9 +45,18 @@ pub const SIDEBAR_WIDTH: f32 = 240.0;
 /// Open right-click context menu state. `None` when no menu is
 /// showing. The position is in window coordinates so we can hand it
 /// straight to [`anchored`] without recomputing on render.
-struct OpenMenu {
-    project_idx: usize,
-    position: Point<Pixels>,
+///
+/// One enum across project + worktree menus rather than two `Option`
+/// fields so opening one always implicitly closes the other — the user
+/// can never see two menus at once and we don't have to reconcile two
+/// "did the row I anchor to disappear?" code paths on render.
+enum OpenMenu {
+    Project { project_idx: usize, position: Point<Pixels> },
+    Worktree {
+        project_idx: usize,
+        worktree_idx: usize,
+        position: Point<Pixels>,
+    },
 }
 
 /// Click handler for a context-menu row. Boxed so we can stash it in
@@ -252,7 +261,27 @@ impl Sidebar {
         if idx >= self.projects.projects.len() {
             return;
         }
-        self.menu = Some(OpenMenu { project_idx: idx, position });
+        self.menu = Some(OpenMenu::Project { project_idx: idx, position });
+        cx.notify();
+    }
+
+    /// Open the worktree context menu at `position` for the worktree
+    /// at `(project_idx, worktree_idx)`. No-op when either index has
+    /// shifted out from under the click (rare but possible if the
+    /// projects file was rewritten between the right-click event being
+    /// queued and us getting around to handling it).
+    fn open_worktree_menu(
+        &mut self,
+        project_idx: usize,
+        worktree_idx: usize,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.projects.projects.get(project_idx) else { return };
+        if worktree_idx >= project.worktrees.len() {
+            return;
+        }
+        self.menu = Some(OpenMenu::Worktree { project_idx, worktree_idx, position });
         cx.notify();
     }
 
@@ -266,19 +295,7 @@ impl Sidebar {
     /// Mirrors the C# `RevealInExplorerCommand`.
     fn reveal_in_explorer(&mut self, idx: usize, cx: &mut Context<Self>) {
         let Some(project) = self.projects.projects.get(idx) else { return };
-        let path = project.path.clone();
-        // Spawn detached so a slow shell-extension doesn't stall the UI
-        // thread. We don't care about the exit status — the user sees
-        // the result on their desktop.
-        #[cfg(target_os = "windows")]
-        let result = Command::new("explorer.exe").arg(&path).spawn();
-        #[cfg(target_os = "macos")]
-        let result = Command::new("open").arg(&path).spawn();
-        #[cfg(all(unix, not(target_os = "macos")))]
-        let result = Command::new("xdg-open").arg(&path).spawn();
-        if let Err(err) = result {
-            eprintln!("warning: failed to reveal {path}: {err:#}");
-        }
+        reveal_path_in_file_browser(&project.path);
         self.close_menu(cx);
     }
 
@@ -287,18 +304,7 @@ impl Sidebar {
     /// `OpenInWindowsTerminalCommand`. No-op on non-Windows.
     fn open_in_windows_terminal(&mut self, idx: usize, cx: &mut Context<Self>) {
         let Some(project) = self.projects.projects.get(idx) else { return };
-        let path = project.path.clone();
-        #[cfg(target_os = "windows")]
-        {
-            if let Err(err) = Command::new("wt").args(["-d", &path]).spawn() {
-                eprintln!("warning: failed to launch Windows Terminal: {err:#}");
-            }
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = path;
-            eprintln!("info: 'Open in Windows Terminal' is Windows-only");
-        }
+        open_path_in_windows_terminal(&project.path);
         self.close_menu(cx);
     }
 
@@ -309,6 +315,140 @@ impl Sidebar {
         let Some(project) = self.projects.projects.get(idx) else { return };
         cx.write_to_clipboard(ClipboardItem::new_string(project.path.clone()));
         self.close_menu(cx);
+    }
+
+    /// Reveal a non-primary worktree in the OS file browser. Same
+    /// platform fan-out as the project version — kept as a separate
+    /// method so the menu wiring stays symmetric and future per-row
+    /// behavior (e.g. selecting the worktree's branch dot in Explorer)
+    /// has a place to land.
+    fn reveal_worktree_in_explorer(
+        &mut self,
+        project_idx: usize,
+        worktree_idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(path) = self.worktree_path(project_idx, worktree_idx) {
+            reveal_path_in_file_browser(&path);
+        }
+        self.close_menu(cx);
+    }
+
+    fn open_worktree_in_windows_terminal(
+        &mut self,
+        project_idx: usize,
+        worktree_idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(path) = self.worktree_path(project_idx, worktree_idx) {
+            open_path_in_windows_terminal(&path);
+        }
+        self.close_menu(cx);
+    }
+
+    fn copy_worktree_path(
+        &mut self,
+        project_idx: usize,
+        worktree_idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(path) = self.worktree_path(project_idx, worktree_idx) {
+            cx.write_to_clipboard(ClipboardItem::new_string(path));
+        }
+        self.close_menu(cx);
+    }
+
+    /// Look up the on-disk path for a non-primary worktree by its
+    /// (project, worktree) indices. Returns `None` if either index has
+    /// shifted out from under us (race with `add_project` /
+    /// `remove_project` / external `projects.json` rewrite). Callers
+    /// should silently no-op on `None` — the user will see the menu
+    /// close and re-open with fresh data on the next click.
+    fn worktree_path(&self, project_idx: usize, worktree_idx: usize) -> Option<String> {
+        self.projects
+            .projects
+            .get(project_idx)
+            .and_then(|p| p.worktrees.get(worktree_idx).map(|wt| wt.path.clone()))
+    }
+
+    /// Snapshot the metadata the "Remove worktree…" flow needs before
+    /// we hand control off to an async task. Returning the values
+    /// up-front means we don't have to re-borrow `self.projects` after
+    /// the await point — the indices may have shifted by then.
+    fn worktree_remove_context(
+        &self,
+        project_idx: usize,
+        worktree_idx: usize,
+    ) -> Option<WorktreeRemoveContext> {
+        let project = self.projects.projects.get(project_idx)?;
+        let wt = project.worktrees.get(worktree_idx)?;
+        if wt.is_primary {
+            return None;
+        }
+        let label = wt
+            .branch
+            .clone()
+            .unwrap_or_else(|| {
+                std::path::Path::new(&wt.path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| wt.path.clone())
+            });
+        Some(WorktreeRemoveContext {
+            project_id: project.id.clone(),
+            worktree_id: wt.id.clone(),
+            project_path: project.path.clone(),
+            worktree_path: wt.path.clone(),
+            display_label: label,
+        })
+    }
+
+    /// Drop a non-primary worktree from this project. Calls
+    /// `git worktree remove` (force=false first; on failure prompts
+    /// the user before retrying with `--force`), then rewrites
+    /// `projects.json` so the row disappears from the sidebar.
+    /// Mirrors `SidebarViewModel.RemoveWorktreeAsync` minus the
+    /// session-close pre-step (the Rust port doesn't yet track which
+    /// tabs are pinned to which worktree, so the user is responsible
+    /// for closing them — the force-prompt covers the file-locked
+    /// case).
+    fn remove_worktree(
+        &mut self,
+        project_idx: usize,
+        worktree_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ctx) = self.worktree_remove_context(project_idx, worktree_idx) else {
+            self.close_menu(cx);
+            return;
+        };
+        self.close_menu(cx);
+
+        let confirm_msg = format!("Delete worktree '{}'?", ctx.display_label);
+        let confirm_detail = format!(
+            "Path: {}\n\nOpen sessions stay running but lose their working directory. \
+             Unpushed commits stay on the branch.",
+            ctx.worktree_path
+        );
+        let rx = window.prompt(
+            gpui::PromptLevel::Warning,
+            &confirm_msg,
+            Some(&confirm_detail),
+            &["Delete", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            // 0 = first button ("Delete"). Anything else = cancel /
+            // dialog dismissed.
+            match rx.await {
+                Ok(0) => {}
+                _ => return,
+            }
+            run_remove_worktree_flow(this, ctx, cx).await;
+        })
+        .detach();
     }
 
     /// Drop a project from the sidebar list and persist `projects.json`.
@@ -533,8 +673,9 @@ impl Render for Sidebar {
             // Non-primary worktree rows. Indented to make the parent /
             // child relationship obvious; click emits `OpenSession`
             // which the AppShell catches to spawn a tab pinned to the
-            // worktree's path.
-            for wt in worktrees {
+            // worktree's path. Right-click opens the worktree context
+            // menu (Reveal / Open in WT / Copy path / Remove…).
+            for (wt_idx, wt) in worktrees.into_iter().enumerate() {
                 let wt_label: SharedString = wt
                     .branch
                     .clone()
@@ -551,6 +692,7 @@ impl Render for Sidebar {
                     })
                     .into();
                 let wt_path_for_event = wt.path.clone();
+                let project_idx_for_menu = idx;
                 // Single spaces around `·` to match the C# build's
                 // `$"{project.Name} · {branch}"` convention in
                 // `MainViewModel.RefreshTabTitlesForWorktree`.
@@ -582,6 +724,17 @@ impl Render for Sidebar {
                             });
                         }),
                     )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.open_worktree_menu(
+                                project_idx_for_menu,
+                                wt_idx,
+                                event.position,
+                                cx,
+                            );
+                        }),
+                    )
                     .child(div().flex_grow().truncate().child(wt_label));
                 project_and_worktree_rows.push(wt_row.into_any_element());
             }
@@ -608,20 +761,38 @@ impl Render for Sidebar {
             .child(div().h_px().bg(theme::divider(&theme)))
             .child(body);
 
-        // Build the project context menu (if any). We snapshot the
-        // index + position so the closure-borrow on `self.menu`
-        // doesn't outlast the call to `render_project_menu`.
-        if let Some((idx, pos, project)) = self.menu.as_ref().and_then(|m| {
-            self.projects
-                .projects
-                .get(m.project_idx)
-                .cloned()
-                .map(|p| (m.project_idx, m.position, p))
-        }) {
-            let overlay = self
-                .render_project_menu(idx, pos, &project, &theme, cx)
-                .into_any_element();
-            root = root.child(overlay);
+        // Build whichever context menu is open (project / worktree /
+        // none). Snapshot indices + position up-front so the closure-
+        // borrow on `self.menu` doesn't outlast the render helper
+        // calls below.
+        match self.menu.as_ref() {
+            Some(OpenMenu::Project { project_idx, position }) => {
+                if let Some(project) = self.projects.projects.get(*project_idx).cloned() {
+                    let overlay = self
+                        .render_project_menu(*project_idx, *position, &project, &theme, cx)
+                        .into_any_element();
+                    root = root.child(overlay);
+                }
+            }
+            Some(OpenMenu::Worktree { project_idx, worktree_idx, position }) => {
+                if let Some(project) = self.projects.projects.get(*project_idx).cloned()
+                    && let Some(wt) = project.worktrees.get(*worktree_idx).cloned()
+                {
+                    let overlay = self
+                        .render_worktree_menu(
+                            *project_idx,
+                            *worktree_idx,
+                            *position,
+                            &project,
+                            &wt,
+                            &theme,
+                            cx,
+                        )
+                        .into_any_element();
+                    root = root.child(overlay);
+                }
+            }
+            None => {}
         }
         if let Some(overlay) = self.render_new_worktree_dialog(window, &theme, cx) {
             root = root.child(overlay);
@@ -764,6 +935,324 @@ impl Sidebar {
                 .snap_to_window_with_margin(px(8.0))
                 .child(menu_body),
         )
+    }
+
+    /// Worktree row context menu — mirrors the C# `BuildWorktreeMenu`
+    /// in scope minus the git/PR rows that depend on subsystems we
+    /// haven't ported yet (rebase, pull, PR detection, dirty-state
+    /// dot). Today: Open session (default), Reveal, Open in WT,
+    /// Copy path, Remove worktree…
+    #[allow(clippy::too_many_arguments)]
+    fn render_worktree_menu(
+        &self,
+        project_idx: usize,
+        worktree_idx: usize,
+        position: Point<Pixels>,
+        project: &Project,
+        worktree: &codescope_core::projects::Worktree,
+        theme: &Arc<Theme>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        // Header: branch (or folder leaf when branch is unknown)
+        // dimmed, project name as the qualifier on the second line —
+        // mirrors the C# header pattern (label + scope tag).
+        let branch_label: SharedString = worktree
+            .branch
+            .clone()
+            .unwrap_or_else(|| {
+                std::path::Path::new(&worktree.path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| worktree.path.clone())
+            })
+            .into();
+        let project_label: SharedString = project.name.clone().into();
+        // Snapshot the open-session payload so the menu row's listener
+        // can `move` the values without keeping a borrow on `project`.
+        let open_session_path = PathBuf::from(&worktree.path);
+        let open_session_title = SharedString::from(format!(
+            "{} · {}",
+            project.name, branch_label
+        ));
+        let is_primary = worktree.is_primary;
+
+        let elevated = theme::elevated(theme);
+        let divider = theme::divider(theme);
+        let ink = theme::ink(theme);
+        let ink_dim = theme::ink_dim(theme);
+        let ink_ghost = theme::ink_ghost(theme);
+        let frost = theme::frost_10(theme);
+        let danger = theme::danger(theme);
+
+        let item = |id: &'static str,
+                    label: &'static str,
+                    danger_row: bool,
+                    on_click: MenuItemAction|
+         -> gpui::Stateful<gpui::Div> {
+            let base_color = if danger_row { danger } else { ink_dim };
+            let hover_color = if danger_row { danger } else { ink };
+            let frost_hover = frost;
+            div()
+                .id(id)
+                .h(px(28.0))
+                .px_3()
+                .flex()
+                .flex_row()
+                .items_center()
+                .text_size(px(13.0))
+                .text_color(base_color)
+                .cursor_pointer()
+                .hover(move |s| s.bg(frost_hover).text_color(hover_color))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        on_click(this, window, cx);
+                    }),
+                )
+                .child(label)
+        };
+
+        let menu_body = div()
+            .flex()
+            .flex_col()
+            .py_1()
+            .min_w(px(240.0))
+            .bg(elevated)
+            .border_1()
+            .border_color(divider)
+            .rounded_md()
+            .shadow_lg()
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(11.0))
+                    .text_color(ink_ghost)
+                    .child(div().text_color(ink).text_size(px(13.0)).truncate().child(branch_label))
+                    .child(div().truncate().child(project_label)),
+            )
+            .child(div().h_px().bg(divider).my_1())
+            .child(item(
+                "wt-menu-open",
+                "Open session",
+                false,
+                Box::new(move |this, _window, cx| {
+                    cx.emit(SidebarEvent::OpenSession {
+                        working_directory: open_session_path.clone(),
+                        title: open_session_title.clone(),
+                    });
+                    this.close_menu(cx);
+                }),
+            ))
+            .child(div().h_px().bg(divider).my_1())
+            .child(item(
+                "wt-menu-reveal",
+                reveal_in_file_browser_label(),
+                false,
+                Box::new(move |this, _window, cx| {
+                    this.reveal_worktree_in_explorer(project_idx, worktree_idx, cx);
+                }),
+            ))
+            .children(cfg!(target_os = "windows").then(|| {
+                item(
+                    "wt-menu-wt",
+                    "Open in Windows Terminal",
+                    false,
+                    Box::new(move |this, _window, cx| {
+                        this.open_worktree_in_windows_terminal(
+                            project_idx,
+                            worktree_idx,
+                            cx,
+                        );
+                    }),
+                )
+            }))
+            .child(item(
+                "wt-menu-copy-path",
+                "Copy path",
+                false,
+                Box::new(move |this, _window, cx| {
+                    this.copy_worktree_path(project_idx, worktree_idx, cx);
+                }),
+            ))
+            // Primary worktrees are tracked by the project row itself —
+            // there's nothing to "remove" without removing the project
+            // (which has its own destructive flow). Hide the row
+            // entirely on the primary so the menu stays a list of
+            // things that actually do something.
+            .children((!is_primary).then(|| {
+                div().child(div().h_px().bg(divider).my_1()).child(item(
+                    "wt-menu-remove",
+                    "Remove worktree…",
+                    true,
+                    Box::new(move |this, window, cx| {
+                        this.remove_worktree(project_idx, worktree_idx, window, cx);
+                    }),
+                ))
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_menu(cx)));
+
+        deferred(
+            anchored()
+                .position(point(position.x, position.y))
+                .anchor(Corner::TopLeft)
+                .snap_to_window_with_margin(px(8.0))
+                .child(menu_body),
+        )
+    }
+}
+
+/// Snapshot of everything `remove_worktree` needs after the user
+/// confirms the prompt. Captured up front so the async task that runs
+/// the `git worktree remove` (and the follow-up `projects.json`
+/// rewrite) doesn't have to re-borrow the sidebar — by the time it
+/// resumes, indices may have shifted under it.
+struct WorktreeRemoveContext {
+    project_id: String,
+    worktree_id: String,
+    project_path: String,
+    worktree_path: String,
+    /// Branch (or folder leaf) shown in toasts/error messages.
+    display_label: String,
+}
+
+/// Run the post-confirm `git worktree remove` flow. Lives outside the
+/// `Sidebar` impl because `cx.spawn_in` hands us an `AsyncApp` and a
+/// `WeakEntity<Sidebar>`, not a `&mut Sidebar` — wrapping the whole
+/// thing in a free async function keeps the borrow shape obvious.
+async fn run_remove_worktree_flow(
+    this: gpui::WeakEntity<Sidebar>,
+    ctx: WorktreeRemoveContext,
+    cx: &mut gpui::AsyncWindowContext,
+) {
+    use codescope_core::git;
+    use std::path::Path;
+
+    let repo = std::path::PathBuf::from(&ctx.project_path);
+    let wt_path = std::path::PathBuf::from(&ctx.worktree_path);
+
+    // First attempt without --force, mirroring the C# flow. The
+    // background_executor lets us off the UI thread while git runs.
+    let first_attempt = {
+        let repo = repo.clone();
+        let wt_path = wt_path.clone();
+        cx.background_spawn(async move { git::remove_worktree(&repo, &wt_path, false) })
+            .await
+    };
+
+    let needs_force = match first_attempt {
+        Ok(()) => false,
+        Err(err) => {
+            // Retry-with-force prompt. Same wording shape as the C#
+            // dialog: show the underlying git error so the user sees
+            // *why* the normal remove failed before deciding to force.
+            let prompt_msg = "Couldn't remove worktree — force?".to_string();
+            let detail = format!(
+                "{}\n\nForce remove will discard uncommitted changes and untracked files in the worktree.",
+                err
+            );
+            let receiver = match this.update_in(cx, |_this, window, cx| {
+                window.prompt(
+                    gpui::PromptLevel::Warning,
+                    &prompt_msg,
+                    Some(&detail),
+                    &["Force remove", "Cancel"],
+                    cx,
+                )
+            }) {
+                Ok(rx) => rx,
+                Err(_) => return,
+            };
+            match receiver.await {
+                Ok(0) => true,
+                _ => return,
+            }
+        }
+    };
+
+    if needs_force {
+        let repo = repo.clone();
+        let wt_path = wt_path.clone();
+        let forced = cx
+            .background_spawn(async move { git::remove_worktree(&repo, &wt_path, true) })
+            .await;
+        if let Err(err) = forced {
+            eprintln!(
+                "warning: force-remove of worktree '{}' failed: {err:#}",
+                ctx.display_label
+            );
+            return;
+        }
+    }
+
+    // Git is happy; rewrite `projects.json` to drop the row. Match by
+    // (project id, worktree id) so a concurrent edit that reordered
+    // the list still hits the right row. If the project / worktree is
+    // already gone (e.g. another window beat us to it), the rewrite
+    // is a no-op and we still return success.
+    let _ = this.update(cx, |this, cx| {
+        let mut next = this.projects.clone();
+        let Some(project) = next.projects.iter_mut().find(|p| p.id == ctx.project_id) else {
+            return;
+        };
+        let before = project.worktrees.len();
+        project.worktrees.retain(|wt| wt.id != ctx.worktree_id);
+        if project.worktrees.len() == before {
+            // Nothing to persist — the row was already gone.
+            return;
+        }
+        if let Err(err) = next.save(this.paths.as_ref()) {
+            eprintln!("warning: failed to save projects.json after worktree removal: {err:#}");
+            return;
+        }
+        this.projects = next;
+        cx.notify();
+    });
+
+    // Best-effort: the empty worktree directory should already be
+    // gone — `git worktree remove` cleans it up. If it lingers (rare,
+    // typically antivirus holding a handle), let it sit; the residual
+    // is a flat empty directory the user can remove manually. Mirrors
+    // the C# `RemoveWorktreeResidualDirPrefix` branch which also just
+    // surfaces the message rather than retrying.
+    let _ = Path::new(&ctx.worktree_path);
+}
+
+/// OS-spawn shared by project + worktree "Reveal" rows. Detached so a
+/// slow shell extension can't stall the UI thread, and we ignore exit
+/// status since the user sees the result on their desktop.
+fn reveal_path_in_file_browser(path: &str) {
+    #[cfg(target_os = "windows")]
+    let result = Command::new("explorer.exe").arg(path).spawn();
+    #[cfg(target_os = "macos")]
+    let result = Command::new("open").arg(path).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = Command::new("xdg-open").arg(path).spawn();
+    if let Err(err) = result {
+        eprintln!("warning: failed to reveal {path}: {err:#}");
+    }
+}
+
+/// `wt -d <path>` — Windows-only. Logs a friendly warning on other
+/// platforms; the menu row is hidden there but the helper itself stays
+/// safe to call so the call sites don't need their own `cfg!` guards.
+fn open_path_in_windows_terminal(path: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        if let Err(err) = Command::new("wt").args(["-d", path]).spawn() {
+            eprintln!("warning: failed to launch Windows Terminal: {err:#}");
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        eprintln!("info: 'Open in Windows Terminal' is Windows-only");
     }
 }
 
