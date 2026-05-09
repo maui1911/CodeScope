@@ -1,12 +1,10 @@
 //! gpui View layer for the terminal.
 //!
-//! Renders the visible grid as one row of styled spans per line. Each
-//! [`StyledRun`] from the backend snapshot becomes a div with its own
-//! `text_color` / `bg`, so we get per-cell ANSI colours without needing
-//! a full `Element` impl yet. The Element layer is still on the roadmap
-//! — it's the only way to get a sub-cell cursor, partial-cell
-//! background fills, and the kind of text-shaping batching that keeps
-//! a 200×60 grid cheap. For now this is plenty to drive a real shell.
+//! Renders the visible grid through a single `canvas` element that
+//! handles both measurement (cell metrics, grid resize) and painting
+//! (default-bg quad, per-row non-default bg quads, batched text runs,
+//! cursor on top). See [`crate::paint::paint_snapshot`] for the actual
+//! pixel work.
 //!
 //! Architecture pointers:
 //!
@@ -16,23 +14,22 @@
 //!   exits cleanly.
 //! * Keyboard input is converted via [`keystroke_to_bytes`] and pushed
 //!   into the backend's input queue.
-//! * A `canvas` overlay on the line stack reports its laid-out bounds
-//!   so we can compute the right `cols`×`rows` for the current window
-//!   size and call [`Backend::resize`] when it changes.
+//! * The canvas measure phase reports its laid-out bounds back so the
+//!   grid resize logic and mouse-coordinate translation can use them.
 
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::backend::{Backend, StyledRun, TerminalSize, TerminalSnapshot};
+use crate::backend::{Backend, TerminalSize, TerminalSnapshot};
 use crate::colors::ColorPalette;
 use crate::input::keystroke_to_bytes;
+use crate::paint::paint_snapshot;
 use gpui::{
     App, Bounds, ClipboardItem, Context, FocusHandle, Focusable, Font, FontFallbacks,
     FontFeatures, FontStyle, FontWeight, InteractiveElement, IntoElement, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
-    Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled, TextRun, Window, canvas, div,
-    px,
+    Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled, TextRun, Window, canvas, div, px,
 };
 
 /// User-overridable font + size knobs. The defaults target oh-my-posh
@@ -260,6 +257,36 @@ impl TerminalView {
             // gets its SIGINT byte.
         }
 
+        // Paste:
+        //   * Ctrl+Shift+V (Windows / Linux convention) — always paste.
+        //   * Cmd+V       (macOS convention)            — always paste.
+        //   * Ctrl+V                                    — paste when
+        //     the TUI has enabled bracketed-paste mode (claude-code,
+        //     vim, modern shells), so it gets a proper paste event
+        //     instead of `\x16`. When bracketed-paste is OFF (cmd.exe,
+        //     bare bash) we fall through to sending `\x16` so
+        //     readline's quoted-insert and PSReadLine's own paste
+        //     binding still work.
+        let always_paste = (mods.control && mods.shift && key == "v")
+            || (mods.platform && key == "v" && !mods.control && !mods.alt);
+        let smart_ctrl_v = mods.control
+            && !mods.shift
+            && !mods.alt
+            && !mods.platform
+            && key == "v"
+            && self
+                .backend
+                .mode()
+                .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
+        if always_paste || smart_ctrl_v {
+            if let Some(item) = cx.read_from_clipboard()
+                && let Some(text) = item.text()
+            {
+                self.paste(&text);
+            }
+            return;
+        }
+
         // PageUp/PageDown without modifiers scroll the view's history
         // instead of being passed to the shell — same convention as
         // most terminals. Holding Shift sends them through to the PTY
@@ -313,6 +340,33 @@ impl TerminalView {
         }
     }
 
+    /// Write clipboard text into the PTY. Honours bracketed-paste mode
+    /// (`ESC[?2004h`) so TUIs like vim, claude-code, and bash >= 4.1
+    /// can distinguish paste from typed input — without it, multi-line
+    /// pastes get interpreted as ENTER key sequences and run commands
+    /// the user didn't intend.
+    ///
+    /// CR/CRLF are normalised to LF: Windows clipboards typically hand
+    /// us CRLF, but a PTY treats CR as ENTER, so a multi-line paste
+    /// would otherwise execute every line.
+    fn paste(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let normalised = text.replace("\r\n", "\n").replace('\r', "\n");
+        let mode = self.backend.mode();
+        if mode.contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE) {
+            let mut bytes = Vec::with_capacity(normalised.len() + 12);
+            bytes.extend_from_slice(b"\x1b[200~");
+            bytes.extend_from_slice(normalised.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+            self.backend.write_input(bytes);
+        } else {
+            self.backend.write_input(normalised.into_bytes());
+        }
+        self.backend.reset_scroll();
+    }
+
     fn maybe_resize(&mut self, cols: u16, rows: u16, cx: &mut Context<Self>) {
         let (cur_cols, cur_rows) = *self.last_size.lock();
         if cols == cur_cols && rows == cur_rows {
@@ -341,70 +395,101 @@ impl Focusable for TerminalView {
     }
 }
 
+/// State handed from the canvas measure phase to the paint phase.
+struct CanvasLayout {
+    bounds: Bounds<Pixels>,
+    cell_width: Pixels,
+    line_height: Pixels,
+}
+
 impl Render for TerminalView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let line_height = self.font.line_height;
         let bg = self.snapshot.default_bg;
         let last_size = self.last_size.clone();
         let bounds_cache = self.bounds_cache.clone();
         let weak = cx.weak_entity();
         let font = self.font.to_font();
         let font_size = self.font.size;
+        let snapshot = self.snapshot.clone();
 
-        // The transparent canvas overlay measures the actual cell width
-        // and line height from the gpui text system, then reports the
-        // laid-out bounds back to the entity so we can resize the
-        // PTY/grid in step with the window. It paints nothing.
-        let resize_probe = canvas(
-            move |bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App| {
-                // Stash the laid-out bounds so mouse handlers can map
-                // window-pixel positions back to grid coordinates.
-                *bounds_cache.lock() = Some(bounds);
+        let canvas_element = canvas(
+            // Layout phase: measure the cell, stash bounds for mouse
+            // coords, and trigger a grid resize if dimensions changed.
+            // The returned `CanvasLayout` is forwarded to the paint
+            // phase so we don't re-shape the probe glyph.
+            {
+                let bounds_cache = bounds_cache.clone();
+                let last_size = last_size.clone();
+                let font = font.clone();
+                move |bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App| {
+                    *bounds_cache.lock() = Some(bounds);
 
-                // Shape a single character through the same font stack
-                // we render with. '│' is the conventional choice — TUI
-                // fonts size it to fill the cell exactly.
-                let probe_run = TextRun {
-                    len: "│".len(),
-                    font: font.clone(),
-                    color: gpui::black(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                };
-                let shaped = window.text_system().shape_line(
-                    "│".into(),
-                    font_size,
-                    &[probe_run],
-                    None,
-                );
-                let measured_cell_w = shaped.width;
-                let measured_line_h = (shaped.ascent + shaped.descent).ceil();
+                    // '│' (BOX DRAWINGS LIGHT VERTICAL) — terminal
+                    // fonts size it to fill the cell exactly, so it's
+                    // the canonical measurement glyph.
+                    let probe_run = TextRun {
+                        len: "│".len(),
+                        font: font.clone(),
+                        color: gpui::black(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let shaped = window.text_system().shape_line(
+                        "│".into(),
+                        font_size,
+                        &[probe_run],
+                        None,
+                    );
+                    let cell_width = shaped.width;
+                    let line_height = (shaped.ascent + shaped.descent).ceil();
 
-                let cell_w_f32: f32 = measured_cell_w.into();
-                let line_h_f32: f32 = measured_line_h.into();
-                let w: f32 = bounds.size.width.into();
-                let h: f32 = bounds.size.height.into();
+                    let cell_w_f32: f32 = cell_width.into();
+                    let line_h_f32: f32 = line_height.into();
+                    if cell_w_f32 > 0.0 && line_h_f32 > 0.0 {
+                        let w: f32 = bounds.size.width.into();
+                        let h: f32 = bounds.size.height.into();
+                        let cols = (w / cell_w_f32).floor() as u16;
+                        let rows = (h / line_h_f32).floor() as u16;
+
+                        let (cur_cols, cur_rows) = *last_size.lock();
+                        if cols != cur_cols || rows != cur_rows {
+                            weak.update(cx, |view, cx| {
+                                view.font.cell_width = cell_width;
+                                view.font.line_height = line_height;
+                                view.maybe_resize(cols, rows, cx);
+                            })
+                            .ok();
+                        }
+                    }
+
+                    CanvasLayout {
+                        bounds,
+                        cell_width,
+                        line_height,
+                    }
+                }
+            },
+            // Paint phase: emit quads + shaped text from the cloned
+            // snapshot.
+            move |_bounds, layout: CanvasLayout, window: &mut Window, cx: &mut App| {
+                let cell_w_f32: f32 = layout.cell_width.into();
+                let line_h_f32: f32 = layout.line_height.into();
                 if cell_w_f32 <= 0.0 || line_h_f32 <= 0.0 {
                     return;
                 }
-                let cols = (w / cell_w_f32).floor() as u16;
-                let rows = (h / line_h_f32).floor() as u16;
-
-                let (cur_cols, cur_rows) = *last_size.lock();
-                if cols != cur_cols || rows != cur_rows {
-                    weak
-                        .update(cx, |view, cx| {
-                            view.font.cell_width = measured_cell_w;
-                            view.font.line_height = measured_line_h;
-                            view.maybe_resize(cols, rows, cx);
-                        })
-                        .ok();
-                }
+                paint_snapshot(
+                    layout.bounds,
+                    &snapshot,
+                    &font,
+                    font_size,
+                    layout.cell_width,
+                    layout.line_height,
+                    window,
+                    cx,
+                );
             },
-            |_bounds, _state, _window, _cx| {},
         )
-        .absolute()
         .size_full();
 
         div()
@@ -419,39 +504,7 @@ impl Render for TerminalView {
             .font_family(self.font.family.clone())
             .text_size(self.font.size)
             .size_full()
-            .relative()
-            .child(resize_probe)
-            .child(
-                div()
-                    .size_full()
-                    .flex()
-                    .flex_col()
-                    .children(self.snapshot.lines.iter().map(|line| {
-                        div()
-                            .h(line_height)
-                            .flex()
-                            .flex_row()
-                            .whitespace_nowrap()
-                            .children(line.iter().map(render_run))
-                    })),
-            )
+            .child(canvas_element)
     }
-}
-
-fn render_run(run: &StyledRun) -> impl IntoElement {
-    let mut element = div()
-        .text_color(run.fg)
-        .bg(run.bg)
-        .child(run.text.clone());
-    if run.bold {
-        element = element.font_weight(FontWeight::BOLD);
-    }
-    if run.italic {
-        element = element.italic();
-    }
-    if run.underline {
-        element = element.underline();
-    }
-    element
 }
 

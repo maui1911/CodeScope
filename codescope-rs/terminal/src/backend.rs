@@ -25,6 +25,7 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::vte::ansi::CursorShape;
 use alacritty_terminal::tty::{self, Options as TtyOptions, Pty, Shell};
 use anyhow::{Context, Result};
 use gpui::Hsla;
@@ -210,18 +211,19 @@ impl Backend {
     }
 
     /// Capture a styled snapshot of the visible grid. Each line is a
-    /// list of [`StyledRun`]s with already-resolved gpui colours and
-    /// flags so the View layer doesn't need to know anything about
-    /// alacritty's `Color` / `NamedColor` enums.
+    /// list of [`StyledRun`]s with already-resolved gpui colours, flags,
+    /// and exact column positions, so the renderer can paint quads and
+    /// text at pixel-accurate offsets without re-walking the grid.
     ///
-    /// Cells are walked via `display_iter`, so this respects scrollback
-    /// scroll position the moment we wire the View up to drive
-    /// `display_offset`. Adjacent cells with identical fg/bg/flags get
-    /// merged into one run to keep the gpui element count down.
+    /// Cells are walked via `display_iter`, so scrollback position is
+    /// respected (the View drives `display_offset`). Adjacent cells with
+    /// identical fg/bg/flags merge into one run; wide-char spacers are
+    /// skipped so the wide cell carries its full visual width
+    /// (`len_cols == 2`).
     ///
-    /// The cursor cell is rendered with fg/bg swapped — good enough for
-    /// the first iteration; a real block cursor with blink will land
-    /// once we have an Element-level paint path.
+    /// Cursor info travels separately on the snapshot — the renderer
+    /// paints the cursor as a quad on top of text, so we don't bake
+    /// inverted colours into the run.
     pub fn snapshot(&self, palette: &ColorPalette) -> TerminalSnapshot {
         self.with_term(|term| {
             let columns = term.columns();
@@ -230,19 +232,14 @@ impl Backend {
 
             let content = term.renderable_content();
             let display_offset = content.display_offset as i32;
-            // Cursor position is reported in absolute grid coordinates;
-            // translate to the visible row so the cursor cell lines up
-            // with what the View actually paints.
-            let cursor_line = content.cursor.point.line.0 + display_offset;
-            let cursor_column = content.cursor.point.column.0;
             let mode = content.mode;
-            // TUIs like claude-code, vim, etc. hide alacritty's logical
-            // cursor and draw their own block character. Honour both
-            // signals (TermMode::SHOW_CURSOR + CursorShape::Hidden) so
-            // we don't double-render.
-            let cursor_visible = mode.contains(TermMode::SHOW_CURSOR)
-                && content.cursor.shape
-                    != alacritty_terminal::vte::ansi::CursorShape::Hidden;
+
+            let default_fg = palette.resolve(
+                alacritty_terminal::vte::ansi::Color::Named(
+                    alacritty_terminal::vte::ansi::NamedColor::Foreground,
+                ),
+                content.colors,
+            );
             let default_bg = palette.resolve(
                 alacritty_terminal::vte::ansi::Color::Named(
                     alacritty_terminal::vte::ansi::NamedColor::Background,
@@ -250,10 +247,24 @@ impl Backend {
                 content.colors,
             );
 
+            // Cursor info — translate the absolute-grid line to a
+            // visible-row index. TUIs like claude-code, vim, etc. hide
+            // alacritty's logical cursor and draw their own; honour both
+            // signals (TermMode::SHOW_CURSOR + CursorShape::Hidden).
+            let cursor_visible = mode.contains(TermMode::SHOW_CURSOR)
+                && content.cursor.shape != CursorShape::Hidden;
+            let cursor_row = content.cursor.point.line.0 + display_offset;
+            let cursor_col = content.cursor.point.column.0;
+            // Track the cursor cell's character + style so the renderer
+            // can paint the right glyph on top of the cursor quad.
+            let mut cursor_char: char = ' ';
+            let mut cursor_cell_fg = default_fg;
+            let mut cursor_cell_bg = default_bg;
+            let mut cursor_cell_bold = false;
+            let mut cursor_cell_italic = false;
+            let mut cursor_cell_underline = false;
+
             for indexed in content.display_iter {
-                // Display iterator emits cells in absolute-grid line
-                // coords (negative for scrollback). Translate to a
-                // visible-row index 0..screen_lines.
                 let row = indexed.point.line.0 + display_offset;
                 if row < 0 || (row as usize) >= screen_lines {
                     continue;
@@ -265,6 +276,14 @@ impl Backend {
 
                 let cell = indexed.cell;
                 let flags = cell.flags;
+
+                // Wide chars span 2 cells: keep the leading cell, skip
+                // the trailing spacer so we don't double-paint.
+                if flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                let len_cols = if flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+
                 let inverse = flags.contains(Flags::INVERSE);
                 let mut fg = palette.resolve(cell.fg, content.colors);
                 let mut bg = palette.resolve(cell.bg, content.colors);
@@ -279,42 +298,26 @@ impl Backend {
                     .selection
                     .as_ref()
                     .is_some_and(|range| range.contains(indexed.point));
-                let is_cursor =
-                    cursor_visible && row == cursor_line && col == cursor_column;
-                let (fg, bg) = if is_cursor || selected { (bg, fg) } else { (fg, bg) };
+                // Selection inverts the styling so it's visible against
+                // any background. We don't bake the cursor's inversion
+                // here — it's painted on top by the renderer.
+                let (fg, bg) = if selected { (bg, fg) } else { (fg, bg) };
 
-                let line = &mut lines[row as usize];
-                let next_col = line.iter().map(|r| r.text.chars().count()).sum::<usize>();
-
-                // Pad missing columns (cells that display_iter skips,
-                // e.g. wide-char spacers) with spaces in the default bg.
-                if next_col < col {
-                    let pad = col - next_col;
-                    if let Some(last) = line.last_mut()
-                        && last.fg == fg_default(palette)
-                        && last.bg == default_bg
-                        && !last.bold
-                        && !last.italic
-                        && !last.underline
-                        && !is_cursor
-                    {
-                        for _ in 0..pad {
-                            last.text.push(' ');
-                        }
-                    } else {
-                        line.push(StyledRun {
-                            text: " ".repeat(pad),
-                            fg: fg_default(palette),
-                            bg: default_bg,
-                            bold: false,
-                            italic: false,
-                            underline: false,
-                        });
-                    }
+                let is_cursor_cell = cursor_visible
+                    && row == cursor_row
+                    && col == cursor_col;
+                if is_cursor_cell {
+                    cursor_char = cell.c;
+                    cursor_cell_fg = fg;
+                    cursor_cell_bg = bg;
+                    cursor_cell_bold = bold;
+                    cursor_cell_italic = italic;
+                    cursor_cell_underline = underline;
                 }
 
+                let line = &mut lines[row as usize];
                 let mergeable = line.last().is_some_and(|last| {
-                    !is_cursor
+                    last.start_col + last.len_cols == col
                         && last.fg == fg
                         && last.bg == bg
                         && last.bold == bold
@@ -322,10 +325,14 @@ impl Backend {
                         && last.underline == underline
                 });
                 if mergeable {
-                    line.last_mut().unwrap().text.push(cell.c);
+                    let last = line.last_mut().unwrap();
+                    last.text.push(cell.c);
+                    last.len_cols += len_cols;
                 } else {
                     line.push(StyledRun {
                         text: cell.c.to_string(),
+                        start_col: col,
+                        len_cols,
                         fg,
                         bg,
                         bold,
@@ -335,30 +342,45 @@ impl Backend {
                 }
             }
 
-            // Empty rows still need a non-zero height; an empty `div` in
-            // gpui collapses to 0 lines tall. A single space in the
-            // default bg gives us a placeholder character to anchor the
-            // line height.
-            for line in lines.iter_mut() {
-                if line.is_empty() {
-                    line.push(StyledRun {
-                        text: " ".to_string(),
-                        fg: fg_default(palette),
-                        bg: default_bg,
-                        bold: false,
-                        italic: false,
-                        underline: false,
-                    });
-                }
-            }
+            // Cursor info: build now that we've captured the cell under
+            // it. For block-style cursors, the renderer inverts colours
+            // (cell.bg → text fg, palette.cursor → cursor bg). For beam
+            // / underline shapes, only the bar uses cursor colour and
+            // the cell text stays unchanged.
+            let cursor = if cursor_visible
+                && cursor_row >= 0
+                && (cursor_row as usize) < screen_lines
+                && cursor_col < columns
+            {
+                let cursor_color = palette.resolve(
+                    alacritty_terminal::vte::ansi::Color::Named(
+                        alacritty_terminal::vte::ansi::NamedColor::Cursor,
+                    ),
+                    content.colors,
+                );
+                Some(CursorInfo {
+                    row: cursor_row,
+                    col: cursor_col,
+                    shape: content.cursor.shape,
+                    cursor_color,
+                    cell_fg: cursor_cell_fg,
+                    cell_bg: cursor_cell_bg,
+                    character: cursor_char,
+                    bold: cursor_cell_bold,
+                    italic: cursor_cell_italic,
+                    underline: cursor_cell_underline,
+                })
+            } else {
+                None
+            };
 
             TerminalSnapshot {
                 lines,
-                cursor_line,
-                cursor_column,
+                cursor,
                 mode,
                 columns,
                 screen_lines,
+                default_fg,
                 default_bg,
             }
         })
@@ -432,16 +454,47 @@ impl Backend {
     }
 }
 
-fn fg_default(palette: &ColorPalette) -> Hsla {
-    palette.foreground
-}
-
 /// One contiguous run of cells with identical styling on a single row.
+/// `start_col` is the leftmost column the run occupies; `len_cols` is
+/// the cell width (each char contributes 1, wide chars contribute 2).
+/// The renderer uses these to position background quads and shaped text
+/// at exact pixel offsets — `text.chars().count()` is *not* a substitute
+/// because of wide chars.
 #[derive(Debug, Clone)]
 pub struct StyledRun {
     pub text: String,
+    pub start_col: usize,
+    pub len_cols: usize,
     pub fg: Hsla,
     pub bg: Hsla,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+}
+
+/// Cursor location, shape, and the colour state it should be painted
+/// against. The renderer paints the cursor as a quad on top of the
+/// styled runs, so the run text under the cursor stays untouched.
+#[derive(Debug, Clone)]
+pub struct CursorInfo {
+    /// Visible row (0-based, top of viewport).
+    pub row: i32,
+    /// Column index.
+    pub col: usize,
+    pub shape: CursorShape,
+    /// Cursor colour from the palette — block fill, beam bar, or
+    /// underline bar all use this.
+    pub cursor_color: Hsla,
+    /// Foreground colour the cell would otherwise paint at.
+    pub cell_fg: Hsla,
+    /// Background colour of the cell — used as the text colour for a
+    /// block cursor so the glyph stays readable against the inverted
+    /// fill.
+    pub cell_bg: Hsla,
+    /// Character occupying the cursor cell. Painted unchanged for beam
+    /// / underline cursors; redrawn with `cell_bg` for block cursors so
+    /// it remains readable on top of the inverted fill.
+    pub character: char,
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
@@ -452,11 +505,11 @@ pub struct StyledRun {
 #[derive(Debug, Clone)]
 pub struct TerminalSnapshot {
     pub lines: Vec<Vec<StyledRun>>,
-    pub cursor_line: i32,
-    pub cursor_column: usize,
+    pub cursor: Option<CursorInfo>,
     pub mode: TermMode,
     pub columns: usize,
     pub screen_lines: usize,
+    pub default_fg: Hsla,
     pub default_bg: Hsla,
 }
 
