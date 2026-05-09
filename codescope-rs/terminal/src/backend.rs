@@ -149,8 +149,18 @@ impl Backend {
 
         let (proxy, events) = EventProxy::new();
 
+        // Match Windows Terminal's out-of-the-box feel: blinking bar.
+        // Shells that emit DECSCUSR (`\x1b[N q`) override this on the
+        // fly; PSReadLine doesn't, so without our own default the
+        // cursor would be a steady block — confusing on Windows where
+        // every other terminal blinks.
+        let default_cursor_style = alacritty_terminal::vte::ansi::CursorStyle {
+            shape: CursorShape::Beam,
+            blinking: true,
+        };
         let term_config = Config {
             scrolling_history: 10_000,
+            default_cursor_style,
             ..Config::default()
         };
         let term = Term::new(term_config, &GridSize::from_window(size), proxy.clone());
@@ -253,6 +263,12 @@ impl Backend {
             // signals (TermMode::SHOW_CURSOR + CursorShape::Hidden).
             let cursor_visible = mode.contains(TermMode::SHOW_CURSOR)
                 && content.cursor.shape != CursorShape::Hidden;
+            // Blink-bit lives on `cursor_style()` rather than the
+            // RenderableContent cursor — the latter only carries the
+            // shape. The shape itself can disagree with cursor_style if
+            // the TUI sent DECSCUSR mid-frame, so we trust each source
+            // for its own field.
+            let cursor_blinking = term.cursor_style().blinking;
             let cursor_row = content.cursor.point.line.0 + display_offset;
             let cursor_col = content.cursor.point.column.0;
             // Track the cursor cell's character + style so the renderer
@@ -362,6 +378,7 @@ impl Backend {
                     row: cursor_row,
                     col: cursor_col,
                     shape: content.cursor.shape,
+                    blinking: cursor_blinking,
                     cursor_color,
                     cell_fg: cursor_cell_fg,
                     cell_bg: cursor_cell_bg,
@@ -482,6 +499,10 @@ pub struct CursorInfo {
     /// Column index.
     pub col: usize,
     pub shape: CursorShape,
+    /// Whether the TUI requested a blinking cursor (`\x1b[1 q` /
+    /// `\x1b[3 q` / `\x1b[5 q`). The renderer drives the actual blink
+    /// timer and skips the cursor paint during the off phase.
+    pub blinking: bool,
     /// Cursor colour from the palette — block fill, beam bar, or
     /// underline bar all use this.
     pub cursor_color: Hsla,

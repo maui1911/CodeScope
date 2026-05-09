@@ -36,6 +36,10 @@ use crate::backend::{CursorInfo, StyledRun, TerminalSnapshot};
 /// `cell_width` and `line_height` must be the actual measured values
 /// from `window.text_system().shape_line(...)` — using a guess will
 /// shift columns out of alignment.
+///
+/// `cursor_visible_now` is the blink-phase boolean: `true` paints the
+/// cursor, `false` skips it. Steady-cursor snapshots ignore this and
+/// always paint (see [`CursorInfo::blinking`]).
 pub fn paint_snapshot(
     bounds: Bounds<Pixels>,
     snapshot: &TerminalSnapshot,
@@ -43,6 +47,7 @@ pub fn paint_snapshot(
     font_size: Pixels,
     cell_width: Pixels,
     line_height: Pixels,
+    cursor_visible_now: bool,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -111,18 +116,21 @@ pub fn paint_snapshot(
         }
     }
 
-    // 4) cursor on top.
+    // 4) cursor on top — but only when the blink phase is on.
+    //    Steady cursors (`blinking = false`) always paint.
     if let Some(cursor) = snapshot.cursor.as_ref() {
-        paint_cursor(
-            window,
-            cx,
-            origin,
-            cursor,
-            font,
-            font_size,
-            cell_width,
-            line_height,
-        );
+        if !cursor.blinking || cursor_visible_now {
+            paint_cursor(
+                window,
+                cx,
+                origin,
+                cursor,
+                font,
+                font_size,
+                cell_width,
+                line_height,
+            );
+        }
     }
 }
 

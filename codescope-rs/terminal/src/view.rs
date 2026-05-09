@@ -18,6 +18,7 @@
 //!   grid resize logic and mouse-coordinate translation can use them.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
@@ -112,6 +113,11 @@ pub struct TerminalView {
     /// this is set, so we don't accidentally extend the selection
     /// every time the cursor passes over the terminal.
     selecting: bool,
+    /// Blink phase for blinking cursors. The renderer reads this in
+    /// the canvas paint phase and skips the cursor when it's `false`.
+    /// A background timer toggles it every 530 ms; input handlers set
+    /// it back to `true` so the cursor doesn't disappear under typing.
+    blink_phase: Arc<Mutex<bool>>,
 }
 
 impl TerminalView {
@@ -130,6 +136,7 @@ impl TerminalView {
         let palette = ColorPalette::default();
         let snapshot = backend.snapshot(&palette);
         let events = backend.events();
+        let blink_phase = Arc::new(Mutex::new(true));
 
         cx.spawn(async move |this, cx| {
             while let Ok(_event) = events.recv_async().await {
@@ -146,6 +153,27 @@ impl TerminalView {
         })
         .detach();
 
+        // Cursor blink timer. 530 ms is the conventional period (it's
+        // what xterm and friends use). The async task lives for the
+        // entity's lifetime; dropping the entity makes the next
+        // `this.update` fail and the loop exits.
+        let blink_phase_for_timer = blink_phase.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(530))
+                    .await;
+                {
+                    let mut phase = blink_phase_for_timer.lock();
+                    *phase = !*phase;
+                }
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         Self {
             backend,
             snapshot,
@@ -155,7 +183,14 @@ impl TerminalView {
             last_size: Arc::new(Mutex::new((0, 0))),
             bounds_cache: Arc::new(Mutex::new(None)),
             selecting: false,
+            blink_phase,
         }
+    }
+
+    /// Snap the cursor to its visible phase. Called whenever the user
+    /// types so the cursor never disappears mid-keystroke.
+    fn show_cursor_now(&self) {
+        *self.blink_phase.lock() = true;
     }
 
     fn point_at(&self, position: Point<Pixels>) -> Option<(i32, usize)> {
@@ -283,6 +318,7 @@ impl TerminalView {
                 && let Some(text) = item.text()
             {
                 self.paste(&text);
+                self.show_cursor_now();
             }
             return;
         }
@@ -316,6 +352,7 @@ impl TerminalView {
             // so the prompt doesn't disappear into history.
             self.backend.reset_scroll();
             self.backend.write_input(bytes);
+            self.show_cursor_now();
         }
     }
 
@@ -411,6 +448,7 @@ impl Render for TerminalView {
         let font = self.font.to_font();
         let font_size = self.font.size;
         let snapshot = self.snapshot.clone();
+        let blink_visible = *self.blink_phase.lock();
 
         let canvas_element = canvas(
             // Layout phase: measure the cell, stash bounds for mouse
@@ -485,6 +523,7 @@ impl Render for TerminalView {
                     font_size,
                     layout.cell_width,
                     layout.line_height,
+                    blink_visible,
                     window,
                     cx,
                 );
