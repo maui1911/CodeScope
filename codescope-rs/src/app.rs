@@ -5,12 +5,21 @@
 //!
 //! ```text
 //! ┌────────────────────────────────────────────────────────┐
-//! │ brand · [strip g0] | [strip g1] · drag · ▭ ▢ ✕         │  ← 40 px titlebar row
+//! │ brand · «  · drag region · [+] · ▭ ▢ ✕                 │  ← 32 px caption row
 //! ├────────────────────────────────────────────────────────┤
-//! │ side │  pane g0          │  pane g1                    │
-//! │ bar  │  (active term)    │  (active term)              │
+//! │ sidebar pad │ [strip g0] │ [strip g1] · ...            │  ← 40 px strip row
+//! ├────────────────────────────────────────────────────────┤
+//! │ side │ ║ │  pane g0      │ ║ │  pane g1                │
+//! │ bar  │   │  (active term)│   │  (active term)          │
 //! └────────────────────────────────────────────────────────┘
 //! ```
+//!
+//! The caption row holds chrome (brand mark, sidebar-toggle, drag,
+//! split, and min/max/close). The strip row holds *only* the
+//! sidebar-mirror padding plus the per-group strip sections — that
+//! way both the strip row and the work row below it share the same
+//! horizontal extent, so the dividers between groups in the strip
+//! line up *exactly* with the splitters between panes below.
 //!
 //! Each top-level "group" is a tab strip + active terminal. Multiple
 //! groups sit side-by-side with the same weight per column on the
@@ -37,9 +46,7 @@ use codescope_terminal::{
     Backend, ColorPalette, CursorStylePreset, FontConfig, Shell, SpawnConfig, TerminalSize,
     TerminalView,
 };
-#[cfg(not(target_os = "windows"))]
 use gpui::ClickEvent;
-#[cfg(not(target_os = "windows"))]
 use gpui::StatefulInteractiveElement;
 use gpui::{
     AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
@@ -1152,16 +1159,37 @@ impl Render for AppShell {
         // `SW_MAXIMIZE`-only on Windows (no toggle), so wiring it
         // would maximize on click and never restore.
         //
-        // On Wayland / X11 the compositor needs an explicit
-        // `start_window_move()` because there's no NC-area hit-test
-        // model — keep that path under `#[cfg(not(target_os = "windows"))]`.
+        // Caption-row drag region. On Windows we issue the
+        // `ReleaseCapture` + `WM_NCLBUTTONDOWN(HTCAPTION)` pair
+        // ourselves (see `win32_titlebar`) — gpui's
+        // `WindowControlArea::Drag` is supposed to map to HTCAPTION
+        // via the hit-test callback but doesn't fire reliably for
+        // our windows. Double-click toggles maximize via the same
+        // module; the OS animates and snap-integrates the way it
+        // does for any HTCAPTION drag.
+        //
+        // On Wayland / X11 the compositor needs `start_window_move`
+        // because there's no NC-area hit-test model. Keep the gpui
+        // path there; macOS gets the cocoa equivalent for free.
         let drag_region = {
-            let base = div().id("titlebar-drag").flex_grow().h(px(40.0));
+            let base = div()
+                .id("titlebar-drag")
+                .flex_grow()
+                .h(px(32.0))
+                .window_control_area(WindowControlArea::Drag);
             #[cfg(target_os = "windows")]
-            let base = base.window_control_area(WindowControlArea::Drag);
+            let base = base
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _, window, _| crate::win32_titlebar::start_drag(window)),
+                )
+                .on_click(cx.listener(|_, event: &ClickEvent, window, _| {
+                    if event.click_count() >= 2 {
+                        crate::win32_titlebar::toggle_maximize(window);
+                    }
+                }));
             #[cfg(not(target_os = "windows"))]
             let base = base
-                .window_control_area(WindowControlArea::Drag)
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|_, _, window, _| window.start_window_move()),
@@ -1175,12 +1203,20 @@ impl Render for AppShell {
         };
 
         // Caption controls: minimise, maximise/restore, close.
-        // 46×40 hitboxes hugging the right edge of the strip, styled
-        // to match the rest of the chrome (ink_dim foreground on
-        // transparent, frost-10 hover; close hover-red).
-        // `window_control_area(...)` annotates the hitbox so Windows
-        // snap-layouts and the platform's accessibility tree know
-        // which native control each button maps to.
+        // 46×32 hitboxes hugging the right edge of the caption row.
+        //
+        // On Windows the `WindowControlArea::*` annotations + the
+        // gpui NC-mouse-up handler give us a *correct* maximize ↔
+        // restore toggle natively (`zoom_window()` on Windows is
+        // `SW_MAXIMIZE`-only with no restore path). We *also* wire
+        // imperative `on_mouse_down` handlers as a defensive
+        // fallback for clicks where the hit-test races the mouse
+        // hitbox update — the native NC-up handler still toggles on
+        // top of our minimize/close calls (idempotent), so the user
+        // gets the right behaviour either way.
+        //
+        // On non-Windows targets the imperative handlers are the
+        // *primary* path — there's no NC-button equivalent.
         let ink = theme::ink(&theme);
         let ink_dim = theme::ink_dim(&theme);
         let frost_hover = theme::frost_10(&theme);
@@ -1188,7 +1224,7 @@ impl Render for AppShell {
         let caption_base = move |id: &'static str, area: WindowControlArea, glyph: &'static str| {
             div()
                 .id(id)
-                .h(px(40.0))
+                .h(px(32.0))
                 .w(px(46.0))
                 .flex()
                 .items_center()
@@ -1200,24 +1236,35 @@ impl Render for AppShell {
                 .child(glyph)
         };
 
-        // On Windows the `WindowControlArea::*` annotations make
-        // gpui's hit-test return `HTMINBUTTON` / `HTMAXBUTTON` /
-        // `HTCLOSE`, and gpui's NC-mouse-up handler does the right
-        // thing natively (toggle on max, post WM_CLOSE on close,
-        // SW_MINIMIZE on min). Wiring our own `on_mouse_down`
-        // handlers here would race the native flow — and for the max
-        // button specifically would *break* the toggle, since
-        // `zoom_window()` on Windows is `SW_MAXIMIZE`-only with no
-        // restore path.
-        //
-        // On non-Windows targets we still need explicit handlers
-        // because there's no equivalent NC-button native handling.
+        // Caption-button click handlers. On Windows we send the
+        // proper `WM_SYSCOMMAND` messages via the `win32_titlebar`
+        // helper — that gives us a correct maximize ↔ restore
+        // toggle (gpui's `zoom_window` is `SW_MAXIMIZE`-only with
+        // no public restore path). Other platforms keep gpui's
+        // `minimize_window` / `zoom_window` / `remove_window`.
         let minimize_btn = caption_base("titlebar-min", WindowControlArea::Min, "—")
             .hover(move |s| s.bg(frost_hover).text_color(ink));
         let maximize_btn = caption_base("titlebar-max", WindowControlArea::Max, "▢")
             .hover(move |s| s.bg(frost_hover).text_color(ink));
         let close_btn = caption_base("titlebar-close", WindowControlArea::Close, "✕")
             .hover(move |s| s.bg(close_hover_bg).text_color(ink));
+
+        #[cfg(target_os = "windows")]
+        let minimize_btn = minimize_btn.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_, _, window, _| crate::win32_titlebar::minimize(window)),
+        );
+        #[cfg(target_os = "windows")]
+        let maximize_btn = maximize_btn.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_, _, window, _| crate::win32_titlebar::toggle_maximize(window)),
+        );
+        #[cfg(target_os = "windows")]
+        let close_btn = close_btn.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_, _, window, _| crate::win32_titlebar::close(window)),
+        );
+
         #[cfg(not(target_os = "windows"))]
         let minimize_btn = minimize_btn.on_mouse_down(
             MouseButton::Left,
@@ -1234,13 +1281,13 @@ impl Render for AppShell {
             cx.listener(|_, _, window, _| window.remove_window()),
         );
 
-        // Split-right caption button — sits left of the min/max/close
-        // trio. Mirrors the C# build's titlebar split control. Pure
-        // client-area button (no `WindowControlArea` annotation), so
-        // `on_mouse_down` runs the same way it does on a tab.
+        // Split-right caption button — lives in the caption row left
+        // of the min/max/close trio. Pure client-area button (no
+        // `WindowControlArea` annotation) so `on_mouse_down` is the
+        // primary click path on every platform.
         let split_btn = div()
             .id("titlebar-split")
-            .h(px(40.0))
+            .h(px(32.0))
             .w(px(46.0))
             .flex()
             .items_center()
@@ -1255,9 +1302,8 @@ impl Render for AppShell {
                     this.split_right(window, cx);
                 }),
             )
-            // Two thin verticals + a divider — pure-shape so we don't
-            // need a glyph font. Aligns visually with C#'s
-            // `Ctx.Icon.SplitGroup`.
+            // Two thin verticals — pure-shape glyph, no font needed.
+            // Mirrors C#'s `Ctx.Icon.SplitGroup`.
             .child(
                 div()
                     .w(px(14.0))
@@ -1283,32 +1329,22 @@ impl Render for AppShell {
                     ),
             );
 
-        // Brand mark — top-left of the tab strip. Pure-shape port of
-        // the C# splash's `.brand-mark` (accent rounded square with a
-        // small black inset square in the upper-right). Sized to fit
-        // the 40 px strip with breathing room. Decorative for now;
-        // clicking it does nothing — it's primarily a visual anchor
-        // and the same affordance the C# build's splash uses for
-        // brand recognition. The drag region above is what actually
-        // moves the window when the user grabs the title bar.
+        // Brand mark — top-left of the caption row. Pure-shape port
+        // of the C# splash's `.brand-mark` (accent rounded square
+        // with a small black inset). Decorative; clicking it just
+        // contributes to the drag region.
         let accent_clr = theme::accent(&theme);
         let brand_mark = div()
             .w(px(40.0))
-            .h(px(40.0))
+            .h(px(32.0))
             .flex()
             .items_center()
             .justify_center()
-            // The mark itself sits inside a flex container so the
-            // rounded square stays centred regardless of the strip's
-            // exact height. `window_control_area(Drag)` makes the
-            // surrounding 40×40 cell draggable like the rest of the
-            // bar — clicking the mark itself starts a window move
-            // since the inner shape doesn't intercept clicks.
             .window_control_area(WindowControlArea::Drag)
             .child(
                 div()
-                    .w(px(22.0))
-                    .h(px(22.0))
+                    .w(px(20.0))
+                    .h(px(20.0))
                     .rounded(px(5.0))
                     .bg(accent_clr)
                     .flex()
@@ -1318,8 +1354,8 @@ impl Render for AppShell {
                     .p(px(4.0))
                     .child(
                         div()
-                            .w(px(7.0))
-                            .h(px(7.0))
+                            .w(px(6.0))
+                            .h(px(6.0))
                             .rounded(px(2.0))
                             .bg(gpui::black()),
                     ),
@@ -1374,26 +1410,15 @@ impl Render for AppShell {
             group_panes.push(pane.into_any_element());
         }
 
-        // Sidebar-width spacer between the 40 px brand mark and the
-        // first strip section so each strip column starts at the same
-        // x-coordinate as the matching pane below — without this, the
-        // strip dividers slide left of the work-area dividers and the
-        // user sees mis-aligned columns. The spacer also serves as
-        // titlebar drag region above the sidebar (window-control area
-        // + start_window_move) so the user can grab the bar there.
-        // Same Windows / non-Windows split as the main drag region:
-        // on Windows we let `HTCAPTION` do the work natively (no
-        // `start_window_move`), elsewhere we fire it explicitly.
-        // Sidebar toggle (chevron). 32×40 cell that sits right of
-        // the brand mark and shows `«` when the sidebar is visible
-        // (click to collapse) or `»` when it's hidden (click to
-        // expand). Same client-area click model as the split icon
-        // below — no `WindowControlArea` annotation, just an
-        // `on_mouse_down` that flips the bool.
+        // Sidebar toggle (chevron). 32×32 cell in the caption row,
+        // immediately right of the brand mark. `«` when the sidebar
+        // is visible (click to collapse), `»` when hidden (click to
+        // expand). Pure client-area click — `on_mouse_down` is the
+        // primary path.
         let toggle_glyph = if self.sidebar_visible { "«" } else { "»" };
         let sidebar_toggle = div()
             .id("titlebar-sidebar-toggle")
-            .h(px(40.0))
+            .h(px(32.0))
             .w(px(32.0))
             .flex()
             .items_center()
@@ -1408,36 +1433,13 @@ impl Render for AppShell {
             )
             .child(toggle_glyph);
 
-        // Sidebar-width spacer: aligns each strip column with the
-        // matching pane below. The body row's left side is sidebar
-        // wrapper (`sidebar_width`) + resize handle (6 px). The
-        // titlebar's left side is brand mark (40 px) + toggle (32 px)
-        // + spacer. So the spacer must equal
-        //   (sidebar_width + handle) − brand − toggle
-        // when visible, and just an 8 px breathing gap when
-        // collapsed so the first strip section doesn't crowd the
-        // toggle.
-        let sidebar_spacer_w = if self.sidebar_visible {
-            px((self.sidebar_width + SPLITTER_HIT_WIDTH - 40.0 - 32.0).max(0.0))
-        } else {
-            px(8.0)
-        };
-        let sidebar_spacer = {
-            let base = div()
-                .id("titlebar-sidebar-spacer")
-                .w(sidebar_spacer_w)
-                .h(px(40.0))
-                .window_control_area(WindowControlArea::Drag);
-            #[cfg(not(target_os = "windows"))]
-            let base = base.on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_, _, window, _| window.start_window_move()),
-            );
-            base
-        };
-
-        let tab_strip = div()
-            .h(px(40.0))
+        // ─── Caption row (32 px) ──────────────────────────────────
+        // Holds all chrome elements. Sits ABOVE the strip row so the
+        // strip and the work area below it share the same horizontal
+        // extent — that's what keeps strip-column dividers aligned
+        // with the splitters between panes.
+        let caption_row = div()
+            .h(px(32.0))
             .flex()
             .flex_row()
             .border_b_1()
@@ -1445,10 +1447,31 @@ impl Render for AppShell {
             .bg(theme::elevated(&theme))
             .child(brand_mark)
             .child(sidebar_toggle)
-            .child(sidebar_spacer)
-            // Per-group strip sections share the available width
-            // equally for now (each is `flex_grow`). Per-group weight
-            // sliders + drag-resize land in the follow-up PR.
+            .child(drag_region)
+            .child(split_btn)
+            .child(minimize_btn)
+            .child(maximize_btn)
+            .child(close_btn);
+
+        // ─── Strip row (40 px) ────────────────────────────────────
+        // Mirrors the body row's left side exactly so strip columns
+        // line up with their panes. When the sidebar is visible the
+        // padding equals `sidebar_width + handle (6)`; when collapsed
+        // it's zero so the strip extends edge-to-edge just like the
+        // work area below.
+        let strip_left_pad_w = if self.sidebar_visible {
+            px(self.sidebar_width + SPLITTER_HIT_WIDTH)
+        } else {
+            px(0.0)
+        };
+        let tab_strip = div()
+            .h(px(40.0))
+            .flex()
+            .flex_row()
+            .border_b_1()
+            .border_color(theme::divider(&theme))
+            .bg(theme::elevated(&theme))
+            .child(div().w(strip_left_pad_w).h_full())
             .child(
                 div()
                     .flex_grow()
@@ -1456,12 +1479,7 @@ impl Render for AppShell {
                     .flex_row()
                     .h_full()
                     .children(strip_sections),
-            )
-            .child(drag_region)
-            .child(split_btn)
-            .child(minimize_btn)
-            .child(maximize_btn)
-            .child(close_btn);
+            );
 
         let work_area = div()
             .flex_grow()
@@ -1547,6 +1565,7 @@ impl Render for AppShell {
             .flex_col()
             .bg(theme::canvas(&theme))
             .text_color(theme::ink(&theme))
+            .child(caption_row)
             .child(tab_strip)
             .child(main_row)
     }
