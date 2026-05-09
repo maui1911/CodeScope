@@ -16,13 +16,30 @@
 //! zero, so a UI dialog can surface "fatal: 'foo' is already checked
 //! out at '...'" without us having to guess the cause. We don't
 //! truncate — the failure modes in scope here (`worktree add/remove/
-//! list`) emit short messages, and clipping mid-sentence is worse
-//! UX than a slightly long line.
+//! list`, `for-each-ref`) emit short messages, and clipping mid-
+//! sentence is worse UX than a slightly long line.
 
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 use anyhow::{Context, Result, anyhow};
+
+/// One row from `git for-each-ref refs/heads refs/remotes`. Surfaced
+/// to the "New worktree" dialog so the user can pick a base branch.
+/// Mirrors `NoScope.CodeScope.Core.Models.BranchInfo` from the C# build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchInfo {
+    /// Short refname — e.g. `main`, `feat/csv`, `origin/main`.
+    pub name: String,
+    /// `true` when `name` lives under `refs/remotes/...`.
+    pub is_remote: bool,
+    /// 7-char commit sha the ref points at.
+    pub short_sha: String,
+    /// Committer date relative to now — e.g. `2 days ago`. Verbatim
+    /// from `%(committerdate:relative)` so the UI doesn't have to
+    /// parse and re-format.
+    pub relative_date: String,
+}
 
 /// One row from `git worktree list --porcelain`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +86,57 @@ pub fn add_worktree(
         args.push(b);
     }
     run_git(repo, &args).map(|_| ())
+}
+
+/// `git for-each-ref` for both local heads and remotes — the union
+/// drives the base-branch picker in the "New worktree" dialog. Mirrors
+/// the C# `GitService.ListBranchesAsync`: format
+/// `<short_ref>|<short_sha>|<relative_date>`, `origin/HEAD` symbolic
+/// refs are dropped, and the final list is sorted alphabetically by
+/// `name` (case-insensitive) so locals and remotes interleave under a
+/// stable ordering — the dialog handles LOCAL/REMOTE grouping itself.
+pub fn list_branches(repo: &Path) -> Result<Vec<BranchInfo>> {
+    let mut all = Vec::new();
+    all.extend(for_each_ref(repo, false, "refs/heads")?);
+    all.extend(for_each_ref(repo, true, "refs/remotes")?);
+    all.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(all)
+}
+
+fn for_each_ref(repo: &Path, is_remote: bool, prefix: &str) -> Result<Vec<BranchInfo>> {
+    // `|` is not a valid refname character, so it's safe as a field
+    // separator (matches the C# build's choice for the same reason).
+    let format = "--format=%(refname:short)|%(objectname:short)|%(committerdate:relative)";
+    let output = run_git(repo, &["for-each-ref", format, prefix])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut rows = Vec::new();
+    for raw in stdout.lines() {
+        let line = raw.trim_matches(|c: char| c == '\r' || c == ' ' || c == '\t' || c == '"');
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(3, '|').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let name = parts[0].trim();
+        // Skip the `<remote>/HEAD` symbolic row — it's not a real
+        // branch and showing it in a base-branch picker is just
+        // noise. On Windows git the same row sometimes shortens to
+        // `<remote>` (HEAD elided) so we also drop bare-remote rows
+        // (a real remote branch always has at least one `/` after
+        // the remote name).
+        if name.ends_with("/HEAD") || (is_remote && !name.contains('/')) {
+            continue;
+        }
+        rows.push(BranchInfo {
+            name: name.to_string(),
+            is_remote,
+            short_sha: parts[1].trim().to_string(),
+            relative_date: parts[2].trim().to_string(),
+        });
+    }
+    Ok(rows)
 }
 
 /// `git worktree remove <path>`. Set `force = true` to bypass dirty-
@@ -334,6 +402,47 @@ some-future-field foo bar\n";
         let wts = list_worktrees(&repo).expect("list after remove");
         assert_eq!(wts.len(), 1, "primary alone after remove");
         assert!(wts[0].is_primary);
+    }
+
+    #[test]
+    fn list_branches_returns_local_and_remote_sorted() {
+        let Some((_guard, repo, _wts)) = init_repo() else { return };
+        // Create a couple of locals and a fake remote so we can verify
+        // both groups come back. `git update-ref` lets us mint a
+        // `refs/remotes/origin/foo` without spinning up an actual
+        // remote — the seed commit's SHA is fine to point it at.
+        run(&repo, &["branch", "feat/x"]);
+        run(&repo, &["branch", "feat/y"]);
+        run(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        run(&repo, &["update-ref", "refs/remotes/origin/feat/x", "HEAD"]);
+        // Symbolic origin/HEAD — must be dropped from the result.
+        run(&repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
+
+        let branches = list_branches(&repo).expect("list");
+        let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
+        // Sorted alphabetically (case-insensitive). `origin/HEAD` is
+        // gone. Locals + remotes interleave under one ordering.
+        assert_eq!(
+            names,
+            vec!["feat/x", "feat/y", "main", "origin/feat/x", "origin/main"],
+            "branches: {names:?}"
+        );
+        // Local vs remote flag matches the prefix.
+        for b in &branches {
+            assert_eq!(b.is_remote, b.name.starts_with("origin/"), "{b:?}");
+            // Every row must have a non-empty short sha — without it
+            // the dialog footer can't render `<sha> · <date>`.
+            assert!(!b.short_sha.is_empty(), "{b:?}");
+        }
+    }
+
+    #[test]
+    fn list_branches_in_repo_with_only_main_returns_one_row() {
+        let Some((_guard, repo, _wts)) = init_repo() else { return };
+        let branches = list_branches(&repo).expect("list");
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].name, "main");
+        assert!(!branches[0].is_remote);
     }
 
     #[test]

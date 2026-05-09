@@ -9,16 +9,152 @@
 >
 > **The Rust port (`codescope-rs/`) is a 1:1 functional port of the C# CodeScope build (`src/CodeScope.App/`, `src/CodeScope.Core/`, `src/CodeScope.AgentCli/`).** Before implementing any feature on the Rust side, **read the equivalent C# code first** and mirror its behavior, button labels, dialogs, data shapes, and persistence layout. Functional parity is the goal — we are not redesigning. If a `HANDOFF.md` entry, README line, or "next entry point" disagrees with what the C# code actually does, the C# code wins; update the doc. Genuine platform-forced deviations (gpui vs WPF idiom) get a one-line comment and an entry in `docs/DECISIONS.md`. "Cleaner" or "more elegant" is not a reason on its own. (Reinforced in session 33 after PR #56 invented a non-existent UX.)
 
-**Last updated:** 2026-05-09 (session 33)
-**Branch:** `main` (PR #55 merged as `6cc89ee`; PR #56 closed without merge)
-**Head:** `6cc89ee` (main, in sync with origin)
+**Last updated:** 2026-05-09 (session 34)
+**Branch:** `main` (PRs #58–#62 merged this session)
+**Head:** main, in sync with origin (latest: PR #62 squash, then this session's bundle PR)
 **Release:** `v0.2.5` shipped — https://github.com/maui1911/CodeScope/releases/tag/v0.2.5
 **Build status:** ✅ C# untouched. Rust workspace builds clean
 (`cargo build --workspace --manifest-path codescope-rs/Cargo.toml`).
-27 unit tests across `codescope-core` (18) + `codescope-terminal`
-mouse-encoder (9). PR #54 merged to main as `7ffe4f3`; PR #55 as `6cc89ee`.
+Tests: `codescope-core` (27 incl. 6 new `git::` integration tests + 3
+new `projects::` round-trip tests) + `codescope-terminal` mouse-encoder
+(9) + `new_worktree_dialog` (7) — all passing. `cargo clippy` clean
+on `codescope-rs-spike` (drive-by fixes landed in this session).
 **Uncommitted work:** none.
 **Open issues:** none on GitHub.
+
+### Session 34 — camelCase, context menu, dialog, titlebar, tests, end-to-end worktree flow (PRs #58–#62 + bundle)
+
+The week's "next entry points" list (1–6 from session 33) is now
+mostly walked. Five small PRs landed sequentially with reviews
+addressed inline (Copilot reviewer flagged one issue per PR), then a
+single larger bundle PR closed out the worktree flow end-to-end.
+
+**Shipped (in merge order):**
+
+1. **PR #58 — camelCase round-trip on `projects.json`** (`599b8d3`).
+   `#[serde(rename_all = "camelCase")]` on `Project`, `Session`,
+   `Worktree`, `ProjectsConfig`. Opaque `agents: Vec<serde_json::Value>`
+   on the root so user agent-profile overrides survive a load/save
+   cycle while the Rust port doesn't consume them yet. Three new
+   tests pin the contract (C#-shape fixture, written-camelCase
+   assertion, agents round-trip). Review feedback: backwards-compat
+   for legacy snake_case Rust port files via per-field
+   `#[serde(alias = "<snake_case>")]` (`f8820cf`, also in #58) plus a
+   regression test (`loads_legacy_snake_case_fixture_without_data_loss`).
+2. **PR #59 — platform-correct labels in the project context menu**
+   (`3f01e2f`). The right-click menu itself piggybacked into PR #58
+   during a branch split (an earlier mistake), so #59 ended up
+   carrying just the platform fix. New `reveal_in_file_browser_label()`
+   helper picks the label per `cfg!(target_os = …)`; "Open in Windows
+   Terminal" row hidden off Windows via
+   `.children(cfg!(target_os = "windows").then(|| …))` so a `None`
+   yields zero children and the chain stays clean.
+3. **PR #60 — titlebar interactions** (`109e1ce`). Drag region
+   (`window_control_area(Drag)` + `start_window_move()`), double-
+   click toggles maximise via `zoom_window()`, three caption buttons
+   (Min/Max/Close, 46×40) with `WindowControlArea` annotations so
+   Windows snap-layouts and accessibility see real controls.
+4. **PR #61 — integration tests for `git::add_worktree` /
+   `remove_worktree`** (`27ceab1`). End-to-end against a real `git`
+   binary: per-test `TempDir` containing `<tmp>/repo/` and
+   `<tmp>/repo.worktrees/` (review feedback: the original draft
+   rooted under the OS-shared tempdir, which would have collided in
+   parallel and leaked outside the cleanup guard). Three tests
+   (add → list, add → remove → list, duplicate-branch error must
+   carry stderr).
+5. **PR #62 — "New worktree from branch…" dialog** (`6109eef`,
+   subagent-built). Trimmed first cut: branch input with auto-derived
+   folder under `<project>.worktrees/<sanitised-branch>`, HEAD as
+   implicit base, no spawn-toggle / base-picker / editable folder
+   yet. Modal rendered via `deferred(anchored().position(0,0).child(backdrop))`
+   with click-out-to-cancel and Escape/Enter handling; key chars come
+   from `event.keystroke.key_char`. New module
+   `codescope-rs/src/new_worktree_dialog.rs` with
+   `NewWorktreeDialogState` stashed on `Sidebar`. `Project::worktree_root_path()`
+   added to `codescope-core`. 7 new unit tests on the sanitiser +
+   folder derivation.
+6. **Bundle PR (this session, end-to-end worktree flow):** worktree
+   *child rows* now render under each project in the sidebar,
+   clicking one emits `SidebarEvent::OpenSession { working_directory,
+   title }` which `AppShell` catches via `cx.subscribe_in` and turns
+   into a fresh tab pinned to the worktree path. The new-worktree
+   dialog also emits the same event on successful create, matching
+   the C# build's `SpawnSession = true` default — the user lands
+   inside the new worktree immediately. New `git::list_branches`
+   (`for-each-ref refs/heads + refs/remotes`, mirrors C#'s
+   `GitService.ListBranchesAsync`; drops `<remote>/HEAD` symbolic
+   rows) + 2 integration tests. `spawn_tab` refactored to
+   `spawn_tab_in(working_directory, title_override, …)` so callers
+   can pin both. Drive-by clippy cleanup (`(1..=9).contains(&n)`,
+   collapsed nested `if let`).
+
+**Process notes (worth carrying forward):**
+- **PR splitting trap.** Stacking commits on the same local branch
+  and then trying to "split" by creating a sibling branch + rebase
+  works **only if you also reset the original branch** to drop the
+  cherry-picked commit. I missed that on the camelCase / context-menu
+  split, so PR #58 swallowed the context-menu commit and merged it to
+  main; PR #59 then needed a rebase that auto-detected the dup
+  ("patch contents already upstream"). Same dance had to happen for
+  PR #60 / #62 after their bases (deleted feature branches)
+  collapsed onto main. Lesson: after `git switch -c new-branch &&
+  rebase --onto …`, also `git switch original-branch && git reset
+  --hard origin/original-branch`. Or just use worktrees from the start.
+- **Branch-protection merging.** main has a protection rule that
+  blocks plain merges (`gh pr merge --squash`) and disallows
+  `--auto` for this repo. `--admin` overrides cleanly — the user
+  greenlit using it explicitly, the auto-mode classifier asked once
+  per session escalation. For the next session, default to `--admin`
+  on owner-merges of own PRs (with explicit per-session OK).
+- **Subagent task on PR #62 worked well.** Briefed with the C# spec
+  link, scoped to "trimmed first cut", isolation: worktree. Returned
+  a clean PR + a punch list of deferred items (Tab cycle, IME,
+  custom folder, base picker, spawn toggle). Worth doing again for
+  any feature that's >150 LOC and self-contained.
+
+**Suggested next entry points (priority order):**
+
+1. **Worktree dialog polish toward C# parity.** The deferred items
+   from PR #62's punch list — pair them with the new
+   `git::list_branches` API:
+   - **Base-branch dropdown** (filterable popup, LOCAL/REMOTE
+     groups, `(HEAD)` pinned). The C# spec is in
+     `src/CodeScope.Ui/Dialogs/NewWorktreeDialog.xaml.cs` lines
+     190–212. `list_branches` already returns the data.
+   - **Editable folder path** (live-syncs from branch but the user
+     can override). C# `BranchBox.TextChanged` handler is the model.
+   - **Spawn-session toggle** (defaults to true to match C# and the
+     bundle PR's behaviour; off = user just gets the worktree row).
+2. **Worktree row context menu.** "Remove worktree…",
+   "Reveal in <file browser>", "Copy path", "Restart session"
+   (later). Mirror `BuildWorktreeMenu` in
+   `src/CodeScope.Ui/Views/SidebarView.xaml.cs`.
+3. **Live theme reload.** Watch `settings.json` mtime via the
+   `notify` crate, reload, resolve theme by name, swap `Arc<Theme>`
+   on AppShell + Sidebar (the `apply_theme` plumbing already exists
+   on Sidebar; AppShell just needs the same).
+4. **Telemetry tail.** FSWatch on `~/.claude/projects/...` →
+   `running / idle / error` per session, drives sidebar status dots.
+   Heavy — multi-agent (Claude / Codex / OpenCode / Copilot / Pi),
+   each with its own session-discovery layer in C#. Probably its
+   own 1-2 session arc.
+5. **Sidebar splitter / collapse.** `LayoutState.sidebar_visible` /
+   `sidebar_width` are loaded but never re-saved because nothing
+   changes them. Add a thin draggable splitter on the right edge +
+   a collapse toggle in the heading.
+6. **`appears_transparent: true` quirks.** Verify on a non-
+   Windows host that the caption controls don't fight the native
+   chrome (we never tested on macOS / Linux).
+
+**Known small things (rolled forward from session 33):**
+- Backend's `hyperlink_at` is unused (snapshot handles it).
+- The "+ new tab" button still spawns in the *active project's*
+  primary path. After the worktree click flow lands, consider
+  making the "+" inherit the most-recent worktree of the active
+  project instead so users don't keep re-clicking a worktree row.
+- `codescope-terminal` has 8 preexisting clippy warnings (not
+  touched this session). Cleanup PR if anyone gets bored.
+
 
 ### Session 33 — worktree-on-new-session was wrong; rolled back; data-loss incident + recovery
 

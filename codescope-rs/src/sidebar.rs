@@ -23,14 +23,15 @@
 //! └───────────────┘
 //! ```
 
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 
 use codescope_core::{AppPaths, LayoutState, Project, ProjectsConfig, Theme};
 use gpui::{
-    ClipboardItem, Context, Corner, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, PathPromptOptions, Pixels, Point, Render, SharedString, Styled, Window,
-    anchored, deferred, div, point, px,
+    ClipboardItem, Context, Corner, EventEmitter, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, PathPromptOptions, Pixels, Point, Render, SharedString, Styled,
+    Window, anchored, deferred, div, point, px,
 };
 
 use crate::new_worktree_dialog::NewWorktreeDialogState;
@@ -55,6 +56,34 @@ struct OpenMenu {
 /// Receives the active window so a row that opens a follow-on dialog
 /// (e.g. "New worktree…") can focus the dialog inline.
 type MenuItemAction = Box<dyn Fn(&mut Sidebar, &mut Window, &mut Context<Sidebar>) + 'static>;
+
+/// Events the sidebar emits up to its host (`AppShell`). Today there
+/// is just one — "open a session at this path" — fired when the user
+/// clicks a worktree row or right after the new-worktree dialog
+/// successfully creates one. Keeping the surface in an enum so adding
+/// more events (e.g. `OpenProjectFolder`) doesn't require changing
+/// the trait wiring.
+#[derive(Debug, Clone)]
+pub enum SidebarEvent {
+    /// Spawn a new tab whose terminal is pinned to `working_directory`,
+    /// using `title` for the tab strip. Title is just a label — the
+    /// host decides what to actually show (in practice the worktree
+    /// branch name suffixed with the project name).
+    OpenSession {
+        working_directory: PathBuf,
+        title: SharedString,
+    },
+}
+
+/// Owned snapshot of one non-primary worktree, captured before render
+/// loops over the project list, so each row's listener closure can
+/// `move` it without taking an outliving borrow on `self.projects`.
+#[derive(Clone)]
+struct WorktreeRowData {
+    id: String,
+    path: String,
+    branch: Option<String>,
+}
 
 pub struct Sidebar {
     projects: ProjectsConfig,
@@ -360,16 +389,42 @@ impl Sidebar {
     }
 }
 
+impl EventEmitter<SidebarEvent> for Sidebar {}
+
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme.clone();
         let selected = self.selected;
-        let rows: Vec<_> = self
+        // Snapshot project + non-primary worktree metadata up front so
+        // each row's `cx.listener` closure can hold owned values
+        // without overlapping the immutable borrow `iter()` would
+        // otherwise extend across the rest of `render`. Primary
+        // worktrees are implicit at `Project::path`; we only emit
+        // child rows for the extras.
+        let rows: Vec<(usize, String, SharedString, String, Vec<WorktreeRowData>)> = self
             .projects
             .projects
             .iter()
             .enumerate()
-            .map(|(idx, p)| (idx, p.id.clone(), SharedString::from(p.name.clone())))
+            .map(|(idx, p)| {
+                let worktrees = p
+                    .worktrees
+                    .iter()
+                    .filter(|wt| !wt.is_primary)
+                    .map(|wt| WorktreeRowData {
+                        id: wt.id.clone(),
+                        path: wt.path.clone(),
+                        branch: wt.branch.clone(),
+                    })
+                    .collect();
+                (
+                    idx,
+                    p.id.clone(),
+                    SharedString::from(p.name.clone()),
+                    p.name.clone(),
+                    worktrees,
+                )
+            })
             .collect();
 
         let heading = div()
@@ -419,7 +474,13 @@ impl Render for Sidebar {
             None
         };
 
-        let project_rows = rows.into_iter().map(|(idx, id, name)| {
+        // Each project expands to one project row + zero or more
+        // worktree child rows. We collect a flat `Vec<AnyElement>`
+        // rather than a single iterator because the project + child
+        // rows are different element shapes and need to be flattened
+        // into a single `.children(...)` call.
+        let mut project_and_worktree_rows: Vec<gpui::AnyElement> = Vec::new();
+        for (idx, id, name, project_name, worktrees) in rows.into_iter() {
             let active = selected == Some(idx);
             let bg = if active {
                 theme::frost_10(&theme)
@@ -439,7 +500,7 @@ impl Render for Sidebar {
             let frost_hover = theme::frost_10(&theme);
             let ink_hover = theme::ink(&theme);
 
-            div()
+            let project_row = div()
                 .id(("project", id_hash(&id)))
                 .h(px(32.0))
                 .flex()
@@ -466,14 +527,68 @@ impl Render for Sidebar {
                         this.open_project_menu(idx, event.position, cx);
                     }),
                 )
-                .child(div().flex_grow().truncate().child(name))
-        });
+                .child(div().flex_grow().truncate().child(name));
+            project_and_worktree_rows.push(project_row.into_any_element());
+
+            // Non-primary worktree rows. Indented to make the parent /
+            // child relationship obvious; click emits `OpenSession`
+            // which the AppShell catches to spawn a tab pinned to the
+            // worktree's path.
+            for wt in worktrees {
+                let wt_label: SharedString = wt
+                    .branch
+                    .clone()
+                    .unwrap_or_else(|| {
+                        // Fallback when the worktree row in
+                        // `projects.json` predates branch tracking:
+                        // surface the folder leaf so the user still
+                        // sees something useful.
+                        std::path::Path::new(&wt.path)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| wt.path.clone())
+                    })
+                    .into();
+                let wt_path_for_event = wt.path.clone();
+                let title_label = SharedString::from(format!(
+                    "{}  ·  {}",
+                    project_name,
+                    wt_label,
+                ));
+                let frost_hover = theme::frost_10(&theme);
+                let ink_hover = theme::ink(&theme);
+                let wt_row = div()
+                    .id(("worktree", id_hash(&wt.id)))
+                    .h(px(28.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .pl(px(34.0)) // align under the project text past the rail + indent
+                    .pr_3()
+                    .text_color(theme::ink_ghost(&theme))
+                    .text_size(px(12.0))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(frost_hover).text_color(ink_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, _, cx| {
+                            cx.emit(SidebarEvent::OpenSession {
+                                working_directory: PathBuf::from(&wt_path_for_event),
+                                title: title_label.clone(),
+                            });
+                        }),
+                    )
+                    .child(div().flex_grow().truncate().child(wt_label));
+                project_and_worktree_rows.push(wt_row.into_any_element());
+            }
+        }
 
         let mut body = div()
             .flex()
             .flex_col()
             .py_1()
-            .children(project_rows);
+            .children(project_and_worktree_rows);
         if let Some(es) = empty_state {
             body = body.child(es);
         }
