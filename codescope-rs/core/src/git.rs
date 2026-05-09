@@ -139,6 +139,64 @@ fn for_each_ref(repo: &Path, is_remote: bool, prefix: &str) -> Result<Vec<Branch
     Ok(rows)
 }
 
+/// `git pull --ff-only`. Refuses to merge — if the upstream has
+/// diverged the user gets the failure instead of a surprise merge
+/// commit. Mirrors the C# build's `PullCommand` (Ctrl+Shift+F).
+pub fn pull_ff_only(repo: &Path) -> Result<()> {
+    run_git(repo, &["pull", "--ff-only"]).map(|_| ())
+}
+
+/// `git config --get remote.origin.url`. Returns the trimmed URL
+/// string, or `Ok(None)` when the remote isn't configured (so
+/// "Open remote in browser" can hide itself instead of erroring).
+pub fn remote_origin_url(repo: &Path) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args(["config", "--get", "remote.origin.url"])
+        .current_dir(repo)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| "spawn git config")?;
+    if !output.status.success() {
+        // `git config --get` exits 1 when the key is missing — that's
+        // expected (no origin), not an error.
+        return Ok(None);
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if url.is_empty() { Ok(None) } else { Ok(Some(url)) }
+}
+
+/// Convert a git remote URL (HTTPS or SSH) into a browser URL.
+/// Returns `None` for shapes we don't recognise so the caller can
+/// fall back to "open the URL as-is" or hide the action.
+///
+/// Handles:
+/// - `https://github.com/owner/repo(.git)` → `https://github.com/owner/repo`
+/// - `git@github.com:owner/repo(.git)` → `https://github.com/owner/repo`
+/// - `ssh://git@github.com/owner/repo(.git)` → `https://github.com/owner/repo`
+///
+/// Mirrors the C# `GitService.NormaliseRemoteUrl` heuristic.
+pub fn remote_url_to_browser(url: &str) -> Option<String> {
+    let url = url.trim();
+    let stripped = url.strip_suffix(".git").unwrap_or(url);
+    if stripped.starts_with("https://") || stripped.starts_with("http://") {
+        return Some(stripped.to_string());
+    }
+    if let Some(rest) = stripped.strip_prefix("git@") {
+        // `host:owner/repo` → `https://host/owner/repo`
+        let (host, path) = rest.split_once(':')?;
+        return Some(format!("https://{host}/{path}"));
+    }
+    if let Some(rest) = stripped.strip_prefix("ssh://git@") {
+        return Some(format!("https://{rest}"));
+    }
+    if let Some(rest) = stripped.strip_prefix("ssh://") {
+        return Some(format!("https://{rest}"));
+    }
+    None
+}
+
 /// `git worktree remove <path>`. Set `force = true` to bypass dirty-
 /// tree / locked checks. The C# build uses force=false in normal
 /// flows and lets the user retry with force after seeing the error.
@@ -281,6 +339,44 @@ detached\n";
     #[test]
     fn empty_input_yields_no_rows() {
         assert!(parse_worktree_porcelain("").is_empty());
+    }
+
+    #[test]
+    fn remote_url_browser_https_passthrough() {
+        assert_eq!(
+            remote_url_to_browser("https://github.com/foo/bar"),
+            Some("https://github.com/foo/bar".into())
+        );
+        assert_eq!(
+            remote_url_to_browser("https://github.com/foo/bar.git"),
+            Some("https://github.com/foo/bar".into())
+        );
+    }
+
+    #[test]
+    fn remote_url_browser_ssh_short_form() {
+        assert_eq!(
+            remote_url_to_browser("git@github.com:foo/bar.git"),
+            Some("https://github.com/foo/bar".into())
+        );
+        assert_eq!(
+            remote_url_to_browser("git@gitlab.com:group/sub/repo.git"),
+            Some("https://gitlab.com/group/sub/repo".into())
+        );
+    }
+
+    #[test]
+    fn remote_url_browser_ssh_long_form() {
+        assert_eq!(
+            remote_url_to_browser("ssh://git@github.com/foo/bar.git"),
+            Some("https://github.com/foo/bar".into())
+        );
+    }
+
+    #[test]
+    fn remote_url_browser_unknown_returns_none() {
+        assert!(remote_url_to_browser("file:///tmp/repo").is_none());
+        assert!(remote_url_to_browser("/local/path").is_none());
     }
 
     #[test]
