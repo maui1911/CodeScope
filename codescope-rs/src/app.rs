@@ -186,9 +186,21 @@ pub(crate) enum ToastKind {
 const TOAST_LIFETIME_OK: Duration = Duration::from_secs(4);
 const TOAST_LIFETIME_INFO: Duration = Duration::from_secs(4);
 const TOAST_LIFETIME_ERR: Duration = Duration::from_secs(8);
-/// How often the auto-dismiss task wakes up to retire expired toasts.
-/// 250 ms gives a smooth-enough feel when several land in a burst.
+/// How often the auto-dismiss task wakes up while toasts are
+/// visible. 250 ms gives a smooth-enough feel when several land in
+/// a burst. When the stack is empty we sleep `TOAST_POLL_IDLE`
+/// instead so an idle app doesn't wake at 4 Hz.
 const TOAST_POLL: Duration = Duration::from_millis(250);
+/// Idle interval when there are no live toasts. The longest
+/// possible lifetime (`TOAST_LIFETIME_ERR = 8s`) bounds how soon a
+/// freshly-pushed toast can need expiry attention, so polling at
+/// the same rate is plenty.
+const TOAST_POLL_IDLE: Duration = TOAST_LIFETIME_ERR;
+/// Cap on simultaneously-visible toasts. Mirrors the C# build's
+/// ToastService visible-cap. When the user fires a flurry of
+/// actions (or hits a recurring error) we evict the oldest so the
+/// stack doesn't grow without bound.
+const TOAST_VISIBLE_CAP: usize = 5;
 
 /// Open right-click menu state for a tab. Identifies the target
 /// tab by id (not index) so the menu still hits the right tab if
@@ -481,14 +493,20 @@ impl AppShell {
         })
         .detach();
 
-        // Toast auto-dismiss loop. Wakes every TOAST_POLL, checks
-        // each entry's `expires_at`, drops the expired ones, and
-        // notifies. Keeps `eprintln`-level errors / OK confirmations
-        // visible long enough to read but auto-clearing so the
-        // floating stack doesn't accumulate.
+        // Toast auto-dismiss loop. While toasts are visible we wake
+        // every `TOAST_POLL` to retire expired entries; when the
+        // stack is empty we drop down to `TOAST_POLL_IDLE` (the
+        // longest possible lifetime) so an idle app barely wakes
+        // for this. Keeps the floating stack auto-clearing without
+        // burning watts when there's nothing on screen.
         cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(TOAST_POLL).await;
+                let interval = match this.update(cx, |this, _| this.toasts.is_empty()) {
+                    Ok(true) => TOAST_POLL_IDLE,
+                    Ok(false) => TOAST_POLL,
+                    Err(_) => break,
+                };
+                cx.background_executor().timer(interval).await;
                 if this.upgrade().is_none() {
                     break;
                 }
@@ -1452,9 +1470,19 @@ impl AppShell {
 
     /// Push a toast onto the top of the floating stack. Each kind
     /// has its own lifetime — errors stay longer so the user can
-    /// read / copy. Pushes the new toast to the *front* of the
-    /// `VecDeque` so the stack reads newest-on-top.
-    pub fn push_toast(
+    /// read / copy. New toasts go to the front so the stack reads
+    /// newest-on-top.
+    ///
+    /// `pub(crate)` because the visible signature mentions
+    /// `ToastKind` which is also crate-internal — the API is for
+    /// internal use only (Sidebar routes through `SidebarEvent::Toast`
+    /// rather than calling here directly).
+    ///
+    /// Cap-evicts at `TOAST_VISIBLE_CAP` so a flurry of actions
+    /// can't grow the deque unboundedly. Drops the *back* (oldest)
+    /// since the visible stack reads newest-first; the user has
+    /// presumably already absorbed those.
+    pub(crate) fn push_toast(
         &mut self,
         kind: ToastKind,
         title: impl Into<SharedString>,
@@ -1475,6 +1503,9 @@ impl AppShell {
             detail,
             expires_at: Instant::now() + lifetime,
         });
+        while self.toasts.len() > TOAST_VISIBLE_CAP {
+            self.toasts.pop_back();
+        }
         cx.notify();
     }
 
