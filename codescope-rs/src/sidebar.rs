@@ -37,10 +37,14 @@ use gpui::{
 use crate::new_worktree_dialog::NewWorktreeDialogState;
 use crate::theme;
 
-/// Width of the sidebar pane. The C# build uses 240 with a
-/// resizable splitter; we keep it fixed for now and add the splitter
-/// when there's a second column to balance against.
-pub const SIDEBAR_WIDTH: f32 = 240.0;
+/// Default sidebar width when none is persisted in `layout.json`.
+/// Mirrors the C# build's initial 240 px. The actual rendered width
+/// is owned by `AppShell` and threaded through a parent wrapper —
+/// drag-resize + collapse live there so the sidebar entity itself
+/// doesn't have to know about its own chrome.
+pub const SIDEBAR_DEFAULT_WIDTH: f32 = 240.0;
+pub const SIDEBAR_MIN_WIDTH: f32 = 160.0;
+pub const SIDEBAR_MAX_WIDTH: f32 = 600.0;
 
 /// Open right-click context menu state. `None` when no menu is
 /// showing. The position is in window coordinates so we can hand it
@@ -201,17 +205,15 @@ impl Sidebar {
         cx.notify();
     }
 
-    /// Persist `layout.json` after selection / sidebar-visibility
-    /// changes. No debounce — selection is user-driven and slow.
-    /// Persist sidebar-owned fields of `layout.json`. Reads the on-
-    /// disk state first and only overwrites the fields we own —
-    /// AppShell holds its own clone of `LayoutState` for
-    /// `group_weights` / `focused_group_index` and writes the same
-    /// file when those change. A naive write of `self.layout` would
-    /// clobber any AppShell field that changed since the last
-    /// reload (drag-resize while a click was in flight, say). The
-    /// reload-merge-save shape avoids the last-writer-wins data
-    /// loss without needing to plumb a shared `Arc<Mutex<…>>`.
+    /// Persist `layout.json` after a project-selection change.
+    /// After PR #75 only `selected_project_id` is sidebar-owned —
+    /// visibility and width moved to `AppShell`, so the sidebar
+    /// entity doesn't have to know about its own chrome. A naive
+    /// write of `self.layout` would clobber AppShell-owned fields
+    /// (`group_weights`, `focused_group_index`, `sidebar_visible`,
+    /// `sidebar_width`), so we reload from disk, overwrite only
+    /// our slot, and save. Mirrors AppShell's `save_layout` to
+    /// keep the merge-on-write story consistent.
     fn save_layout(&self) {
         let mut on_disk = match LayoutState::load(&self.paths) {
             Ok(state) => state,
@@ -223,8 +225,6 @@ impl Sidebar {
                 self.layout.clone()
             }
         };
-        on_disk.sidebar_visible = self.layout.sidebar_visible;
-        on_disk.sidebar_width = self.layout.sidebar_width;
         on_disk.selected_project_id = self.layout.selected_project_id.clone();
         if let Err(err) = on_disk.save(&self.paths) {
             eprintln!("warning: failed to save layout.json: {err:#}");
@@ -797,9 +797,11 @@ impl Render for Sidebar {
             body = body.child(es);
         }
 
+        // Width is set by the parent wrapper in `AppShell` so the
+        // sidebar can be drag-resized + collapsed at the shell level.
+        // We just fill what we're given.
         let mut root = div()
-            .w(px(SIDEBAR_WIDTH))
-            .h_full()
+            .size_full()
             .flex()
             .flex_col()
             .bg(theme::elevated(&theme))
