@@ -203,8 +203,30 @@ impl Sidebar {
 
     /// Persist `layout.json` after selection / sidebar-visibility
     /// changes. No debounce — selection is user-driven and slow.
+    /// Persist sidebar-owned fields of `layout.json`. Reads the on-
+    /// disk state first and only overwrites the fields we own —
+    /// AppShell holds its own clone of `LayoutState` for
+    /// `group_weights` / `focused_group_index` and writes the same
+    /// file when those change. A naive write of `self.layout` would
+    /// clobber any AppShell field that changed since the last
+    /// reload (drag-resize while a click was in flight, say). The
+    /// reload-merge-save shape avoids the last-writer-wins data
+    /// loss without needing to plumb a shared `Arc<Mutex<…>>`.
     fn save_layout(&self) {
-        if let Err(err) = self.layout.save(&self.paths) {
+        let mut on_disk = match LayoutState::load(&self.paths) {
+            Ok(state) => state,
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to read layout.json before save \
+                     (using in-memory copy as base): {err:#}"
+                );
+                self.layout.clone()
+            }
+        };
+        on_disk.sidebar_visible = self.layout.sidebar_visible;
+        on_disk.sidebar_width = self.layout.sidebar_width;
+        on_disk.selected_project_id = self.layout.selected_project_id.clone();
+        if let Err(err) = on_disk.save(&self.paths) {
             eprintln!("warning: failed to save layout.json: {err:#}");
         }
     }
