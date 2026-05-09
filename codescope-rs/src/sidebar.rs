@@ -240,7 +240,6 @@ impl Sidebar {
 
     /// Apply a fresh theme snapshot. Called by the AppShell when the
     /// user changes themes — the sidebar redraws on the next frame.
-    #[allow(dead_code)]
     pub fn apply_theme(&mut self, theme: Arc<Theme>, cx: &mut Context<Self>) {
         self.theme = theme;
         cx.notify();

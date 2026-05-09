@@ -60,6 +60,12 @@ const WINDOW_SAVE_POLL: Duration = Duration::from_millis(150);
 /// hit disk. Long enough that a drag-resize doesn't write on every
 /// pixel; short enough that a normal resize-and-let-go feels instant.
 const WINDOW_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+/// How often the settings-watch loop checks `settings.json`'s mtime.
+/// 1 s is plenty — settings edits are user-driven and never on a hot
+/// path; the latency is "save-to-see" and the user won't notice the
+/// gap. Using mtime polling instead of a real fswatch keeps us off
+/// the `notify` crate dependency for a single-file watch.
+const SETTINGS_POLL: Duration = Duration::from_millis(1000);
 
 struct PendingWindowSave {
     state: WindowState,
@@ -107,6 +113,14 @@ struct SplitterDrag {
     /// Set from `(viewport_width - sidebar_width) / total_weight`.
     /// Used to translate cursor delta-x into a weight delta.
     px_per_unit: f32,
+}
+
+/// `mtime` for the watcher loop's "did the file change?" check.
+/// Returns `None` when the file is missing — that lets the loop
+/// detect reappearance (e.g. user re-creates `settings.json` after
+/// deleting it) the same way it detects an edit.
+fn settings_file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
 /// Read the saved group weights out of a `LayoutState` snapshot.
@@ -290,6 +304,50 @@ impl AppShell {
         })
         .detach();
 
+        // Live settings reload. Polls `settings.json`'s mtime every
+        // `SETTINGS_POLL` and triggers `apply_settings` on a real
+        // change. Mirrors C# `SettingsStore`'s file-watcher
+        // behaviour without the `notify` crate dependency — a single
+        // file at human typing speed doesn't need OS-level events.
+        let settings_path = paths.settings_file();
+        let initial_mtime = settings_file_mtime(&settings_path);
+        cx.spawn(async move |this, cx| {
+            let mut last_mtime = initial_mtime;
+            loop {
+                cx.background_executor().timer(SETTINGS_POLL).await;
+                if this.upgrade().is_none() {
+                    break;
+                }
+                let current_mtime = settings_file_mtime(&settings_path);
+                if current_mtime == last_mtime {
+                    continue;
+                }
+                let settings = match Settings::load_from(&settings_path) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        // A half-written save mid-edit is the common
+                        // case — `Settings::load_from` returns an
+                        // error, we log and try again on the next
+                        // tick. **Do not** advance `last_mtime` here:
+                        // if we did, a transient parse failure would
+                        // leave us stuck on the old settings until
+                        // the user touched the file again. Leaving
+                        // it at the old value means the next tick
+                        // sees the same "newer" mtime and retries
+                        // until the editor finishes its atomic
+                        // write.
+                        eprintln!("warning: failed to reload settings: {err:#}");
+                        continue;
+                    }
+                };
+                last_mtime = current_mtime;
+                let _ = this.update(cx, |this, cx| {
+                    this.apply_settings(settings, cx);
+                });
+            }
+        })
+        .detach();
+
         // Restore sidebar geometry from layout. Width is clamped on
         // load too — a corrupt or hand-edited layout.json could
         // otherwise pin the sidebar at 0 or eat the whole window.
@@ -401,6 +459,25 @@ impl AppShell {
 
     fn focused_group(&self) -> &Group {
         &self.groups[self.focused_group]
+    }
+
+    /// Apply a freshly-loaded `Settings` to the shell. Resolves the
+    /// theme by name from the built-in registry, swaps both the
+    /// settings and theme `Arc`s, and forwards the new theme to the
+    /// sidebar so its chrome repaints in the same frame. Existing
+    /// terminals keep their baked-in palette / font; the swap takes
+    /// effect for chrome immediately and for new tabs on next spawn.
+    /// Live-reapplying palette / font to running terminals lands
+    /// when the renderer exposes that knob — until then a settings
+    /// edit fully takes over only after the next Ctrl+Shift+T.
+    fn apply_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
+        let theme = Arc::new(codescope_core::theme::builtin::by_name(&settings.theme));
+        self.settings = Arc::new(settings);
+        self.theme = theme.clone();
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.apply_theme(theme, cx);
+        });
+        cx.notify();
     }
 
     /// Open a fresh shell session and append it as a new tab. The new
