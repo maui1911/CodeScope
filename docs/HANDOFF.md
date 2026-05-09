@@ -5,17 +5,143 @@
 > **Intent:** cursor + last 1–2 sessions in depth, everything else a one-liner.
 > Old detail lives in `git log` — don't duplicate it here.
 
-**Last updated:** 2026-05-09 (session 32)
-**Branch:** `feat/codescope-rs-window-state-save` (PR #55, manual-tested)
-**Head:** `27301fe` — pushed (`fix(rs): address PR #55 review feedback`)
+> ### House rule for the Rust port
+>
+> **The Rust port (`codescope-rs/`) is a 1:1 functional port of the C# CodeScope build (`src/CodeScope.App/`, `src/CodeScope.Core/`, `src/CodeScope.AgentCli/`).** Before implementing any feature on the Rust side, **read the equivalent C# code first** and mirror its behavior, button labels, dialogs, data shapes, and persistence layout. Functional parity is the goal — we are not redesigning. If a `HANDOFF.md` entry, README line, or "next entry point" disagrees with what the C# code actually does, the C# code wins; update the doc. Genuine platform-forced deviations (gpui vs WPF idiom) get a one-line comment and an entry in `docs/DECISIONS.md`. "Cleaner" or "more elegant" is not a reason on its own. (Reinforced in session 33 after PR #56 invented a non-existent UX.)
+
+**Last updated:** 2026-05-09 (session 33)
+**Branch:** `main` (PR #55 merged as `6cc89ee`; PR #56 closed without merge)
+**Head:** `6cc89ee` (main, in sync with origin)
 **Release:** `v0.2.5` shipped — https://github.com/maui1911/CodeScope/releases/tag/v0.2.5
 **Build status:** ✅ C# untouched. Rust workspace builds clean
 (`cargo build --workspace --manifest-path codescope-rs/Cargo.toml`).
-27 unit tests across `codescope-core` (18: +4 git porcelain parser
-+ 2 `Project::new` since session 31's 12) + `codescope-terminal`
-mouse-encoder (9). PR #54 merged to main as `7ffe4f3`.
+27 unit tests across `codescope-core` (18) + `codescope-terminal`
+mouse-encoder (9). PR #54 merged to main as `7ffe4f3`; PR #55 as `6cc89ee`.
 **Uncommitted work:** none.
 **Open issues:** none on GitHub.
+
+### Session 33 — worktree-on-new-session was wrong; rolled back; data-loss incident + recovery
+
+Aborted work in this session. Captured here so the next pass doesn't
+walk back into the same trap.
+
+**What I did and why it was wrong (PR #56, closed):**
+On the strength of session 32's "Suggested next entry points" list
+("Add a 'New session' affordance per project … run `add_worktree`,
+save a `Session`, open a tab in the worktree path"), I built exactly
+that: a `+ new session` row under the active project that
+auto-created a `session-N` worktree, persisted Worktree + Session,
+and emitted a `SidebarEvent::OpenSession` the AppShell caught via
+`subscribe_in` to spawn a tab in the worktree path. PR #56 opened,
+build clean, tests green (5 new on `Project::next_session_branch_name`,
+`worktree_path_for`, `worktree_root_path` — those helpers are
+still solid). User pushed back hard on first manual click:
+
+> "hij lijkt nu meteen een nieuwe worktree aan te maken op een
+> nieuwe sessie, dat is echt niet nodig hoor, als dat in de readme
+> staat dan is dat ook fout."
+>
+> "worktree aanmaken alleen maar uit context menu doen."
+
+**The rule (now also in auto-memory `feedback_session_vs_worktree.md`):**
+A new session is just a tab opened in the project's *primary* path —
+no worktree. Worktree creation is a separate, opt-in action that
+lives **only** in a right-click context menu, prompts for a branch
+name, and is named accordingly ("New worktree…"). Treat any spec doc
+that conflates the two — including last session's "next entry
+points" — as out-of-date.
+
+PR #56 closed; branch deleted (local + remote); main is back to
+`6cc89ee`. The `core::projects` helpers added in PR #56
+(`worktree_root_path`, `worktree_path_for`, `next_session_branch_name`)
+are *not* in tree — they came in on the closed branch. Reland those
+under a context-menu-driven worktree action when the time comes.
+
+**Data-loss incident — production `projects.json` overwritten:**
+While trying to launch the dev build for the manual test, I called
+the Bash tool with `$env:CODESCOPE_DEV = "1"; cargo run …` (PowerShell
+syntax). The Bash tool runs `bash`, not pwsh, so it parsed `$env:`
+as a stray identifier (`$env:CODESCOPE_DEV: command not found`) and
+the env var was *never set*. The Rust build therefore resolved
+`AppPaths` against **production** paths, not Dev. When the user
+added a project + clicked the (then-still-present) `+ new session`
+button, the Rust build wrote its snake_case `projects.json` over the
+C# camelCase production file at `%APPDATA%\CodeScope\projects.json`.
+Outcome: the user's full C# project list was overwritten down to
+just `brmble` + 2 stray `session-N` worktrees on disk at
+`C:\dev\brmble\brmble.worktrees\`. No backup at the usual paths
+(`%LOCALAPPDATA%\CodeScope.Dev.backup-*` from session 32 was not
+recreated this session).
+
+**Recovery actions taken:**
+- Closed PR #56 with a comment explaining the design miss.
+- Deleted the feature branch (local + remote).
+- `git worktree remove` for both stray worktrees in the brmble repo
+  and `rmdir` for the now-empty (wrong-default) `brmble.worktrees`
+  parent — left brmble's *real* `.worktrees/` (dot-prefix) intact.
+- User restoring `%APPDATA%\CodeScope\projects.json` themselves from
+  their own backup outside this system.
+
+**Lessons captured (carry into every future session):**
+
+1. **Env vars in the Bash tool: bash syntax only.** `CODESCOPE_DEV=1
+   cargo run --manifest-path … --bin window`. Never `$env:NAME = …`
+   in a Bash tool call. PowerShell syntax goes only in commands the
+   user runs in their own shell.
+2. **The Rust port silently overwrites a C#-shape `projects.json`.**
+   Loading a camelCase file fails to deserialize, defaults to empty
+   config, and the very next user mutation persists snake_case over
+   the original. Until the camelCase round-trip lands (still on the
+   follow-up list — see session 32 ⚠️ note), do not point a Rust
+   build at production paths. Treat the `CODESCOPE_DEV=1` redirect
+   as a **safety boundary**, not a convenience.
+3. **Session ≠ worktree.** Repeated for emphasis. Memory file:
+   `~/.claude/projects/C--dev-codescope-public/memory/feedback_session_vs_worktree.md`.
+4. **Read the C# implementation before designing anything Rust-side.**
+   The Rust port targets functional parity with the C# build, not
+   reinvention. Grep `src/CodeScope.App/**/*.xaml{,.cs}` +
+   `src/CodeScope.Core/**/*.cs` for the feature first; mirror UX
+   terminology, data shapes, and persistence layout 1:1. PR #56
+   invented a UX that doesn't exist in the C# build — that
+   shouldn't have been possible if I'd looked at the C# tab strip /
+   sidebar context menu first. House rule now codified at the top
+   of this file and in
+   `~/.claude/projects/C--dev-codescope-public/memory/feedback_csharp_parity.md`.
+
+**Suggested next entry points (priority order, replacing session 32's list):**
+
+1. **camelCase round-trip on `projects.json`.** Add
+   `#[serde(rename_all = "camelCase")]` on `Project`, `Session`,
+   `Worktree`, `ProjectsConfig`. Verify the C# build's top-level
+   `agents: []` survives load (serde tolerance is default). Land a
+   fixture-based round-trip integration test (the user's own
+   restored production file is a good source — copy a sanitised
+   subset into `core/tests/fixtures/`). **Without this the
+   data-loss footgun above is still cocked.**
+2. **Right-click context menu on a project row.** "Open in
+   Explorer", "Reveal in shell", "Remove from sidebar", "**New
+   worktree…**" (this last entry is the *only* place worktree
+   creation lives). Needs a small popup-menu primitive — gpui has
+   `cx.show_window` / overlay patterns; check `examples/`.
+3. **Branch-name input** for "New worktree…". Real text input
+   needed (gpui `examples/input.rs` is the reference, but it's a
+   chunk of code). Pair with the sidebar filter input so the
+   widget effort lands once.
+4. **Live theme reload.** Watch `settings.json` mtime, reload,
+   resolve theme by name, swap `Arc<Theme>` on AppShell + Sidebar.
+5. **Telemetry tail.** FSWatch on `~/.claude/projects/...` →
+   `running / idle / error` per session, drives status dots.
+6. **Titlebar interactions.** Drag region, min/max/close caption
+   controls. Carved out from session 32, still pending.
+
+**Known small things (rolled forward unchanged from session 32):**
+- Backend's `hyperlink_at` is unused (snapshot handles it).
+- `LayoutState.sidebar_visible` / `sidebar_width` loaded but never
+  re-saved — fine until a toggle / splitter lands.
+- `git::add_worktree` / `remove_worktree` have no integration test
+  hitting a real `git` binary; land it alongside "New worktree…".
+
+
 
 ### Session 32 — window/layout persistence, add-project, git primitives, sidebar drives tab cwd
 
