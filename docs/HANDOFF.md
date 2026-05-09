@@ -5,15 +5,139 @@
 > **Intent:** cursor + last 1–2 sessions in depth, everything else a one-liner.
 > Old detail lives in `git log` — don't duplicate it here.
 
-**Last updated:** 2026-05-09 (session 29)
+**Last updated:** 2026-05-09 (session 30)
 **Branch:** `feat/codescope-rs-terminal`
-**Head:** `127d1f2` — pushed to PR #53
+**Head:** `a2f1d18` — pushed to PR #53
 **Release:** `v0.2.5` shipped — https://github.com/maui1911/CodeScope/releases/tag/v0.2.5
 **Build status:** ✅ C# untouched. Rust workspace builds clean
 (`cargo build --workspace --manifest-path codescope-rs/Cargo.toml`),
 clippy `-D warnings` green for `codescope-terminal`.
 **Uncommitted work:** none.
 **Open issues:** none on GitHub.
+
+### Session 30 — pixel-accurate paint, paste, cursor blink, resize debounce, box-drawing alignment, OSC query handshake
+
+This session took the working interactive terminal from session 29
+and made it _feel_ like a real terminal — pixel-perfect rendering,
+proper paste, blinking cursor, no-flicker resize, clean box drawings,
+and inline answers to terminal capability queries.
+
+**Shipped (5 commits on `feat/codescope-rs-terminal`, all on PR #53):**
+
+1. `cd1665a` — pixel-accurate paint pass + bracketed paste.
+   Replaced the flex-of-divs render with a single `canvas` element:
+   measure phase shapes `│` for cell metrics, paint phase emits the
+   default-bg quad, per-row merged non-default-bg quads, then one
+   shaped TextRun per styled run at exact `col × cell_width`, then
+   the cursor on top. `StyledRun` now carries `start_col` + `len_cols`;
+   wide-char spacers filtered. Cursor shapes Block / HollowBlock /
+   Beam / Underline rendered correctly (block redraws the cell glyph
+   in `cell.bg` so the inverted fill stays readable). Adds
+   `Ctrl+Shift+V` / `Cmd+V` paste, plus a smart `Ctrl+V` that pastes
+   when the TUI has bracketed-paste mode on (claude-code, vim, modern
+   shells) and falls through to `\\x16` when off (PSReadLine's own
+   paste binding and readline's quoted-insert still work). CRLF
+   normalised to LF so multi-line pastes don't run each line.
+2. `59c7354` — cursor blink + Windows-Terminal default. Surface
+   `term.cursor_style().blinking` onto the snapshot; View runs a
+   530 ms blink timer (xterm convention) and snaps the phase back to
+   "visible" on every keystroke. Term's `default_cursor_style` set to
+   blinking bar so the cursor matches Windows Terminal even when
+   PSReadLine doesn't emit DECSCUSR; TUIs that send DECSCUSR still
+   override live.
+3. `ad82486` — debounce resize + shape per cell. ConPTY on Windows
+   dumps the active viewport into scrollback every time conhost is
+   resized; resizing 60×/sec during a window drag filled scrollback
+   with near-duplicate copies of the prompt, obvious as soon as the
+   user scrolled up. Stage incoming sizes in `pending_size`; a 40 ms
+   poll task applies after 120 ms of stability. One drag → one
+   resize. Box-drawing characters (`╭╮╰╯─│`) used to break in
+   claude-code's banner because `shape_line` over a whole run let
+   glyph-advance differences in font fallbacks accumulate; now we
+   shape one glyph at a time and paint each at exact `col ×
+   cell_width`. gpui caches glyph shaping internally so the cost on
+   a 100×30 grid is negligible.
+4. `67a3b67` — answer OSC color + text-area-size queries inline.
+   `Event::ColorRequest` (OSC 4 / 10-12) and `Event::TextAreaSizeRequest`
+   (CSI 14 t) used to be silently dropped. Now resolved directly in
+   `EventProxy::send_event` (event-loop thread) and forwarded as
+   `Msg::Input` — round-trip is microseconds, not a frame. Added
+   `Rgb` mirror of `ColorPalette` defaults + `resolve_rgb_no_overrides`
+   that doesn't lock the term (the event-loop thread can't safely
+   take the `Term` lock mid-parse). Per-terminal OSC 4 overrides
+   aren't consulted; rare in practice.
+5. `a2f1d18` — set `TERM_PROGRAM=CodeScope` in spawn env.
+   Doesn't fix claude-code's minimal-UI fallback (that's a Node-side
+   detection that also affects the C# CodeScope build), but is the
+   right thing to advertise so other capability-aware TUIs (Ink apps,
+   fzf, lazygit) recognise the host instead of treating us as a bare
+   ConPTY.
+
+**Confirmed working on Windows (manual test, this machine):**
+pwsh + oh-my-posh banner with full colour + nerd glyphs · keyboard
+input including `Ctrl+Shift+V` / `Cmd+V` paste with bracketed-paste
+markers · smart `Ctrl+V` that pastes inside TUIs but stays
+quoted-insert at the prompt · cursor blinks at 530 ms with proper
+shape (matches DECSCUSR) and stays visible during typing · live
+resize that doesn't fill scrollback with duplicates · box-drawing
+characters render seamlessly (vim borders, claude banner — when
+claude isn't in minimal mode).
+
+**Known limitation:** claude-code falls back to its minimal UI in
+both this terminal and the C# build's `EasyWindowsTerminalControl`.
+TERM_PROGRAM, COLORTERM, OSC color/size response timing all
+investigated; not the trigger. Likely a Node-side detection
+(`isTTY`, `terminal-size`, or claude-internal heuristic). Out of
+scope for our terminal layer; user accepted as long-standing.
+
+**Architectural notes worth carrying forward:**
+- The paint module (`terminal/src/paint.rs`) is the renderer of
+  record. Per-cell shaping > per-run shaping for terminals. Block
+  cursor needs to repaint the cell glyph in `cell.bg` to stay
+  readable on top of the inverted fill — easy to forget.
+- ConPTY resize-debounce is mandatory on Windows. Without it,
+  scrollback fills with garbage on every drag. 120 ms of stability
+  is the sweet spot — short enough to feel instant when the user
+  stops dragging, long enough that a single drag doesn't fire 60
+  resizes.
+- OSC color / text-area-size queries _must_ be answered from the
+  event-loop thread, not from the View's async drain. A frame of
+  latency was enough to drop claude-code into minimal mode (though
+  the trigger turned out to be elsewhere — the latency lesson stands
+  for other TUIs).
+- `EventProxy` carries a default `ColorPalette` clone and a
+  `Mutex<WindowSize>` so it can answer queries without locking
+  `Term`. The View pushes resize updates into the proxy via
+  `Backend::resize` → `proxy.update_size`.
+
+**Suggested next entry points (in priority order):**
+
+1. **Settings file.** `settings.json` next to `projects.json` with
+   `font.family`, `font.size`, `line_height`, `colors.*`, `scrollback`,
+   `cursor.{shape,blinking}`. Replaces the `CODESCOPE_FONT` env var
+   and hardcoded defaults. Reuse `AppPaths` for dev-mode separation.
+2. **Hyperlinks (OSC 8) and URL/path detection.** Zed's
+   `terminal_hyperlinks.rs` has clean heuristics to lift.
+3. **Mouse-mode reporting.** TUIs like `tmux`, `htop`, `vim` want
+   mouse events forwarded as escape sequences when they enable mouse
+   mode. Currently we eat all clicks for selection.
+4. **Tabs / multiple terminals in one window.** The View is stable
+   enough now; scaling to N TerminalViews in a tab strip is the
+   fastest route to actual workflow replacement.
+5. **Box-drawing primitives.** Per-cell shaping fixed alignment, but
+   for fonts that lack `╭╮╰╯`-style rounded corners we could draw
+   them ourselves (`vendor/gpui-terminal/src/box_drawing.rs` is a
+   working reference). Lower priority — current font fallback chain
+   covers the common cases.
+
+**Known small things still to clean up:**
+- View's font defaults are still hardcoded `FiraCode Nerd Font` —
+  settings file fixes this properly.
+- `EventProxy` holds a default-cloned `ColorPalette`; if themes
+  start updating the View's palette, we need an `update_palette`
+  method on the proxy (or move the palette into a shared `Arc`).
+- No tests on the View / paint layers; only `Backend` has the smoke
+  example.
 
 ### Session 29 — Backend, View+Element-lite, scrollback, mouse selection, clipboard
 
