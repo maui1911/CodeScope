@@ -205,15 +205,15 @@ impl Sidebar {
         cx.notify();
     }
 
-    /// Persist `layout.json` after selection / sidebar-visibility
-    /// changes. No debounce — selection is user-driven and slow.
-    /// Persist the sidebar-only fields of `layout.json`. Today only
-    /// `selected_project_id` is sidebar-owned: visibility and width
-    /// moved to `AppShell` so the sidebar entity itself doesn't
-    /// have to know about its own chrome. A naive write of
-    /// `self.layout` would clobber AppShell-owned fields, so we
-    /// reload, overwrite our slot, and save. Mirrors AppShell's
-    /// `save_layout` to keep the merge-on-write story consistent.
+    /// Persist `layout.json` after a project-selection change.
+    /// After PR #75 only `selected_project_id` is sidebar-owned —
+    /// visibility and width moved to `AppShell`, so the sidebar
+    /// entity doesn't have to know about its own chrome. A naive
+    /// write of `self.layout` would clobber AppShell-owned fields
+    /// (`group_weights`, `focused_group_index`, `sidebar_visible`,
+    /// `sidebar_width`), so we reload from disk, overwrite only
+    /// our slot, and save. Mirrors AppShell's `save_layout` to
+    /// keep the merge-on-write story consistent.
     fn save_layout(&self) {
         let mut on_disk = match LayoutState::load(&self.paths) {
             Ok(state) => state,

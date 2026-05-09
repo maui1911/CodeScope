@@ -318,15 +318,17 @@ impl AppShell {
     /// `layout.json`. Called after splitter-drag end, split-right, and
     /// group-collapse — anything that mutates either field. Never
     /// fails fatally; logs and moves on, the next save will retry.
-    /// Persist this AppShell's layout fields (`group_weights` +
-    /// `focused_group_index`) to `layout.json`. Reads the on-disk
-    /// state first and only overwrites the fields we own — the
-    /// Sidebar holds its own clone of `LayoutState` for sidebar
-    /// fields (visibility, width, selected project) and writes the
-    /// same file when those change. A naive write of our cached
-    /// `self.layout` would clobber any sidebar field the user
-    /// changed since the last reload, so we re-read on every save
-    /// to avoid the last-writer-wins data loss the reviewer flagged.
+    /// Persist this AppShell's layout fields to `layout.json`. After
+    /// PR #75 the AppShell owns `group_weights`, `focused_group_index`,
+    /// `sidebar_visible`, and `sidebar_width` (sidebar geometry
+    /// moved here so the Sidebar entity doesn't have to know about
+    /// its own chrome). The Sidebar still owns `selected_project_id`.
+    ///
+    /// Reads the on-disk state first and only overwrites the fields
+    /// we own — a naive write of our cached `self.layout` would
+    /// clobber any `selected_project_id` the user changed since the
+    /// last reload, so we re-read on every save to avoid the
+    /// last-writer-wins data loss the reviewer flagged in #73.
     fn save_layout(&mut self) {
         let mut on_disk = match LayoutState::load(self.paths.as_ref()) {
             Ok(state) => state,
@@ -699,7 +701,17 @@ impl AppShell {
         // feel that we ignore them here). Total weight is the sum of
         // all current weights.
         let viewport: f32 = window.viewport_size().width.into();
-        let sidebar_pixels = if self.sidebar_visible { self.sidebar_width } else { 0.0 };
+        // The sidebar wrapper takes `sidebar_width` plus the 6 px
+        // resize handle that sits between sidebar and work area;
+        // both are gone when collapsed. Subtracting the handle here
+        // (and not just the sidebar) keeps `px_per_unit` accurate so
+        // a group-splitter drag tracks the cursor 1:1 instead of
+        // drifting by 6 px after the first move.
+        let sidebar_pixels = if self.sidebar_visible {
+            self.sidebar_width + SPLITTER_HIT_WIDTH
+        } else {
+            0.0
+        };
         let work_width = (viewport - sidebar_pixels).max(1.0);
         let total_weight: f32 = self.group_weights.iter().copied().sum::<f32>().max(0.001);
         let px_per_unit = work_width / total_weight;
@@ -1166,12 +1178,16 @@ impl Render for AppShell {
             .child(toggle_glyph);
 
         // Sidebar-width spacer: aligns each strip column with the
-        // matching pane below. Width = sidebar_width − brand_mark −
-        // toggle when visible, just zero (well, almost — we keep an
-        // 8 px breathing gap) when collapsed so the first strip
-        // section butts up against the toggle without crowding it.
+        // matching pane below. The body row's left side is sidebar
+        // wrapper (`sidebar_width`) + resize handle (6 px). The
+        // titlebar's left side is brand mark (40 px) + toggle (32 px)
+        // + spacer. So the spacer must equal
+        //   (sidebar_width + handle) − brand − toggle
+        // when visible, and just an 8 px breathing gap when
+        // collapsed so the first strip section doesn't crowd the
+        // toggle.
         let sidebar_spacer_w = if self.sidebar_visible {
-            px((self.sidebar_width - 40.0 - 32.0).max(0.0))
+            px((self.sidebar_width + SPLITTER_HIT_WIDTH - 40.0 - 32.0).max(0.0))
         } else {
             px(8.0)
         };
