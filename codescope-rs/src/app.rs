@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use codescope_core::{AppPaths, ProjectsConfig, Settings, Theme, WindowState};
+use codescope_core::{AppPaths, LayoutState, ProjectsConfig, Settings, Theme, WindowState};
 use codescope_terminal::{
     Backend, ColorPalette, CursorStylePreset, FontConfig, Shell, SpawnConfig, TerminalSize,
     TerminalView,
@@ -83,12 +83,15 @@ impl AppShell {
         settings: Arc<Settings>,
         theme: Arc<Theme>,
         projects: ProjectsConfig,
+        layout: LayoutState,
         paths: Arc<AppPaths>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
-        let sidebar = cx.new(|_| Sidebar::new(projects, theme.clone(), paths.clone()));
+        let sidebar = cx.new(|_| {
+            Sidebar::new(projects, layout, theme.clone(), paths.clone())
+        });
         let pending_window_save: Arc<Mutex<Option<PendingWindowSave>>> = Arc::new(Mutex::new(None));
 
         // Persist live window geometry. The observer fires for every

@@ -87,7 +87,6 @@ fn main() -> Result<()> {
             LayoutState::default()
         }
     };
-    let layout = Arc::new(layout);
 
     let saved_window = match WindowState::load(&paths) {
         Ok(state) => state,
@@ -107,13 +106,10 @@ fn main() -> Result<()> {
     let app = gpui::Application::new();
 
     app.run(move |cx| {
-        // `window.json` save now lives inside `AppShell::new` — it
-        // observes bounds and debounces writes. `layout.json` save
-        // is still TODO (waiting on real live layout state); we
-        // deliberately don't write `LayoutState::default()` at
-        // quit-time because that would clobber whatever the user
-        // last saved.
-        let _ = layout;
+        // `window.json` save lives inside `AppShell::new` (observes
+        // bounds, debounces writes). `layout.json` save lives inside
+        // `Sidebar::select` / `add_project` — selection changes are
+        // user-driven and slow, no debounce needed.
 
         cx.spawn(async move |cx| {
             cx.open_window(
@@ -128,7 +124,15 @@ fn main() -> Result<()> {
                 },
                 |window, cx| {
                     let shell = cx.new(|cx| {
-                        AppShell::new(settings, theme.clone(), projects, paths, window, cx)
+                        AppShell::new(
+                            settings,
+                            theme.clone(),
+                            projects,
+                            layout,
+                            paths,
+                            window,
+                            cx,
+                        )
                     });
                     cx.new(|_| Root { shell, theme })
                 },

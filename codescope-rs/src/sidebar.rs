@@ -23,7 +23,7 @@
 
 use std::sync::Arc;
 
-use codescope_core::{AppPaths, Project, ProjectsConfig, Theme};
+use codescope_core::{AppPaths, LayoutState, Project, ProjectsConfig, Theme};
 use gpui::{
     Context, InteractiveElement, IntoElement, MouseButton, ParentElement, PathPromptOptions,
     Render, SharedString, Styled, Window, div, px,
@@ -42,21 +42,49 @@ pub struct Sidebar {
     /// projects exist yet.
     selected: Option<usize>,
     theme: Arc<Theme>,
-    /// Where `projects.json` lives. Threaded in so add/remove can
-    /// persist without re-detecting the env.
+    /// Where `projects.json` and `layout.json` live. Threaded in so
+    /// add/remove + selection changes can persist without re-detecting
+    /// the env.
     paths: Arc<AppPaths>,
+    /// In-memory copy of `layout.json` — kept in sync as the user
+    /// changes selection so a save-on-change writes out the full
+    /// (correct) struct, not just the field we touched.
+    layout: LayoutState,
 }
 
 impl Sidebar {
-    pub fn new(projects: ProjectsConfig, theme: Arc<Theme>, paths: Arc<AppPaths>) -> Self {
-        let selected = (!projects.projects.is_empty()).then_some(0);
-        Self { projects, selected, theme, paths }
+    pub fn new(
+        projects: ProjectsConfig,
+        layout: LayoutState,
+        theme: Arc<Theme>,
+        paths: Arc<AppPaths>,
+    ) -> Self {
+        // Restore last-opened project if it still exists. Falls back
+        // to the first project when the saved id is gone (project
+        // removed between sessions) or absent (first launch).
+        let selected = match layout.selected_project_id.as_deref() {
+            Some(id) => projects.projects.iter().position(|p| p.id == id),
+            None => None,
+        }
+        .or_else(|| (!projects.projects.is_empty()).then_some(0));
+        Self { projects, selected, theme, paths, layout }
     }
 
     pub fn select(&mut self, idx: usize, cx: &mut Context<Self>) {
         if idx < self.projects.projects.len() {
             self.selected = Some(idx);
+            self.layout.selected_project_id =
+                Some(self.projects.projects[idx].id.clone());
+            self.save_layout();
             cx.notify();
+        }
+    }
+
+    /// Persist `layout.json` after selection / sidebar-visibility
+    /// changes. No debounce — selection is user-driven and slow.
+    fn save_layout(&self) {
+        if let Err(err) = self.layout.save(&self.paths) {
+            eprintln!("warning: failed to save layout.json: {err:#}");
         }
     }
 
@@ -130,12 +158,15 @@ impl Sidebar {
             return;
         }
         let project = Project::new(path);
+        let new_id = project.id.clone();
         self.projects.projects.push(project);
         let new_idx = self.projects.projects.len() - 1;
         self.selected = Some(new_idx);
+        self.layout.selected_project_id = Some(new_id);
         if let Err(err) = self.projects.save(&self.paths) {
             eprintln!("warning: failed to save projects.json: {err:#}");
         }
+        self.save_layout();
         cx.notify();
     }
 }
