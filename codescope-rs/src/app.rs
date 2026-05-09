@@ -24,19 +24,35 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use codescope_core::{ProjectsConfig, Settings, Theme};
+use codescope_core::{AppPaths, ProjectsConfig, Settings, Theme, WindowState};
 use codescope_terminal::{
     Backend, ColorPalette, CursorStylePreset, FontConfig, Shell, SpawnConfig, TerminalSize,
     TerminalView,
 };
 use gpui::{
     AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, ParentElement, Render, SharedString, Styled, Window, div, px,
+    KeyDownEvent, MouseButton, ParentElement, Render, SharedString, Styled, Window, WindowBounds,
+    div, px,
 };
+use parking_lot::Mutex;
 
 use crate::sidebar::Sidebar;
 use crate::theme;
+
+/// How often the window-state debounce loop wakes up to check whether
+/// the latest pending save has been stable long enough.
+const WINDOW_SAVE_POLL: Duration = Duration::from_millis(150);
+/// How long the pending save must sit untouched before we actually
+/// hit disk. Long enough that a drag-resize doesn't write on every
+/// pixel; short enough that a normal resize-and-let-go feels instant.
+const WINDOW_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+
+struct PendingWindowSave {
+    state: WindowState,
+    set_at: Instant,
+}
 
 /// One tab = one terminal session.
 struct Tab {
@@ -67,11 +83,56 @@ impl AppShell {
         settings: Arc<Settings>,
         theme: Arc<Theme>,
         projects: Arc<ProjectsConfig>,
+        paths: Arc<AppPaths>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
         let sidebar = cx.new(|_| Sidebar::new(projects, theme.clone()));
+        let pending_window_save: Arc<Mutex<Option<PendingWindowSave>>> = Arc::new(Mutex::new(None));
+
+        // Persist live window geometry. The observer fires for every
+        // resize / move tick; we just stash the latest state and let
+        // the background debounce task hit disk once the dust settles.
+        cx.observe_window_bounds(window, {
+            let pending = pending_window_save.clone();
+            move |_, window, _| {
+                let state = window_state_from_window(window);
+                *pending.lock() = Some(PendingWindowSave {
+                    state,
+                    set_at: Instant::now(),
+                });
+            }
+        })
+        .detach();
+
+        // Debounced disk write. The loop dies when AppShell drops
+        // (`this.upgrade()` returns None), which is what we want — at
+        // app shutdown anything still pending is genuinely stale.
+        let pending_for_timer = pending_window_save.clone();
+        let paths_for_timer = paths.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(WINDOW_SAVE_POLL).await;
+                if this.upgrade().is_none() {
+                    break;
+                }
+                let to_save = {
+                    let mut guard = pending_for_timer.lock();
+                    match guard.as_ref() {
+                        Some(p) if p.set_at.elapsed() >= WINDOW_SAVE_DEBOUNCE => guard.take(),
+                        _ => None,
+                    }
+                };
+                if let Some(p) = to_save {
+                    if let Err(err) = p.state.save(&paths_for_timer) {
+                        eprintln!("warning: failed to save window state: {err:#}");
+                    }
+                }
+            }
+        })
+        .detach();
+
         let mut shell = Self {
             tabs: Vec::new(),
             active_tab: 0,
@@ -410,6 +471,31 @@ impl Render for AppShell {
             .text_color(theme::ink(&theme))
             .child(tab_strip)
             .child(main_row)
+    }
+}
+
+// ─── Window-state extraction ────────────────────────────────────────
+
+/// Snapshot the platform window into the on-disk `WindowState`. We
+/// always store the *restore* bounds so unmaximising lands at a
+/// sensible size; `maximised` is a separate flag the loader uses to
+/// pick `WindowBounds::Maximized` vs `Windowed`.
+fn window_state_from_window(window: &Window) -> WindowState {
+    let restore = match window.window_bounds() {
+        WindowBounds::Windowed(b) => b,
+        WindowBounds::Maximized(b) => b,
+        WindowBounds::Fullscreen(b) => b,
+    };
+    let f32_x: f32 = restore.origin.x.into();
+    let f32_y: f32 = restore.origin.y.into();
+    let f32_w: f32 = restore.size.width.into();
+    let f32_h: f32 = restore.size.height.into();
+    WindowState {
+        x: f32_x as i32,
+        y: f32_y as i32,
+        width: f32_w.max(0.0) as u32,
+        height: f32_h.max(0.0) as u32,
+        maximised: window.is_maximized(),
     }
 }
 

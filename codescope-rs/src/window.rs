@@ -103,6 +103,7 @@ fn main() -> Result<()> {
     };
 
     let window_bounds = saved_window.map(window_state_to_bounds);
+    let paths = Arc::new(paths);
 
     let app = gpui::Application::new();
 
@@ -111,14 +112,14 @@ fn main() -> Result<()> {
         let theme = theme.clone();
         let projects = projects.clone();
         let layout = layout.clone();
+        let paths = paths.clone();
 
-        // No quit-time save yet. Writing `LayoutState::default()`
-        // would clobber any layout the user (or a previous session)
-        // saved, and we don't yet have live state on the AppShell
-        // to write instead. `window.json` is in the same boat — we
-        // restore on launch but don't observe bounds-changes to
-        // write back. Both wires land together with
-        // `cx.observe_window_bounds`.
+        // `window.json` save now lives inside `AppShell::new` — it
+        // observes bounds and debounces writes. `layout.json` save
+        // is still TODO (waiting on real live layout state); we
+        // deliberately don't write `LayoutState::default()` at
+        // quit-time because that would clobber whatever the user
+        // last saved.
 
         cx.spawn(async move |cx| {
             cx.open_window(
@@ -132,7 +133,9 @@ fn main() -> Result<()> {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let shell = cx.new(|cx| AppShell::new(settings, theme.clone(), projects, window, cx));
+                    let shell = cx.new(|cx| {
+                        AppShell::new(settings, theme.clone(), projects, paths, window, cx)
+                    });
                     cx.new(|_| Root { shell, theme })
                 },
             )?;
