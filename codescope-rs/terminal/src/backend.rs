@@ -571,12 +571,20 @@ fn inject_url_hyperlinks(lines: &mut [Vec<StyledRun>]) {
         // column on screen, so linkify's byte ranges translate
         // directly to columns. Wide-char runs throw the alignment
         // off — `apply_url_to_line` skips runs in that case.
+        //
+        // Track `current_col` alongside the string so padding is
+        // O(total_chars) instead of O(chars²) — `chars().count()`
+        // in a while-loop rescans the whole string per padded
+        // space, which would dominate snapshot time on long lines.
         let mut text = String::new();
+        let mut current_col: usize = 0;
         for run in line.iter() {
-            while text.chars().count() < run.start_col {
+            while current_col < run.start_col {
                 text.push(' ');
+                current_col += 1;
             }
             text.push_str(&run.text);
+            current_col += run.text.chars().count();
         }
         let urls: Vec<(usize, usize, Arc<str>)> = finder
             .links(&text)
@@ -584,8 +592,20 @@ fn inject_url_hyperlinks(lines: &mut [Vec<StyledRun>]) {
             .map(|link| (link.start(), link.end(), Arc::from(link.as_str())))
             .collect();
         for (b_start, b_end, url) in urls {
-            let col_start = text[..b_start].chars().count();
-            let col_end = text[..b_end].chars().count();
+            // For ASCII URLs (always the case) byte == char ==
+            // column. The general `chars().count()` is kept as the
+            // safe path in case a future regex-pass admits non-ASCII
+            // matches, but the common path stays O(1) per URL.
+            let col_start = if text.is_char_boundary(b_start) && text[..b_start].is_ascii() {
+                b_start
+            } else {
+                text[..b_start].chars().count()
+            };
+            let col_end = if text.is_char_boundary(b_end) && text[..b_end].is_ascii() {
+                b_end
+            } else {
+                text[..b_end].chars().count()
+            };
             apply_url_to_line(line, col_start, col_end, url);
         }
     }

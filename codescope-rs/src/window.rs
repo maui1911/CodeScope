@@ -103,7 +103,6 @@ fn main() -> Result<()> {
     };
 
     let window_bounds = saved_window.map(window_state_to_bounds);
-    let paths_for_quit = paths.clone();
 
     let app = gpui::Application::new();
 
@@ -112,31 +111,14 @@ fn main() -> Result<()> {
         let theme = theme.clone();
         let projects = projects.clone();
         let layout = layout.clone();
-        let paths_quit = paths_for_quit.clone();
 
-        // Persist UI state on shutdown.
-        //
-        // Window bounds tracking lives one notch deeper than
-        // `on_app_quit` can reach (no `Window` handle here), so
-        // for now the load path restores the last-known window
-        // size + position but the *save* path is wired against a
-        // shared cell that AppShell will start updating as soon as
-        // we add `cx.observe_window_bounds` — landed in a follow-up.
-        //
-        // Layout state (sidebar visibility, selected project) is
-        // mutable via the AppShell already, so we save the live
-        // value here. For now `LayoutState::default()` is correct
-        // — toggle / select wiring follows in the same commit
-        // sequence.
-        cx.on_app_quit(move |_| {
-            let paths = paths_quit.clone();
-            async move {
-                if let Err(err) = LayoutState::default().save(&paths) {
-                    eprintln!("failed to save layout state: {err:#}");
-                }
-            }
-        })
-        .detach();
+        // No quit-time save yet. Writing `LayoutState::default()`
+        // would clobber any layout the user (or a previous session)
+        // saved, and we don't yet have live state on the AppShell
+        // to write instead. `window.json` is in the same boat — we
+        // restore on launch but don't observe bounds-changes to
+        // write back. Both wires land together with
+        // `cx.observe_window_bounds`.
 
         cx.spawn(async move |cx| {
             cx.open_window(

@@ -329,10 +329,18 @@ impl TerminalView {
             alt: modifiers.alt,
             control: modifiers.control,
         };
+        // Only claim the event when we actually emit bytes. If
+        // `mouse::encode` returns `None` (e.g. X10 overflow on a
+        // 300-col terminal) we'd otherwise swallow the click —
+        // returning `false` here lets the View fall back to
+        // selection / scrollback so the user gets *some* response
+        // instead of a silent dead spot.
         if let Some(bytes) = mouse::encode(mode, kind, button, mods, col, row) {
             self.backend.write_input(bytes);
+            true
+        } else {
+            false
         }
-        true
     }
 
     fn refresh_snapshot(&mut self, cx: &mut Context<Self>) {
@@ -346,7 +354,24 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Try mouse-reporting first. When a TUI like tmux/htop/vim
+        // Ctrl/Cmd-click on a hyperlink always opens it, even when
+        // a TUI has mouse mode on. Ctrl is the universal "bypass
+        // mouse reporting for one click" convention (Shift handles
+        // the same job for selection); without this short-circuit
+        // tmux / vim would swallow Ctrl+click and the user could
+        // never open a link inside them.
+        let modifier = event.modifiers.control || event.modifiers.platform;
+        let is_left = event.button == MouseButton::Left;
+        if is_left && modifier && !event.modifiers.shift {
+            if let Some((row, col)) = self.visible_rc(event.position) {
+                if let Some(uri) = self.snapshot.hyperlink_at(row, col) {
+                    let _ = open::that_detached(uri.as_ref());
+                    return;
+                }
+            }
+        }
+
+        // Try mouse-reporting next. When a TUI like tmux/htop/vim
         // is in mouse mode, the click belongs to it — only fall
         // through to selection when reporting is off (or the user
         // held Shift to bypass).
@@ -360,22 +385,8 @@ impl TerminalView {
                 return;
             }
         }
-        if event.button != MouseButton::Left {
+        if !is_left {
             return;
-        }
-        // Ctrl/Cmd-click on a hyperlink opens it in the system
-        // handler (browser for http(s)://, OS shell for file
-        // paths, …). Ctrl is the convention because plain click
-        // belongs to text-selection — same as VS Code / Windows
-        // Terminal / iTerm2.
-        let modifier = event.modifiers.control || event.modifiers.platform;
-        if modifier && !event.modifiers.shift {
-            if let Some((row, col)) = self.visible_rc(event.position) {
-                if let Some(uri) = self.snapshot.hyperlink_at(row, col) {
-                    let _ = open::that_detached(uri.as_ref());
-                    return;
-                }
-            }
         }
         if let Some((line, col)) = self.point_at(event.position) {
             self.backend.start_selection(line, col);

@@ -55,7 +55,11 @@ impl Default for Settings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FontSettings {
-    /// Primary family. Empty string = "let the platform pick".
+    /// Primary font family. Empty string falls back to the binary's
+    /// built-in default chain (currently a Nerd-Font-first list, see
+    /// `app::build_font_config`) — *not* an OS-resolved system
+    /// monospace. True platform-default picking would need a per-OS
+    /// font resolver and isn't wired yet.
     pub family: String,
     /// Glyph fallback chain. gpui falls back per-glyph, so installing
     /// any one of these is enough to pick up missing icons.

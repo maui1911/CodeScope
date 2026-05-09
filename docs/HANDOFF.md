@@ -155,8 +155,6 @@ typing + scroll + selection + paste all still work cleanly.
 
 ### Session 30 — pixel-accurate paint, paste, cursor blink, resize debounce, box-drawing alignment, OSC query handshake
 
-### Session 30 — pixel-accurate paint, paste, cursor blink, resize debounce, box-drawing alignment, OSC query handshake
-
 This session took the working interactive terminal from session 29
 and made it _feel_ like a real terminal — pixel-perfect rendering,
 proper paste, blinking cursor, no-flicker resize, clean box drawings,
