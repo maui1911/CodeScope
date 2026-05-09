@@ -153,6 +153,20 @@ impl TerminalView {
     /// palette matches whatever theme the [`Backend`] was spawned
     /// with. Callers that don't care about themes can keep using
     /// [`Self::new`] / [`Self::new_with_font`].
+    /// Write raw bytes to the pty as if the user had typed them.
+    /// Lets app shells inject startup commands (e.g. auto-type
+    /// `claude\r` after opening a tab) without going through the
+    /// keyboard pipeline. The bytes are queued on the backend; if the
+    /// shell hasn't started reading yet they wait there until it
+    /// does, so calling this immediately after `Backend::spawn` is
+    /// safe.
+    pub fn write_input<B>(&self, bytes: B)
+    where
+        B: Into<std::borrow::Cow<'static, [u8]>>,
+    {
+        self.backend.write_input(bytes);
+    }
+
     pub fn new_full(
         backend: Backend,
         palette: ColorPalette,

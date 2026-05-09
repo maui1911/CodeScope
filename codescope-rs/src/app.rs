@@ -129,10 +129,11 @@ impl AppShell {
         // focus inline.
         cx.subscribe_in(&sidebar, window, |this, _sidebar, event, window, cx| {
             match event {
-                SidebarEvent::OpenSession { working_directory, title } => {
+                SidebarEvent::OpenSession { working_directory, title, auto_type } => {
                     this.spawn_tab_in(
                         Some(working_directory.clone()),
                         Some(title.clone()),
+                        auto_type.clone(),
                         window,
                         cx,
                     );
@@ -212,13 +213,14 @@ impl AppShell {
     /// worktree clicks, post-create-worktree spawns) hand both in
     /// directly.
     fn spawn_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.spawn_tab_in(None, None, window, cx);
+        self.spawn_tab_in(None, None, None, window, cx);
     }
 
     fn spawn_tab_in(
         &mut self,
         working_directory: Option<std::path::PathBuf>,
         title_override: Option<SharedString>,
+        auto_type: Option<SharedString>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -294,9 +296,28 @@ impl AppShell {
             .unwrap_or_else(|| format!("Terminal {}", id + 1).into());
         let group_idx = self.focused_group;
         let group = &mut self.groups[group_idx];
+        // Capture the entity so an `auto_type` job can write to it
+        // without re-borrowing `self.groups` after the await point.
+        let terminal_for_autotype = terminal.clone();
         group.tabs.push(Tab { id, title, terminal });
         let new_idx = group.tabs.len() - 1;
         self.activate_tab(group_idx, new_idx, window, cx);
+
+        // Auto-type the requested command after a short settling
+        // delay so the shell has had time to print its prompt.
+        // Without the delay, the bytes can land before pwsh starts
+        // its REPL and get echoed into the banner instead of run.
+        if let Some(cmd) = auto_type {
+            cx.spawn(async move |_, cx| {
+                cx.background_executor().timer(Duration::from_millis(250)).await;
+                let _ = terminal_for_autotype.update(cx, |term, _cx| {
+                    let mut bytes = cmd.as_bytes().to_vec();
+                    bytes.push(b'\r');
+                    term.write_input(bytes);
+                });
+            })
+            .detach();
+        }
     }
 
     /// Close the tab at `(group_idx, tab_idx)`. When the group's last

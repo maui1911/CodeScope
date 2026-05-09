@@ -88,6 +88,11 @@ pub enum SidebarEvent {
     OpenSession {
         working_directory: PathBuf,
         title: SharedString,
+        /// Optional command to auto-type at the shell prompt once the
+        /// pty has come up. Used by "New Claude session" / "New
+        /// Codex session" rows to launch the agent inline; `None`
+        /// just opens a plain shell. The host adds the trailing CR.
+        auto_type: Option<SharedString>,
     },
 }
 
@@ -738,6 +743,7 @@ impl Render for Sidebar {
                             cx.emit(SidebarEvent::OpenSession {
                                 working_directory: PathBuf::from(&wt_path_for_event),
                                 title: title_label.clone(),
+                                auto_type: None,
                             });
                         }),
                     )
@@ -895,6 +901,51 @@ impl Sidebar {
                     .child(div().text_color(ink).text_size(px(13.0)).truncate().child(header_label))
                     .child(div().child("project")),
             )
+            .child(div().h_px().bg(divider).my_1())
+            // "New session" rows fire `OpenSession` on the project's
+            // primary worktree path. Project name doubles as the tab
+            // title — the user can rename later. Two flavours:
+            //   • Plain "New session" — opens a shell at the project
+            //     root, no auto-typed command.
+            //   • "New Claude session" — opens a shell, then types
+            //     `claude` after the prompt is up. Mirrors the C#
+            //     build's `BuildAgentChoices` flow at the project
+            //     scope; we don't have the full agent picker yet so
+            //     this is the headline shortcut.
+            .child({
+                let project_path = project.path.clone();
+                let project_title: SharedString = project.name.clone().into();
+                item(
+                    "menu-new-session",
+                    "New session",
+                    false,
+                    Box::new(move |this, _window, cx| {
+                        cx.emit(SidebarEvent::OpenSession {
+                            working_directory: PathBuf::from(&project_path),
+                            title: project_title.clone(),
+                            auto_type: None,
+                        });
+                        this.close_menu(cx);
+                    }),
+                )
+            })
+            .child({
+                let project_path = project.path.clone();
+                let project_title: SharedString = project.name.clone().into();
+                item(
+                    "menu-new-claude",
+                    "New Claude session",
+                    false,
+                    Box::new(move |this, _window, cx| {
+                        cx.emit(SidebarEvent::OpenSession {
+                            working_directory: PathBuf::from(&project_path),
+                            title: project_title.clone(),
+                            auto_type: Some(claude_command().into()),
+                        });
+                        this.close_menu(cx);
+                    }),
+                )
+            })
             .child(div().h_px().bg(divider).my_1())
             .child(item(
                 "menu-new-worktree",
@@ -1063,10 +1114,32 @@ impl Sidebar {
                     cx.emit(SidebarEvent::OpenSession {
                         working_directory: open_session_path.clone(),
                         title: open_session_title.clone(),
+                        auto_type: None,
                     });
                     this.close_menu(cx);
                 }),
             ))
+            // "New Claude session" — same as Open session but auto-
+            // types `claude` after the shell is up. Lands above the
+            // Reveal/Copy/Remove rows so the agent-launch path stays
+            // close to the plain Open session row.
+            .child({
+                let path = PathBuf::from(&worktree.path);
+                let title = SharedString::from(format!("{} · claude", project.name));
+                item(
+                    "wt-menu-new-claude",
+                    "New Claude session",
+                    false,
+                    Box::new(move |this, _window, cx| {
+                        cx.emit(SidebarEvent::OpenSession {
+                            working_directory: path.clone(),
+                            title: title.clone(),
+                            auto_type: Some(claude_command().into()),
+                        });
+                        this.close_menu(cx);
+                    }),
+                )
+            })
             .child(div().h_px().bg(divider).my_1())
             .child({
                 let id_for_reveal = worktree_id.clone();
@@ -1278,6 +1351,17 @@ fn open_path_in_windows_terminal(path: &str) {
         let _ = path;
         eprintln!("info: 'Open in Windows Terminal' is Windows-only");
     }
+}
+
+/// The command we auto-type for "New Claude session". Bare `claude`
+/// — relies on the user's PATH to resolve it (npm-global on Windows,
+/// homebrew/npm on macOS, /usr/local/bin or similar on Linux). When
+/// it fails the user just sees a `command not found` in their shell
+/// and can install it from there. Mirrors the C# build's default
+/// agent invocation; the full agent picker (Codex / shell / custom)
+/// lands when the settings story does.
+fn claude_command() -> &'static str {
+    "claude"
 }
 
 /// Platform-appropriate label for the "Reveal in <native file browser>"
