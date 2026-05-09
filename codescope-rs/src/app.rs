@@ -133,6 +133,12 @@ pub struct AppShell {
     /// `split_right` pushes 1.0; `close_tab`'s collapse drops the
     /// matching entry. The render loop maps these to flex_grow values
     /// so a 1.5 / 1.0 split allocates 60% / 40% of the work area.
+    ///
+    /// Persisted to `layout.json` via `save_layout` after every
+    /// drag / split / collapse. **Not yet rehydrated at cold-start**:
+    /// the AppShell still spawns a single group on launch so a saved
+    /// multi-group layout has nothing to map onto. Restoring the full
+    /// shape lands together with session restore.
     group_weights: Vec<f32>,
     /// In-flight splitter drag, if any. `Some` between mouse-down on
     /// a divider and mouse-up. Tracks the gap index (which two
@@ -271,12 +277,33 @@ impl AppShell {
     /// `layout.json`. Called after splitter-drag end, split-right, and
     /// group-collapse — anything that mutates either field. Never
     /// fails fatally; logs and moves on, the next save will retry.
+    /// Persist this AppShell's layout fields (`group_weights` +
+    /// `focused_group_index`) to `layout.json`. Reads the on-disk
+    /// state first and only overwrites the fields we own — the
+    /// Sidebar holds its own clone of `LayoutState` for sidebar
+    /// fields (visibility, width, selected project) and writes the
+    /// same file when those change. A naive write of our cached
+    /// `self.layout` would clobber any sidebar field the user
+    /// changed since the last reload, so we re-read on every save
+    /// to avoid the last-writer-wins data loss the reviewer flagged.
     fn save_layout(&mut self) {
-        self.layout.group_weights = self.group_weights.clone();
-        self.layout.focused_group_index = self.focused_group;
-        if let Err(err) = self.layout.save(self.paths.as_ref()) {
+        let mut on_disk = match LayoutState::load(self.paths.as_ref()) {
+            Ok(state) => state,
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to read layout.json before save \
+                     (using in-memory copy as base): {err:#}"
+                );
+                self.layout.clone()
+            }
+        };
+        on_disk.group_weights = self.group_weights.clone();
+        on_disk.focused_group_index = self.focused_group;
+        if let Err(err) = on_disk.save(self.paths.as_ref()) {
             eprintln!("warning: failed to save layout.json: {err:#}");
+            return;
         }
+        self.layout = on_disk;
     }
 
     fn focused_group(&self) -> &Group {
