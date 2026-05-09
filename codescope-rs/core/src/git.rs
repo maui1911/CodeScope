@@ -146,9 +146,11 @@ pub fn pull_ff_only(repo: &Path) -> Result<()> {
     run_git(repo, &["pull", "--ff-only"]).map(|_| ())
 }
 
-/// `git fetch --all --prune`. Pulls down all remotes and removes
-/// any local refs whose remote-tracking branches are gone. Runs at
-/// project scope (the primary worktree root) — fetched refs are
+/// `git fetch --all --prune`. Updates every remote and prunes the
+/// **remote-tracking** refs (`refs/remotes/<remote>/*`) whose
+/// upstream branches have been deleted. Local branches and tags
+/// are left untouched — only the remote-tracking shadows go. Runs
+/// at project scope (the primary worktree root); fetched refs are
 /// shared across all worktrees of the project. Mirrors the C#
 /// build's `FetchAllCommand`.
 pub fn fetch_all_prune(repo: &Path) -> Result<()> {

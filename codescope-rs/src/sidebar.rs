@@ -477,30 +477,7 @@ impl Sidebar {
         let project_path = std::path::PathBuf::from(&project.path);
         self.close_menu(cx);
         cx.spawn(async move |_, cx| {
-            let url_result = cx
-                .background_spawn(async move {
-                    codescope_core::git::remote_origin_url(&project_path)
-                })
-                .await;
-            let url = match url_result {
-                Ok(Some(u)) => u,
-                Ok(None) => {
-                    eprintln!("info: no remote.origin.url configured");
-                    return;
-                }
-                Err(err) => {
-                    eprintln!("warning: failed to read remote.origin.url: {err:#}");
-                    return;
-                }
-            };
-            let browser_url = match codescope_core::git::remote_url_to_browser(&url) {
-                Some(u) => u,
-                None => {
-                    eprintln!("info: remote URL not a recognised browser shape: {url}");
-                    return;
-                }
-            };
-            open_url_in_browser(&browser_url);
+            spawn_open_remote_in_browser(project_path, cx).await;
         })
         .detach();
     }
@@ -624,9 +601,8 @@ impl Sidebar {
 
     /// Resolve the project's `remote.origin.url` and open the
     /// browser-shape URL via the OS handler. Same plumbing as
-    /// `open_worktree_remote_in_browser` but at project scope —
-    /// project menu, not worktree menu. No-op + log when no
-    /// origin is configured. Mirrors C#'s
+    /// `open_worktree_remote_in_browser` but at project scope.
+    /// No-op + log when no origin is configured. Mirrors C#'s
     /// `OpenRemoteRepositoryCommand` (project scope).
     fn open_project_remote_in_browser(&mut self, idx: usize, cx: &mut Context<Self>) {
         let Some(project) = self.projects.projects.get(idx) else {
@@ -636,30 +612,7 @@ impl Sidebar {
         let project_path = std::path::PathBuf::from(&project.path);
         self.close_menu(cx);
         cx.spawn(async move |_, cx| {
-            let url_result = cx
-                .background_spawn(async move {
-                    codescope_core::git::remote_origin_url(&project_path)
-                })
-                .await;
-            let url = match url_result {
-                Ok(Some(u)) => u,
-                Ok(None) => {
-                    eprintln!("info: no remote.origin.url configured");
-                    return;
-                }
-                Err(err) => {
-                    eprintln!("warning: failed to read remote.origin.url: {err:#}");
-                    return;
-                }
-            };
-            let browser_url = match codescope_core::git::remote_url_to_browser(&url) {
-                Some(u) => u,
-                None => {
-                    eprintln!("info: remote URL not a recognised browser shape: {url}");
-                    return;
-                }
-            };
-            open_url_in_browser(&browser_url);
+            spawn_open_remote_in_browser(project_path, cx).await;
         })
         .detach();
     }
@@ -1606,6 +1559,40 @@ fn reveal_path_in_file_browser(path: &str) {
     if let Err(err) = result {
         eprintln!("warning: failed to reveal {path}: {err:#}");
     }
+}
+
+/// Resolve `remote.origin.url` for `repo`, normalise it to a
+/// browser URL, and open it via the OS handler. Shared by the
+/// project menu and the worktree menu — both ultimately read
+/// `origin` from the project's primary repo (worktrees inherit
+/// via their `gitdir:` pointer). No-op + log when there's no
+/// origin or the URL shape isn't recognised.
+async fn spawn_open_remote_in_browser(
+    repo: std::path::PathBuf,
+    cx: &mut gpui::AsyncApp,
+) {
+    let url_result = cx
+        .background_spawn(async move { codescope_core::git::remote_origin_url(&repo) })
+        .await;
+    let url = match url_result {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            eprintln!("info: no remote.origin.url configured");
+            return;
+        }
+        Err(err) => {
+            eprintln!("warning: failed to read remote.origin.url: {err:#}");
+            return;
+        }
+    };
+    let browser_url = match codescope_core::git::remote_url_to_browser(&url) {
+        Some(u) => u,
+        None => {
+            eprintln!("info: remote URL not a recognised browser shape: {url}");
+            return;
+        }
+    };
+    open_url_in_browser(&browser_url);
 }
 
 /// Open an HTTP(S) URL in the user's default browser. On Windows
