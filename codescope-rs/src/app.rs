@@ -606,7 +606,7 @@ impl Render for AppShell {
         //
         // On Wayland / X11 the compositor needs an explicit
         // `start_window_move()` because there's no NC-area hit-test
-        // model — keep that path under `cfg!(not(windows))`.
+        // model — keep that path under `#[cfg(not(target_os = "windows"))]`.
         let drag_region = {
             let base = div().id("titlebar-drag").flex_grow().h(px(40.0));
             #[cfg(target_os = "windows")]
