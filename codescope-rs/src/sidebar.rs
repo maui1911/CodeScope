@@ -1106,26 +1106,38 @@ impl Sidebar {
                     .child(div().truncate().child(project_label)),
             )
             .child(div().h_px().bg(divider).my_1())
-            .child(item(
-                "wt-menu-open",
-                "Open session",
-                false,
-                Box::new(move |this, _window, cx| {
-                    cx.emit(SidebarEvent::OpenSession {
-                        working_directory: open_session_path.clone(),
-                        title: open_session_title.clone(),
-                        auto_type: None,
-                    });
-                    this.close_menu(cx);
-                }),
-            ))
+            .child({
+                let path_for_open = open_session_path.clone();
+                let title_for_open = open_session_title.clone();
+                item(
+                    "wt-menu-open",
+                    "Open session",
+                    false,
+                    Box::new(move |this, _window, cx| {
+                        cx.emit(SidebarEvent::OpenSession {
+                            working_directory: path_for_open.clone(),
+                            title: title_for_open.clone(),
+                            auto_type: None,
+                        });
+                        this.close_menu(cx);
+                    }),
+                )
+            })
             // "New Claude session" — same as Open session but auto-
             // types `claude` after the shell is up. Lands above the
             // Reveal/Copy/Remove rows so the agent-launch path stays
             // close to the plain Open session row.
+            //
+            // Title derives from the same `open_session_title` shape
+            // (`{project} · {branch}`) plus a ` · claude` suffix so
+            // multiple worktrees stay distinguishable in the tab strip
+            // when the user has agents running in several of them.
             .child({
                 let path = PathBuf::from(&worktree.path);
-                let title = SharedString::from(format!("{} · claude", project.name));
+                let title = SharedString::from(format!(
+                    "{} · claude",
+                    open_session_title.clone()
+                ));
                 item(
                     "wt-menu-new-claude",
                     "New Claude session",

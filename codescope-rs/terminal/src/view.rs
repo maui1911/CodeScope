@@ -153,20 +153,6 @@ impl TerminalView {
     /// palette matches whatever theme the [`Backend`] was spawned
     /// with. Callers that don't care about themes can keep using
     /// [`Self::new`] / [`Self::new_with_font`].
-    /// Write raw bytes to the pty as if the user had typed them.
-    /// Lets app shells inject startup commands (e.g. auto-type
-    /// `claude\r` after opening a tab) without going through the
-    /// keyboard pipeline. The bytes are queued on the backend; if the
-    /// shell hasn't started reading yet they wait there until it
-    /// does, so calling this immediately after `Backend::spawn` is
-    /// safe.
-    pub fn write_input<B>(&self, bytes: B)
-    where
-        B: Into<std::borrow::Cow<'static, [u8]>>,
-    {
-        self.backend.write_input(bytes);
-    }
-
     pub fn new_full(
         backend: Backend,
         palette: ColorPalette,
@@ -257,6 +243,27 @@ impl TerminalView {
             blink_phase,
             hovered_link: None,
         }
+    }
+
+    /// Write raw bytes to the pty as if the user had typed them.
+    /// Lets app shells inject startup commands (e.g. auto-type
+    /// `claude\r` after opening a tab) without going through the
+    /// keyboard pipeline.
+    ///
+    /// I/O-safe to call right after `Backend::spawn` — the bytes
+    /// queue on the slave side and the shell consumes them once it
+    /// starts reading. **UX-wise** that isn't always what you want:
+    /// pwsh on Windows prints a banner before its REPL starts
+    /// reading, and bytes that land before the prompt can get echoed
+    /// into the banner instead of executed. Callers that want the
+    /// command to run *as if* typed at the prompt should give the
+    /// shell a moment to settle (a short timer, or wait for the
+    /// first idle event from the backend) before calling this.
+    pub fn write_input<B>(&self, bytes: B)
+    where
+        B: Into<std::borrow::Cow<'static, [u8]>>,
+    {
+        self.backend.write_input(bytes);
     }
 
     /// Snap the cursor to its visible phase. Called whenever the user
