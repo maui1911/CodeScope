@@ -241,4 +241,119 @@ some-future-field foo bar\n";
         assert_eq!(wts.len(), 1);
         assert_eq!(wts[0].path, "/repo");
     }
+
+    // ─── Integration tests against a real `git` binary ──────────────
+    //
+    // These exercise `add_worktree` / `list_worktrees` / `remove_worktree`
+    // end-to-end against a freshly-initialised temp repo. Skipped (with
+    // an `eprintln!` trace) when `git` isn't on PATH so a CI image
+    // without git in scope still goes green — but in normal dev the
+    // CLAUDE.md technology-decisions list makes git a hard dependency,
+    // so these run on every local invocation.
+
+    use std::path::Path;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    /// Initialise a fresh repo *inside a per-test tempdir* and produce
+    /// one commit so HEAD points at a real ref. Both the repo and its
+    /// `repo.worktrees/` sibling live under the same `TempDir`, so
+    /// drop = full cleanup and parallel test runs can't collide on
+    /// shared paths in the OS tempdir root. Uses `-c
+    /// init.defaultBranch=main` so `worktree add -b feat <path>`
+    /// doesn't trip on Git 2.28+'s "no default branch configured"
+    /// warning.
+    ///
+    /// Returns the tempdir guard (drop = cleanup), the absolute repo
+    /// path, and the absolute worktrees-root path (already created so
+    /// `git worktree add` doesn't have to).
+    fn init_repo() -> Option<(TempDir, std::path::PathBuf, std::path::PathBuf)> {
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("skipping: `git` not on PATH");
+            return None;
+        }
+        let dir = tempfile::tempdir().ok()?;
+        let repo = dir.path().join("repo");
+        let worktrees_root = dir.path().join("repo.worktrees");
+        std::fs::create_dir_all(&repo).ok()?;
+        std::fs::create_dir_all(&worktrees_root).ok()?;
+        run(&repo, &["-c", "init.defaultBranch=main", "init", "-q"]);
+        // Identity is required for `commit` even with `--allow-empty`.
+        run(&repo, &["config", "user.email", "test@example.invalid"]);
+        run(&repo, &["config", "user.name", "Test"]);
+        run(&repo, &["commit", "--allow-empty", "-m", "init", "-q"]);
+        Some((dir, repo, worktrees_root))
+    }
+
+    fn run(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    #[test]
+    fn add_worktree_then_list_includes_new_branch() {
+        let Some((_guard, repo, wts_root)) = init_repo() else { return };
+        let wt_path = wts_root.join("feat-x");
+
+        add_worktree(&repo, &wt_path, "feat/x", None).expect("add");
+
+        let wts = list_worktrees(&repo).expect("list");
+        assert_eq!(wts.len(), 2, "primary + feat-x = 2");
+        assert!(wts[0].is_primary);
+        assert_eq!(wts[0].branch.as_deref(), Some("main"));
+
+        let feat = wts.iter().find(|w| w.branch.as_deref() == Some("feat/x"));
+        assert!(feat.is_some(), "feat/x worktree should be listed");
+        let feat = feat.unwrap();
+        assert!(!feat.is_primary);
+        // git canonicalises the path; just check that the leaf matches
+        // — full-path comparison would fight Windows short-name vs
+        // long-name, junctioned drives, and macOS `/private/var` vs
+        // `/var` symlinks for tempdirs.
+        assert!(feat.path.ends_with("feat-x"), "path: {}", feat.path);
+    }
+
+    #[test]
+    fn remove_worktree_drops_it_from_list() {
+        let Some((_guard, repo, wts_root)) = init_repo() else { return };
+        let wt_path = wts_root.join("feat-y");
+        add_worktree(&repo, &wt_path, "feat/y", None).expect("add");
+        assert_eq!(list_worktrees(&repo).expect("list").len(), 2);
+
+        remove_worktree(&repo, &wt_path, false).expect("remove");
+
+        let wts = list_worktrees(&repo).expect("list after remove");
+        assert_eq!(wts.len(), 1, "primary alone after remove");
+        assert!(wts[0].is_primary);
+    }
+
+    #[test]
+    fn add_worktree_existing_branch_returns_stderr_error() {
+        let Some((_guard, repo, wts_root)) = init_repo() else { return };
+        let wt1 = wts_root.join("dup-1");
+        let wt2 = wts_root.join("dup-2");
+        add_worktree(&repo, &wt1, "feat/dup", None).expect("first add");
+
+        let err = add_worktree(&repo, &wt2, "feat/dup", None)
+            .expect_err("second add of same branch must fail");
+        let msg = format!("{err:#}");
+        // The message should contain git's actual stderr — without it
+        // the UI dialog can't tell the user *why* the call failed.
+        // We just check for substring matches that hold across git
+        // versions ("already exists" / "fatal:") instead of pinning
+        // to one phrasing.
+        assert!(
+            msg.contains("already exists") || msg.contains("fatal:"),
+            "expected stderr to bubble up; got: {msg}"
+        );
+    }
 }
