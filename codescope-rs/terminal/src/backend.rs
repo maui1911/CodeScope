@@ -21,10 +21,13 @@ use alacritty_terminal::event::{Notify, OnResize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, Notifier, State};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::tty::{self, Options as TtyOptions, Pty, Shell};
 use anyhow::{Context, Result};
+use gpui::Hsla;
 
+use crate::colors::ColorPalette;
 use crate::event::{BackendEvent, EventProxy};
 
 /// Dimensions plus per-cell pixel size, packaged the way alacritty wants
@@ -199,6 +202,184 @@ impl Backend {
     pub fn events(&self) -> flume::Receiver<BackendEvent> {
         self.events.clone()
     }
+
+    /// Capture a styled snapshot of the visible grid. Each line is a
+    /// list of [`StyledRun`]s with already-resolved gpui colours and
+    /// flags so the View layer doesn't need to know anything about
+    /// alacritty's `Color` / `NamedColor` enums.
+    ///
+    /// Cells are walked via `display_iter`, so this respects scrollback
+    /// scroll position the moment we wire the View up to drive
+    /// `display_offset`. Adjacent cells with identical fg/bg/flags get
+    /// merged into one run to keep the gpui element count down.
+    ///
+    /// The cursor cell is rendered with fg/bg swapped — good enough for
+    /// the first iteration; a real block cursor with blink will land
+    /// once we have an Element-level paint path.
+    pub fn snapshot(&self, palette: &ColorPalette) -> TerminalSnapshot {
+        self.with_term(|term| {
+            let columns = term.columns();
+            let screen_lines = term.screen_lines();
+            let mut lines: Vec<Vec<StyledRun>> = vec![Vec::new(); screen_lines];
+
+            let content = term.renderable_content();
+            let cursor_line = content.cursor.point.line.0;
+            let cursor_column = content.cursor.point.column.0;
+            let mode = content.mode;
+            // TUIs like claude-code, vim, etc. hide alacritty's logical
+            // cursor and draw their own block character. Honour both
+            // signals (TermMode::SHOW_CURSOR + CursorShape::Hidden) so
+            // we don't double-render.
+            let cursor_visible = mode.contains(TermMode::SHOW_CURSOR)
+                && content.cursor.shape
+                    != alacritty_terminal::vte::ansi::CursorShape::Hidden;
+            let default_bg = palette.resolve(
+                alacritty_terminal::vte::ansi::Color::Named(
+                    alacritty_terminal::vte::ansi::NamedColor::Background,
+                ),
+                content.colors,
+            );
+
+            for indexed in content.display_iter {
+                let row = indexed.point.line.0;
+                if row < 0 || (row as usize) >= screen_lines {
+                    continue;
+                }
+                let col = indexed.point.column.0;
+                if col >= columns {
+                    continue;
+                }
+
+                let cell = indexed.cell;
+                let flags = cell.flags;
+                let inverse = flags.contains(Flags::INVERSE);
+                let mut fg = palette.resolve(cell.fg, content.colors);
+                let mut bg = palette.resolve(cell.bg, content.colors);
+                if inverse {
+                    std::mem::swap(&mut fg, &mut bg);
+                }
+                let bold = flags.contains(Flags::BOLD);
+                let italic = flags.contains(Flags::ITALIC);
+                let underline = flags.contains(Flags::UNDERLINE);
+
+                let is_cursor =
+                    cursor_visible && row == cursor_line && col == cursor_column;
+                let (fg, bg) = if is_cursor { (bg, fg) } else { (fg, bg) };
+
+                let line = &mut lines[row as usize];
+                let next_col = line.iter().map(|r| r.text.chars().count()).sum::<usize>();
+
+                // Pad missing columns (cells that display_iter skips,
+                // e.g. wide-char spacers) with spaces in the default bg.
+                if next_col < col {
+                    let pad = col - next_col;
+                    if let Some(last) = line.last_mut()
+                        && last.fg == fg_default(palette)
+                        && last.bg == default_bg
+                        && !last.bold
+                        && !last.italic
+                        && !last.underline
+                        && !is_cursor
+                    {
+                        for _ in 0..pad {
+                            last.text.push(' ');
+                        }
+                    } else {
+                        line.push(StyledRun {
+                            text: " ".repeat(pad),
+                            fg: fg_default(palette),
+                            bg: default_bg,
+                            bold: false,
+                            italic: false,
+                            underline: false,
+                        });
+                    }
+                }
+
+                let mergeable = line.last().is_some_and(|last| {
+                    !is_cursor
+                        && last.fg == fg
+                        && last.bg == bg
+                        && last.bold == bold
+                        && last.italic == italic
+                        && last.underline == underline
+                });
+                if mergeable {
+                    line.last_mut().unwrap().text.push(cell.c);
+                } else {
+                    line.push(StyledRun {
+                        text: cell.c.to_string(),
+                        fg,
+                        bg,
+                        bold,
+                        italic,
+                        underline,
+                    });
+                }
+            }
+
+            // Empty rows still need a non-zero height; an empty `div` in
+            // gpui collapses to 0 lines tall. A single space in the
+            // default bg gives us a placeholder character to anchor the
+            // line height.
+            for line in lines.iter_mut() {
+                if line.is_empty() {
+                    line.push(StyledRun {
+                        text: " ".to_string(),
+                        fg: fg_default(palette),
+                        bg: default_bg,
+                        bold: false,
+                        italic: false,
+                        underline: false,
+                    });
+                }
+            }
+
+            TerminalSnapshot {
+                lines,
+                cursor_line,
+                cursor_column,
+                mode,
+                columns,
+                screen_lines,
+                default_bg,
+            }
+        })
+    }
+
+    /// Current terminal mode (used by the keystroke encoder for
+    /// APP_CURSOR-aware arrow keys).
+    pub fn mode(&self) -> TermMode {
+        self.with_term(|term| *term.mode())
+    }
+}
+
+fn fg_default(palette: &ColorPalette) -> Hsla {
+    palette.foreground
+}
+
+/// One contiguous run of cells with identical styling on a single row.
+#[derive(Debug, Clone)]
+pub struct StyledRun {
+    pub text: String,
+    pub fg: Hsla,
+    pub bg: Hsla,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+}
+
+/// One frame's worth of grid contents, prepared for the gpui View. Lines
+/// are indexed by visible row (0-based, top-down).
+#[derive(Debug, Clone)]
+pub struct TerminalSnapshot {
+    pub lines: Vec<Vec<StyledRun>>,
+    pub cursor_line: i32,
+    pub cursor_column: usize,
+    pub mode: TermMode,
+    pub columns: usize,
+    pub screen_lines: usize,
+    pub default_bg: Hsla,
 }
 
 impl Drop for Backend {

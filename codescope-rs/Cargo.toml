@@ -13,6 +13,10 @@ description = "Spike: gpui window with one embedded terminal running pwsh."
 name = "spike"
 path = "src/main.rs"
 
+[[bin]]
+name = "window"
+path = "src/window.rs"
+
 [[example]]
 name = "ptytest"
 path = "examples/ptytest.rs"
@@ -20,6 +24,7 @@ path = "examples/ptytest.rs"
 [dependencies]
 gpui = "0.2.2"
 gpui-terminal = { path = "vendor/gpui-terminal" }
+codescope-terminal = { path = "terminal" }
 portable-pty = "0.9"
 anyhow = "1"
 parking_lot = "0.12"
