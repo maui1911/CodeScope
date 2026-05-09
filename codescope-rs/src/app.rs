@@ -57,6 +57,7 @@ use parking_lot::Mutex;
 
 use crate::sidebar::{
     SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, Sidebar, SidebarEvent,
+    ToastSeverity,
 };
 use crate::theme;
 
@@ -158,6 +159,36 @@ const MIN_GROUP_WEIGHT: f32 = 0.15;
 /// 1px divider so the user can actually grab it without pixel-perfect
 /// aiming.
 const SPLITTER_HIT_WIDTH: f32 = 6.0;
+
+/// One on-screen toast — short status notification anchored bottom-
+/// right of the window. Mirrors C# `ToastHost` shape (Ok / Err /
+/// Info severities, auto-dismiss, top-newest stacking).
+#[derive(Clone)]
+struct Toast {
+    id: u64,
+    kind: ToastKind,
+    title: SharedString,
+    detail: Option<SharedString>,
+    expires_at: Instant,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ToastKind {
+    Ok,
+    Err,
+    #[allow(dead_code)]
+    Info,
+}
+
+/// How long a toast stays visible before the auto-dismiss task
+/// removes it. 4 s is long enough to read a one-liner; longer for
+/// errors so the user can copy a path / message before it fades.
+const TOAST_LIFETIME_OK: Duration = Duration::from_secs(4);
+const TOAST_LIFETIME_INFO: Duration = Duration::from_secs(4);
+const TOAST_LIFETIME_ERR: Duration = Duration::from_secs(8);
+/// How often the auto-dismiss task wakes up to retire expired toasts.
+/// 250 ms gives a smooth-enough feel when several land in a burst.
+const TOAST_POLL: Duration = Duration::from_millis(250);
 
 /// Open right-click menu state for a tab. Identifies the target
 /// tab by id (not index) so the menu still hits the right tab if
@@ -274,6 +305,15 @@ pub struct AppShell {
     sidebar_drag: Option<SidebarDrag>,
     /// Open tab right-click menu, if any.
     tab_menu: Option<TabMenu>,
+    /// Active toasts. Newest pushed at the front so the floating
+    /// stack reads top-to-bottom from the recently-fired action.
+    /// Auto-dismissed by the background poller spawned in
+    /// `AppShell::new`.
+    toasts: std::collections::VecDeque<Toast>,
+    /// Monotonic id source for toasts so the auto-dismiss task can
+    /// target the exact toast that just expired (otherwise
+    /// concurrent pushes could shift indices under the timer).
+    next_toast_id: u64,
     /// Threading the on-disk path bundle through so `save_layout` can
     /// reach `paths.layout_file()` without us having to pull it from
     /// the sidebar every time.
@@ -341,6 +381,14 @@ impl AppShell {
                         window,
                         cx,
                     );
+                }
+                SidebarEvent::Toast { kind, title, detail } => {
+                    let kind = match kind {
+                        ToastSeverity::Ok => ToastKind::Ok,
+                        ToastSeverity::Err => ToastKind::Err,
+                        ToastSeverity::Info => ToastKind::Info,
+                    };
+                    this.push_toast(kind, title.clone(), detail.clone(), cx);
                 }
             }
         })
@@ -433,6 +481,29 @@ impl AppShell {
         })
         .detach();
 
+        // Toast auto-dismiss loop. Wakes every TOAST_POLL, checks
+        // each entry's `expires_at`, drops the expired ones, and
+        // notifies. Keeps `eprintln`-level errors / OK confirmations
+        // visible long enough to read but auto-clearing so the
+        // floating stack doesn't accumulate.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(TOAST_POLL).await;
+                if this.upgrade().is_none() {
+                    break;
+                }
+                let _ = this.update(cx, |this, cx| {
+                    let now = Instant::now();
+                    let before = this.toasts.len();
+                    this.toasts.retain(|t| t.expires_at > now);
+                    if this.toasts.len() != before {
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+
         // Restore sidebar geometry from layout. Width is clamped on
         // load too — a corrupt or hand-edited layout.json could
         // otherwise pin the sidebar at 0 or eat the whole window.
@@ -493,6 +564,8 @@ impl AppShell {
             sidebar_visible,
             sidebar_drag: None,
             tab_menu: None,
+            toasts: std::collections::VecDeque::new(),
+            next_toast_id: 0,
             paths: paths.clone(),
             layout,
             next_group_id: group_count as u64,
@@ -1068,6 +1141,115 @@ impl AppShell {
         }
     }
 
+    /// Build the floating toast stack. Anchored bottom-right, deferred
+    /// so it paints over the rest of the chrome. Returns `None`
+    /// when there are no toasts so the root render's `.children(...)`
+    /// stays an empty iterator.
+    fn render_toasts(
+        &self,
+        theme: &Arc<Theme>,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if self.toasts.is_empty() {
+            return None;
+        }
+        let elevated = theme::elevated(theme);
+        let divider = theme::divider(theme);
+        let ink = theme::ink(theme);
+        let ink_dim = theme::ink_dim(theme);
+        let ink_ghost = theme::ink_ghost(theme);
+        let danger = theme::danger(theme);
+        let accent_clean = theme::status_clean(theme);
+
+        let stack = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .min_w(px(280.0))
+            .max_w(px(420.0))
+            .children(self.toasts.iter().map(|t| {
+                let id = t.id;
+                let stripe = match t.kind {
+                    ToastKind::Ok => accent_clean,
+                    ToastKind::Err => danger,
+                    ToastKind::Info => ink_dim,
+                };
+                let title = t.title.clone();
+                let detail = t.detail.clone();
+                div()
+                    .id(("toast", id))
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap_2()
+                    .p_3()
+                    .bg(elevated)
+                    .border_1()
+                    .border_color(divider)
+                    .rounded_md()
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .w(px(3.0))
+                            .h_full()
+                            .min_h(px(20.0))
+                            .bg(stripe)
+                            .rounded_sm(),
+                    )
+                    .child(
+                        div()
+                            .flex_grow()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_color(ink)
+                                    .text_size(px(13.0))
+                                    .child(title),
+                            )
+                            .children(detail.map(|d| {
+                                div()
+                                    .text_color(ink_dim)
+                                    .text_size(px(11.0))
+                                    .child(d)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id(("toast-dismiss", id))
+                            .w(px(20.0))
+                            .h(px(20.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .text_color(ink_ghost)
+                            .cursor_pointer()
+                            .hover(move |s| s.text_color(ink))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.dismiss_toast(id, cx);
+                                }),
+                            )
+                            .child("×"),
+                    )
+                    .into_any_element()
+            }));
+
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position(gpui::point(px(0.0), px(0.0)))
+                    .anchor(gpui::Corner::BottomRight)
+                    .snap_to_window_with_margin(px(16.0))
+                    .child(stack),
+            )
+            .into_any_element(),
+        )
+    }
+
     /// Build the tab right-click menu when one is open. Returns
     /// `None` when no menu is showing — caller uses `.children(...)`
     /// so 0 / 1 children both work without splitting the chain.
@@ -1266,6 +1448,45 @@ impl AppShell {
             .child(div().child(tab_label))
             .child(div().w_px().h(px(12.0)).bg(theme::divider(theme)))
             .child(div().child(group_label))
+    }
+
+    /// Push a toast onto the top of the floating stack. Each kind
+    /// has its own lifetime — errors stay longer so the user can
+    /// read / copy. Pushes the new toast to the *front* of the
+    /// `VecDeque` so the stack reads newest-on-top.
+    pub fn push_toast(
+        &mut self,
+        kind: ToastKind,
+        title: impl Into<SharedString>,
+        detail: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.next_toast_id;
+        self.next_toast_id += 1;
+        let lifetime = match kind {
+            ToastKind::Ok => TOAST_LIFETIME_OK,
+            ToastKind::Info => TOAST_LIFETIME_INFO,
+            ToastKind::Err => TOAST_LIFETIME_ERR,
+        };
+        self.toasts.push_front(Toast {
+            id,
+            kind,
+            title: title.into(),
+            detail,
+            expires_at: Instant::now() + lifetime,
+        });
+        cx.notify();
+    }
+
+    /// Dismiss a toast immediately by id. Wired to a small `×` on
+    /// each rendered toast so the user can clear them ahead of the
+    /// auto-dismiss timer.
+    fn dismiss_toast(&mut self, id: u64, cx: &mut Context<Self>) {
+        let before = self.toasts.len();
+        self.toasts.retain(|t| t.id != id);
+        if self.toasts.len() != before {
+            cx.notify();
+        }
     }
 
     /// Open the tab right-click menu at `position` for the tab
@@ -2065,6 +2286,7 @@ impl Render for AppShell {
             .child(main_row)
             .child(self.render_status_bar(&theme))
             .children(self.render_tab_menu(&theme, cx))
+            .children(self.render_toasts(&theme, cx))
     }
 }
 
