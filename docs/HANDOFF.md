@@ -10,7 +10,7 @@
 > **The Rust port (`codescope-rs/`) is a 1:1 functional port of the C# CodeScope build (`src/CodeScope.App/`, `src/CodeScope.Core/`, `src/CodeScope.AgentCli/`).** Before implementing any feature on the Rust side, **read the equivalent C# code first** and mirror its behavior, button labels, dialogs, data shapes, and persistence layout. Functional parity is the goal — we are not redesigning. If a `HANDOFF.md` entry, README line, or "next entry point" disagrees with what the C# code actually does, the C# code wins; update the doc. Genuine platform-forced deviations (gpui vs WPF idiom) get a one-line comment and an entry in `docs/DECISIONS.md`. "Cleaner" or "more elegant" is not a reason on its own. (Reinforced in session 33 after PR #56 invented a non-existent UX.)
 
 **Last updated:** 2026-05-10 (session 35 — long autonomous run)
-**Branch:** `main` (PRs #68–#88 merged this session)
+**Branch:** `main` (PRs #68–#90 merged this session)
 **Head:** main, in sync with origin
 **Release:** `v0.2.5` shipped earlier — no new release this run
 **Build status:** ✅ C# untouched. Rust workspace builds clean.
@@ -78,6 +78,14 @@ with replies linked + threads resolved.
   `git clean -fd`. New `worktree_display_label` helper consolidates
   the "branch name or folder leaf" pattern across Remove / Discard
   prompts.
+- **Toast notifications** (#90). Generic floating-stack overlay
+  (bottom-right, anchored, deferred). `AppShell.toasts` VecDeque
+  with two-rate poll (250 ms while visible, 8 s idle), cap of 5
+  with oldest-evict, three severities (Ok / Err / Info — Info
+  reserved for future use). Sidebar emits via new
+  `SidebarEvent::Toast`; AppShell maps to its private `ToastKind`.
+  Pull / Fetch all / Discard menu actions now toast their result.
+  Mirrors C# `ToastHost`.
 
 **Lessons:**
 
