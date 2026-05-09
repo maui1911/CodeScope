@@ -148,6 +148,11 @@ impl AppShell {
 
     /// Open a fresh shell session and append it as a new tab. The new
     /// tab becomes the active one and the terminal grabs focus.
+    ///
+    /// Working directory + tab title come from the sidebar's currently
+    /// selected project. Without a selection (cold launch, no
+    /// projects yet) the shell starts in whatever cwd the binary
+    /// inherited.
     fn spawn_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let shell = std::env::var("CODESCOPE_SHELL")
             .ok()
@@ -166,6 +171,17 @@ impl AppShell {
         env.insert("TERM_PROGRAM".into(), "CodeScope".into());
         env.insert("TERM_PROGRAM_VERSION".into(), "0.0.1".into());
 
+        // Pull project context from the sidebar — clone the path +
+        // name so we don't hold a borrow across `cx.new` further down.
+        let active_project = self
+            .sidebar
+            .read(cx)
+            .active_project()
+            .map(|p| (p.path.clone(), p.name.clone()));
+        let working_directory = active_project
+            .as_ref()
+            .map(|(path, _)| std::path::PathBuf::from(path));
+
         // Build the terminal palette + cursor preset from the active
         // theme + settings. Cloned per spawn so each tab carries its
         // own snapshot — themes can swap later without breaking
@@ -179,6 +195,7 @@ impl AppShell {
 
         let backend = match Backend::spawn(SpawnConfig {
             shell,
+            working_directory,
             env,
             size: TerminalSize {
                 num_lines: 30,
@@ -201,11 +218,11 @@ impl AppShell {
         let terminal = cx.new(|cx| TerminalView::new_full(backend, palette, font, cx));
         let id = self.next_id;
         self.next_id += 1;
-        self.tabs.push(Tab {
-            id,
-            title: format!("Terminal {}", id + 1).into(),
-            terminal,
-        });
+        let title: SharedString = match active_project {
+            Some((_, name)) => name.into(),
+            None => format!("Terminal {}", id + 1).into(),
+        };
+        self.tabs.push(Tab { id, title, terminal });
         let new_idx = self.tabs.len() - 1;
         self.activate_tab(new_idx, window, cx);
     }

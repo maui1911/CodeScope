@@ -60,6 +60,13 @@ impl Sidebar {
         }
     }
 
+    /// The project the user currently has selected, if any. AppShell
+    /// reads this when spawning a new tab so the terminal lands in
+    /// the right cwd.
+    pub fn active_project(&self) -> Option<&Project> {
+        self.selected.and_then(|idx| self.projects.projects.get(idx))
+    }
+
     /// Apply a fresh theme snapshot. Called by the AppShell when the
     /// user changes themes — the sidebar redraws on the next frame.
     #[allow(dead_code)]

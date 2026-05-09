@@ -122,7 +122,7 @@ pub fn parse_worktree_porcelain(stdout: &str) -> Vec<WorktreeInfo> {
     let mut branch: Option<String> = None;
     let mut locked = false;
 
-    let mut flush = |path: &mut Option<String>,
+    let flush = |path: &mut Option<String>,
                      head: &mut Option<String>,
                      branch: &mut Option<String>,
                      locked: &mut bool,
