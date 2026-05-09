@@ -287,20 +287,25 @@ impl AppShell {
                 if current_mtime == last_mtime {
                     continue;
                 }
-                last_mtime = current_mtime;
                 let settings = match Settings::load_from(&settings_path) {
                     Ok(s) => s,
                     Err(err) => {
                         // A half-written save mid-edit is the common
                         // case — `Settings::load_from` returns an
                         // error, we log and try again on the next
-                        // tick. The user's editor will commit the
-                        // final write within a tick or two and the
-                        // next pass picks it up cleanly.
+                        // tick. **Do not** advance `last_mtime` here:
+                        // if we did, a transient parse failure would
+                        // leave us stuck on the old settings until
+                        // the user touched the file again. Leaving
+                        // it at the old value means the next tick
+                        // sees the same "newer" mtime and retries
+                        // until the editor finishes its atomic
+                        // write.
                         eprintln!("warning: failed to reload settings: {err:#}");
                         continue;
                     }
                 };
+                last_mtime = current_mtime;
                 let _ = this.update(cx, |this, cx| {
                     this.apply_settings(settings, cx);
                 });
