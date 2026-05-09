@@ -391,6 +391,110 @@ impl Sidebar {
         self.close_menu(cx);
     }
 
+    /// Copy the branch name of a non-primary worktree to the system
+    /// clipboard. The menu row gates itself on `branch.is_some()` so
+    /// this only runs for tracked-branch worktrees, but we double-
+    /// check anyway. Mirrors C#'s `CopyBranchCommand`.
+    fn copy_worktree_branch(
+        &mut self,
+        project_idx: usize,
+        worktree_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.projects.projects.get(project_idx) else {
+            self.close_menu(cx);
+            return;
+        };
+        let branch = project
+            .worktrees
+            .iter()
+            .find(|wt| wt.id == worktree_id)
+            .and_then(|wt| wt.branch.clone());
+        if let Some(branch) = branch {
+            cx.write_to_clipboard(ClipboardItem::new_string(branch));
+        }
+        self.close_menu(cx);
+    }
+
+    /// Run `git pull --ff-only` on the worktree's path. Spawned on
+    /// the background executor so the UI thread doesn't block on
+    /// network I/O. Failures land in stderr — the toast layer that
+    /// would surface them to the user is C# parity work that
+    /// follows when the toast primitive lands.
+    fn pull_worktree(
+        &mut self,
+        project_idx: usize,
+        worktree_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self.worktree_path(project_idx, worktree_id) else {
+            self.close_menu(cx);
+            return;
+        };
+        self.close_menu(cx);
+        let path = std::path::PathBuf::from(path);
+        cx.spawn(async move |_, cx| {
+            let result = cx
+                .background_spawn(async move { codescope_core::git::pull_ff_only(&path) })
+                .await;
+            if let Err(err) = result {
+                eprintln!("warning: git pull --ff-only failed: {err:#}");
+            }
+        })
+        .detach();
+    }
+
+    /// Resolve the worktree's project remote URL, normalise it to
+    /// a browser URL, and open it via the OS handler. Hidden /
+    /// silent if there's no `origin` remote. Mirrors C#'s
+    /// `OpenRemoteRepositoryCommand`.
+    fn open_worktree_remote_in_browser(
+        &mut self,
+        project_idx: usize,
+        worktree_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.projects.projects.get(project_idx) else {
+            self.close_menu(cx);
+            return;
+        };
+        // The worktree row's project is the project we look up the
+        // origin URL from — different worktrees of the same project
+        // share the same remote. We could also walk the worktree's
+        // own .git but it's a `gitdir:` reference back to the
+        // primary repo, so this is equivalent and faster.
+        let _ = worktree_id; // silence unused: kept for API symmetry
+        let project_path = std::path::PathBuf::from(&project.path);
+        self.close_menu(cx);
+        cx.spawn(async move |_, cx| {
+            let url_result = cx
+                .background_spawn(async move {
+                    codescope_core::git::remote_origin_url(&project_path)
+                })
+                .await;
+            let url = match url_result {
+                Ok(Some(u)) => u,
+                Ok(None) => {
+                    eprintln!("info: no remote.origin.url configured");
+                    return;
+                }
+                Err(err) => {
+                    eprintln!("warning: failed to read remote.origin.url: {err:#}");
+                    return;
+                }
+            };
+            let browser_url = match codescope_core::git::remote_url_to_browser(&url) {
+                Some(u) => u,
+                None => {
+                    eprintln!("info: remote URL not a recognised browser shape: {url}");
+                    return;
+                }
+            };
+            open_url_in_browser(&browser_url);
+        })
+        .detach();
+    }
+
     /// Look up the on-disk path for a worktree by `worktree_id`.
     /// Returns `None` if the project / worktree has shifted out from
     /// under us (race with `add_project` / `remove_project` / external
@@ -1175,6 +1279,46 @@ impl Sidebar {
                     }),
                 )
             })
+            // ── Git ─────────────────────────────────────────────
+            // Pull / Copy branch / Open remote in browser. The
+            // dirty-state aware Rebase + Discard rows from the C#
+            // build land when the worktree polling infra does;
+            // these three are stateless enough to ship now.
+            .child(div().h_px().bg(divider).my_1())
+            .child({
+                let id_for_pull = worktree_id.clone();
+                item(
+                    "wt-menu-pull",
+                    "Pull (fast-forward)",
+                    false,
+                    Box::new(move |this, _window, cx| {
+                        this.pull_worktree(project_idx, &id_for_pull, cx);
+                    }),
+                )
+            })
+            .children(worktree.branch.is_some().then(|| {
+                let id_for_copy_branch = worktree_id.clone();
+                item(
+                    "wt-menu-copy-branch",
+                    "Copy branch name",
+                    false,
+                    Box::new(move |this, _window, cx| {
+                        this.copy_worktree_branch(project_idx, &id_for_copy_branch, cx);
+                    }),
+                )
+            }))
+            .child({
+                let id_for_remote = worktree_id.clone();
+                item(
+                    "wt-menu-open-remote",
+                    "Open remote in browser",
+                    false,
+                    Box::new(move |this, _window, cx| {
+                        this.open_worktree_remote_in_browser(project_idx, &id_for_remote, cx);
+                    }),
+                )
+            })
+            // ── Reveal ──────────────────────────────────────────
             .child(div().h_px().bg(divider).my_1())
             .child({
                 let id_for_reveal = worktree_id.clone();
@@ -1368,6 +1512,22 @@ fn reveal_path_in_file_browser(path: &str) {
     let result = Command::new("xdg-open").arg(path).spawn();
     if let Err(err) = result {
         eprintln!("warning: failed to reveal {path}: {err:#}");
+    }
+}
+
+/// Open an HTTP(S) URL in the user's default browser. Uses the
+/// platform-native handler — `start <url>` style on Windows,
+/// `open` on macOS, `xdg-open` on Linux. Detached so a slow
+/// browser launch doesn't stall the UI thread.
+fn open_url_in_browser(url: &str) {
+    #[cfg(target_os = "windows")]
+    let result = Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    #[cfg(target_os = "macos")]
+    let result = Command::new("open").arg(url).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = Command::new("xdg-open").arg(url).spawn();
+    if let Err(err) = result {
+        eprintln!("warning: failed to open URL in browser: {err:#}");
     }
 }
 
