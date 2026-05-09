@@ -618,6 +618,27 @@ impl Sidebar {
     /// up-front means we don't have to re-borrow `self.projects` after
     /// the await point — the worktree may have moved or vanished by
     /// then.
+    /// Friendly user-facing label for a worktree — branch name when
+    /// tracked, otherwise the folder leaf. Used by every prompt /
+    /// confirm dialog that names a worktree (Remove, Discard, …)
+    /// so the strings stay consistent across actions.
+    fn worktree_display_label(&self, project_idx: usize, worktree_id: &str) -> Option<String> {
+        let wt = self
+            .projects
+            .projects
+            .get(project_idx)?
+            .worktrees
+            .iter()
+            .find(|wt| wt.id == worktree_id)?;
+        Some(wt.branch.clone().unwrap_or_else(|| {
+            std::path::Path::new(&wt.path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| wt.path.clone())
+        }))
+    }
+
     fn worktree_remove_context(
         &self,
         project_idx: usize,
@@ -628,23 +649,71 @@ impl Sidebar {
         if wt.is_primary {
             return None;
         }
-        let label = wt
-            .branch
-            .clone()
-            .unwrap_or_else(|| {
-                std::path::Path::new(&wt.path)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| wt.path.clone())
-            });
+        let display_label = self
+            .worktree_display_label(project_idx, worktree_id)
+            .unwrap_or_else(|| wt.path.clone());
         Some(WorktreeRemoveContext {
             project_id: project.id.clone(),
             worktree_id: wt.id.clone(),
             project_path: project.path.clone(),
             worktree_path: wt.path.clone(),
-            display_label: label,
+            display_label,
         })
+    }
+
+    /// Confirm-then-run `git reset --hard HEAD` + `git clean -fd`
+    /// for a worktree. Destructive — uses a `Critical`-level prompt
+    /// so the user has to actively confirm. Mirrors C#'s
+    /// `DiscardChangesCommand`.
+    fn discard_worktree_changes(
+        &mut self,
+        project_idx: usize,
+        worktree_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self.worktree_path(project_idx, worktree_id) else {
+            self.close_menu(cx);
+            return;
+        };
+        // Friendly label for the prompt — shared with the rest of
+        // the worktree-action surface so wording stays consistent
+        // (`Remove worktree '<label>'?` and `Discard all changes
+        // in '<label>'?` line up).
+        let label = self
+            .worktree_display_label(project_idx, worktree_id)
+            .unwrap_or_else(|| "this worktree".into());
+        self.close_menu(cx);
+        let prompt_msg = format!("Discard all changes in '{label}'?");
+        let detail = format!(
+            "Path: {path}\n\nThis runs `git reset --hard HEAD` followed \
+             by `git clean -fd`. Untracked files and modifications to \
+             tracked files will be lost — there's no undo."
+        );
+        let rx = window.prompt(
+            gpui::PromptLevel::Critical,
+            &prompt_msg,
+            Some(&detail),
+            &["Discard", "Cancel"],
+            cx,
+        );
+        let path = std::path::PathBuf::from(path);
+        cx.spawn(async move |_, cx| {
+            // 0 = first button ("Discard"). Anything else = cancel.
+            match rx.await {
+                Ok(0) => {}
+                _ => return,
+            }
+            let result = cx
+                .background_spawn(
+                    async move { codescope_core::git::discard_all_changes(&path) },
+                )
+                .await;
+            if let Err(err) = result {
+                eprintln!("warning: discard_all_changes failed: {err:#}");
+            }
+        })
+        .detach();
     }
 
     /// Drop a non-primary worktree from this project. Calls
@@ -1497,6 +1566,32 @@ impl Sidebar {
                     }),
                 )
             })
+            // "Discard changes…" — only surface when the dirty
+            // poller has flagged this worktree as having changes;
+            // for clean / unknown worktrees the action would be a
+            // no-op + scary prompt, so hide the row entirely.
+            .children(
+                self.dirty_state
+                    .get(&worktree.path)
+                    .copied()
+                    .unwrap_or(false)
+                    .then(|| {
+                        let id_for_discard = worktree_id.clone();
+                        item(
+                            "wt-menu-discard",
+                            "Discard changes…",
+                            true,
+                            Box::new(move |this, window, cx| {
+                                this.discard_worktree_changes(
+                                    project_idx,
+                                    &id_for_discard,
+                                    window,
+                                    cx,
+                                );
+                            }),
+                        )
+                    }),
+            )
             // ── Reveal ──────────────────────────────────────────
             .child(div().h_px().bg(divider).my_1())
             .child({

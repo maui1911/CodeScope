@@ -146,6 +146,16 @@ pub fn pull_ff_only(repo: &Path) -> Result<()> {
     run_git(repo, &["pull", "--ff-only"]).map(|_| ())
 }
 
+/// Drop every uncommitted change in the worktree: `git reset --hard
+/// HEAD` resets tracked files, then `git clean -fd` removes untracked
+/// files and directories. Destructive — callers must confirm with
+/// the user first. Mirrors the C# build's `DiscardChangesCommand`.
+pub fn discard_all_changes(repo: &Path) -> Result<()> {
+    run_git(repo, &["reset", "--hard", "HEAD"])?;
+    run_git(repo, &["clean", "-fd"])?;
+    Ok(())
+}
+
 /// `git status --porcelain` — empty stdout means a clean worktree
 /// (no staged, unstaged, or untracked changes), anything else
 /// means dirty. Cheap enough to poll a couple of times per second
@@ -633,6 +643,27 @@ some-future-field foo bar\n";
         assert!(!is_dirty(&repo).expect("clean after commit"));
         std::fs::write(repo.join("README"), b"v2").expect("write");
         assert!(is_dirty(&repo).expect("dirty after modify"));
+    }
+
+    #[test]
+    fn discard_all_changes_resets_tracked_and_drops_untracked() {
+        let Some((_guard, repo, _wts)) = init_repo() else { return };
+        // Track a file then modify it; create an untracked file too.
+        std::fs::write(repo.join("tracked.txt"), b"v1").expect("write");
+        run(&repo, &["add", "tracked.txt"]);
+        run(&repo, &["commit", "-m", "add tracked", "-q"]);
+        std::fs::write(repo.join("tracked.txt"), b"v2").expect("write");
+        std::fs::write(repo.join("untracked.txt"), b"junk").expect("write");
+        assert!(is_dirty(&repo).expect("dirty before discard"));
+
+        discard_all_changes(&repo).expect("discard");
+
+        assert!(!is_dirty(&repo).expect("clean after discard"));
+        // tracked.txt back to v1
+        let body = std::fs::read_to_string(repo.join("tracked.txt")).expect("read");
+        assert_eq!(body, "v1");
+        // untracked.txt gone
+        assert!(!repo.join("untracked.txt").exists());
     }
 
     #[test]
