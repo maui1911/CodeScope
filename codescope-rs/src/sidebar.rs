@@ -647,6 +647,70 @@ impl Sidebar {
         })
     }
 
+    /// Confirm-then-run `git reset --hard HEAD` + `git clean -fd`
+    /// for a worktree. Destructive — uses a `Critical`-level prompt
+    /// so the user has to actively confirm. Mirrors C#'s
+    /// `DiscardChangesCommand`.
+    fn discard_worktree_changes(
+        &mut self,
+        project_idx: usize,
+        worktree_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self.worktree_path(project_idx, worktree_id) else {
+            self.close_menu(cx);
+            return;
+        };
+        // Build a friendly label for the prompt — branch name when
+        // we have one, folder leaf otherwise.
+        let label = self
+            .projects
+            .projects
+            .get(project_idx)
+            .and_then(|p| p.worktrees.iter().find(|wt| wt.id == worktree_id))
+            .and_then(|wt| {
+                wt.branch.clone().or_else(|| {
+                    std::path::Path::new(&wt.path)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_string())
+                })
+            })
+            .unwrap_or_else(|| "this worktree".into());
+        self.close_menu(cx);
+        let prompt_msg = format!("Discard all changes in '{label}'?");
+        let detail = format!(
+            "Path: {path}\n\nThis runs `git reset --hard HEAD` followed \
+             by `git clean -fd`. Untracked files and modifications to \
+             tracked files will be lost — there's no undo."
+        );
+        let rx = window.prompt(
+            gpui::PromptLevel::Critical,
+            &prompt_msg,
+            Some(&detail),
+            &["Discard", "Cancel"],
+            cx,
+        );
+        let path = std::path::PathBuf::from(path);
+        cx.spawn(async move |_, cx| {
+            // 0 = first button ("Discard"). Anything else = cancel.
+            match rx.await {
+                Ok(0) => {}
+                _ => return,
+            }
+            let result = cx
+                .background_spawn(
+                    async move { codescope_core::git::discard_all_changes(&path) },
+                )
+                .await;
+            if let Err(err) = result {
+                eprintln!("warning: discard_all_changes failed: {err:#}");
+            }
+        })
+        .detach();
+    }
+
     /// Drop a non-primary worktree from this project. Calls
     /// `git worktree remove` (force=false first; on failure prompts
     /// the user before retrying with `--force`), then rewrites
@@ -1497,6 +1561,32 @@ impl Sidebar {
                     }),
                 )
             })
+            // "Discard changes…" — only surface when the dirty
+            // poller has flagged this worktree as having changes;
+            // for clean / unknown worktrees the action would be a
+            // no-op + scary prompt, so hide the row entirely.
+            .children(
+                self.dirty_state
+                    .get(&worktree.path)
+                    .copied()
+                    .unwrap_or(false)
+                    .then(|| {
+                        let id_for_discard = worktree_id.clone();
+                        item(
+                            "wt-menu-discard",
+                            "Discard changes…",
+                            true,
+                            Box::new(move |this, window, cx| {
+                                this.discard_worktree_changes(
+                                    project_idx,
+                                    &id_for_discard,
+                                    window,
+                                    cx,
+                                );
+                            }),
+                        )
+                    }),
+            )
             // ── Reveal ──────────────────────────────────────────
             .child(div().h_px().bg(divider).my_1())
             .child({
