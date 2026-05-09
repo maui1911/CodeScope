@@ -190,21 +190,64 @@ fn paint_run(
         color: Some(run.fg),
         wavy: false,
     });
-    let text: SharedString = run.text.clone().into();
-    let text_run = TextRun {
-        len: text.len(),
-        font,
-        color: run.fg,
-        background_color: None,
-        underline,
-        strikethrough: None,
-    };
-    let shaped = window
-        .text_system()
-        .shape_line(text, font_size, &[text_run], None);
 
-    let x = origin.x + cell_width * (run.start_col as f32);
-    let _ = shaped.paint(Point { x, y }, line_height, window, cx);
+    // Paint per-cell rather than as one batched `shape_line`. Box
+    // drawing characters (`╭ ╮ ╰ ╯ ─ │` etc.) often shape through a
+    // font-fallback whose advance differs slightly from the primary
+    // font; batching lets that drift accumulate across the run, so
+    // rounded boxes (claude-code's banner, vim's borders) end up
+    // visually broken. Shaping each glyph at its exact `col ×
+    // cell_width` position keeps every cell aligned no matter what
+    // fallback served the glyph. Cost: one `shape_line` per cell
+    // instead of per run; gpui caches glyph shaping internally so
+    // the difference at a 100×30 grid is negligible.
+    let mut col = run.start_col;
+    for ch in run.text.chars() {
+        // Wide chars (CJK, emoji) advance two cells; the snapshot has
+        // already filtered the spacer cell, so we just bump the
+        // column counter by 2 here.
+        let cell_span = if is_wide_char(ch) { 2 } else { 1 };
+        if ch != ' ' && ch != '\0' {
+            let glyph: SharedString = ch.to_string().into();
+            let text_run = TextRun {
+                len: glyph.len(),
+                font: font.clone(),
+                color: run.fg,
+                background_color: None,
+                underline,
+                strikethrough: None,
+            };
+            let shaped = window
+                .text_system()
+                .shape_line(glyph, font_size, &[text_run], None);
+            let x = origin.x + cell_width * (col as f32);
+            let _ = shaped.paint(Point { x, y }, line_height, window, cx);
+        }
+        col += cell_span;
+    }
+}
+
+/// East-Asian-Wide / emoji probe matching what alacritty marks as a
+/// `WIDE_CHAR`. Conservative: only the BMP ranges everyone agrees on
+/// plus the supplementary symbol/emoji range. The snapshot is the
+/// authoritative source for cell width — this is just a fallback
+/// when iterating chars in paint.
+fn is_wide_char(c: char) -> bool {
+    matches!(c as u32,
+        0x1100..=0x115F   // Hangul Jamo
+        | 0x2E80..=0x303E // CJK Radicals
+        | 0x3041..=0x33FF // Hiragana / Katakana / CJK Symbols
+        | 0x3400..=0x4DBF // CJK Ext A
+        | 0x4E00..=0x9FFF // CJK Unified
+        | 0xA000..=0xA4CF // Yi
+        | 0xAC00..=0xD7A3 // Hangul Syllables
+        | 0xF900..=0xFAFF // CJK Compat
+        | 0xFE30..=0xFE4F // CJK Compat Forms
+        | 0xFF00..=0xFF60 // Fullwidth Forms
+        | 0xFFE0..=0xFFE6
+        | 0x1F300..=0x1FAFF // Emoji + symbols
+        | 0x20000..=0x2FFFD
+        | 0x30000..=0x3FFFD)
 }
 
 fn paint_cursor(

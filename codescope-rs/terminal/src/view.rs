@@ -18,7 +18,7 @@
 //!   grid resize logic and mouse-coordinate translation can use them.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
@@ -104,6 +104,13 @@ pub struct TerminalView {
     /// Last grid size we sent to the Backend, so we don't trigger a
     /// resize on every render.
     last_size: Arc<Mutex<(u16, u16)>>,
+    /// Pending resize request, waiting for the user to stop dragging.
+    /// On Windows ConPTY, every resize causes conhost to dump the
+    /// current viewport into scrollback — apply too often and the
+    /// scrollback fills with duplicates. We hold off until the
+    /// requested size has been stable for `RESIZE_DEBOUNCE` and only
+    /// then call `Backend::resize`.
+    pending_size: Arc<Mutex<Option<PendingResize>>>,
     /// Shared cache of the most recently laid-out terminal bounds.
     /// Mouse handlers read this to translate window-pixel positions to
     /// grid (line, column) coords.
@@ -137,6 +144,7 @@ impl TerminalView {
         let snapshot = backend.snapshot(&palette);
         let events = backend.events();
         let blink_phase = Arc::new(Mutex::new(true));
+        let pending_size: Arc<Mutex<Option<PendingResize>>> = Arc::new(Mutex::new(None));
 
         cx.spawn(async move |this, cx| {
             while let Ok(_event) = events.recv_async().await {
@@ -148,6 +156,35 @@ impl TerminalView {
                     .is_err()
                 {
                     break;
+                }
+            }
+        })
+        .detach();
+
+        // Resize debounce task. Polls the pending request every
+        // `RESIZE_POLL`; applies when the pending request has been
+        // stable for `RESIZE_DEBOUNCE`. Same lifetime story as the
+        // event drain task — dropping the entity ends the loop.
+        let pending_for_timer = pending_size.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(RESIZE_POLL).await;
+                let to_apply = {
+                    let mut guard = pending_for_timer.lock();
+                    match guard.as_ref() {
+                        Some(req) if req.set_at.elapsed() >= RESIZE_DEBOUNCE => guard.take(),
+                        _ => None,
+                    }
+                };
+                if let Some(req) = to_apply {
+                    if this
+                        .update(cx, |view, cx| {
+                            view.apply_resize(req.cols, req.rows, cx);
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
             }
         })
@@ -181,6 +218,7 @@ impl TerminalView {
             font,
             focus_handle,
             last_size: Arc::new(Mutex::new((0, 0))),
+            pending_size,
             bounds_cache: Arc::new(Mutex::new(None)),
             selecting: false,
             blink_phase,
@@ -404,12 +442,32 @@ impl TerminalView {
         self.backend.reset_scroll();
     }
 
-    fn maybe_resize(&mut self, cols: u16, rows: u16, cx: &mut Context<Self>) {
-        let (cur_cols, cur_rows) = *self.last_size.lock();
-        if cols == cur_cols && rows == cur_rows {
+    /// Stage a resize request. Cheap — the actual call into the
+    /// backend happens later, in [`Self::apply_resize`], when the
+    /// request has been stable for [`RESIZE_DEBOUNCE`].
+    fn maybe_resize(&self, cols: u16, rows: u16, _cx: &mut Context<Self>) {
+        if cols == 0 || rows == 0 {
             return;
         }
-        if cols == 0 || rows == 0 {
+        let (cur_cols, cur_rows) = *self.last_size.lock();
+        if cols == cur_cols && rows == cur_rows {
+            // Already at the target; if a stale pending request would
+            // try to undo it, drop it.
+            self.pending_size.lock().take();
+            return;
+        }
+        *self.pending_size.lock() = Some(PendingResize {
+            cols,
+            rows,
+            set_at: Instant::now(),
+        });
+    }
+
+    /// Actually call `Backend::resize` and refresh the snapshot. Driven
+    /// by the debounce task spawned in `new_with_font`.
+    fn apply_resize(&mut self, cols: u16, rows: u16, cx: &mut Context<Self>) {
+        let (cur_cols, cur_rows) = *self.last_size.lock();
+        if cols == cur_cols && rows == cur_rows {
             return;
         }
         *self.last_size.lock() = (cols, rows);
@@ -430,6 +488,25 @@ impl Focusable for TerminalView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
+}
+
+/// Debounce window for grid resize. ConPTY duplicates viewport
+/// content into scrollback on every resize on Windows; resizing 60×
+/// per second during a drag fills the buffer with garbage. 120 ms is
+/// short enough to feel snappy when the user finishes dragging,
+/// long enough that intermediate sizes during a drag are skipped.
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(120);
+
+/// Polling interval for the debounce timer. Independent of
+/// `RESIZE_DEBOUNCE`: shorter than the debounce so we react quickly
+/// once the user stops dragging.
+const RESIZE_POLL: Duration = Duration::from_millis(40);
+
+#[derive(Copy, Clone)]
+struct PendingResize {
+    cols: u16,
+    rows: u16,
+    set_at: Instant,
 }
 
 /// State handed from the canvas measure phase to the paint phase.
