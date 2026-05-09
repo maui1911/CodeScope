@@ -21,7 +21,7 @@ pub mod settings;
 pub mod theme;
 pub mod window_state;
 
-pub use layout::LayoutState;
+pub use layout::{LayoutState, RestoreTab};
 pub use paths::AppPaths;
 pub use projects::{Project, ProjectsConfig, Session, Worktree};
 pub use settings::{CursorSettings, FontSettings, Settings};

@@ -69,6 +69,15 @@ struct Tab {
     id: u64,
     title: SharedString,
     terminal: Entity<TerminalView>,
+    /// Working directory the pty was spawned in. Captured so a
+    /// session-restore round-trip can re-spawn the tab in the same
+    /// folder without going through the sidebar's active-project
+    /// fallback (which may have shifted since save).
+    working_directory: Option<std::path::PathBuf>,
+    /// Auto-typed command at spawn (None for plain shells, Some for
+    /// agent-launch tabs). Persisted so "New Claude session" comes
+    /// back as claude on restore.
+    auto_type: Option<SharedString>,
 }
 
 /// One column in the work area: a tab strip + the currently-selected
@@ -269,7 +278,7 @@ impl AppShell {
             theme,
             sidebar,
         };
-        shell.spawn_tab(window, cx);
+        shell.rehydrate_or_cold_start(window, cx);
         shell
     }
 
@@ -299,6 +308,7 @@ impl AppShell {
         };
         on_disk.group_weights = self.group_weights.clone();
         on_disk.focused_group_index = self.focused_group;
+        on_disk.open_tabs = self.snapshot_open_tabs();
         if let Err(err) = on_disk.save(self.paths.as_ref()) {
             eprintln!("warning: failed to save layout.json: {err:#}");
             return;
@@ -306,8 +316,114 @@ impl AppShell {
         self.layout = on_disk;
     }
 
+    /// Build a `RestoreTab` for every currently-open tab. Tabs
+    /// without a known working directory are skipped — we'd have
+    /// nothing useful to restore them in. The resulting list goes
+    /// straight into `LayoutState::open_tabs`.
+    fn snapshot_open_tabs(&self) -> Vec<codescope_core::RestoreTab> {
+        let mut out = Vec::new();
+        for (g_idx, group) in self.groups.iter().enumerate() {
+            for (t_idx, tab) in group.tabs.iter().enumerate() {
+                let Some(ref wd) = tab.working_directory else { continue };
+                out.push(codescope_core::RestoreTab {
+                    working_directory: wd.to_string_lossy().into_owned(),
+                    title: tab.title.to_string(),
+                    auto_type: tab.auto_type.as_ref().map(|s| s.to_string()),
+                    group_index: g_idx,
+                    active_in_group: t_idx == group.active_tab,
+                });
+            }
+        }
+        out
+    }
+
     fn focused_group(&self) -> &Group {
         &self.groups[self.focused_group]
+    }
+
+    /// Restore tabs from the persisted `LayoutState::open_tabs`, or
+    /// fall back to a single cold-start tab when there's nothing to
+    /// restore. Called once at the end of `AppShell::new`. Each tab
+    /// goes back into the group it was saved to (clamped into
+    /// range), and the active-in-group flag drives the per-group
+    /// selection. After restore we focus the *globally* focused
+    /// group's active tab so keyboard input lands somewhere live.
+    ///
+    /// Tabs whose `working_directory` no longer exists are silently
+    /// dropped — the user gets a fresh group with whatever survived.
+    /// If everything is dropped (rare: every saved path was deleted),
+    /// we fall through to the cold-start path so the user isn't
+    /// left staring at empty groups.
+    fn rehydrate_or_cold_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let saved: Vec<codescope_core::RestoreTab> = self.layout.open_tabs.clone();
+        if saved.is_empty() {
+            self.spawn_tab(window, cx);
+            return;
+        }
+
+        // Group by `group_index`, dropping non-existent paths and
+        // clamping out-of-range groups into 0..groups.len().
+        let group_count = self.groups.len();
+        let mut active_by_group: Vec<Option<usize>> = vec![None; group_count];
+        let mut spawned_any = false;
+        for tab in saved.into_iter() {
+            let path = std::path::PathBuf::from(&tab.working_directory);
+            if !path.exists() {
+                eprintln!(
+                    "info: skipping restored tab — path no longer exists: {}",
+                    tab.working_directory
+                );
+                continue;
+            }
+            let group_idx = tab.group_index.min(group_count.saturating_sub(1));
+            // Spawn into the requested group by temporarily moving
+            // focus there. `spawn_tab_in` always lands in the
+            // currently-focused group, so we can't address other
+            // groups directly without focus-stomping. We restore the
+            // intended `focused_group` after the loop.
+            self.focused_group = group_idx;
+            let title = SharedString::from(tab.title);
+            let auto = tab.auto_type.map(SharedString::from);
+            self.spawn_tab_in(Some(path), Some(title), auto, window, cx);
+            spawned_any = true;
+            if tab.active_in_group {
+                let new_idx = self.groups[group_idx].tabs.len() - 1;
+                active_by_group[group_idx] = Some(new_idx);
+            }
+        }
+
+        if !spawned_any {
+            // Every restore candidate's path was missing — fall back
+            // to the cold-start spawn so the user gets *something*.
+            self.spawn_tab(window, cx);
+            return;
+        }
+
+        // Apply per-group active selections. `spawn_tab_in` left each
+        // group's `active_tab` pointing at its last-spawned, which
+        // for groups without an explicit active_in_group flag is
+        // the right answer (matches the legacy "newest tab wins"
+        // behaviour); for groups with a flag we override.
+        for (g_idx, active) in active_by_group.iter().enumerate() {
+            if let Some(t_idx) = active
+                && let Some(group) = self.groups.get_mut(g_idx)
+                && *t_idx < group.tabs.len()
+            {
+                group.active_tab = *t_idx;
+            }
+        }
+
+        // Re-focus the saved focused group's active tab so keyboard
+        // input lands on the user's actual last-active terminal,
+        // not whichever tab spawn happened to land last.
+        let focused = self
+            .layout
+            .focused_group_index
+            .min(self.groups.len().saturating_sub(1));
+        if !self.groups[focused].tabs.is_empty() {
+            let active = self.groups[focused].active_tab;
+            self.activate_tab(focused, active, window, cx);
+        }
     }
 
     /// Open a fresh shell session and append it as a new tab. The new
@@ -373,6 +489,11 @@ impl AppShell {
         };
         let font = build_font_config(&self.settings);
 
+        // Clone the resolved working directory before the SpawnConfig
+        // moves it — the Tab keeps its own copy so session-restore
+        // can re-spawn the pty in the same folder later, without
+        // re-resolving via the sidebar (which may have shifted).
+        let working_directory_for_tab = working_directory.clone();
         let backend = match Backend::spawn(SpawnConfig {
             shell,
             working_directory,
@@ -406,7 +527,13 @@ impl AppShell {
         // Capture the entity so an `auto_type` job can write to it
         // without re-borrowing `self.groups` after the await point.
         let terminal_for_autotype = terminal.clone();
-        group.tabs.push(Tab { id, title, terminal });
+        group.tabs.push(Tab {
+            id,
+            title,
+            terminal,
+            working_directory: working_directory_for_tab,
+            auto_type: auto_type.clone(),
+        });
         let new_idx = group.tabs.len() - 1;
         self.activate_tab(group_idx, new_idx, window, cx);
 

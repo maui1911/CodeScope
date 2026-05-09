@@ -37,6 +37,46 @@ pub struct LayoutState {
     /// group count matches; out-of-range falls back to 0. Mirrors
     /// `WorkspaceLayout.FocusedGroupIndex`.
     pub focused_group_index: usize,
+    /// Open tabs to rehydrate at next launch. Each entry binds a
+    /// terminal session to a group + active flag. We don't try to
+    /// restore the *running process* (the pty was killed at app
+    /// shutdown) — `auto_type` re-runs whatever command was used to
+    /// spawn the original tab so "New Claude session" comes back as
+    /// claude and plain shells come back as plain shells. Tabs
+    /// whose `working_directory` no longer exists are silently
+    /// dropped on rehydrate. Empty → no tabs at last save (fresh
+    /// install / migration from older layout.json), AppShell falls
+    /// back to a single cold-start tab.
+    pub open_tabs: Vec<RestoreTab>,
+}
+
+/// One tab worth of restore metadata. Light enough to round-trip
+/// cleanly — full C# `Session` parity (agent_session_id,
+/// last_opened timestamps, history bookkeeping) is out of scope
+/// until the projects.json side moves over.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RestoreTab {
+    /// Working directory the pty was spawned in. Missing this and
+    /// the user wakes up to a tab that ran in a different folder
+    /// than they remember.
+    pub working_directory: String,
+    /// Tab strip label. Free-form string the user originally saw —
+    /// usually `{project} · {branch}` or `{project} · {branch} · claude`.
+    pub title: String,
+    /// Optional command that was auto-typed at the prompt when this
+    /// tab spawned. `Some("claude")` for "New Claude session" rows;
+    /// `None` for plain shells. Re-runs at next launch so the agent
+    /// is back even though the pty itself is fresh.
+    #[serde(default)]
+    pub auto_type: Option<String>,
+    /// Index of the group this tab belongs to in `group_weights`'s
+    /// numbering. Restore clamps out-of-range values to 0.
+    pub group_index: usize,
+    /// Was this tab the active one in its group at save time?
+    /// Restore picks the first `true` per group; if none, the first
+    /// tab wins.
+    #[serde(default)]
+    pub active_in_group: bool,
 }
 
 impl Default for LayoutState {
@@ -47,6 +87,7 @@ impl Default for LayoutState {
             selected_project_id: None,
             group_weights: Vec::new(),
             focused_group_index: 0,
+            open_tabs: Vec::new(),
         }
     }
 }
@@ -108,6 +149,22 @@ mod tests {
             selected_project_id: Some("proj-1".into()),
             group_weights: vec![1.5, 1.0],
             focused_group_index: 1,
+            open_tabs: vec![
+                RestoreTab {
+                    working_directory: "C:\\repos\\foo".into(),
+                    title: "foo · main".into(),
+                    auto_type: None,
+                    group_index: 0,
+                    active_in_group: true,
+                },
+                RestoreTab {
+                    working_directory: "C:\\repos\\foo.worktrees\\branch-x".into(),
+                    title: "foo · branch-x · claude".into(),
+                    auto_type: Some("claude".into()),
+                    group_index: 1,
+                    active_in_group: true,
+                },
+            ],
         };
         state.save_to(&path).unwrap();
         let loaded = LayoutState::load_from(&path).unwrap();
@@ -115,6 +172,9 @@ mod tests {
         assert_eq!(loaded.selected_project_id.as_deref(), Some("proj-1"));
         assert_eq!(loaded.group_weights, vec![1.5, 1.0]);
         assert_eq!(loaded.focused_group_index, 1);
+        assert_eq!(loaded.open_tabs.len(), 2);
+        assert_eq!(loaded.open_tabs[1].auto_type.as_deref(), Some("claude"));
+        assert!(loaded.open_tabs[0].active_in_group);
     }
 
     #[test]
