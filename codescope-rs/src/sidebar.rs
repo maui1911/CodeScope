@@ -618,6 +618,27 @@ impl Sidebar {
     /// up-front means we don't have to re-borrow `self.projects` after
     /// the await point — the worktree may have moved or vanished by
     /// then.
+    /// Friendly user-facing label for a worktree — branch name when
+    /// tracked, otherwise the folder leaf. Used by every prompt /
+    /// confirm dialog that names a worktree (Remove, Discard, …)
+    /// so the strings stay consistent across actions.
+    fn worktree_display_label(&self, project_idx: usize, worktree_id: &str) -> Option<String> {
+        let wt = self
+            .projects
+            .projects
+            .get(project_idx)?
+            .worktrees
+            .iter()
+            .find(|wt| wt.id == worktree_id)?;
+        Some(wt.branch.clone().unwrap_or_else(|| {
+            std::path::Path::new(&wt.path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| wt.path.clone())
+        }))
+    }
+
     fn worktree_remove_context(
         &self,
         project_idx: usize,
@@ -628,22 +649,15 @@ impl Sidebar {
         if wt.is_primary {
             return None;
         }
-        let label = wt
-            .branch
-            .clone()
-            .unwrap_or_else(|| {
-                std::path::Path::new(&wt.path)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| wt.path.clone())
-            });
+        let display_label = self
+            .worktree_display_label(project_idx, worktree_id)
+            .unwrap_or_else(|| wt.path.clone());
         Some(WorktreeRemoveContext {
             project_id: project.id.clone(),
             worktree_id: wt.id.clone(),
             project_path: project.path.clone(),
             worktree_path: wt.path.clone(),
-            display_label: label,
+            display_label,
         })
     }
 
@@ -662,21 +676,12 @@ impl Sidebar {
             self.close_menu(cx);
             return;
         };
-        // Build a friendly label for the prompt — branch name when
-        // we have one, folder leaf otherwise.
+        // Friendly label for the prompt — shared with the rest of
+        // the worktree-action surface so wording stays consistent
+        // (`Remove worktree '<label>'?` and `Discard all changes
+        // in '<label>'?` line up).
         let label = self
-            .projects
-            .projects
-            .get(project_idx)
-            .and_then(|p| p.worktrees.iter().find(|wt| wt.id == worktree_id))
-            .and_then(|wt| {
-                wt.branch.clone().or_else(|| {
-                    std::path::Path::new(&wt.path)
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .map(|s| s.to_string())
-                })
-            })
+            .worktree_display_label(project_idx, worktree_id)
             .unwrap_or_else(|| "this worktree".into());
         self.close_menu(cx);
         let prompt_msg = format!("Discard all changes in '{label}'?");
