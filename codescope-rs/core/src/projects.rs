@@ -53,6 +53,33 @@ pub struct Project {
 
 fn default_branch() -> String { "main".to_string() }
 
+impl Project {
+    /// Build a fresh project pointing at `path`. Name defaults to the
+    /// folder leaf (or `"project"` if the path has no leaf for some
+    /// reason), id is a fresh UUIDv4. The default branch is `"main"`
+    /// — callers can override by mutating the returned struct before
+    /// saving. No validation that `path` is actually a git repo: the
+    /// sidebar lists everything the user adds; bad paths surface when
+    /// the worktree code tries to use them.
+    pub fn new(path: String) -> Self {
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "project".to_string());
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            name,
+            path,
+            default_branch: default_branch(),
+            worktree_root: None,
+            default_agent_id: None,
+            sessions: Vec::new(),
+            worktrees: Vec::new(),
+        }
+    }
+}
+
 /// One git worktree under a [`Project`]. Every project has an
 /// implicit primary worktree at `Project::path`; additional ones live
 /// here and get `is_primary = false`.
@@ -199,6 +226,21 @@ mod tests {
         assert_eq!(p.sessions.len(), 1);
         assert_eq!(p.worktrees.len(), 1);
         assert!(p.worktrees[0].is_primary);
+    }
+
+    #[test]
+    fn new_project_uses_folder_leaf_as_name() {
+        let p = Project::new("/home/me/codescope".into());
+        assert_eq!(p.name, "codescope");
+        assert_eq!(p.default_branch, "main");
+        // UUIDv4 is 36 chars including the dashes.
+        assert_eq!(p.id.len(), 36);
+    }
+
+    #[test]
+    fn new_project_falls_back_when_path_has_no_leaf() {
+        let p = Project::new("/".into());
+        assert_eq!(p.name, "project");
     }
 
     #[test]

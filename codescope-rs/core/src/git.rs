@@ -1,0 +1,244 @@
+//! Thin wrapper around `git worktree` and friends.
+//!
+//! Shells out to the system `git` binary — see CLAUDE.md, the
+//! technology decisions list explicitly chooses shelling-out over
+//! libgit2 bindings. Process spawning makes this module the only
+//! impure thing in `core`, but parsing porcelain output stays here
+//! (away from gpui) so it can be unit-tested without the renderer.
+//!
+//! The C# build's [`GitService`] has a much wider surface
+//! (`for-each-ref`, branch listing, status). We start narrow: the
+//! Rust port only needs the primitives that drive the sidebar's
+//! per-session worktrees. Branch listing lands the day the new-
+//! session dialog needs it.
+//!
+//! Errors carry the trimmed stderr verbatim when `git` exits non-
+//! zero, so a UI dialog can surface "fatal: 'foo' is already checked
+//! out at '...'" without us having to guess the cause. We don't
+//! truncate — the failure modes in scope here (`worktree add/remove/
+//! list`) emit short messages, and clipping mid-sentence is worse
+//! UX than a slightly long line.
+
+use std::path::Path;
+use std::process::{Command, Output, Stdio};
+
+use anyhow::{Context, Result, anyhow};
+
+/// One row from `git worktree list --porcelain`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeInfo {
+    /// Absolute path to the worktree root.
+    pub path: String,
+    /// SHA the worktree currently points at (`HEAD <sha>` line). The
+    /// porcelain emits this for every worktree, so it's never empty
+    /// in practice — we keep it `String` (not `Option`) on purpose.
+    pub head: String,
+    /// Branch name without the `refs/heads/` prefix. `None` for a
+    /// detached HEAD or a bare repo.
+    pub branch: Option<String>,
+    /// Whether this is the primary working tree (the one the repo
+    /// was initialised at). Porcelain output emits the primary
+    /// first; we tag the first stanza accordingly.
+    pub is_primary: bool,
+    /// `true` if the worktree is currently locked. Locked worktrees
+    /// can't be removed without `--force` and we surface the flag
+    /// so the UI can warn before destructive ops.
+    pub locked: bool,
+}
+
+/// `git worktree list --porcelain` for `repo`. The repo is *any*
+/// path inside the working tree — git resolves it to the right
+/// `.git` directory.
+pub fn list_worktrees(repo: &Path) -> Result<Vec<WorktreeInfo>> {
+    let output = run_git(repo, &["worktree", "list", "--porcelain"])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_worktree_porcelain(&stdout))
+}
+
+/// `git worktree add <path> -b <branch> [<base>]`. Creates the
+/// branch as part of the same call so we don't race.
+pub fn add_worktree(
+    repo: &Path,
+    path: &Path,
+    branch: &str,
+    base: Option<&str>,
+) -> Result<()> {
+    let path_str = path.to_string_lossy();
+    let mut args: Vec<&str> = vec!["worktree", "add", &path_str, "-b", branch];
+    if let Some(b) = base {
+        args.push(b);
+    }
+    run_git(repo, &args).map(|_| ())
+}
+
+/// `git worktree remove <path>`. Set `force = true` to bypass dirty-
+/// tree / locked checks. The C# build uses force=false in normal
+/// flows and lets the user retry with force after seeing the error.
+pub fn remove_worktree(repo: &Path, path: &Path, force: bool) -> Result<()> {
+    let path_str = path.to_string_lossy();
+    let mut args: Vec<&str> = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(&path_str);
+    run_git(repo, &args).map(|_| ())
+}
+
+/// Run `git <args...>` in `cwd`. Returns the captured `Output` on
+/// success; bubbles up stderr (trimmed) on non-zero exit.
+fn run_git(cwd: &Path, args: &[&str]) -> Result<Output> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("spawn git {}", args.join(" ")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let code = output.status.code().unwrap_or(-1);
+        return Err(anyhow!("git {} exited {}: {}", args.join(" "), code, stderr));
+    }
+    Ok(output)
+}
+
+/// Parse the porcelain output from `git worktree list --porcelain`.
+/// Format (per `git-worktree(1)`):
+///
+/// ```text
+/// worktree /path/to/wt
+/// HEAD <sha>
+/// branch refs/heads/<name>   ← OR `bare` OR `detached`
+/// [locked [reason]]
+///
+/// worktree /path/to/wt2
+/// ...
+/// ```
+///
+/// Stanzas are separated by blank lines. The first stanza is the
+/// primary working tree.
+pub fn parse_worktree_porcelain(stdout: &str) -> Vec<WorktreeInfo> {
+    let mut out = Vec::new();
+    let mut path: Option<String> = None;
+    let mut head: Option<String> = None;
+    let mut branch: Option<String> = None;
+    let mut locked = false;
+
+    let flush = |path: &mut Option<String>,
+                     head: &mut Option<String>,
+                     branch: &mut Option<String>,
+                     locked: &mut bool,
+                     out: &mut Vec<WorktreeInfo>| {
+        if let (Some(p), Some(h)) = (path.take(), head.take()) {
+            let is_primary = out.is_empty();
+            out.push(WorktreeInfo {
+                path: p,
+                head: h,
+                branch: branch.take(),
+                is_primary,
+                locked: std::mem::replace(locked, false),
+            });
+        } else {
+            // Reset if we hit a malformed stanza.
+            path.take();
+            head.take();
+            branch.take();
+            *locked = false;
+        }
+    };
+
+    for raw in stdout.lines() {
+        let line = raw.trim_end_matches('\r');
+        if line.is_empty() {
+            flush(&mut path, &mut head, &mut branch, &mut locked, &mut out);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("worktree ") {
+            path = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("HEAD ") {
+            head = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("branch ") {
+            branch = Some(rest.trim_start_matches("refs/heads/").to_string());
+        } else if line == "bare" || line == "detached" {
+            // No branch — leave `branch` as None.
+        } else if line == "locked" || line.starts_with("locked ") {
+            locked = true;
+        }
+        // Unknown lines are ignored — porcelain v1 is documented to
+        // be append-only, so a future field can show up here without
+        // breaking us.
+    }
+    // Trailing stanza without a blank line.
+    flush(&mut path, &mut head, &mut branch, &mut locked, &mut out);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = "worktree /home/me/repo\n\
+HEAD abc1234\n\
+branch refs/heads/main\n\
+\n\
+worktree /home/me/repo.worktrees/feat-x\n\
+HEAD def5678\n\
+branch refs/heads/feat-x\n\
+locked\n\
+\n\
+worktree /home/me/repo.worktrees/detached\n\
+HEAD 999aaaa\n\
+detached\n";
+
+    #[test]
+    fn parses_primary_branch_and_detached() {
+        let wts = parse_worktree_porcelain(SAMPLE);
+        assert_eq!(wts.len(), 3);
+
+        assert_eq!(wts[0].path, "/home/me/repo");
+        assert_eq!(wts[0].head, "abc1234");
+        assert_eq!(wts[0].branch.as_deref(), Some("main"));
+        assert!(wts[0].is_primary);
+        assert!(!wts[0].locked);
+
+        assert_eq!(wts[1].branch.as_deref(), Some("feat-x"));
+        assert!(!wts[1].is_primary);
+        assert!(wts[1].locked);
+
+        assert_eq!(wts[2].branch, None);
+        assert!(!wts[2].is_primary);
+    }
+
+    #[test]
+    fn empty_input_yields_no_rows() {
+        assert!(parse_worktree_porcelain("").is_empty());
+    }
+
+    #[test]
+    fn malformed_stanza_is_dropped() {
+        // Missing HEAD line → stanza dropped, but next valid stanza
+        // still parses.
+        let stdout = "worktree /broken\n\
+\n\
+worktree /good\n\
+HEAD abc\n\
+branch refs/heads/main\n";
+        let wts = parse_worktree_porcelain(stdout);
+        assert_eq!(wts.len(), 1);
+        assert_eq!(wts[0].path, "/good");
+        // First *successfully-parsed* stanza is primary.
+        assert!(wts[0].is_primary);
+    }
+
+    #[test]
+    fn unknown_lines_are_ignored() {
+        let stdout = "worktree /repo\n\
+HEAD abc\n\
+branch refs/heads/main\n\
+some-future-field foo bar\n";
+        let wts = parse_worktree_porcelain(stdout);
+        assert_eq!(wts.len(), 1);
+        assert_eq!(wts[0].path, "/repo");
+    }
+}

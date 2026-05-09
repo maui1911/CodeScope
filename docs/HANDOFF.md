@@ -5,17 +5,138 @@
 > **Intent:** cursor + last 1–2 sessions in depth, everything else a one-liner.
 > Old detail lives in `git log` — don't duplicate it here.
 
-**Last updated:** 2026-05-09 (session 31)
-**Branch:** `feat/codescope-rs-architecture` (PR #54, open)
-**Head:** `33083b2` — pushed
+**Last updated:** 2026-05-09 (session 32)
+**Branch:** `feat/codescope-rs-window-state-save` (PR #55, manual-tested)
+**Head:** `27301fe` — pushed (`fix(rs): address PR #55 review feedback`)
 **Release:** `v0.2.5` shipped — https://github.com/maui1911/CodeScope/releases/tag/v0.2.5
 **Build status:** ✅ C# untouched. Rust workspace builds clean
 (`cargo build --workspace --manifest-path codescope-rs/Cargo.toml`).
-21 unit tests across `codescope-core` (12) + `codescope-terminal`
-mouse-encoder (9). PR #53 squash-merged to main as `7a05ed6`;
-session 30's terminal-layer work (sessions 28-30) is in `main` now.
+27 unit tests across `codescope-core` (18: +4 git porcelain parser
++ 2 `Project::new` since session 31's 12) + `codescope-terminal`
+mouse-encoder (9). PR #54 merged to main as `7ffe4f3`.
 **Uncommitted work:** none.
 **Open issues:** none on GitHub.
+
+### Session 32 — window/layout persistence, add-project, git primitives, sidebar drives tab cwd
+
+Picked up the priority list left by session 31 and walked five items
+in stacked commits on `feat/codescope-rs-window-state-save` (off main):
+
+1. **`window.json` save wiring** (`48ccd19`). AppShell registers
+   `cx.observe_window_bounds`; bounds + `is_maximized` flow into a
+   `PendingWindowSave` slot, debounced for 500 ms before hitting
+   disk. Restore-bounds (not live size) are serialised so an
+   un-maximise on the next launch lands at the user's chosen size.
+   Loop dies on AppShell drop — anything still pending at quit is
+   genuinely stale.
+2. **Sidebar `+` add-project** (`60f9c8a`). Native folder picker
+   via `cx.prompt_for_paths(directories: true)`; on confirm a
+   fresh `Project` is appended and `projects.json` written.
+   `Project::new(path)` lives in `core`: leaf folder name → display
+   name, UUIDv4 id, branch defaults to "main". Duplicate paths
+   short-circuit (re-pick selects the existing row instead of
+   adding a stale copy). Switched Sidebar to own `ProjectsConfig`
+   directly (was `Arc<...>`) — simpler add/remove without
+   `Arc::make_mut`.
+3. **`codescope-core::git` worktree primitives** (`ca7c10d`).
+   `list_worktrees` / `add_worktree` / `remove_worktree` shell out
+   to the system `git`. Pure-stdlib (no libgit2 — see CLAUDE.md
+   technology decisions). Porcelain parser handles
+   primary/branched/detached/locked stanzas. 4 unit tests on the
+   parser. Errors carry the trimmed stderr verbatim so a future
+   error dialog can surface "fatal: 'foo' is already checked out
+   at '...'" without guessing the cause. Not yet wired to UI.
+4. **Sidebar drives new-tab cwd** (`1d2163d`). AppShell reads
+   `Sidebar::active_project()` at spawn time, threads `path`
+   through `SpawnConfig.working_directory`, labels the tab with
+   the project name. Without a selection (cold launch / no
+   projects) we fall back to inherited cwd + numeric label.
+5. **Selection persists across launches** (`ee8d155`). Sidebar
+   owns `LayoutState`, restores selection by id on construction,
+   writes `layout.json` on every `select` / `add_project`. Saved
+   id missing or stale → first project. Single writer (Sidebar);
+   AppShell-side fields (sidebar_visible / sidebar_width — both
+   unused so far) will land the same way once they become
+   user-controllable.
+
+**Architectural notes worth carrying forward:**
+- `core` is now slightly impure: `git.rs` shells out to `git`. UI
+  imports are still excluded (gpui, alacritty, windows-rs) — the
+  layering pyramid still holds.
+- Background-debounce + `Arc<Mutex<Option<PendingX>>>` works
+  cleanly for both terminal-resize (terminal/view.rs) and
+  window-state save (src/app.rs). Reach for it whenever a fast
+  observer feeds a slow consumer.
+- `Sidebar` is the writer for `layout.json`. Splitting writes per
+  field-owner keeps the persistence surface obvious — when adding
+  fields, prefer to put the writer next to the state owner rather
+  than centralising.
+
+**Suggested next entry points (priority order):**
+
+1. **Worktree orchestration UI.** Add a "New session" affordance
+   per project (button in sidebar, command-palette later). Prompt
+   for a branch, run `add_worktree`, save a `Session` to the
+   project, open a new tab in the worktree path. The "actually
+   CodeScope" milestone — primitives in `core::git` are ready,
+   the UI piece is what's left.
+2. **Live theme reload.** Watch `settings.json` for mtime change
+   (poll every ~1 s in a background task), reload settings,
+   resolve theme by name, swap `Arc<Theme>` on AppShell + Sidebar,
+   `cx.notify`. The two `theme::canvas(theme)` etc. helpers
+   already accept `&Theme` so a swap repaints without rebuilding.
+3. **Telemetry tail.** FSWatch on `~/.claude/projects/...` →
+   `running / idle / error` per session, drives status dots
+   (currently hardcoded green when active).
+4. **Filter input at the top of the sidebar.** Needs a real text
+   input — gpui's `examples/input.rs` is the reference but it's a
+   chunk of code. Worth pairing with the new-session dialog so
+   the input widget effort lands once.
+5. **Right-click on project / tab.** "Remove from sidebar",
+   "Open in Explorer", "Reveal in shell" — mirrors the C# build's
+   tab-strip context menu.
+
+**Manual-test results (this machine, dev build, end of session):**
+- ✅ resize + reposition → close → relaunch reopens at the same
+  bounds (`window.json` save wiring works)
+- ✅ click `+` → folder picker → new row appended, `projects.json`
+  written in Rust shape (snake_case)
+- ✅ select project → close → relaunch restores selection
+  (`layout.json.selected_project_id` wired)
+- ✅ select project → `Ctrl+Shift+T` → new tab labelled with the
+  project name, `pwd` lands in the project's path
+- ⚠️ test plan claimed "v0.x C# `projects.json` round-trips" — it
+  does **not** in practice. C# writes camelCase
+  (`defaultBranch`, `worktreePath`, `agentSessionId`, …); Rust
+  expects snake_case. C#-shape file fails to deserialize and we
+  fall back to empty config. Fix in the next pass: add
+  `#[serde(rename_all = "camelCase")]` on `Project`, `Session`,
+  `Worktree`, `ProjectsConfig` (verify per-field — the C# file
+  has a top-level `agents: []` we don't model yet, so a
+  `serde(default)` fallthrough on extras is also needed). Then
+  add a round-trip integration test with a fixture cribbed from
+  `CodeScope.Dev.backup-*` so the schema break can't silently
+  return.
+
+**Known small things still to clean up (rolled into the "next
+pass" lane the user explicitly carved out):**
+- **Titlebar interactions broken.** `appears_transparent: true`
+  claims the bar for our tab strip but we don't replace the
+  drag region or the caption controls — so the window can't be
+  dragged, can't be maximised by double-clicking the bar, and
+  has no min/max/close glyphs. gpui's `examples/window.rs` and
+  `window_shadow.rs` show the pattern: a `WindowControlArea`
+  for the buttons + a hand-rolled drag handler on empty bar
+  space (`window.start_window_move()` on Windows). Land
+  alongside the next round of polish.
+- Backend's `hyperlink_at` is unused (snapshot handles it).
+- Layout fields `sidebar_visible` / `sidebar_width` are loaded
+  but never re-saved because nothing changes them yet — fine for
+  now, will update when a toggle / resize lands.
+- `git::add_worktree` / `remove_worktree` have no integration
+  test that hits a real `git` binary. The parser is tested; the
+  shell-out wrapper is thin enough that the integration test can
+  land alongside the new-session UI.
 
 ### Session 31 — codescope-core, settings + themes, sidebar + projects, window/layout state, mouse-mode, OSC 8 + URL detection
 
@@ -122,36 +243,8 @@ typing + scroll + selection + paste all still work cleanly.
   to stay safe; URLs in the wild are pure ASCII so the fallback
   basically never trips.
 
-**Suggested next entry points (in priority order):**
-
-1. **window.json save wiring.** The load path works; saving
-   needs `cx.observe_window_bounds` (or equivalent) threaded
-   through the AppShell so live changes get persisted. Without
-   this we still default to whatever the OS remembers, which is
-   already pretty good on Windows.
-2. **Sidebar interactions.** `+` add-project (file picker → new
-   `Project` row → save to `projects.json`). Clicking a project
-   should drive the tab list (each project's sessions become
-   tabs). Filter input at the top of the sidebar.
-3. **Worktree orchestration.** Shell out to `git worktree` for
-   per-session worktrees, mirroring `CodeScope.Worktrees` in
-   the C# build. This is the "actually CodeScope" milestone.
-4. **Telemetry tail.** FSWatch on `~/.claude/projects/…` to
-   drive the (currently hardcoded green) status dots — `running
-   / idle / error` per session.
-5. **Live theme reload + `+` add-theme commands.** Watch
-   `settings.json` for changes and swap the `Arc<Theme>`
-   without restart.
-
-**Known small things still to clean up:**
-- Backend's `hyperlink_at` is now unused (snapshot handles it)
-  — keep until we expose a non-snapshot API or delete on next
-  cleanup pass.
-- Theme accent on tabs is hardcoded to top-border — Framer Blue
-  feels right but other themes might want a different placement.
-- The `inject_url_hyperlinks` post-processing runs every
-  snapshot. Reasonable for typical grids; profile if it shows up
-  in flame graphs at very large sizes.
+(Next-entry-points list moved to the session 32 entry above —
+those items are still accurate but session 32 added context.)
 
 ### Session 30 — pixel-accurate paint, paste, cursor blink, resize debounce, box-drawing alignment, OSC query handshake
 

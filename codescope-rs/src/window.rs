@@ -20,8 +20,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use codescope_core::{AppPaths, LayoutState, ProjectsConfig, Settings, Theme, WindowState, builtin};
 use gpui::{
-    AppContext, Bounds, Context, IntoElement, ParentElement, Pixels, Render, Styled,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, div, point, px, size,
+    AppContext, Bounds, Context, IntoElement, ParentElement, Render, Styled, TitlebarOptions,
+    Window, WindowBounds, WindowOptions, div, point, px, size,
 };
 
 use crate::app::AppShell;
@@ -75,7 +75,6 @@ fn main() -> Result<()> {
             ProjectsConfig::default()
         }
     };
-    let projects = Arc::new(projects);
 
     let layout = match LayoutState::load(&paths) {
         Ok(l) => l,
@@ -88,7 +87,6 @@ fn main() -> Result<()> {
             LayoutState::default()
         }
     };
-    let layout = Arc::new(layout);
 
     let saved_window = match WindowState::load(&paths) {
         Ok(state) => state,
@@ -103,22 +101,15 @@ fn main() -> Result<()> {
     };
 
     let window_bounds = saved_window.map(window_state_to_bounds);
+    let paths = Arc::new(paths);
 
     let app = gpui::Application::new();
 
     app.run(move |cx| {
-        let settings = settings.clone();
-        let theme = theme.clone();
-        let projects = projects.clone();
-        let layout = layout.clone();
-
-        // No quit-time save yet. Writing `LayoutState::default()`
-        // would clobber any layout the user (or a previous session)
-        // saved, and we don't yet have live state on the AppShell
-        // to write instead. `window.json` is in the same boat — we
-        // restore on launch but don't observe bounds-changes to
-        // write back. Both wires land together with
-        // `cx.observe_window_bounds`.
+        // `window.json` save lives inside `AppShell::new` (observes
+        // bounds, debounces writes). `layout.json` save lives inside
+        // `Sidebar::select` / `add_project` — selection changes are
+        // user-driven and slow, no debounce needed.
 
         cx.spawn(async move |cx| {
             cx.open_window(
@@ -132,14 +123,23 @@ fn main() -> Result<()> {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let shell = cx.new(|cx| AppShell::new(settings, theme.clone(), projects, window, cx));
+                    let shell = cx.new(|cx| {
+                        AppShell::new(
+                            settings,
+                            theme.clone(),
+                            projects,
+                            layout,
+                            paths,
+                            window,
+                            cx,
+                        )
+                    });
                     cx.new(|_| Root { shell, theme })
                 },
             )?;
             Ok::<_, anyhow::Error>(())
         })
         .detach();
-        let _ = layout;
     });
 
     Ok(())
@@ -154,21 +154,6 @@ fn window_state_to_bounds(state: WindowState) -> WindowBounds {
         WindowBounds::Maximized(bounds)
     } else {
         WindowBounds::Windowed(bounds)
-    }
-}
-
-#[allow(dead_code)]
-fn bounds_to_window_state(bounds: Bounds<Pixels>, maximised: bool) -> WindowState {
-    let f32_x: f32 = bounds.origin.x.into();
-    let f32_y: f32 = bounds.origin.y.into();
-    let f32_w: f32 = bounds.size.width.into();
-    let f32_h: f32 = bounds.size.height.into();
-    WindowState {
-        x: f32_x as i32,
-        y: f32_y as i32,
-        width: f32_w.max(0.0) as u32,
-        height: f32_h.max(0.0) as u32,
-        maximised,
     }
 }
 

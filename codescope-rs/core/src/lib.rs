@@ -13,6 +13,7 @@
 //! lives in the `app` crate. Anything terminal-protocol-bound lives in
 //! `codescope-terminal`.
 
+pub mod git;
 pub mod layout;
 pub mod paths;
 pub mod projects;

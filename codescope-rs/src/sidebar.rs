@@ -2,17 +2,18 @@
 //!
 //! Single-purpose view: lists every entry in the loaded
 //! [`codescope_core::ProjectsConfig`] and lets the user select one.
-//! No "add project" / "remove project" interactions yet — that lives
-//! one step further along the roadmap, behind a `+` action and a
-//! command-palette entry.
+//! The `+` button kicks off a directory picker and, on success,
+//! appends a new project and persists `projects.json`. Removal /
+//! editing are still TODO and live behind right-click + a command
+//! palette in the C# build.
 //!
 //! Layout (240 px wide):
 //!
 //! ```text
 //! ┌───────────────┐
-//! │ PROJECTS    + │ ← heading + add (placeholder)
+//! │ PROJECTS    + │ ← heading + add (file picker)
 //! ├───────────────┤
-//! │ filter…       │ ← (placeholder, wired next session)
+//! │ filter…       │ ← (placeholder, wired later)
 //! ├───────────────┤
 //! │ ▍ project A   │ ← active = accent rail + frost bg
 //! │   project B   │
@@ -22,10 +23,10 @@
 
 use std::sync::Arc;
 
-use codescope_core::{ProjectsConfig, Theme};
+use codescope_core::{AppPaths, LayoutState, Project, ProjectsConfig, Theme};
 use gpui::{
-    Context, InteractiveElement, IntoElement, MouseButton, ParentElement, Render, SharedString,
-    Styled, Window, div, px,
+    Context, InteractiveElement, IntoElement, MouseButton, ParentElement, PathPromptOptions,
+    Render, SharedString, Styled, Window, div, px,
 };
 
 use crate::theme;
@@ -36,24 +37,65 @@ use crate::theme;
 pub const SIDEBAR_WIDTH: f32 = 240.0;
 
 pub struct Sidebar {
-    projects: Arc<ProjectsConfig>,
+    projects: ProjectsConfig,
     /// Index of the currently-selected project. `None` when no
     /// projects exist yet.
     selected: Option<usize>,
     theme: Arc<Theme>,
+    /// Where `projects.json` and `layout.json` live. Threaded in so
+    /// add/remove + selection changes can persist without re-detecting
+    /// the env.
+    paths: Arc<AppPaths>,
+    /// In-memory copy of `layout.json` — kept in sync as the user
+    /// changes selection so a save-on-change writes out the full
+    /// (correct) struct, not just the field we touched.
+    layout: LayoutState,
 }
 
 impl Sidebar {
-    pub fn new(projects: Arc<ProjectsConfig>, theme: Arc<Theme>) -> Self {
-        let selected = (!projects.projects.is_empty()).then_some(0);
-        Self { projects, selected, theme }
+    pub fn new(
+        projects: ProjectsConfig,
+        layout: LayoutState,
+        theme: Arc<Theme>,
+        paths: Arc<AppPaths>,
+    ) -> Self {
+        // Restore last-opened project if it still exists. Falls back
+        // to the first project when the saved id is gone (project
+        // removed between sessions) or absent (first launch).
+        let selected = match layout.selected_project_id.as_deref() {
+            Some(id) => projects.projects.iter().position(|p| p.id == id),
+            None => None,
+        }
+        .or_else(|| (!projects.projects.is_empty()).then_some(0));
+        Self { projects, selected, theme, paths, layout }
     }
 
     pub fn select(&mut self, idx: usize, cx: &mut Context<Self>) {
-        if idx < self.projects.projects.len() {
-            self.selected = Some(idx);
-            cx.notify();
+        if idx >= self.projects.projects.len() || self.selected == Some(idx) {
+            // Out-of-range or re-clicking the active row — no-op,
+            // skip the synchronous `layout.json` write.
+            return;
         }
+        self.selected = Some(idx);
+        self.layout.selected_project_id =
+            Some(self.projects.projects[idx].id.clone());
+        self.save_layout();
+        cx.notify();
+    }
+
+    /// Persist `layout.json` after selection / sidebar-visibility
+    /// changes. No debounce — selection is user-driven and slow.
+    fn save_layout(&self) {
+        if let Err(err) = self.layout.save(&self.paths) {
+            eprintln!("warning: failed to save layout.json: {err:#}");
+        }
+    }
+
+    /// The project the user currently has selected, if any. AppShell
+    /// reads this when spawning a new tab so the terminal lands in
+    /// the right cwd.
+    pub fn active_project(&self) -> Option<&Project> {
+        self.selected.and_then(|idx| self.projects.projects.get(idx))
     }
 
     /// Apply a fresh theme snapshot. Called by the AppShell when the
@@ -61,6 +103,81 @@ impl Sidebar {
     #[allow(dead_code)]
     pub fn apply_theme(&mut self, theme: Arc<Theme>, cx: &mut Context<Self>) {
         self.theme = theme;
+        cx.notify();
+    }
+
+    /// Open the platform "pick a folder" dialog. On confirm, hand the
+    /// path to [`Self::add_project`] which writes `projects.json`
+    /// before mutating in-memory state, so a save failure leaves both
+    /// the disk and the UI in their previous (consistent) state.
+    pub fn open_add_project_picker(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Add project".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let paths = match rx.await {
+                Ok(Ok(Some(paths))) => paths,
+                // `Ok(None)` = user cancelled, `Ok(Err(...))` = picker
+                // failed to open (Linux). Both end the flow silently
+                // — the user already sees what happened on screen.
+                Ok(Ok(None)) => return,
+                Ok(Err(err)) => {
+                    eprintln!("warning: file picker failed: {err:#}");
+                    return;
+                }
+                Err(_) => return,
+            };
+            if let Some(path) = paths.into_iter().next() {
+                let path_str = path.to_string_lossy().into_owned();
+                let _ = this.update(cx, |this, cx| {
+                    this.add_project(path_str, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Append a project at `path` and persist. Newly-added project
+    /// becomes the selection — the user just chose it, so dropping
+    /// them straight into it is what they expect.
+    ///
+    /// Save-then-commit ordering: we build a candidate `ProjectsConfig`,
+    /// write it to disk, and only swap it into `self.projects` (and
+    /// touch `selected` / `layout.json`) once the write succeeds. A
+    /// failed write therefore leaves both disk and UI in their
+    /// previous consistent state, instead of producing an in-memory
+    /// row that disappears on relaunch — and (worse) a `layout.json`
+    /// pointing at a project id that never made it to `projects.json`.
+    pub fn add_project(&mut self, path: String, cx: &mut Context<Self>) {
+        // Refuse exact duplicates by path. Two rows pointing at the
+        // same directory would let a user "add" the same project
+        // twice and then wonder why both rows behave identically.
+        if let Some(idx) = self.projects.projects.iter().position(|p| p.path == path) {
+            self.select(idx, cx);
+            return;
+        }
+        let project = Project::new(path);
+        let new_id = project.id.clone();
+        // Clone-then-save: failure leaves `self.projects` untouched.
+        let mut next = self.projects.clone();
+        next.projects.push(project);
+        if let Err(err) = next.save(&self.paths) {
+            eprintln!("warning: failed to save projects.json: {err:#}");
+            return;
+        }
+        // Disk is committed; now mirror the change in memory.
+        self.projects = next;
+        let new_idx = self.projects.projects.len() - 1;
+        self.selected = Some(new_idx);
+        self.layout.selected_project_id = Some(new_id);
+        self.save_layout();
         cx.notify();
     }
 }
@@ -86,7 +203,6 @@ impl Render for Sidebar {
             .text_size(px(11.0))
             .text_color(theme::ink_muted(&theme))
             .child(div().flex_grow().child("PROJECTS"))
-            // Placeholder "+" button — wired up in a follow-up commit.
             .child(
                 div()
                     .id("sidebar-add")
@@ -97,11 +213,18 @@ impl Render for Sidebar {
                     .justify_center()
                     .rounded_sm()
                     .text_color(theme::ink_ghost(&theme))
+                    .cursor_pointer()
                     .hover({
                         let frost = theme::frost_10(&theme);
                         let ink = theme::ink(&theme);
                         move |s| s.bg(frost).text_color(ink)
                     })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            this.open_add_project_picker(window, cx);
+                        }),
+                    )
                     .child("+"),
             );
 
@@ -151,6 +274,7 @@ impl Render for Sidebar {
                 .bg(bg)
                 .text_color(text_color)
                 .text_size(px(13.0))
+                .cursor_pointer()
                 .hover(move |s| {
                     if active { s } else { s.bg(frost_hover).text_color(ink_hover) }
                 })
