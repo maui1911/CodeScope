@@ -46,9 +46,7 @@ use codescope_terminal::{
     Backend, ColorPalette, CursorStylePreset, FontConfig, Shell, SpawnConfig, TerminalSize,
     TerminalView,
 };
-#[cfg(not(target_os = "windows"))]
 use gpui::ClickEvent;
-#[cfg(not(target_os = "windows"))]
 use gpui::StatefulInteractiveElement;
 use gpui::{
     AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
@@ -1161,18 +1159,37 @@ impl Render for AppShell {
         // `SW_MAXIMIZE`-only on Windows (no toggle), so wiring it
         // would maximize on click and never restore.
         //
-        // Caption-row drag region. `WindowControlArea::Drag` makes
-        // the OS hit-test return `HTCAPTION` so Windows handles
-        // native drag, snap-layouts, and double-click-to-toggle.
+        // Caption-row drag region. On Windows we issue the
+        // `ReleaseCapture` + `WM_NCLBUTTONDOWN(HTCAPTION)` pair
+        // ourselves (see `win32_titlebar`) — gpui's
+        // `WindowControlArea::Drag` is supposed to map to HTCAPTION
+        // via the hit-test callback but doesn't fire reliably for
+        // our windows. Double-click toggles maximize via the same
+        // module; the OS animates and snap-integrates the way it
+        // does for any HTCAPTION drag.
+        //
         // On Wayland / X11 the compositor needs `start_window_move`
-        // because there's no NC-area hit-test model.
+        // because there's no NC-area hit-test model. Keep the gpui
+        // path there; macOS gets the cocoa equivalent for free.
         let drag_region = {
-            let base = div().id("titlebar-drag").flex_grow().h(px(32.0));
+            let base = div()
+                .id("titlebar-drag")
+                .flex_grow()
+                .h(px(32.0))
+                .window_control_area(WindowControlArea::Drag);
             #[cfg(target_os = "windows")]
-            let base = base.window_control_area(WindowControlArea::Drag);
+            let base = base
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _, window, _| crate::win32_titlebar::start_drag(window)),
+                )
+                .on_click(cx.listener(|_, event: &ClickEvent, window, _| {
+                    if event.click_count() >= 2 {
+                        crate::win32_titlebar::toggle_maximize(window);
+                    }
+                }));
             #[cfg(not(target_os = "windows"))]
             let base = base
-                .window_control_area(WindowControlArea::Drag)
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|_, _, window, _| window.start_window_move()),
@@ -1219,24 +1236,50 @@ impl Render for AppShell {
                 .child(glyph)
         };
 
+        // Caption-button click handlers. On Windows we send the
+        // proper `WM_SYSCOMMAND` messages via the `win32_titlebar`
+        // helper — that gives us a correct maximize ↔ restore
+        // toggle (gpui's `zoom_window` is `SW_MAXIMIZE`-only with
+        // no public restore path). Other platforms keep gpui's
+        // `minimize_window` / `zoom_window` / `remove_window`.
         let minimize_btn = caption_base("titlebar-min", WindowControlArea::Min, "—")
-            .hover(move |s| s.bg(frost_hover).text_color(ink))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_, _, window, _| window.minimize_window()),
-            );
+            .hover(move |s| s.bg(frost_hover).text_color(ink));
         let maximize_btn = caption_base("titlebar-max", WindowControlArea::Max, "▢")
-            .hover(move |s| s.bg(frost_hover).text_color(ink))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_, _, window, _| window.zoom_window()),
-            );
+            .hover(move |s| s.bg(frost_hover).text_color(ink));
         let close_btn = caption_base("titlebar-close", WindowControlArea::Close, "✕")
-            .hover(move |s| s.bg(close_hover_bg).text_color(ink))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_, _, window, _| window.remove_window()),
-            );
+            .hover(move |s| s.bg(close_hover_bg).text_color(ink));
+
+        #[cfg(target_os = "windows")]
+        let minimize_btn = minimize_btn.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_, _, window, _| crate::win32_titlebar::minimize(window)),
+        );
+        #[cfg(target_os = "windows")]
+        let maximize_btn = maximize_btn.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_, _, window, _| crate::win32_titlebar::toggle_maximize(window)),
+        );
+        #[cfg(target_os = "windows")]
+        let close_btn = close_btn.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_, _, window, _| crate::win32_titlebar::close(window)),
+        );
+
+        #[cfg(not(target_os = "windows"))]
+        let minimize_btn = minimize_btn.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_, _, window, _| window.minimize_window()),
+        );
+        #[cfg(not(target_os = "windows"))]
+        let maximize_btn = maximize_btn.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_, _, window, _| window.zoom_window()),
+        );
+        #[cfg(not(target_os = "windows"))]
+        let close_btn = close_btn.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_, _, window, _| window.remove_window()),
+        );
 
         // Split-right caption button — lives in the caption row left
         // of the min/max/close trio. Pure client-area button (no

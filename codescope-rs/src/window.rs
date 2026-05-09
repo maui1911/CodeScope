@@ -15,6 +15,8 @@ mod app;
 mod new_worktree_dialog;
 mod sidebar;
 mod theme;
+#[cfg(target_os = "windows")]
+mod win32_titlebar;
 
 use std::sync::Arc;
 

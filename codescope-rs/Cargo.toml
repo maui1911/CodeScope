@@ -31,6 +31,22 @@ portable-pty = "0.9"
 anyhow = "1"
 parking_lot = "0.12"
 uuid = { version = "1", features = ["v4"] }
+raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+# Direct Win32 access for the custom titlebar: gpui's
+# `WindowControlArea` hit-test returns the right `HT*` codes but
+# Windows' default DefWindowProc handling for those is suppressed
+# (gpui returns `Some(0)` from WM_NCHITTEST), and the supposed
+# native NC-button toggle path doesn't fire reliably for our
+# windows in practice. So we send `WM_SYSCOMMAND` / `WM_NCLBUTTONDOWN`
+# ourselves from `on_mouse_down` listeners — same pattern Chrome,
+# VS Code, and Windows Terminal use for their custom title bars.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
 
 [target.'cfg(windows)'.build-dependencies]
 # Embed `assets/codescope.ico` as the Windows resource icon for the

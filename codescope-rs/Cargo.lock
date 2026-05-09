@@ -966,7 +966,9 @@ dependencies = [
  "gpui-terminal",
  "parking_lot",
  "portable-pty",
+ "raw-window-handle",
  "uuid",
+ "windows 0.61.3",
 ]
 
 [[package]]
