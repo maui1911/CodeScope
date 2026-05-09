@@ -47,7 +47,6 @@ pub fn surface_border() -> Hsla { rgb(0x1f1f1f).into() }
 
 // ─── Status dots ────────────────────────────────────────────────────
 
-#[allow(dead_code)]
 pub fn status_running() -> Hsla { rgb(0x22c55e).into() } // emerald
 #[allow(dead_code)]
 pub fn status_idle() -> Hsla { ink_muted() }

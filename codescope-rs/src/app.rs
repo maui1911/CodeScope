@@ -234,44 +234,60 @@ impl Render for AppShell {
 
         let tabs = tab_meta.into_iter().map(|(idx, id, title)| {
             let active = idx == active_idx;
-            let bg = if active {
-                theme::frost_10()
-            } else {
-                theme::canvas()
-            };
-            let text_color = if active {
-                theme::ink()
-            } else {
-                theme::ink_dim()
-            };
+            // Active tab: pure-black "card" punched into the
+            // near-black strip, plus a 2 px Framer-Blue top border —
+            // the same shape the C# tab strip uses. Inactive tabs
+            // sit transparent on the strip and only fill on hover.
+            let bg = if active { theme::canvas() } else { gpui::transparent_black() };
+            let text_color = if active { theme::ink() } else { theme::ink_dim() };
+            let top_border = if active { theme::accent() } else { gpui::transparent_black() };
 
             div()
                 .id(("tab", id))
                 .h_full()
-                .my(px(6.0))
-                .px_3()
-                .min_w(px(120.0))
-                .max_w(px(220.0))
+                .min_w(px(140.0))
+                .max_w(px(240.0))
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .rounded_md()
+                .px_3()
+                .border_t_2()
+                .border_color(top_border)
                 .bg(bg)
                 .text_color(text_color)
-                .hover(|s| s.bg(theme::frost_10()))
+                .hover(|s| {
+                    if active {
+                        s
+                    } else {
+                        s.bg(theme::frost_10()).text_color(theme::ink())
+                    }
+                })
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, window, cx| {
                         this.activate_tab(idx, window, cx);
                     }),
                 )
+                // Status dot — green = active session, dim = inactive.
+                // Cheap visual hook even before we wire real status.
+                .child(
+                    div()
+                        .w(px(8.0))
+                        .h(px(8.0))
+                        .rounded_full()
+                        .bg(if active {
+                            theme::status_running()
+                        } else {
+                            theme::ink_ghost()
+                        }),
+                )
                 .child(div().flex_grow().truncate().child(title))
                 .child(
                     div()
                         .id(("close", idx as u64))
-                        .w(px(18.0))
-                        .h(px(18.0))
+                        .w(px(20.0))
+                        .h(px(20.0))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -291,14 +307,14 @@ impl Render for AppShell {
 
         let new_tab_button = div()
             .id("new-tab")
-            .my(px(6.0))
-            .w(px(28.0))
+            .h_full()
+            .w(px(40.0))
             .flex()
             .items_center()
             .justify_center()
-            .rounded_md()
             .text_color(theme::ink_dim())
-            .hover(|s| s.bg(theme::frost_10()).text_color(theme::ink()))
+            .text_size(px(18.0))
+            .hover(|s| s.bg(theme::frost_10()).text_color(theme::accent()))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
@@ -311,8 +327,6 @@ impl Render for AppShell {
             .h(px(40.0))
             .flex()
             .flex_row()
-            .px_2()
-            .gap_1()
             .border_b_1()
             .border_color(theme::divider())
             .bg(theme::near_black())
