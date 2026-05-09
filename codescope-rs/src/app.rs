@@ -48,7 +48,9 @@ use gpui::{
 };
 use parking_lot::Mutex;
 
-use crate::sidebar::{SIDEBAR_WIDTH, Sidebar, SidebarEvent};
+use crate::sidebar::{
+    SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, Sidebar, SidebarEvent,
+};
 use crate::theme;
 
 /// How often the window-state debounce loop wakes up to check whether
@@ -119,6 +121,17 @@ const MIN_GROUP_WEIGHT: f32 = 0.15;
 /// aiming.
 const SPLITTER_HIT_WIDTH: f32 = 6.0;
 
+/// Live state for an in-flight sidebar drag. Same shape as
+/// `SplitterDrag` — captured at mouse-down on the sidebar's right
+/// edge so we don't keep re-deriving from a moving target.
+struct SidebarDrag {
+    /// Cursor X at drag start.
+    start_x: gpui::Pixels,
+    /// Sidebar width at drag start. Each `mouse_move` recomputes
+    /// from `start_width + (current_x - start_x)`.
+    start_width: f32,
+}
+
 pub struct AppShell {
     /// Flat list of tab groups laid out left-to-right. Always at
     /// least one entry — `close_tab` collapses an emptied group only
@@ -147,6 +160,20 @@ pub struct AppShell {
     /// from the original numbers — re-deriving from the live weights
     /// would compound rounding error across many small mouse moves.
     splitter_drag: Option<SplitterDrag>,
+    /// Current sidebar width. Mirrors `LayoutState::sidebar_width`;
+    /// updated live during a drag (clamped between
+    /// `SIDEBAR_MIN_WIDTH` and `SIDEBAR_MAX_WIDTH`) and persisted on
+    /// drag-end. Read by both `render` (to size the wrapper) and
+    /// `begin_splitter_drag` (to compute pixels-per-unit for the
+    /// group splitter math).
+    sidebar_width: f32,
+    /// Sidebar visibility flag. When `false` the sidebar is hidden
+    /// and the work area takes the full width; a small expand
+    /// caret stays in the titlebar so the user can bring it back.
+    sidebar_visible: bool,
+    /// In-flight sidebar drag, if any. Same shape as `splitter_drag`
+    /// but specific to the sidebar's right edge.
+    sidebar_drag: Option<SidebarDrag>,
     /// Threading the on-disk path bundle through so `save_layout` can
     /// reach `paths.layout_file()` without us having to pull it from
     /// the sidebar every time.
@@ -255,11 +282,25 @@ impl AppShell {
         })
         .detach();
 
+        // Restore sidebar geometry from layout. Width is clamped on
+        // load too — a corrupt or hand-edited layout.json could
+        // otherwise pin the sidebar at 0 or eat the whole window.
+        let sidebar_width = if layout.sidebar_width > 0.0 {
+            layout
+                .sidebar_width
+                .clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH)
+        } else {
+            SIDEBAR_DEFAULT_WIDTH
+        };
+        let sidebar_visible = layout.sidebar_visible;
         let mut shell = Self {
             groups: vec![Group { id: 0, tabs: Vec::new(), active_tab: 0 }],
             focused_group: 0,
             group_weights: vec![1.0],
             splitter_drag: None,
+            sidebar_width,
+            sidebar_visible,
+            sidebar_drag: None,
             paths: paths.clone(),
             layout,
             next_group_id: 1,
@@ -299,6 +340,8 @@ impl AppShell {
         };
         on_disk.group_weights = self.group_weights.clone();
         on_disk.focused_group_index = self.focused_group;
+        on_disk.sidebar_visible = self.sidebar_visible;
+        on_disk.sidebar_width = self.sidebar_width;
         if let Err(err) = on_disk.save(self.paths.as_ref()) {
             eprintln!("warning: failed to save layout.json: {err:#}");
             return;
@@ -597,6 +640,46 @@ impl AppShell {
         self.save_layout();
     }
 
+    /// Toggle the sidebar between visible and collapsed. Persists so
+    /// the choice survives a restart. When collapsing, the saved
+    /// width stays put — re-opening uses the previous width instead
+    /// of resetting to default.
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_visible = !self.sidebar_visible;
+        cx.notify();
+        self.save_layout();
+    }
+
+    /// Begin a sidebar resize drag from the mouse-down on the right
+    /// edge handle.
+    fn begin_sidebar_drag(&mut self, cursor_x: gpui::Pixels, _cx: &mut Context<Self>) {
+        self.sidebar_drag = Some(SidebarDrag {
+            start_x: cursor_x,
+            start_width: self.sidebar_width,
+        });
+    }
+
+    /// Update sidebar width during an in-flight drag. Clamped between
+    /// `SIDEBAR_MIN_WIDTH` (160 px — below this the project list is
+    /// unusable) and `SIDEBAR_MAX_WIDTH` (600 px — beyond this the
+    /// work area gets crowded out).
+    fn update_sidebar_drag(&mut self, cursor_x: gpui::Pixels, cx: &mut Context<Self>) {
+        let Some(drag) = self.sidebar_drag.as_ref() else { return };
+        let dx: f32 = (cursor_x - drag.start_x).into();
+        let new_width = (drag.start_width + dx).clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+        if (new_width - self.sidebar_width).abs() > 0.1 {
+            self.sidebar_width = new_width;
+            cx.notify();
+        }
+    }
+
+    fn end_sidebar_drag(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_drag.take().is_some() {
+            self.save_layout();
+            cx.notify();
+        }
+    }
+
     /// Mouse pressed on the splitter at gap `split_idx`. Captures the
     /// snapshot the drag-update needs and stamps the cursor as
     /// col-resize until release.
@@ -616,7 +699,8 @@ impl AppShell {
         // feel that we ignore them here). Total weight is the sum of
         // all current weights.
         let viewport: f32 = window.viewport_size().width.into();
-        let work_width = (viewport - SIDEBAR_WIDTH).max(1.0);
+        let sidebar_pixels = if self.sidebar_visible { self.sidebar_width } else { 0.0 };
+        let work_width = (viewport - sidebar_pixels).max(1.0);
         let total_weight: f32 = self.group_weights.iter().copied().sum::<f32>().max(0.001);
         let px_per_unit = work_width / total_weight;
         self.splitter_drag = Some(SplitterDrag {
@@ -735,6 +819,13 @@ impl AppShell {
             "\\" => {
                 cx.stop_propagation();
                 self.split_right(window, cx);
+            }
+            // Ctrl+B — toggle sidebar visibility. Matches VS Code +
+            // most editors with a project tree, so the muscle memory
+            // carries over.
+            "b" if !mods.shift => {
+                cx.stop_propagation();
+                self.toggle_sidebar(cx);
             }
             "tab" if !mods.shift => {
                 cx.stop_propagation();
@@ -1050,7 +1141,40 @@ impl Render for AppShell {
         // Same Windows / non-Windows split as the main drag region:
         // on Windows we let `HTCAPTION` do the work natively (no
         // `start_window_move`), elsewhere we fire it explicitly.
-        let sidebar_spacer_w = px(SIDEBAR_WIDTH) - px(40.0);
+        // Sidebar toggle (chevron). 32×40 cell that sits right of
+        // the brand mark and shows `«` when the sidebar is visible
+        // (click to collapse) or `»` when it's hidden (click to
+        // expand). Same client-area click model as the split icon
+        // below — no `WindowControlArea` annotation, just an
+        // `on_mouse_down` that flips the bool.
+        let toggle_glyph = if self.sidebar_visible { "«" } else { "»" };
+        let sidebar_toggle = div()
+            .id("titlebar-sidebar-toggle")
+            .h(px(40.0))
+            .w(px(32.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(14.0))
+            .text_color(ink_dim)
+            .cursor_pointer()
+            .hover(move |s| s.bg(frost_hover).text_color(ink))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)),
+            )
+            .child(toggle_glyph);
+
+        // Sidebar-width spacer: aligns each strip column with the
+        // matching pane below. Width = sidebar_width − brand_mark −
+        // toggle when visible, just zero (well, almost — we keep an
+        // 8 px breathing gap) when collapsed so the first strip
+        // section butts up against the toggle without crowding it.
+        let sidebar_spacer_w = if self.sidebar_visible {
+            px((self.sidebar_width - 40.0 - 32.0).max(0.0))
+        } else {
+            px(8.0)
+        };
         let sidebar_spacer = {
             let base = div()
                 .id("titlebar-sidebar-spacer")
@@ -1073,6 +1197,7 @@ impl Render for AppShell {
             .border_color(theme::divider(&theme))
             .bg(theme::elevated(&theme))
             .child(brand_mark)
+            .child(sidebar_toggle)
             .child(sidebar_spacer)
             // Per-group strip sections share the available width
             // equally for now (each is `flex_grow`). Per-group weight
@@ -1097,12 +1222,51 @@ impl Render for AppShell {
             .flex_row()
             .children(group_panes);
 
-        let main_row = div()
-            .flex_grow()
+        // Sidebar wrapper — sized by AppShell so we can drag-resize
+        // and collapse without poking the Sidebar entity. Hidden
+        // entirely (zero-width child) when `sidebar_visible` is
+        // false; the toggle in the titlebar brings it back. The
+        // 6 px right-edge handle is the resize hit-target — same
+        // width / cursor / drag pattern as the group splitter.
+        let sidebar_drag_color = theme::divider(&theme);
+        let sidebar_handle = div()
+            .id("sidebar-resize-handle")
+            .w(px(SPLITTER_HIT_WIDTH))
+            .h_full()
             .flex()
             .flex_row()
-            .child(self.sidebar.clone())
-            .child(work_area);
+            .justify_center()
+            .cursor_col_resize()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.begin_sidebar_drag(event.position.x, cx);
+                }),
+            )
+            .child(div().w_px().h_full().bg(sidebar_drag_color));
+
+        let main_row = if self.sidebar_visible {
+            div()
+                .flex_grow()
+                .flex()
+                .flex_row()
+                .child(
+                    div()
+                        .w(px(self.sidebar_width))
+                        .h_full()
+                        .flex_shrink_0()
+                        .child(self.sidebar.clone()),
+                )
+                .child(sidebar_handle)
+                .child(work_area)
+        } else {
+            div()
+                .flex_grow()
+                .flex()
+                .flex_row()
+                .child(work_area)
+        };
 
         // While a splitter drag is in flight we listen for mouse
         // moves anywhere in the window (the cursor commonly leaves
@@ -1120,11 +1284,15 @@ impl Render for AppShell {
                 if this.splitter_drag.is_some() {
                     this.update_splitter_drag(event.position.x, cx);
                 }
+                if this.sidebar_drag.is_some() {
+                    this.update_sidebar_drag(event.position.x, cx);
+                }
             }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     this.end_splitter_drag(cx);
+                    this.end_sidebar_drag(cx);
                 }),
             )
             .size_full()
