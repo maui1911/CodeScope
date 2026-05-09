@@ -551,8 +551,11 @@ impl Render for Sidebar {
                     })
                     .into();
                 let wt_path_for_event = wt.path.clone();
+                // Single spaces around `·` to match the C# build's
+                // `$"{project.Name} · {branch}"` convention in
+                // `MainViewModel.RefreshTabTitlesForWorktree`.
                 let title_label = SharedString::from(format!(
-                    "{}  ·  {}",
+                    "{} · {}",
                     project_name,
                     wt_label,
                 ));
