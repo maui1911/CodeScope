@@ -27,6 +27,16 @@ pub struct LayoutState {
     /// Stable id of the project last opened. Sidebar selects this on
     /// startup if the project still exists.
     pub selected_project_id: Option<String>,
+    /// Per-group flex weights for the work area. Length matches the
+    /// number of groups; restored on launch so drag-resized columns
+    /// keep their proportions across restarts. Mirrors C#'s
+    /// `WorkspaceLayout.GroupWidths`. Empty / mismatched → AppShell
+    /// falls back to equal weights.
+    pub group_weights: Vec<f32>,
+    /// Index of the focused group at last save. Restored when the
+    /// group count matches; out-of-range falls back to 0. Mirrors
+    /// `WorkspaceLayout.FocusedGroupIndex`.
+    pub focused_group_index: usize,
 }
 
 impl Default for LayoutState {
@@ -35,6 +45,8 @@ impl Default for LayoutState {
             sidebar_visible: true,
             sidebar_width: 240.0,
             selected_project_id: None,
+            group_weights: Vec::new(),
+            focused_group_index: 0,
         }
     }
 }
@@ -94,10 +106,32 @@ mod tests {
             sidebar_visible: false,
             sidebar_width: 320.0,
             selected_project_id: Some("proj-1".into()),
+            group_weights: vec![1.5, 1.0],
+            focused_group_index: 1,
         };
         state.save_to(&path).unwrap();
         let loaded = LayoutState::load_from(&path).unwrap();
         assert!(!loaded.sidebar_visible);
         assert_eq!(loaded.selected_project_id.as_deref(), Some("proj-1"));
+        assert_eq!(loaded.group_weights, vec![1.5, 1.0]);
+        assert_eq!(loaded.focused_group_index, 1);
+    }
+
+    #[test]
+    fn legacy_layout_without_group_fields_loads() {
+        // Older layout.json files (pre-tab-groups) didn't carry
+        // group_weights / focused_group_index. They must still load —
+        // serde's `default` should fill in empty/zero.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        std::fs::write(
+            &path,
+            r#"{"sidebar_visible":true,"sidebar_width":240,"selected_project_id":"proj-x"}"#,
+        )
+        .unwrap();
+        let loaded = LayoutState::load_from(&path).unwrap();
+        assert_eq!(loaded.selected_project_id.as_deref(), Some("proj-x"));
+        assert!(loaded.group_weights.is_empty());
+        assert_eq!(loaded.focused_group_index, 0);
     }
 }

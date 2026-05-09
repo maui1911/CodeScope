@@ -85,6 +85,40 @@ struct Group {
     active_tab: usize,
 }
 
+/// Live state for an in-flight splitter drag. Captured at mouse-down
+/// on a divider so each subsequent `on_mouse_move` can recompute the
+/// new weights from the *original* numbers — re-deriving from the
+/// live weights every frame would compound rounding error across the
+/// many small moves a real drag generates.
+struct SplitterDrag {
+    /// Index of the gap being dragged. Resolves to splitting between
+    /// `groups[split_idx]` (left) and `groups[split_idx + 1]` (right).
+    split_idx: usize,
+    /// Cursor X at drag start, in window coords.
+    start_x: gpui::Pixels,
+    /// Snapshot of weights at drag start, indexed parallel to
+    /// `groups`. We only ever modify entries `split_idx` and
+    /// `split_idx + 1`; the rest stay at their snapshot values so
+    /// neighbouring groups don't shift while we resize.
+    start_weights: Vec<f32>,
+    /// Pixels of work-area width per unit of weight at drag start.
+    /// Set from `(viewport_width - sidebar_width) / total_weight`.
+    /// Used to translate cursor delta-x into a weight delta.
+    px_per_unit: f32,
+}
+
+/// Smallest weight we let either side of a drag go to. Below this the
+/// pane visibly disappears and the user can't get focus back to it
+/// without a Ctrl+Shift+W to remove the empty group. Mirrors C#'s
+/// `MinWidth = 200` on the GridSplitter columns at the conceptual
+/// level; ours is in weight units rather than pixels because the
+/// total-width depends on the viewport.
+const MIN_GROUP_WEIGHT: f32 = 0.15;
+/// Width of the actual splitter hit-target. Wider than the painted
+/// 1px divider so the user can actually grab it without pixel-perfect
+/// aiming.
+const SPLITTER_HIT_WIDTH: f32 = 6.0;
+
 pub struct AppShell {
     /// Flat list of tab groups laid out left-to-right. Always at
     /// least one entry — `close_tab` collapses an emptied group only
@@ -95,6 +129,26 @@ pub struct AppShell {
     /// shortcuts (Ctrl+T, Ctrl+\, Ctrl+W, Ctrl+1..9) target this
     /// group; click on any pane / tab strip section moves the focus.
     focused_group: usize,
+    /// Per-group flex weights. Length always matches `groups.len()`.
+    /// `split_right` pushes 1.0; `close_tab`'s collapse drops the
+    /// matching entry. The render loop maps these to flex_grow values
+    /// so a 1.5 / 1.0 split allocates 60% / 40% of the work area.
+    group_weights: Vec<f32>,
+    /// In-flight splitter drag, if any. `Some` between mouse-down on
+    /// a divider and mouse-up. Tracks the gap index (which two
+    /// adjacent groups the splitter sits between) plus the cursor
+    /// origin and weight snapshot so each `mouse_move` can recompute
+    /// from the original numbers — re-deriving from the live weights
+    /// would compound rounding error across many small mouse moves.
+    splitter_drag: Option<SplitterDrag>,
+    /// Threading the on-disk path bundle through so `save_layout` can
+    /// reach `paths.layout_file()` without us having to pull it from
+    /// the sidebar every time.
+    paths: Arc<AppPaths>,
+    /// In-memory copy of `layout.json` — kept in sync as group
+    /// weights / focus / counts change so a save-on-change writes the
+    /// full struct instead of the field we touched.
+    layout: LayoutState,
     next_group_id: u64,
     next_tab_id: u64,
     focus_handle: FocusHandle,
@@ -121,8 +175,14 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
+        // The sidebar reads sidebar-* fields and selectedProjectId
+        // out of the same `LayoutState`; we keep our own clone for
+        // the group fields so save-on-change here doesn't trample
+        // sidebar writes (and vice versa). Two writers to the same
+        // file is acceptable — both go through the same atomic write
+        // wrapper, last-writer-wins on order.
         let sidebar = cx.new(|_| {
-            Sidebar::new(projects, layout, theme.clone(), paths.clone())
+            Sidebar::new(projects, layout.clone(), theme.clone(), paths.clone())
         });
 
         // Spawn a tab whenever the sidebar asks us to — fired by a
@@ -191,6 +251,10 @@ impl AppShell {
         let mut shell = Self {
             groups: vec![Group { id: 0, tabs: Vec::new(), active_tab: 0 }],
             focused_group: 0,
+            group_weights: vec![1.0],
+            splitter_drag: None,
+            paths: paths.clone(),
+            layout,
             next_group_id: 1,
             next_tab_id: 0,
             focus_handle,
@@ -200,6 +264,18 @@ impl AppShell {
         };
         shell.spawn_tab(window, cx);
         shell
+    }
+
+    /// Persist the current group layout (weights + focus index) to
+    /// `layout.json`. Called after splitter-drag end, split-right, and
+    /// group-collapse — anything that mutates either field. Never
+    /// fails fatally; logs and moves on, the next save will retry.
+    fn save_layout(&mut self) {
+        self.layout.group_weights = self.group_weights.clone();
+        self.layout.focused_group_index = self.focused_group;
+        if let Err(err) = self.layout.save(self.paths.as_ref()) {
+            eprintln!("warning: failed to save layout.json: {err:#}");
+        }
     }
 
     fn focused_group(&self) -> &Group {
@@ -333,6 +409,13 @@ impl AppShell {
                 return;
             }
             self.groups.remove(group_idx);
+            // Drop the matching weight slot. Surviving weights stay
+            // unchanged — closing one column doesn't redistribute, so
+            // the remaining groups keep their ratios. Mirrors C#'s
+            // `MainViewModel.CloseGroup`.
+            if group_idx < self.group_weights.len() {
+                self.group_weights.remove(group_idx);
+            }
             // If the focused group was at or after `group_idx`, slide
             // its index left so it keeps pointing at the same group.
             // Re-focus the (possibly new) focused group so keyboard
@@ -344,6 +427,7 @@ impl AppShell {
             }
             let active = self.groups[self.focused_group].active_tab;
             self.activate_tab(self.focused_group, active, window, cx);
+            self.save_layout();
             return;
         }
         // Group still has tabs — slide the active index left if we
@@ -381,10 +465,14 @@ impl AppShell {
             return;
         }
         group.active_tab = tab_idx;
+        let prev_focused = self.focused_group;
         self.focused_group = group_idx;
         let handle = self.groups[group_idx].tabs[tab_idx].terminal.read(cx).focus_handle(cx);
         handle.focus(window);
         cx.notify();
+        if prev_focused != group_idx {
+            self.save_layout();
+        }
     }
 
     fn next_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -422,11 +510,15 @@ impl AppShell {
         debug_assert!(self.groups.len() > 1);
         let removed = self.focused_group;
         self.groups.remove(removed);
+        if removed < self.group_weights.len() {
+            self.group_weights.remove(removed);
+        }
         if self.focused_group >= self.groups.len() {
             self.focused_group = self.groups.len() - 1;
         }
         let active = self.groups[self.focused_group].active_tab;
         self.activate_tab(self.focused_group, active, window, cx);
+        self.save_layout();
     }
 
     /// Append a new empty group to the right of the focused one and
@@ -442,6 +534,11 @@ impl AppShell {
             insert_at,
             Group { id, tabs: Vec::new(), active_tab: 0 },
         );
+        // New group enters with weight 1.0 — equal share of whatever
+        // a unit weight resolves to in the current layout. The
+        // existing groups keep their weights so a 1.5/1.0 split that
+        // gets a third group becomes 1.5/1.0/1.0 (≈42.9/28.6/28.6%).
+        self.group_weights.insert(insert_at, 1.0);
         self.focused_group = insert_at;
         // Drop keyboard focus back on AppShell's root handle so the
         // next typed character isn't routed to a now-stale terminal
@@ -449,6 +546,74 @@ impl AppShell {
         // / clicks +, `activate_tab` will rehome focus.
         self.focus_handle.focus(window);
         cx.notify();
+        self.save_layout();
+    }
+
+    /// Mouse pressed on the splitter at gap `split_idx`. Captures the
+    /// snapshot the drag-update needs and stamps the cursor as
+    /// col-resize until release.
+    fn begin_splitter_drag(
+        &mut self,
+        split_idx: usize,
+        cursor_x: gpui::Pixels,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        if split_idx + 1 >= self.groups.len() {
+            return;
+        }
+        // Pixels-per-weight conversion. Total work-area width is the
+        // viewport minus the sidebar (and minus the per-splitter
+        // hit-targets, but those are tiny — close enough for drag
+        // feel that we ignore them here). Total weight is the sum of
+        // all current weights.
+        let viewport: f32 = window.viewport_size().width.into();
+        let work_width = (viewport - SIDEBAR_WIDTH).max(1.0);
+        let total_weight: f32 = self.group_weights.iter().copied().sum::<f32>().max(0.001);
+        let px_per_unit = work_width / total_weight;
+        self.splitter_drag = Some(SplitterDrag {
+            split_idx,
+            start_x: cursor_x,
+            start_weights: self.group_weights.clone(),
+            px_per_unit,
+        });
+    }
+
+    /// Cursor moved while a splitter drag is in flight. Recomputes the
+    /// two affected weights from the start snapshot — re-deriving
+    /// from the live values would compound rounding error across the
+    /// many per-pixel moves a real drag generates.
+    fn update_splitter_drag(&mut self, cursor_x: gpui::Pixels, cx: &mut Context<Self>) {
+        let Some(drag) = self.splitter_drag.as_ref() else { return };
+        let split_idx = drag.split_idx;
+        if split_idx + 1 >= self.group_weights.len() {
+            // Group count changed under us (collapse mid-drag) — bail.
+            self.splitter_drag = None;
+            return;
+        }
+        let dx: f32 = (cursor_x - drag.start_x).into();
+        let mut delta_units = dx / drag.px_per_unit;
+        let left = drag.start_weights[split_idx];
+        let right = drag.start_weights[split_idx + 1];
+        // Clamp so neither side disappears below MIN_GROUP_WEIGHT.
+        if left + delta_units < MIN_GROUP_WEIGHT {
+            delta_units = MIN_GROUP_WEIGHT - left;
+        }
+        if right - delta_units < MIN_GROUP_WEIGHT {
+            delta_units = right - MIN_GROUP_WEIGHT;
+        }
+        self.group_weights[split_idx] = left + delta_units;
+        self.group_weights[split_idx + 1] = right - delta_units;
+        cx.notify();
+    }
+
+    /// Mouse released — commit the drag-end weights to disk so the
+    /// resized column survives a restart.
+    fn end_splitter_drag(&mut self, cx: &mut Context<Self>) {
+        if self.splitter_drag.take().is_some() {
+            self.save_layout();
+            cx.notify();
+        }
     }
 
     /// Move focus to the group at `idx`. Routes keyboard focus to the
@@ -575,6 +740,7 @@ impl Render for AppShell {
                 group_id: group.id,
                 active_tab: group.active_tab,
                 is_focused: g_idx == focused_group_idx,
+                weight: self.group_weights.get(g_idx).copied().unwrap_or(1.0),
                 tabs: group
                     .tabs
                     .iter()
@@ -784,26 +950,42 @@ impl Render for AppShell {
         let group_count = groups_meta.len();
         let mut strip_sections: Vec<gpui::AnyElement> = Vec::with_capacity(group_count * 2);
         let mut group_panes: Vec<gpui::AnyElement> = Vec::with_capacity(group_count * 2);
+        let divider_color = theme::divider(&theme);
         for (col_idx, gmeta) in groups_meta.into_iter().enumerate() {
             if col_idx > 0 {
-                // 1 px column divider mirrors the C# build's
-                // `GridSplitter` chrome — strictly visual today; drag
-                // handling lands in the next PR alongside per-group
-                // weight persistence.
+                // The split lives between groups[col_idx-1] (left) and
+                // groups[col_idx] (right). The strip layer gets a
+                // pure-visual 1 px divider; the work-area layer gets a
+                // wider interactive splitter so the user can grab it
+                // without pixel-perfect aiming.
+                let split_idx = col_idx - 1;
                 strip_sections.push(
                     div()
                         .w_px()
                         .h_full()
-                        .bg(theme::divider(&theme))
+                        .bg(divider_color)
                         .into_any_element(),
                 );
-                group_panes.push(
-                    div()
-                        .w_px()
-                        .h_full()
-                        .bg(theme::divider(&theme))
-                        .into_any_element(),
-                );
+                let splitter = div()
+                    .id(("group-splitter", split_idx as u64))
+                    .w(px(SPLITTER_HIT_WIDTH))
+                    .h_full()
+                    .flex()
+                    .flex_row()
+                    .justify_center()
+                    .cursor_col_resize()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.begin_splitter_drag(split_idx, event.position.x, window, cx);
+                        }),
+                    )
+                    // 1 px painted line, vertically centred inside the
+                    // 6 px hit-target. Keeps the visual identical to
+                    // the strip divider above so columns line up.
+                    .child(div().w_px().h_full().bg(divider_color));
+                group_panes.push(splitter.into_any_element());
             }
             let (strip, pane) = self.render_group(&theme, &gmeta, cx);
             strip_sections.push(strip.into_any_element());
@@ -874,10 +1056,29 @@ impl Render for AppShell {
             .child(self.sidebar.clone())
             .child(work_area);
 
+        // While a splitter drag is in flight we listen for mouse
+        // moves anywhere in the window (the cursor commonly leaves
+        // the 6 px hit-target during a fast drag) and clamp them
+        // against the original snapshot. Mouse up — anywhere —
+        // commits the new weights. We attach both handlers
+        // unconditionally because gpui doesn't have an `is_some()`-
+        // gated handler primitive; the closures are tiny and bail
+        // when no drag is in flight.
         div()
             .key_context("AppShell")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                if this.splitter_drag.is_some() {
+                    this.update_splitter_drag(event.position.x, cx);
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.end_splitter_drag(cx);
+                }),
+            )
             .size_full()
             .flex()
             .flex_col()
@@ -906,6 +1107,11 @@ struct GroupRenderData {
     group_id: u64,
     active_tab: usize,
     is_focused: bool,
+    /// Flex weight for this group's column; mapped to `flex_grow` on
+    /// both the strip section and the pane below so they stay
+    /// column-aligned. `1.0` = equal share, `1.5` = 1.5× a sibling at
+    /// `1.0`. Snapshotted from `AppShell.group_weights` at render time.
+    weight: f32,
     tabs: Vec<TabRenderData>,
     active_terminal: Option<Entity<TerminalView>>,
 }
@@ -1042,12 +1248,16 @@ impl AppShell {
         // remaining whitespace focuses the group so the next Ctrl+T
         // lands here. The trailing `flex_grow` filler captures the
         // empty area to the right of the rightmost tab.
-        let strip = div()
+        //
+        // `flex_grow` is set via `style().flex_grow = Some(weight)`
+        // because gpui's chainable `.flex_grow()` only sets the value
+        // to 1.0 — we need arbitrary weights for the column layout.
+        let mut strip = div()
             .id(("group-strip", group_id))
             .h_full()
-            .flex_grow()
             .flex()
             .flex_row()
+            .flex_shrink()
             .bg(elevated)
             .on_mouse_down(
                 MouseButton::Left,
@@ -1060,6 +1270,8 @@ impl AppShell {
             // Empty trailing region — gives the user something to
             // click for "focus this group" without hitting a tab.
             .child(div().flex_grow().h_full());
+        strip.style().flex_grow = Some(gmeta.weight);
+        strip.style().flex_basis = Some(gpui::Length::Definite(px(0.0).into()));
 
         // Pane: active tab's terminal, or a black void when the group
         // has no tabs (split-right + Ctrl+T-not-yet-pressed). 2 px
@@ -1079,12 +1291,12 @@ impl AppShell {
                 .child("Empty group · press Ctrl+Shift+T to open a tab")
                 .into_any_element()
         };
-        let pane = div()
+        let mut pane = div()
             .id(("group-pane", group_id))
             .h_full()
-            .flex_grow()
             .flex()
             .flex_col()
+            .flex_shrink()
             .border_t_2()
             .border_color(rail_color)
             .bg(canvas)
@@ -1095,6 +1307,8 @@ impl AppShell {
                 }),
             )
             .child(body_inner);
+        pane.style().flex_grow = Some(gmeta.weight);
+        pane.style().flex_basis = Some(gpui::Length::Definite(px(0.0).into()));
 
         (strip, pane)
     }
