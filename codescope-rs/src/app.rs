@@ -38,7 +38,7 @@ use gpui::{
 };
 use parking_lot::Mutex;
 
-use crate::sidebar::Sidebar;
+use crate::sidebar::{Sidebar, SidebarEvent};
 use crate::theme;
 
 /// How often the window-state debounce loop wakes up to check whether
@@ -92,6 +92,26 @@ impl AppShell {
         let sidebar = cx.new(|_| {
             Sidebar::new(projects, layout, theme.clone(), paths.clone())
         });
+
+        // Spawn a tab whenever the sidebar asks us to — fired by a
+        // worktree-row click in the project list and by a successful
+        // `submit_new_worktree_dialog`. `subscribe_in` (vs
+        // `subscribe`) is the variant that hands us `&mut Window`,
+        // which we need so the freshly-spawned terminal can grab
+        // focus inline.
+        cx.subscribe_in(&sidebar, window, |this, _sidebar, event, window, cx| {
+            match event {
+                SidebarEvent::OpenSession { working_directory, title } => {
+                    this.spawn_tab_in(
+                        Some(working_directory.clone()),
+                        Some(title.clone()),
+                        window,
+                        cx,
+                    );
+                }
+            }
+        })
+        .detach();
         let pending_window_save: Arc<Mutex<Option<PendingWindowSave>>> = Arc::new(Mutex::new(None));
 
         // Persist live window geometry. The observer fires for every
@@ -127,10 +147,10 @@ impl AppShell {
                         _ => None,
                     }
                 };
-                if let Some(p) = to_save {
-                    if let Err(err) = p.state.save(&paths_for_timer) {
-                        eprintln!("warning: failed to save window state: {err:#}");
-                    }
+                if let Some(p) = to_save
+                    && let Err(err) = p.state.save(&paths_for_timer)
+                {
+                    eprintln!("warning: failed to save window state: {err:#}");
                 }
             }
         })
@@ -152,11 +172,23 @@ impl AppShell {
     /// Open a fresh shell session and append it as a new tab. The new
     /// tab becomes the active one and the terminal grabs focus.
     ///
-    /// Working directory + tab title come from the sidebar's currently
-    /// selected project. Without a selection (cold launch, no
-    /// projects yet) the shell starts in whatever cwd the binary
-    /// inherited.
+    /// Without an explicit `working_directory` / `title`, working
+    /// directory + tab title come from the sidebar's currently
+    /// selected project (cold launch, "+ new tab" button). Callers
+    /// that already know which path to pin the terminal to (sidebar
+    /// worktree clicks, post-create-worktree spawns) hand both in
+    /// directly.
     fn spawn_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.spawn_tab_in(None, None, window, cx);
+    }
+
+    fn spawn_tab_in(
+        &mut self,
+        working_directory: Option<std::path::PathBuf>,
+        title_override: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let shell = std::env::var("CODESCOPE_SHELL")
             .ok()
             .map(|program| Shell::new(program, Vec::new()))
@@ -174,16 +206,19 @@ impl AppShell {
         env.insert("TERM_PROGRAM".into(), "CodeScope".into());
         env.insert("TERM_PROGRAM_VERSION".into(), "0.0.1".into());
 
-        // Pull project context from the sidebar — clone the path +
-        // name so we don't hold a borrow across `cx.new` further down.
+        // Resolve working directory + tab title. Explicit args win;
+        // otherwise pull project context from the sidebar — clone the
+        // path + name so we don't hold a borrow across `cx.new`.
         let active_project = self
             .sidebar
             .read(cx)
             .active_project()
             .map(|p| (p.path.clone(), p.name.clone()));
-        let working_directory = active_project
-            .as_ref()
-            .map(|(path, _)| std::path::PathBuf::from(path));
+        let working_directory = working_directory.or_else(|| {
+            active_project
+                .as_ref()
+                .map(|(path, _)| std::path::PathBuf::from(path))
+        });
 
         // Build the terminal palette + cursor preset from the active
         // theme + settings. Cloned per spawn so each tab carries its
@@ -221,10 +256,9 @@ impl AppShell {
         let terminal = cx.new(|cx| TerminalView::new_full(backend, palette, font, cx));
         let id = self.next_id;
         self.next_id += 1;
-        let title: SharedString = match active_project {
-            Some((_, name)) => name.into(),
-            None => format!("Terminal {}", id + 1).into(),
-        };
+        let title: SharedString = title_override
+            .or_else(|| active_project.map(|(_, name)| name.into()))
+            .unwrap_or_else(|| format!("Terminal {}", id + 1).into());
         self.tabs.push(Tab { id, title, terminal });
         let new_idx = self.tabs.len() - 1;
         self.activate_tab(new_idx, window, cx);
@@ -316,13 +350,13 @@ impl AppShell {
                 self.prev_tab(window, cx);
             }
             d if !mods.shift && d.len() == 1 => {
-                if let Some(n) = d.chars().next().and_then(|c| c.to_digit(10)) {
-                    if n >= 1 && n <= 9 {
-                        let idx = (n as usize) - 1;
-                        if idx < self.tabs.len() {
-                            cx.stop_propagation();
-                            self.activate_tab(idx, window, cx);
-                        }
+                if let Some(n) = d.chars().next().and_then(|c| c.to_digit(10))
+                    && (1..=9).contains(&n)
+                {
+                    let idx = (n as usize) - 1;
+                    if idx < self.tabs.len() {
+                        cx.stop_propagation();
+                        self.activate_tab(idx, window, cx);
                     }
                 }
             }

@@ -171,6 +171,7 @@ impl Sidebar {
         let folder = state.folder.clone();
         let project_path = state.project_path.clone();
 
+        let project_name = state.project_name.clone();
         let result = codescope_core::git::add_worktree(
             Path::new(&project_path),
             Path::new(&folder),
@@ -181,8 +182,8 @@ impl Sidebar {
             Ok(()) => {
                 let new_wt = Worktree {
                     id: uuid::Uuid::new_v4().to_string(),
-                    path: folder,
-                    branch: Some(branch),
+                    path: folder.clone(),
+                    branch: Some(branch.clone()),
                     is_primary: false,
                 };
                 // Clone-then-save: a write failure leaves the in-
@@ -204,6 +205,14 @@ impl Sidebar {
                 }
                 self.replace_projects(next);
                 self.cancel_new_worktree_dialog(cx);
+                // Spawn a session pinned to the new worktree so the
+                // user lands inside it immediately. Mirrors the C#
+                // dialog's `SpawnSession = true` default. The host
+                // (`AppShell`) catches the event and creates the tab.
+                cx.emit(crate::sidebar::SidebarEvent::OpenSession {
+                    working_directory: std::path::PathBuf::from(&folder),
+                    title: format!("{project_name}  ·  {branch}").into(),
+                });
             }
             Err(err) => {
                 let msg = err.to_string();
