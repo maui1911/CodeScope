@@ -1048,6 +1048,60 @@ impl AppShell {
         }
     }
 
+    /// Build the bottom status bar (24 px). Compact line that
+    /// surfaces the focused group, the focused tab's title, and
+    /// counts so the user has a single place to verify "where am I"
+    /// at a glance — useful especially with multiple groups + many
+    /// tabs. Mirrors the C# build's `StatusBarView` minus the live
+    /// git-status / agent-state badges (those land when the polling
+    /// infra does).
+    fn render_status_bar(&self, theme: &Arc<Theme>) -> impl IntoElement {
+        let group_count = self.groups.len();
+        let focused_group_idx = self.focused_group;
+        let focused_group = self.focused_group();
+        let tab_count = focused_group.tabs.len();
+        let active_tab = focused_group.active_tab;
+        let active_title: Option<SharedString> = focused_group
+            .tabs
+            .get(active_tab)
+            .map(|t| t.title.clone());
+
+        let group_label = format!("group {}/{}", focused_group_idx + 1, group_count);
+        let tab_label = if tab_count == 0 {
+            "no tabs".to_string()
+        } else {
+            format!("tab {}/{}", active_tab + 1, tab_count)
+        };
+        let title_text: SharedString = active_title
+            .unwrap_or_else(|| SharedString::from("(empty group)"));
+
+        div()
+            .h(px(24.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .px_3()
+            .gap_3()
+            .border_t_1()
+            .border_color(theme::divider(theme))
+            .bg(theme::elevated(theme))
+            .text_size(px(11.0))
+            .text_color(theme::ink_dim(theme))
+            // Active title is the most prominent piece — gets `flex_grow`
+            // so it eats the rest of the row before the per-group counts
+            // on the right.
+            .child(
+                div()
+                    .flex_grow()
+                    .truncate()
+                    .text_color(theme::ink(theme))
+                    .child(title_text),
+            )
+            .child(div().child(tab_label))
+            .child(div().w_px().h(px(12.0)).bg(theme::divider(theme)))
+            .child(div().child(group_label))
+    }
+
     /// Reparent a tab from one group to another by id. Triggered by
     /// `on_drop` on a group's strip section after the user drags a
     /// tab out. The terminal entity is moved unchanged — no
@@ -1706,6 +1760,7 @@ impl Render for AppShell {
             .child(caption_row)
             .child(tab_strip)
             .child(main_row)
+            .child(self.render_status_bar(&theme))
     }
 }
 
