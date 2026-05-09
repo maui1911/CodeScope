@@ -21,7 +21,8 @@ use std::sync::Arc;
 use codescope_core::{Project, Theme, git::BranchInfo, projects::Worktree};
 use gpui::{
     Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, SharedString, Styled, Window, anchored, deferred, div, point, px,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, anchored, deferred,
+    div, point, px,
 };
 
 use crate::sidebar::Sidebar;
@@ -114,10 +115,18 @@ pub struct NewWorktreeDialogState {
     pub focused_field: DialogField,
     /// Available branches for the base-branch picker. Loaded once at
     /// dialog open via `git::list_branches`; an Err there yields an
-    /// empty list and a stashed `error` message — the dialog still
-    /// works (the user can pick "(HEAD)") but the picker just shows
-    /// no rows.
+    /// empty list and a populated [`Self::branch_load_error`] which
+    /// the popup renders in place of the empty row list. The dialog
+    /// still works in that state — the user can pick "(HEAD)" and
+    /// hit Create.
     pub branches: Vec<BranchInfo>,
+    /// Error message from the failed `list_branches` call at dialog
+    /// open, surfaced inside the base-branch popup so the user knows
+    /// *why* it's empty. Kept separate from [`Self::error`] (which is
+    /// reserved for submit / validation failures) so a transient
+    /// branch-list failure doesn't clobber a later, more relevant
+    /// `git worktree add` error message.
+    pub branch_load_error: Option<String>,
     /// Selected base branch by name. `None` = `(HEAD)` (the current
     /// HEAD of the project's primary worktree). The C# build's
     /// `(HEAD)` row maps to a null `BaseBranch` for the same reason.
@@ -153,6 +162,7 @@ impl NewWorktreeDialogState {
             folder_overridden: false,
             focused_field: DialogField::Branch,
             branches,
+            branch_load_error: None,
             base_branch,
             base_popup_open: false,
             base_query: String::new(),
@@ -161,10 +171,13 @@ impl NewWorktreeDialogState {
     }
 
     /// Mirrors the C# `RefreshValidity`: branch must be at least 2
-    /// non-whitespace chars, and the derived folder must be non-empty
-    /// (sanitisation can otherwise reduce a branch like `///` to "").
+    /// non-whitespace chars, and the (trimmed) folder must be
+    /// non-empty. Trimming matters now that the FOLDER row is
+    /// editable — without it the user could whitespace their way to
+    /// an enabled Create button and then watch git fail on the
+    /// resulting nonsense path.
     pub fn is_valid(&self) -> bool {
-        self.branch.trim().len() >= 2 && !self.folder.is_empty()
+        self.branch.trim().len() >= 2 && !self.folder.trim().is_empty()
     }
 
     fn recompute_folder(&mut self) {
@@ -242,17 +255,31 @@ pub fn filter_branches<'a>(
 }
 
 /// Pure helper used by [`NewWorktreeDialogState::new`] to pick the
-/// default base. Returns `Some(default_branch)` when the project's
-/// declared default branch exists as a *local* ref in the loaded
-/// list; otherwise `None` (which the dialog renders as `(HEAD)`).
-/// Mirrors C#'s `req.DefaultBase ?? first-local-match ?? (HEAD)`.
+/// default base. Mirrors C#'s
+/// `req.DefaultBase ?? first-local-match ?? (HEAD)`:
+///
+/// 1. exact match on the project's `default_branch` (local ref), or
+/// 2. the first local branch in the loaded list, or
+/// 3. `None` — which the dialog renders as `(HEAD)`.
+///
+/// The fallback step matters for repos where the configured default
+/// branch was renamed (e.g. `master` → `main`) but the rename hasn't
+/// been pulled locally yet, or for fresh clones where only one local
+/// branch exists. Without it the dialog would default to `(HEAD)`
+/// even when there's an obvious local choice.
 pub fn resolve_default_base(
     branches: &[BranchInfo],
     default_branch: &str,
 ) -> Option<String> {
-    branches
+    if let Some(b) = branches
         .iter()
         .find(|b| !b.is_remote && b.name == default_branch)
+    {
+        return Some(b.name.clone());
+    }
+    branches
+        .iter()
+        .find(|b| !b.is_remote)
         .map(|b| b.name.clone())
 }
 
@@ -272,9 +299,12 @@ impl Sidebar {
         };
         // Load branches once at open. An I/O error here doesn't stop
         // the dialog — the user can still pick `(HEAD)` and create —
-        // but we stash the error so the picker shows it instead of
-        // an empty list. Cloning the project path so we don't hold a
-        // borrow across the `cx.focus_handle()` call.
+        // but we stash the message in `branch_load_error` so the
+        // popup can surface it inline instead of showing an empty
+        // row list. Kept separate from `state.error` (submit / git
+        // failures) so a transient list failure doesn't clobber a
+        // later, more relevant message. Cloning the project path so
+        // we don't hold a borrow across the `cx.focus_handle()` call.
         let project_path = project.path.clone();
         let project_clone = project.clone();
         let (branches, branch_load_err) =
@@ -286,7 +316,7 @@ impl Sidebar {
         focus_handle.focus(window);
         let mut state =
             NewWorktreeDialogState::new(idx, &project_clone, branches, focus_handle);
-        state.error = branch_load_err;
+        state.branch_load_error = branch_load_err;
         self.set_dialog(Some(state));
         self.close_menu_no_notify();
         cx.notify();
@@ -422,7 +452,11 @@ impl Sidebar {
         }
         let idx = state.project_idx;
         let branch = state.branch.trim().to_string();
-        let folder = state.folder.clone();
+        // Trim the folder too — the field is user-editable now, so a
+        // stray leading/trailing space would otherwise sneak into
+        // both the on-disk path and the persisted `Worktree.path`,
+        // causing a confusing mismatch later.
+        let folder = state.folder.trim().to_string();
         let project_path = state.project_path.clone();
         let base_branch = state.base_branch.clone();
         let spawn_session = state.spawn_session;
@@ -1068,6 +1102,20 @@ impl Sidebar {
             }
         }
 
+        // Branch-list-load error banner. Shown above the rows when
+        // `git::list_branches` failed at dialog open — the popup is
+        // empty in that case (no branches loaded), so we surface the
+        // reason inline instead of leaving the user staring at a
+        // blank popover.
+        let load_error_banner = state.branch_load_error.as_ref().map(|msg| {
+            div()
+                .px_3()
+                .py_2()
+                .text_size(px(11.0))
+                .text_color(theme::danger(theme))
+                .child(SharedString::from(msg.clone()))
+        });
+
         let popup = div()
             .w(px(360.0))
             .max_h(px(320.0))
@@ -1086,11 +1134,21 @@ impl Sidebar {
                 cx.listener(|_, _, _, cx| cx.stop_propagation()),
             )
             .child(search)
+            .children(load_error_banner)
             .child(
+                // Stateful + `overflow_y_scroll` so a repo with more
+                // branches than fit in `max_h(320)` still lets the
+                // user reach every row by mouse. Without this the
+                // popup container clips the overflowing rows and
+                // they're unreachable. Stable id so gpui can persist
+                // the scroll offset across renders.
                 div()
+                    .id("nw-base-popup-rows")
+                    .flex_grow()
                     .flex()
                     .flex_col()
                     .py_1()
+                    .overflow_y_scroll()
                     .children(rows),
             );
 
@@ -1223,7 +1281,8 @@ mod tests {
     #[test]
     fn resolve_default_base_ignores_remotes() {
         // Only `origin/dev` exists; we don't fall back to it because
-        // the C# build's default-base lookup is "first local match".
+        // the C# build's default-base lookup is "first local match"
+        // — and there are no locals here, so the result is `None`.
         let bs = vec![branch("origin/dev", true)];
         assert!(resolve_default_base(&bs, "dev").is_none());
     }
@@ -1232,6 +1291,39 @@ mod tests {
     fn resolve_default_base_is_none_when_list_empty() {
         let bs: Vec<BranchInfo> = vec![];
         assert!(resolve_default_base(&bs, "main").is_none());
+    }
+
+    #[test]
+    fn resolve_default_base_falls_back_to_first_local_when_default_missing() {
+        // `default_branch = "master"` doesn't exist locally; the
+        // C# fallback picks the first local branch. Without this
+        // step the dialog would default to `(HEAD)` even when there
+        // was an obvious local choice — common after a `master` →
+        // `main` rename that hasn't been pulled.
+        let bs = vec![
+            branch("main", false),
+            branch("feat/x", false),
+            branch("origin/main", true),
+        ];
+        assert_eq!(
+            resolve_default_base(&bs, "master").as_deref(),
+            Some("main"),
+            "first local branch wins when default_branch is missing"
+        );
+    }
+
+    #[test]
+    fn resolve_default_base_fallback_skips_remotes() {
+        // Even when there's a remote that matches default_branch
+        // and no exact local match, fallback must stay on locals.
+        let bs = vec![
+            branch("origin/master", true),
+            branch("dev", false),
+        ];
+        assert_eq!(
+            resolve_default_base(&bs, "master").as_deref(),
+            Some("dev")
+        );
     }
 }
 
