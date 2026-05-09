@@ -21,9 +21,12 @@ pub mod paint;
 pub mod view;
 
 pub use alacritty_terminal::tty::Shell;
-pub use backend::{Backend, CursorInfo, SpawnConfig, StyledRun, TerminalSize, TerminalSnapshot};
+pub use alacritty_terminal::vte::ansi::CursorShape;
+pub use backend::{
+    Backend, CursorInfo, CursorStylePreset, SpawnConfig, StyledRun, TerminalSize, TerminalSnapshot,
+};
 pub use colors::ColorPalette;
 pub use event::{BackendEvent, EventProxy};
 pub use input::keystroke_to_bytes;
 pub use paint::paint_snapshot;
-pub use view::TerminalView;
+pub use view::{FontConfig, TerminalView};

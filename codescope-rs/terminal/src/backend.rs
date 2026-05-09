@@ -51,10 +51,37 @@ pub struct SpawnConfig {
     /// Initial geometry. Cell metrics may be 0 if the View hasn't laid
     /// out yet — alacritty only uses them for `WindowSize` reports.
     pub size: TerminalSize,
+    /// Optional palette override. `None` falls back to
+    /// [`ColorPalette::default`] (VS Code dark). The palette is shared
+    /// with the [`EventProxy`] so OSC 4 / 10-12 colour queries answer
+    /// against the theme the user actually sees.
+    pub palette: Option<ColorPalette>,
+    /// Maximum scrollback line count.
+    pub scrollback: usize,
+    /// Default cursor style + blink state. TUIs that emit DECSCUSR
+    /// override this on the fly.
+    pub default_cursor_style: CursorStylePreset,
     /// On Windows, escape command-line arguments per CRT rules. Set
     /// `false` only if you know the child does its own argv parsing.
     #[cfg(target_os = "windows")]
     pub escape_args: bool,
+}
+
+/// Cursor shape + blink that the terminal starts with — what shells
+/// without DECSCUSR (PSReadLine, plain bash) inherit. Mirrors
+/// [`alacritty_terminal::vte::ansi::CursorShape`] but as a serde-
+/// friendly default that can come from `settings.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorStylePreset {
+    pub shape: CursorShape,
+    pub blinking: bool,
+}
+
+impl Default for CursorStylePreset {
+    fn default() -> Self {
+        // Match Windows Terminal's out-of-the-box feel.
+        Self { shape: CursorShape::Beam, blinking: true }
+    }
 }
 
 impl Default for SpawnConfig {
@@ -69,6 +96,9 @@ impl Default for SpawnConfig {
                 cell_width: 0,
                 cell_height: 0,
             },
+            palette: None,
+            scrollback: 10_000,
+            default_cursor_style: CursorStylePreset::default(),
             #[cfg(target_os = "windows")]
             escape_args: true,
         }
@@ -131,6 +161,9 @@ impl Backend {
             working_directory,
             env,
             size,
+            palette,
+            scrollback,
+            default_cursor_style,
             #[cfg(target_os = "windows")]
             escape_args,
         } = config;
@@ -152,25 +185,19 @@ impl Backend {
 
         // EventProxy answers colour / text-area-size queries directly
         // on the event-loop thread, so it needs a palette to resolve
-        // against. The View's palette can drift later (themes), but for
-        // the spike a default-cloned copy is fine — colour queries are
-        // niche and updating later is just an `EventProxy::update_palette`
-        // away.
-        let palette = ColorPalette::default();
+        // against. We hand it a clone of whatever the caller chose
+        // (typically derived from the active theme) so OSC 4 / 10-12
+        // responses match what the user actually sees.
+        let palette = palette.unwrap_or_default();
         let (proxy, events) = EventProxy::new(palette, size);
 
-        // Match Windows Terminal's out-of-the-box feel: blinking bar.
-        // Shells that emit DECSCUSR (`\x1b[N q`) override this on the
-        // fly; PSReadLine doesn't, so without our own default the
-        // cursor would be a steady block — confusing on Windows where
-        // every other terminal blinks.
-        let default_cursor_style = alacritty_terminal::vte::ansi::CursorStyle {
-            shape: CursorShape::Beam,
-            blinking: true,
+        let cursor_style = alacritty_terminal::vte::ansi::CursorStyle {
+            shape: default_cursor_style.shape,
+            blinking: default_cursor_style.blinking,
         };
         let term_config = Config {
-            scrolling_history: 10_000,
-            default_cursor_style,
+            scrolling_history: scrollback,
+            default_cursor_style: cursor_style,
             ..Config::default()
         };
         let term = Term::new(term_config, &GridSize::from_window(size), proxy.clone());

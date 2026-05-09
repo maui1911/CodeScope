@@ -1,54 +1,79 @@
-//! Color tokens lifted from CodeScope's
-//! `src/CodeScope.App/Styles/DesignTokens.xaml`. Same hex values, same
-//! names — when the visual designers update the C# tokens we update
-//! these and the two builds stay in lock-step.
+//! gpui-side theme helpers.
 //!
-//! Philosophy (DESIGN.md §2):
-//! * Binary surface — pure black canvas + pure white ink.
-//! * One accent — Framer Blue. Used for focus rings, the active tab
-//!   underline, and links. **No** secondary accent.
-//! * Frosted glass via white-on-black alpha tiers (10 / 20 / 50).
-//! * Pill geometry on every interactive CTA (radius 40+, never square).
+//! `codescope-core` owns the theme *data* (serializable, UI-free).
+//! This module is the bridge: it reads the active `core::Theme` and
+//! hands gpui-flavoured `Hsla` values back to the renderer. When we
+//! later add a theme picker / live reload, the `Theme` reference in
+//! `AppShell` gets swapped and every accessor here returns the new
+//! values on the next render — no touch required in the call sites.
 
-use gpui::{Hsla, rgb, rgba};
+use codescope_core::{Rgb, Theme};
+use gpui::{Hsla, hsla};
 
-// ─── Binary ink + canvas ────────────────────────────────────────────
+/// Convert an 8-bit-per-channel RGB triplet to gpui's `Hsla`. Direct
+/// translation, no gamma — gpui handles colour-space matters
+/// internally.
+pub fn rgb_to_hsla(rgb: Rgb) -> Hsla {
+    let r = rgb.r as f32 / 255.0;
+    let g = rgb.g as f32 / 255.0;
+    let b = rgb.b as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    let l = (max + min) / 2.0;
+    let s = if delta == 0.0 {
+        0.0
+    } else {
+        delta / (1.0 - (2.0 * l - 1.0).abs())
+    };
+    let h = if delta == 0.0 {
+        0.0
+    } else if max == r {
+        60.0 * (((g - b) / delta).rem_euclid(6.0))
+    } else if max == g {
+        60.0 * (((b - r) / delta) + 2.0)
+    } else {
+        60.0 * (((r - g) / delta) + 4.0)
+    };
+    let h = if h < 0.0 { h + 360.0 } else { h } / 360.0;
+    hsla(h, s, l, 1.0)
+}
 
-pub fn canvas() -> Hsla { rgb(0x000000).into() }
-pub fn near_black() -> Hsla { rgb(0x090909).into() }
-pub fn ink() -> Hsla { rgb(0xffffff).into() }
-pub fn ink_muted() -> Hsla { rgb(0xa6a6a6).into() }
-pub fn ink_dim() -> Hsla { rgba(0xffffff99).into() }   // 0.60 alpha
-pub fn ink_ghost() -> Hsla { rgba(0xffffff66).into() } // 0.40 alpha
-pub fn divider() -> Hsla { rgba(0xffffff22).into() }
+/// Same as [`rgb_to_hsla`] but with an explicit alpha (0.0–1.0). The
+/// frosted-glass surfaces in the chrome are derived this way:
+/// `with_alpha(theme.chrome.ink, 0.10)` = `frost_10`.
+pub fn with_alpha(rgb: Rgb, alpha: f32) -> Hsla {
+    let mut color = rgb_to_hsla(rgb);
+    color.a = alpha.clamp(0.0, 1.0);
+    color
+}
 
-// ─── Framer Blue (the only accent) ──────────────────────────────────
+// ─── Chrome accessors ───────────────────────────────────────────────
+//
+// Tiny wrappers around the theme's `chrome` block. Renderers call
+// `theme::canvas(theme)` instead of reaching into `theme.chrome.canvas`
+// directly so we can swap out the lookup later (e.g. when a tab can
+// override its accent without mutating the global theme).
 
+pub fn canvas(theme: &Theme) -> Hsla { rgb_to_hsla(theme.chrome.canvas) }
+pub fn elevated(theme: &Theme) -> Hsla { rgb_to_hsla(theme.chrome.elevated) }
+pub fn ink(theme: &Theme) -> Hsla { rgb_to_hsla(theme.chrome.ink) }
 #[allow(dead_code)]
-pub fn accent() -> Hsla { rgb(0x0099ff).into() }
-#[allow(dead_code)]
-pub fn accent_glow() -> Hsla { rgba(0x0099ff26).into() }     // 0.15
-#[allow(dead_code)]
-pub fn accent_glow_soft() -> Hsla { rgba(0x0099ff14).into() } // 0.08
+pub fn ink_muted(theme: &Theme) -> Hsla { rgb_to_hsla(theme.chrome.ink_muted) }
+pub fn divider(theme: &Theme) -> Hsla { rgb_to_hsla(theme.chrome.divider) }
+pub fn accent(theme: &Theme) -> Hsla { rgb_to_hsla(theme.chrome.accent) }
 
-// ─── Frosted glass (white over black) ──────────────────────────────
-
-pub fn frost_10() -> Hsla { rgba(0xffffff1a).into() } // button surface
-pub fn frost_20() -> Hsla { rgba(0xffffff33).into() } // hover
+/// Frosted-glass overlays — ink at varying alpha, the same trick the
+/// C# build uses for hover states and button surfaces.
+pub fn frost_10(theme: &Theme) -> Hsla { with_alpha(theme.chrome.ink, 0.10) }
+pub fn frost_20(theme: &Theme) -> Hsla { with_alpha(theme.chrome.ink, 0.20) }
 #[allow(dead_code)]
-pub fn frost_50() -> Hsla { rgba(0xffffff80).into() } // emphasis hover
+pub fn frost_50(theme: &Theme) -> Hsla { with_alpha(theme.chrome.ink, 0.50) }
 
-// ─── Surfaces (Overview tokens — exact values from C# build) ────────
+/// Dim variants of the ink for placeholders / inactive labels.
+pub fn ink_dim(theme: &Theme) -> Hsla { with_alpha(theme.chrome.ink, 0.60) }
+pub fn ink_ghost(theme: &Theme) -> Hsla { with_alpha(theme.chrome.ink, 0.40) }
 
-#[allow(dead_code)]
-pub fn surface_elev() -> Hsla { rgb(0x141414).into() }
-#[allow(dead_code)]
-pub fn surface_border() -> Hsla { rgb(0x1f1f1f).into() }
-
-// ─── Status dots ────────────────────────────────────────────────────
-
-pub fn status_running() -> Hsla { rgb(0x22c55e).into() } // emerald
-#[allow(dead_code)]
-pub fn status_idle() -> Hsla { ink_muted() }
-#[allow(dead_code)]
-pub fn status_error() -> Hsla { rgb(0xef4444).into() } // red
+/// Status-dot colour. Hard-coded across themes for now — a green dot
+/// reads as "running" in every dark theme we ship. Themable later.
+pub fn status_running() -> Hsla { rgb_to_hsla(Rgb::from_hex(0x22c55e)) }

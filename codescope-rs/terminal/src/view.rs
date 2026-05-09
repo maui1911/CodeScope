@@ -131,7 +131,7 @@ impl TerminalView {
     /// Wrap a [`Backend`] in a gpui Entity. Spawns an async drain task
     /// that re-snapshots and notifies on every backend event.
     pub fn new(backend: Backend, cx: &mut Context<Self>) -> Self {
-        Self::new_with_font(backend, FontConfig::default(), cx)
+        Self::new_full(backend, ColorPalette::default(), FontConfig::default(), cx)
     }
 
     pub fn new_with_font(
@@ -139,8 +139,20 @@ impl TerminalView {
         font: FontConfig,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_full(backend, ColorPalette::default(), font, cx)
+    }
+
+    /// Full constructor — the binary uses this so the View's render
+    /// palette matches whatever theme the [`Backend`] was spawned
+    /// with. Callers that don't care about themes can keep using
+    /// [`Self::new`] / [`Self::new_with_font`].
+    pub fn new_full(
+        backend: Backend,
+        palette: ColorPalette,
+        font: FontConfig,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
-        let palette = ColorPalette::default();
         let snapshot = backend.snapshot(&palette);
         let events = backend.events();
         let blink_phase = Arc::new(Mutex::new(true));

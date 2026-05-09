@@ -1,5 +1,5 @@
 [workspace]
-members = ["terminal"]
+members = ["core", "terminal"]
 exclude = ["vendor/gpui-terminal"]
 
 [package]
@@ -25,6 +25,7 @@ path = "examples/ptytest.rs"
 gpui = "0.2.2"
 gpui-terminal = { path = "vendor/gpui-terminal" }
 codescope-terminal = { path = "terminal" }
+codescope-core = { path = "core" }
 portable-pty = "0.9"
 anyhow = "1"
 parking_lot = "0.12"

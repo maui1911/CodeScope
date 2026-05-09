@@ -23,8 +23,13 @@
 //! thread.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use codescope_terminal::{Backend, Shell, SpawnConfig, TerminalSize, TerminalView};
+use codescope_core::{Settings, Theme};
+use codescope_terminal::{
+    Backend, ColorPalette, CursorStylePreset, FontConfig, Shell, SpawnConfig, TerminalSize,
+    TerminalView,
+};
 use gpui::{
     AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
     KeyDownEvent, MouseButton, ParentElement, Render, SharedString, Styled, Window, div, px,
@@ -44,16 +49,30 @@ pub struct AppShell {
     active_tab: usize,
     next_id: u64,
     focus_handle: FocusHandle,
+    /// Loaded user settings. Cloned into each new tab spawn so a
+    /// future "reload settings" can swap this without disturbing
+    /// already-running tabs.
+    settings: Arc<Settings>,
+    /// Active theme — chrome reads from this on every render. Kept
+    /// in an `Arc` so swapping themes is a single pointer write.
+    theme: Arc<Theme>,
 }
 
 impl AppShell {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        settings: Arc<Settings>,
+        theme: Arc<Theme>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         let mut shell = Self {
             tabs: Vec::new(),
             active_tab: 0,
             next_id: 0,
             focus_handle,
+            settings,
+            theme,
         };
         shell.spawn_tab(window, cx);
         shell
@@ -79,6 +98,17 @@ impl AppShell {
         env.insert("TERM_PROGRAM".into(), "CodeScope".into());
         env.insert("TERM_PROGRAM_VERSION".into(), "0.0.1".into());
 
+        // Build the terminal palette + cursor preset from the active
+        // theme + settings. Cloned per spawn so each tab carries its
+        // own snapshot — themes can swap later without breaking
+        // already-running terminals.
+        let palette = ColorPalette::from_theme_palette(&self.theme.palette);
+        let cursor_preset = CursorStylePreset {
+            shape: cursor_shape_from_str(&self.settings.cursor.shape),
+            blinking: self.settings.cursor.blinking,
+        };
+        let font = build_font_config(&self.settings);
+
         let backend = match Backend::spawn(SpawnConfig {
             shell,
             env,
@@ -88,6 +118,9 @@ impl AppShell {
                 cell_width: 8,
                 cell_height: 18,
             },
+            palette: Some(palette.clone()),
+            scrollback: self.settings.scrollback,
+            default_cursor_style: cursor_preset,
             ..SpawnConfig::default()
         }) {
             Ok(b) => b,
@@ -97,7 +130,7 @@ impl AppShell {
             }
         };
 
-        let terminal = cx.new(|cx| TerminalView::new(backend, cx));
+        let terminal = cx.new(|cx| TerminalView::new_full(backend, palette, font, cx));
         let id = self.next_id;
         self.next_id += 1;
         self.tabs.push(Tab {
@@ -222,6 +255,7 @@ impl Render for AppShell {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let theme = self.theme.clone();
         // Snapshot the data we need into owned values up front. Lets us
         // hand each `cx.listener` its own mutable borrow without
         // overlapping with the immutable borrow `self.tabs.iter()`
@@ -240,13 +274,18 @@ impl Render for AppShell {
 
         let tabs = tab_meta.into_iter().map(|(idx, id, title)| {
             let active = idx == active_idx;
-            // Active tab: pure-black "card" punched into the
-            // near-black strip, plus a 2 px Framer-Blue top border —
-            // the same shape the C# tab strip uses. Inactive tabs
-            // sit transparent on the strip and only fill on hover.
-            let bg = if active { theme::canvas() } else { gpui::transparent_black() };
-            let text_color = if active { theme::ink() } else { theme::ink_dim() };
-            let top_border = if active { theme::accent() } else { gpui::transparent_black() };
+            // Active tab: canvas-coloured "card" punched into the
+            // elevated strip, plus a 2 px accent top border — the
+            // same shape the C# tab strip uses. Inactive tabs sit
+            // transparent on the strip and only fill on hover.
+            let bg = if active { theme::canvas(&theme) } else { gpui::transparent_black() };
+            let text_color = if active { theme::ink(&theme) } else { theme::ink_dim(&theme) };
+            let top_border = if active { theme::accent(&theme) } else { gpui::transparent_black() };
+            let frost_10 = theme::frost_10(&theme);
+            let frost_20 = theme::frost_20(&theme);
+            let ink = theme::ink(&theme);
+            let ink_ghost = theme::ink_ghost(&theme);
+            let status_dot = if active { theme::status_running() } else { theme::ink_ghost(&theme) };
 
             div()
                 .id(("tab", id))
@@ -262,12 +301,8 @@ impl Render for AppShell {
                 .border_color(top_border)
                 .bg(bg)
                 .text_color(text_color)
-                .hover(|s| {
-                    if active {
-                        s
-                    } else {
-                        s.bg(theme::frost_10()).text_color(theme::ink())
-                    }
+                .hover(move |s| {
+                    if active { s } else { s.bg(frost_10).text_color(ink) }
                 })
                 .on_mouse_down(
                     MouseButton::Left,
@@ -282,11 +317,7 @@ impl Render for AppShell {
                         .w(px(8.0))
                         .h(px(8.0))
                         .rounded_full()
-                        .bg(if active {
-                            theme::status_running()
-                        } else {
-                            theme::ink_ghost()
-                        }),
+                        .bg(status_dot),
                 )
                 .child(div().flex_grow().truncate().child(title))
                 .child(
@@ -298,8 +329,8 @@ impl Render for AppShell {
                         .items_center()
                         .justify_center()
                         .rounded_full()
-                        .text_color(theme::ink_ghost())
-                        .hover(|s| s.bg(theme::frost_20()).text_color(theme::ink()))
+                        .text_color(ink_ghost)
+                        .hover(move |s| s.bg(frost_20).text_color(ink))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _, window, cx| {
@@ -311,6 +342,8 @@ impl Render for AppShell {
                 )
         });
 
+        let new_tab_frost = theme::frost_10(&theme);
+        let new_tab_accent = theme::accent(&theme);
         let new_tab_button = div()
             .id("new-tab")
             .h_full()
@@ -318,9 +351,9 @@ impl Render for AppShell {
             .flex()
             .items_center()
             .justify_center()
-            .text_color(theme::ink_dim())
+            .text_color(theme::ink_dim(&theme))
             .text_size(px(18.0))
-            .hover(|s| s.bg(theme::frost_10()).text_color(theme::accent()))
+            .hover(move |s| s.bg(new_tab_frost).text_color(new_tab_accent))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
@@ -334,8 +367,8 @@ impl Render for AppShell {
             .flex()
             .flex_row()
             .border_b_1()
-            .border_color(theme::divider())
-            .bg(theme::near_black())
+            .border_color(theme::divider(&theme))
+            .bg(theme::elevated(&theme))
             .children(tabs)
             .child(new_tab_button);
 
@@ -354,9 +387,46 @@ impl Render for AppShell {
             .size_full()
             .flex()
             .flex_col()
-            .bg(theme::canvas())
-            .text_color(theme::ink())
+            .bg(theme::canvas(&theme))
+            .text_color(theme::ink(&theme))
             .child(tab_strip)
             .child(div().flex_grow().child(body))
+    }
+}
+
+// ─── Settings → terminal-config helpers ─────────────────────────────
+
+fn cursor_shape_from_str(s: &str) -> codescope_terminal::CursorShape {
+    use codescope_terminal::CursorShape;
+    match s {
+        "block" => CursorShape::Block,
+        "underline" | "underscore" => CursorShape::Underline,
+        "hollow-block" | "hollow_block" => CursorShape::HollowBlock,
+        // "beam", anything else → beam (Windows-Terminal default).
+        _ => CursorShape::Beam,
+    }
+}
+
+fn build_font_config(settings: &Settings) -> FontConfig {
+    let family: SharedString = if settings.font.family.is_empty() {
+        // Empty value in settings.json = "let the platform pick" →
+        // defer to FontConfig's own platform default.
+        FontConfig::default().family
+    } else {
+        settings.font.family.clone().into()
+    };
+    let fallbacks = settings.font.fallbacks.iter().map(|s| s.clone().into()).collect();
+    let size = px(settings.font.size.max(1.0));
+    // line_height_multiplier is recorded for later — gpui's
+    // text_system measures line height directly, so we just stash
+    // a placeholder here. A multiplier knob lands when the renderer
+    // exposes it.
+    let line_height = px(settings.font.size * settings.font.line_height_multiplier.max(0.5));
+    FontConfig {
+        family,
+        fallbacks,
+        size,
+        line_height,
+        cell_width: px(settings.font.size * 0.6),
     }
 }

@@ -96,6 +96,36 @@ impl Default for ColorPalette {
 }
 
 impl ColorPalette {
+    /// Build a palette from a `codescope_core::ThemePalette`. The core
+    /// crate carries the canonical theme data (serializable, UI-free);
+    /// this is the bridge that turns it into something the terminal
+    /// renderer can resolve cells against. The 256-colour extended
+    /// table is taken from the theme verbatim — themes that ship a
+    /// custom cube/grayscale ramp get rendered exactly.
+    pub fn from_theme_palette(palette: &codescope_core::ThemePalette) -> Self {
+        let ansi_rgb: [Rgb; 16] = std::array::from_fn(|i| core_to_alac(palette.ansi[i]));
+        let mut extended_rgb = [Rgb { r: 0, g: 0, b: 0 }; 256];
+        for (slot, src) in extended_rgb.iter_mut().zip(palette.extended.iter()) {
+            *slot = core_to_alac(*src);
+        }
+        let foreground_rgb = core_to_alac(palette.foreground);
+        let background_rgb = core_to_alac(palette.background);
+        let cursor_rgb = core_to_alac(palette.cursor);
+
+        Self {
+            ansi: ansi_rgb.map(rgb_to_hsla),
+            extended: extended_rgb.map(rgb_to_hsla),
+            ansi_rgb,
+            extended_rgb,
+            foreground: rgb_to_hsla(foreground_rgb),
+            background: rgb_to_hsla(background_rgb),
+            cursor: rgb_to_hsla(cursor_rgb),
+            foreground_rgb,
+            background_rgb,
+            cursor_rgb,
+        }
+    }
+
     /// Map an alacritty cell colour to a gpui `Hsla`. `colors` is the
     /// per-terminal override table that themes write into; named colours
     /// consult it before falling back to our fixed palette.
@@ -159,6 +189,10 @@ impl ColorPalette {
             _ => self.foreground_rgb,
         }
     }
+}
+
+fn core_to_alac(rgb: codescope_core::Rgb) -> Rgb {
+    Rgb { r: rgb.r, g: rgb.g, b: rgb.b }
 }
 
 fn dim(mut c: Hsla) -> Hsla {
