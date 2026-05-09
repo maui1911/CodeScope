@@ -601,6 +601,69 @@ impl Sidebar {
         .detach();
     }
 
+    /// Run `git fetch --all --prune` against the project's primary
+    /// repo. Spawned on the background executor so the UI thread
+    /// doesn't block on network I/O. Mirrors C#'s `FetchAllCommand`.
+    fn fetch_all_for_project(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let Some(project) = self.projects.projects.get(idx) else {
+            self.close_menu(cx);
+            return;
+        };
+        let repo = std::path::PathBuf::from(&project.path);
+        self.close_menu(cx);
+        cx.spawn(async move |_, cx| {
+            let result = cx
+                .background_spawn(async move { codescope_core::git::fetch_all_prune(&repo) })
+                .await;
+            if let Err(err) = result {
+                eprintln!("warning: git fetch --all --prune failed: {err:#}");
+            }
+        })
+        .detach();
+    }
+
+    /// Resolve the project's `remote.origin.url` and open the
+    /// browser-shape URL via the OS handler. Same plumbing as
+    /// `open_worktree_remote_in_browser` but at project scope —
+    /// project menu, not worktree menu. No-op + log when no
+    /// origin is configured. Mirrors C#'s
+    /// `OpenRemoteRepositoryCommand` (project scope).
+    fn open_project_remote_in_browser(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let Some(project) = self.projects.projects.get(idx) else {
+            self.close_menu(cx);
+            return;
+        };
+        let project_path = std::path::PathBuf::from(&project.path);
+        self.close_menu(cx);
+        cx.spawn(async move |_, cx| {
+            let url_result = cx
+                .background_spawn(async move {
+                    codescope_core::git::remote_origin_url(&project_path)
+                })
+                .await;
+            let url = match url_result {
+                Ok(Some(u)) => u,
+                Ok(None) => {
+                    eprintln!("info: no remote.origin.url configured");
+                    return;
+                }
+                Err(err) => {
+                    eprintln!("warning: failed to read remote.origin.url: {err:#}");
+                    return;
+                }
+            };
+            let browser_url = match codescope_core::git::remote_url_to_browser(&url) {
+                Some(u) => u,
+                None => {
+                    eprintln!("info: remote URL not a recognised browser shape: {url}");
+                    return;
+                }
+            };
+            open_url_in_browser(&browser_url);
+        })
+        .detach();
+    }
+
     /// Drop a project from the sidebar list and persist `projects.json`.
     /// Does **not** touch anything on disk — the working tree stays
     /// where it is; the user just removes it from CodeScope's view.
@@ -1092,6 +1155,26 @@ impl Sidebar {
                     this.open_new_worktree_dialog(idx, window, cx);
                 }),
             ))
+            // ── Git ─────────────────────────────────────────────
+            // Fetch + Open remote. Mirrors C# BuildProjectMenu
+            // Git section. "Set default agent" submenu lands when
+            // we have a submenu primitive.
+            .child(div().h_px().bg(divider).my_1())
+            .child(item(
+                "menu-fetch-all",
+                "Fetch all (prune)",
+                false,
+                Box::new(move |this, _window, cx| this.fetch_all_for_project(idx, cx)),
+            ))
+            .child(item(
+                "menu-open-remote",
+                "Open remote in browser",
+                false,
+                Box::new(move |this, _window, cx| {
+                    this.open_project_remote_in_browser(idx, cx);
+                }),
+            ))
+            // ── Reveal ──────────────────────────────────────────
             .child(div().h_px().bg(divider).my_1())
             .child(item(
                 "menu-reveal",
