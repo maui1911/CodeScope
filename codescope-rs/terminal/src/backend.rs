@@ -118,6 +118,9 @@ pub struct Backend {
     sender: EventLoopSender,
     join: Option<JoinHandle<(EventLoop<Pty, EventProxy>, State)>>,
     events: flume::Receiver<BackendEvent>,
+    /// Kept around so resize calls can update the cached size the
+    /// proxy uses to answer text-area-size queries.
+    proxy: EventProxy,
 }
 
 impl Backend {
@@ -147,7 +150,14 @@ impl Backend {
         let pty = tty::new(&tty_options, size, /* window_id */ 0)
             .context("failed to spawn PTY child process")?;
 
-        let (proxy, events) = EventProxy::new();
+        // EventProxy answers colour / text-area-size queries directly
+        // on the event-loop thread, so it needs a palette to resolve
+        // against. The View's palette can drift later (themes), but for
+        // the spike a default-cloned copy is fine — colour queries are
+        // niche and updating later is just an `EventProxy::update_palette`
+        // away.
+        let palette = ColorPalette::default();
+        let (proxy, events) = EventProxy::new(palette, size);
 
         // Match Windows Terminal's out-of-the-box feel: blinking bar.
         // Shells that emit DECSCUSR (`\x1b[N q`) override this on the
@@ -187,6 +197,7 @@ impl Backend {
             sender,
             join: Some(join),
             events,
+            proxy,
         })
     }
 
@@ -204,6 +215,7 @@ impl Backend {
     pub fn resize(&mut self, size: TerminalSize) {
         self.notifier.on_resize(size);
         self.terminal.lock().resize(GridSize::from_window(size));
+        self.proxy.update_size(size);
     }
 
     /// Run a closure with a read-only view of the terminal. The mutex is

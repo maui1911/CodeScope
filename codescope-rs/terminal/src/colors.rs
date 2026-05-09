@@ -11,67 +11,86 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 use gpui::Hsla;
 
 /// Concrete colour palette used to resolve alacritty `Color` values.
+/// Each colour is kept in both `Hsla` (for the gpui paint pipeline)
+/// and `Rgb` (for OSC 4 / OSC 10-12 query responses, where the
+/// terminal must return the underlying RGB triplet to the TUI).
 #[derive(Debug, Clone)]
 pub struct ColorPalette {
     ansi: [Hsla; 16],
     extended: [Hsla; 256],
+    ansi_rgb: [Rgb; 16],
+    extended_rgb: [Rgb; 256],
     pub foreground: Hsla,
     pub background: Hsla,
     pub cursor: Hsla,
+    pub foreground_rgb: Rgb,
+    pub background_rgb: Rgb,
+    pub cursor_rgb: Rgb,
 }
 
 impl Default for ColorPalette {
     fn default() -> Self {
         // VS Code's default-dark palette — not an accident: the user is
         // already on it elsewhere, so the colours match.
-        let ansi = [
-            rgb_to_hsla(Rgb { r: 0x00, g: 0x00, b: 0x00 }),
-            rgb_to_hsla(Rgb { r: 0xcd, g: 0x31, b: 0x31 }),
-            rgb_to_hsla(Rgb { r: 0x0d, g: 0xbc, b: 0x79 }),
-            rgb_to_hsla(Rgb { r: 0xe5, g: 0xe5, b: 0x10 }),
-            rgb_to_hsla(Rgb { r: 0x24, g: 0x72, b: 0xc8 }),
-            rgb_to_hsla(Rgb { r: 0xbc, g: 0x3f, b: 0xbc }),
-            rgb_to_hsla(Rgb { r: 0x11, g: 0xa8, b: 0xcd }),
-            rgb_to_hsla(Rgb { r: 0xcc, g: 0xcc, b: 0xcc }),
-            rgb_to_hsla(Rgb { r: 0x66, g: 0x66, b: 0x66 }),
-            rgb_to_hsla(Rgb { r: 0xf1, g: 0x4c, b: 0x4c }),
-            rgb_to_hsla(Rgb { r: 0x23, g: 0xd1, b: 0x8b }),
-            rgb_to_hsla(Rgb { r: 0xf5, g: 0xf5, b: 0x43 }),
-            rgb_to_hsla(Rgb { r: 0x3b, g: 0x8e, b: 0xea }),
-            rgb_to_hsla(Rgb { r: 0xd6, g: 0x70, b: 0xd6 }),
-            rgb_to_hsla(Rgb { r: 0x29, g: 0xb8, b: 0xdb }),
-            rgb_to_hsla(Rgb { r: 0xff, g: 0xff, b: 0xff }),
+        let ansi_rgb = [
+            Rgb { r: 0x00, g: 0x00, b: 0x00 },
+            Rgb { r: 0xcd, g: 0x31, b: 0x31 },
+            Rgb { r: 0x0d, g: 0xbc, b: 0x79 },
+            Rgb { r: 0xe5, g: 0xe5, b: 0x10 },
+            Rgb { r: 0x24, g: 0x72, b: 0xc8 },
+            Rgb { r: 0xbc, g: 0x3f, b: 0xbc },
+            Rgb { r: 0x11, g: 0xa8, b: 0xcd },
+            Rgb { r: 0xcc, g: 0xcc, b: 0xcc },
+            Rgb { r: 0x66, g: 0x66, b: 0x66 },
+            Rgb { r: 0xf1, g: 0x4c, b: 0x4c },
+            Rgb { r: 0x23, g: 0xd1, b: 0x8b },
+            Rgb { r: 0xf5, g: 0xf5, b: 0x43 },
+            Rgb { r: 0x3b, g: 0x8e, b: 0xea },
+            Rgb { r: 0xd6, g: 0x70, b: 0xd6 },
+            Rgb { r: 0x29, g: 0xb8, b: 0xdb },
+            Rgb { r: 0xff, g: 0xff, b: 0xff },
         ];
+        let ansi = ansi_rgb.map(rgb_to_hsla);
 
         // 256-colour palette: 0..16 = ANSI; 16..232 = 6×6×6 cube;
         // 232..256 = grayscale ramp.
-        let mut extended = [Hsla::default(); 256];
-        extended[0..16].copy_from_slice(&ansi);
+        let mut extended_rgb = [Rgb { r: 0, g: 0, b: 0 }; 256];
+        extended_rgb[0..16].copy_from_slice(&ansi_rgb);
         let mut idx = 16;
         for r in 0..6u8 {
             for g in 0..6u8 {
                 for b in 0..6u8 {
                     let comp = |c: u8| if c == 0 { 0 } else { 55 + c * 40 };
-                    extended[idx] = rgb_to_hsla(Rgb {
+                    extended_rgb[idx] = Rgb {
                         r: comp(r),
                         g: comp(g),
                         b: comp(b),
-                    });
+                    };
                     idx += 1;
                 }
             }
         }
         for i in 0..24u8 {
             let v = 8 + i * 10;
-            extended[232 + i as usize] = rgb_to_hsla(Rgb { r: v, g: v, b: v });
+            extended_rgb[232 + i as usize] = Rgb { r: v, g: v, b: v };
         }
+        let extended = extended_rgb.map(rgb_to_hsla);
+
+        let foreground_rgb = Rgb { r: 0xcc, g: 0xcc, b: 0xcc };
+        let background_rgb = Rgb { r: 0x1e, g: 0x1e, b: 0x1e };
+        let cursor_rgb = Rgb { r: 0xff, g: 0xff, b: 0xff };
 
         Self {
             ansi,
             extended,
-            foreground: rgb_to_hsla(Rgb { r: 0xcc, g: 0xcc, b: 0xcc }),
-            background: rgb_to_hsla(Rgb { r: 0x1e, g: 0x1e, b: 0x1e }),
-            cursor: rgb_to_hsla(Rgb { r: 0xff, g: 0xff, b: 0xff }),
+            ansi_rgb,
+            extended_rgb,
+            foreground: rgb_to_hsla(foreground_rgb),
+            background: rgb_to_hsla(background_rgb),
+            cursor: rgb_to_hsla(cursor_rgb),
+            foreground_rgb,
+            background_rgb,
+            cursor_rgb,
         }
     }
 }
@@ -109,6 +128,35 @@ impl ColorPalette {
             }
             Color::Spec(rgb) => rgb_to_hsla(rgb),
             Color::Indexed(idx) => self.extended[idx as usize],
+        }
+    }
+
+    /// Resolve an alacritty colour-table index back to an `Rgb` triplet
+    /// for OSC 4 / OSC 10-12 query responses. The index follows
+    /// alacritty's `Colors` layout: 0..16 = ANSI, 16..256 = 256-colour
+    /// extended palette, 256+ = `NamedColor` slots (Foreground=256,
+    /// Background=257, Cursor=258, …). Per-terminal overrides (set via
+    /// OSC 4 / 10-12 setters) live in `colors[index]` and take
+    /// precedence over our defaults.
+    pub fn resolve_rgb(&self, index: usize, colors: &Colors) -> Rgb {
+        if let Some(rgb) = colors[index] {
+            return rgb;
+        }
+        self.resolve_rgb_no_overrides(index)
+    }
+
+    /// Resolve an alacritty colour-table index back to an `Rgb` from
+    /// the *default* palette only — no `Colors` overrides consulted.
+    /// Used by [`EventProxy`] from the event-loop thread, which can't
+    /// safely lock the `Term` to read overrides.
+    pub fn resolve_rgb_no_overrides(&self, index: usize) -> Rgb {
+        match index {
+            i if i < 16 => self.ansi_rgb[i],
+            i if i < 256 => self.extended_rgb[i],
+            i if i == NamedColor::Foreground as usize => self.foreground_rgb,
+            i if i == NamedColor::Background as usize => self.background_rgb,
+            i if i == NamedColor::Cursor as usize => self.cursor_rgb,
+            _ => self.foreground_rgb,
         }
     }
 }
