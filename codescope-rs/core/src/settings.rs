@@ -6,8 +6,10 @@
 //!
 //! Conservative defaults: every field is optional in serde, so a
 //! half-written or empty `settings.json` still loads. Unknown keys
-//! survive a load/save round-trip too — nice for forward compat when
-//! we add a field in vN+1 and the user's still on vN.
+//! at the *root* are silently dropped on save — we don't currently
+//! preserve them via `#[serde(flatten)]`, so a write-back cycle will
+//! lose forward-compat fields. Re-add when the on-disk schema starts
+//! seeing real version skew.
 
 use std::path::Path;
 

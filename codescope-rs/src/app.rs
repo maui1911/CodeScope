@@ -423,8 +423,14 @@ fn cursor_shape_from_str(s: &str) -> codescope_terminal::CursorShape {
 
 fn build_font_config(settings: &Settings) -> FontConfig {
     let family: SharedString = if settings.font.family.is_empty() {
-        // Empty value in settings.json = "let the platform pick" →
-        // defer to FontConfig's own platform default.
+        // Empty `font.family` in settings.json falls back to whatever
+        // `FontConfig::default()` picks — currently the same Nerd-Font-
+        // first chain, just sourced from the env (`CODESCOPE_FONT`) or
+        // hard-coded, *not* an OS-supplied "platform default monospace".
+        // True system-default font picking would need a platform-
+        // specific resolver (DirectWrite IDWriteSystemFontCollection on
+        // Windows, NSFont/userFixedPitchFont on macOS, fontconfig on
+        // Linux). Land that the day someone actually asks for it.
         FontConfig::default().family
     } else {
         settings.font.family.clone().into()

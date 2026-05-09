@@ -29,7 +29,10 @@ pub struct AppPaths {
     pub config_dir: PathBuf,
     /// `%LOCALAPPDATA%\<app_folder>` on Windows;
     /// `~/.local/state/<app_folder>` on Linux;
-    /// `~/Library/Application Support/<app_folder>/state` on macOS.
+    /// `~/Library/Application Support/<app_folder>` on macOS (no
+    /// separate `state` segment — Apple's HIG treats Application
+    /// Support as the canonical home for both config and state, and
+    /// nothing in our codebase currently distinguishes them on mac).
     pub state_dir: PathBuf,
 }
 

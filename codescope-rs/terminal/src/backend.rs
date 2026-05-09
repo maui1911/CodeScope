@@ -69,8 +69,11 @@ pub struct SpawnConfig {
 
 /// Cursor shape + blink that the terminal starts with — what shells
 /// without DECSCUSR (PSReadLine, plain bash) inherit. Mirrors
-/// [`alacritty_terminal::vte::ansi::CursorShape`] but as a serde-
-/// friendly default that can come from `settings.json`.
+/// [`alacritty_terminal::vte::ansi::CursorShape`] in a Copy-cheap form
+/// the [`SpawnConfig`] caller can hand around. Not directly serde —
+/// the app layer parses the string from `settings.json` (`"block"`,
+/// `"beam"`, …) and constructs this struct, keeping alacritty's
+/// `CursorShape` enum out of the on-disk surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CursorStylePreset {
     pub shape: CursorShape,

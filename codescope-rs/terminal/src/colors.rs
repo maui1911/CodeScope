@@ -99,15 +99,24 @@ impl ColorPalette {
     /// Build a palette from a `codescope_core::ThemePalette`. The core
     /// crate carries the canonical theme data (serializable, UI-free);
     /// this is the bridge that turns it into something the terminal
-    /// renderer can resolve cells against. The 256-colour extended
-    /// table is taken from the theme verbatim — themes that ship a
-    /// custom cube/grayscale ramp get rendered exactly.
+    /// renderer can resolve cells against.
+    ///
+    /// Themes shipped from the built-in registry always provide a full
+    /// 256-entry `extended` table. If a theme loaded from disk (or a
+    /// future hand-edited file) supplies fewer than 256 entries we
+    /// synthesize the missing slots with the standard xterm 6×6×6 cube
+    /// + 24-step grayscale ramp — the terminal renderer indexes
+    /// straight into this table for `Color::Indexed`, so a partial
+    /// table would otherwise paint as black.
     pub fn from_theme_palette(palette: &codescope_core::ThemePalette) -> Self {
+        debug_assert_eq!(
+            palette.extended.len(),
+            256,
+            "ThemePalette.extended should ship a full 256-colour table; \
+             short tables get the standard xterm cube/grayscale fallback"
+        );
         let ansi_rgb: [Rgb; 16] = std::array::from_fn(|i| core_to_alac(palette.ansi[i]));
-        let mut extended_rgb = [Rgb { r: 0, g: 0, b: 0 }; 256];
-        for (slot, src) in extended_rgb.iter_mut().zip(palette.extended.iter()) {
-            *slot = core_to_alac(*src);
-        }
+        let extended_rgb = build_extended_with_fallback(&ansi_rgb, &palette.extended);
         let foreground_rgb = core_to_alac(palette.foreground);
         let background_rgb = core_to_alac(palette.background);
         let cursor_rgb = core_to_alac(palette.cursor);
@@ -193,6 +202,41 @@ impl ColorPalette {
 
 fn core_to_alac(rgb: codescope_core::Rgb) -> Rgb {
     Rgb { r: rgb.r, g: rgb.g, b: rgb.b }
+}
+
+/// Build a 256-entry table from a theme's (possibly partial) extended
+/// palette. Slots beyond `theme_extended.len()` are filled in with the
+/// standard xterm 6×6×6 cube + 24-step grayscale ramp — same numbers
+/// you'd see in any other terminal so OSC 4 / 256-colour apps look
+/// right even when the theme didn't bother spelling out every cell.
+fn build_extended_with_fallback(
+    ansi: &[Rgb; 16],
+    theme_extended: &[codescope_core::Rgb],
+) -> [Rgb; 256] {
+    let mut out = [Rgb { r: 0, g: 0, b: 0 }; 256];
+    // ANSI 0..16 mirror the theme's primary colours.
+    out[..16].copy_from_slice(ansi);
+    // 6×6×6 cube
+    let levels: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    let mut idx = 16;
+    for &r in &levels {
+        for &g in &levels {
+            for &b in &levels {
+                out[idx] = Rgb { r, g, b };
+                idx += 1;
+            }
+        }
+    }
+    // 24-step grayscale
+    for i in 0..24u8 {
+        let v = 8 + i * 10;
+        out[232 + i as usize] = Rgb { r: v, g: v, b: v };
+    }
+    // Now overlay whatever the theme supplied — it wins where present.
+    for (slot, src) in out.iter_mut().zip(theme_extended.iter()) {
+        *slot = core_to_alac(*src);
+    }
+    out
 }
 
 fn dim(mut c: Hsla) -> Hsla {
