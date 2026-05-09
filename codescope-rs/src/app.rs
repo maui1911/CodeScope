@@ -171,12 +171,18 @@ impl AppShell {
         if !app_mod || mods.alt {
             return;
         }
+        // Bindings match Windows Terminal / VS Code so users have
+        // the muscle memory: Ctrl+Shift+T new tab, Ctrl+Shift+W
+        // close. Plain Ctrl+T / Ctrl+W stay with the shell (`yank`
+        // / `unix-word-rubout` in readline, transpose-words in
+        // PSReadLine) — the View deliberately leaves the shifted
+        // variants for us to pick up.
         match key {
-            "t" if !mods.shift => {
+            "t" if mods.shift => {
                 cx.stop_propagation();
                 self.spawn_tab(window, cx);
             }
-            "w" if !mods.shift => {
+            "w" if mods.shift => {
                 cx.stop_propagation();
                 self.close_tab(self.active_tab, window, cx);
             }

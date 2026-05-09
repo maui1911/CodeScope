@@ -304,10 +304,22 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        cx.stop_propagation();
-
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
+
+        // Let app-level shortcuts (Ctrl+T new tab, Ctrl+W close,
+        // Ctrl+Tab cycle, Ctrl+1-9 select) bubble up to whichever
+        // ancestor is listening for them. Without this skip the
+        // `stop_propagation` below would swallow them and the only
+        // way to switch tabs would be a mouse click — exactly the
+        // bug the user reported. Done here, in the terminal, instead
+        // of by keymap registration up in `AppShell` so we don't have
+        // to teach the terminal about every embedder's bindings.
+        if is_app_level_shortcut(key, mods) {
+            return;
+        }
+
+        cx.stop_propagation();
 
         // Copy semantics, matching Windows Terminal / GNOME Terminal:
         //   * Ctrl+C with a live selection → copy, clear selection.
@@ -507,6 +519,40 @@ struct PendingResize {
     cols: u16,
     rows: u16,
     set_at: Instant,
+}
+
+/// Keystrokes the terminal should *not* swallow. A parent shell
+/// (tab strip, command palette, …) is expected to handle them.
+/// Kept conservative — we only opt out of bindings nothing in a
+/// shell prompt would meaningfully use, so power-users running vim
+/// or readline still get every key they need.
+fn is_app_level_shortcut(key: &str, mods: &gpui::Modifiers) -> bool {
+    let app_mod = mods.control || mods.platform;
+    if !app_mod || mods.alt {
+        return false;
+    }
+    // Ctrl+Tab / Ctrl+Shift+Tab (tab cycling).
+    if key == "tab" {
+        return true;
+    }
+    // Ctrl+1 .. Ctrl+9 (direct tab select).
+    if !mods.shift
+        && key.len() == 1
+        && key
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit() && c != '0')
+    {
+        return true;
+    }
+    // Ctrl+Shift+T / Ctrl+Shift+W — explicit "always" bindings that
+    // never conflict with anything readline-shaped. Plain Ctrl+T /
+    // Ctrl+W would clash with the shell's word/transpose, so the
+    // app-shell uses the shifted variants by convention.
+    if mods.shift && (key == "t" || key == "w") {
+        return true;
+    }
+    false
 }
 
 /// State handed from the canvas measure phase to the paint phase.
