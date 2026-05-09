@@ -1220,6 +1220,43 @@ impl AppShell {
         // Cmd on macOS, Ctrl elsewhere — gpui already maps `platform`
         // to the right modifier per OS, so we just check both.
         let app_mod = mods.control || mods.platform;
+
+        // Alt-only chords drive group-focus navigation (Alt+Left /
+        // Right cycle, Alt+1..9 jump). Mirrors C#'s
+        // `MainViewModel.FocusNextGroup` etc. Kept separate from the
+        // Ctrl-based tab chords below so they don't conflict.
+        if mods.alt && !app_mod {
+            match key {
+                "left" => {
+                    cx.stop_propagation();
+                    if self.focused_group > 0 {
+                        self.focus_group(self.focused_group - 1, window, cx);
+                    }
+                    return;
+                }
+                "right" => {
+                    cx.stop_propagation();
+                    if self.focused_group + 1 < self.groups.len() {
+                        self.focus_group(self.focused_group + 1, window, cx);
+                    }
+                    return;
+                }
+                d if d.len() == 1 => {
+                    if let Some(n) = d.chars().next().and_then(|c| c.to_digit(10))
+                        && (1..=9).contains(&n)
+                    {
+                        let idx = (n as usize) - 1;
+                        if idx < self.groups.len() {
+                            cx.stop_propagation();
+                            self.focus_group(idx, window, cx);
+                            return;
+                        }
+                    }
+                }
+                _ => return,
+            }
+        }
+
         if !app_mod || mods.alt {
             return;
         }
