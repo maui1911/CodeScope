@@ -272,21 +272,24 @@ impl AppShell {
         // show the "press Ctrl+Shift+T" placeholder; the user can
         // close them with Ctrl+Shift+W if they don't want them.
         //
-        // Sanitise on the way in: drop any non-positive weights and
-        // anything wildly large to avoid a corrupt layout.json
-        // wedging the work area. `<= 0.0` weights would zero out
-        // their column with `flex-grow`, hiding the pane and giving
-        // no way to recover via the UI.
+        // Sanitise on the way in: drop any non-finite, non-positive,
+        // wildly large, or invisibly small weights. A `<= 0.0` weight
+        // would zero out its column with `flex-grow`, hiding the
+        // pane with no way to recover via the UI; a tiny weight like
+        // `1e-9` is the same problem (column collapses to a sub-
+        // pixel slice that the user can't grab). Clamp to
+        // `MIN_GROUP_WEIGHT` so any persisted weight maps to a
+        // visible, draggable column.
         let mut sanitized_weights: Vec<f32> = saved_group_weights(&layout)
             .iter()
-            .filter(|w| w.is_finite() && **w > 0.0 && **w < 1000.0)
+            .filter(|w| w.is_finite() && **w >= MIN_GROUP_WEIGHT && **w < 1000.0)
             .copied()
             .collect();
         if sanitized_weights.is_empty() {
             sanitized_weights.push(1.0);
         }
         let group_count = sanitized_weights.len();
-        let mut groups: Vec<Group> = (0..group_count)
+        let groups: Vec<Group> = (0..group_count)
             .map(|idx| Group {
                 id: idx as u64,
                 tabs: Vec::new(),
@@ -298,9 +301,6 @@ impl AppShell {
         let focused_group = layout
             .focused_group_index
             .min(groups.len().saturating_sub(1));
-        // Cold-start tab lands in the focused group only — siblings
-        // remain empty placeholders pending session restore.
-        let _ = &mut groups; // silence unused when group_count == 1
 
         let mut shell = Self {
             groups,
