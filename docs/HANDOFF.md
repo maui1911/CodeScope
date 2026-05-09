@@ -5,15 +5,153 @@
 > **Intent:** cursor + last 1–2 sessions in depth, everything else a one-liner.
 > Old detail lives in `git log` — don't duplicate it here.
 
-**Last updated:** 2026-05-09 (session 30)
-**Branch:** `feat/codescope-rs-terminal`
-**Head:** `a2f1d18` — pushed to PR #53
+**Last updated:** 2026-05-09 (session 31)
+**Branch:** `feat/codescope-rs-architecture` (PR #54, open)
+**Head:** `33083b2` — pushed
 **Release:** `v0.2.5` shipped — https://github.com/maui1911/CodeScope/releases/tag/v0.2.5
 **Build status:** ✅ C# untouched. Rust workspace builds clean
-(`cargo build --workspace --manifest-path codescope-rs/Cargo.toml`),
-clippy `-D warnings` green for `codescope-terminal`.
+(`cargo build --workspace --manifest-path codescope-rs/Cargo.toml`).
+21 unit tests across `codescope-core` (12) + `codescope-terminal`
+mouse-encoder (9). PR #53 squash-merged to main as `7a05ed6`;
+session 30's terminal-layer work (sessions 28-30) is in `main` now.
 **Uncommitted work:** none.
 **Open issues:** none on GitHub.
+
+### Session 31 — codescope-core, settings + themes, sidebar + projects, window/layout state, mouse-mode, OSC 8 + URL detection
+
+This session went from "working terminal in a window" to a real
+app shell with a clean architecture, persisted state, and the
+quality-of-life polish that makes the Rust port feel like a
+product instead of a tech demo.
+
+**Shipped (10+ commits on `feat/codescope-rs-architecture`, all on PR #54):**
+
+1. **App shell + tab strip + Codescope theme tokens** (`95fe32f`,
+   `c2f43f6`, `4a26ca7` — recovered via reflog after PR #53 squash
+   landed without them; pushed cleanly on the new branch).
+   `AppShell` Entity, 40 px tab strip in the titlebar zone, pill
+   tabs (canvas-bg + 2 px Framer Blue top border on active, frost-
+   on-hover for inactive), green status dot per tab, `+` new-tab
+   button, custom titlebar via `appears_transparent`. Keybindings:
+   `Ctrl+Shift+T` / `Ctrl+Shift+W` (Windows-Terminal convention so
+   readline's word-bindings stay intact), `Ctrl+Tab` cycle,
+   `Ctrl+1..9` direct select. View deliberately doesn't
+   `stop_propagation` on app-level shortcuts so they bubble up.
+2. **`codescope-core` workspace crate** (`d156734`). Pure-Rust,
+   no gpui or alacritty deps. Hosts settings, themes, env-aware
+   paths. Architecture pyramid is now `core ← terminal ← app/src`.
+   Five built-in themes (`codescope-default`, `vs-code-dark`,
+   `one-dark`, `solarized-dark`, `tokyo-night`); `settings.json`
+   at `%APPDATA%\CodeScope\settings.json` with theme name, font
+   chain, scrollback, cursor preset; `AppPaths` ports the C#
+   `NoScope.CodeScope.Core.AppPaths` 1:1 (same folder names, same
+   `CODESCOPE_DEV` redirect, same single-instance mutex naming).
+   Terminal crate gained `ColorPalette::from_theme_palette` so a
+   theme flows straight into the renderer + the OSC-query proxy
+   without an interop seam in the binary.
+3. **Project / Worktree / Session models + PROJECTS sidebar**
+   (`e7126a7`). Direct port of
+   `src/CodeScope.Core/Models/{Project,Session,Worktree,
+   ProjectsConfig}.cs` — same field names so a `projects.json`
+   written by the v0.x C# build round-trips. 240 px left rail with
+   PROJECTS heading, project rows (accent rail + frost on active),
+   empty-state prompt, placeholder `+` add button.
+4. **window.json + layout.json persistence** (`674a985`). Load
+   path wired: saved bounds (or `WindowBounds::Maximized`) flow
+   into `WindowOptions::window_bounds`. Implausibly small saved
+   sizes (< 320×240) are rejected so a 4K → laptop monitor swap
+   doesn't break the next launch. Save path is a stub —
+   `cx.observe_window_bounds` wiring is the follow-up.
+5. **Mouse-mode reporting** (`0567b43`). New `terminal::mouse`
+   module: SGR encoding when `?1006h` is set, X10 fallback. All
+   click / drag / wheel / motion events route through
+   `try_report_mouse` first; selection only kicks in when no TUI
+   asked for the click (or the user held Shift to bypass). Right
+   + Middle button listeners added so `tmux` context menus and
+   `vim` middle-click work. 9 unit tests on the encoder.
+6. **OSC 8 hyperlinks + plain-text URL detection** (`051cf3b`,
+   `33083b2`). `StyledRun` carries `Option<Arc<str>>` hyperlink;
+   snapshot reads `cell.hyperlink()` for OSC 8, then post-
+   processes each line via `linkify` to retro-tag bare-text URLs
+   (`claude-code`, `gh pr view`, `cargo --message-format json`).
+   `TerminalSnapshot::hyperlink_at(row, col)` lets the View look
+   up links without re-locking the live `Term`. Pointer cursor on
+   hover, Ctrl/Cmd-click opens via the `open` crate; OSC 8 always
+   wins over URL detection.
+7. **Review fixes for PR #54** (`5d15ace`). Five copilot-reviewer
+   threads addressed: settings doc honesty about unknown-key
+   drop, accurate `build_font_config` "platform pick" comment,
+   macOS state-dir doc match, `from_theme_palette` synthesizes
+   the standard xterm cube/grayscale ramp for short tables (with
+   `debug_assert_eq!`), `CursorStylePreset` doc no longer claims
+   serde-friendliness it doesn't have.
+8. **`+` button + hover cursor fixes** (`33083b2`). `+`
+   collapsed to 0 px hit area because `h_full()` didn't always
+   resolve before hit-testing — switched to explicit `h(40)` +
+   `cursor_pointer()`. Hover-over-link now flips the root div to
+   pointer cursor; we only `cx.notify` on URI changes so motion
+   doesn't repaint.
+
+**Confirmed working on Windows (manual test, this machine):**
+multi-tab spawning + closing + cycling · `Ctrl+Shift+T/W` /
+`Ctrl+Tab` / `Ctrl+1..9` from terminal focus · five themes
+swap via `settings.json` and look right · sidebar shows
+hand-edited `projects.json` entries · OSC 8 hyperlinks render
+underlined and open on Ctrl+click with hand cursor · plain-text
+URLs in claude-code output are clickable · pwsh + claude-code +
+typing + scroll + selection + paste all still work cleanly.
+
+**Architectural notes worth carrying forward:**
+- `core` crate is the canonical home for any data the app needs
+  to load / save / share. Adding gpui or alacritty there reverses
+  the pyramid — push the new code into `terminal/` or `src/`
+  instead.
+- `Arc<Theme>` on `AppShell` is the swap point for live theme
+  reload. `theme::canvas(theme)` etc. accept a `&Theme` so when
+  the Arc swaps, the next render redraws against the new values
+  without rebuilding the entity.
+- The squash-merge / unpushed-commit incident at the start of
+  the session: PR #53 squashed against the last *pushed* HEAD,
+  not the live local HEAD. Three commits I'd made locally
+  (app-shell + theme + style + shortcut bubble) were lost
+  briefly. Recovered via reflog cherry-pick — the lesson is
+  push after every meaningful commit, not after a sequence.
+- `StyledRun` post-processing for URL detection is the right
+  layer — keeps the per-cell loop clean and lets OSC 8 always
+  win over heuristics. Wide-char runs are skipped on splitting
+  to stay safe; URLs in the wild are pure ASCII so the fallback
+  basically never trips.
+
+**Suggested next entry points (in priority order):**
+
+1. **window.json save wiring.** The load path works; saving
+   needs `cx.observe_window_bounds` (or equivalent) threaded
+   through the AppShell so live changes get persisted. Without
+   this we still default to whatever the OS remembers, which is
+   already pretty good on Windows.
+2. **Sidebar interactions.** `+` add-project (file picker → new
+   `Project` row → save to `projects.json`). Clicking a project
+   should drive the tab list (each project's sessions become
+   tabs). Filter input at the top of the sidebar.
+3. **Worktree orchestration.** Shell out to `git worktree` for
+   per-session worktrees, mirroring `CodeScope.Worktrees` in
+   the C# build. This is the "actually CodeScope" milestone.
+4. **Telemetry tail.** FSWatch on `~/.claude/projects/…` to
+   drive the (currently hardcoded green) status dots — `running
+   / idle / error` per session.
+5. **Live theme reload + `+` add-theme commands.** Watch
+   `settings.json` for changes and swap the `Arc<Theme>`
+   without restart.
+
+**Known small things still to clean up:**
+- Backend's `hyperlink_at` is now unused (snapshot handles it)
+  — keep until we expose a non-snapshot API or delete on next
+  cleanup pass.
+- Theme accent on tabs is hardcoded to top-border — Framer Blue
+  feels right but other themes might want a different placement.
+- The `inject_url_hyperlinks` post-processing runs every
+  snapshot. Reasonable for typical grids; profile if it shows up
+  in flame graphs at very large sizes.
 
 ### Session 30 — pixel-accurate paint, paste, cursor blink, resize debounce, box-drawing alignment, OSC query handshake
 

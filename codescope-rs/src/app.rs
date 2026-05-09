@@ -1,0 +1,457 @@
+//! Application shell — the chrome that wraps one or more
+//! `TerminalView` entities.
+//!
+//! Layout (top to bottom):
+//!
+//! ```text
+//! ┌────────────────────────────────────────────────────────┐
+//! │ tab strip (40px) — pill tabs · "+" · caption controls │  ← in titlebar
+//! ├────────────────────────────────────────────────────────┤
+//! │                                                        │
+//! │              active TerminalView (size_full)           │
+//! │                                                        │
+//! └────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! Visuals follow `src/CodeScope.App/Styles/DesignTokens.xaml`:
+//! pure-black canvas, pure-white ink, single Framer Blue accent,
+//! frosted-glass surfaces. See [`crate::theme`] for the tokens.
+//!
+//! Each tab owns its own [`Backend`] + [`TerminalView`]. Closing a
+//! tab drops the entity, which drops the backend, which sends
+//! `Msg::Shutdown` to the alacritty event loop and joins the worker
+//! thread.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use codescope_core::{ProjectsConfig, Settings, Theme};
+use codescope_terminal::{
+    Backend, ColorPalette, CursorStylePreset, FontConfig, Shell, SpawnConfig, TerminalSize,
+    TerminalView,
+};
+use gpui::{
+    AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    KeyDownEvent, MouseButton, ParentElement, Render, SharedString, Styled, Window, div, px,
+};
+
+use crate::sidebar::Sidebar;
+use crate::theme;
+
+/// One tab = one terminal session.
+struct Tab {
+    id: u64,
+    title: SharedString,
+    terminal: Entity<TerminalView>,
+}
+
+pub struct AppShell {
+    tabs: Vec<Tab>,
+    active_tab: usize,
+    next_id: u64,
+    focus_handle: FocusHandle,
+    /// Loaded user settings. Cloned into each new tab spawn so a
+    /// future "reload settings" can swap this without disturbing
+    /// already-running tabs.
+    settings: Arc<Settings>,
+    /// Active theme — chrome reads from this on every render. Kept
+    /// in an `Arc` so swapping themes is a single pointer write.
+    theme: Arc<Theme>,
+    /// Left rail. Lives behind a feature flag in the layout state —
+    /// hidden when the user collapses the sidebar (later).
+    sidebar: Entity<Sidebar>,
+}
+
+impl AppShell {
+    pub fn new(
+        settings: Arc<Settings>,
+        theme: Arc<Theme>,
+        projects: Arc<ProjectsConfig>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let focus_handle = cx.focus_handle();
+        let sidebar = cx.new(|_| Sidebar::new(projects, theme.clone()));
+        let mut shell = Self {
+            tabs: Vec::new(),
+            active_tab: 0,
+            next_id: 0,
+            focus_handle,
+            settings,
+            theme,
+            sidebar,
+        };
+        shell.spawn_tab(window, cx);
+        shell
+    }
+
+    /// Open a fresh shell session and append it as a new tab. The new
+    /// tab becomes the active one and the terminal grabs focus.
+    fn spawn_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let shell = std::env::var("CODESCOPE_SHELL")
+            .ok()
+            .map(|program| Shell::new(program, Vec::new()))
+            .or_else(|| {
+                if cfg!(windows) {
+                    Some(Shell::new("pwsh.exe".into(), Vec::new()))
+                } else {
+                    None
+                }
+            });
+
+        let mut env = HashMap::new();
+        env.insert("TERM".into(), "xterm-256color".into());
+        env.insert("COLORTERM".into(), "truecolor".into());
+        env.insert("TERM_PROGRAM".into(), "CodeScope".into());
+        env.insert("TERM_PROGRAM_VERSION".into(), "0.0.1".into());
+
+        // Build the terminal palette + cursor preset from the active
+        // theme + settings. Cloned per spawn so each tab carries its
+        // own snapshot — themes can swap later without breaking
+        // already-running terminals.
+        let palette = ColorPalette::from_theme_palette(&self.theme.palette);
+        let cursor_preset = CursorStylePreset {
+            shape: cursor_shape_from_str(&self.settings.cursor.shape),
+            blinking: self.settings.cursor.blinking,
+        };
+        let font = build_font_config(&self.settings);
+
+        let backend = match Backend::spawn(SpawnConfig {
+            shell,
+            env,
+            size: TerminalSize {
+                num_lines: 30,
+                num_cols: 100,
+                cell_width: 8,
+                cell_height: 18,
+            },
+            palette: Some(palette.clone()),
+            scrollback: self.settings.scrollback,
+            default_cursor_style: cursor_preset,
+            ..SpawnConfig::default()
+        }) {
+            Ok(b) => b,
+            Err(err) => {
+                eprintln!("failed to spawn terminal backend: {err:#}");
+                return;
+            }
+        };
+
+        let terminal = cx.new(|cx| TerminalView::new_full(backend, palette, font, cx));
+        let id = self.next_id;
+        self.next_id += 1;
+        self.tabs.push(Tab {
+            id,
+            title: format!("Terminal {}", id + 1).into(),
+            terminal,
+        });
+        let new_idx = self.tabs.len() - 1;
+        self.activate_tab(new_idx, window, cx);
+    }
+
+    fn close_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        self.tabs.remove(idx);
+        if self.tabs.is_empty() {
+            // Last tab closed — quit the app.
+            cx.quit();
+            return;
+        }
+        if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len() - 1;
+        } else if self.active_tab > idx {
+            self.active_tab -= 1;
+        }
+        self.activate_tab(self.active_tab, window, cx);
+    }
+
+    fn activate_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        self.active_tab = idx;
+        let handle = self.tabs[idx].terminal.read(cx).focus_handle(cx);
+        handle.focus(window);
+        cx.notify();
+    }
+
+    fn next_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let next = (self.active_tab + 1) % self.tabs.len();
+        self.activate_tab(next, window, cx);
+    }
+
+    fn prev_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let prev = if self.active_tab == 0 {
+            self.tabs.len() - 1
+        } else {
+            self.active_tab - 1
+        };
+        self.activate_tab(prev, window, cx);
+    }
+
+    fn on_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mods = &event.keystroke.modifiers;
+        let key = event.keystroke.key.as_str();
+        // Cmd on macOS, Ctrl elsewhere — gpui already maps `platform`
+        // to the right modifier per OS, so we just check both.
+        let app_mod = mods.control || mods.platform;
+        if !app_mod || mods.alt {
+            return;
+        }
+        // Bindings match Windows Terminal / VS Code so users have
+        // the muscle memory: Ctrl+Shift+T new tab, Ctrl+Shift+W
+        // close. Plain Ctrl+T / Ctrl+W stay with the shell (`yank`
+        // / `unix-word-rubout` in readline, transpose-words in
+        // PSReadLine) — the View deliberately leaves the shifted
+        // variants for us to pick up.
+        match key {
+            "t" if mods.shift => {
+                cx.stop_propagation();
+                self.spawn_tab(window, cx);
+            }
+            "w" if mods.shift => {
+                cx.stop_propagation();
+                self.close_tab(self.active_tab, window, cx);
+            }
+            "tab" if !mods.shift => {
+                cx.stop_propagation();
+                self.next_tab(window, cx);
+            }
+            "tab" if mods.shift => {
+                cx.stop_propagation();
+                self.prev_tab(window, cx);
+            }
+            d if !mods.shift && d.len() == 1 => {
+                if let Some(n) = d.chars().next().and_then(|c| c.to_digit(10)) {
+                    if n >= 1 && n <= 9 {
+                        let idx = (n as usize) - 1;
+                        if idx < self.tabs.len() {
+                            cx.stop_propagation();
+                            self.activate_tab(idx, window, cx);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Focusable for AppShell {
+    fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for AppShell {
+    fn render(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = self.theme.clone();
+        // Snapshot the data we need into owned values up front. Lets us
+        // hand each `cx.listener` its own mutable borrow without
+        // overlapping with the immutable borrow `self.tabs.iter()`
+        // would otherwise hold.
+        let active_idx = self.active_tab;
+        let tab_meta: Vec<(usize, u64, SharedString)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(idx, tab)| (idx, tab.id, tab.title.clone()))
+            .collect();
+        let active_terminal = self
+            .tabs
+            .get(self.active_tab)
+            .map(|t| t.terminal.clone());
+
+        let tabs = tab_meta.into_iter().map(|(idx, id, title)| {
+            let active = idx == active_idx;
+            // Active tab: canvas-coloured "card" punched into the
+            // elevated strip, plus a 2 px accent top border — the
+            // same shape the C# tab strip uses. Inactive tabs sit
+            // transparent on the strip and only fill on hover.
+            let bg = if active { theme::canvas(&theme) } else { gpui::transparent_black() };
+            let text_color = if active { theme::ink(&theme) } else { theme::ink_dim(&theme) };
+            let top_border = if active { theme::accent(&theme) } else { gpui::transparent_black() };
+            let frost_10 = theme::frost_10(&theme);
+            let frost_20 = theme::frost_20(&theme);
+            let ink = theme::ink(&theme);
+            let ink_ghost = theme::ink_ghost(&theme);
+            let status_dot = if active { theme::status_running() } else { theme::ink_ghost(&theme) };
+
+            div()
+                .id(("tab", id))
+                .h_full()
+                .min_w(px(140.0))
+                .max_w(px(240.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .border_t_2()
+                .border_color(top_border)
+                .bg(bg)
+                .text_color(text_color)
+                .hover(move |s| {
+                    if active { s } else { s.bg(frost_10).text_color(ink) }
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        this.activate_tab(idx, window, cx);
+                    }),
+                )
+                // Status dot — green = active session, dim = inactive.
+                // Cheap visual hook even before we wire real status.
+                .child(
+                    div()
+                        .w(px(8.0))
+                        .h(px(8.0))
+                        .rounded_full()
+                        .bg(status_dot),
+                )
+                .child(div().flex_grow().truncate().child(title))
+                .child(
+                    div()
+                        .id(("close", idx as u64))
+                        .w(px(20.0))
+                        .h(px(20.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .text_color(ink_ghost)
+                        .hover(move |s| s.bg(frost_20).text_color(ink))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.close_tab(idx, window, cx);
+                            }),
+                        )
+                        .child("×"),
+                )
+        });
+
+        let new_tab_frost = theme::frost_10(&theme);
+        let new_tab_accent = theme::accent(&theme);
+        // `h(40)` instead of `h_full()` because the strip's flex-row
+        // doesn't always resolve `h_full` to the parent's 40 px before
+        // hit-testing happens — the button looked the right size but
+        // its hit area collapsed to 0, killing both hover and click.
+        let new_tab_button = div()
+            .id("new-tab")
+            .h(px(40.0))
+            .w(px(40.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(theme::ink_dim(&theme))
+            .text_size(px(18.0))
+            .cursor_pointer()
+            .hover(move |s| s.bg(new_tab_frost).text_color(new_tab_accent))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.spawn_tab(window, cx);
+                }),
+            )
+            .child("+");
+
+        let tab_strip = div()
+            .h(px(40.0))
+            .flex()
+            .flex_row()
+            .border_b_1()
+            .border_color(theme::divider(&theme))
+            .bg(theme::elevated(&theme))
+            .children(tabs)
+            .child(new_tab_button);
+
+        let body = if let Some(terminal) = active_terminal {
+            div().size_full().child(terminal).into_any_element()
+        } else {
+            // No tabs left — usually we've just quit, but render a
+            // black void in the meantime so we never flash.
+            div().size_full().into_any_element()
+        };
+
+        let main_row = div()
+            .flex_grow()
+            .flex()
+            .flex_row()
+            .child(self.sidebar.clone())
+            .child(div().flex_grow().child(body));
+
+        div()
+            .key_context("AppShell")
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::on_key_down))
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme::canvas(&theme))
+            .text_color(theme::ink(&theme))
+            .child(tab_strip)
+            .child(main_row)
+    }
+}
+
+// ─── Settings → terminal-config helpers ─────────────────────────────
+
+fn cursor_shape_from_str(s: &str) -> codescope_terminal::CursorShape {
+    use codescope_terminal::CursorShape;
+    match s {
+        "block" => CursorShape::Block,
+        "underline" | "underscore" => CursorShape::Underline,
+        "hollow-block" | "hollow_block" => CursorShape::HollowBlock,
+        // "beam", anything else → beam (Windows-Terminal default).
+        _ => CursorShape::Beam,
+    }
+}
+
+fn build_font_config(settings: &Settings) -> FontConfig {
+    let family: SharedString = if settings.font.family.is_empty() {
+        // Empty `font.family` in settings.json falls back to whatever
+        // `FontConfig::default()` picks — currently the same Nerd-Font-
+        // first chain, just sourced from the env (`CODESCOPE_FONT`) or
+        // hard-coded, *not* an OS-supplied "platform default monospace".
+        // True system-default font picking would need a platform-
+        // specific resolver (DirectWrite IDWriteSystemFontCollection on
+        // Windows, NSFont/userFixedPitchFont on macOS, fontconfig on
+        // Linux). Land that the day someone actually asks for it.
+        FontConfig::default().family
+    } else {
+        settings.font.family.clone().into()
+    };
+    let fallbacks = settings.font.fallbacks.iter().map(|s| s.clone().into()).collect();
+    let size = px(settings.font.size.max(1.0));
+    // line_height_multiplier is recorded for later — gpui's
+    // text_system measures line height directly, so we just stash
+    // a placeholder here. A multiplier knob lands when the renderer
+    // exposes it.
+    let line_height = px(settings.font.size * settings.font.line_height_multiplier.max(0.5));
+    FontConfig {
+        family,
+        fallbacks,
+        size,
+        line_height,
+        cell_width: px(settings.font.size * 0.6),
+    }
+}

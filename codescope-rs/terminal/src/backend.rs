@@ -51,10 +51,40 @@ pub struct SpawnConfig {
     /// Initial geometry. Cell metrics may be 0 if the View hasn't laid
     /// out yet — alacritty only uses them for `WindowSize` reports.
     pub size: TerminalSize,
+    /// Optional palette override. `None` falls back to
+    /// [`ColorPalette::default`] (VS Code dark). The palette is shared
+    /// with the [`EventProxy`] so OSC 4 / 10-12 colour queries answer
+    /// against the theme the user actually sees.
+    pub palette: Option<ColorPalette>,
+    /// Maximum scrollback line count.
+    pub scrollback: usize,
+    /// Default cursor style + blink state. TUIs that emit DECSCUSR
+    /// override this on the fly.
+    pub default_cursor_style: CursorStylePreset,
     /// On Windows, escape command-line arguments per CRT rules. Set
     /// `false` only if you know the child does its own argv parsing.
     #[cfg(target_os = "windows")]
     pub escape_args: bool,
+}
+
+/// Cursor shape + blink that the terminal starts with — what shells
+/// without DECSCUSR (PSReadLine, plain bash) inherit. Mirrors
+/// [`alacritty_terminal::vte::ansi::CursorShape`] in a Copy-cheap form
+/// the [`SpawnConfig`] caller can hand around. Not directly serde —
+/// the app layer parses the string from `settings.json` (`"block"`,
+/// `"beam"`, …) and constructs this struct, keeping alacritty's
+/// `CursorShape` enum out of the on-disk surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorStylePreset {
+    pub shape: CursorShape,
+    pub blinking: bool,
+}
+
+impl Default for CursorStylePreset {
+    fn default() -> Self {
+        // Match Windows Terminal's out-of-the-box feel.
+        Self { shape: CursorShape::Beam, blinking: true }
+    }
 }
 
 impl Default for SpawnConfig {
@@ -69,6 +99,9 @@ impl Default for SpawnConfig {
                 cell_width: 0,
                 cell_height: 0,
             },
+            palette: None,
+            scrollback: 10_000,
+            default_cursor_style: CursorStylePreset::default(),
             #[cfg(target_os = "windows")]
             escape_args: true,
         }
@@ -131,6 +164,9 @@ impl Backend {
             working_directory,
             env,
             size,
+            palette,
+            scrollback,
+            default_cursor_style,
             #[cfg(target_os = "windows")]
             escape_args,
         } = config;
@@ -152,25 +188,19 @@ impl Backend {
 
         // EventProxy answers colour / text-area-size queries directly
         // on the event-loop thread, so it needs a palette to resolve
-        // against. The View's palette can drift later (themes), but for
-        // the spike a default-cloned copy is fine — colour queries are
-        // niche and updating later is just an `EventProxy::update_palette`
-        // away.
-        let palette = ColorPalette::default();
+        // against. We hand it a clone of whatever the caller chose
+        // (typically derived from the active theme) so OSC 4 / 10-12
+        // responses match what the user actually sees.
+        let palette = palette.unwrap_or_default();
         let (proxy, events) = EventProxy::new(palette, size);
 
-        // Match Windows Terminal's out-of-the-box feel: blinking bar.
-        // Shells that emit DECSCUSR (`\x1b[N q`) override this on the
-        // fly; PSReadLine doesn't, so without our own default the
-        // cursor would be a steady block — confusing on Windows where
-        // every other terminal blinks.
-        let default_cursor_style = alacritty_terminal::vte::ansi::CursorStyle {
-            shape: CursorShape::Beam,
-            blinking: true,
+        let cursor_style = alacritty_terminal::vte::ansi::CursorStyle {
+            shape: default_cursor_style.shape,
+            blinking: default_cursor_style.blinking,
         };
         let term_config = Config {
-            scrolling_history: 10_000,
-            default_cursor_style,
+            scrolling_history: scrollback,
+            default_cursor_style: cursor_style,
             ..Config::default()
         };
         let term = Term::new(term_config, &GridSize::from_window(size), proxy.clone());
@@ -320,7 +350,14 @@ impl Backend {
                 }
                 let bold = flags.contains(Flags::BOLD);
                 let italic = flags.contains(Flags::ITALIC);
-                let underline = flags.contains(Flags::UNDERLINE);
+                // Hyperlinks (OSC 8) always render with an underline,
+                // regardless of whether the cell explicitly carries
+                // `Flags::UNDERLINE`. Saves the user from emitting
+                // both — and matches every other terminal's hover
+                // affordance for clickable text.
+                let hyperlink: Option<Arc<str>> =
+                    cell.hyperlink().map(|h| Arc::from(h.uri()));
+                let underline = flags.contains(Flags::UNDERLINE) || hyperlink.is_some();
 
                 let selected = content
                     .selection
@@ -351,6 +388,11 @@ impl Backend {
                         && last.bold == bold
                         && last.italic == italic
                         && last.underline == underline
+                        // Don't merge across hyperlinks — adjacent
+                        // links to different URIs would otherwise
+                        // collapse, and we'd lose the per-run uri
+                        // we use for click handling.
+                        && last.hyperlink == hyperlink
                 });
                 if mergeable {
                     let last = line.last_mut().unwrap();
@@ -366,9 +408,17 @@ impl Backend {
                         bold,
                         italic,
                         underline,
+                        hyperlink,
                     });
                 }
             }
+
+            // Sweep each row for plain-text URLs (claude-code,
+            // `gh pr view`, `cargo --message-format json`, … emit
+            // them without OSC 8) and turn them into clickable runs.
+            // Existing OSC 8 hyperlinks are left alone; URL detection
+            // never overrides an explicit one.
+            inject_url_hyperlinks(&mut lines);
 
             // Cursor info: build now that we've captured the cell under
             // it. For block-style cursors, the renderer inverts colours
@@ -481,6 +531,154 @@ impl Backend {
     pub fn selection_text(&self) -> Option<String> {
         self.terminal.lock().selection_to_string()
     }
+
+    /// Look up the OSC 8 hyperlink at a visible-row / column position.
+    /// Used by the View to decide whether a click should open a URL.
+    /// Returns the resolved URI, or `None` when the cell isn't a link
+    /// (or coordinates are outside the grid).
+    pub fn hyperlink_at(&self, visible_row: usize, col: usize) -> Option<String> {
+        self.with_term(|term| {
+            let display_offset = term.grid().display_offset() as i32;
+            // Translate viewport row → absolute grid line. With
+            // `display_offset = 0` (no scrollback) row 0 = line 0;
+            // when scrolled, row 0 sits at line `-display_offset`.
+            let line = visible_row as i32 - display_offset;
+            let point = Point::new(Line(line), Column(col));
+            let cell = &term.grid()[point];
+            cell.hyperlink().map(|h| h.uri().to_string())
+        })
+    }
+}
+
+/// Post-processing pass that finds plain-text URLs (`https://…`,
+/// `http://…`, `file://…`, …) inside each line of styled runs and
+/// retro-tags the matching cells with a hyperlink, just like an OSC 8
+/// link would have done. Lets `claude-code` / `gh` / `cargo` output
+/// stay clickable even though they emit URLs as bare text.
+///
+/// Runs that already carry an OSC 8 hyperlink are left untouched —
+/// the explicit signal always wins. Runs containing wide chars (where
+/// `len_cols != chars().count()`) are skipped to keep splitting safe;
+/// real-world URLs are pure ASCII so this is rarely a constraint.
+fn inject_url_hyperlinks(lines: &mut [Vec<StyledRun>]) {
+    let finder = linkify::LinkFinder::new();
+    for line in lines.iter_mut() {
+        if line.is_empty() {
+            continue;
+        }
+        // Build column-aligned text. With ASCII content (URLs are
+        // always ASCII) the byte index inside `text` matches the
+        // column on screen, so linkify's byte ranges translate
+        // directly to columns. Wide-char runs throw the alignment
+        // off — `apply_url_to_line` skips runs in that case.
+        //
+        // Track `current_col` alongside the string so padding is
+        // O(total_chars) instead of O(chars²) — `chars().count()`
+        // in a while-loop rescans the whole string per padded
+        // space, which would dominate snapshot time on long lines.
+        let mut text = String::new();
+        let mut current_col: usize = 0;
+        for run in line.iter() {
+            while current_col < run.start_col {
+                text.push(' ');
+                current_col += 1;
+            }
+            text.push_str(&run.text);
+            current_col += run.text.chars().count();
+        }
+        let urls: Vec<(usize, usize, Arc<str>)> = finder
+            .links(&text)
+            .filter(|link| link.kind() == &linkify::LinkKind::Url)
+            .map(|link| (link.start(), link.end(), Arc::from(link.as_str())))
+            .collect();
+        for (b_start, b_end, url) in urls {
+            // For ASCII URLs (always the case) byte == char ==
+            // column. The general `chars().count()` is kept as the
+            // safe path in case a future regex-pass admits non-ASCII
+            // matches, but the common path stays O(1) per URL.
+            let col_start = if text.is_char_boundary(b_start) && text[..b_start].is_ascii() {
+                b_start
+            } else {
+                text[..b_start].chars().count()
+            };
+            let col_end = if text.is_char_boundary(b_end) && text[..b_end].is_ascii() {
+                b_end
+            } else {
+                text[..b_end].chars().count()
+            };
+            apply_url_to_line(line, col_start, col_end, url);
+        }
+    }
+}
+
+fn apply_url_to_line(
+    line: &mut Vec<StyledRun>,
+    url_start: usize,
+    url_end: usize,
+    url: Arc<str>,
+) {
+    let mut new_runs: Vec<StyledRun> = Vec::with_capacity(line.len() + 2);
+    for run in line.drain(..) {
+        let r_start = run.start_col;
+        let r_end = run.start_col + run.len_cols;
+        // Run sits entirely outside the URL → keep as-is.
+        // Run already has its own (OSC 8) hyperlink → don't override.
+        // Run has wide chars → splitting on column boundaries gets
+        // ambiguous, skip the URL injection here.
+        if r_end <= url_start
+            || r_start >= url_end
+            || run.hyperlink.is_some()
+            || run.text.chars().count() != run.len_cols
+        {
+            new_runs.push(run);
+            continue;
+        }
+        let chars: Vec<char> = run.text.chars().collect();
+        let split_left = url_start.saturating_sub(r_start);
+        let split_right = (url_end - r_start).min(run.len_cols);
+
+        if split_left > 0 {
+            let pre: String = chars[..split_left].iter().collect();
+            new_runs.push(StyledRun {
+                text: pre,
+                start_col: r_start,
+                len_cols: split_left,
+                fg: run.fg,
+                bg: run.bg,
+                bold: run.bold,
+                italic: run.italic,
+                underline: run.underline,
+                hyperlink: None,
+            });
+        }
+        let mid: String = chars[split_left..split_right].iter().collect();
+        new_runs.push(StyledRun {
+            text: mid,
+            start_col: r_start + split_left,
+            len_cols: split_right - split_left,
+            fg: run.fg,
+            bg: run.bg,
+            bold: run.bold,
+            italic: run.italic,
+            underline: true,
+            hyperlink: Some(url.clone()),
+        });
+        if split_right < run.len_cols {
+            let post: String = chars[split_right..].iter().collect();
+            new_runs.push(StyledRun {
+                text: post,
+                start_col: r_start + split_right,
+                len_cols: run.len_cols - split_right,
+                fg: run.fg,
+                bg: run.bg,
+                bold: run.bold,
+                italic: run.italic,
+                underline: run.underline,
+                hyperlink: None,
+            });
+        }
+    }
+    *line = new_runs;
 }
 
 /// One contiguous run of cells with identical styling on a single row.
@@ -499,6 +697,11 @@ pub struct StyledRun {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
+    /// OSC 8 hyperlink URI, if the cells in this run are clickable.
+    /// Always paints underlined (the renderer treats `hyperlink.is_some()`
+    /// as an implicit `underline = true`). Click-to-open is wired in
+    /// `TerminalView::on_mouse_down`.
+    pub hyperlink: Option<Arc<str>>,
 }
 
 /// Cursor location, shape, and the colour state it should be painted
@@ -544,6 +747,21 @@ pub struct TerminalSnapshot {
     pub screen_lines: usize,
     pub default_fg: Hsla,
     pub default_bg: Hsla,
+}
+
+impl TerminalSnapshot {
+    /// Find the OSC 8 / detected-URL hyperlink at a viewport-relative
+    /// (row, col). Walks the row's runs for the one covering `col` —
+    /// O(runs-per-row), tiny in practice. The View uses this for
+    /// hover-cursor and Ctrl-click handling, so it doesn't have to
+    /// re-lock the live `Term` just to look up a URL.
+    pub fn hyperlink_at(&self, row: usize, col: usize) -> Option<Arc<str>> {
+        let line = self.lines.get(row)?;
+        line.iter()
+            .find(|r| col >= r.start_col && col < r.start_col + r.len_cols)?
+            .hyperlink
+            .clone()
+    }
 }
 
 impl Drop for Backend {
