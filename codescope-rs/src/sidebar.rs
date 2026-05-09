@@ -23,9 +23,11 @@
 //! └───────────────┘
 //! ```
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 
 use codescope_core::{AppPaths, LayoutState, Project, ProjectsConfig, Theme};
 use gpui::{
@@ -36,6 +38,14 @@ use gpui::{
 
 use crate::new_worktree_dialog::NewWorktreeDialogState;
 use crate::theme;
+
+/// How often the dirty-state poller wakes up. 5 s is well under
+/// the user's reaction-to-edit window (most workflows save +
+/// glance at the sidebar within 1-2 seconds), and well over the
+/// per-call I/O budget of `git status --porcelain` even on
+/// thousand-file repos. Mirrors the C# build's
+/// `WorktreePoller.Interval`.
+const DIRTY_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Default sidebar width when none is persisted in `layout.json`.
 /// Mirrors the C# build's initial 240 px. The actual rendered width
@@ -130,6 +140,13 @@ pub struct Sidebar {
     /// At most one dialog at a time — opening another would race
     /// against an in-flight `git worktree add` call from the first.
     dialog: Option<NewWorktreeDialogState>,
+    /// Per-worktree clean/dirty state, keyed by absolute path.
+    /// Updated by the background poller spawned in `Sidebar::new`;
+    /// `None` = unknown (still loading), `Some(true)` = dirty,
+    /// `Some(false)` = clean. The render loop maps that to a tiny
+    /// status dot next to each worktree row. Mirrors C# build's
+    /// `WorktreePoller` cache.
+    dirty_state: HashMap<String, bool>,
 }
 
 impl Sidebar {
@@ -147,7 +164,91 @@ impl Sidebar {
             None => None,
         }
         .or_else(|| (!projects.projects.is_empty()).then_some(0));
-        Self { projects, selected, theme, paths, layout, menu: None, dialog: None }
+        Self {
+            projects,
+            selected,
+            theme,
+            paths,
+            layout,
+            menu: None,
+            dialog: None,
+            dirty_state: HashMap::new(),
+        }
+    }
+
+    /// Spawn the dirty-state polling loop. Runs every
+    /// `DIRTY_POLL_INTERVAL` and walks every known worktree path,
+    /// running `git status --porcelain`. Per-call latency is in the
+    /// 10–50 ms range on small repos, low single-digit seconds on
+    /// large ones — both well below the poll interval. The loop
+    /// dies when the entity drops (`update` returns Err). Mirrors
+    /// the C# build's `WorktreePoller`.
+    ///
+    /// Called from `AppShell::new` after the entity is constructed;
+    /// can't run inside `Sidebar::new` itself because we don't have
+    /// `cx.spawn` access until we're past the constructor.
+    pub fn start_dirty_poll(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(DIRTY_POLL_INTERVAL).await;
+                if this.upgrade().is_none() {
+                    break;
+                }
+                // Snapshot every worktree path under each project so
+                // the background `git status` calls don't pin an
+                // entity borrow.
+                let paths: Vec<String> = match this.update(cx, |this, _| {
+                    this.projects
+                        .projects
+                        .iter()
+                        .flat_map(|p| {
+                            // Primary path counts too — the Sidebar
+                            // only renders non-primary worktrees, but
+                            // we still want the dirty-state cache
+                            // populated for the project row's
+                            // worktree.
+                            std::iter::once(p.path.clone()).chain(
+                                p.worktrees.iter().map(|wt| wt.path.clone()),
+                            )
+                        })
+                        .collect()
+                }) {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                let updates: Vec<(String, bool)> = cx
+                    .background_spawn(async move {
+                        paths
+                            .into_iter()
+                            .filter_map(|p| {
+                                let path = std::path::PathBuf::from(&p);
+                                codescope_core::git::is_dirty(&path)
+                                    .ok()
+                                    .map(|dirty| (p, dirty))
+                            })
+                            .collect()
+                    })
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        let mut changed = false;
+                        for (path, dirty) in updates {
+                            let prev = this.dirty_state.insert(path, dirty);
+                            if prev != Some(dirty) {
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Read-only handle to the in-memory project list. Exposed so the
@@ -876,6 +977,15 @@ impl Render for Sidebar {
                 ));
                 let frost_hover = theme::frost_10(&theme);
                 let ink_hover = theme::ink(&theme);
+                // Resolve dirty-state for this worktree. `None` (still
+                // loading) gets a dim ghost dot; `Some(false)` (clean)
+                // a small accent-coloured dot; `Some(true)` (dirty) a
+                // warning-coloured dot.
+                let dirty_dot_color = match self.dirty_state.get(&wt.path) {
+                    Some(true) => theme::status_dirty(&theme),
+                    Some(false) => theme::status_clean(&theme),
+                    None => theme::ink_ghost(&theme),
+                };
                 let wt_row = div()
                     .id(("worktree", id_hash(&wt.id)))
                     .h(px(28.0))
@@ -884,6 +994,7 @@ impl Render for Sidebar {
                     .items_center()
                     .pl(px(34.0)) // align under the project text past the rail + indent
                     .pr_3()
+                    .gap_2()
                     .text_color(theme::ink_ghost(&theme))
                     .text_size(px(12.0))
                     .cursor_pointer()
@@ -911,6 +1022,13 @@ impl Render for Sidebar {
                                 );
                             }
                         }),
+                    )
+                    .child(
+                        div()
+                            .w(px(6.0))
+                            .h(px(6.0))
+                            .rounded_full()
+                            .bg(dirty_dot_color),
                     )
                     .child(div().flex_grow().truncate().child(wt_label));
                 project_and_worktree_rows.push(wt_row.into_any_element());

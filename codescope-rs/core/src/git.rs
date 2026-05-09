@@ -146,6 +146,16 @@ pub fn pull_ff_only(repo: &Path) -> Result<()> {
     run_git(repo, &["pull", "--ff-only"]).map(|_| ())
 }
 
+/// `git status --porcelain` — empty stdout means a clean worktree
+/// (no staged, unstaged, or untracked changes), anything else
+/// means dirty. Cheap enough to poll a couple of times per second
+/// per worktree without blowing the I/O budget. Mirrors C#'s
+/// `WorktreePoller.IsDirtyAsync`.
+pub fn is_dirty(repo: &Path) -> Result<bool> {
+    let output = run_git(repo, &["status", "--porcelain"])?;
+    Ok(!output.stdout.is_empty())
+}
+
 /// `git fetch --all --prune`. Updates every remote and prunes the
 /// **remote-tracking** refs (`refs/remotes/<remote>/*`) whose
 /// upstream branches have been deleted. Local branches and tags
