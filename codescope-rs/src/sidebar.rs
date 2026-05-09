@@ -108,6 +108,24 @@ pub enum SidebarEvent {
         /// just opens a plain shell. The host adds the trailing CR.
         auto_type: Option<SharedString>,
     },
+    /// Surface a status notification to the user. The sidebar emits
+    /// these from menu actions (pull / fetch / open remote / discard)
+    /// so the AppShell's toast layer can render them; without this
+    /// channel sidebar errors would only land in stderr where the
+    /// user can't see them. Severity drives the toast colour stripe
+    /// and lifetime.
+    Toast { kind: ToastSeverity, title: SharedString, detail: Option<SharedString> },
+}
+
+/// Toast severity emitted by the sidebar. AppShell maps these to its
+/// own `ToastKind` (the indirection keeps `Sidebar` from importing
+/// `app.rs` types).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // `Info` is reserved for future non-error notices.
+pub enum ToastSeverity {
+    Ok,
+    Err,
+    Info,
 }
 
 /// Owned snapshot of one non-primary worktree, captured before render
@@ -536,9 +554,8 @@ impl Sidebar {
 
     /// Run `git pull --ff-only` on the worktree's path. Spawned on
     /// the background executor so the UI thread doesn't block on
-    /// network I/O. Failures land in stderr — the toast layer that
-    /// would surface them to the user is C# parity work that
-    /// follows when the toast primitive lands.
+    /// network I/O. Result surfaces as a toast — Ok on success, Err
+    /// with stderr-derived detail on failure.
     fn pull_worktree(
         &mut self,
         project_idx: usize,
@@ -549,15 +566,27 @@ impl Sidebar {
             self.close_menu(cx);
             return;
         };
+        let label = self
+            .worktree_display_label(project_idx, worktree_id)
+            .unwrap_or_else(|| "this worktree".into());
         self.close_menu(cx);
         let path = std::path::PathBuf::from(path);
-        cx.spawn(async move |_, cx| {
+        cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move { codescope_core::git::pull_ff_only(&path) })
                 .await;
-            if let Err(err) = result {
-                eprintln!("warning: git pull --ff-only failed: {err:#}");
-            }
+            let _ = this.update(cx, |_, cx| match result {
+                Ok(_) => cx.emit(SidebarEvent::Toast {
+                    kind: ToastSeverity::Ok,
+                    title: format!("Pulled '{label}'").into(),
+                    detail: None,
+                }),
+                Err(err) => cx.emit(SidebarEvent::Toast {
+                    kind: ToastSeverity::Err,
+                    title: format!("Pull failed for '{label}'").into(),
+                    detail: Some(format!("{err:#}").into()),
+                }),
+            });
         })
         .detach();
     }
@@ -698,7 +727,8 @@ impl Sidebar {
             cx,
         );
         let path = std::path::PathBuf::from(path);
-        cx.spawn(async move |_, cx| {
+        let label_for_toast = label.clone();
+        cx.spawn(async move |this, cx| {
             // 0 = first button ("Discard"). Anything else = cancel.
             match rx.await {
                 Ok(0) => {}
@@ -709,9 +739,18 @@ impl Sidebar {
                     async move { codescope_core::git::discard_all_changes(&path) },
                 )
                 .await;
-            if let Err(err) = result {
-                eprintln!("warning: discard_all_changes failed: {err:#}");
-            }
+            let _ = this.update(cx, |_, cx| match result {
+                Ok(_) => cx.emit(SidebarEvent::Toast {
+                    kind: ToastSeverity::Ok,
+                    title: format!("Discarded changes in '{label_for_toast}'").into(),
+                    detail: None,
+                }),
+                Err(err) => cx.emit(SidebarEvent::Toast {
+                    kind: ToastSeverity::Err,
+                    title: format!("Discard failed for '{label_for_toast}'").into(),
+                    detail: Some(format!("{err:#}").into()),
+                }),
+            });
         })
         .detach();
     }
@@ -771,15 +810,25 @@ impl Sidebar {
             self.close_menu(cx);
             return;
         };
+        let project_name = project.name.clone();
         let repo = std::path::PathBuf::from(&project.path);
         self.close_menu(cx);
-        cx.spawn(async move |_, cx| {
+        cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move { codescope_core::git::fetch_all_prune(&repo) })
                 .await;
-            if let Err(err) = result {
-                eprintln!("warning: git fetch --all --prune failed: {err:#}");
-            }
+            let _ = this.update(cx, |_, cx| match result {
+                Ok(_) => cx.emit(SidebarEvent::Toast {
+                    kind: ToastSeverity::Ok,
+                    title: format!("Fetched '{project_name}'").into(),
+                    detail: None,
+                }),
+                Err(err) => cx.emit(SidebarEvent::Toast {
+                    kind: ToastSeverity::Err,
+                    title: format!("Fetch failed for '{project_name}'").into(),
+                    detail: Some(format!("{err:#}").into()),
+                }),
+            });
         })
         .detach();
     }
