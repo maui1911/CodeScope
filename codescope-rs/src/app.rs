@@ -44,7 +44,7 @@ use gpui::{
 };
 use parking_lot::Mutex;
 
-use crate::sidebar::{Sidebar, SidebarEvent};
+use crate::sidebar::{SIDEBAR_WIDTH, Sidebar, SidebarEvent};
 use crate::theme;
 
 /// How often the window-state debounce loop wakes up to check whether
@@ -299,9 +299,15 @@ impl AppShell {
         self.activate_tab(group_idx, new_idx, window, cx);
     }
 
-    /// Close the tab at `(group_idx, tab_idx)`. When the focused
-    /// group's last tab closes we collapse the group entirely (provided
-    /// at least one sibling remains); when no groups remain we quit.
+    /// Close the tab at `(group_idx, tab_idx)`. When the group's last
+    /// tab closes we collapse the group entirely (provided at least
+    /// one sibling remains); when no groups remain we quit.
+    ///
+    /// Closing a tab in an *unfocused* group keeps focus where it was
+    /// (mirrors C# `MainViewModel.CloseTabAsync` — the user clicked an
+    /// "x" on a sibling, they didn't ask to switch contexts). Auto-
+    /// collapsing a focused group that becomes empty does refocus the
+    /// fallback group so typing keeps landing somewhere.
     fn close_tab(
         &mut self,
         group_idx: usize,
@@ -313,20 +319,20 @@ impl AppShell {
         if tab_idx >= group.tabs.len() {
             return;
         }
+        let was_focused_group = self.focused_group == group_idx;
         group.tabs.remove(tab_idx);
         if group.tabs.is_empty() {
             // Empty group — collapse if there are siblings, otherwise
-            // quit (mirrors `close_tab` on the singleton group before
-            // multi-group support).
+            // quit.
             if self.groups.len() == 1 {
                 cx.quit();
                 return;
             }
             self.groups.remove(group_idx);
-            // If we just removed the focused group (or anything to its
-            // left), shift the focus index left so it still points at
-            // a real entry. Then re-focus the new focused group's
-            // active tab so the terminal regains keyboard input.
+            // If the focused group was at or after `group_idx`, slide
+            // its index left so it keeps pointing at the same group.
+            // Re-focus the (possibly new) focused group so keyboard
+            // input lands somewhere live.
             if self.focused_group >= self.groups.len() {
                 self.focused_group = self.groups.len() - 1;
             } else if group_idx <= self.focused_group && self.focused_group > 0 {
@@ -344,8 +350,15 @@ impl AppShell {
         } else if group.active_tab > tab_idx {
             group.active_tab -= 1;
         }
-        let new_active = group.active_tab;
-        self.activate_tab(group_idx, new_active, window, cx);
+        if was_focused_group {
+            let new_active = group.active_tab;
+            self.activate_tab(group_idx, new_active, window, cx);
+        } else {
+            // Closing a tab in a sibling group — adjust its `active_tab`
+            // (already done above) and redraw, but leave keyboard focus
+            // on the user's actually-focused group.
+            cx.notify();
+        }
     }
 
     /// Activate `(group_idx, tab_idx)`. Sets focused group, marks the
@@ -392,6 +405,24 @@ impl AppShell {
             group.active_tab - 1
         };
         self.activate_tab(group_idx, prev, window, cx);
+    }
+
+    /// Drop the focused group entirely. Pre-condition: the group is
+    /// empty (caller checks) and there's at least one sibling. After
+    /// removal we land focus on the previous (or first remaining)
+    /// group's active tab so typing keeps working without an extra
+    /// click. Mirrors `MainViewModel.CloseGroup`.
+    fn close_focused_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        debug_assert!(self.focused_group < self.groups.len());
+        debug_assert!(self.groups[self.focused_group].tabs.is_empty());
+        debug_assert!(self.groups.len() > 1);
+        let removed = self.focused_group;
+        self.groups.remove(removed);
+        if self.focused_group >= self.groups.len() {
+            self.focused_group = self.groups.len() - 1;
+        }
+        let active = self.groups[self.focused_group].active_tab;
+        self.activate_tab(self.focused_group, active, window, cx);
     }
 
     /// Append a new empty group to the right of the focused one and
@@ -463,8 +494,21 @@ impl AppShell {
             "w" if mods.shift => {
                 cx.stop_propagation();
                 let g = self.focused_group;
-                let t = self.focused_group().active_tab;
-                self.close_tab(g, t, window, cx);
+                let group = self.focused_group();
+                if group.tabs.is_empty() {
+                    // Empty focused group — collapse it so the user
+                    // can undo an accidental split right without
+                    // having to spawn a tab first. Mirrors the
+                    // `tab is null` branch of `MainViewModel.CloseTabAsync`.
+                    // No-op when this is the only group; the user has
+                    // to close their last tab to quit.
+                    if self.groups.len() > 1 {
+                        self.close_focused_group(window, cx);
+                    }
+                } else {
+                    let t = group.active_tab;
+                    self.close_tab(g, t, window, cx);
+                }
             }
             // Ctrl+\ — split the focused group to the right. Matches
             // the C# binding (`SplitRightCommand`). Backslash is a
@@ -690,6 +734,24 @@ impl Render for AppShell {
             group_panes.push(pane.into_any_element());
         }
 
+        // Sidebar-width spacer between the 40 px brand mark and the
+        // first strip section so each strip column starts at the same
+        // x-coordinate as the matching pane below — without this, the
+        // strip dividers slide left of the work-area dividers and the
+        // user sees mis-aligned columns. The spacer also serves as
+        // titlebar drag region above the sidebar (window-control area
+        // + start_window_move) so the user can grab the bar there.
+        let sidebar_spacer_w = px(SIDEBAR_WIDTH) - px(40.0);
+        let sidebar_spacer = div()
+            .id("titlebar-sidebar-spacer")
+            .w(sidebar_spacer_w)
+            .h(px(40.0))
+            .window_control_area(WindowControlArea::Drag)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, window, _| window.start_window_move()),
+            );
+
         let tab_strip = div()
             .h(px(40.0))
             .flex()
@@ -698,6 +760,7 @@ impl Render for AppShell {
             .border_color(theme::divider(&theme))
             .bg(theme::elevated(&theme))
             .child(brand_mark)
+            .child(sidebar_spacer)
             // Per-group strip sections share the available width
             // equally for now (each is `flex_grow`). Per-group weight
             // sliders + drag-resize land in the follow-up PR.
