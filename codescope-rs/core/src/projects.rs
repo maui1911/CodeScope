@@ -79,6 +79,15 @@ impl Project {
             worktrees: Vec::new(),
         }
     }
+
+    /// Effective worktree root for this project. Mirrors the C# rule
+    /// in `NewWorktreeDialog`: explicit `worktree_root` wins, otherwise
+    /// fall back to `"{path}.worktrees"` next to the primary tree.
+    pub fn worktree_root_path(&self) -> String {
+        self.worktree_root
+            .clone()
+            .unwrap_or_else(|| format!("{}.worktrees", self.path))
+    }
 }
 
 /// One git worktree under a [`Project`]. Every project has an

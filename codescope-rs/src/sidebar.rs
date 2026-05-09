@@ -33,6 +33,7 @@ use gpui::{
     anchored, deferred, div, point, px,
 };
 
+use crate::new_worktree_dialog::NewWorktreeDialogState;
 use crate::theme;
 
 /// Width of the sidebar pane. The C# build uses 240 with a
@@ -51,7 +52,9 @@ struct OpenMenu {
 /// Click handler for a context-menu row. Boxed so we can stash it in
 /// the closure passed to `cx.listener` without leaking the helper's
 /// generic-over-fn shape into every menu-row construction site.
-type MenuItemAction = Box<dyn Fn(&mut Sidebar, &mut Context<Sidebar>) + 'static>;
+/// Receives the active window so a row that opens a follow-on dialog
+/// (e.g. "New worktree…") can focus the dialog inline.
+type MenuItemAction = Box<dyn Fn(&mut Sidebar, &mut Window, &mut Context<Sidebar>) + 'static>;
 
 pub struct Sidebar {
     projects: ProjectsConfig,
@@ -69,6 +72,10 @@ pub struct Sidebar {
     layout: LayoutState,
     /// Currently-open project context menu, if any.
     menu: Option<OpenMenu>,
+    /// Currently-open "New worktree from branch…" dialog, if any.
+    /// At most one dialog at a time — opening another would race
+    /// against an in-flight `git worktree add` call from the first.
+    dialog: Option<NewWorktreeDialogState>,
 }
 
 impl Sidebar {
@@ -86,7 +93,49 @@ impl Sidebar {
             None => None,
         }
         .or_else(|| (!projects.projects.is_empty()).then_some(0));
-        Self { projects, selected, theme, paths, layout, menu: None }
+        Self { projects, selected, theme, paths, layout, menu: None, dialog: None }
+    }
+
+    /// Read-only handle to the in-memory project list. Exposed so the
+    /// dialog module can read project metadata without re-borrowing
+    /// every private field individually.
+    pub(crate) fn projects(&self) -> &ProjectsConfig {
+        &self.projects
+    }
+
+    /// Same as [`Self::projects`] for the path bundle. Used by the
+    /// dialog to persist `projects.json` after a successful create.
+    pub(crate) fn paths_ref(&self) -> &AppPaths {
+        &self.paths
+    }
+
+    /// Commit a freshly-built `ProjectsConfig` into in-memory state
+    /// after the dialog has already saved it to disk. Save-then-commit
+    /// ordering matches `add_project` / `remove_project`.
+    pub(crate) fn replace_projects(&mut self, next: ProjectsConfig) {
+        self.projects = next;
+    }
+
+    /// Dialog accessors used by the dialog module's helpers. Kept
+    /// `pub(crate)` so the dialog can mutate state without us having
+    /// to expose the full struct.
+    pub(crate) fn dialog(&self) -> Option<&NewWorktreeDialogState> {
+        self.dialog.as_ref()
+    }
+    pub(crate) fn dialog_mut(&mut self) -> Option<&mut NewWorktreeDialogState> {
+        self.dialog.as_mut()
+    }
+    pub(crate) fn set_dialog(&mut self, dialog: Option<NewWorktreeDialogState>) {
+        self.dialog = dialog;
+    }
+    pub(crate) fn take_dialog(&mut self) -> Option<NewWorktreeDialogState> {
+        self.dialog.take()
+    }
+
+    /// Drop the open context menu without notifying — the caller is
+    /// already going to call `cx.notify()` for a different reason.
+    pub(crate) fn close_menu_no_notify(&mut self) {
+        self.menu = None;
     }
 
     pub fn select(&mut self, idx: usize, cx: &mut Context<Self>) {
@@ -312,7 +361,7 @@ impl Sidebar {
 }
 
 impl Render for Sidebar {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme.clone();
         let selected = self.selected;
         let rows: Vec<_> = self
@@ -429,11 +478,6 @@ impl Render for Sidebar {
             body = body.child(es);
         }
 
-        let menu_overlay = self.menu.as_ref().and_then(|menu| {
-            let project = self.projects.projects.get(menu.project_idx)?;
-            Some(self.render_project_menu(menu.project_idx, menu.position, project, &theme, cx))
-        });
-
         let mut root = div()
             .w(px(SIDEBAR_WIDTH))
             .h_full()
@@ -445,7 +489,23 @@ impl Render for Sidebar {
             .child(heading)
             .child(div().h_px().bg(theme::divider(&theme)))
             .child(body);
-        if let Some(overlay) = menu_overlay {
+
+        // Build the project context menu (if any). We snapshot the
+        // index + position so the closure-borrow on `self.menu`
+        // doesn't outlast the call to `render_project_menu`.
+        if let Some((idx, pos, project)) = self.menu.as_ref().and_then(|m| {
+            self.projects
+                .projects
+                .get(m.project_idx)
+                .cloned()
+                .map(|p| (m.project_idx, m.position, p))
+        }) {
+            let overlay = self
+                .render_project_menu(idx, pos, &project, &theme, cx)
+                .into_any_element();
+            root = root.child(overlay);
+        }
+        if let Some(overlay) = self.render_new_worktree_dialog(window, &theme, cx) {
             root = root.child(overlay);
         }
         root
@@ -496,9 +556,9 @@ impl Sidebar {
                 .hover(move |s| s.bg(frost_hover).text_color(hover_color))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
+                    cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        on_click(this, cx);
+                        on_click(this, window, cx);
                     }),
                 )
                 .child(label)
@@ -526,27 +586,20 @@ impl Sidebar {
                     .child(div().child("project")),
             )
             .child(div().h_px().bg(divider).my_1())
-            // "New worktree from branch…" lands once the input-dialog
-            // primitive exists; rendering it disabled now keeps the
-            // menu shape stable so muscle memory carries over.
-            .child(
-                div()
-                    .id("menu-new-worktree-disabled")
-                    .h(px(28.0))
-                    .px_3()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .text_size(px(13.0))
-                    .text_color(ink_ghost)
-                    .child("New worktree from branch…"),
-            )
+            .child(item(
+                "menu-new-worktree",
+                "New worktree from branch…",
+                false,
+                Box::new(move |this, window, cx| {
+                    this.open_new_worktree_dialog(idx, window, cx);
+                }),
+            ))
             .child(div().h_px().bg(divider).my_1())
             .child(item(
                 "menu-reveal",
                 reveal_in_file_browser_label(),
                 false,
-                Box::new(move |this, cx| this.reveal_in_explorer(idx, cx)),
+                Box::new(move |this, _window, cx| this.reveal_in_explorer(idx, cx)),
             ))
             // "Open in Windows Terminal" is genuinely Windows-only —
             // `wt.exe` doesn't exist on macOS / Linux. Hide the row
@@ -558,21 +611,21 @@ impl Sidebar {
                     "menu-wt",
                     "Open in Windows Terminal",
                     false,
-                    Box::new(move |this, cx| this.open_in_windows_terminal(idx, cx)),
+                    Box::new(move |this, _window, cx| this.open_in_windows_terminal(idx, cx)),
                 )
             }))
             .child(item(
                 "menu-copy-path",
                 "Copy path",
                 false,
-                Box::new(move |this, cx| this.copy_path(idx, cx)),
+                Box::new(move |this, _window, cx| this.copy_path(idx, cx)),
             ))
             .child(div().h_px().bg(divider).my_1())
             .child(item(
                 "menu-remove",
                 "Remove project",
                 true,
-                Box::new(move |this, cx| this.remove_project(idx, cx)),
+                Box::new(move |this, _window, cx| this.remove_project(idx, cx)),
             ))
             // Click on the menu itself shouldn't bubble out and trigger
             // the dismiss handler we install below.

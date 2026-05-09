@@ -965,6 +965,7 @@ dependencies = [
  "gpui-terminal",
  "parking_lot",
  "portable-pty",
+ "uuid",
 ]
 
 [[package]]
