@@ -36,13 +36,13 @@ pub struct Project {
     /// Absolute path to the primary working tree.
     pub path: String,
     /// Default branch — used as the base when creating new worktrees.
-    #[serde(default = "default_branch")]
+    #[serde(default = "default_branch", alias = "default_branch")]
     pub default_branch: String,
     /// Where new worktrees go. `None` = `"{path}.worktrees"`.
-    #[serde(default)]
+    #[serde(default, alias = "worktree_root")]
     pub worktree_root: Option<String>,
     /// Per-project agent override. `None` = use the global default.
-    #[serde(default)]
+    #[serde(default, alias = "default_agent_id")]
     pub default_agent_id: Option<String>,
     /// Sessions persisted across restarts.
     #[serde(default)]
@@ -91,7 +91,7 @@ pub struct Worktree {
     pub path: String,
     #[serde(default)]
     pub branch: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "is_primary")]
     pub is_primary: bool,
 }
 
@@ -102,21 +102,22 @@ pub struct Worktree {
 #[serde(rename_all = "camelCase")]
 pub struct Session {
     pub id: String,
+    #[serde(alias = "worktree_path")]
     pub worktree_path: String,
     #[serde(default)]
     pub branch: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "agent_id")]
     pub agent_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "display_name")]
     pub display_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "worktree_id")]
     pub worktree_id: Option<String>,
     /// ISO 8601 UTC.
-    #[serde(default)]
+    #[serde(default, alias = "last_opened")]
     pub last_opened: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "agent_session_id")]
     pub agent_session_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "closed_at")]
     pub closed_at: Option<String>,
 }
 
@@ -380,6 +381,68 @@ mod tests {
         assert!(written.contains("\"isPrimary\""), "{written}");
         assert!(!written.contains("\"default_branch\""), "{written}");
         assert!(!written.contains("\"worktree_path\""), "{written}");
+    }
+
+    /// Pre-PR-58 the Rust port wrote snake_case keys. A `projects.json`
+    /// produced by that older binary must still load cleanly after
+    /// flipping to camelCase, otherwise users running the dev build
+    /// would see all renamed fields silently default to their zero
+    /// values and the next save would overwrite the file with the
+    /// defaults — exactly the data-loss footgun this PR is closing.
+    /// `#[serde(alias = "...")]` on each renamed field accepts both
+    /// shapes during deserialization; saves still write camelCase.
+    #[test]
+    fn loads_legacy_snake_case_fixture_without_data_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.json");
+        let snake_json = r#"{
+          "version": 1,
+          "projects": [
+            {
+              "id": "p1",
+              "name": "Repo",
+              "path": "C:\\repos\\repo",
+              "default_branch": "develop",
+              "worktree_root": "C:\\repos\\repo.worktrees",
+              "default_agent_id": "claude",
+              "sessions": [
+                {
+                  "id": "s1",
+                  "worktree_path": "C:\\repos\\repo",
+                  "branch": "develop",
+                  "agent_id": "claude",
+                  "display_name": "main shell",
+                  "worktree_id": "primary",
+                  "last_opened": "2026-04-01T10:00:00+00:00",
+                  "agent_session_id": "abc-123",
+                  "closed_at": null
+                }
+              ],
+              "worktrees": [
+                { "id": "primary", "path": "C:\\repos\\repo", "branch": "develop", "is_primary": true }
+              ]
+            }
+          ]
+        }"#;
+        std::fs::write(&path, snake_json).unwrap();
+
+        let cfg = ProjectsConfig::load_from(&path).unwrap();
+        let p = &cfg.projects[0];
+        assert_eq!(p.default_branch, "develop", "default_branch must survive");
+        assert_eq!(
+            p.worktree_root.as_deref(),
+            Some("C:\\repos\\repo.worktrees"),
+            "worktree_root must survive"
+        );
+        assert_eq!(p.default_agent_id.as_deref(), Some("claude"));
+        let s = &p.sessions[0];
+        assert_eq!(s.worktree_path, "C:\\repos\\repo", "worktree_path must survive");
+        assert_eq!(s.agent_id.as_deref(), Some("claude"));
+        assert_eq!(s.display_name.as_deref(), Some("main shell"));
+        assert_eq!(s.worktree_id.as_deref(), Some("primary"));
+        assert_eq!(s.last_opened.as_deref(), Some("2026-04-01T10:00:00+00:00"));
+        assert_eq!(s.agent_session_id.as_deref(), Some("abc-123"));
+        assert!(p.worktrees[0].is_primary, "is_primary must survive");
     }
 
     /// Load a file containing agent overrides → mutate projects → save
