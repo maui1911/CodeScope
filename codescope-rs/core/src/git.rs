@@ -255,25 +255,34 @@ some-future-field foo bar\n";
     use std::process::Command;
     use tempfile::TempDir;
 
-    /// Initialise a fresh repo in a tempdir and produce one commit so
-    /// HEAD points at a real ref. Returns the tempdir (drop = cleanup)
-    /// and the absolute repo path. Uses `-c init.defaultBranch=main`
-    /// so `worktree add -b feat <path>` doesn't trip on Git 2.28+'s
-    /// "no default branch configured" warning, which would still
-    /// succeed but pollute stderr.
-    fn init_repo() -> Option<(TempDir, std::path::PathBuf)> {
+    /// Initialise a fresh repo *inside a per-test tempdir* and produce
+    /// one commit so HEAD points at a real ref. Both the repo and its
+    /// `repo.worktrees/` sibling live under the same `TempDir`, so
+    /// drop = full cleanup and parallel test runs can't collide on
+    /// shared paths in the OS tempdir root. Uses `-c
+    /// init.defaultBranch=main` so `worktree add -b feat <path>`
+    /// doesn't trip on Git 2.28+'s "no default branch configured"
+    /// warning.
+    ///
+    /// Returns the tempdir guard (drop = cleanup), the absolute repo
+    /// path, and the absolute worktrees-root path (already created so
+    /// `git worktree add` doesn't have to).
+    fn init_repo() -> Option<(TempDir, std::path::PathBuf, std::path::PathBuf)> {
         if Command::new("git").arg("--version").output().is_err() {
             eprintln!("skipping: `git` not on PATH");
             return None;
         }
         let dir = tempfile::tempdir().ok()?;
-        let repo = dir.path().to_path_buf();
+        let repo = dir.path().join("repo");
+        let worktrees_root = dir.path().join("repo.worktrees");
+        std::fs::create_dir_all(&repo).ok()?;
+        std::fs::create_dir_all(&worktrees_root).ok()?;
         run(&repo, &["-c", "init.defaultBranch=main", "init", "-q"]);
         // Identity is required for `commit` even with `--allow-empty`.
         run(&repo, &["config", "user.email", "test@example.invalid"]);
         run(&repo, &["config", "user.name", "Test"]);
         run(&repo, &["commit", "--allow-empty", "-m", "init", "-q"]);
-        Some((dir, repo))
+        Some((dir, repo, worktrees_root))
     }
 
     fn run(repo: &Path, args: &[&str]) {
@@ -292,10 +301,8 @@ some-future-field foo bar\n";
 
     #[test]
     fn add_worktree_then_list_includes_new_branch() {
-        let Some((_guard, repo)) = init_repo() else { return };
-        // Worktrees can't be nested inside the primary repo, so place
-        // the sibling next to it like the real C# / Rust UX does.
-        let wt_path = repo.parent().unwrap().join("repo.worktrees").join("feat-x");
+        let Some((_guard, repo, wts_root)) = init_repo() else { return };
+        let wt_path = wts_root.join("feat-x");
 
         add_worktree(&repo, &wt_path, "feat/x", None).expect("add");
 
@@ -317,8 +324,8 @@ some-future-field foo bar\n";
 
     #[test]
     fn remove_worktree_drops_it_from_list() {
-        let Some((_guard, repo)) = init_repo() else { return };
-        let wt_path = repo.parent().unwrap().join("repo.worktrees").join("feat-y");
+        let Some((_guard, repo, wts_root)) = init_repo() else { return };
+        let wt_path = wts_root.join("feat-y");
         add_worktree(&repo, &wt_path, "feat/y", None).expect("add");
         assert_eq!(list_worktrees(&repo).expect("list").len(), 2);
 
@@ -331,9 +338,9 @@ some-future-field foo bar\n";
 
     #[test]
     fn add_worktree_existing_branch_returns_stderr_error() {
-        let Some((_guard, repo)) = init_repo() else { return };
-        let wt1 = repo.parent().unwrap().join("repo.worktrees").join("dup-1");
-        let wt2 = repo.parent().unwrap().join("repo.worktrees").join("dup-2");
+        let Some((_guard, repo, wts_root)) = init_repo() else { return };
+        let wt1 = wts_root.join("dup-1");
+        let wt2 = wts_root.join("dup-2");
         add_worktree(&repo, &wt1, "feat/dup", None).expect("first add");
 
         let err = add_worktree(&repo, &wt2, "feat/dup", None)
