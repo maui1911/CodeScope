@@ -391,10 +391,12 @@ impl Sidebar {
         self.close_menu(cx);
     }
 
-    /// Copy the branch name of a non-primary worktree to the system
-    /// clipboard. The menu row gates itself on `branch.is_some()` so
-    /// this only runs for tracked-branch worktrees, but we double-
-    /// check anyway. Mirrors C#'s `CopyBranchCommand`.
+    /// Copy the worktree's branch name to the system clipboard. The
+    /// menu row gates itself on `branch.is_some()` so this only
+    /// surfaces when the worktree has a tracked branch (detached
+    /// worktrees skip the row), but we double-check inside in case
+    /// the row is reused from a future entry point. Mirrors C#'s
+    /// `CopyBranchCommand`.
     fn copy_worktree_branch(
         &mut self,
         project_idx: usize,
@@ -445,8 +447,16 @@ impl Sidebar {
     }
 
     /// Resolve the worktree's project remote URL, normalise it to
-    /// a browser URL, and open it via the OS handler. Hidden /
-    /// silent if there's no `origin` remote. Mirrors C#'s
+    /// a browser URL, and open it via the OS handler.
+    ///
+    /// **No-op when there's no `origin` remote** — we log to stderr
+    /// and silently return; the menu row stays visible so the user
+    /// gets a friendly explanation rather than a hidden affordance
+    /// that flickers based on async probe state. The C# build
+    /// gates the row up-front via `HasOriginRemote`; doing the
+    /// equivalent here would require a sync `.git/config` scan on
+    /// every render. We can revisit when there's a project-level
+    /// "git capabilities" cache to back it. Mirrors C#'s
     /// `OpenRemoteRepositoryCommand`.
     fn open_worktree_remote_in_browser(
         &mut self,
@@ -1515,19 +1525,29 @@ fn reveal_path_in_file_browser(path: &str) {
     }
 }
 
-/// Open an HTTP(S) URL in the user's default browser. Uses the
-/// platform-native handler — `start <url>` style on Windows,
-/// `open` on macOS, `xdg-open` on Linux. Detached so a slow
-/// browser launch doesn't stall the UI thread.
+/// Open an HTTP(S) URL in the user's default browser. On Windows
+/// we route through `ShellExecuteW` (via `win32_titlebar::shell_open_url`)
+/// rather than `cmd /C start` — the latter would let any `&` / `|`
+/// in the URL be interpreted as command separators by `cmd.exe`,
+/// which is a command-injection risk for a URL we got out of
+/// `git config`. macOS uses `open`, Linux uses `xdg-open`; both
+/// pass arguments verbatim without shell parsing.
 fn open_url_in_browser(url: &str) {
     #[cfg(target_os = "windows")]
-    let result = Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    {
+        crate::win32_titlebar::shell_open_url(url);
+    }
     #[cfg(target_os = "macos")]
-    let result = Command::new("open").arg(url).spawn();
+    {
+        if let Err(err) = Command::new("open").arg(url).spawn() {
+            eprintln!("warning: failed to open URL in browser: {err:#}");
+        }
+    }
     #[cfg(all(unix, not(target_os = "macos")))]
-    let result = Command::new("xdg-open").arg(url).spawn();
-    if let Err(err) = result {
-        eprintln!("warning: failed to open URL in browser: {err:#}");
+    {
+        if let Err(err) = Command::new("xdg-open").arg(url).spawn() {
+            eprintln!("warning: failed to open URL in browser: {err:#}");
+        }
     }
 }
 

@@ -24,10 +24,12 @@ use gpui::Window;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    HTCAPTION, IsZoomed, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SendMessageW,
-    WM_NCLBUTTONDOWN, WM_SYSCOMMAND,
+    HTCAPTION, IsZoomed, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SW_SHOWNORMAL,
+    SendMessageW, WM_NCLBUTTONDOWN, WM_SYSCOMMAND,
 };
+use windows::core::HSTRING;
 
 /// Best-effort HWND extraction. Returns `None` when the window is
 /// in a state where the platform handle isn't available — caller
@@ -105,6 +107,28 @@ pub fn close(window: &Window) {
             WM_SYSCOMMAND,
             Some(WPARAM(SC_CLOSE as usize)),
             Some(LPARAM(0)),
+        );
+    }
+}
+
+/// Open a URL via `ShellExecuteW` ("open" verb). This is the
+/// shell-injection-safe path: `cmd /C start <url>` would let
+/// metacharacters in the URL (`&`, `|`, …) be interpreted as
+/// command separators by `cmd.exe`. ShellExecuteW takes the URL
+/// as an opaque wide string and routes it through the registered
+/// protocol handler without going through a shell — same model
+/// `start` would use under the hood, minus the cmd.exe parsing.
+pub fn shell_open_url(url: &str) {
+    let url_wide = HSTRING::from(url);
+    let verb_wide = HSTRING::from("open");
+    unsafe {
+        let _ = ShellExecuteW(
+            None,
+            &verb_wide,
+            &url_wide,
+            None,
+            None,
+            SW_SHOWNORMAL,
         );
     }
 }

@@ -147,8 +147,14 @@ pub fn pull_ff_only(repo: &Path) -> Result<()> {
 }
 
 /// `git config --get remote.origin.url`. Returns the trimmed URL
-/// string, or `Ok(None)` when the remote isn't configured (so
-/// "Open remote in browser" can hide itself instead of erroring).
+/// string, or `Ok(None)` when the remote isn't configured. Other
+/// failure modes (not a git repo, unreadable config, …) bubble up
+/// as `Err` so callers can distinguish "no origin" from "something
+/// is wrong" — collapsing both into `Ok(None)` would mis-report
+/// genuine errors as "no remote" and silently hide them.
+///
+/// Exit-code conventions: `git config --get` returns 1 specifically
+/// for "key not found"; anything else is a real error.
 pub fn remote_origin_url(repo: &Path) -> Result<Option<String>> {
     let output = Command::new("git")
         .args(["config", "--get", "remote.origin.url"])
@@ -158,13 +164,23 @@ pub fn remote_origin_url(repo: &Path) -> Result<Option<String>> {
         .stderr(Stdio::piped())
         .output()
         .with_context(|| "spawn git config")?;
-    if !output.status.success() {
-        // `git config --get` exits 1 when the key is missing — that's
-        // expected (no origin), not an error.
-        return Ok(None);
+    match output.status.code() {
+        Some(0) => {
+            let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if url.is_empty() { Ok(None) } else { Ok(Some(url)) }
+        }
+        // 1 = "the key was not found"; treat as "no origin".
+        Some(1) => Ok(None),
+        // Anything else (128 = not in a git directory, 129 = bad args,
+        // …) is a real error worth surfacing.
+        Some(code) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(anyhow!("git config --get remote.origin.url exited {code}: {stderr}"))
+        }
+        None => Err(anyhow!(
+            "git config --get remote.origin.url terminated by signal"
+        )),
     }
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if url.is_empty() { Ok(None) } else { Ok(Some(url)) }
 }
 
 /// Convert a git remote URL (HTTPS or SSH) into a browser URL.
@@ -540,6 +556,38 @@ some-future-field foo bar\n";
         assert_eq!(branches[0].name, "main");
         assert!(!branches[0].is_remote);
     }
+
+    #[test]
+    fn remote_origin_url_returns_none_when_unset() {
+        let Some((_guard, repo, _wts)) = init_repo() else { return };
+        // `init_repo` doesn't configure a remote — this should be the
+        // canonical "no origin" case.
+        let result = remote_origin_url(&repo).expect("call ok");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn remote_origin_url_returns_configured_value() {
+        let Some((_guard, repo, _wts)) = init_repo() else { return };
+        run(
+            &repo,
+            &[
+                "config",
+                "remote.origin.url",
+                "git@github.com:foo/bar.git",
+            ],
+        );
+        let result = remote_origin_url(&repo).expect("call ok");
+        assert_eq!(result.as_deref(), Some("git@github.com:foo/bar.git"));
+    }
+
+    // Note: there's no integration test for the error path (e.g.
+    // a corrupt config file) because reproducing one reliably
+    // across hosts is awkward — `git config --get` outside a repo
+    // can succeed with `Ok(None)` if global config is reachable but
+    // doesn't have the key. The exit-code branching in the source
+    // is small enough that the doc + visual review serves better
+    // than a flaky integration test would.
 
     #[test]
     fn add_worktree_existing_branch_returns_stderr_error() {
