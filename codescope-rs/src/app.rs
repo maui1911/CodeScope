@@ -32,9 +32,9 @@ use codescope_terminal::{
     TerminalView,
 };
 use gpui::{
-    AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, ParentElement, Render, SharedString, Styled, Window, WindowBounds,
-    div, px,
+    AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Window, WindowBounds, WindowControlArea, div, px,
 };
 use parking_lot::Mutex;
 
@@ -455,6 +455,77 @@ impl Render for AppShell {
             )
             .child("+");
 
+        // The drag region fills the gap between the "+" button and the
+        // caption controls so the user can grab the bar to move the
+        // window. `window_control_area(Drag)` annotates the hitbox so
+        // Windows snap-layouts and double-click-to-maximise behave like
+        // the rest of the OS; `start_window_move()` is the explicit
+        // drag-initiate for platforms that don't infer it from the
+        // hitbox (X11 / Wayland).
+        let drag_region = div()
+            .id("titlebar-drag")
+            .flex_grow()
+            .h(px(40.0))
+            .window_control_area(WindowControlArea::Drag)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, window, _| window.start_window_move()),
+            )
+            .on_click(cx.listener(|_, event: &ClickEvent, window, _| {
+                // Double-click toggles maximise / restore — matches the
+                // Windows + macOS native title-bar behaviour the user
+                // would normally get for free if we hadn't claimed the
+                // bar with `appears_transparent: true`.
+                if event.click_count() >= 2 {
+                    window.zoom_window();
+                }
+            }));
+
+        // Caption controls: minimise, maximise/restore, close.
+        // 46×40 hitboxes hugging the right edge of the strip, styled
+        // to match the rest of the chrome (ink_dim foreground on
+        // transparent, frost-10 hover; close hover-red).
+        // `window_control_area(...)` annotates the hitbox so Windows
+        // snap-layouts and the platform's accessibility tree know
+        // which native control each button maps to.
+        let ink = theme::ink(&theme);
+        let ink_dim = theme::ink_dim(&theme);
+        let frost_hover = theme::frost_10(&theme);
+        let close_hover_bg = theme::danger(&theme);
+        let caption_base = move |id: &'static str, area: WindowControlArea, glyph: &'static str| {
+            div()
+                .id(id)
+                .h(px(40.0))
+                .w(px(46.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(11.0))
+                .text_color(ink_dim)
+                .cursor_pointer()
+                .window_control_area(area)
+                .child(glyph)
+        };
+
+        let minimize_btn = caption_base("titlebar-min", WindowControlArea::Min, "—")
+            .hover(move |s| s.bg(frost_hover).text_color(ink))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, window, _| window.minimize_window()),
+            );
+        let maximize_btn = caption_base("titlebar-max", WindowControlArea::Max, "▢")
+            .hover(move |s| s.bg(frost_hover).text_color(ink))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, window, _| window.zoom_window()),
+            );
+        let close_btn = caption_base("titlebar-close", WindowControlArea::Close, "✕")
+            .hover(move |s| s.bg(close_hover_bg).text_color(ink))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, window, _| window.remove_window()),
+            );
+
         let tab_strip = div()
             .h(px(40.0))
             .flex()
@@ -463,7 +534,11 @@ impl Render for AppShell {
             .border_color(theme::divider(&theme))
             .bg(theme::elevated(&theme))
             .children(tabs)
-            .child(new_tab_button);
+            .child(new_tab_button)
+            .child(drag_region)
+            .child(minimize_btn)
+            .child(maximize_btn)
+            .child(close_btn);
 
         let body = if let Some(terminal) = active_terminal {
             div().size_full().child(terminal).into_any_element()
