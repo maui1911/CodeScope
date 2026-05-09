@@ -21,15 +21,32 @@
 //! └───────────────┘
 //! ```
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use codescope_core::{AppPaths, LayoutState, Project, ProjectsConfig, Theme};
+use codescope_core::{
+    AppPaths, LayoutState, Project, ProjectsConfig, Session, Theme, Worktree, git,
+};
 use gpui::{
-    Context, InteractiveElement, IntoElement, MouseButton, ParentElement, PathPromptOptions,
-    Render, SharedString, Styled, Window, div, px,
+    AnyElement, Context, EventEmitter, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, PathPromptOptions, Render, SharedString, Styled, Window, div, px,
 };
 
 use crate::theme;
+
+/// Events the sidebar emits to the AppShell. Sidebar owns project /
+/// session persistence; AppShell owns terminals + tab strip. They meet
+/// here.
+#[derive(Clone, Debug)]
+pub enum SidebarEvent {
+    /// User asked us to open a session in `working_directory`. Could
+    /// be a freshly-created worktree or an existing one being
+    /// re-opened — the receiver doesn't need to care.
+    OpenSession {
+        working_directory: PathBuf,
+        title: SharedString,
+    },
+}
 
 /// Width of the sidebar pane. The C# build uses 240 with a
 /// resizable splitter; we keep it fixed for now and add the splitter
@@ -144,6 +161,82 @@ impl Sidebar {
         .detach();
     }
 
+    /// Spin up a brand-new session under the project at `idx`. Creates
+    /// a fresh worktree on a `session-N` branch (next free index),
+    /// records the worktree + session in `projects.json`, then asks
+    /// the AppShell to open a tab in the new worktree path.
+    ///
+    /// Synchronous for now: `git worktree add` is fast on a normal
+    /// repo (fractions of a second) and shifting it onto a background
+    /// task means juggling the `Project` clone across an await point.
+    /// Move it async when somebody complains about the tiny stutter.
+    pub fn new_session(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let Some(project) = self.projects.projects.get(idx) else {
+            return;
+        };
+        let branch = project.next_session_branch_name();
+        let worktree_path = project.worktree_path_for(&branch);
+        let repo_path = PathBuf::from(&project.path);
+        let base = project.default_branch.clone();
+        let project_name = project.name.clone();
+
+        // Create the worktree on disk first. If git fails, leave both
+        // disk and projects.json untouched and surface the message.
+        if let Err(err) =
+            git::add_worktree(&repo_path, &worktree_path, &branch, Some(&base))
+        {
+            eprintln!("warning: git worktree add failed: {err:#}");
+            return;
+        }
+
+        // Persist the new Worktree + Session under the project,
+        // clone-then-save so a write failure rolls everything back.
+        let worktree_id = uuid::Uuid::new_v4().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let worktree_path_str = worktree_path.to_string_lossy().into_owned();
+        let mut next = self.projects.clone();
+        let project_mut = &mut next.projects[idx];
+        project_mut.worktrees.push(Worktree {
+            id: worktree_id.clone(),
+            path: worktree_path_str.clone(),
+            branch: Some(branch.clone()),
+            is_primary: false,
+        });
+        project_mut.sessions.push(Session {
+            id: session_id,
+            worktree_path: worktree_path_str.clone(),
+            branch: Some(branch.clone()),
+            agent_id: project_mut.default_agent_id.clone(),
+            display_name: None,
+            worktree_id: Some(worktree_id),
+            last_opened: Some(now_iso8601()),
+            agent_session_id: None,
+            closed_at: None,
+        });
+        if let Err(err) = next.save(&self.paths) {
+            eprintln!(
+                "warning: failed to save projects.json after creating worktree at {}: {err:#}",
+                worktree_path_str,
+            );
+            // The worktree is still on disk — leaving it there is the
+            // safer call (user can `git worktree remove` if needed)
+            // than racing to undo it and possibly leaving partial
+            // state. Surface the failure and bail.
+            return;
+        }
+        self.projects = next;
+
+        // Tell the AppShell to open a tab in the new worktree. Tab
+        // title combines project name + branch so multiple sessions
+        // on the same project stay distinguishable in the strip.
+        let title: SharedString = format!("{project_name}/{branch}").into();
+        cx.emit(SidebarEvent::OpenSession {
+            working_directory: worktree_path,
+            title,
+        });
+        cx.notify();
+    }
+
     /// Append a project at `path` and persist. Newly-added project
     /// becomes the selection — the user just chose it, so dropping
     /// them straight into it is what they expect.
@@ -241,7 +334,8 @@ impl Render for Sidebar {
             None
         };
 
-        let project_rows = rows.into_iter().map(|(idx, id, name)| {
+        let mut project_rows: Vec<AnyElement> = Vec::new();
+        for (idx, id, name) in rows {
             let active = selected == Some(idx);
             let bg = if active {
                 theme::frost_10(&theme)
@@ -261,29 +355,61 @@ impl Render for Sidebar {
             let frost_hover = theme::frost_10(&theme);
             let ink_hover = theme::ink(&theme);
 
-            div()
-                .id(("project", id_hash(&id)))
-                .h(px(32.0))
-                .flex()
-                .flex_row()
-                .items_center()
-                .pr_3()
-                .border_l_2()
-                .border_color(rail)
-                .pl(px(10.0)) // 12px - 2px border = 10
-                .bg(bg)
-                .text_color(text_color)
-                .text_size(px(13.0))
-                .cursor_pointer()
-                .hover(move |s| {
-                    if active { s } else { s.bg(frost_hover).text_color(ink_hover) }
-                })
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| this.select(idx, cx)),
-                )
-                .child(div().flex_grow().truncate().child(name))
-        });
+            project_rows.push(
+                div()
+                    .id(("project", id_hash(&id)))
+                    .h(px(32.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .pr_3()
+                    .border_l_2()
+                    .border_color(rail)
+                    .pl(px(10.0)) // 12px - 2px border = 10
+                    .bg(bg)
+                    .text_color(text_color)
+                    .text_size(px(13.0))
+                    .cursor_pointer()
+                    .hover(move |s| {
+                        if active { s } else { s.bg(frost_hover).text_color(ink_hover) }
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.select(idx, cx)),
+                    )
+                    .child(div().flex_grow().truncate().child(name))
+                    .into_any_element(),
+            );
+
+            // "+ new session" affordance under the active project. Lives
+            // here (not in the heading) so the action is visually scoped
+            // to the project it operates on. Indented past the rail
+            // border so it reads as a child of the row above.
+            if active {
+                let frost_session = theme::frost_10(&theme);
+                let ink_session = theme::ink(&theme);
+                project_rows.push(
+                    div()
+                        .id(("new-session", id_hash(&id)))
+                        .h(px(28.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .pl(px(24.0))
+                        .pr_3()
+                        .text_size(px(12.0))
+                        .text_color(theme::ink_ghost(&theme))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(frost_session).text_color(ink_session))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| this.new_session(idx, cx)),
+                        )
+                        .child("+ new session")
+                        .into_any_element(),
+                );
+            }
+        }
 
         let mut body = div()
             .flex()
@@ -306,6 +432,47 @@ impl Render for Sidebar {
             .child(div().h_px().bg(theme::divider(&theme)))
             .child(body)
     }
+}
+
+impl EventEmitter<SidebarEvent> for Sidebar {}
+
+/// ISO 8601 / RFC 3339 UTC timestamp without sub-second precision —
+/// matches what the C# build writes for `lastOpened`. Bare-bones
+/// formatter (no `chrono` dep) because we only need to *write* it;
+/// nobody parses it back into a typed time on this side yet.
+fn now_iso8601() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Days-from-epoch arithmetic for a Z-suffixed UTC string. Good
+    // enough for a "when did the user last touch this" record; not
+    // a stand-in for real time math.
+    let days = (secs / 86_400) as i64;
+    let secs_of_day = secs % 86_400;
+    let h = secs_of_day / 3600;
+    let m = (secs_of_day % 3600) / 60;
+    let s = secs_of_day % 60;
+    let (y, mo, d) = days_to_ymd(days);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+/// Days-since-1970-01-01 → (year, month, day). Civil-from-days, the
+/// algorithm from Howard Hinnant's date library — branch-free and
+/// correct for the full proleptic Gregorian range we care about.
+fn days_to_ymd(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as i64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let y = (if m <= 2 { y + 1 } else { y }) as i32;
+    (y, m, d)
 }
 
 /// Cheap hash for use as a gpui element id derived from a string id.

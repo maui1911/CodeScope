@@ -13,7 +13,7 @@
 //! because users can rename or relocate a worktree without breaking
 //! cross-references.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -76,6 +76,52 @@ impl Project {
             default_agent_id: None,
             sessions: Vec::new(),
             worktrees: Vec::new(),
+        }
+    }
+
+    /// Where new worktrees go for this project. Honours
+    /// `worktree_root` if set, otherwise falls back to
+    /// `"{path}.worktrees"` — matches the C# build's default and keeps
+    /// worktrees on the same volume as the primary tree (fast `git
+    /// worktree add` because the object database is shared).
+    pub fn worktree_root_path(&self) -> PathBuf {
+        match &self.worktree_root {
+            Some(root) => PathBuf::from(root),
+            None => PathBuf::from(format!("{}.worktrees", self.path)),
+        }
+    }
+
+    /// Absolute path of the worktree we'd create for a session on
+    /// `branch`. The branch name is used as the leaf folder name.
+    /// Slashes in branch names (`feature/foo`) become nested dirs,
+    /// which is what `git worktree add` does anyway.
+    pub fn worktree_path_for(&self, branch: &str) -> PathBuf {
+        self.worktree_root_path().join(branch)
+    }
+
+    /// Pick the next free `session-N` branch name. Walks both existing
+    /// `sessions` (closed-or-open records) and `worktrees` so we don't
+    /// clash with a branch that's still checked out somewhere. Starts
+    /// at `1` and counts up — gaps are fine, we just want uniqueness.
+    pub fn next_session_branch_name(&self) -> String {
+        let mut taken: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for s in &self.sessions {
+            if let Some(b) = s.branch.as_deref() {
+                taken.insert(b);
+            }
+        }
+        for w in &self.worktrees {
+            if let Some(b) = w.branch.as_deref() {
+                taken.insert(b);
+            }
+        }
+        let mut n: u32 = 1;
+        loop {
+            let candidate = format!("session-{n}");
+            if !taken.contains(candidate.as_str()) {
+                return candidate;
+            }
+            n += 1;
         }
     }
 }
@@ -241,6 +287,57 @@ mod tests {
     fn new_project_falls_back_when_path_has_no_leaf() {
         let p = Project::new("/".into());
         assert_eq!(p.name, "project");
+    }
+
+    #[test]
+    fn worktree_root_path_defaults_to_path_dot_worktrees() {
+        let p = Project::new("/repos/foo".into());
+        assert_eq!(p.worktree_root_path(), PathBuf::from("/repos/foo.worktrees"));
+    }
+
+    #[test]
+    fn worktree_root_path_honours_explicit_override() {
+        let mut p = Project::new("/repos/foo".into());
+        p.worktree_root = Some("/elsewhere/wt".into());
+        assert_eq!(p.worktree_root_path(), PathBuf::from("/elsewhere/wt"));
+    }
+
+    #[test]
+    fn worktree_path_for_joins_branch() {
+        let p = Project::new("/repos/foo".into());
+        assert_eq!(
+            p.worktree_path_for("session-1"),
+            PathBuf::from("/repos/foo.worktrees").join("session-1"),
+        );
+    }
+
+    #[test]
+    fn next_session_branch_name_starts_at_one() {
+        let p = Project::new("/repos/foo".into());
+        assert_eq!(p.next_session_branch_name(), "session-1");
+    }
+
+    #[test]
+    fn next_session_branch_name_skips_taken() {
+        let mut p = Project::new("/repos/foo".into());
+        p.worktrees.push(Worktree {
+            id: "w1".into(),
+            path: "/repos/foo.worktrees/session-1".into(),
+            branch: Some("session-1".into()),
+            is_primary: false,
+        });
+        p.sessions.push(Session {
+            id: "s2".into(),
+            worktree_path: "/repos/foo.worktrees/session-2".into(),
+            branch: Some("session-2".into()),
+            agent_id: None,
+            display_name: None,
+            worktree_id: None,
+            last_opened: None,
+            agent_session_id: None,
+            closed_at: None,
+        });
+        assert_eq!(p.next_session_branch_name(), "session-3");
     }
 
     #[test]

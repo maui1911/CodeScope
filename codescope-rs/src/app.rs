@@ -38,7 +38,7 @@ use gpui::{
 };
 use parking_lot::Mutex;
 
-use crate::sidebar::Sidebar;
+use crate::sidebar::{Sidebar, SidebarEvent};
 use crate::theme;
 
 /// How often the window-state debounce loop wakes up to check whether
@@ -92,6 +92,31 @@ impl AppShell {
         let sidebar = cx.new(|_| {
             Sidebar::new(projects, layout, theme.clone(), paths.clone())
         });
+
+        // Sidebar drives session lifecycle; we drive terminals + tabs.
+        // The `OpenSession` event is the single hand-off — sidebar
+        // builds the worktree and persists, we open a tab in it.
+        // `subscribe_in` (vs plain `subscribe`) gives the handler a
+        // `&mut Window`, which `spawn_tab_in` needs to focus the new
+        // tab's terminal.
+        cx.subscribe_in(
+            &sidebar,
+            window,
+            |this, _emitter, event, window, cx| match event {
+                SidebarEvent::OpenSession {
+                    working_directory,
+                    title,
+                } => {
+                    this.spawn_tab_in(
+                        Some(working_directory.clone()),
+                        Some(title.clone()),
+                        window,
+                        cx,
+                    );
+                }
+            },
+        )
+        .detach();
         let pending_window_save: Arc<Mutex<Option<PendingWindowSave>>> = Arc::new(Mutex::new(None));
 
         // Persist live window geometry. The observer fires for every
@@ -157,6 +182,26 @@ impl AppShell {
     /// projects yet) the shell starts in whatever cwd the binary
     /// inherited.
     fn spawn_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Pull project context from the sidebar — clone the path +
+        // name so we don't hold a borrow across `cx.new` further down.
+        let (working_directory, title) = match self.sidebar.read(cx).active_project() {
+            Some(p) => (Some(std::path::PathBuf::from(&p.path)), Some(p.name.clone().into())),
+            None => (None, None),
+        };
+        self.spawn_tab_in(working_directory, title, window, cx);
+    }
+
+    /// Same as [`Self::spawn_tab`] but with explicit cwd + tab title.
+    /// Used by the sidebar's session orchestration: a new worktree
+    /// becomes a new tab rooted in that worktree, titled
+    /// `{project}/{branch}`.
+    fn spawn_tab_in(
+        &mut self,
+        working_directory: Option<std::path::PathBuf>,
+        title: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let shell = std::env::var("CODESCOPE_SHELL")
             .ok()
             .map(|program| Shell::new(program, Vec::new()))
@@ -173,17 +218,6 @@ impl AppShell {
         env.insert("COLORTERM".into(), "truecolor".into());
         env.insert("TERM_PROGRAM".into(), "CodeScope".into());
         env.insert("TERM_PROGRAM_VERSION".into(), "0.0.1".into());
-
-        // Pull project context from the sidebar — clone the path +
-        // name so we don't hold a borrow across `cx.new` further down.
-        let active_project = self
-            .sidebar
-            .read(cx)
-            .active_project()
-            .map(|p| (p.path.clone(), p.name.clone()));
-        let working_directory = active_project
-            .as_ref()
-            .map(|(path, _)| std::path::PathBuf::from(path));
 
         // Build the terminal palette + cursor preset from the active
         // theme + settings. Cloned per spawn so each tab carries its
@@ -221,10 +255,7 @@ impl AppShell {
         let terminal = cx.new(|cx| TerminalView::new_full(backend, palette, font, cx));
         let id = self.next_id;
         self.next_id += 1;
-        let title: SharedString = match active_project {
-            Some((_, name)) => name.into(),
-            None => format!("Terminal {}", id + 1).into(),
-        };
+        let title: SharedString = title.unwrap_or_else(|| format!("Terminal {}", id + 1).into());
         self.tabs.push(Tab { id, title, terminal });
         let new_idx = self.tabs.len() - 1;
         self.activate_tab(new_idx, window, cx);
