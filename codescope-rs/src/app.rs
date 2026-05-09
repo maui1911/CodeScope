@@ -1085,6 +1085,7 @@ impl AppShell {
         let divider = theme::divider(theme);
         let ink = theme::ink(theme);
         let ink_dim = theme::ink_dim(theme);
+        let ink_ghost = theme::ink_ghost(theme);
         let frost = theme::frost_10(theme);
         let danger = theme::danger(theme);
 
@@ -1095,15 +1096,19 @@ impl AppShell {
                     danger_row: bool,
                     on_click: Action|
          -> gpui::Stateful<gpui::Div> {
+            // Disabled rows step down a tone to `ink_ghost` so the
+            // user sees the affordance is greyed-out without having
+            // to hover. Enabled rows keep the regular `ink_dim` /
+            // `danger` palette.
             let base_color = if !enabled {
-                ink_dim
+                ink_ghost
             } else if danger_row {
                 danger
             } else {
                 ink_dim
             };
             let hover_color = if !enabled {
-                ink_dim
+                ink_ghost
             } else if danger_row {
                 danger
             } else {
@@ -1278,6 +1283,13 @@ impl AppShell {
     /// Close every tab in `group_id` *except* the one identified by
     /// `keep_tab_id`. Mirrors the C# build's "Close others" tab
     /// menu row. The kept tab becomes the group's active one.
+    ///
+    /// Resolves `keep_tab_id` *before* mutating: if the tab vanished
+    /// between menu-open and click (rare but possible — concurrent
+    /// close, drag-out), we abort silently. Without this guard the
+    /// `retain` would drop every tab in the group and leave it in a
+    /// broken empty state (it wouldn't even auto-collapse — that
+    /// path lives in `close_tab`).
     fn close_other_tabs_in_group(
         &mut self,
         group_id: u64,
@@ -1289,16 +1301,26 @@ impl AppShell {
             self.close_tab_menu(cx);
             return;
         };
-        self.groups[group_idx].tabs.retain(|t| t.id == keep_tab_id);
-        if self.groups[group_idx].tabs.is_empty() {
+        // Refuse to mutate if the target tab is gone — preserves the
+        // existing tab list rather than wiping it via `retain`.
+        if !self.groups[group_idx].tabs.iter().any(|t| t.id == keep_tab_id) {
             self.close_tab_menu(cx);
             return;
         }
+        self.groups[group_idx].tabs.retain(|t| t.id == keep_tab_id);
         // Only the kept tab remains — pin the active selection to it.
+        let prev_focused = self.focused_group;
         self.groups[group_idx].active_tab = 0;
         self.activate_tab(group_idx, 0, window, cx);
         self.close_tab_menu(cx);
-        self.save_layout();
+        // `activate_tab` only writes layout when focus changes. When
+        // the menu was triggered on the already-focused group it
+        // won't have saved, so we still need to here. When it *did*
+        // change focus, `activate_tab` already saved and another
+        // call would just be redundant disk I/O.
+        if prev_focused == group_idx {
+            self.save_layout();
+        }
     }
 
     /// Close every tab in `group_id` whose position is to the right
@@ -1328,10 +1350,15 @@ impl AppShell {
         if self.groups[group_idx].active_tab > pivot_pos {
             self.groups[group_idx].active_tab = pivot_pos;
         }
+        let prev_focused = self.focused_group;
         let active = self.groups[group_idx].active_tab;
         self.activate_tab(group_idx, active, window, cx);
         self.close_tab_menu(cx);
-        self.save_layout();
+        // Only save here if `activate_tab` didn't — same dedupe as
+        // `close_other_tabs_in_group`.
+        if prev_focused == group_idx {
+            self.save_layout();
+        }
     }
 
     /// Reparent a tab from one group to another by id. Triggered by
