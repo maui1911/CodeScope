@@ -508,6 +508,7 @@ impl Sidebar {
                     cx.emit(crate::sidebar::SidebarEvent::OpenSession {
                         working_directory: std::path::PathBuf::from(&folder),
                         title: format!("{project_name} · {branch}").into(),
+                        auto_type: None,
                     });
                 }
             }
