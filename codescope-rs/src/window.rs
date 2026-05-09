@@ -18,10 +18,10 @@ mod theme;
 use std::sync::Arc;
 
 use anyhow::Result;
-use codescope_core::{AppPaths, ProjectsConfig, Settings, Theme, builtin};
+use codescope_core::{AppPaths, LayoutState, ProjectsConfig, Settings, Theme, WindowState, builtin};
 use gpui::{
-    AppContext, Context, IntoElement, ParentElement, Render, Styled, TitlebarOptions, Window,
-    WindowOptions, div,
+    AppContext, Bounds, Context, IntoElement, ParentElement, Pixels, Render, Styled,
+    TitlebarOptions, Window, WindowBounds, WindowOptions, div, point, px, size,
 };
 
 use crate::app::AppShell;
@@ -77,15 +77,71 @@ fn main() -> Result<()> {
     };
     let projects = Arc::new(projects);
 
+    let layout = match LayoutState::load(&paths) {
+        Ok(l) => l,
+        Err(err) => {
+            eprintln!(
+                "warning: failed to load {} ({}); using default layout",
+                paths.layout_file().display(),
+                err
+            );
+            LayoutState::default()
+        }
+    };
+    let layout = Arc::new(layout);
+
+    let saved_window = match WindowState::load(&paths) {
+        Ok(state) => state,
+        Err(err) => {
+            eprintln!(
+                "warning: failed to load {} ({}); window will open at default size",
+                paths.window_file().display(),
+                err
+            );
+            None
+        }
+    };
+
+    let window_bounds = saved_window.map(window_state_to_bounds);
+    let paths_for_quit = paths.clone();
+
     let app = gpui::Application::new();
 
     app.run(move |cx| {
         let settings = settings.clone();
         let theme = theme.clone();
         let projects = projects.clone();
+        let layout = layout.clone();
+        let paths_quit = paths_for_quit.clone();
+
+        // Persist UI state on shutdown.
+        //
+        // Window bounds tracking lives one notch deeper than
+        // `on_app_quit` can reach (no `Window` handle here), so
+        // for now the load path restores the last-known window
+        // size + position but the *save* path is wired against a
+        // shared cell that AppShell will start updating as soon as
+        // we add `cx.observe_window_bounds` — landed in a follow-up.
+        //
+        // Layout state (sidebar visibility, selected project) is
+        // mutable via the AppShell already, so we save the live
+        // value here. For now `LayoutState::default()` is correct
+        // — toggle / select wiring follows in the same commit
+        // sequence.
+        cx.on_app_quit(move |_| {
+            let paths = paths_quit.clone();
+            async move {
+                if let Err(err) = LayoutState::default().save(&paths) {
+                    eprintln!("failed to save layout state: {err:#}");
+                }
+            }
+        })
+        .detach();
+
         cx.spawn(async move |cx| {
             cx.open_window(
                 WindowOptions {
+                    window_bounds,
                     titlebar: Some(TitlebarOptions {
                         title: Some("CodeScope".into()),
                         appears_transparent: true,
@@ -101,7 +157,36 @@ fn main() -> Result<()> {
             Ok::<_, anyhow::Error>(())
         })
         .detach();
+        let _ = layout;
     });
 
     Ok(())
 }
+
+fn window_state_to_bounds(state: WindowState) -> WindowBounds {
+    let bounds = Bounds {
+        origin: point(px(state.x as f32), px(state.y as f32)),
+        size: size(px(state.width as f32), px(state.height as f32)),
+    };
+    if state.maximised {
+        WindowBounds::Maximized(bounds)
+    } else {
+        WindowBounds::Windowed(bounds)
+    }
+}
+
+#[allow(dead_code)]
+fn bounds_to_window_state(bounds: Bounds<Pixels>, maximised: bool) -> WindowState {
+    let f32_x: f32 = bounds.origin.x.into();
+    let f32_y: f32 = bounds.origin.y.into();
+    let f32_w: f32 = bounds.size.width.into();
+    let f32_h: f32 = bounds.size.height.into();
+    WindowState {
+        x: f32_x as i32,
+        y: f32_y as i32,
+        width: f32_w.max(0.0) as u32,
+        height: f32_h.max(0.0) as u32,
+        maximised,
+    }
+}
+

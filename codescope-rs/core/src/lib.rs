@@ -13,12 +13,16 @@
 //! lives in the `app` crate. Anything terminal-protocol-bound lives in
 //! `codescope-terminal`.
 
+pub mod layout;
 pub mod paths;
 pub mod projects;
 pub mod settings;
 pub mod theme;
+pub mod window_state;
 
+pub use layout::LayoutState;
 pub use paths::AppPaths;
 pub use projects::{Project, ProjectsConfig, Session, Worktree};
 pub use settings::{CursorSettings, FontSettings, Settings};
 pub use theme::{Rgb, Theme, ThemePalette, builtin};
+pub use window_state::WindowState;
