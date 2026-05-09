@@ -141,10 +141,14 @@ pub struct Sidebar {
     /// against an in-flight `git worktree add` call from the first.
     dialog: Option<NewWorktreeDialogState>,
     /// Per-worktree clean/dirty state, keyed by absolute path.
-    /// Updated by the background poller spawned in `Sidebar::new`;
-    /// `None` = unknown (still loading), `Some(true)` = dirty,
-    /// `Some(false)` = clean. The render loop maps that to a tiny
-    /// status dot next to each worktree row. Mirrors C# build's
+    /// Updated by the background poller spawned via
+    /// `start_dirty_poll`, which `AppShell::new` calls from inside
+    /// the `cx.new(|cx| { … })` closure that builds the Sidebar
+    /// entity (we can't call it from `Sidebar::new` itself because
+    /// that signature has no `Context<Sidebar>`). `None` = unknown
+    /// (still loading), `Some(true)` = dirty, `Some(false)` =
+    /// clean. The render loop maps that to a tiny status dot next
+    /// to each worktree row. Mirrors the C# build's
     /// `WorktreePoller` cache.
     dirty_state: HashMap<String, bool>,
 }
@@ -194,10 +198,11 @@ impl Sidebar {
                 if this.upgrade().is_none() {
                     break;
                 }
-                // Snapshot every worktree path under each project so
-                // the background `git status` calls don't pin an
-                // entity borrow.
-                let paths: Vec<String> = match this.update(cx, |this, _| {
+                // Snapshot every worktree path under each project
+                // into a `HashSet` so duplicates (primary worktree
+                // also listed under `worktrees`, two projects sharing
+                // a path, …) only run `git status` once per tick.
+                let paths: std::collections::HashSet<String> = match this.update(cx, |this, _| {
                     this.projects
                         .projects
                         .iter()
@@ -216,6 +221,7 @@ impl Sidebar {
                     Ok(p) => p,
                     Err(_) => break,
                 };
+                let known: std::collections::HashSet<String> = paths.clone();
                 let updates: Vec<(String, bool)> = cx
                     .background_spawn(async move {
                         paths
@@ -232,6 +238,15 @@ impl Sidebar {
                 if this
                     .update(cx, |this, cx| {
                         let mut changed = false;
+                        // Prune cache entries for paths that no longer
+                        // exist in the current project list — projects
+                        // / worktrees can be removed between ticks and
+                        // the map would otherwise grow stale.
+                        let prev_len = this.dirty_state.len();
+                        this.dirty_state.retain(|path, _| known.contains(path));
+                        if this.dirty_state.len() != prev_len {
+                            changed = true;
+                        }
                         for (path, dirty) in updates {
                             let prev = this.dirty_state.insert(path, dirty);
                             if prev != Some(dirty) {

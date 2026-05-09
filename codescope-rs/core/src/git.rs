@@ -611,6 +611,31 @@ some-future-field foo bar\n";
     // than a flaky integration test would.
 
     #[test]
+    fn is_dirty_false_on_freshly_initialised_repo() {
+        let Some((_guard, repo, _wts)) = init_repo() else { return };
+        assert!(!is_dirty(&repo).expect("call ok"));
+    }
+
+    #[test]
+    fn is_dirty_true_after_creating_an_untracked_file() {
+        let Some((_guard, repo, _wts)) = init_repo() else { return };
+        std::fs::write(repo.join("dirty.txt"), b"hello").expect("write");
+        assert!(is_dirty(&repo).expect("call ok"));
+    }
+
+    #[test]
+    fn is_dirty_true_after_modifying_tracked_file() {
+        let Some((_guard, repo, _wts)) = init_repo() else { return };
+        // Commit a file first so it's tracked, then modify it.
+        std::fs::write(repo.join("README"), b"v1").expect("write");
+        run(&repo, &["add", "README"]);
+        run(&repo, &["commit", "-m", "add README", "-q"]);
+        assert!(!is_dirty(&repo).expect("clean after commit"));
+        std::fs::write(repo.join("README"), b"v2").expect("write");
+        assert!(is_dirty(&repo).expect("dirty after modify"));
+    }
+
+    #[test]
     fn add_worktree_existing_branch_returns_stderr_error() {
         let Some((_guard, repo, wts_root)) = init_repo() else { return };
         let wt1 = wts_root.join("dup-1");
