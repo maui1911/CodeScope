@@ -18,7 +18,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use codescope_core::{Project, Theme, projects::Worktree};
+use codescope_core::{Project, Theme, git::BranchInfo, projects::Worktree};
 use gpui::{
     Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
     ParentElement, SharedString, Styled, Window, anchored, deferred, div, point, px,
@@ -73,6 +73,19 @@ fn folder_leaf(path: &str) -> &str {
     path.rsplit_once(['\\', '/']).map(|(_, leaf)| leaf).unwrap_or(path)
 }
 
+/// Which input field currently receives typed characters from the
+/// dialog's `on_key_down`. `Branch` is the open-dialog default;
+/// `Folder` activates when the user clicks into the folder row to
+/// override the auto-derived path; `BasePopupSearch` activates when
+/// the base-branch dropdown is open and steals focus for type-to-
+/// filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogField {
+    Branch,
+    Folder,
+    BasePopupSearch,
+}
+
 /// Live state of an open dialog. Created by [`Sidebar::open_new_worktree_dialog`]
 /// and dropped when the user confirms or cancels.
 pub struct NewWorktreeDialogState {
@@ -84,11 +97,49 @@ pub struct NewWorktreeDialogState {
     pub folder: String,
     pub error: Option<String>,
     pub focus_handle: FocusHandle,
+    /// Mirrors C#'s `SpawnSession` — defaults to `true` so confirming
+    /// the dialog drops the user inside the new worktree. Toggle in
+    /// the dialog footer flips it; `submit_new_worktree_dialog` gates
+    /// the `OpenSession` event on this flag.
+    pub spawn_session: bool,
+    /// `false` until the user clicks into the FOLDER row and types.
+    /// While `false`, every BRANCH change re-derives the folder; once
+    /// `true`, the user is in control and we stop overwriting their
+    /// edits. Mirrors the C# `BranchBox.TextChanged` heuristic
+    /// ("auto-sync only when the path is empty or still under the
+    /// worktree root").
+    pub folder_overridden: bool,
+    /// Where typed characters land. Click handlers on the BRANCH /
+    /// FOLDER / base-popup search rows flip this.
+    pub focused_field: DialogField,
+    /// Available branches for the base-branch picker. Loaded once at
+    /// dialog open via `git::list_branches`; an Err there yields an
+    /// empty list and a stashed `error` message — the dialog still
+    /// works (the user can pick "(HEAD)") but the picker just shows
+    /// no rows.
+    pub branches: Vec<BranchInfo>,
+    /// Selected base branch by name. `None` = `(HEAD)` (the current
+    /// HEAD of the project's primary worktree). The C# build's
+    /// `(HEAD)` row maps to a null `BaseBranch` for the same reason.
+    pub base_branch: Option<String>,
+    /// Dropdown popover open?
+    pub base_popup_open: bool,
+    /// Filter text typed into the popup search.
+    pub base_query: String,
+    /// Currently-highlighted row in the popup (post-filter index).
+    /// `0` always points at `(HEAD)` since we pin it on top.
+    pub base_selected_idx: usize,
 }
 
 impl NewWorktreeDialogState {
-    pub fn new(idx: usize, project: &Project, focus_handle: FocusHandle) -> Self {
+    pub fn new(
+        idx: usize,
+        project: &Project,
+        branches: Vec<BranchInfo>,
+        focus_handle: FocusHandle,
+    ) -> Self {
         let worktree_root = project.worktree_root_path();
+        let base_branch = resolve_default_base(&branches, &project.default_branch);
         Self {
             project_idx: idx,
             project_name: project.name.clone(),
@@ -98,6 +149,14 @@ impl NewWorktreeDialogState {
             folder: String::new(),
             error: None,
             focus_handle,
+            spawn_session: true,
+            folder_overridden: false,
+            focused_field: DialogField::Branch,
+            branches,
+            base_branch,
+            base_popup_open: false,
+            base_query: String::new(),
+            base_selected_idx: 0,
         }
     }
 
@@ -109,21 +168,92 @@ impl NewWorktreeDialogState {
     }
 
     fn recompute_folder(&mut self) {
-        self.folder = derived_folder(&self.worktree_root, &self.branch);
+        if !self.folder_overridden {
+            self.folder = derived_folder(&self.worktree_root, &self.branch);
+        }
         // A typing change always invalidates a stale error message —
         // the user is correcting the input.
         self.error = None;
     }
 
     fn append_char(&mut self, ch: char) {
-        self.branch.push(ch);
-        self.recompute_folder();
+        match self.focused_field {
+            DialogField::Branch => {
+                self.branch.push(ch);
+                self.recompute_folder();
+            }
+            DialogField::Folder => {
+                // First keystroke flips the override flag so the auto-
+                // derive doesn't fight the user's edit on the next
+                // BRANCH change.
+                self.folder_overridden = true;
+                self.folder.push(ch);
+                self.error = None;
+            }
+            DialogField::BasePopupSearch => {
+                self.base_query.push(ch);
+                self.base_selected_idx = 0;
+            }
+        }
     }
 
     fn pop_char(&mut self) {
-        self.branch.pop();
-        self.recompute_folder();
+        match self.focused_field {
+            DialogField::Branch => {
+                self.branch.pop();
+                self.recompute_folder();
+            }
+            DialogField::Folder => {
+                self.folder_overridden = true;
+                self.folder.pop();
+                self.error = None;
+            }
+            DialogField::BasePopupSearch => {
+                self.base_query.pop();
+                self.base_selected_idx = 0;
+            }
+        }
     }
+
+    /// Filtered branch list for the base-branch popup. `(HEAD)` is
+    /// never in this vec — the renderer pins it as a sentinel row at
+    /// the top of the popup. LOCAL group first, then REMOTE — within
+    /// each group the original alphabetic sort from `list_branches`
+    /// is preserved.
+    pub fn filtered_branches(&self) -> Vec<&BranchInfo> {
+        filter_branches(&self.branches, &self.base_query)
+    }
+}
+
+/// Pure helper used by [`NewWorktreeDialogState::filtered_branches`].
+/// Extracted so the filter logic can be unit-tested without
+/// constructing a `NewWorktreeDialogState` (which carries a real
+/// `FocusHandle` we don't have in test scope).
+pub fn filter_branches<'a>(
+    branches: &'a [BranchInfo],
+    query: &str,
+) -> Vec<&'a BranchInfo> {
+    let q = query.trim().to_lowercase();
+    let matches = |b: &&BranchInfo| q.is_empty() || b.name.to_lowercase().contains(&q);
+    let mut out: Vec<&BranchInfo> =
+        branches.iter().filter(|b| !b.is_remote).filter(matches).collect();
+    out.extend(branches.iter().filter(|b| b.is_remote).filter(matches));
+    out
+}
+
+/// Pure helper used by [`NewWorktreeDialogState::new`] to pick the
+/// default base. Returns `Some(default_branch)` when the project's
+/// declared default branch exists as a *local* ref in the loaded
+/// list; otherwise `None` (which the dialog renders as `(HEAD)`).
+/// Mirrors C#'s `req.DefaultBase ?? first-local-match ?? (HEAD)`.
+pub fn resolve_default_base(
+    branches: &[BranchInfo],
+    default_branch: &str,
+) -> Option<String> {
+    branches
+        .iter()
+        .find(|b| !b.is_remote && b.name == default_branch)
+        .map(|b| b.name.clone())
 }
 
 impl Sidebar {
@@ -140,9 +270,23 @@ impl Sidebar {
         let Some(project) = self.projects().projects.get(idx) else {
             return;
         };
+        // Load branches once at open. An I/O error here doesn't stop
+        // the dialog — the user can still pick `(HEAD)` and create —
+        // but we stash the error so the picker shows it instead of
+        // an empty list. Cloning the project path so we don't hold a
+        // borrow across the `cx.focus_handle()` call.
+        let project_path = project.path.clone();
+        let project_clone = project.clone();
+        let (branches, branch_load_err) =
+            match codescope_core::git::list_branches(Path::new(&project_path)) {
+                Ok(bs) => (bs, None),
+                Err(err) => (Vec::new(), Some(format!("branch list failed: {err:#}"))),
+            };
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
-        let state = NewWorktreeDialogState::new(idx, project, focus_handle);
+        let mut state =
+            NewWorktreeDialogState::new(idx, &project_clone, branches, focus_handle);
+        state.error = branch_load_err;
         self.set_dialog(Some(state));
         self.close_menu_no_notify();
         cx.notify();
@@ -154,6 +298,116 @@ impl Sidebar {
         if self.take_dialog().is_some() {
             cx.notify();
         }
+    }
+
+    /// Switch which dialog field receives typed characters. Click
+    /// handlers on BRANCH / FOLDER call this. Closes the base popup
+    /// as a side effect — they're mutually exclusive focus targets.
+    pub fn focus_dialog_field(
+        &mut self,
+        field: DialogField,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = self.dialog_mut() {
+            state.focused_field = field;
+            state.base_popup_open = false;
+            state.base_query.clear();
+            state.base_selected_idx = 0;
+            cx.notify();
+        }
+    }
+
+    /// Flip the spawn-session toggle. Mirrors clicking the C#
+    /// `SpawnTrack` pill.
+    pub fn toggle_spawn_session(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = self.dialog_mut() {
+            state.spawn_session = !state.spawn_session;
+            cx.notify();
+        }
+    }
+
+    /// Open / close the base-branch dropdown. Opening also moves
+    /// keyboard focus to the popup's filter input so the user can
+    /// type-to-filter without an extra click.
+    pub fn toggle_base_popup(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = self.dialog_mut() {
+            state.base_popup_open = !state.base_popup_open;
+            if state.base_popup_open {
+                state.focused_field = DialogField::BasePopupSearch;
+                state.base_query.clear();
+                state.base_selected_idx = 0;
+            } else if state.focused_field == DialogField::BasePopupSearch {
+                // Closing without picking returns focus to BRANCH —
+                // matches the C# `BasePopup.IsOpen = false; BranchBox.Focus();`.
+                state.focused_field = DialogField::Branch;
+            }
+            cx.notify();
+        }
+    }
+
+    /// Pick a base branch by name (or `None` for `(HEAD)`) and close
+    /// the popup. Returns focus to BRANCH so the user can keep
+    /// editing the branch field. Mirrors C#'s `SetSelectedBase` +
+    /// `BasePopup.IsOpen = false`.
+    pub fn select_base_branch(
+        &mut self,
+        name: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = self.dialog_mut() {
+            state.base_branch = name;
+            state.base_popup_open = false;
+            state.focused_field = DialogField::Branch;
+            state.base_query.clear();
+            state.base_selected_idx = 0;
+            cx.notify();
+        }
+    }
+
+    /// Move the popup highlight up/down. `delta = 1` moves down,
+    /// `-1` up. Clamped to the filtered list length (including the
+    /// pinned `(HEAD)` row at index 0).
+    pub fn move_base_popup_selection(
+        &mut self,
+        delta: isize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.dialog_mut() else { return };
+        let len = state.filtered_branches().len() + 1; // +1 for (HEAD)
+        if len == 0 {
+            return;
+        }
+        let max = len - 1;
+        let cur = state.base_selected_idx as isize;
+        let next = (cur + delta).clamp(0, max as isize);
+        state.base_selected_idx = next as usize;
+        cx.notify();
+    }
+
+    /// Resolve the current popup selection. Index 0 = `(HEAD)`;
+    /// indices 1.. point into the filtered list (locals first, then
+    /// remotes — same ordering as the rendered rows).
+    pub fn confirm_base_popup_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.dialog_mut() else { return };
+        if !state.base_popup_open {
+            return;
+        }
+        let idx = state.base_selected_idx;
+        let name = if idx == 0 {
+            None
+        } else {
+            // Borrow filtered branches transiently to extract the
+            // chosen name, then drop the borrow before calling
+            // `select_base_branch` (which mutates state).
+            state
+                .filtered_branches()
+                .get(idx - 1)
+                .map(|b| b.name.clone())
+        };
+        // Selection apply path is shared with click → reuse it so
+        // the post-conditions stay consistent (focus returns to
+        // BRANCH, query clears, popup closes).
+        self.select_base_branch(name, cx);
     }
 
     /// Confirm. Validates, runs `git worktree add`, appends a
@@ -170,13 +424,15 @@ impl Sidebar {
         let branch = state.branch.trim().to_string();
         let folder = state.folder.clone();
         let project_path = state.project_path.clone();
+        let base_branch = state.base_branch.clone();
+        let spawn_session = state.spawn_session;
 
         let project_name = state.project_name.clone();
         let result = codescope_core::git::add_worktree(
             Path::new(&project_path),
             Path::new(&folder),
             &branch,
-            None,
+            base_branch.as_deref(),
         );
         match result {
             Ok(()) => {
@@ -205,17 +461,21 @@ impl Sidebar {
                 }
                 self.replace_projects(next);
                 self.cancel_new_worktree_dialog(cx);
-                // Spawn a session pinned to the new worktree so the
-                // user lands inside it immediately. Mirrors the C#
-                // dialog's `SpawnSession = true` default. The host
-                // (`AppShell`) catches the event and creates the tab.
-                // Single spaces around `·` to match the C# build's
+                // Spawn a session pinned to the new worktree only when
+                // the toggle is on. Mirrors the C# dialog's
+                // `SpawnSession` flag — defaults to `true` so the
+                // common path drops the user inside the new worktree,
+                // but flipping it off lets them create the worktree
+                // without entering it. Single spaces around `·` to
+                // match the C# build's
                 // `$"{project.Name} · {branch}"` convention in
                 // `MainViewModel.RefreshTabTitlesForWorktree`.
-                cx.emit(crate::sidebar::SidebarEvent::OpenSession {
-                    working_directory: std::path::PathBuf::from(&folder),
-                    title: format!("{project_name} · {branch}").into(),
-                });
+                if spawn_session {
+                    cx.emit(crate::sidebar::SidebarEvent::OpenSession {
+                        working_directory: std::path::PathBuf::from(&folder),
+                        title: format!("{project_name} · {branch}").into(),
+                    });
+                }
             }
             Err(err) => {
                 let msg = err.to_string();
@@ -253,16 +513,6 @@ impl Sidebar {
         let canvas = theme::canvas(theme);
 
         let project_eyebrow: SharedString = state.project_name.to_uppercase().into();
-        let branch_display: SharedString = if state.branch.is_empty() {
-            SharedString::from("")
-        } else {
-            state.branch.clone().into()
-        };
-        let folder_display: SharedString = if state.folder.is_empty() {
-            SharedString::from("…")
-        } else {
-            state.folder.clone().into()
-        };
         let footer_branch: SharedString = if state.branch.is_empty() {
             SharedString::from("…")
         } else {
@@ -273,12 +523,25 @@ impl Sidebar {
         } else {
             folder_leaf(&state.folder).to_string().into()
         };
+        let footer_base: SharedString = state
+            .base_branch
+            .clone()
+            .unwrap_or_else(|| "HEAD".to_string())
+            .into();
         let valid = state.is_valid();
         let error_msg: Option<SharedString> = state
             .error
             .as_ref()
             .map(|e| e.clone().into());
         let focus_handle = state.focus_handle.clone();
+        let focused = state.focused_field;
+        let spawn_session = state.spawn_session;
+        let base_popup_open = state.base_popup_open;
+        let base_label: SharedString = state
+            .base_branch
+            .clone()
+            .unwrap_or_else(|| "(HEAD)".to_string())
+            .into();
 
         // Header — eyebrow (project name) + title.
         let header = div()
@@ -304,43 +567,57 @@ impl Sidebar {
                     .child("New worktree"),
             );
 
-        // Branch field — div styled to look like a textbox. The thin
-        // accent caret is appended only when the field is focused-and-
-        // empty would be invisible otherwise; we always paint it for
-        // simplicity since the dialog grabs focus on open and never
-        // gives it up before close.
-        let placeholder_visible = state.branch.is_empty();
-        let branch_field_inner = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1()
-            .child(
-                div()
-                    .flex_grow()
-                    .text_color(if placeholder_visible { ink_ghost } else { ink })
-                    .child(if placeholder_visible {
-                        SharedString::from("e.g. feat/awesome")
-                    } else {
-                        branch_display
+        // Reusable textbox builder — lays out a single-line input as a
+        // div styled like a WPF TextBox. The thin accent caret is
+        // only painted when this field has focus, which gives the
+        // user visual feedback as they click between BRANCH and
+        // FOLDER.
+        let textbox = |id: &'static str,
+                       value: &str,
+                       placeholder: &'static str,
+                       this_field: DialogField|
+         -> gpui::Stateful<gpui::Div> {
+            let placeholder_visible = value.is_empty();
+            let display: SharedString = if placeholder_visible {
+                SharedString::from(placeholder)
+            } else {
+                value.to_string().into()
+            };
+            let is_focused = focused == this_field && !base_popup_open;
+            let mut inner = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .flex_grow()
+                        .text_color(if placeholder_visible { ink_ghost } else { ink })
+                        .truncate()
+                        .child(display),
+                );
+            if is_focused {
+                inner = inner.child(div().w(px(1.5)).h(px(16.0)).bg(accent));
+            }
+            div()
+                .id(id)
+                .px_3()
+                .py_2()
+                .bg(canvas)
+                .border_1()
+                .border_color(if is_focused { accent } else { divider })
+                .rounded_md()
+                .text_size(px(13.0))
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.focus_dialog_field(this_field, cx);
                     }),
-            )
-            .child(
-                div()
-                    .w(px(1.5))
-                    .h(px(16.0))
-                    .bg(accent),
-            );
-
-        let branch_field = div()
-            .px_3()
-            .py_2()
-            .bg(canvas)
-            .border_1()
-            .border_color(divider)
-            .rounded_md()
-            .text_size(px(13.0))
-            .child(branch_field_inner);
+                )
+                .child(inner)
+        };
 
         let branch_block = div()
             .flex()
@@ -353,9 +630,18 @@ impl Sidebar {
                     .text_color(ink_ghost)
                     .child("BRANCH"),
             )
-            .child(branch_field);
+            .child(textbox(
+                "nw-branch",
+                &state.branch,
+                "e.g. feat/awesome",
+                DialogField::Branch,
+            ));
 
-        // Read-only folder preview.
+        // FOLDER row — editable, but the empty state still shows the
+        // auto-derived path (greyed out so it reads as a hint, not an
+        // edit). We pass the live `state.folder` whether or not the
+        // user has overridden — auto-derive keeps it in sync with the
+        // branch until the first folder keystroke.
         let folder_block = div()
             .flex()
             .flex_col()
@@ -367,12 +653,101 @@ impl Sidebar {
                     .text_color(ink_ghost)
                     .child("FOLDER"),
             )
+            .child(textbox(
+                "nw-folder",
+                &state.folder,
+                "<derived from branch>",
+                DialogField::Folder,
+            ));
+
+        // BASE row — clickable pill that toggles the dropdown popup.
+        // The current selection is rendered inline; a chevron hints
+        // that it's a dropdown. Mirrors the C# `BaseTrigger`.
+        let base_block = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_5()
             .child(
                 div()
-                    .text_size(px(12.0))
-                    .text_color(ink_dim)
-                    .truncate()
-                    .child(folder_display),
+                    .text_size(px(11.0))
+                    .text_color(ink_ghost)
+                    .child("BASE"),
+            )
+            .child(
+                div()
+                    .id("nw-base-trigger")
+                    .px_3()
+                    .py_2()
+                    .bg(canvas)
+                    .border_1()
+                    .border_color(if base_popup_open { accent } else { divider })
+                    .rounded_md()
+                    .text_size(px(13.0))
+                    .text_color(ink)
+                    .cursor_pointer()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_base_popup(cx);
+                        }),
+                    )
+                    .child(div().flex_grow().truncate().child(base_label))
+                    .child(div().text_color(ink_ghost).child("▾")),
+            );
+
+        // SPAWN toggle — pill switch matching the C# `SpawnTrack` /
+        // `SpawnThumb`. Click anywhere flips `spawn_session`. Track
+        // colour reflects state; the label sits next to the pill.
+        let track_bg = if spawn_session { accent } else { divider };
+        let thumb_align = if spawn_session { "right" } else { "left" };
+        let mut track = div()
+            .id("nw-spawn-track")
+            .w(px(34.0))
+            .h(px(18.0))
+            .bg(track_bg)
+            .rounded_full()
+            .flex()
+            .items_center()
+            .px(px(2.0))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.toggle_spawn_session(cx);
+                }),
+            );
+        let thumb = div()
+            .w(px(14.0))
+            .h(px(14.0))
+            .rounded_full()
+            .bg(canvas);
+        // Push thumb to the right edge when on; left edge when off.
+        // `flex_grow` on a sibling spacer is the simplest way to align
+        // without measuring the track's own bounds.
+        if thumb_align == "right" {
+            track = track.child(div().flex_grow()).child(thumb);
+        } else {
+            track = track.child(thumb).child(div().flex_grow());
+        }
+        let spawn_block = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .px_5()
+            .child(track)
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(if spawn_session { ink } else { ink_dim })
+                    .child("Open a session in the new worktree"),
             );
 
         // Optional error row.
@@ -385,7 +760,7 @@ impl Sidebar {
         });
 
         // Footer caption — mirrors the C# `FootMeta`:
-        // "git worktree add  ·  HEAD → <branch>  @  <leaf>"
+        // "git worktree add · <base> → <branch> @ <leaf>"
         let footer_meta = div()
             .px_5()
             .text_size(px(11.0))
@@ -395,7 +770,9 @@ impl Sidebar {
                     .flex()
                     .flex_row()
                     .gap_2()
-                    .child("git worktree add  ·  HEAD →")
+                    .child("git worktree add ·")
+                    .child(div().text_color(ink_dim).child(footer_base))
+                    .child("→")
                     .child(div().text_color(ink_dim).child(footer_branch))
                     .child("@")
                     .child(div().text_color(ink_dim).child(footer_leaf)),
@@ -482,11 +859,12 @@ impl Sidebar {
             )
             .child(header)
             .child(branch_block)
-            .child(folder_block);
+            .child(folder_block)
+            .child(base_block);
         if let Some(eb) = error_block {
             card = card.child(eb);
         }
-        card = card.child(footer_meta).child(footer_buttons);
+        card = card.child(footer_meta).child(spawn_block).child(footer_buttons);
 
         // Backdrop covers the entire window. Sized exactly to the
         // viewport so a click anywhere outside the card lands here.
@@ -503,7 +881,18 @@ impl Sidebar {
             )
             .child(card);
 
-        Some(
+        // Optional base-branch popup. Rendered as a separate
+        // `deferred` element with higher priority than the dialog
+        // backdrop so it overlays the card. We don't anchor it to
+        // the BASE trigger's screen-space rect (we don't have it
+        // here without a hitbox round-trip), so we centre it under
+        // the dialog instead — simpler and matches the C# popup's
+        // visual placement closely enough.
+        let popup = base_popup_open
+            .then(|| self.render_base_popup(state, theme, viewport, cx));
+
+        let mut layers: Vec<gpui::AnyElement> = Vec::new();
+        layers.push(
             deferred(
                 anchored()
                     .position(point(px(0.0), px(0.0)))
@@ -513,7 +902,210 @@ impl Sidebar {
             // dialog always paints on top.
             .with_priority(10)
             .into_any_element(),
+        );
+        if let Some(p) = popup {
+            layers.push(p);
+        }
+
+        Some(
+            div().children(layers).into_any_element(),
         )
+    }
+
+    /// Build the base-branch dropdown popover. Pinned to the dialog's
+    /// vertical centre so the search row + first few rows are visible
+    /// even on a small window. The `(HEAD)` row is always at the top;
+    /// LOCAL group label + rows; REMOTE group label + rows.
+    fn render_base_popup(
+        &self,
+        state: &NewWorktreeDialogState,
+        theme: &Arc<Theme>,
+        viewport: gpui::Size<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let elevated = theme::elevated(theme);
+        let divider = theme::divider(theme);
+        let ink = theme::ink(theme);
+        let ink_dim = theme::ink_dim(theme);
+        let ink_ghost = theme::ink_ghost(theme);
+        let ink_muted = theme::ink_muted(theme);
+        let frost = theme::frost_10(theme);
+        let accent = theme::accent(theme);
+        let canvas = theme::canvas(theme);
+
+        let filtered = state.filtered_branches();
+        let selected_idx = state.base_selected_idx;
+        let q_display: SharedString = if state.base_query.is_empty() {
+            SharedString::from("")
+        } else {
+            state.base_query.clone().into()
+        };
+        let placeholder_visible = state.base_query.is_empty();
+
+        // Search row at the top — the type-to-filter input.
+        let search = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .h(px(32.0))
+            .border_b_1()
+            .border_color(divider)
+            .bg(canvas)
+            .text_size(px(12.0))
+            .child(
+                div()
+                    .flex_grow()
+                    .text_color(if placeholder_visible { ink_ghost } else { ink })
+                    .truncate()
+                    .child(if placeholder_visible {
+                        SharedString::from("Filter branches…")
+                    } else {
+                        q_display
+                    }),
+            )
+            .child(div().w(px(1.5)).h(px(14.0)).bg(accent));
+
+        // Build rows. `(HEAD)` is always at index 0 in the visible
+        // list; locals start after, remotes after that. The selected
+        // index drives the highlight + Enter resolution in the key
+        // handler.
+        let row_for = |idx: usize, label: SharedString, meta: SharedString, is_head: bool, name: Option<String>| {
+            let active = idx == selected_idx;
+            let bg = if active { frost } else { gpui::transparent_black() };
+            div()
+                .id(("nw-base-row", idx as u64))
+                .h(px(28.0))
+                .px_3()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .text_size(px(12.0))
+                .text_color(if is_head { ink_dim } else { ink })
+                .bg(bg)
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.select_base_branch(name.clone(), cx);
+                    }),
+                )
+                .child(div().flex_grow().truncate().child(label))
+                .child(div().text_color(ink_ghost).text_size(px(11.0)).child(meta))
+        };
+
+        // Index 0: `(HEAD)` sentinel. Always visible regardless of
+        // filter — matching C#'s `s_headRow` pin.
+        let head_row = row_for(
+            0,
+            SharedString::from("(HEAD)"),
+            SharedString::from("current"),
+            true,
+            None,
+        );
+
+        // Build local + remote rows with group headers when each
+        // group is non-empty in the filtered list. Visible-index
+        // tracker keeps the click highlight in sync with the
+        // keyboard navigation.
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        rows.push(head_row.into_any_element());
+
+        let local_count = filtered.iter().filter(|b| !b.is_remote).count();
+        let remote_count = filtered.len() - local_count;
+        let mut visible_idx = 1usize;
+        if local_count > 0 {
+            rows.push(
+                div()
+                    .px_3()
+                    .pt_2()
+                    .text_size(px(10.0))
+                    .text_color(ink_muted)
+                    .child("LOCAL")
+                    .into_any_element(),
+            );
+            for b in filtered.iter().filter(|b| !b.is_remote) {
+                let meta = format!("{} · {}", b.short_sha, b.relative_date);
+                rows.push(
+                    row_for(
+                        visible_idx,
+                        b.name.clone().into(),
+                        meta.into(),
+                        false,
+                        Some(b.name.clone()),
+                    )
+                    .into_any_element(),
+                );
+                visible_idx += 1;
+            }
+        }
+        if remote_count > 0 {
+            rows.push(
+                div()
+                    .px_3()
+                    .pt_2()
+                    .text_size(px(10.0))
+                    .text_color(ink_muted)
+                    .child("REMOTE")
+                    .into_any_element(),
+            );
+            for b in filtered.iter().filter(|b| b.is_remote) {
+                let meta = format!("{} · {}", b.short_sha, b.relative_date);
+                rows.push(
+                    row_for(
+                        visible_idx,
+                        b.name.clone().into(),
+                        meta.into(),
+                        false,
+                        Some(b.name.clone()),
+                    )
+                    .into_any_element(),
+                );
+                visible_idx += 1;
+            }
+        }
+
+        let popup = div()
+            .w(px(360.0))
+            .max_h(px(320.0))
+            .bg(elevated)
+            .border_1()
+            .border_color(divider)
+            .rounded_md()
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            // Click on the popup itself shouldn't bubble out and
+            // trigger the dialog's mouse-down stopper from above.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .child(search)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .py_1()
+                    .children(rows),
+            );
+
+        // Centre the popup horizontally; place it ~80 px below the
+        // top of the viewport so it always has room above the
+        // dialog's BASE trigger no matter the window height.
+        let viewport_w: f32 = viewport.width.into();
+        let popup_x = (viewport_w - 360.0) / 2.0;
+        deferred(
+            anchored()
+                .position(point(px(popup_x.max(8.0)), px(80.0)))
+                .child(popup),
+        )
+        .with_priority(20)
+        .into_any_element()
     }
 }
 
@@ -563,12 +1155,97 @@ mod tests {
         assert_eq!(folder_leaf("/a/b/feat-x"), "feat-x");
         assert_eq!(folder_leaf("no-separators"), "no-separators");
     }
+
+    // ─── State / filtering tests ─────────────────────────────────
+    //
+    // The dialog's pure helpers (`filter_branches`,
+    // `resolve_default_base`) are extracted as free functions so we
+    // can test them without constructing a `NewWorktreeDialogState`
+    // (which carries a `FocusHandle` we can't forge outside a gpui
+    // context).
+
+    fn branch(name: &str, is_remote: bool) -> BranchInfo {
+        BranchInfo {
+            name: name.into(),
+            is_remote,
+            short_sha: "abcdef0".into(),
+            relative_date: "2 days ago".into(),
+        }
+    }
+
+    #[test]
+    fn filter_branches_orders_locals_before_remotes() {
+        let bs = vec![
+            branch("origin/main", true),
+            branch("main", false),
+            branch("feat/x", false),
+            branch("origin/feat/x", true),
+        ];
+        let names: Vec<&str> = filter_branches(&bs, "")
+            .iter()
+            .map(|b| b.name.as_str())
+            .collect();
+        // Locals come first (in their input order), remotes after.
+        assert_eq!(names, vec!["main", "feat/x", "origin/main", "origin/feat/x"]);
+    }
+
+    #[test]
+    fn filter_branches_query_is_case_insensitive_substring() {
+        let bs = vec![
+            branch("Main", false),
+            branch("origin/main", true),
+            branch("feat/csv", false),
+        ];
+        let names: Vec<&str> = filter_branches(&bs, "MAIN")
+            .iter()
+            .map(|b| b.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Main", "origin/main"]);
+    }
+
+    #[test]
+    fn filter_branches_empty_query_returns_all() {
+        let bs = vec![branch("main", false), branch("origin/main", true)];
+        assert_eq!(filter_branches(&bs, "").len(), 2);
+        assert_eq!(filter_branches(&bs, "   ").len(), 2, "whitespace trims to empty");
+    }
+
+    #[test]
+    fn resolve_default_base_picks_local_match() {
+        let bs = vec![
+            branch("main", false),
+            branch("dev", false),
+            branch("origin/dev", true),
+        ];
+        assert_eq!(resolve_default_base(&bs, "dev").as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn resolve_default_base_ignores_remotes() {
+        // Only `origin/dev` exists; we don't fall back to it because
+        // the C# build's default-base lookup is "first local match".
+        let bs = vec![branch("origin/dev", true)];
+        assert!(resolve_default_base(&bs, "dev").is_none());
+    }
+
+    #[test]
+    fn resolve_default_base_is_none_when_list_empty() {
+        let bs: Vec<BranchInfo> = vec![];
+        assert!(resolve_default_base(&bs, "main").is_none());
+    }
 }
 
 /// Top-level key handler for the dialog. Mutates the active
 /// `NewWorktreeDialogState` directly because gpui's listener helper
 /// gives us `&mut Sidebar` — there's nowhere to hang per-state
 /// listeners that are also `Send + 'static`.
+///
+/// Behaviour fans out by `state.focused_field` and `base_popup_open`:
+/// - Branch / Folder field → typing appends to that field, Enter
+///   submits, Escape cancels, Tab cycles focus.
+/// - Base popup search → typing filters, Up/Down moves selection,
+///   Enter confirms, Escape closes the popup (without cancelling
+///   the dialog).
 fn handle_key_down(
     sidebar: &mut Sidebar,
     event: &KeyDownEvent,
@@ -577,13 +1254,56 @@ fn handle_key_down(
 ) {
     let key = event.keystroke.key.as_str();
     cx.stop_propagation();
+
+    // Snapshot popup state up front since we need it across multiple
+    // match arms and the borrow rules don't allow holding a `&state`
+    // across `sidebar.method()` calls.
+    let popup_open = sidebar
+        .dialog()
+        .map(|s| s.base_popup_open)
+        .unwrap_or(false);
+
     match key {
         "escape" => {
-            sidebar.cancel_new_worktree_dialog(cx);
+            // Escape inside an open popup just closes the popup —
+            // matches the C# `OnBaseSearchKeyDown`. Otherwise it
+            // cancels the whole dialog.
+            if popup_open {
+                sidebar.toggle_base_popup(cx);
+            } else {
+                sidebar.cancel_new_worktree_dialog(cx);
+            }
             return;
         }
         "enter" => {
-            sidebar.submit_new_worktree_dialog(cx);
+            if popup_open {
+                sidebar.confirm_base_popup_selection(cx);
+            } else {
+                sidebar.submit_new_worktree_dialog(cx);
+            }
+            return;
+        }
+        "tab" => {
+            // Cycle focus BRANCH → FOLDER → BRANCH. Skip when the
+            // popup is open (it has its own keyboard model).
+            if !popup_open
+                && let Some(state) = sidebar.dialog_mut()
+            {
+                state.focused_field = match state.focused_field {
+                    DialogField::Branch => DialogField::Folder,
+                    DialogField::Folder => DialogField::Branch,
+                    DialogField::BasePopupSearch => DialogField::Branch,
+                };
+                cx.notify();
+            }
+            return;
+        }
+        "up" if popup_open => {
+            sidebar.move_base_popup_selection(-1, cx);
+            return;
+        }
+        "down" if popup_open => {
+            sidebar.move_base_popup_selection(1, cx);
             return;
         }
         "backspace" => {
