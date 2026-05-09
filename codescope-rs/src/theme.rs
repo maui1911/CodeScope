@@ -76,3 +76,9 @@ pub fn ink_ghost(theme: &Theme) -> Hsla { with_alpha(theme.chrome.ink, 0.40) }
 /// Status-dot colour. Hard-coded across themes for now — a green dot
 /// reads as "running" in every dark theme we ship. Themable later.
 pub fn status_running() -> Hsla { rgb_to_hsla(Rgb::from_hex(0x22c55e)) }
+
+/// Foreground for destructive context-menu entries ("Remove project",
+/// "Discard changes…"). Mirrors `Ctx.Color.Danger` from the C# build's
+/// `ContextMenuStyles.xaml`. Hard-coded — a danger red that reads
+/// across every theme. Themable later.
+pub fn danger(_theme: &Theme) -> Hsla { rgb_to_hsla(Rgb::from_hex(0xff8a8a)) }

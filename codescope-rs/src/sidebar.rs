@@ -3,9 +3,11 @@
 //! Single-purpose view: lists every entry in the loaded
 //! [`codescope_core::ProjectsConfig`] and lets the user select one.
 //! The `+` button kicks off a directory picker and, on success,
-//! appends a new project and persists `projects.json`. Removal /
-//! editing are still TODO and live behind right-click + a command
-//! palette in the C# build.
+//! appends a new project and persists `projects.json`. Right-click on
+//! a project opens a context menu mirroring the C# build's
+//! `BuildProjectMenu` — Reveal / Copy path / Open in Windows
+//! Terminal / Remove project today, with `New worktree from branch…`
+//! landing once the input dialog primitive exists.
 //!
 //! Layout (240 px wide):
 //!
@@ -21,12 +23,14 @@
 //! └───────────────┘
 //! ```
 
+use std::process::Command;
 use std::sync::Arc;
 
 use codescope_core::{AppPaths, LayoutState, Project, ProjectsConfig, Theme};
 use gpui::{
-    Context, InteractiveElement, IntoElement, MouseButton, ParentElement, PathPromptOptions,
-    Render, SharedString, Styled, Window, div, px,
+    ClipboardItem, Context, Corner, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, PathPromptOptions, Pixels, Point, Render, SharedString, Styled, Window,
+    anchored, deferred, div, point, px,
 };
 
 use crate::theme;
@@ -35,6 +39,19 @@ use crate::theme;
 /// resizable splitter; we keep it fixed for now and add the splitter
 /// when there's a second column to balance against.
 pub const SIDEBAR_WIDTH: f32 = 240.0;
+
+/// Open right-click context menu state. `None` when no menu is
+/// showing. The position is in window coordinates so we can hand it
+/// straight to [`anchored`] without recomputing on render.
+struct OpenMenu {
+    project_idx: usize,
+    position: Point<Pixels>,
+}
+
+/// Click handler for a context-menu row. Boxed so we can stash it in
+/// the closure passed to `cx.listener` without leaking the helper's
+/// generic-over-fn shape into every menu-row construction site.
+type MenuItemAction = Box<dyn Fn(&mut Sidebar, &mut Context<Sidebar>) + 'static>;
 
 pub struct Sidebar {
     projects: ProjectsConfig,
@@ -50,6 +67,8 @@ pub struct Sidebar {
     /// changes selection so a save-on-change writes out the full
     /// (correct) struct, not just the field we touched.
     layout: LayoutState,
+    /// Currently-open project context menu, if any.
+    menu: Option<OpenMenu>,
 }
 
 impl Sidebar {
@@ -67,7 +86,7 @@ impl Sidebar {
             None => None,
         }
         .or_else(|| (!projects.projects.is_empty()).then_some(0));
-        Self { projects, selected, theme, paths, layout }
+        Self { projects, selected, theme, paths, layout, menu: None }
     }
 
     pub fn select(&mut self, idx: usize, cx: &mut Context<Self>) {
@@ -142,6 +161,116 @@ impl Sidebar {
             }
         })
         .detach();
+    }
+
+    /// Open the project context menu at `position` (window coords)
+    /// for the project at `idx`. No-op if the index is out of range.
+    fn open_project_menu(
+        &mut self,
+        idx: usize,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if idx >= self.projects.projects.len() {
+            return;
+        }
+        self.menu = Some(OpenMenu { project_idx: idx, position });
+        cx.notify();
+    }
+
+    fn close_menu(&mut self, cx: &mut Context<Self>) {
+        if self.menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Reveal the project's working tree in the OS file browser.
+    /// Mirrors the C# `RevealInExplorerCommand`.
+    fn reveal_in_explorer(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let Some(project) = self.projects.projects.get(idx) else { return };
+        let path = project.path.clone();
+        // Spawn detached so a slow shell-extension doesn't stall the UI
+        // thread. We don't care about the exit status — the user sees
+        // the result on their desktop.
+        #[cfg(target_os = "windows")]
+        let result = Command::new("explorer.exe").arg(&path).spawn();
+        #[cfg(target_os = "macos")]
+        let result = Command::new("open").arg(&path).spawn();
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let result = Command::new("xdg-open").arg(&path).spawn();
+        if let Err(err) = result {
+            eprintln!("warning: failed to reveal {path}: {err:#}");
+        }
+        self.close_menu(cx);
+    }
+
+    /// `wt -d <path>` — opens Windows Terminal with its starting
+    /// directory pinned to the project root. Mirrors C#'s
+    /// `OpenInWindowsTerminalCommand`. No-op on non-Windows.
+    fn open_in_windows_terminal(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let Some(project) = self.projects.projects.get(idx) else { return };
+        let path = project.path.clone();
+        #[cfg(target_os = "windows")]
+        {
+            if let Err(err) = Command::new("wt").args(["-d", &path]).spawn() {
+                eprintln!("warning: failed to launch Windows Terminal: {err:#}");
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = path;
+            eprintln!("info: 'Open in Windows Terminal' is Windows-only");
+        }
+        self.close_menu(cx);
+    }
+
+    /// Copy the project's absolute path to the system clipboard.
+    /// Mirrors C#'s `CopyPathCommand` (Ctrl+Alt+C in the C# build —
+    /// keybinding wiring lands when the global shortcut layer does).
+    fn copy_path(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let Some(project) = self.projects.projects.get(idx) else { return };
+        cx.write_to_clipboard(ClipboardItem::new_string(project.path.clone()));
+        self.close_menu(cx);
+    }
+
+    /// Drop a project from the sidebar list and persist `projects.json`.
+    /// Does **not** touch anything on disk — the working tree stays
+    /// where it is; the user just removes it from CodeScope's view.
+    /// Save-then-commit ordering matches `add_project` so a write
+    /// failure leaves both disk and UI in their previous state.
+    fn remove_project(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if idx >= self.projects.projects.len() {
+            return;
+        }
+        let prev_selected_id = self.layout.selected_project_id.clone();
+        let mut next = self.projects.clone();
+        next.projects.remove(idx);
+        if let Err(err) = next.save(&self.paths) {
+            eprintln!("warning: failed to save projects.json: {err:#}");
+            return;
+        }
+        self.projects = next;
+        // Selection housekeeping: if we just removed the selected
+        // project, fall back to the previous row (or `None` when the
+        // list is empty). Otherwise shift the cursor left when an
+        // earlier row was removed so it keeps pointing at the same
+        // project.
+        self.selected = match self.selected {
+            Some(sel) if sel == idx => {
+                if self.projects.projects.is_empty() { None } else { Some(sel.min(self.projects.projects.len() - 1)) }
+            }
+            Some(sel) if sel > idx => Some(sel - 1),
+            other => other,
+        };
+        self.layout.selected_project_id =
+            self.selected.and_then(|i| self.projects.projects.get(i).map(|p| p.id.clone()));
+        // Only persist layout when the persisted id actually changed —
+        // i.e. when the removed project was the active one. Removing
+        // a row before/after the active one leaves the id intact.
+        if self.layout.selected_project_id != prev_selected_id {
+            self.save_layout();
+        }
+        self.close_menu(cx);
     }
 
     /// Append a project at `path` and persist. Newly-added project
@@ -282,6 +411,12 @@ impl Render for Sidebar {
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| this.select(idx, cx)),
                 )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        this.open_project_menu(idx, event.position, cx);
+                    }),
+                )
                 .child(div().flex_grow().truncate().child(name))
         });
 
@@ -294,7 +429,12 @@ impl Render for Sidebar {
             body = body.child(es);
         }
 
-        div()
+        let menu_overlay = self.menu.as_ref().and_then(|menu| {
+            let project = self.projects.projects.get(menu.project_idx)?;
+            Some(self.render_project_menu(menu.project_idx, menu.position, project, &theme, cx))
+        });
+
+        let mut root = div()
             .w(px(SIDEBAR_WIDTH))
             .h_full()
             .flex()
@@ -304,7 +444,148 @@ impl Render for Sidebar {
             .border_color(theme::divider(&theme))
             .child(heading)
             .child(div().h_px().bg(theme::divider(&theme)))
-            .child(body)
+            .child(body);
+        if let Some(overlay) = menu_overlay {
+            root = root.child(overlay);
+        }
+        root
+    }
+}
+
+impl Sidebar {
+    /// Build the floating project context menu. Anchored to the
+    /// click position and `deferred` so it paints over the rest of
+    /// the chrome instead of being clipped by the sidebar's bounds.
+    /// Click outside (anywhere in the window) dismisses via
+    /// `on_mouse_down_out`.
+    fn render_project_menu(
+        &self,
+        idx: usize,
+        position: Point<Pixels>,
+        project: &Project,
+        theme: &Arc<Theme>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let header_label: SharedString = project.name.clone().into();
+        let elevated = theme::elevated(theme);
+        let divider = theme::divider(theme);
+        let ink = theme::ink(theme);
+        let ink_dim = theme::ink_dim(theme);
+        let ink_ghost = theme::ink_ghost(theme);
+        let frost = theme::frost_10(theme);
+        let danger = theme::danger(theme);
+
+        let item = |id: &'static str,
+                    label: &'static str,
+                    danger_row: bool,
+                    on_click: MenuItemAction|
+         -> gpui::Stateful<gpui::Div> {
+            let base_color = if danger_row { danger } else { ink_dim };
+            let hover_color = if danger_row { danger } else { ink };
+            let frost_hover = frost;
+            div()
+                .id(id)
+                .h(px(28.0))
+                .px_3()
+                .flex()
+                .flex_row()
+                .items_center()
+                .text_size(px(13.0))
+                .text_color(base_color)
+                .cursor_pointer()
+                .hover(move |s| s.bg(frost_hover).text_color(hover_color))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        on_click(this, cx);
+                    }),
+                )
+                .child(label)
+        };
+
+        let menu_body = div()
+            .flex()
+            .flex_col()
+            .py_1()
+            .min_w(px(220.0))
+            .bg(elevated)
+            .border_1()
+            .border_color(divider)
+            .rounded_md()
+            .shadow_lg()
+            // Header — non-interactive, mirrors the C# `BuildContextHeader`
+            // (project name dimmed, "project" qualifier).
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(11.0))
+                    .text_color(ink_ghost)
+                    .child(div().text_color(ink).text_size(px(13.0)).truncate().child(header_label))
+                    .child(div().child("project")),
+            )
+            .child(div().h_px().bg(divider).my_1())
+            // "New worktree from branch…" lands once the input-dialog
+            // primitive exists; rendering it disabled now keeps the
+            // menu shape stable so muscle memory carries over.
+            .child(
+                div()
+                    .id("menu-new-worktree-disabled")
+                    .h(px(28.0))
+                    .px_3()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .text_size(px(13.0))
+                    .text_color(ink_ghost)
+                    .child("New worktree from branch…"),
+            )
+            .child(div().h_px().bg(divider).my_1())
+            .child(item(
+                "menu-reveal",
+                "Reveal in File Explorer",
+                false,
+                Box::new(move |this, cx| this.reveal_in_explorer(idx, cx)),
+            ))
+            .child(item(
+                "menu-wt",
+                "Open in Windows Terminal",
+                false,
+                Box::new(move |this, cx| this.open_in_windows_terminal(idx, cx)),
+            ))
+            .child(item(
+                "menu-copy-path",
+                "Copy path",
+                false,
+                Box::new(move |this, cx| this.copy_path(idx, cx)),
+            ))
+            .child(div().h_px().bg(divider).my_1())
+            .child(item(
+                "menu-remove",
+                "Remove project",
+                true,
+                Box::new(move |this, cx| this.remove_project(idx, cx)),
+            ))
+            // Click on the menu itself shouldn't bubble out and trigger
+            // the dismiss handler we install below.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_menu(cx)));
+
+        // `deferred` paints the menu after the rest of the frame so it
+        // overlays the tab strip / terminal area instead of being
+        // clipped to the 240 px sidebar column. `anchored` snaps it
+        // to a window edge if the click happens close to one.
+        deferred(
+            anchored()
+                .position(point(position.x, position.y))
+                .anchor(Corner::TopLeft)
+                .snap_to_window_with_margin(px(8.0))
+                .child(menu_body),
+        )
     }
 }
 

@@ -27,6 +27,7 @@ pub const CURRENT_VERSION: u32 = 1;
 
 /// One git repository as it appears in the sidebar.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Project {
     /// Stable id used by sessions to refer to this project.
     pub id: String,
@@ -35,13 +36,13 @@ pub struct Project {
     /// Absolute path to the primary working tree.
     pub path: String,
     /// Default branch — used as the base when creating new worktrees.
-    #[serde(default = "default_branch")]
+    #[serde(default = "default_branch", alias = "default_branch")]
     pub default_branch: String,
     /// Where new worktrees go. `None` = `"{path}.worktrees"`.
-    #[serde(default)]
+    #[serde(default, alias = "worktree_root")]
     pub worktree_root: Option<String>,
     /// Per-project agent override. `None` = use the global default.
-    #[serde(default)]
+    #[serde(default, alias = "default_agent_id")]
     pub default_agent_id: Option<String>,
     /// Sessions persisted across restarts.
     #[serde(default)]
@@ -84,12 +85,13 @@ impl Project {
 /// implicit primary worktree at `Project::path`; additional ones live
 /// here and get `is_primary = false`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Worktree {
     pub id: String,
     pub path: String,
     #[serde(default)]
     pub branch: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "is_primary")]
     pub is_primary: bool,
 }
 
@@ -97,31 +99,41 @@ pub struct Worktree {
 /// session manager, not here — this is the "what should be restored
 /// at launch" record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Session {
     pub id: String,
+    #[serde(alias = "worktree_path")]
     pub worktree_path: String,
     #[serde(default)]
     pub branch: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "agent_id")]
     pub agent_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "display_name")]
     pub display_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "worktree_id")]
     pub worktree_id: Option<String>,
     /// ISO 8601 UTC.
-    #[serde(default)]
+    #[serde(default, alias = "last_opened")]
     pub last_opened: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "agent_session_id")]
     pub agent_session_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "closed_at")]
     pub closed_at: Option<String>,
 }
 
 /// Root object persisted to `%APPDATA%\CodeScope\projects.json`.
+///
+/// `agents` is round-tripped opaquely via [`serde_json::Value`]: the C#
+/// build persists per-user `AgentProfile` overrides here, and the Rust
+/// port doesn't consume them yet but must not erase them. Once the
+/// Rust port grows its own agent registry the field can be replaced
+/// with a typed `Vec<AgentProfile>` mirror — until then "preserve
+/// what's there, write back what was read" is the safe behaviour.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 pub struct ProjectsConfig {
     pub version: u32,
+    pub agents: Vec<serde_json::Value>,
     pub projects: Vec<Project>,
 }
 
@@ -129,6 +141,7 @@ impl Default for ProjectsConfig {
     fn default() -> Self {
         Self {
             version: CURRENT_VERSION,
+            agents: Vec::new(),
             projects: Vec::new(),
         }
     }
@@ -192,6 +205,7 @@ mod tests {
         let path = dir.path().join("projects.json");
         let cfg = ProjectsConfig {
             version: CURRENT_VERSION,
+            agents: Vec::new(),
             projects: vec![Project {
                 id: "p1".into(),
                 name: "Repo".into(),
@@ -256,5 +270,210 @@ mod tests {
         // default behaviour (no `deny_unknown_fields`).
         let cfg = ProjectsConfig::load_from(&path).unwrap();
         assert_eq!(cfg.version, 1);
+    }
+
+    /// Real-shape fixture matching what the C# build's `ProjectStore`
+    /// writes (camelCase keys, top-level `agents`, nested
+    /// `defaultBranch` / `worktreePath` / `isPrimary` / etc.). If this
+    /// stops parsing cleanly the data-loss footgun from session 33 is
+    /// back: the Rust port would default to an empty config and the
+    /// next mutation would overwrite the user's file.
+    #[test]
+    fn loads_csharp_shape_fixture_without_data_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.json");
+        let csharp_json = r#"{
+          "version": 1,
+          "agents": [
+            { "id": "claude", "displayName": "Claude Code", "command": "claude", "isDefault": true }
+          ],
+          "projects": [
+            {
+              "id": "p1",
+              "name": "Repo",
+              "path": "C:\\repos\\repo",
+              "defaultBranch": "main",
+              "worktreeRoot": "C:\\repos\\repo.worktrees",
+              "defaultAgentId": "claude",
+              "sessions": [
+                {
+                  "id": "s1",
+                  "worktreePath": "C:\\repos\\repo",
+                  "branch": "main",
+                  "agentId": "claude",
+                  "worktreeId": "primary",
+                  "agentSessionId": "abc-123",
+                  "lastOpened": "2026-05-09T10:00:00+00:00"
+                }
+              ],
+              "worktrees": [
+                { "id": "primary", "path": "C:\\repos\\repo", "branch": "main", "isPrimary": true },
+                { "id": "feat-x",  "path": "C:\\repos\\repo.worktrees\\feat-x", "branch": "feat/x", "isPrimary": false }
+              ]
+            }
+          ]
+        }"#;
+        std::fs::write(&path, csharp_json).unwrap();
+
+        let cfg = ProjectsConfig::load_from(&path).unwrap();
+        assert_eq!(cfg.version, 1);
+        assert_eq!(cfg.agents.len(), 1, "agent overrides must survive load");
+        let p = &cfg.projects[0];
+        assert_eq!(p.default_branch, "main");
+        assert_eq!(p.worktree_root.as_deref(), Some("C:\\repos\\repo.worktrees"));
+        assert_eq!(p.default_agent_id.as_deref(), Some("claude"));
+        assert_eq!(p.sessions.len(), 1);
+        let s = &p.sessions[0];
+        assert_eq!(s.worktree_path, "C:\\repos\\repo");
+        assert_eq!(s.agent_id.as_deref(), Some("claude"));
+        assert_eq!(s.worktree_id.as_deref(), Some("primary"));
+        assert_eq!(s.agent_session_id.as_deref(), Some("abc-123"));
+        assert!(s.last_opened.is_some());
+        assert_eq!(p.worktrees.len(), 2);
+        assert!(p.worktrees[0].is_primary);
+        assert!(!p.worktrees[1].is_primary);
+    }
+
+    #[test]
+    fn save_uses_camelcase_keys_matching_csharp_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.json");
+        let cfg = ProjectsConfig {
+            version: CURRENT_VERSION,
+            agents: Vec::new(),
+            projects: vec![Project {
+                id: "p1".into(),
+                name: "Repo".into(),
+                path: "C:\\repo".into(),
+                default_branch: "main".into(),
+                worktree_root: Some("C:\\repo.worktrees".into()),
+                default_agent_id: Some("claude".into()),
+                sessions: vec![Session {
+                    id: "s1".into(),
+                    worktree_path: "C:\\repo".into(),
+                    branch: None,
+                    agent_id: None,
+                    display_name: None,
+                    worktree_id: Some("primary".into()),
+                    last_opened: None,
+                    agent_session_id: None,
+                    closed_at: None,
+                }],
+                worktrees: vec![Worktree {
+                    id: "primary".into(),
+                    path: "C:\\repo".into(),
+                    branch: None,
+                    is_primary: true,
+                }],
+            }],
+        };
+        cfg.save_to(&path).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        // Spot-check the keys that diverge between snake_case (what
+        // serde writes by default) and the C# build's camelCase. If
+        // any of these flip back to snake_case we'd silently fail to
+        // round-trip with the installed C# binary.
+        assert!(written.contains("\"defaultBranch\""), "{written}");
+        assert!(written.contains("\"worktreeRoot\""), "{written}");
+        assert!(written.contains("\"defaultAgentId\""), "{written}");
+        assert!(written.contains("\"worktreePath\""), "{written}");
+        assert!(written.contains("\"worktreeId\""), "{written}");
+        assert!(written.contains("\"isPrimary\""), "{written}");
+        assert!(!written.contains("\"default_branch\""), "{written}");
+        assert!(!written.contains("\"worktree_path\""), "{written}");
+    }
+
+    /// Pre-PR-58 the Rust port wrote snake_case keys. A `projects.json`
+    /// produced by that older binary must still load cleanly after
+    /// flipping to camelCase, otherwise users running the dev build
+    /// would see all renamed fields silently default to their zero
+    /// values and the next save would overwrite the file with the
+    /// defaults — exactly the data-loss footgun this PR is closing.
+    /// `#[serde(alias = "...")]` on each renamed field accepts both
+    /// shapes during deserialization; saves still write camelCase.
+    #[test]
+    fn loads_legacy_snake_case_fixture_without_data_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.json");
+        let snake_json = r#"{
+          "version": 1,
+          "projects": [
+            {
+              "id": "p1",
+              "name": "Repo",
+              "path": "C:\\repos\\repo",
+              "default_branch": "develop",
+              "worktree_root": "C:\\repos\\repo.worktrees",
+              "default_agent_id": "claude",
+              "sessions": [
+                {
+                  "id": "s1",
+                  "worktree_path": "C:\\repos\\repo",
+                  "branch": "develop",
+                  "agent_id": "claude",
+                  "display_name": "main shell",
+                  "worktree_id": "primary",
+                  "last_opened": "2026-04-01T10:00:00+00:00",
+                  "agent_session_id": "abc-123",
+                  "closed_at": null
+                }
+              ],
+              "worktrees": [
+                { "id": "primary", "path": "C:\\repos\\repo", "branch": "develop", "is_primary": true }
+              ]
+            }
+          ]
+        }"#;
+        std::fs::write(&path, snake_json).unwrap();
+
+        let cfg = ProjectsConfig::load_from(&path).unwrap();
+        let p = &cfg.projects[0];
+        assert_eq!(p.default_branch, "develop", "default_branch must survive");
+        assert_eq!(
+            p.worktree_root.as_deref(),
+            Some("C:\\repos\\repo.worktrees"),
+            "worktree_root must survive"
+        );
+        assert_eq!(p.default_agent_id.as_deref(), Some("claude"));
+        let s = &p.sessions[0];
+        assert_eq!(s.worktree_path, "C:\\repos\\repo", "worktree_path must survive");
+        assert_eq!(s.agent_id.as_deref(), Some("claude"));
+        assert_eq!(s.display_name.as_deref(), Some("main shell"));
+        assert_eq!(s.worktree_id.as_deref(), Some("primary"));
+        assert_eq!(s.last_opened.as_deref(), Some("2026-04-01T10:00:00+00:00"));
+        assert_eq!(s.agent_session_id.as_deref(), Some("abc-123"));
+        assert!(p.worktrees[0].is_primary, "is_primary must survive");
+    }
+
+    /// Load a file containing agent overrides → mutate projects → save
+    /// → reload. The agent array must come back identical. This is the
+    /// regression net for the data-loss class from session 33.
+    #[test]
+    fn round_trip_preserves_unknown_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "version": 1,
+              "agents": [
+                { "id": "claude", "displayName": "Claude Code", "command": "claude" },
+                { "id": "codex",  "displayName": "Codex",       "command": "codex" }
+              ],
+              "projects": []
+            }"#,
+        )
+        .unwrap();
+
+        let mut cfg = ProjectsConfig::load_from(&path).unwrap();
+        assert_eq!(cfg.agents.len(), 2);
+        cfg.projects.push(Project::new("C:\\new".into()));
+        cfg.save_to(&path).unwrap();
+
+        let reloaded = ProjectsConfig::load_from(&path).unwrap();
+        assert_eq!(reloaded.agents.len(), 2);
+        assert_eq!(reloaded.agents[0]["id"], "claude");
+        assert_eq!(reloaded.agents[1]["id"], "codex");
+        assert_eq!(reloaded.projects.len(), 1);
     }
 }
