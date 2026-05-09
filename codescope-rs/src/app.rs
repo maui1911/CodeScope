@@ -37,10 +37,14 @@ use codescope_terminal::{
     Backend, ColorPalette, CursorStylePreset, FontConfig, Shell, SpawnConfig, TerminalSize,
     TerminalView,
 };
+#[cfg(not(target_os = "windows"))]
+use gpui::ClickEvent;
+#[cfg(not(target_os = "windows"))]
+use gpui::StatefulInteractiveElement;
 use gpui::{
-    AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Window, WindowBounds, WindowControlArea, div, px,
+    AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    KeyDownEvent, MouseButton, ParentElement, Render, SharedString, Styled, Window, WindowBounds,
+    WindowControlArea, div, px,
 };
 use parking_lot::Mutex;
 
@@ -588,31 +592,39 @@ impl Render for AppShell {
             })
             .collect();
 
-        // The drag region fills the gap between the "+" button and the
+        // The drag region fills the gap between the strips and the
         // caption controls so the user can grab the bar to move the
         // window. `window_control_area(Drag)` annotates the hitbox so
-        // Windows snap-layouts and double-click-to-maximise behave like
-        // the rest of the OS; `start_window_move()` is the explicit
-        // drag-initiate for platforms that don't infer it from the
-        // hitbox (X11 / Wayland).
-        let drag_region = div()
-            .id("titlebar-drag")
-            .flex_grow()
-            .h(px(40.0))
-            .window_control_area(WindowControlArea::Drag)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_, _, window, _| window.start_window_move()),
-            )
-            .on_click(cx.listener(|_, event: &ClickEvent, window, _| {
-                // Double-click toggles maximise / restore — matches the
-                // Windows + macOS native title-bar behaviour the user
-                // would normally get for free if we hadn't claimed the
-                // bar with `appears_transparent: true`.
-                if event.click_count() >= 2 {
-                    window.zoom_window();
-                }
-            }));
+        // Windows hit-tests it as `HTCAPTION` — that gets us native
+        // drag, snap-layouts, and *correct* double-click toggle
+        // (maximize ↔ restore) for free. We deliberately don't attach
+        // an `on_mouse_down(start_window_move)` or
+        // `on_click(zoom_window)` here on Windows: both fight the
+        // native NC handling. `zoom_window()` in particular is
+        // `SW_MAXIMIZE`-only on Windows (no toggle), so wiring it
+        // would maximize on click and never restore.
+        //
+        // On Wayland / X11 the compositor needs an explicit
+        // `start_window_move()` because there's no NC-area hit-test
+        // model — keep that path under `#[cfg(not(target_os = "windows"))]`.
+        let drag_region = {
+            let base = div().id("titlebar-drag").flex_grow().h(px(40.0));
+            #[cfg(target_os = "windows")]
+            let base = base.window_control_area(WindowControlArea::Drag);
+            #[cfg(not(target_os = "windows"))]
+            let base = base
+                .window_control_area(WindowControlArea::Drag)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _, window, _| window.start_window_move()),
+                )
+                .on_click(cx.listener(|_, event: &ClickEvent, window, _| {
+                    if event.click_count() >= 2 {
+                        window.zoom_window();
+                    }
+                }));
+            base
+        };
 
         // Caption controls: minimise, maximise/restore, close.
         // 46×40 hitboxes hugging the right edge of the strip, styled
@@ -640,23 +652,87 @@ impl Render for AppShell {
                 .child(glyph)
         };
 
+        // On Windows the `WindowControlArea::*` annotations make
+        // gpui's hit-test return `HTMINBUTTON` / `HTMAXBUTTON` /
+        // `HTCLOSE`, and gpui's NC-mouse-up handler does the right
+        // thing natively (toggle on max, post WM_CLOSE on close,
+        // SW_MINIMIZE on min). Wiring our own `on_mouse_down`
+        // handlers here would race the native flow — and for the max
+        // button specifically would *break* the toggle, since
+        // `zoom_window()` on Windows is `SW_MAXIMIZE`-only with no
+        // restore path.
+        //
+        // On non-Windows targets we still need explicit handlers
+        // because there's no equivalent NC-button native handling.
         let minimize_btn = caption_base("titlebar-min", WindowControlArea::Min, "—")
-            .hover(move |s| s.bg(frost_hover).text_color(ink))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_, _, window, _| window.minimize_window()),
-            );
+            .hover(move |s| s.bg(frost_hover).text_color(ink));
         let maximize_btn = caption_base("titlebar-max", WindowControlArea::Max, "▢")
+            .hover(move |s| s.bg(frost_hover).text_color(ink));
+        let close_btn = caption_base("titlebar-close", WindowControlArea::Close, "✕")
+            .hover(move |s| s.bg(close_hover_bg).text_color(ink));
+        #[cfg(not(target_os = "windows"))]
+        let minimize_btn = minimize_btn.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_, _, window, _| window.minimize_window()),
+        );
+        #[cfg(not(target_os = "windows"))]
+        let maximize_btn = maximize_btn.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_, _, window, _| window.zoom_window()),
+        );
+        #[cfg(not(target_os = "windows"))]
+        let close_btn = close_btn.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_, _, window, _| window.remove_window()),
+        );
+
+        // Split-right caption button — sits left of the min/max/close
+        // trio. Mirrors the C# build's titlebar split control. Pure
+        // client-area button (no `WindowControlArea` annotation), so
+        // `on_mouse_down` runs the same way it does on a tab.
+        let split_btn = div()
+            .id("titlebar-split")
+            .h(px(40.0))
+            .w(px(46.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(13.0))
+            .text_color(ink_dim)
+            .cursor_pointer()
             .hover(move |s| s.bg(frost_hover).text_color(ink))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|_, _, window, _| window.zoom_window()),
-            );
-        let close_btn = caption_base("titlebar-close", WindowControlArea::Close, "✕")
-            .hover(move |s| s.bg(close_hover_bg).text_color(ink))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_, _, window, _| window.remove_window()),
+                cx.listener(|this, _, window, cx| {
+                    this.split_right(window, cx);
+                }),
+            )
+            // Two thin verticals + a divider — pure-shape so we don't
+            // need a glyph font. Aligns visually with C#'s
+            // `Ctx.Icon.SplitGroup`.
+            .child(
+                div()
+                    .w(px(14.0))
+                    .h(px(12.0))
+                    .flex()
+                    .flex_row()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .w(px(6.0))
+                            .h_full()
+                            .border_1()
+                            .border_color(ink_dim)
+                            .rounded_sm(),
+                    )
+                    .child(
+                        div()
+                            .w(px(6.0))
+                            .h_full()
+                            .border_1()
+                            .border_color(ink_dim)
+                            .rounded_sm(),
+                    ),
             );
 
         // Brand mark — top-left of the tab strip. Pure-shape port of
@@ -741,16 +817,23 @@ impl Render for AppShell {
         // user sees mis-aligned columns. The spacer also serves as
         // titlebar drag region above the sidebar (window-control area
         // + start_window_move) so the user can grab the bar there.
+        // Same Windows / non-Windows split as the main drag region:
+        // on Windows we let `HTCAPTION` do the work natively (no
+        // `start_window_move`), elsewhere we fire it explicitly.
         let sidebar_spacer_w = px(SIDEBAR_WIDTH) - px(40.0);
-        let sidebar_spacer = div()
-            .id("titlebar-sidebar-spacer")
-            .w(sidebar_spacer_w)
-            .h(px(40.0))
-            .window_control_area(WindowControlArea::Drag)
-            .on_mouse_down(
+        let sidebar_spacer = {
+            let base = div()
+                .id("titlebar-sidebar-spacer")
+                .w(sidebar_spacer_w)
+                .h(px(40.0))
+                .window_control_area(WindowControlArea::Drag);
+            #[cfg(not(target_os = "windows"))]
+            let base = base.on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|_, _, window, _| window.start_window_move()),
             );
+            base
+        };
 
         let tab_strip = div()
             .h(px(40.0))
@@ -773,6 +856,7 @@ impl Render for AppShell {
                     .children(strip_sections),
             )
             .child(drag_region)
+            .child(split_btn)
             .child(minimize_btn)
             .child(maximize_btn)
             .child(close_btn);
