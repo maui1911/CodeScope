@@ -1,0 +1,7 @@
+// Windows resource script — bound into the `window` binary by
+// `build.rs` (via `embed-resource`) so File Explorer, the taskbar,
+// Alt-Tab, and the OS's window-icon API all surface the CodeScope
+// brand mark. Mirrors the C# build's `<ApplicationIcon>` in
+// `CodeScope.App.csproj`. Resource ID `1` is the convention Windows
+// uses to find "the" application icon.
+1 ICON "codescope.ico"

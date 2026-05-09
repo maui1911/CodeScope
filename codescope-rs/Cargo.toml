@@ -8,6 +8,7 @@ version = "0.0.1"
 edition = "2024"
 publish = false
 description = "Spike: gpui window with one embedded terminal running pwsh."
+build = "build.rs"
 
 [[bin]]
 name = "spike"
@@ -30,6 +31,14 @@ portable-pty = "0.9"
 anyhow = "1"
 parking_lot = "0.12"
 uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.build-dependencies]
+# Embed `assets/codescope.ico` as the Windows resource icon for the
+# `window` binary so File Explorer / taskbar / Alt-Tab show the same
+# brand mark as the C# build's `ApplicationIcon`. Used only by
+# `build.rs` on Windows hosts; non-Windows targets skip the resource
+# step entirely.
+embed-resource = "3"
 
 [profile.dev]
 opt-level = 1

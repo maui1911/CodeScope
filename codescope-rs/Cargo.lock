@@ -961,6 +961,7 @@ dependencies = [
  "anyhow",
  "codescope-core",
  "codescope-terminal",
+ "embed-resource",
  "gpui",
  "gpui-terminal",
  "parking_lot",

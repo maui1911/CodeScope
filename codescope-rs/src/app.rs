@@ -560,6 +560,48 @@ impl Render for AppShell {
                 cx.listener(|_, _, window, _| window.remove_window()),
             );
 
+        // Brand mark — top-left of the tab strip. Pure-shape port of
+        // the C# splash's `.brand-mark` (accent rounded square with a
+        // small black inset square in the upper-right). Sized to fit
+        // the 40 px strip with breathing room. Decorative for now;
+        // clicking it does nothing — it's primarily a visual anchor
+        // and the same affordance the C# build's splash uses for
+        // brand recognition. The drag region above is what actually
+        // moves the window when the user grabs the title bar.
+        let accent_clr = theme::accent(&theme);
+        let brand_mark = div()
+            .w(px(40.0))
+            .h(px(40.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            // The mark itself sits inside a flex container so the
+            // rounded square stays centred regardless of the strip's
+            // exact height. `window_control_area(Drag)` makes the
+            // surrounding 40×40 cell draggable like the rest of the
+            // bar — clicking the mark itself starts a window move
+            // since the inner shape doesn't intercept clicks.
+            .window_control_area(WindowControlArea::Drag)
+            .child(
+                div()
+                    .w(px(22.0))
+                    .h(px(22.0))
+                    .rounded(px(5.0))
+                    .bg(accent_clr)
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .justify_end()
+                    .p(px(4.0))
+                    .child(
+                        div()
+                            .w(px(7.0))
+                            .h(px(7.0))
+                            .rounded(px(2.0))
+                            .bg(gpui::black()),
+                    ),
+            );
+
         let tab_strip = div()
             .h(px(40.0))
             .flex()
@@ -567,6 +609,7 @@ impl Render for AppShell {
             .border_b_1()
             .border_color(theme::divider(&theme))
             .bg(theme::elevated(&theme))
+            .child(brand_mark)
             .children(tabs)
             .child(new_tab_button)
             .child(drag_region)
