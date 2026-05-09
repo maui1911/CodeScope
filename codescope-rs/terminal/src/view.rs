@@ -356,6 +356,20 @@ impl TerminalView {
         if event.button != MouseButton::Left {
             return;
         }
+        // Ctrl/Cmd-click on a hyperlink opens it in the system
+        // handler (browser for http(s)://, OS shell for file
+        // paths, …). Ctrl is the convention because plain click
+        // belongs to text-selection — same as VS Code / Windows
+        // Terminal / iTerm2.
+        let modifier = event.modifiers.control || event.modifiers.platform;
+        if modifier && !event.modifiers.shift {
+            if let Some((row, col)) = self.visible_rc(event.position) {
+                if let Some(uri) = self.backend.hyperlink_at(row, col) {
+                    let _ = open::that_detached(&uri);
+                    return;
+                }
+            }
+        }
         if let Some((line, col)) = self.point_at(event.position) {
             self.backend.start_selection(line, col);
             self.selecting = true;

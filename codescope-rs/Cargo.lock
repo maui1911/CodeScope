@@ -975,6 +975,7 @@ dependencies = [
  "codescope-core",
  "flume 0.11.1",
  "gpui",
+ "open",
  "parking_lot",
 ]
 

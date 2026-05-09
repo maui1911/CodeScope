@@ -347,7 +347,14 @@ impl Backend {
                 }
                 let bold = flags.contains(Flags::BOLD);
                 let italic = flags.contains(Flags::ITALIC);
-                let underline = flags.contains(Flags::UNDERLINE);
+                // Hyperlinks (OSC 8) always render with an underline,
+                // regardless of whether the cell explicitly carries
+                // `Flags::UNDERLINE`. Saves the user from emitting
+                // both — and matches every other terminal's hover
+                // affordance for clickable text.
+                let hyperlink: Option<Arc<str>> =
+                    cell.hyperlink().map(|h| Arc::from(h.uri()));
+                let underline = flags.contains(Flags::UNDERLINE) || hyperlink.is_some();
 
                 let selected = content
                     .selection
@@ -378,6 +385,11 @@ impl Backend {
                         && last.bold == bold
                         && last.italic == italic
                         && last.underline == underline
+                        // Don't merge across hyperlinks — adjacent
+                        // links to different URIs would otherwise
+                        // collapse, and we'd lose the per-run uri
+                        // we use for click handling.
+                        && last.hyperlink == hyperlink
                 });
                 if mergeable {
                     let last = line.last_mut().unwrap();
@@ -393,6 +405,7 @@ impl Backend {
                         bold,
                         italic,
                         underline,
+                        hyperlink,
                     });
                 }
             }
@@ -508,6 +521,23 @@ impl Backend {
     pub fn selection_text(&self) -> Option<String> {
         self.terminal.lock().selection_to_string()
     }
+
+    /// Look up the OSC 8 hyperlink at a visible-row / column position.
+    /// Used by the View to decide whether a click should open a URL.
+    /// Returns the resolved URI, or `None` when the cell isn't a link
+    /// (or coordinates are outside the grid).
+    pub fn hyperlink_at(&self, visible_row: usize, col: usize) -> Option<String> {
+        self.with_term(|term| {
+            let display_offset = term.grid().display_offset() as i32;
+            // Translate viewport row → absolute grid line. With
+            // `display_offset = 0` (no scrollback) row 0 = line 0;
+            // when scrolled, row 0 sits at line `-display_offset`.
+            let line = visible_row as i32 - display_offset;
+            let point = Point::new(Line(line), Column(col));
+            let cell = &term.grid()[point];
+            cell.hyperlink().map(|h| h.uri().to_string())
+        })
+    }
 }
 
 /// One contiguous run of cells with identical styling on a single row.
@@ -526,6 +556,11 @@ pub struct StyledRun {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
+    /// OSC 8 hyperlink URI, if the cells in this run are clickable.
+    /// Always paints underlined (the renderer treats `hyperlink.is_some()`
+    /// as an implicit `underline = true`). Click-to-open is wired in
+    /// `TerminalView::on_mouse_down`.
+    pub hyperlink: Option<Arc<str>>,
 }
 
 /// Cursor location, shape, and the colour state it should be painted
