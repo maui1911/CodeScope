@@ -544,16 +544,23 @@ impl Sidebar {
             .child(div().h_px().bg(divider).my_1())
             .child(item(
                 "menu-reveal",
-                "Reveal in File Explorer",
+                reveal_in_file_browser_label(),
                 false,
                 Box::new(move |this, cx| this.reveal_in_explorer(idx, cx)),
             ))
-            .child(item(
-                "menu-wt",
-                "Open in Windows Terminal",
-                false,
-                Box::new(move |this, cx| this.open_in_windows_terminal(idx, cx)),
-            ))
+            // "Open in Windows Terminal" is genuinely Windows-only —
+            // `wt.exe` doesn't exist on macOS / Linux. Hide the row
+            // entirely on other platforms instead of shipping a
+            // misleading no-op. `.children(Option<_>)` yields 0 or 1
+            // child without splitting the chain.
+            .children(cfg!(target_os = "windows").then(|| {
+                item(
+                    "menu-wt",
+                    "Open in Windows Terminal",
+                    false,
+                    Box::new(move |this, cx| this.open_in_windows_terminal(idx, cx)),
+                )
+            }))
             .child(item(
                 "menu-copy-path",
                 "Copy path",
@@ -586,6 +593,24 @@ impl Sidebar {
                 .snap_to_window_with_margin(px(8.0))
                 .child(menu_body),
         )
+    }
+}
+
+/// Platform-appropriate label for the "Reveal in <native file browser>"
+/// menu row. Mirrors the underlying spawn target in
+/// [`Sidebar::reveal_in_explorer`] (`explorer.exe` / `open` /
+/// `xdg-open`) so the UI matches what actually happens. The C# build
+/// is Windows-only and uses "Reveal in File Explorer" verbatim — we
+/// keep that string on Windows and pick a native equivalent
+/// elsewhere instead of shipping a Windows-centric label on macOS /
+/// Linux.
+fn reveal_in_file_browser_label() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Reveal in File Explorer"
+    } else if cfg!(target_os = "macos") {
+        "Reveal in Finder"
+    } else {
+        "Reveal in File Manager"
     }
 }
 
