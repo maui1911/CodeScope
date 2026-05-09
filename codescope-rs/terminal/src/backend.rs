@@ -19,7 +19,9 @@ use std::thread::JoinHandle;
 
 use alacritty_terminal::event::{Notify, OnResize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, Notifier, State};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
@@ -146,7 +148,11 @@ impl Backend {
 
         let (proxy, events) = EventProxy::new();
 
-        let term = Term::new(Config::default(), &GridSize::from_window(size), proxy.clone());
+        let term_config = Config {
+            scrolling_history: 10_000,
+            ..Config::default()
+        };
+        let term = Term::new(term_config, &GridSize::from_window(size), proxy.clone());
         let terminal = Arc::new(FairMutex::new(term));
 
         let event_loop = EventLoop::new(
@@ -223,7 +229,11 @@ impl Backend {
             let mut lines: Vec<Vec<StyledRun>> = vec![Vec::new(); screen_lines];
 
             let content = term.renderable_content();
-            let cursor_line = content.cursor.point.line.0;
+            let display_offset = content.display_offset as i32;
+            // Cursor position is reported in absolute grid coordinates;
+            // translate to the visible row so the cursor cell lines up
+            // with what the View actually paints.
+            let cursor_line = content.cursor.point.line.0 + display_offset;
             let cursor_column = content.cursor.point.column.0;
             let mode = content.mode;
             // TUIs like claude-code, vim, etc. hide alacritty's logical
@@ -241,7 +251,10 @@ impl Backend {
             );
 
             for indexed in content.display_iter {
-                let row = indexed.point.line.0;
+                // Display iterator emits cells in absolute-grid line
+                // coords (negative for scrollback). Translate to a
+                // visible-row index 0..screen_lines.
+                let row = indexed.point.line.0 + display_offset;
                 if row < 0 || (row as usize) >= screen_lines {
                     continue;
                 }
@@ -262,9 +275,13 @@ impl Backend {
                 let italic = flags.contains(Flags::ITALIC);
                 let underline = flags.contains(Flags::UNDERLINE);
 
+                let selected = content
+                    .selection
+                    .as_ref()
+                    .is_some_and(|range| range.contains(indexed.point));
                 let is_cursor =
                     cursor_visible && row == cursor_line && col == cursor_column;
-                let (fg, bg) = if is_cursor { (bg, fg) } else { (fg, bg) };
+                let (fg, bg) = if is_cursor || selected { (bg, fg) } else { (fg, bg) };
 
                 let line = &mut lines[row as usize];
                 let next_col = line.iter().map(|r| r.text.chars().count()).sum::<usize>();
@@ -351,6 +368,67 @@ impl Backend {
     /// APP_CURSOR-aware arrow keys).
     pub fn mode(&self) -> TermMode {
         self.with_term(|term| *term.mode())
+    }
+
+    /// Scroll the visible region by `delta` lines: positive scrolls
+    /// *up* into history, negative scrolls back down toward the active
+    /// region. Alacritty emits a `MouseCursorDirty` event afterward
+    /// which our drain loop turns into a re-snapshot, so the View
+    /// repaints automatically.
+    pub fn scroll(&self, delta: i32) {
+        self.terminal.lock().scroll_display(Scroll::Delta(delta));
+    }
+
+    /// Snap the visible region back to the active grid (line 0 of the
+    /// scrollback / `display_offset = 0`). Called whenever the user
+    /// types so input stays at the cursor instead of in history.
+    pub fn reset_scroll(&self) {
+        self.terminal.lock().scroll_display(Scroll::Bottom);
+    }
+
+    /// Page-sized scroll, useful for `PageUp`/`PageDown` keybindings.
+    pub fn scroll_page_up(&self) {
+        self.terminal.lock().scroll_display(Scroll::PageUp);
+    }
+
+    pub fn scroll_page_down(&self) {
+        self.terminal.lock().scroll_display(Scroll::PageDown);
+    }
+
+    /// Current `display_offset` (number of rows scrolled into history).
+    /// The View needs this to translate pixel coordinates to absolute
+    /// grid points when starting / extending a selection.
+    pub fn display_offset(&self) -> usize {
+        self.terminal.lock().grid().display_offset()
+    }
+
+    /// Begin a fresh `Simple`-mode selection anchored at `point`.
+    /// Replaces any prior selection.
+    pub fn start_selection(&self, line: i32, column: usize) {
+        let point = Point::new(Line(line), Column(column));
+        let mut term = self.terminal.lock();
+        term.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+    }
+
+    /// Extend the active selection's far end to `point`. No-op if there
+    /// is no selection in flight.
+    pub fn extend_selection(&self, line: i32, column: usize) {
+        let point = Point::new(Line(line), Column(column));
+        let mut term = self.terminal.lock();
+        if let Some(sel) = term.selection.as_mut() {
+            sel.update(point, Side::Right);
+        }
+    }
+
+    /// Clear any active selection.
+    pub fn clear_selection(&self) {
+        self.terminal.lock().selection = None;
+    }
+
+    /// Materialise the current selection as a `String`. Returns `None`
+    /// when there is no selection or it covers no cells.
+    pub fn selection_text(&self) -> Option<String> {
+        self.terminal.lock().selection_to_string()
     }
 }
 

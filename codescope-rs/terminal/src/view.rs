@@ -28,9 +28,11 @@ use crate::backend::{Backend, StyledRun, TerminalSize, TerminalSnapshot};
 use crate::colors::ColorPalette;
 use crate::input::keystroke_to_bytes;
 use gpui::{
-    App, Bounds, Context, FocusHandle, Focusable, Font, FontFallbacks, FontFeatures, FontStyle,
-    FontWeight, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Pixels, Render,
-    SharedString, Styled, TextRun, Window, canvas, div, px,
+    App, Bounds, ClipboardItem, Context, FocusHandle, Focusable, Font, FontFallbacks,
+    FontFeatures, FontStyle, FontWeight, InteractiveElement, IntoElement, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
+    Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled, TextRun, Window, canvas, div,
+    px,
 };
 
 /// User-overridable font + size knobs. The defaults target oh-my-posh
@@ -104,6 +106,15 @@ pub struct TerminalView {
     /// Last grid size we sent to the Backend, so we don't trigger a
     /// resize on every render.
     last_size: Arc<Mutex<(u16, u16)>>,
+    /// Shared cache of the most recently laid-out terminal bounds.
+    /// Mouse handlers read this to translate window-pixel positions to
+    /// grid (line, column) coords.
+    bounds_cache: Arc<Mutex<Option<Bounds<Pixels>>>>,
+    /// `true` between `mouse_down` and `mouse_up` while the user is
+    /// dragging out a selection. Mouse-move events are ignored unless
+    /// this is set, so we don't accidentally extend the selection
+    /// every time the cursor passes over the terminal.
+    selecting: bool,
 }
 
 impl TerminalView {
@@ -145,7 +156,76 @@ impl TerminalView {
             font,
             focus_handle,
             last_size: Arc::new(Mutex::new((0, 0))),
+            bounds_cache: Arc::new(Mutex::new(None)),
+            selecting: false,
         }
+    }
+
+    fn point_at(&self, position: Point<Pixels>) -> Option<(i32, usize)> {
+        let bounds = (*self.bounds_cache.lock())?;
+        let cell_w: f32 = self.font.cell_width.into();
+        let line_h: f32 = self.font.line_height.into();
+        if cell_w <= 0.0 || line_h <= 0.0 {
+            return None;
+        }
+        let local_x: f32 = (position.x - bounds.origin.x).into();
+        let local_y: f32 = (position.y - bounds.origin.y).into();
+        if local_x < 0.0 || local_y < 0.0 {
+            return None;
+        }
+        let col = (local_x / cell_w).floor().max(0.0) as usize;
+        let visible_row = (local_y / line_h).floor() as i32;
+        let display_offset = self.backend.display_offset() as i32;
+        // Convert visible-row index back to absolute grid line so the
+        // selection range stays anchored to the original output even
+        // when the user scrolls.
+        let grid_line = visible_row - display_offset;
+        Some((grid_line, col))
+    }
+
+    fn refresh_snapshot(&mut self, cx: &mut Context<Self>) {
+        self.snapshot = self.backend.snapshot(&self.palette);
+        cx.notify();
+    }
+
+    fn on_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left {
+            return;
+        }
+        if let Some((line, col)) = self.point_at(event.position) {
+            self.backend.start_selection(line, col);
+            self.selecting = true;
+            self.refresh_snapshot(cx);
+        }
+    }
+
+    fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.selecting {
+            return;
+        }
+        if let Some((line, col)) = self.point_at(event.position) {
+            self.backend.extend_selection(line, col);
+            self.refresh_snapshot(cx);
+        }
+    }
+
+    fn on_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.selecting = false;
     }
 
     fn on_key_down(
@@ -154,11 +234,83 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        cx.stop_propagation();
+
+        let key = event.keystroke.key.as_str();
+        let mods = &event.keystroke.modifiers;
+
+        // Copy semantics, matching Windows Terminal / GNOME Terminal:
+        //   * Ctrl+C with a live selection → copy, clear selection.
+        //   * Ctrl+C with no selection      → fall through to SIGINT.
+        //   * Ctrl+Shift+C                  → always copy (no-op if
+        //                                     nothing is selected).
+        //   * Cmd+C (macOS)                 → always copy.
+        if key == "c" && (mods.control || mods.platform) && !mods.alt {
+            let force_copy = mods.shift || mods.platform;
+            if let Some(text) = self.backend.selection_text() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.backend.clear_selection();
+                self.refresh_snapshot(cx);
+                return;
+            }
+            if force_copy {
+                return;
+            }
+            // No selection + plain Ctrl+C: fall through so the shell
+            // gets its SIGINT byte.
+        }
+
+        // PageUp/PageDown without modifiers scroll the view's history
+        // instead of being passed to the shell — same convention as
+        // most terminals. Holding Shift sends them through to the PTY
+        // for apps that actually use them (less, vim).
+        let plain = !mods.control && !mods.alt && !mods.platform;
+        if plain && !mods.shift {
+            match key {
+                "pageup" => {
+                    self.backend.scroll_page_up();
+                    return;
+                }
+                "pagedown" => {
+                    self.backend.scroll_page_down();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         let mode = self.backend.mode();
         if let Some(bytes) = keystroke_to_bytes(&event.keystroke, mode) {
+            // Typing dismisses any active selection — both because
+            // selection rendering would obscure the new prompt and
+            // because the user has clearly moved on.
+            self.backend.clear_selection();
+            // Snap back to the active region whenever the user types
+            // so the prompt doesn't disappear into history.
+            self.backend.reset_scroll();
             self.backend.write_input(bytes);
         }
-        cx.stop_propagation();
+    }
+
+    fn on_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        let lines = match event.delta {
+            ScrollDelta::Pixels(point) => {
+                let line_h: f32 = self.font.line_height.into();
+                let py: f32 = point.y.into();
+                if line_h > 0.0 { (py / line_h).round() as i32 } else { 0 }
+            }
+            ScrollDelta::Lines(point) => point.y.round() as i32,
+        };
+        if lines != 0 {
+            // gpui reports +y for wheel-up, alacritty's Scroll::Delta
+            // is +n for "scroll up into history" — same direction.
+            self.backend.scroll(lines);
+        }
     }
 
     fn maybe_resize(&mut self, cols: u16, rows: u16, cx: &mut Context<Self>) {
@@ -194,6 +346,7 @@ impl Render for TerminalView {
         let line_height = self.font.line_height;
         let bg = self.snapshot.default_bg;
         let last_size = self.last_size.clone();
+        let bounds_cache = self.bounds_cache.clone();
         let weak = cx.weak_entity();
         let font = self.font.to_font();
         let font_size = self.font.size;
@@ -204,6 +357,10 @@ impl Render for TerminalView {
         // PTY/grid in step with the window. It paints nothing.
         let resize_probe = canvas(
             move |bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App| {
+                // Stash the laid-out bounds so mouse handlers can map
+                // window-pixel positions back to grid coordinates.
+                *bounds_cache.lock() = Some(bounds);
+
                 // Shape a single character through the same font stack
                 // we render with. '│' is the conventional choice — TUI
                 // fonts size it to fill the cell exactly.
@@ -254,6 +411,10 @@ impl Render for TerminalView {
             .track_focus(&self.focus_handle)
             .key_context("Terminal")
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .bg(bg)
             .font_family(self.font.family.clone())
             .text_size(self.font.size)
