@@ -6,8 +6,8 @@
 > Old detail lives in `git log` — don't duplicate it here.
 
 **Last updated:** 2026-05-09 (session 32)
-**Branch:** `feat/codescope-rs-window-state-save` (PR pending)
-**Head:** `ee8d155` — pushed (`feat(rs): persist sidebar selection across launches`)
+**Branch:** `feat/codescope-rs-window-state-save` (PR #55, manual-tested)
+**Head:** `27301fe` — pushed (`fix(rs): address PR #55 review feedback`)
 **Release:** `v0.2.5` shipped — https://github.com/maui1911/CodeScope/releases/tag/v0.2.5
 **Build status:** ✅ C# untouched. Rust workspace builds clean
 (`cargo build --workspace --manifest-path codescope-rs/Cargo.toml`).
@@ -96,7 +96,39 @@ in stacked commits on `feat/codescope-rs-window-state-save` (off main):
    "Open in Explorer", "Reveal in shell" — mirrors the C# build's
    tab-strip context menu.
 
-**Known small things still to clean up:**
+**Manual-test results (this machine, dev build, end of session):**
+- ✅ resize + reposition → close → relaunch reopens at the same
+  bounds (`window.json` save wiring works)
+- ✅ click `+` → folder picker → new row appended, `projects.json`
+  written in Rust shape (snake_case)
+- ✅ select project → close → relaunch restores selection
+  (`layout.json.selected_project_id` wired)
+- ✅ select project → `Ctrl+Shift+T` → new tab labelled with the
+  project name, `pwd` lands in the project's path
+- ⚠️ test plan claimed "v0.x C# `projects.json` round-trips" — it
+  does **not** in practice. C# writes camelCase
+  (`defaultBranch`, `worktreePath`, `agentSessionId`, …); Rust
+  expects snake_case. C#-shape file fails to deserialize and we
+  fall back to empty config. Fix in the next pass: add
+  `#[serde(rename_all = "camelCase")]` on `Project`, `Session`,
+  `Worktree`, `ProjectsConfig` (verify per-field — the C# file
+  has a top-level `agents: []` we don't model yet, so a
+  `serde(default)` fallthrough on extras is also needed). Then
+  add a round-trip integration test with a fixture cribbed from
+  `CodeScope.Dev.backup-*` so the schema break can't silently
+  return.
+
+**Known small things still to clean up (rolled into the "next
+pass" lane the user explicitly carved out):**
+- **Titlebar interactions broken.** `appears_transparent: true`
+  claims the bar for our tab strip but we don't replace the
+  drag region or the caption controls — so the window can't be
+  dragged, can't be maximised by double-clicking the bar, and
+  has no min/max/close glyphs. gpui's `examples/window.rs` and
+  `window_shadow.rs` show the pattern: a `WindowControlArea`
+  for the buttons + a hand-rolled drag handler on empty bar
+  space (`window.start_window_move()` on Windows). Land
+  alongside the next round of polish.
 - Backend's `hyperlink_at` is unused (snapshot handles it).
 - Layout fields `sidebar_visible` / `sidebar_width` are loaded
   but never re-saved because nothing changes them yet — fine for
