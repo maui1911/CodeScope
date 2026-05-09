@@ -14,9 +14,11 @@
 //! `codescope-terminal`.
 
 pub mod paths;
+pub mod projects;
 pub mod settings;
 pub mod theme;
 
 pub use paths::AppPaths;
+pub use projects::{Project, ProjectsConfig, Session, Worktree};
 pub use settings::{CursorSettings, FontSettings, Settings};
 pub use theme::{Rgb, Theme, ThemePalette, builtin};

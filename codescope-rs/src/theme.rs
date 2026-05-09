@@ -58,7 +58,6 @@ pub fn with_alpha(rgb: Rgb, alpha: f32) -> Hsla {
 pub fn canvas(theme: &Theme) -> Hsla { rgb_to_hsla(theme.chrome.canvas) }
 pub fn elevated(theme: &Theme) -> Hsla { rgb_to_hsla(theme.chrome.elevated) }
 pub fn ink(theme: &Theme) -> Hsla { rgb_to_hsla(theme.chrome.ink) }
-#[allow(dead_code)]
 pub fn ink_muted(theme: &Theme) -> Hsla { rgb_to_hsla(theme.chrome.ink_muted) }
 pub fn divider(theme: &Theme) -> Hsla { rgb_to_hsla(theme.chrome.divider) }
 pub fn accent(theme: &Theme) -> Hsla { rgb_to_hsla(theme.chrome.accent) }

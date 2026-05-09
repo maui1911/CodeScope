@@ -12,12 +12,13 @@
 //!    initial terminal tab and owns everything from there.
 
 mod app;
+mod sidebar;
 mod theme;
 
 use std::sync::Arc;
 
 use anyhow::Result;
-use codescope_core::{AppPaths, Settings, Theme, builtin};
+use codescope_core::{AppPaths, ProjectsConfig, Settings, Theme, builtin};
 use gpui::{
     AppContext, Context, IntoElement, ParentElement, Render, Styled, TitlebarOptions, Window,
     WindowOptions, div,
@@ -63,11 +64,25 @@ fn main() -> Result<()> {
     let theme = Arc::new(builtin::by_name(&settings.theme));
     let settings = Arc::new(settings);
 
+    let projects = match ProjectsConfig::load(&paths) {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!(
+                "warning: failed to load {} ({}); starting with no projects",
+                paths.projects_file().display(),
+                err
+            );
+            ProjectsConfig::default()
+        }
+    };
+    let projects = Arc::new(projects);
+
     let app = gpui::Application::new();
 
     app.run(move |cx| {
         let settings = settings.clone();
         let theme = theme.clone();
+        let projects = projects.clone();
         cx.spawn(async move |cx| {
             cx.open_window(
                 WindowOptions {
@@ -79,7 +94,7 @@ fn main() -> Result<()> {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let shell = cx.new(|cx| AppShell::new(settings, theme.clone(), window, cx));
+                    let shell = cx.new(|cx| AppShell::new(settings, theme.clone(), projects, window, cx));
                     cx.new(|_| Root { shell, theme })
                 },
             )?;

@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use codescope_core::{Settings, Theme};
+use codescope_core::{ProjectsConfig, Settings, Theme};
 use codescope_terminal::{
     Backend, ColorPalette, CursorStylePreset, FontConfig, Shell, SpawnConfig, TerminalSize,
     TerminalView,
@@ -35,6 +35,7 @@ use gpui::{
     KeyDownEvent, MouseButton, ParentElement, Render, SharedString, Styled, Window, div, px,
 };
 
+use crate::sidebar::Sidebar;
 use crate::theme;
 
 /// One tab = one terminal session.
@@ -56,16 +57,21 @@ pub struct AppShell {
     /// Active theme — chrome reads from this on every render. Kept
     /// in an `Arc` so swapping themes is a single pointer write.
     theme: Arc<Theme>,
+    /// Left rail. Lives behind a feature flag in the layout state —
+    /// hidden when the user collapses the sidebar (later).
+    sidebar: Entity<Sidebar>,
 }
 
 impl AppShell {
     pub fn new(
         settings: Arc<Settings>,
         theme: Arc<Theme>,
+        projects: Arc<ProjectsConfig>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
+        let sidebar = cx.new(|_| Sidebar::new(projects, theme.clone()));
         let mut shell = Self {
             tabs: Vec::new(),
             active_tab: 0,
@@ -73,6 +79,7 @@ impl AppShell {
             focus_handle,
             settings,
             theme,
+            sidebar,
         };
         shell.spawn_tab(window, cx);
         shell
@@ -380,6 +387,13 @@ impl Render for AppShell {
             div().size_full().into_any_element()
         };
 
+        let main_row = div()
+            .flex_grow()
+            .flex()
+            .flex_row()
+            .child(self.sidebar.clone())
+            .child(div().flex_grow().child(body));
+
         div()
             .key_context("AppShell")
             .track_focus(&self.focus_handle)
@@ -390,7 +404,7 @@ impl Render for AppShell {
             .bg(theme::canvas(&theme))
             .text_color(theme::ink(&theme))
             .child(tab_strip)
-            .child(div().flex_grow().child(body))
+            .child(main_row)
     }
 }
 
