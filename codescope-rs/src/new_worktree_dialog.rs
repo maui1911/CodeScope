@@ -209,9 +209,12 @@ impl Sidebar {
                 // user lands inside it immediately. Mirrors the C#
                 // dialog's `SpawnSession = true` default. The host
                 // (`AppShell`) catches the event and creates the tab.
+                // Single spaces around `·` to match the C# build's
+                // `$"{project.Name} · {branch}"` convention in
+                // `MainViewModel.RefreshTabTitlesForWorktree`.
                 cx.emit(crate::sidebar::SidebarEvent::OpenSession {
                     working_directory: std::path::PathBuf::from(&folder),
-                    title: format!("{project_name}  ·  {branch}").into(),
+                    title: format!("{project_name} · {branch}").into(),
                 });
             }
             Err(err) => {
