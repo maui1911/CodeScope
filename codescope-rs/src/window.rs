@@ -20,8 +20,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use codescope_core::{AppPaths, LayoutState, ProjectsConfig, Settings, Theme, WindowState, builtin};
 use gpui::{
-    AppContext, Bounds, Context, IntoElement, ParentElement, Pixels, Render, Styled,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, div, point, px, size,
+    AppContext, Bounds, Context, IntoElement, ParentElement, Render, Styled, TitlebarOptions,
+    Window, WindowBounds, WindowOptions, div, point, px, size,
 };
 
 use crate::app::AppShell;
@@ -75,7 +75,6 @@ fn main() -> Result<()> {
             ProjectsConfig::default()
         }
     };
-    let projects = Arc::new(projects);
 
     let layout = match LayoutState::load(&paths) {
         Ok(l) => l,
@@ -108,18 +107,13 @@ fn main() -> Result<()> {
     let app = gpui::Application::new();
 
     app.run(move |cx| {
-        let settings = settings.clone();
-        let theme = theme.clone();
-        let projects = projects.clone();
-        let layout = layout.clone();
-        let paths = paths.clone();
-
         // `window.json` save now lives inside `AppShell::new` — it
         // observes bounds and debounces writes. `layout.json` save
         // is still TODO (waiting on real live layout state); we
         // deliberately don't write `LayoutState::default()` at
         // quit-time because that would clobber whatever the user
         // last saved.
+        let _ = layout;
 
         cx.spawn(async move |cx| {
             cx.open_window(
@@ -142,7 +136,6 @@ fn main() -> Result<()> {
             Ok::<_, anyhow::Error>(())
         })
         .detach();
-        let _ = layout;
     });
 
     Ok(())
@@ -157,21 +150,6 @@ fn window_state_to_bounds(state: WindowState) -> WindowBounds {
         WindowBounds::Maximized(bounds)
     } else {
         WindowBounds::Windowed(bounds)
-    }
-}
-
-#[allow(dead_code)]
-fn bounds_to_window_state(bounds: Bounds<Pixels>, maximised: bool) -> WindowState {
-    let f32_x: f32 = bounds.origin.x.into();
-    let f32_y: f32 = bounds.origin.y.into();
-    let f32_w: f32 = bounds.size.width.into();
-    let f32_h: f32 = bounds.size.height.into();
-    WindowState {
-        x: f32_x as i32,
-        y: f32_y as i32,
-        width: f32_w.max(0.0) as u32,
-        height: f32_h.max(0.0) as u32,
-        maximised,
     }
 }
 

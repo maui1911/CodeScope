@@ -82,13 +82,13 @@ impl AppShell {
     pub fn new(
         settings: Arc<Settings>,
         theme: Arc<Theme>,
-        projects: Arc<ProjectsConfig>,
+        projects: ProjectsConfig,
         paths: Arc<AppPaths>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
-        let sidebar = cx.new(|_| Sidebar::new(projects, theme.clone()));
+        let sidebar = cx.new(|_| Sidebar::new(projects, theme.clone(), paths.clone()));
         let pending_window_save: Arc<Mutex<Option<PendingWindowSave>>> = Arc::new(Mutex::new(None));
 
         // Persist live window geometry. The observer fires for every
