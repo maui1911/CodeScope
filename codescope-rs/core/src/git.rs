@@ -146,6 +146,16 @@ pub fn pull_ff_only(repo: &Path) -> Result<()> {
     run_git(repo, &["pull", "--ff-only"]).map(|_| ())
 }
 
+/// `git status --porcelain` — empty stdout means a clean worktree
+/// (no staged, unstaged, or untracked changes), anything else
+/// means dirty. Cheap enough to poll a couple of times per second
+/// per worktree without blowing the I/O budget. Mirrors C#'s
+/// `WorktreePoller.IsDirtyAsync`.
+pub fn is_dirty(repo: &Path) -> Result<bool> {
+    let output = run_git(repo, &["status", "--porcelain"])?;
+    Ok(!output.stdout.is_empty())
+}
+
 /// `git fetch --all --prune`. Updates every remote and prunes the
 /// **remote-tracking** refs (`refs/remotes/<remote>/*`) whose
 /// upstream branches have been deleted. Local branches and tags
@@ -599,6 +609,31 @@ some-future-field foo bar\n";
     // doesn't have the key. The exit-code branching in the source
     // is small enough that the doc + visual review serves better
     // than a flaky integration test would.
+
+    #[test]
+    fn is_dirty_false_on_freshly_initialised_repo() {
+        let Some((_guard, repo, _wts)) = init_repo() else { return };
+        assert!(!is_dirty(&repo).expect("call ok"));
+    }
+
+    #[test]
+    fn is_dirty_true_after_creating_an_untracked_file() {
+        let Some((_guard, repo, _wts)) = init_repo() else { return };
+        std::fs::write(repo.join("dirty.txt"), b"hello").expect("write");
+        assert!(is_dirty(&repo).expect("call ok"));
+    }
+
+    #[test]
+    fn is_dirty_true_after_modifying_tracked_file() {
+        let Some((_guard, repo, _wts)) = init_repo() else { return };
+        // Commit a file first so it's tracked, then modify it.
+        std::fs::write(repo.join("README"), b"v1").expect("write");
+        run(&repo, &["add", "README"]);
+        run(&repo, &["commit", "-m", "add README", "-q"]);
+        assert!(!is_dirty(&repo).expect("clean after commit"));
+        std::fs::write(repo.join("README"), b"v2").expect("write");
+        assert!(is_dirty(&repo).expect("dirty after modify"));
+    }
 
     #[test]
     fn add_worktree_existing_branch_returns_stderr_error() {

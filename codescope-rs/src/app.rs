@@ -314,8 +314,15 @@ impl AppShell {
         // sidebar writes (and vice versa). Two writers to the same
         // file is acceptable — both go through the same atomic write
         // wrapper, last-writer-wins on order.
-        let sidebar = cx.new(|_| {
-            Sidebar::new(projects, layout.clone(), theme.clone(), paths.clone())
+        let sidebar = cx.new(|cx| {
+            let sidebar =
+                Sidebar::new(projects, layout.clone(), theme.clone(), paths.clone());
+            // Kick off the per-worktree dirty-state poll. Has to be
+            // called from inside the `cx.new` callback because that's
+            // where we have a `Context<Sidebar>` to register the
+            // background task against.
+            sidebar.start_dirty_poll(cx);
+            sidebar
         });
 
         // Spawn a tab whenever the sidebar asks us to — fired by a

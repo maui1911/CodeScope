@@ -77,6 +77,16 @@ pub fn ink_ghost(theme: &Theme) -> Hsla { with_alpha(theme.chrome.ink, 0.40) }
 /// reads as "running" in every dark theme we ship. Themable later.
 pub fn status_running() -> Hsla { rgb_to_hsla(Rgb::from_hex(0x22c55e)) }
 
+/// Worktree dirty indicator. Amber, distinct enough from
+/// `status_running` (green) and `danger` (red) that the user can
+/// tell at a glance.
+pub fn status_dirty(_theme: &Theme) -> Hsla { rgb_to_hsla(Rgb::from_hex(0xf5a623)) }
+
+/// Worktree clean indicator. Reuses the accent colour so a fully-
+/// clean worktree visually rhymes with the focus / accent rail
+/// elsewhere in the chrome.
+pub fn status_clean(theme: &Theme) -> Hsla { accent(theme) }
+
 /// Foreground for destructive context-menu entries ("Remove project",
 /// "Discard changes…"). Mirrors `Ctx.Color.Danger` from the C# build's
 /// `ContextMenuStyles.xaml`. Hard-coded — a danger red that reads
