@@ -29,6 +29,7 @@ codescope-core = { path = "core" }
 portable-pty = "0.9"
 anyhow = "1"
 parking_lot = "0.12"
+uuid = { version = "1", features = ["v4"] }
 
 [profile.dev]
 opt-level = 1
