@@ -54,7 +54,14 @@ enum OpenMenu {
     Project { project_idx: usize, position: Point<Pixels> },
     Worktree {
         project_idx: usize,
-        worktree_idx: usize,
+        /// Stable id of the right-clicked worktree. Looked up in
+        /// `project.worktrees` at action time so a concurrent
+        /// `projects.json` rewrite (or a primary worktree slipping
+        /// into the list) can't shift the row underneath us. Indexing
+        /// would break here because the sidebar enumerates *only*
+        /// non-primary rows for display, while the action handlers
+        /// search the full list — using the id sidesteps both axes.
+        worktree_id: String,
         position: Point<Pixels>,
     },
 }
@@ -266,22 +273,22 @@ impl Sidebar {
     }
 
     /// Open the worktree context menu at `position` for the worktree
-    /// at `(project_idx, worktree_idx)`. No-op when either index has
-    /// shifted out from under the click (rare but possible if the
-    /// projects file was rewritten between the right-click event being
-    /// queued and us getting around to handling it).
+    /// identified by `worktree_id` inside `project_idx`. No-op when
+    /// either has shifted out from under the click (rare but possible
+    /// if the projects file was rewritten between the right-click
+    /// event being queued and us getting around to handling it).
     fn open_worktree_menu(
         &mut self,
         project_idx: usize,
-        worktree_idx: usize,
+        worktree_id: String,
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
         let Some(project) = self.projects.projects.get(project_idx) else { return };
-        if worktree_idx >= project.worktrees.len() {
+        if !project.worktrees.iter().any(|wt| wt.id == worktree_id) {
             return;
         }
-        self.menu = Some(OpenMenu::Worktree { project_idx, worktree_idx, position });
+        self.menu = Some(OpenMenu::Worktree { project_idx, worktree_id, position });
         cx.notify();
     }
 
@@ -325,10 +332,10 @@ impl Sidebar {
     fn reveal_worktree_in_explorer(
         &mut self,
         project_idx: usize,
-        worktree_idx: usize,
+        worktree_id: &str,
         cx: &mut Context<Self>,
     ) {
-        if let Some(path) = self.worktree_path(project_idx, worktree_idx) {
+        if let Some(path) = self.worktree_path(project_idx, worktree_id) {
             reveal_path_in_file_browser(&path);
         }
         self.close_menu(cx);
@@ -337,10 +344,10 @@ impl Sidebar {
     fn open_worktree_in_windows_terminal(
         &mut self,
         project_idx: usize,
-        worktree_idx: usize,
+        worktree_id: &str,
         cx: &mut Context<Self>,
     ) {
-        if let Some(path) = self.worktree_path(project_idx, worktree_idx) {
+        if let Some(path) = self.worktree_path(project_idx, worktree_id) {
             open_path_in_windows_terminal(&path);
         }
         self.close_menu(cx);
@@ -349,39 +356,42 @@ impl Sidebar {
     fn copy_worktree_path(
         &mut self,
         project_idx: usize,
-        worktree_idx: usize,
+        worktree_id: &str,
         cx: &mut Context<Self>,
     ) {
-        if let Some(path) = self.worktree_path(project_idx, worktree_idx) {
+        if let Some(path) = self.worktree_path(project_idx, worktree_id) {
             cx.write_to_clipboard(ClipboardItem::new_string(path));
         }
         self.close_menu(cx);
     }
 
-    /// Look up the on-disk path for a non-primary worktree by its
-    /// (project, worktree) indices. Returns `None` if either index has
-    /// shifted out from under us (race with `add_project` /
-    /// `remove_project` / external `projects.json` rewrite). Callers
-    /// should silently no-op on `None` — the user will see the menu
-    /// close and re-open with fresh data on the next click.
-    fn worktree_path(&self, project_idx: usize, worktree_idx: usize) -> Option<String> {
+    /// Look up the on-disk path for a worktree by `worktree_id`.
+    /// Returns `None` if the project / worktree has shifted out from
+    /// under us (race with `add_project` / `remove_project` / external
+    /// `projects.json` rewrite, or simply a stale id from a closed
+    /// menu). Callers should silently no-op on `None` — the user will
+    /// see the menu close and re-open with fresh data on the next
+    /// click.
+    fn worktree_path(&self, project_idx: usize, worktree_id: &str) -> Option<String> {
         self.projects
             .projects
             .get(project_idx)
-            .and_then(|p| p.worktrees.get(worktree_idx).map(|wt| wt.path.clone()))
+            .and_then(|p| p.worktrees.iter().find(|wt| wt.id == worktree_id))
+            .map(|wt| wt.path.clone())
     }
 
     /// Snapshot the metadata the "Remove worktree…" flow needs before
     /// we hand control off to an async task. Returning the values
     /// up-front means we don't have to re-borrow `self.projects` after
-    /// the await point — the indices may have shifted by then.
+    /// the await point — the worktree may have moved or vanished by
+    /// then.
     fn worktree_remove_context(
         &self,
         project_idx: usize,
-        worktree_idx: usize,
+        worktree_id: &str,
     ) -> Option<WorktreeRemoveContext> {
         let project = self.projects.projects.get(project_idx)?;
-        let wt = project.worktrees.get(worktree_idx)?;
+        let wt = project.worktrees.iter().find(|wt| wt.id == worktree_id)?;
         if wt.is_primary {
             return None;
         }
@@ -416,11 +426,11 @@ impl Sidebar {
     fn remove_worktree(
         &mut self,
         project_idx: usize,
-        worktree_idx: usize,
+        worktree_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ctx) = self.worktree_remove_context(project_idx, worktree_idx) else {
+        let Some(ctx) = self.worktree_remove_context(project_idx, worktree_id) else {
             self.close_menu(cx);
             return;
         };
@@ -675,7 +685,7 @@ impl Render for Sidebar {
             // which the AppShell catches to spawn a tab pinned to the
             // worktree's path. Right-click opens the worktree context
             // menu (Reveal / Open in WT / Copy path / Remove…).
-            for (wt_idx, wt) in worktrees.into_iter().enumerate() {
+            for wt in worktrees.into_iter() {
                 let wt_label: SharedString = wt
                     .branch
                     .clone()
@@ -693,6 +703,13 @@ impl Render for Sidebar {
                     .into();
                 let wt_path_for_event = wt.path.clone();
                 let project_idx_for_menu = idx;
+                // The right-click handler captures the worktree id by
+                // clone — looking up by id at action time makes the
+                // menu robust against `projects.json` rewrites that
+                // shift indices, and avoids the bug where enumerating
+                // the *filtered* (non-primary) view here would mis-map
+                // to the unfiltered `project.worktrees` later.
+                let wt_id_for_menu = wt.id.clone();
                 // Single spaces around `·` to match the C# build's
                 // `$"{project.Name} · {branch}"` convention in
                 // `MainViewModel.RefreshTabTitlesForWorktree`.
@@ -726,13 +743,16 @@ impl Render for Sidebar {
                     )
                     .on_mouse_down(
                         MouseButton::Right,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            this.open_worktree_menu(
-                                project_idx_for_menu,
-                                wt_idx,
-                                event.position,
-                                cx,
-                            );
+                        cx.listener({
+                            let id_for_menu = wt_id_for_menu.clone();
+                            move |this, event: &MouseDownEvent, _, cx| {
+                                this.open_worktree_menu(
+                                    project_idx_for_menu,
+                                    id_for_menu.clone(),
+                                    event.position,
+                                    cx,
+                                );
+                            }
                         }),
                     )
                     .child(div().flex_grow().truncate().child(wt_label));
@@ -774,14 +794,15 @@ impl Render for Sidebar {
                     root = root.child(overlay);
                 }
             }
-            Some(OpenMenu::Worktree { project_idx, worktree_idx, position }) => {
+            Some(OpenMenu::Worktree { project_idx, worktree_id, position }) => {
                 if let Some(project) = self.projects.projects.get(*project_idx).cloned()
-                    && let Some(wt) = project.worktrees.get(*worktree_idx).cloned()
+                    && let Some(wt) =
+                        project.worktrees.iter().find(|w| &w.id == worktree_id).cloned()
                 {
                     let overlay = self
                         .render_worktree_menu(
                             *project_idx,
-                            *worktree_idx,
+                            worktree_id.clone(),
                             *position,
                             &project,
                             &wt,
@@ -946,7 +967,7 @@ impl Sidebar {
     fn render_worktree_menu(
         &self,
         project_idx: usize,
-        worktree_idx: usize,
+        worktree_id: String,
         position: Point<Pixels>,
         project: &Project,
         worktree: &codescope_core::projects::Worktree,
@@ -1047,48 +1068,52 @@ impl Sidebar {
                 }),
             ))
             .child(div().h_px().bg(divider).my_1())
-            .child(item(
-                "wt-menu-reveal",
-                reveal_in_file_browser_label(),
-                false,
-                Box::new(move |this, _window, cx| {
-                    this.reveal_worktree_in_explorer(project_idx, worktree_idx, cx);
-                }),
-            ))
+            .child({
+                let id_for_reveal = worktree_id.clone();
+                item(
+                    "wt-menu-reveal",
+                    reveal_in_file_browser_label(),
+                    false,
+                    Box::new(move |this, _window, cx| {
+                        this.reveal_worktree_in_explorer(project_idx, &id_for_reveal, cx);
+                    }),
+                )
+            })
             .children(cfg!(target_os = "windows").then(|| {
+                let id_for_wt = worktree_id.clone();
                 item(
                     "wt-menu-wt",
                     "Open in Windows Terminal",
                     false,
                     Box::new(move |this, _window, cx| {
-                        this.open_worktree_in_windows_terminal(
-                            project_idx,
-                            worktree_idx,
-                            cx,
-                        );
+                        this.open_worktree_in_windows_terminal(project_idx, &id_for_wt, cx);
                     }),
                 )
             }))
-            .child(item(
-                "wt-menu-copy-path",
-                "Copy path",
-                false,
-                Box::new(move |this, _window, cx| {
-                    this.copy_worktree_path(project_idx, worktree_idx, cx);
-                }),
-            ))
+            .child({
+                let id_for_copy = worktree_id.clone();
+                item(
+                    "wt-menu-copy-path",
+                    "Copy path",
+                    false,
+                    Box::new(move |this, _window, cx| {
+                        this.copy_worktree_path(project_idx, &id_for_copy, cx);
+                    }),
+                )
+            })
             // Primary worktrees are tracked by the project row itself —
             // there's nothing to "remove" without removing the project
             // (which has its own destructive flow). Hide the row
             // entirely on the primary so the menu stays a list of
             // things that actually do something.
             .children((!is_primary).then(|| {
+                let id_for_remove = worktree_id.clone();
                 div().child(div().h_px().bg(divider).my_1()).child(item(
                     "wt-menu-remove",
                     "Remove worktree…",
                     true,
                     Box::new(move |this, window, cx| {
-                        this.remove_worktree(project_idx, worktree_idx, window, cx);
+                        this.remove_worktree(project_idx, &id_for_remove, window, cx);
                     }),
                 ))
             }))
@@ -1132,7 +1157,6 @@ async fn run_remove_worktree_flow(
     cx: &mut gpui::AsyncWindowContext,
 ) {
     use codescope_core::git;
-    use std::path::Path;
 
     let repo = std::path::PathBuf::from(&ctx.project_path);
     let wt_path = std::path::PathBuf::from(&ctx.worktree_path);
@@ -1215,13 +1239,13 @@ async fn run_remove_worktree_flow(
         cx.notify();
     });
 
-    // Best-effort: the empty worktree directory should already be
-    // gone — `git worktree remove` cleans it up. If it lingers (rare,
-    // typically antivirus holding a handle), let it sit; the residual
-    // is a flat empty directory the user can remove manually. Mirrors
-    // the C# `RemoveWorktreeResidualDirPrefix` branch which also just
-    // surfaces the message rather than retrying.
-    let _ = Path::new(&ctx.worktree_path);
+    // Note: `git worktree remove` already deletes the worktree
+    // directory on success. If the directory lingers (rare, typically
+    // antivirus holding a handle), it stays as a flat empty folder the
+    // user can remove manually. We deliberately don't retry on the
+    // Rust side — the C# build's `RemoveWorktreeResidualDirPrefix`
+    // path also just surfaces the message rather than attempting
+    // another delete from app code.
 }
 
 /// OS-spawn shared by project + worktree "Reveal" rows. Detached so a
