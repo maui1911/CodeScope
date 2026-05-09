@@ -50,6 +50,14 @@ fn main() -> Result<()> {
                     let mut env = std::collections::HashMap::new();
                     env.insert("TERM".into(), "xterm-256color".into());
                     env.insert("COLORTERM".into(), "truecolor".into());
+                    // Identify the host so TUIs that detect minimal
+                    // terminals via TERM_PROGRAM (claude-code, some
+                    // Ink-based apps, …) recognise us as a real
+                    // graphical terminal. Empty TERM_PROGRAM is the
+                    // default on Windows ConPTY, which is why claude
+                    // falls back to its stripped UI.
+                    env.insert("TERM_PROGRAM".into(), "CodeScope".into());
+                    env.insert("TERM_PROGRAM_VERSION".into(), "0.0.1".into());
 
                     let backend = Backend::spawn(SpawnConfig {
                         shell,
