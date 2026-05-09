@@ -5,14 +5,107 @@
 > **Intent:** cursor + last 1–2 sessions in depth, everything else a one-liner.
 > Old detail lives in `git log` — don't duplicate it here.
 
-**Last updated:** 2026-05-08 (session 28)
+**Last updated:** 2026-05-09 (session 29)
 **Branch:** `feat/codescope-rs-terminal`
-**Head:** _uncommitted_ — `codescope-rs/` spike + terminal-crate scaffold
+**Head:** `127d1f2` — pushed to PR #53
 **Release:** `v0.2.5` shipped — https://github.com/maui1911/CodeScope/releases/tag/v0.2.5
-**Build status:** ✅ C# side untouched, still green. Rust workspace at
-`codescope-rs/` builds (`cargo build --workspace --manifest-path codescope-rs/Cargo.toml`).
-**Uncommitted work:** entire `codescope-rs/` directory (3 commits planned).
+**Build status:** ✅ C# untouched. Rust workspace builds clean
+(`cargo build --workspace --manifest-path codescope-rs/Cargo.toml`),
+clippy `-D warnings` green for `codescope-terminal`.
+**Uncommitted work:** none.
 **Open issues:** none on GitHub.
+
+### Session 29 — Backend, View+Element-lite, scrollback, mouse selection, clipboard
+
+This session turned the Rust port from "Backend stub + headless smoke
+test" into a working interactive terminal window driven by our own code,
+with a clear path forward.
+
+**Shipped (3 commits on `feat/codescope-rs-terminal`, all on PR #53):**
+
+1. `e469cc2` — `codescope-terminal::Backend` on alacritty's `EventLoop`.
+   `EventProxy` forwards user-facing `Event` variants to a flume channel
+   and routes `Event::PtyWrite` back via `Msg::Input` (the gpui-terminal
+   Bug #1 we patched in vendor; here it's the canonical shape).
+   `examples/smoke.rs` proves the pipeline headlessly: pwsh, `echo`,
+   round-trip in the grid, clean exit. ~280 LOC, no UI dependency.
+2. `fc03180` — `TerminalView` (gpui Entity, high-level div-based render,
+   Element layer deferred). `colors::ColorPalette` resolves alacritty
+   `Color` → `Hsla`. `input.rs` (lifted verbatim from vendor) maps
+   keystrokes to bytes. Fonts: default `FiraCode Nerd Font` + 9-deep
+   fallback stack so oh-my-posh glyphs render; `CODESCOPE_FONT` env
+   override. Live resize via `canvas` overlay that measures cell width
+   from `window.text_system().shape_line("│", …)` (Zed's pattern) and
+   triggers `Backend::resize`. Cursor cell rendered with inverted bg/fg
+   and gated on `TermMode::SHOW_CURSOR` + `CursorShape::Hidden` so TUIs
+   that draw their own cursor (claude code, vim) don't double up.
+   `cargo run --bin window` is the demo binary.
+3. `127d1f2` — scrollback (`Config::scrolling_history = 10_000`),
+   `Backend::scroll/scroll_page_up/page_down/reset_scroll/display_offset`
+   wired through alacritty's `Term::scroll_display`. Snapshot translates
+   `display_iter`'s absolute-line coords back to visible-row using
+   `display_offset` (the bug that made scrolled rows render black). Mouse
+   selection: `bounds_cache` Arc populated from the resize-probe canvas,
+   `point_at(position)` maps window pixels → grid coords using measured
+   cell metrics, `on_mouse_down/move/up` drive `Backend::start_/extend_
+   /clear_selection`. Selected cells get fg/bg swapped in the snapshot.
+   `Ctrl+C` is smart: copies + clears the selection if there is one,
+   otherwise falls through to SIGINT. `Ctrl+Shift+C` and `Cmd+C` always
+   copy. Typing clears selection and snaps back to active region.
+
+**Confirmed working on Windows (manual test, this machine):**
+pwsh + oh-my-posh prompt with full colour and nerd glyphs · keyboard
+input including arrow keys / Ctrl+key combos · live resize tracking the
+window edge · 10k-line scrollback via wheel and PageUp/PageDown ·
+drag-select with visual inversion · clipboard round-trip via Ctrl+C
+(with selection) and Ctrl+Shift+C (always) · plain Ctrl+C still kills
+running commands when nothing is selected · cursor doubling in
+claude-code resolved.
+
+**Architectural notes worth carrying forward:**
+- The `Backend` design exactly mirrors Zed's `Terminal` struct
+  (`Arc<FairMutex<Term<EventListener>>>` + alacritty `EventLoop` +
+  `Notifier` for writes + flume channel for upstream events). Validated
+  by reading `crates/terminal/src/terminal.rs` from `zed-industries/zed`
+  before writing ours — same shape, smaller.
+- "Bug #2 conhost-vs-grid scroll-sync" from session 28 turns out to be
+  a gpui-terminal *render* bug, not a ConPTY-level coordinate problem.
+  Zed walks `display_iter` directly and does no translation. Our
+  snapshot does the same now and the symptom is gone.
+- The View layer skips the Element trait for now and uses high-level
+  `div().flex().children(...)` with one styled run per cell-batch. This
+  trades pixel-perfect alignment for ~150 LOC of paint code instead of
+  several hundred. The Element layer goes in when alignment / cursor
+  shape / sub-cell selection matter.
+
+**Suggested next entry points (in priority order):**
+
+1. **Element-level renderer.** Replace the per-line flex-of-divs with
+   a real `Element` impl that paints background quads + batched
+   `TextRun`s at exact `col × cell_width` offsets. Needed for: a real
+   block/beam/underline cursor with blink, sub-cell selection
+   highlighting, and to make the right-edge alignment perfect at any
+   cell width. Reference: `gpui-terminal/src/render.rs` (vendored)
+   and Zed's `terminal_view/src/terminal_element.rs`.
+2. **Settings file.** A `settings.json` next to `projects.json` with
+   `font.family`, `font.size`, `line_height`, `colors.*`, `scrollback`.
+   Reuse `AppPaths` so dev-mode separation works.
+3. **Hyperlinks (OSC 8) and URL/path detection.** Zed has a clean
+   `terminal_hyperlinks.rs` we can lift the heuristics from.
+4. **Mouse-mode reporting.** TUIs like `tmux`, `htop` want mouse events
+   forwarded as escape sequences when they enable mouse mode. Currently
+   we eat all clicks for selection.
+5. **Tabs / multiple terminals in one window.** Once the View is
+   stable, scaling to N TerminalViews in a tab strip is the fastest
+   route to "actually replaces my workflow."
+
+**Known small things still to clean up:**
+- The View's font defaults are hardcoded `FiraCode Nerd Font`. Settings
+  file would fix this properly; until then, `CODESCOPE_FONT` works.
+- `fg_default(palette)` helper is private to `backend.rs` but mirrors
+  `palette.foreground`; keep until colours come out of a theme struct.
+- No tests on the View layer; only `Backend` has the smoke example.
+  Element-layer rewrite is the right time to add unit tests.
 
 ### Session 28 — Rust port direction set; spike validates stack; terminal crate scaffolded
 
