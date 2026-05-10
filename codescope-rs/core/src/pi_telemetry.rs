@@ -176,11 +176,19 @@ fn parse_line(line: &str) -> Option<Entry> {
 /// Mirrors `PiTranscriptParser.ExtractSessionIdFromFileName` in the
 /// C# build.
 pub fn extract_session_id_from_file_name(file_name: &str) -> Option<String> {
-    if file_name.trim().is_empty() {
+    let trimmed = file_name.trim();
+    if trimmed.is_empty() {
         return None;
     }
-    // Strip the .jsonl extension first (case-insensitive).
-    let stem = match Path::new(file_name).file_stem().and_then(|s| s.to_str()) {
+    // Require a `.jsonl` extension explicitly (case-insensitive). The C#
+    // version relies on its callers always passing pre-filtered
+    // `*.jsonl` paths from `Directory.EnumerateFiles(..., "*.jsonl", ...)`,
+    // so the parser itself is naive about extensions; callers in this
+    // crate go through `locate_transcript` which is `.jsonl`-bounded too,
+    // but exposing the function publicly means a non-JSONL sidecar
+    // ending in `_<uuid>.<ext>` could otherwise yield a false positive.
+    // Validating the suffix here keeps the public contract honest.
+    let stem = match strip_jsonl_extension(trimmed) {
         Some(s) => s,
         None => return None,
     };
@@ -191,6 +199,22 @@ pub fn extract_session_id_from_file_name(file_name: &str) -> Option<String> {
     let id = &stem[underscore + 1..];
     if is_canonical_uuid(id) {
         Some(id.to_owned())
+    } else {
+        None
+    }
+}
+
+/// Return the stem when `file_name` ends with `.jsonl` (case-insensitive),
+/// otherwise `None`. Splits on the literal byte boundary so we don't have
+/// to allocate a lowercase copy of the whole string.
+fn strip_jsonl_extension(file_name: &str) -> Option<&str> {
+    const EXT_LEN: usize = 6; // ".jsonl"
+    if file_name.len() <= EXT_LEN {
+        return None;
+    }
+    let (stem, ext) = file_name.split_at(file_name.len() - EXT_LEN);
+    if ext.eq_ignore_ascii_case(".jsonl") {
+        Some(stem)
     } else {
         None
     }
@@ -561,6 +585,30 @@ mod tests {
     #[test]
     fn extract_sid_rejects_trailing_underscore() {
         assert!(extract_session_id_from_file_name("ts_.jsonl").is_none());
+    }
+
+    #[test]
+    fn extract_sid_rejects_non_jsonl_extension() {
+        // Sidecar with a UUID-shaped suffix but a non-JSONL extension
+        // must NOT be adopted as a Pi transcript. Mirrors the C#
+        // discovery pipeline's `*.jsonl` enumeration filter — keeps
+        // the public contract honest without requiring callers to
+        // pre-filter.
+        let txt = "2026-04-22T08-00-00-000Z_f1e2d3c4-aaaa-bbbb-cccc-1234567890ab.txt";
+        assert!(extract_session_id_from_file_name(txt).is_none());
+        let log = "2026-04-22T08-00-00-000Z_f1e2d3c4-aaaa-bbbb-cccc-1234567890ab.log";
+        assert!(extract_session_id_from_file_name(log).is_none());
+    }
+
+    #[test]
+    fn extract_sid_jsonl_extension_is_case_insensitive() {
+        // Windows-style upper/mixed case `.JSONL` / `.JsonL` must
+        // still be accepted (FAT32-derived case insensitivity).
+        let upper = "ts_f1e2d3c4-aaaa-bbbb-cccc-1234567890ab.JSONL";
+        assert_eq!(
+            extract_session_id_from_file_name(upper).as_deref(),
+            Some("f1e2d3c4-aaaa-bbbb-cccc-1234567890ab")
+        );
     }
 
     #[test]
