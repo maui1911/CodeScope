@@ -48,6 +48,15 @@ pub struct LayoutState {
     /// install / migration from older layout.json), AppShell falls
     /// back to a single cold-start tab.
     pub open_tabs: Vec<RestoreTab>,
+    /// Project ids the user has collapsed in the sidebar tree.
+    /// Restored on launch so chevron state survives a restart;
+    /// project ids not in this list render expanded (the default).
+    /// Stored as a `Vec<String>` rather than the in-memory
+    /// `HashSet` so the on-disk JSON is a stable, ordered array —
+    /// nicer to diff and hand-edit. Sidebar prunes ids that no
+    /// longer match a known project before saving so the file
+    /// can't grow stale entries across many sessions.
+    pub collapsed_projects: Vec<String>,
 }
 
 /// One tab worth of restore metadata. Light enough to round-trip
@@ -86,6 +95,7 @@ impl Default for LayoutState {
             group_weights: Vec::new(),
             focused_group_index: 0,
             open_tabs: Vec::new(),
+            collapsed_projects: Vec::new(),
         }
     }
 }
@@ -154,6 +164,7 @@ mod tests {
                 group_index: 0,
                 active_in_group: true,
             }],
+            collapsed_projects: vec!["proj-2".into(), "proj-3".into()],
         };
         state.save_to(&path).unwrap();
         let loaded = LayoutState::load_from(&path).unwrap();
@@ -164,6 +175,25 @@ mod tests {
         assert_eq!(loaded.open_tabs.len(), 1);
         assert_eq!(loaded.open_tabs[0].auto_type.as_deref(), Some("claude"));
         assert!(loaded.open_tabs[0].active_in_group);
+        assert_eq!(loaded.collapsed_projects, vec!["proj-2", "proj-3"]);
+    }
+
+    #[test]
+    fn legacy_layout_without_collapsed_projects_loads() {
+        // layout.json files written before sidebar collapse persistence
+        // landed don't carry `collapsed_projects`. They must still load
+        // and produce an empty list — `#[serde(default)]` on the field
+        // backfills.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        std::fs::write(
+            &path,
+            r#"{"sidebar_visible":true,"sidebar_width":240,"selected_project_id":"proj-x","group_weights":[],"focused_group_index":0,"open_tabs":[]}"#,
+        )
+        .unwrap();
+        let loaded = LayoutState::load_from(&path).unwrap();
+        assert_eq!(loaded.selected_project_id.as_deref(), Some("proj-x"));
+        assert!(loaded.collapsed_projects.is_empty());
     }
 
     #[test]
