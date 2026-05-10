@@ -9,17 +9,134 @@
 >
 > **The Rust port (`codescope-rs/`) is a 1:1 functional port of the C# CodeScope build (`src/CodeScope.App/`, `src/CodeScope.Core/`, `src/CodeScope.AgentCli/`).** Before implementing any feature on the Rust side, **read the equivalent C# code first** and mirror its behavior, button labels, dialogs, data shapes, and persistence layout. Functional parity is the goal — we are not redesigning. If a `HANDOFF.md` entry, README line, or "next entry point" disagrees with what the C# code actually does, the C# code wins; update the doc. Genuine platform-forced deviations (gpui vs WPF idiom) get a one-line comment and an entry in `docs/DECISIONS.md`. "Cleaner" or "more elegant" is not a reason on its own. (Reinforced in session 33 after PR #56 invented a non-existent UX.)
 
-**Last updated:** 2026-05-10 (session 35 — long autonomous run)
-**Branch:** `main` (PRs #68–#90 merged this session)
+**Last updated:** 2026-05-10 (session 36 — title bar + status bar foundations)
+**Branch:** `main` (PRs #92–#96 merged this session)
 **Head:** main, in sync with origin
 **Release:** `v0.2.5` shipped earlier — no new release this run
 **Build status:** ✅ C# untouched. Rust workspace builds clean.
-Tests: `codescope-core` (38) + `codescope-terminal` mouse-encoder (9)
-+ `new_worktree_dialog` (15) — 62 total, all passing.
-`cargo clippy --bin window --all-targets` clean (one pre-existing
-`items_after_test_module` warning in dialog code, unrelated).
+Tests: `codescope-core` (66 — git_status added 16, claude_telemetry
+added 28) + `codescope-terminal` mouse-encoder (9) + `notifications`
+(14) + `new_worktree_dialog` (15) — 112 total, all passing.
 **Uncommitted work:** none.
 **Open issues:** none on GitHub.
+
+### Session 36 — title bar merge + status bar / data-source foundations
+
+Started from a `RefCell already borrowed` panic on title-bar
+click (SendMessage re-entrancy via gpui's modal NC drag loop) and
+ended with the four-PR foundation for a feature-complete status
+bar.
+
+**PR #92 — Chrome-style title bar.** Tabs merged into the same
+40 px row as brand mark, sidebar toggle, and caption controls.
+Caption controls absolute-positioned top-right so per-group tab
+strips can span the same horizontal extent as the panes below
+(divider alignment preserved). Rightmost group reserves
+`CAPTION_CTRLS_W = 184 px` with `overflow_hidden` + opaque caption-
+controls bg so tabs can't slide visibly under the buttons. Win32
+PostMessageW everywhere (was SendMessageW — that's what caused
+the original panic). Title-bar drag spots route through one
+`AppShell::handle_titlebar_press` helper that time-discriminates
+real human clicks (>10 ms apart) from the synthetic
+`WM_NCLBUTTONDOWN` echo our own `start_drag` posts (gpui's
+ClickState bumps click_count to 2 on the echo, which would
+otherwise toggle maximize on every single click).
+`DIVIDER_VISUAL_WIDTH = 1.0` constant — splitters / sidebar handle
+are 1 px painted with a 6 px transparent absolute hit-overlay
+extending into the adjacent panes for grabbing.
+
+**PR #93 — status bar layout + workspace summary.** 32 px tall,
+two-cluster shape mirroring C# `StatusBarView`. Active title left
+(flex_grow + truncate), right cluster: `N worktrees · M dirty`
+(via new `Sidebar::worktree_counts()`) + optional `N groups` (only
+when >1) + tab counter. 1×14 vertical `SbSep` dividers between
+items.
+
+**PR #94 — per-worktree git status polling.** New
+`core/git.rs::git_status(path)` returning `Option<GitStatus>` with
+branch, numstat `(added, removed, has_changes)`, and ahead/behind
+upstream. Early `git rev-parse --is-inside-work-tree` probe gates
+the rest. `Sidebar::start_git_status_poll` runs every 5 s next to
+the dirty-state poll. Accessor: `sidebar.git_status_for(&path) ->
+Option<&GitStatus>`. `#[allow(dead_code)]` until the integrating
+PR consumes it.
+
+**PR #95 — Claude transcript tail.** `core/claude_telemetry.rs`
+mirrors C# `ClaudeTelemetryService` / `ClaudeTranscriptParser` /
+`ClaudeModelCatalog`. JSONL tail with stat-first incremental
+read, per-instant DST-correct path through `process_new_lines`.
+`turn_count` increments on assistant entries with usage (matches
+C# `HasUsage`), not user prompts. `context_pct` clamped to
+`[0.0, 1.0]`. Read errors preserve `last_pos` for retry. Adaptive
+poll: 250 ms while any tail is Busy, 2 s while all idle, 30 s
+when no tails registered (armed-only-when-needed). Accessor:
+`app.telemetry_for(&session_id) -> Option<TelemetrySnapshot>`.
+Register via `app.register_telemetry(session_id, working_dir)` —
+returns early when neither USERPROFILE nor HOME is set.
+
+**PR #96 — persistent notifications + popover.** New
+`src/notifications.rs` (1:1 port of C# `NotificationService`).
+Ring buffer of 50 entries, kinds = Generic / SessionWaiting /
+SessionReady, popover render mirrors `BellPopup` XAML (360 wide,
+max 420 tall, 14/10 padding, header / scrollable list / footer).
+`format_hhmm` uses `FileTimeToSystemTime` →
+`SystemTimeToTzSpecificLocalTime` for per-instant DST-correct
+local time. Click on entry calls `activate_tab(group, idx)` if
+the entry's session title matches an open tab. Popover
+positioning currently snaps above the status bar via
+`Edges{bottom: 38}`; integrating PR will swap for
+`anchored().position(button_rect)` once the bell button exists.
+
+**Build / test status after the four merges**
+
+`cargo build --bin window` clean (3 warnings: `git_status_for`,
+`register_telemetry`, `unregister_telemetry`, `telemetry_for` are
+"never used" — deliberate, the integrating PR consumes them).
+`cargo test --workspace` 112/112 passing.
+
+### Cursor — what's next
+
+The four data sources (`sidebar.git_status_for(path)`,
+`app.telemetry_for(session_id)`, `app.notifications`) are ready
+to be consumed by the status bar. The integrating PR should:
+
+1. **Left cluster** — session-context dot (colour driven by
+   `TelemetrySnapshot.state`: green = Idle, yellow = Busy /
+   PendingToolUse) + branch name from `git_status_for`. Halo
+   pulse when busy (animated via gpui timer entity) — optional,
+   could ship without animation first and add it as a separate
+   PR.
+2. **Mid-left** — git dirty `+N −N` (white added, dim removed,
+   fallback "changes" when has_changes && numstat zero) + remote
+   `↑/↓` (`format!("↑{ahead}/↓{behind}")`).
+3. **Right** — model name (icon + text), `tokens_used` + percent
+   ("12345 tok 6.2%"), `turn_count` ("3 turns"), turn-duration
+   clock-icon + `format_duration`, agent rollup
+   `Σ busy / Σ idle` across all registered tails.
+4. **Bell button** — small icon + 4 px accent unread dot when
+   `notifications.has_unread()`. Click → `notifications.toggle()`.
+   Replace the `Edges{bottom:38}` workaround in
+   `render_notifications_popover` with
+   `anchored().position(button_rect).anchor(BottomRight)` so the
+   popover tracks the bell.
+
+To wire telemetry data, callers also need to invoke
+`app.register_telemetry(session_id, working_dir)` when a tab
+spawns (and `unregister_telemetry` when it closes). That hook
+isn't wired yet — currently `telemetry_tails` stays empty so the
+poller idles at 30 s. Plumbing through `spawn_tab` /
+`close_tab` is the prerequisite for the right-cluster slots
+showing real data.
+
+Ordering suggestion: (a) wire register / unregister into
+spawn / close (no UI yet), (b) integrating PR for the bar
+itself (left + mid-left + right + bell). The two could be one
+PR but they're independent enough to split if it stays
+reviewable.
+
+### Earlier sessions
+
+
 
 ### Session 35 — long autonomous run (PRs #68 → #88)
 
