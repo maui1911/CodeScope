@@ -1473,16 +1473,24 @@ impl AppShell {
         )
     }
 
-    /// Build the bottom status bar (24 px). Compact line that
-    /// surfaces the focused group, the focused tab's title, and
-    /// counts so the user has a single place to verify "where am I"
-    /// at a glance — useful especially with multiple groups + many
-    /// tabs. Mirrors the C# build's `StatusBarView` minus the live
-    /// git-status / agent-state badges (those land when the polling
-    /// infra does).
-    fn render_status_bar(&self, theme: &Arc<Theme>) -> impl IntoElement {
+    /// Build the bottom status bar. 32 px tall, two clusters: the
+    /// active tab's title truncates on the left as a flex-grow span,
+    /// and the right cluster surfaces the workspace summary
+    /// (`N worktrees · M dirty`), an optional `N groups` label
+    /// (only when more than one group), and the tab counter,
+    /// separated by 1×14 vertical rules.
+    ///
+    /// Mirrors the C# `StatusBarView` skeleton; the slots that
+    /// depend on data we don't have yet (session context dot +
+    /// branch + halo, git numstat / ahead-behind, model / tokens /
+    /// turns / agent rollup, notifications bell) land with their
+    /// respective polling / telemetry / notification PRs.
+    fn render_status_bar(
+        &self,
+        theme: &Arc<Theme>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let group_count = self.groups.len();
-        let focused_group_idx = self.focused_group;
         let focused_group = self.focused_group();
         let tab_count = focused_group.tabs.len();
         let active_tab = focused_group.active_tab;
@@ -1491,7 +1499,29 @@ impl AppShell {
             .get(active_tab)
             .map(|t| t.title.clone());
 
-        let group_label = format!("group {}/{}", focused_group_idx + 1, group_count);
+        // ─── Right cluster pieces ────────────────────────────────
+        // Mirrors the C# `StatusBarView` right cluster, *minus* the
+        // telemetry-driven slots (model, tokens, turns, agent
+        // rollup) and the notifications bell — those land when the
+        // Claude transcript tail and the notifications subsystem
+        // come online. For now we ship the bits whose data already
+        // exists in `AppShell` / `Sidebar`:
+        //   - group count (only when there's more than one group,
+        //     same conditional as C#'s `StatusGroupCountVisible`)
+        //   - workspace summary: `N worktrees · M dirty`, fed by
+        //     `Sidebar::worktree_counts`. Dirty-segment hides when
+        //     no worktree is currently dirty (matches C#'s
+        //     `StatusDirtyVisible`).
+        // The active-tab title takes the left cluster as a
+        // truncating flex-grow span until session/branch/git-state
+        // pollers exist to populate the proper left cluster.
+        let (worktree_total, worktree_dirty) =
+            self.sidebar.read(cx).worktree_counts();
+        let group_label = if group_count > 1 {
+            Some(format!("{} groups", group_count))
+        } else {
+            None
+        };
         let tab_label = if tab_count == 0 {
             "no tabs".to_string()
         } else {
@@ -1500,31 +1530,76 @@ impl AppShell {
         let title_text: SharedString = active_title
             .unwrap_or_else(|| SharedString::from("(empty group)"));
 
-        div()
-            .h(px(24.0))
+        let ink = theme::ink(theme);
+        let ink_dim = theme::ink_dim(theme);
+        let divider_clr = theme::divider(theme);
+
+        // 1×14 vertical separator between right-cluster items.
+        // Same colour and proportions as the C# `SbSep` style.
+        let sep = move || {
+            div()
+                .w_px()
+                .h(px(14.0))
+                .bg(divider_clr)
+        };
+
+        // Workspace summary — `N worktrees · M dirty`. The middle
+        // dot only appears when the dirty segment is visible.
+        let worktree_text = format!(
+            "{} {}",
+            worktree_total,
+            if worktree_total == 1 { "worktree" } else { "worktrees" }
+        );
+        let mut workspace_summary = div()
             .flex()
             .flex_row()
             .items_center()
-            .px_3()
-            .gap_3()
+            .gap(px(6.0))
+            .text_color(ink_dim)
+            .child(div().child(worktree_text));
+        if worktree_dirty > 0 {
+            workspace_summary = workspace_summary
+                .child(div().child("·"))
+                .child(div().child(format!("{} dirty", worktree_dirty)));
+        }
+
+        // ─── Bar ─────────────────────────────────────────────────
+        // 32 px tall (matches C# `<Border Height="32">`), 12 px
+        // horizontal padding, 1 px top divider, elevated bg.
+        let mut bar = div()
+            .h(px(32.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .px(px(12.0))
+            .gap(px(14.0))
             .border_t_1()
-            .border_color(theme::divider(theme))
+            .border_color(divider_clr)
             .bg(theme::elevated(theme))
-            .text_size(px(11.0))
-            .text_color(theme::ink_dim(theme))
-            // Active title is the most prominent piece — gets `flex_grow`
-            // so it eats the rest of the row before the per-group counts
-            // on the right.
-            .child(
-                div()
-                    .flex_grow()
-                    .truncate()
-                    .text_color(theme::ink(theme))
-                    .child(title_text),
-            )
-            .child(div().child(tab_label))
-            .child(div().w_px().h(px(12.0)).bg(theme::divider(theme)))
-            .child(div().child(group_label))
+            .text_size(px(11.5))
+            .text_color(ink_dim);
+
+        // Left cluster — active tab title (placeholder for the
+        // session-context cluster the C# build shows once we have
+        // branch / git-state data).
+        bar = bar.child(
+            div()
+                .flex_grow()
+                .truncate()
+                .text_color(ink)
+                .child(title_text),
+        );
+
+        // Right cluster — workspace summary, optional group count,
+        // tab counter. Each pair is separated by a 1×14 vertical
+        // rule; the rules collapse together with their items
+        // (group-count rule only renders when there's >1 group).
+        bar = bar.child(workspace_summary).child(sep());
+        if let Some(gl) = group_label {
+            bar = bar.child(div().child(gl)).child(sep());
+        }
+        bar = bar.child(div().child(tab_label));
+        bar
     }
 
     /// Push a toast onto the top of the floating stack. Each kind
@@ -2418,7 +2493,7 @@ impl Render for AppShell {
             .text_color(theme::ink(&theme))
             .child(caption_row)
             .child(main_row)
-            .child(self.render_status_bar(&theme))
+            .child(self.render_status_bar(&theme, cx))
             .children(self.render_tab_menu(&theme, cx))
             .children(self.render_toasts(&theme, cx))
     }
