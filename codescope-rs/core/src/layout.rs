@@ -182,8 +182,9 @@ mod tests {
     fn legacy_layout_without_collapsed_projects_loads() {
         // layout.json files written before sidebar collapse persistence
         // landed don't carry `collapsed_projects`. They must still load
-        // and produce an empty list — `#[serde(default)]` on the field
-        // backfills.
+        // and produce an empty list — the struct-level
+        // `#[serde(default)]` on `LayoutState` backfills the missing
+        // field with `Vec::new()` from `Default`.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("layout.json");
         std::fs::write(

@@ -227,6 +227,10 @@ impl Sidebar {
         // Restore collapsed-project ids from disk, dropping any ids
         // that no longer match a known project so a removed-then-
         // re-added project doesn't inherit a stale collapsed flag.
+        // Mirror the filtered set back into `layout.collapsed_projects`
+        // (sorted) so any later `save_layout()` (selection change,
+        // add/remove project) doesn't resurrect the stale ids we
+        // dropped here.
         let live: HashSet<&str> =
             projects.projects.iter().map(|p| p.id.as_str()).collect();
         let collapsed_projects: HashSet<String> = layout
@@ -235,6 +239,10 @@ impl Sidebar {
             .filter(|id| live.contains(id.as_str()))
             .cloned()
             .collect();
+        let mut layout = layout;
+        let mut filtered: Vec<String> = collapsed_projects.iter().cloned().collect();
+        filtered.sort();
+        layout.collapsed_projects = filtered;
         Self {
             projects,
             selected,
