@@ -7,8 +7,10 @@
 //! `AppShell` gets swapped and every accessor here returns the new
 //! values on the next render — no touch required in the call sites.
 
+use std::sync::OnceLock;
+
 use codescope_core::{Rgb, Theme};
-use gpui::{Hsla, hsla};
+use gpui::{Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, Hsla, SharedString, hsla};
 
 /// Convert an 8-bit-per-channel RGB triplet to gpui's `Hsla`. Direct
 /// translation, no gamma — gpui handles colour-space matters
@@ -104,3 +106,144 @@ pub fn signal_ok() -> Hsla { rgb_to_hsla(Rgb::from_hex(0x4BD87B)) }
 /// busy / pending tool use, the agent rollup's busy counter dot,
 /// and the notifications popover's `SessionWaiting` kind dot.
 pub fn signal_warn() -> Hsla { rgb_to_hsla(Rgb::from_hex(0xFF5A5A)) }
+
+// ─── Font accessors ─────────────────────────────────────────────────
+//
+// Mirror the `Fig.Font.Sans` / `Fig.Font.Mono` resources from the C#
+// build's `DesignTokens.xaml`. Sidebar (and, by extension, the rest
+// of the chrome) uses two families: a variable sans for prose / UI
+// labels, and a monospace for branch names, status slugs, keymap
+// hints — anything the user reads as "code-like" data. The C# values
+// (Windows-native fallbacks for the Framer reference fonts) are:
+//
+//     Fig.Font.Sans  = Segoe UI Variable Display, Segoe UI Variable,
+//                       Segoe UI, Inter, system-ui
+//     Fig.Font.Mono  = FiraCode Nerd Font Mono, Cascadia Mono,
+//                       Cascadia Code, Consolas, Azeret Mono, menlo
+//
+// gpui resolves a single primary family + an optional fallback list;
+// we hand it the same chains so missing-on-this-machine families
+// degrade the same way they do in WPF.
+
+/// Sans-serif `Font` for chrome labels — pass to `.font(...)` on a
+/// gpui element. Equivalent to applying `Fig.Font.Sans` in the C#
+/// build's XAML. Both the primary family and the ordered fallback
+/// list mirror `<FontFamily x:Key="Fig.Font.Sans">` from
+/// `DesignTokens.xaml`. The result is built once and cached in a
+/// `OnceLock`; callers get a cheap `Font` clone (the inner
+/// `FontFallbacks` is `Arc<Vec<String>>`, so the clone is two
+/// `Arc::clone`s, no per-render heap churn).
+pub fn font_sans() -> Font {
+    static FONT: OnceLock<Font> = OnceLock::new();
+    FONT.get_or_init(|| Font {
+        family: SharedString::new_static("Segoe UI Variable Display"),
+        features: FontFeatures::default(),
+        // Fallback chain copied verbatim (case included) from
+        // `Fig.Font.Sans` so a `cargo test` failure on the ordered-
+        // list assertion catches accidental drift.
+        fallbacks: Some(FontFallbacks::from_fonts(vec![
+            "Segoe UI Variable".to_string(),
+            "Segoe UI".to_string(),
+            "Inter".to_string(),
+            "system-ui".to_string(),
+        ])),
+        weight: FontWeight::default(),
+        style: FontStyle::default(),
+    })
+    .clone()
+}
+
+/// Monospace `Font` for chrome data — pass to `.font(...)` on a
+/// gpui element. Equivalent to applying `Fig.Font.Mono` in the C#
+/// build's XAML. The primary family is `FiraCode Nerd Font Mono`,
+/// which is the same family the embedded terminal lists as a
+/// fallback (its primary is `FiraCode Nerd Font` —
+/// non-monospace-suffix variant, see
+/// `codescope-rs/terminal/src/view.rs` `FontConfig::default`,
+/// overridable via `CODESCOPE_FONT`). Both render in the same
+/// FiraCode Nerd Font family on a typical install, so the
+/// sidebar's branch labels and the shell match visually. Cached +
+/// cloned the same way as `font_sans`.
+pub fn font_mono() -> Font {
+    static FONT: OnceLock<Font> = OnceLock::new();
+    FONT.get_or_init(|| Font {
+        family: SharedString::new_static("FiraCode Nerd Font Mono"),
+        features: FontFeatures::default(),
+        // Fallback chain copied verbatim (case included) from
+        // `Fig.Font.Mono` — note `menlo` is intentionally lower-
+        // case to match the XAML token character-for-character.
+        fallbacks: Some(FontFallbacks::from_fonts(vec![
+            "Cascadia Mono".to_string(),
+            "Cascadia Code".to_string(),
+            "Consolas".to_string(),
+            "Azeret Mono".to_string(),
+            "menlo".to_string(),
+        ])),
+        weight: FontWeight::default(),
+        style: FontStyle::default(),
+    })
+    .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lock the full `Fig.Font.Sans` ordering. Asserting the exact
+    /// list (not just `contains`) catches accidental reorders /
+    /// omissions / additions that would silently drift the chrome
+    /// away from the C# build's typography.
+    #[test]
+    fn font_sans_chain_matches_fig_font_sans() {
+        let f = font_sans();
+        assert_eq!(f.family.as_ref(), "Segoe UI Variable Display");
+        let fallbacks = f.fallbacks.expect("sans fallbacks present");
+        assert_eq!(
+            fallbacks.fallback_list(),
+            &[
+                "Segoe UI Variable".to_string(),
+                "Segoe UI".to_string(),
+                "Inter".to_string(),
+                "system-ui".to_string(),
+            ]
+        );
+    }
+
+    /// Lock the full `Fig.Font.Mono` ordering — same reasoning as
+    /// the sans test: a parity helper is only useful if drift gets
+    /// caught by `cargo test` / CI. `menlo` is lowercase on purpose
+    /// to match the XAML token character-for-character.
+    #[test]
+    fn font_mono_chain_matches_fig_font_mono() {
+        let f = font_mono();
+        assert_eq!(f.family.as_ref(), "FiraCode Nerd Font Mono");
+        let fallbacks = f.fallbacks.expect("mono fallbacks present");
+        assert_eq!(
+            fallbacks.fallback_list(),
+            &[
+                "Cascadia Mono".to_string(),
+                "Cascadia Code".to_string(),
+                "Consolas".to_string(),
+                "Azeret Mono".to_string(),
+                "menlo".to_string(),
+            ]
+        );
+    }
+
+    /// Both helpers cache their `Font` in a `OnceLock`, so repeated
+    /// calls share the same backing storage. We assert that via the
+    /// public `fallback_list()` API rather than reaching into
+    /// `FontFallbacks`' internal `Arc`: equal `as_ptr()` proves the
+    /// returned slices point at the same allocation, which is only
+    /// possible if both calls received the cached `Font`.
+    #[test]
+    fn font_helpers_share_cached_fallbacks_across_calls() {
+        let a = font_sans().fallbacks.expect("sans fallbacks");
+        let b = font_sans().fallbacks.expect("sans fallbacks");
+        assert_eq!(a.fallback_list().as_ptr(), b.fallback_list().as_ptr());
+
+        let m1 = font_mono().fallbacks.expect("mono fallbacks");
+        let m2 = font_mono().fallbacks.expect("mono fallbacks");
+        assert_eq!(m1.fallback_list().as_ptr(), m2.fallback_list().as_ptr());
+    }
+}
