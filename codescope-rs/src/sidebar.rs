@@ -23,7 +23,7 @@
 //! └───────────────┘
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -188,7 +188,7 @@ pub struct Sidebar {
     /// In-memory only for now; persisting to `layout.json` is a
     /// follow-up (matches what the C# build does — TreeView state
     /// is also session-scoped over there).
-    collapsed_projects: std::collections::HashSet<String>,
+    collapsed_projects: HashSet<String>,
 }
 
 impl Sidebar {
@@ -216,7 +216,7 @@ impl Sidebar {
             dialog: None,
             dirty_state: HashMap::new(),
             git_status: HashMap::new(),
-            collapsed_projects: std::collections::HashSet::new(),
+            collapsed_projects: HashSet::new(),
         }
     }
 
@@ -254,7 +254,7 @@ impl Sidebar {
                 // into a `HashSet` so duplicates (primary worktree
                 // also listed under `worktrees`, two projects sharing
                 // a path, …) only run `git status` once per tick.
-                let paths: std::collections::HashSet<String> = match this.update(cx, |this, _| {
+                let paths: HashSet<String> = match this.update(cx, |this, _| {
                     this.projects
                         .projects
                         .iter()
@@ -273,7 +273,7 @@ impl Sidebar {
                     Ok(p) => p,
                     Err(_) => break,
                 };
-                let known: std::collections::HashSet<String> = paths.clone();
+                let known: HashSet<String> = paths.clone();
                 let updates: Vec<(String, bool)> = cx
                     .background_spawn(async move {
                         paths
@@ -338,7 +338,7 @@ impl Sidebar {
                 }
                 // Snapshot every worktree path into a de-duplicated set
                 // (same de-dup rationale as start_dirty_poll).
-                let paths: std::collections::HashSet<String> = match this.update(cx, |this, _| {
+                let paths: HashSet<String> = match this.update(cx, |this, _| {
                     this.projects
                         .projects
                         .iter()
@@ -352,7 +352,7 @@ impl Sidebar {
                     Ok(p) => p,
                     Err(_) => break,
                 };
-                let known: std::collections::HashSet<String> = paths.clone();
+                let known: HashSet<String> = paths.clone();
                 let updates: Vec<(String, GitStatus)> = cx
                     .background_spawn(async move {
                         paths
@@ -431,8 +431,8 @@ impl Sidebar {
     ///   confirmed clean, and `true` means dirty. Both unknown and
     ///   clean paths are excluded from the count.
     pub(crate) fn worktree_counts(&self) -> (usize, usize) {
-        let mut paths: std::collections::HashSet<&str> =
-            std::collections::HashSet::new();
+        let mut paths: HashSet<&str> =
+            HashSet::new();
         for project in &self.projects.projects {
             paths.insert(project.path.as_str());
             for wt in &project.worktrees {
@@ -1227,7 +1227,14 @@ impl Render for Sidebar {
                 .pr_3()
                 .border_l_2()
                 .border_color(rail)
-                .pl(px(4.0)) // chevron eats 14+6 px so the name lines up where it used to
+                // 4 px row inset; the chevron (14 px wide + 6 px right
+                // margin) sits between the rail and the project name.
+                // This is a small rightward shift versus the pre-chevron
+                // 10 px inset (project name now starts ~14 px further
+                // right), matching the C# TreeViewItem template's
+                // disclosure indent rather than trying to claw the name
+                // back to its old origin.
+                .pl(px(4.0))
                 .bg(bg)
                 .text_color(text_color)
                 .text_size(px(13.0))
