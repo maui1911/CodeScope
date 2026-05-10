@@ -2477,9 +2477,9 @@ impl AppShell {
             // window-space `Bounds<Pixels>` and stashes them on the
             // entity so `render_notifications_popover` can anchor to
             // the actual button rect. Updates every frame, so resizes
-            // / status-bar reflows keep the popover stuck to the
-            // bell. `pointer-events: none` (no listeners on the
-            // canvas itself) so it doesn't shadow the bell's click.
+            // / status-bar reflows keep the popover stuck to the bell.
+            // The canvas registers no mouse listeners; the parent
+            // `bell_btn`'s `on_mouse_down` still receives the click.
             .child({
                 let entity = cx.entity();
                 gpui::canvas(
