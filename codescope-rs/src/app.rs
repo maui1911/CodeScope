@@ -1473,20 +1473,24 @@ impl AppShell {
         )
     }
 
-    /// Build the bottom status bar (24 px). Compact line that
-    /// surfaces the focused group, the focused tab's title, and
-    /// counts so the user has a single place to verify "where am I"
-    /// at a glance — useful especially with multiple groups + many
-    /// tabs. Mirrors the C# build's `StatusBarView` minus the live
-    /// git-status / agent-state badges (those land when the polling
-    /// infra does).
+    /// Build the bottom status bar. 32 px tall, two clusters: the
+    /// active tab's title truncates on the left as a flex-grow span,
+    /// and the right cluster surfaces the workspace summary
+    /// (`N worktrees · M dirty`), an optional `N groups` label
+    /// (only when more than one group), and the tab counter,
+    /// separated by 1×14 vertical rules.
+    ///
+    /// Mirrors the C# `StatusBarView` skeleton; the slots that
+    /// depend on data we don't have yet (session context dot +
+    /// branch + halo, git numstat / ahead-behind, model / tokens /
+    /// turns / agent rollup, notifications bell) land with their
+    /// respective polling / telemetry / notification PRs.
     fn render_status_bar(
         &self,
         theme: &Arc<Theme>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let group_count = self.groups.len();
-        let focused_group_idx = self.focused_group;
         let focused_group = self.focused_group();
         let tab_count = focused_group.tabs.len();
         let active_tab = focused_group.active_tab;
@@ -1523,7 +1527,6 @@ impl AppShell {
         } else {
             format!("tab {}/{}", active_tab + 1, tab_count)
         };
-        let _ = focused_group_idx;
         let title_text: SharedString = active_title
             .unwrap_or_else(|| SharedString::from("(empty group)"));
 
