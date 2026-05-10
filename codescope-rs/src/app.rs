@@ -424,6 +424,15 @@ pub struct AppShell {
     /// `telemetry_for(session_id)` exposes the latest snapshot without
     /// taking a mutable reference.
     telemetry_tails: HashMap<String, codescope_core::TranscriptTail>,
+    /// Window-coordinate anchor captured from the last bell-button
+    /// click. Used by `render_notifications_popover` to position the
+    /// popover above the bell via `gpui::anchored().position(...)`,
+    /// mirroring the C# `BellPopup` `PlacementTarget=BellButton`
+    /// `Placement=Top` `VerticalOffset=-6` rule. `None` until the
+    /// user has clicked the bell at least once; the popover falls
+    /// back to a window-corner anchor in that case so it never
+    /// renders at (0, 0).
+    bell_anchor: Option<gpui::Point<gpui::Pixels>>,
 }
 
 impl AppShell {
@@ -723,6 +732,7 @@ impl AppShell {
             last_titlebar_press_at: None,
             notifications: crate::notifications::Notifications::new(),
             telemetry_tails: HashMap::new(),
+            bell_anchor: None,
         };
         shell.start_telemetry_poll(cx);
         shell.start_claude_discovery_poll(cx);
@@ -1949,36 +1959,62 @@ impl AppShell {
             .child(body)
             .child(footer);
 
-        // The C# `BellPopup` anchors to the bell button itself
-        // (`PlacementTarget=BellButton`, `Placement=Top`,
-        // `VerticalOffset=-6`). We don't have the bell button yet
-        // (lands with the integrating PR), but we can already snap
-        // above the status bar so the popover doesn't overlap it.
-        // Bottom margin = status-bar height (32 px) + the XAML's
-        // -6 offset, expressed as a positive bottom edge so
-        // `snap_to_window_with_margin` keeps the panel clear of
-        // the bar. Once the bell button exists the integrating PR
-        // will swap this to an `anchored().position(button_rect)`
-        // call so the popover tracks the button's actual screen
-        // position.
-        const STATUS_BAR_HEIGHT_PX: f32 = 32.0;
-        const POPOVER_BOTTOM_GAP_PX: f32 = 6.0;
-        let edges = gpui::Edges {
-            top: px(8.0),
-            right: px(8.0),
-            bottom: px(STATUS_BAR_HEIGHT_PX + POPOVER_BOTTOM_GAP_PX),
-            left: px(8.0),
+        // Mirror the C# `BellPopup` anchor:
+        // `PlacementTarget=BellButton`, `Placement=Top`,
+        // `VerticalOffset=-6`. In gpui we anchor the popover's
+        // `BottomRight` corner to a point at the bell button's
+        // top-right edge minus the 6 px gap. The bell button is
+        // 22×22 (see `bell_btn` above) and `bell_anchor` records
+        // the click position, which lands inside the button — we
+        // treat it as the button centre and offset by half the
+        // button width / height to derive the top-right corner.
+        //
+        // If `bell_anchor` is `None` (popover opened by some path
+        // other than a bell click — defensive only, the toggle is
+        // bell-only today) we fall back to a window-corner anchor
+        // so the popover never renders at (0, 0).
+        const BELL_HALF_W: f32 = 11.0;
+        const BELL_HALF_H: f32 = 11.0;
+        const POPOVER_GAP_PX: f32 = 6.0;
+        // Window-edge inset used by both the anchored and the
+        // fallback path so the popover never kisses the right edge.
+        const SNAP_MARGIN_PX: f32 = 8.0;
+        let snap_edges = gpui::Edges {
+            top: px(SNAP_MARGIN_PX),
+            right: px(SNAP_MARGIN_PX),
+            bottom: px(SNAP_MARGIN_PX),
+            left: px(SNAP_MARGIN_PX),
         };
-        Some(
-            gpui::deferred(
-                gpui::anchored()
-                    .position(gpui::point(px(0.0), px(0.0)))
-                    .anchor(gpui::Corner::BottomRight)
-                    .snap_to_window_with_margin(edges)
-                    .child(panel),
-            )
-            .into_any_element(),
-        )
+        let anchored = if let Some(click) = self.bell_anchor {
+            // Top-right of the bell button, then move up by the
+            // 6 px C# `VerticalOffset` so the popover bottom edge
+            // sits 6 px above the bell.
+            let anchor_point = gpui::point(
+                click.x + px(BELL_HALF_W),
+                click.y - px(BELL_HALF_H) - px(POPOVER_GAP_PX),
+            );
+            gpui::anchored()
+                .position(anchor_point)
+                .anchor(gpui::Corner::BottomRight)
+                .snap_to_window_with_margin(snap_edges)
+                .child(panel)
+        } else {
+            // Status bar is 32 px tall; keep the panel clear of it
+            // by snapping above the bar plus the same 6 px gap.
+            const STATUS_BAR_HEIGHT_PX: f32 = 32.0;
+            let fallback_edges = gpui::Edges {
+                top: px(SNAP_MARGIN_PX),
+                right: px(SNAP_MARGIN_PX),
+                bottom: px(STATUS_BAR_HEIGHT_PX + POPOVER_GAP_PX),
+                left: px(SNAP_MARGIN_PX),
+            };
+            gpui::anchored()
+                .position(gpui::point(px(0.0), px(0.0)))
+                .anchor(gpui::Corner::BottomRight)
+                .snap_to_window_with_margin(fallback_edges)
+                .child(panel)
+        };
+        Some(gpui::deferred(anchored).into_any_element())
     }
 
     /// Build the tab right-click menu when one is open. Returns
@@ -2429,7 +2465,17 @@ impl AppShell {
             .hover(move |s| s.bg(gpui::Hsla { h: 0.0, s: 0.0, l: 1.0, a: 0.08 }))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
+                cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                    // Capture the click position in window coordinates
+                    // so the popover can anchor relative to the bell
+                    // button instead of snapping above the status bar
+                    // with a hard-coded edge offset. The bell button
+                    // is 22×22, centred on the click; we treat the
+                    // click point as ~the button centre and let the
+                    // popover render compute the actual anchor (top
+                    // edge of the bell, with the C# `VerticalOffset=
+                    // -6` gap baked in).
+                    this.bell_anchor = Some(event.position);
                     this.notifications.toggle();
                     cx.notify();
                 }),
