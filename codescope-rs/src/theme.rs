@@ -8,7 +8,7 @@
 //! values on the next render — no touch required in the call sites.
 
 use codescope_core::{Rgb, Theme};
-use gpui::{Hsla, hsla};
+use gpui::{Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, Hsla, SharedString, hsla};
 
 /// Convert an 8-bit-per-channel RGB triplet to gpui's `Hsla`. Direct
 /// translation, no gamma — gpui handles colour-space matters
@@ -104,3 +104,111 @@ pub fn signal_ok() -> Hsla { rgb_to_hsla(Rgb::from_hex(0x4BD87B)) }
 /// busy / pending tool use, the agent rollup's busy counter dot,
 /// and the notifications popover's `SessionWaiting` kind dot.
 pub fn signal_warn() -> Hsla { rgb_to_hsla(Rgb::from_hex(0xFF5A5A)) }
+
+// ─── Font accessors ─────────────────────────────────────────────────
+//
+// Mirror the `Fig.Font.Sans` / `Fig.Font.Mono` resources from the C#
+// build's `DesignTokens.xaml`. Sidebar (and, by extension, the rest
+// of the chrome) uses two families: a variable sans for prose / UI
+// labels, and a monospace for branch names, status slugs, keymap
+// hints — anything the user reads as "code-like" data. The C# values
+// (Windows-native fallbacks for the Framer reference fonts) are:
+//
+//     Fig.Font.Sans  = Segoe UI Variable Display, Segoe UI Variable,
+//                       Segoe UI, Inter, system-ui
+//     Fig.Font.Mono  = FiraCode Nerd Font Mono, Cascadia Mono,
+//                       Cascadia Code, Consolas, Azeret Mono, menlo
+//
+// gpui resolves a single primary family + an optional fallback list;
+// we hand it the same chains so missing-on-this-machine families
+// degrade the same way they do in WPF.
+
+/// Primary sans-serif family for sidebar prose / UI labels (project
+/// names, "(no worktrees)" placeholder, headings).
+fn sans_primary() -> SharedString {
+    SharedString::new_static("Segoe UI Variable Display")
+}
+
+/// Sans-serif fallback chain. Order mirrors `Fig.Font.Sans` from
+/// `DesignTokens.xaml`. The primary above is excluded — gpui only
+/// uses fallbacks when the primary fails to resolve.
+fn sans_fallbacks() -> Vec<String> {
+    vec![
+        "Segoe UI Variable".to_string(),
+        "Segoe UI".to_string(),
+        "Inter".to_string(),
+        "system-ui".to_string(),
+    ]
+}
+
+/// Primary monospace family for sidebar code-like data (branch
+/// labels, status slugs, keymap hints).
+fn mono_primary() -> SharedString {
+    SharedString::new_static("Cascadia Mono")
+}
+
+/// Monospace fallback chain. Order mirrors `Fig.Font.Mono` from
+/// `DesignTokens.xaml`, minus the Nerd-Font variant which is rarely
+/// installed on the dev target. Cascadia Mono is the Windows 11
+/// default and the same family the terminal ships with, so the
+/// sidebar's mono and the embedded shell render in the same metal.
+fn mono_fallbacks() -> Vec<String> {
+    vec![
+        "Cascadia Code".to_string(),
+        "Consolas".to_string(),
+        "Azeret Mono".to_string(),
+        "Menlo".to_string(),
+    ]
+}
+
+/// Sans-serif `Font` for chrome labels — pass to `.font(...)` on a
+/// gpui element. Equivalent to applying `Fig.Font.Sans` in the C#
+/// build's XAML.
+pub fn font_sans() -> Font {
+    Font {
+        family: sans_primary(),
+        features: FontFeatures::default(),
+        fallbacks: Some(FontFallbacks::from_fonts(sans_fallbacks())),
+        weight: FontWeight::default(),
+        style: FontStyle::default(),
+    }
+}
+
+/// Monospace `Font` for chrome data — pass to `.font(...)` on a
+/// gpui element. Equivalent to applying `Fig.Font.Mono` in the C#
+/// build's XAML.
+pub fn font_mono() -> Font {
+    Font {
+        family: mono_primary(),
+        features: FontFeatures::default(),
+        fallbacks: Some(FontFallbacks::from_fonts(mono_fallbacks())),
+        weight: FontWeight::default(),
+        style: FontStyle::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn font_sans_uses_segoe_ui_variable_display_with_fallbacks() {
+        let f = font_sans();
+        assert_eq!(f.family.as_ref(), "Segoe UI Variable Display");
+        let fallbacks = f.fallbacks.expect("sans fallbacks present");
+        let list = fallbacks.fallback_list();
+        assert!(list.contains(&"Segoe UI Variable".to_string()));
+        assert!(list.contains(&"Segoe UI".to_string()));
+        assert!(list.contains(&"Inter".to_string()));
+    }
+
+    #[test]
+    fn font_mono_uses_cascadia_mono_with_fallbacks() {
+        let f = font_mono();
+        assert_eq!(f.family.as_ref(), "Cascadia Mono");
+        let fallbacks = f.fallbacks.expect("mono fallbacks present");
+        let list = fallbacks.fallback_list();
+        assert!(list.contains(&"Cascadia Code".to_string()));
+        assert!(list.contains(&"Consolas".to_string()));
+    }
+}

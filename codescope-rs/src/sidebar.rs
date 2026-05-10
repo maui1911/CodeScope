@@ -1508,19 +1508,23 @@ impl Render for Sidebar {
                             .rounded_full()
                             .bg(dirty_dot_color),
                     )
-                    .child(div().flex_grow().truncate().child(wt_label));
+                    // Branch label — mono, mirrors `Fig.Font.Mono` on
+                    // the `DisplayBranch` TextBlock in
+                    // `SidebarView.xaml` (worktree DataTemplate).
+                    .child(
+                        div()
+                            .flex_grow()
+                            .truncate()
+                            .font(theme::font_mono())
+                            .child(wt_label),
+                    );
                 // Right-aligned status slug — `chg` / `↑N ↓N` / `idle`
                 // computed by
                 // `codescope_core::git::worktree_status_label` from
                 // the cached `git_status` snapshot. Renders the same
                 // information the C# `WorktreeViewModel.StatusLabel`
-                // slot shows. Sized at 10 pt with the dim
-                // `ink_ghost` foreground; the C# build also paints
-                // this in `Fig.Font.Mono`, but the Rust sidebar
-                // still draws every text element in the default
-                // sans family — switching the whole sidebar over to
-                // the mono / sans split is a separate follow-up
-                // rather than a one-off here. The C# build also
+                // slot shows, in `Fig.Font.Mono` at 10 pt with a
+                // dim `ink_ghost` foreground. The C# build also
                 // surfaces `busy` (active agent) and `ci!` (failing
                 // PR CI); those land alongside session and PR
                 // tracking.
@@ -1538,6 +1542,7 @@ impl Render for Sidebar {
                             .mr(px(4.0))
                             .text_size(px(10.0))
                             .text_color(theme::ink_ghost(&theme))
+                            .font(theme::font_mono())
                             .child(status_slug),
                     )
                 };
@@ -1564,6 +1569,13 @@ impl Render for Sidebar {
             .bg(theme::elevated(&theme))
             .border_r_1()
             .border_color(theme::divider(&theme))
+            // Mirror the C# build's `Fig.Font.Sans` default for the
+            // sidebar — TextElement.FontFamily on `SidebarView` (see
+            // `src/CodeScope.Ui/Views/SidebarView.xaml`). Branch labels
+            // and status slugs override this with `theme::font_mono()`
+            // on their own `div`, matching the per-element
+            // `Fig.Font.Mono` overrides on those XAML nodes.
+            .font(theme::font_sans())
             .child(heading)
             .child(div().h_px().bg(theme::divider(&theme)))
             .child(body);
