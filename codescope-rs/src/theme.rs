@@ -207,8 +207,8 @@ mod tests {
 
     /// Lock the full `Fig.Font.Mono` ordering — same reasoning as
     /// the sans test: a parity helper is only useful if drift gets
-    /// caught at compile time. `menlo` is lowercase on purpose to
-    /// match the XAML token character-for-character.
+    /// caught by `cargo test` / CI. `menlo` is lowercase on purpose
+    /// to match the XAML token character-for-character.
     #[test]
     fn font_mono_chain_matches_fig_font_mono() {
         let f = font_mono();
