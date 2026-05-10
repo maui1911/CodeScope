@@ -34,7 +34,7 @@ use codescope_core::git::GitStatus;
 use gpui::{
     AppContext, ClipboardItem, Context, Corner, EventEmitter, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render,
-    SharedString, Styled, Window, anchored, deferred, div, point, px,
+    SharedString, StatefulInteractiveElement, Styled, Window, anchored, deferred, div, point, px,
 };
 
 use crate::new_project_dialog::NewProjectDialogState;
@@ -1748,12 +1748,22 @@ impl Render for Sidebar {
             }
         }
 
+        // `flex_grow` + `min_h(0)` + `overflow_y_scroll` so the
+        // project/worktree tree absorbs remaining height in the
+        // sidebar's flex column and clips + scrolls instead of
+        // pushing the footer off the bottom edge with a long
+        // project list. Same pattern AppShell's notifications panel
+        // uses; without `min_h(0)` flex children default to their
+        // content's intrinsic size and the column overflows.
         let mut body = div()
+            .id("sidebar-body")
             .flex()
             .flex_col()
             .flex_grow()
+            .overflow_y_scroll()
             .py_1()
             .children(project_and_worktree_rows);
+        body.style().min_size.height = Some(gpui::Length::Definite(px(0.0).into()));
         if let Some(es) = empty_state {
             body = body.child(es);
         }
@@ -1780,9 +1790,10 @@ impl Render for Sidebar {
         //    correct for the future port.
         //    New Project: routes to `open_new_project_dialog`, the
         //    same entry point the `+` glyph in the heading uses (PR
-        //    #124). Mutually exclusive with the "+" via the same
+        //    #124). The function itself enforces the
         //    `new_project_dialog().is_none() && dialog().is_none()`
-        //    gate the heading glyph relies on.
+        //    gate so both call sites share one source of truth and
+        //    neither can stack a second modal on top of an open one.
         let footer = {
             let frost_hover = theme::frost_10(&theme);
             let ink_hover = theme::ink(&theme);
@@ -1859,12 +1870,6 @@ impl Render for Sidebar {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, window, cx| {
-                        // Same gate as the "+" glyph in the heading —
-                        // skip when another modal is already showing
-                        // so we never stack two on top of each other.
-                        if this.new_project_dialog().is_some() || this.dialog().is_some() {
-                            return;
-                        }
                         this.open_new_project_dialog(window, cx);
                     }),
                 )

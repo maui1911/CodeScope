@@ -275,11 +275,20 @@ impl Sidebar {
     /// Replaces the previous bare-picker flow — clicking "+" now opens
     /// the in-app modal, and the dialog itself drives the platform
     /// folder picker as part of its Browse button.
+    ///
+    /// Gated: returns silently if a "New project" or "New worktree"
+    /// dialog is already open. All call sites — the heading `+`
+    /// glyph and the sidebar footer's "New Project" button — share
+    /// this single gate so neither path can stack a second modal on
+    /// top of an existing one.
     pub fn open_new_project_dialog(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.new_project_dialog().is_some() || self.dialog().is_some() {
+            return;
+        }
         let existing_paths: Vec<&str> = self
             .projects()
             .projects
