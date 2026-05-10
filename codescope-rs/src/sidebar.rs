@@ -1292,13 +1292,20 @@ impl Render for Sidebar {
                     )
                     .child(div().flex_grow().truncate().child(wt_label));
                 // Right-aligned status slug — `chg` / `↑N ↓N` / `idle`
-                // computed by `core::git::worktree_status_label` from
-                // the cached `git_status` snapshot. Matches the C#
-                // `WorktreeViewModel.StatusLabel` slot in the sidebar
-                // template (mono 10 pt, `Text.Faint` foreground). The
-                // C# build also surfaces `busy` (active agent) and
-                // `ci!` (failing PR CI) — those land alongside session
-                // and PR tracking.
+                // computed by
+                // `codescope_core::git::worktree_status_label` from
+                // the cached `git_status` snapshot. Renders the same
+                // information the C# `WorktreeViewModel.StatusLabel`
+                // slot shows. Sized at 10 pt with the dim
+                // `ink_ghost` foreground; the C# build also paints
+                // this in `Fig.Font.Mono`, but the Rust sidebar
+                // still draws every text element in the default
+                // sans family — switching the whole sidebar over to
+                // the mono / sans split is a separate follow-up
+                // rather than a one-off here. The C# build also
+                // surfaces `busy` (active agent) and `ci!` (failing
+                // PR CI); those land alongside session and PR
+                // tracking.
                 let status_slug = self
                     .git_status
                     .get(&wt.path)
