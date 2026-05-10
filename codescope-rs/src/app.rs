@@ -167,11 +167,15 @@ const SPLITTER_HIT_WIDTH: f32 = 6.0;
 
 /// Visible width of the splitter / sidebar-handle / strip-divider
 /// line. Kept at 1 px for a clean, single-pixel rule between panes;
-/// the hit area is enlarged to `SPLITTER_HIT_WIDTH` via an absolute
-/// overlay (see `splitter_hitbox` / `sidebar_handle_hitbox`).
-/// Layout math (`strip_left_pad_w`, alignment between tab-strip
-/// dividers and pane splitters) uses *this* width so both rows
-/// divide the same horizontal extent by the same `weight` factor.
+/// the hit area is enlarged to `SPLITTER_HIT_WIDTH` via an absolute-
+/// positioned overlay div nested inside the splitter / sidebar-handle
+/// element (search for `cursor_col_resize` in `render` /
+/// `render_group` to find them — there are no named helpers, the
+/// overlays are inlined where they're built). Layout math
+/// (`strip_left_pad_w`, alignment between tab-strip dividers and
+/// pane splitters, `begin_splitter_drag`'s sidebar-pixels subtraction)
+/// uses *this* width so both rows divide the same horizontal extent
+/// by the same `weight` factor.
 const DIVIDER_VISUAL_WIDTH: f32 = 1.0;
 
 /// Width of the right-side caption-controls cluster in the title
@@ -1152,14 +1156,17 @@ impl AppShell {
         // feel that we ignore them here). Total weight is the sum of
         // all current weights.
         let viewport: f32 = window.viewport_size().width.into();
-        // The sidebar wrapper takes `sidebar_width` plus the 6 px
+        // The sidebar wrapper takes `sidebar_width` plus the 1 px
         // resize handle that sits between sidebar and work area;
-        // both are gone when collapsed. Subtracting the handle here
-        // (and not just the sidebar) keeps `px_per_unit` accurate so
-        // a group-splitter drag tracks the cursor 1:1 instead of
-        // drifting by 6 px after the first move.
+        // both are gone when collapsed. We subtract `DIVIDER_VISUAL_WIDTH`
+        // (not `SPLITTER_HIT_WIDTH`) here because the handle's flex
+        // contribution to the layout is just the visible line — the
+        // 6 px hit zone is an absolute overlay that doesn't displace
+        // adjacent content. Using the wrong constant would shave 5
+        // extra pixels off `work_width` and the splitter drag would
+        // drift relative to the cursor.
         let sidebar_pixels = if self.sidebar_visible {
-            self.sidebar_width + SPLITTER_HIT_WIDTH
+            self.sidebar_width + DIVIDER_VISUAL_WIDTH
         } else {
             0.0
         };
@@ -1949,7 +1956,7 @@ impl Render for AppShell {
             .collect();
 
         // Caption controls: minimise, maximise/restore, close.
-        // 46×32 hitboxes hugging the right edge of the caption row.
+        // 46×40 hitboxes hugging the right edge of the caption row.
         //
         // On Windows the `WindowControlArea::*` annotations + the
         // gpui NC-mouse-up handler give us a *correct* maximize ↔
@@ -1995,12 +2002,16 @@ impl Render for AppShell {
         let close_btn = caption_base("titlebar-close", WindowControlArea::Close, "✕")
             .hover(move |s| s.bg(close_hover_bg).text_color(ink));
 
-        // Same defer-via-`window.defer` story as the drag region:
-        // `SendMessage(WM_SYSCOMMAND, …)` runs *synchronously* and can
-        // pump Windows messages that wake gpui background tasks; those
-        // tasks call `update` → `borrow_mut()` while the App is still
-        // borrowed by our mouse-down dispatch. Defer to the next
-        // effect cycle so the borrow is released first.
+        // The Win32 paths (`minimize` / `toggle_maximize` / `close` in
+        // `win32_titlebar`) all post via `PostMessageW` — async,
+        // non-blocking, no synchronous WndProc re-entry — so the
+        // re-entrant-borrow problem `start_drag` had with `SendMessage`
+        // doesn't apply here. The `window.defer` is kept anyway for
+        // consistency with the title-bar drag region (which *does*
+        // need it because `WM_NCLBUTTONDOWN(HTCAPTION)` enters the
+        // OS's modal NC drag loop on the next pump iteration) and as
+        // insurance against any future change to the win32 helper
+        // that swaps `PostMessageW` for a synchronous send.
         #[cfg(target_os = "windows")]
         let minimize_btn = minimize_btn.on_mouse_down(
             MouseButton::Left,
