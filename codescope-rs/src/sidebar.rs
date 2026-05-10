@@ -692,11 +692,11 @@ impl Sidebar {
                 // pending fetch differs from the live branch, the
                 // user switched mid-fetch; we'll spawn a fresh task
                 // and the older one will be discarded on completion.
-                Some(PrLookup::Pending { branch: pending }) => *pending != branch,
+                Some(PrLookup::Pending { branch: pending }) => pending != &branch,
                 // Branch switched out from under the cached lookup —
                 // refetch. This fixes the "user switched branches and
                 // the menu still shows the old PR / no PR" race.
-                Some(PrLookup::Resolved { branch: cached, .. }) => *cached != branch,
+                Some(PrLookup::Resolved { branch: cached, .. }) => cached != &branch,
             };
             if needs_fetch {
                 self.pr_urls.insert(
