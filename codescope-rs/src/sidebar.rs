@@ -250,6 +250,20 @@ impl Sidebar {
         cx.notify();
     }
 
+    /// Drop any `collapsed_projects` entries that no longer exist in
+    /// the current `projects.projects` list. Called after every
+    /// mutation that removes or replaces project rows so the set
+    /// can't grow monotonically across a long-running session
+    /// (project removed → its id sat there forever; same id later
+    /// re-added would inherit the stale collapsed flag).
+    fn prune_collapsed_projects(&mut self) {
+        if self.collapsed_projects.is_empty() {
+            return;
+        }
+        let live: HashSet<&str> = self.projects.projects.iter().map(|p| p.id.as_str()).collect();
+        self.collapsed_projects.retain(|id| live.contains(id.as_str()));
+    }
+
     /// Spawn the dirty-state polling loop. Runs every
     /// `DIRTY_POLL_INTERVAL` and walks every known worktree path,
     /// running `git status --porcelain`. Per-call latency is in the
@@ -470,6 +484,7 @@ impl Sidebar {
     /// ordering matches `add_project` / `remove_project`.
     pub(crate) fn replace_projects(&mut self, next: ProjectsConfig) {
         self.projects = next;
+        self.prune_collapsed_projects();
     }
 
     /// Dialog accessors used by the dialog module's helpers. Kept
@@ -1101,6 +1116,7 @@ impl Sidebar {
             return;
         }
         self.projects = next;
+        self.prune_collapsed_projects();
         // Selection housekeeping: if we just removed the selected
         // project, fall back to the previous row (or `None` when the
         // list is empty). Otherwise shift the cursor left when an

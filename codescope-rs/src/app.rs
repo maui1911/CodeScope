@@ -3272,22 +3272,15 @@ impl Render for AppShell {
         // tab/"+" content normally lives well to the left of the
         // overlap so it stays clickable.
         //
-        // `strip_left_pad` keeps the *left* side of the tab area
-        // aligned with the *left* side of the work area (panes start
-        // at `sidebar_width + handle`). When the sidebar is collapsed
-        // the padding is zero so tabs sit flush against the toggle.
-        // The padding is itself a drag region so the user can grab
-        // the empty bit between the toggle and the first tab to
-        // drag the window — same behaviour as the brand-mark.
         // The brand cluster (mark + wordmark/version label) spans
         // the full width above the sidebar so the column header
-        // visually "owns" the sidebar; that means the wordmark
-        // label grows to fill `(sidebar_width + divider) - brand_mark`
-        // when the sidebar is visible. When the sidebar is
-        // collapsed, fall back to a fixed 150 px so the wordmark
-        // still has a readable footprint. With the wordmark
-        // absorbing the space the strip pad goes to zero — tabs sit
-        // flush against the wordmark column.
+        // visually "owns" the sidebar — the wordmark label grows
+        // to fill `(sidebar_width + divider) - brand_mark` when the
+        // sidebar is visible. When the sidebar is collapsed it
+        // falls back to a fixed 150 px so the wordmark still has a
+        // readable footprint. With the wordmark absorbing the
+        // space the strip pad below stays a 0 px placeholder; the
+        // brand cluster runs straight into the first tab.
         let brand_label_w = if self.sidebar_visible {
             (self.sidebar_width + DIVIDER_VISUAL_WIDTH - 40.0).max(BRAND_LABEL_FALLBACK_W)
         } else {
