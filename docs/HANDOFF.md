@@ -9,16 +9,124 @@
 >
 > **The Rust port (`codescope-rs/`) is a 1:1 functional port of the C# CodeScope build (`src/CodeScope.App/`, `src/CodeScope.Core/`, `src/CodeScope.AgentCli/`).** Before implementing any feature on the Rust side, **read the equivalent C# code first** and mirror its behavior, button labels, dialogs, data shapes, and persistence layout. Functional parity is the goal — we are not redesigning. If a `HANDOFF.md` entry, README line, or "next entry point" disagrees with what the C# code actually does, the C# code wins; update the doc. Genuine platform-forced deviations (gpui vs WPF idiom) get a one-line comment and an entry in `docs/DECISIONS.md`. "Cleaner" or "more elegant" is not a reason on its own. (Reinforced in session 33 after PR #56 invented a non-existent UX.)
 
-**Last updated:** 2026-05-10 (session 36 — title bar + status bar foundations)
-**Branch:** `main` (PRs #92–#96 merged this session)
+**Last updated:** 2026-05-10 (session 37 — status bar wired + sidebar parity sweep)
+**Branch:** `main` (PRs #98–#101 merged; #102 + #103 in flight pending review)
 **Head:** main, in sync with origin
-**Release:** `v0.2.5` shipped earlier — no new release this run
+**Release:** `v0.2.5` shipped in session 36 — no new release this run
 **Build status:** ✅ C# untouched. Rust workspace builds clean.
-Tests: `codescope-core` (66 — git_status added 16, claude_telemetry
-added 28) + `codescope-terminal` mouse-encoder (9) + `notifications`
-(14) + `new_worktree_dialog` (15) — 112 total, all passing.
-**Uncommitted work:** none.
+Tests: `codescope-core` (121 — claude_discovery added 19,
+git status_label added 8, status-bar formatters added 14) +
+`codescope-terminal` mouse-encoder (9) + sidebar-bin tests (29) —
+**159 total**, all passing.
+**Uncommitted work:** none on `main`. Open branches: `feat/sidebar-rebase-onto-default` (#102), `feat/sidebar-project-collapse` (#103).
 **Open issues:** none on GitHub.
+
+### Session 37 — status bar integration + sidebar parity sweep
+
+Started with the cursor from session 36 ("wire register / unregister
+into spawn / close, then integrating PR for the bar") and pivoted
+to a broader autonomous sidebar-parity sweep after the user said
+"ok misschien kan je hierna gaan zorgen dat de sidebar functioneel
+het zelfde wordt als de c# versie. dit mag je helemaal autonoom
+doen, zelf pr'en wachten op de review adressen en mergen."
+
+**PR #98 — Claude session adoption + telemetry register/unregister.**
+New `core/claude_discovery.rs` mirrors C# `ClaudeSessionDiscovery`
+(poll-only, no `notify` dep). `Tab` gains `spawned_at`,
+`adopted_session_id`, `fired_session_ids` — the latter mirrors
+`WatchHandle._fired` so `/clear` rotations swap cleanly without
+leaking stale tails. `start_claude_discovery_poll` stays armed
+for the tab's full lifetime; on a new id it unregisters the
+previous tail before registering the new one. Helper
+`is_claude_auto_type` ported into core for unit testing the
+agent-id heuristic.
+
+**PR #99 — wire status bar to telemetry / git / notifications.**
+Brings `render_status_bar` to functional parity with C#
+`StatusBarView`. Left cluster: session dot (`signal_ok` /
+`signal_warn` from new `theme::signal_*` helpers, exact
+DesignTokens.xaml hex) + branch from `git_status_for` + `+N −N`
+numstat (white added, dim removed, "changes" fallback) + remote
+`↑/↓`. Hidden entirely on tabs without a git context. Right
+cluster: short model name (via new `core::model_display_name`),
+`tokens k tok pct%` (via new `format_tokens` / `format_context_pct`
+that match C#'s `0.#` rule), `N turns`, last-turn duration,
+`N busy · M idle` agent rollup, optional `N groups`, workspace
+summary, tab counter, and a clickable bell button with a 4 px
+unread dot. Segments are built as `Vec<AnyElement>` and
+separators interspersed only between visible items — no stray
+rules when an optional segment is `None`.
+
+**PR #100 — worktree row right-aligned status slug.** New
+`core::git::worktree_status_label` ports C#
+`WorktreeViewModel.StatusLabel`: `chg` / `↑N ↓N` / `idle` (and
+empty when no upstream + clean, deviating slightly from C# to
+avoid a fresh standalone branch claiming sync state). Slug
+renders right-aligned (sans 10 pt; switching the whole sidebar
+to mono / sans is a follow-up). 8 new tests cover the slug
+rules.
+
+**PR #101 — `(no worktrees)` placeholder.** Dim row indented to
+align with the worktree children, shown when a project has no
+non-primary worktrees. Stable gpui id keyed off the project id
+so it doesn't confuse element reuse when the user adds the
+project's first worktree.
+
+**PRs in flight (review pending):**
+
+- **PR #102 — Rebase onto origin/<default>… menu row.**
+  `core::git::rebase_onto`, worktree menu row hidden when on
+  default branch, background-spawn run with toast surface.
+- **PR #103 — Project chevron collapse / expand.** ▸ / ▾ glyph
+  + click toggle, in-memory `collapsed_projects: HashSet<String>`,
+  worktree children + placeholder skipped via `continue` when
+  collapsed.
+
+**Lessons / patterns:**
+
+- The `address-review` autonomous loop turned out cheap: under
+  a minute round-trip per PR. Copilot consistently flags concrete
+  things (segment/separator interspersing, hard-coded vs
+  themed colors, doc-vs-impl drift on ported behaviour) — most
+  reviews resolved in one fix-commit.
+- C# parity claims are easy to over-state in docstrings.
+  Several review threads landed on "you say 'mirrors X' but it
+  diverges in some small detail" — fix is to spell out *what*
+  diverges + *why*, not silently hand-wave.
+- `Box::leak` is a tempting shortcut for dynamic
+  `&'static str` labels in gpui menus; it leaks on every
+  re-render. Better: build the row inline rather than going
+  through helpers that need a static lifetime.
+
+### Cursor — what's next
+
+Two PRs are open and waiting on review (`#102` rebase, `#103`
+project chevron). Once they merge the next sidebar parity work
+falls into roughly four sizes:
+
+1. **Tiny** — persist `collapsed_projects` to `layout.json` so
+   expand state survives across launches. Builds on #103.
+2. **Small** — port the worktree menu's "Copy branch" copy-PR-
+   URL row once a PR detection model lands; today that needs a
+   `gh` shell-out.
+3. **Medium** — adopt the same mono / sans font split the C#
+   sidebar uses (`Fig.Font.Mono` for branch labels and the
+   status slug, `Fig.Font.Sans` for project names). Touches
+   most sidebar render paths.
+4. **Big — session-state tracking.** The biggest remaining gap
+   per the parity audit. Live + closed history rows, session
+   dots, history disclosure, soft-close + reopen flow. Depends
+   on a Rust-side `SessionManager` that today doesn't exist
+   (the Rust port treats every Tab as its own ad-hoc session).
+   This is the structural work that unlocks busy-halo, agent
+   rollup beyond Claude tabs, PR detection, etc.
+
+The audit run earlier in the session lives in the conversation
+transcript — see the Claude Code session log under your local
+`~/.claude/projects/C--dev-codescope-public/` (the file name is
+the session UUID; on Windows that's `%USERPROFILE%\.claude\…`).
+
+### Earlier sessions
 
 ### Session 36 — title bar merge + status bar / data-source foundations
 
@@ -133,10 +241,6 @@ spawn / close (no UI yet), (b) integrating PR for the bar
 itself (left + mid-left + right + bell). The two could be one
 PR but they're independent enough to split if it stays
 reviewable.
-
-### Earlier sessions
-
-
 
 ### Session 35 — long autonomous run (PRs #68 → #88)
 
