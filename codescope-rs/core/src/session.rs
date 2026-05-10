@@ -47,8 +47,6 @@
 //! Live sessions (`closed_at = None`) are never pruned. Sweep is run
 //! one-shot on load and after every soft-close, just like the C# build.
 
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -82,6 +80,7 @@ impl RetentionPolicy {
 /// build one of these, the UI layer consumes it to wire up the pty.
 /// Not consumed yet on the Rust side — kept here so the agent-launch
 /// port can land in a separate PR without re-litigating the shape.
+#[allow(dead_code)] // Consumed by a follow-up PR (agent-launch port).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionDescriptor {
     pub id: String,
@@ -952,5 +951,156 @@ mod tests {
         // sweep would early-return on every call.
         let now = now_iso8601();
         assert!(parse_iso8601_secs(&now).is_some(), "produced: {now}");
+    }
+
+    // ---- AppShell ↔ SessionManager persistence wiring ----------
+    //
+    // These tests exercise the load_with_sweep → open → save →
+    // load → soft_close → save round-trip the AppShell relies on
+    // (Big-Step-2). The integration site itself is gpui-bound and
+    // hard to unit-test; the persistence shape is what matters and
+    // can be tested through the public API alone.
+
+    #[test]
+    fn appshell_lifecycle_round_trip_through_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::paths::rooted_for_tests(false, root.path());
+        paths.ensure_dirs().unwrap();
+
+        // Seed: one project with a primary worktree, no sessions yet.
+        let mut seed = ProjectsConfig::default();
+        seed.projects.push(make_project("p1"));
+        seed.save(&paths).unwrap();
+
+        // 1. AppShell launch: load with sweep — empty list, no prune.
+        let cfg = SessionManager::load_with_sweep(&paths, fixed_now()).unwrap();
+        assert_eq!(cfg.projects[0].sessions.len(), 0);
+
+        // 2. spawn_tab → SessionManager::open → save.
+        let mut cfg = ProjectsConfig::load(&paths).unwrap();
+        let session = make_session("s1", Some("primary"));
+        SessionManager::open(&mut cfg, "p1", session, fixed_now()).unwrap();
+        save(&cfg, &paths).unwrap();
+
+        // 3. Reload and verify the row persisted with last_opened set.
+        let reloaded = ProjectsConfig::load(&paths).unwrap();
+        assert_eq!(reloaded.projects[0].sessions.len(), 1);
+        let row = &reloaded.projects[0].sessions[0];
+        assert_eq!(row.id, "s1");
+        assert_eq!(row.last_opened.as_deref(), Some(fixed_now()));
+        assert!(row.closed_at.is_none());
+
+        // 4. close_tab → soft_close → save.
+        let mut cfg = ProjectsConfig::load(&paths).unwrap();
+        let pruned = SessionManager::soft_close(&mut cfg, "s1", fixed_now()).unwrap();
+        assert!(pruned.is_empty());
+        save(&cfg, &paths).unwrap();
+
+        // 5. Reload — row still present, now with closed_at.
+        let reloaded = ProjectsConfig::load(&paths).unwrap();
+        assert_eq!(reloaded.projects[0].sessions.len(), 1);
+        assert_eq!(
+            reloaded.projects[0].sessions[0].closed_at.as_deref(),
+            Some(fixed_now())
+        );
+    }
+
+    #[test]
+    fn appshell_dev_mode_keeps_session_files_separate() {
+        // Mirrors the in-module dev/prod test, but goes through the
+        // open + save lifecycle the AppShell would actually drive,
+        // not just save → load. Catches a future regression where a
+        // stray hard-coded path ignores the dev-mode redirection.
+        let root = tempfile::tempdir().unwrap();
+        let prod = crate::paths::rooted_for_tests(false, root.path());
+        let dev = crate::paths::rooted_for_tests(true, root.path());
+        prod.ensure_dirs().unwrap();
+        dev.ensure_dirs().unwrap();
+
+        let mut seed = ProjectsConfig::default();
+        seed.projects.push(make_project("p1"));
+        seed.save(&prod).unwrap();
+        let mut seed = ProjectsConfig::default();
+        seed.projects.push(make_project("p1"));
+        seed.save(&dev).unwrap();
+
+        // Open a session under each side and persist independently.
+        let mut prod_cfg = SessionManager::load_with_sweep(&prod, fixed_now()).unwrap();
+        SessionManager::open(
+            &mut prod_cfg,
+            "p1",
+            make_session("prod-s", Some("primary")),
+            fixed_now(),
+        )
+        .unwrap();
+        save(&prod_cfg, &prod).unwrap();
+
+        let mut dev_cfg = SessionManager::load_with_sweep(&dev, fixed_now()).unwrap();
+        SessionManager::open(
+            &mut dev_cfg,
+            "p1",
+            make_session("dev-s", Some("primary")),
+            fixed_now(),
+        )
+        .unwrap();
+        save(&dev_cfg, &dev).unwrap();
+
+        // Each side reads back only its own session.
+        let prod_back = ProjectsConfig::load(&prod).unwrap();
+        let dev_back = ProjectsConfig::load(&dev).unwrap();
+        assert_eq!(prod_back.projects[0].sessions[0].id, "prod-s");
+        assert_eq!(dev_back.projects[0].sessions[0].id, "dev-s");
+    }
+
+    #[test]
+    fn appshell_close_after_concurrent_sidebar_reload_does_not_lose_data() {
+        // Reproduces the AppShell pattern: reload-from-disk before
+        // each session mutation so a sidebar write between two of
+        // ours doesn't get clobbered.
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::paths::rooted_for_tests(false, root.path());
+        paths.ensure_dirs().unwrap();
+
+        let mut seed = ProjectsConfig::default();
+        seed.projects.push(make_project("p1"));
+        seed.save(&paths).unwrap();
+
+        // AppShell opens session s1.
+        let mut cfg = ProjectsConfig::load(&paths).unwrap();
+        SessionManager::open(
+            &mut cfg,
+            "p1",
+            make_session("s1", Some("primary")),
+            fixed_now(),
+        )
+        .unwrap();
+        save(&cfg, &paths).unwrap();
+
+        // Sidebar (out-of-band) appends a second project to disk
+        // — simulating an `add_project` write between AppShell ticks.
+        let mut sidebar_view = ProjectsConfig::load(&paths).unwrap();
+        sidebar_view.projects.push(make_project("p2"));
+        sidebar_view.save(&paths).unwrap();
+
+        // AppShell soft-closes s1, going through reload-from-disk
+        // first (mirrors `AppShell::soft_close_session`).
+        let mut cfg = ProjectsConfig::load(&paths).unwrap();
+        SessionManager::soft_close(&mut cfg, "s1", fixed_now()).unwrap();
+        save(&cfg, &paths).unwrap();
+
+        // Final state: both projects present, s1 closed.
+        let final_cfg = ProjectsConfig::load(&paths).unwrap();
+        assert_eq!(final_cfg.projects.len(), 2);
+        assert!(
+            final_cfg.projects.iter().any(|p| p.id == "p2"),
+            "sidebar's p2 must survive the AppShell close"
+        );
+        let s1 = final_cfg
+            .projects
+            .iter()
+            .flat_map(|p| p.sessions.iter())
+            .find(|s| s.id == "s1")
+            .expect("s1 must remain on disk");
+        assert!(s1.closed_at.is_some(), "s1 must be soft-closed");
     }
 }

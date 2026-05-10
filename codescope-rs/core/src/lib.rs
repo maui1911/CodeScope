@@ -40,6 +40,7 @@ pub use claude_telemetry::{
 pub use layout::{LayoutState, RestoreTab};
 pub use paths::AppPaths;
 pub use projects::{Project, ProjectsConfig, Session, Worktree};
+pub use session::{RetentionPolicy, SessionManager, now_iso8601};
 pub use settings::{CursorSettings, FontSettings, Settings};
 pub use theme::{Rgb, Theme, ThemePalette, builtin};
 pub use window_state::WindowState;

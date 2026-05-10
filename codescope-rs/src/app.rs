@@ -41,7 +41,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use codescope_core::{AppPaths, LayoutState, ProjectsConfig, Settings, Theme, WindowState};
+use codescope_core::{
+    AppPaths, LayoutState, ProjectsConfig, Session, SessionManager, Settings, Theme, WindowState,
+    now_iso8601,
+};
 use codescope_terminal::{
     Backend, ColorPalette, CursorStylePreset, FontConfig, Shell, SpawnConfig, TerminalSize,
     TerminalView,
@@ -89,6 +92,15 @@ struct PendingWindowSave {
 /// One tab = one terminal session.
 struct Tab {
     id: u64,
+    /// The CodeScope session id — the stable identifier persisted in
+    /// `projects.json` under the owning project's `sessions[]`.
+    /// Allocated at spawn via [`SessionManager::open`] (or restored
+    /// from disk for a launch-time rehydrate). Distinct from
+    /// [`Tab::adopted_session_id`] which is the *Claude Code* UUID
+    /// discovered later from a tail of the agent's `.jsonl` transcript.
+    /// Mirrors C# `SessionTabViewModel.Descriptor.Id` /
+    /// `Models.Session.Id`.
+    session_id: String,
     title: SharedString,
     terminal: Entity<TerminalView>,
     /// Working directory the pty was spawned in. Captured so a
@@ -160,6 +172,20 @@ struct SplitterDrag {
     /// Set from `(viewport_width - sidebar_width) / total_weight`.
     /// Used to translate cursor delta-x into a weight delta.
     px_per_unit: f32,
+}
+
+/// Case-insensitive equality for filesystem paths after stripping
+/// any trailing separator. Windows paths persisted under different
+/// casings ("C:\\Repo" vs "c:\\repo") still need to compare equal so
+/// `locate_project_for_path` lands on the right project on every
+/// platform our build targets.
+fn path_eq_ci(a: &str, b: &str) -> bool {
+    fn norm(s: &str) -> &str {
+        s.trim_end_matches(|c| c == '\\' || c == '/')
+    }
+    let a = norm(a);
+    let b = norm(b);
+    a.len() == b.len() && a.chars().zip(b.chars()).all(|(x, y)| x.eq_ignore_ascii_case(&y))
 }
 
 /// `mtime` for the watcher loop's "did the file change?" check.
@@ -447,6 +473,21 @@ pub struct AppShell {
     /// same notification entry on every tick. `None` until the first
     /// poll surfaces an `Available` result.
     last_announced_update: Option<String>,
+    /// In-memory snapshot of the on-disk session catalog used by
+    /// the session-lifecycle helpers. Initialised at construction
+    /// from a [`SessionManager::load_with_sweep`] pass so the
+    /// retention sweep runs once per launch (mirrors C#
+    /// `SessionStore.LoadAsync`). Each session mutation (open /
+    /// soft-close) re-reads from disk first so concurrent sidebar
+    /// writes (project / worktree mutations also persist to
+    /// `projects.json`) are not clobbered, then applies the change
+    /// via [`SessionManager`] and writes back via
+    /// [`session::save`]. The Sidebar still owns its own
+    /// `ProjectsConfig` clone for project / worktree rendering —
+    /// they converge through the shared file. This split mirrors
+    /// the C# build where `SessionStore` is the orchestrator and
+    /// `SidebarViewModel.StoreSync` projects from it.
+    projects: ProjectsConfig,
 }
 
 impl AppShell {
@@ -466,6 +507,12 @@ impl AppShell {
         // sidebar writes (and vice versa). Two writers to the same
         // file is acceptable — both go through the same atomic write
         // wrapper, last-writer-wins on order.
+        // Hand the sidebar its own clone so session-lifecycle writes
+        // on the AppShell side don't have to thread through the
+        // sidebar entity. Our `projects` field below keeps a parallel
+        // copy used purely for session bookkeeping; both converge
+        // through the shared `projects.json`.
+        let projects_for_sessions = projects.clone();
         let sidebar = cx.new(|cx| {
             let sidebar =
                 Sidebar::new(projects, layout.clone(), theme.clone(), paths.clone());
@@ -526,6 +573,7 @@ impl AppShell {
                         Some(working_directory.clone()),
                         Some(title.clone()),
                         auto_type.clone(),
+                        None,
                         window,
                         cx,
                     );
@@ -748,6 +796,7 @@ impl AppShell {
             telemetry_tails: HashMap::new(),
             bell_bounds: None,
             last_announced_update: None,
+            projects: projects_for_sessions,
         };
         shell.start_telemetry_poll(cx);
         shell.start_claude_discovery_poll(cx);
@@ -1178,7 +1227,16 @@ impl AppShell {
             self.focused_group = group_idx;
             let title = SharedString::from(tab.title);
             let auto = tab.auto_type.map(SharedString::from);
-            self.spawn_tab_in(Some(path), Some(title), auto, window, cx);
+            // Rehydrate path lets `spawn_tab_in` mint a fresh session
+            // id rather than try to map back to a stored row — the
+            // launch-time `restore_live_sessions` pass handles the
+            // session-restore flow separately, mirroring C# where the
+            // tab list and the session list are adopted via two
+            // distinct entry points (`SessionStore.LoadAsync` for the
+            // store; `MainViewModel.RestoreClosedWorktreeSessionsAsync`
+            // for the tab side, but here unified into
+            // `restore_live_sessions`).
+            self.spawn_tab_in(Some(path), Some(title), auto, None, window, cx);
             spawned_any = true;
             if tab.active_in_group {
                 let new_idx = self.groups[group_idx].tabs.len() - 1;
@@ -1208,6 +1266,147 @@ impl AppShell {
         if !self.groups[focused].tabs.is_empty() {
             let active = self.groups[focused].active_tab;
             self.activate_tab(focused, active, window, cx);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Session lifecycle (Big-Step-2 — Tab ↔ SessionManager plumbing)
+    //
+    // These helpers funnel every Tab create / close through
+    // [`SessionManager`] so the on-disk session list stays in sync with
+    // what the user actually has open. The Sidebar still owns project
+    // and worktree mutations on its side; both writers go through the
+    // shared `projects.json`. Mirrors the C# split between
+    // `MainViewModel.NewSessionAsync` / `CloseTabAsync` and
+    // `SidebarViewModel.StoreSync`.
+    // -----------------------------------------------------------------------
+
+    /// Find the project that owns `working_directory`, if any.
+    /// Match order mirrors C# `MainViewModel`: a worktree path match
+    /// wins over a project-root path match, and case-insensitive
+    /// comparison handles Windows path quirks. Returns `(project_id,
+    /// worktree_id)` so the caller can stamp both fields on the
+    /// `Session` row exactly the way the C# build does.
+    fn locate_project_for_path(&self, working_directory: &std::path::Path) -> Option<(String, Option<String>)> {
+        let target = working_directory.to_string_lossy();
+        for project in &self.projects.projects {
+            for wt in &project.worktrees {
+                if path_eq_ci(&wt.path, &target) {
+                    return Some((project.id.clone(), Some(wt.id.clone())));
+                }
+            }
+            if path_eq_ci(&project.path, &target) {
+                // Project root that has a primary worktree row will
+                // already have hit the loop above; the fall-through
+                // here covers legacy / partially-migrated configs.
+                let primary_id = project
+                    .worktrees
+                    .iter()
+                    .find(|w| w.is_primary)
+                    .map(|w| w.id.clone());
+                return Some((project.id.clone(), primary_id));
+            }
+        }
+        None
+    }
+
+    /// Allocate a session id for a freshly-spawned tab.
+    ///
+    /// Three modes:
+    /// 1. `restore_session_id = Some` → caller is rehydrating a
+    ///    persisted live session row; use that id verbatim. The row
+    ///    already exists on disk so we don't append a new one.
+    /// 2. The `working_directory` maps to a known project → mint a
+    ///    fresh uuid, build a [`Session`], reload from disk so any
+    ///    sidebar writes since construction aren't clobbered, append
+    ///    the row via [`SessionManager::open`], persist.
+    /// 3. No project owns this path → return a free-floating uuid
+    ///    without persisting. The Tab still works as a terminal; the
+    ///    session simply isn't tracked in `projects.json`. Matches C#
+    ///    where `MainViewModel.NewSessionAsync` returns early when
+    ///    `project is null`, except we don't want to refuse the spawn —
+    ///    cold-start before any project is added still gets a Tab.
+    fn allocate_session_id(
+        &mut self,
+        working_directory: Option<&std::path::Path>,
+        restore_session_id: Option<String>,
+    ) -> String {
+        if let Some(id) = restore_session_id {
+            return id;
+        }
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let Some(wd) = working_directory else {
+            return new_id;
+        };
+        let Some((project_id, worktree_id)) = self.locate_project_for_path(wd) else {
+            return new_id;
+        };
+        // Reload from disk before mutating — the sidebar may have
+        // persisted a project / worktree change since our last
+        // snapshot. Mirrors C# `SessionStore`'s read-then-write
+        // pattern (it owns the in-memory list under a lock; we don't,
+        // so re-reading is the cheapest equivalent).
+        match ProjectsConfig::load(&self.paths) {
+            Ok(cfg) => {
+                self.projects = cfg;
+            }
+            Err(err) => {
+                eprintln!("warning: failed to reload projects.json before SessionManager::open: {err:#}");
+            }
+        }
+        let session = Session {
+            id: new_id.clone(),
+            worktree_path: wd.to_string_lossy().into_owned(),
+            branch: None,
+            agent_id: None,
+            display_name: None,
+            worktree_id,
+            last_opened: None,
+            agent_session_id: None,
+            closed_at: None,
+        };
+        match SessionManager::open(&mut self.projects, &project_id, session, &now_iso8601()) {
+            Ok(_) => {
+                if let Err(err) = codescope_core::session::save(&self.projects, &self.paths) {
+                    eprintln!("warning: failed to persist session open: {err:#}");
+                }
+            }
+            Err(err) => {
+                eprintln!("warning: SessionManager::open rejected new session: {err:#}");
+            }
+        }
+        new_id
+    }
+
+    /// Mark `session_id` as soft-closed and persist. Called from
+    /// `close_tab` so every Tab close lands in the closed-history
+    /// list. Mirrors C# `SessionStore.SoftCloseSessionAsync`.
+    /// Best-effort: a free-floating tab whose session id is not in
+    /// `projects.json` (path matched no project at spawn time) is a
+    /// silent no-op rather than an error. Reload-then-mutate-then-save
+    /// keeps us in sync with concurrent sidebar writes.
+    fn soft_close_session(&mut self, session_id: &str) {
+        match ProjectsConfig::load(&self.paths) {
+            Ok(cfg) => {
+                self.projects = cfg;
+            }
+            Err(err) => {
+                eprintln!("warning: failed to reload projects.json before soft_close: {err:#}");
+            }
+        }
+        match SessionManager::soft_close(&mut self.projects, session_id, &now_iso8601()) {
+            Ok(_pruned) => {
+                if let Err(err) = codescope_core::session::save(&self.projects, &self.paths) {
+                    eprintln!("warning: failed to persist session soft-close: {err:#}");
+                }
+            }
+            Err(_) => {
+                // Free-floating session (no project context at spawn
+                // time, or row already removed by the sidebar). Drop
+                // silently — mirrors C#'s "session id not found is
+                // ok" branch in `CloseTabAsync` where `storedForTab`
+                // is null.
+            }
         }
     }
 
@@ -1244,7 +1443,7 @@ impl AppShell {
     /// worktree clicks, post-create-worktree spawns) hand both in
     /// directly.
     fn spawn_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.spawn_tab_in(None, None, None, window, cx);
+        self.spawn_tab_in(None, None, None, None, window, cx);
     }
 
     fn spawn_tab_in(
@@ -1252,6 +1451,12 @@ impl AppShell {
         working_directory: Option<std::path::PathBuf>,
         title_override: Option<SharedString>,
         auto_type: Option<SharedString>,
+        // `Some` on the launch-time rehydrate path so the freshly
+        // spawned `Tab` adopts an existing session row rather than
+        // appending a new one. `None` on every other call site
+        // (sidebar click, dialog spawn, Ctrl+T) — those allocate a
+        // fresh id and persist via `SessionManager::open`.
+        restore_session_id: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1330,6 +1535,15 @@ impl AppShell {
         let title: SharedString = title_override
             .or_else(|| active_project.map(|(_, name)| name.into()))
             .unwrap_or_else(|| format!("Terminal {}", id + 1).into());
+        // Allocate / adopt the persisted session id. `restore_session_id`
+        // is `Some` only on the rehydrate path (a session row that was
+        // already on disk and is now being brought back into a Tab);
+        // every other call site lets us mint a fresh id and append a new
+        // row through `SessionManager::open`. Mirrors C#
+        // `MainViewModel.NewSessionAsync` (open path) vs. cold-start
+        // session restore.
+        let session_id =
+            self.allocate_session_id(working_directory_for_tab.as_deref(), restore_session_id);
         let group_idx = self.focused_group;
         let group = &mut self.groups[group_idx];
         // Capture the entity so an `auto_type` job can write to it
@@ -1337,6 +1551,7 @@ impl AppShell {
         let terminal_for_autotype = terminal.clone();
         group.tabs.push(Tab {
             id,
+            session_id,
             title,
             terminal,
             working_directory: working_directory_for_tab,
@@ -1383,14 +1598,24 @@ impl AppShell {
     ) {
         // Look up the closing tab's adopted Claude session id (if any)
         // *before* mutating, so we can drop the telemetry tail without
-        // holding `&mut group` across the call.
-        let adopted = self
+        // holding `&mut group` across the call. The CodeScope session
+        // id we soft-close in `SessionManager` is a separate value
+        // (always present, allocated at spawn) — read it here too.
+        let (adopted, codescope_session_id) = self
             .groups
             .get(group_idx)
             .and_then(|g| g.tabs.get(tab_idx))
-            .and_then(|t| t.adopted_session_id.clone());
+            .map(|t| (t.adopted_session_id.clone(), t.session_id.clone()))
+            .unwrap_or_default();
         if let Some(sid) = adopted {
             self.unregister_telemetry(&sid);
+        }
+        // Mark the session row as closed in `projects.json` (mirrors
+        // C# `SessionStore.SoftCloseSessionAsync`). Best-effort —
+        // failure logs and proceeds; the in-memory tab state is the
+        // source of truth for what's on screen.
+        if !codescope_session_id.is_empty() {
+            self.soft_close_session(&codescope_session_id);
         }
         let Some(group) = self.groups.get_mut(group_idx) else { return };
         if tab_idx >= group.tabs.len() {
@@ -4112,5 +4337,19 @@ fn build_font_config(settings: &Settings) -> FontConfig {
         size,
         line_height,
         cell_width: px(settings.font.size * 0.6),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_eq_ci_handles_case_and_trailing_slash() {
+        assert!(path_eq_ci("C:\\Repos\\Foo", "c:\\repos\\foo"));
+        assert!(path_eq_ci("C:\\Repos\\Foo\\", "C:\\Repos\\Foo"));
+        assert!(path_eq_ci("/usr/local/bin/", "/usr/local/bin"));
+        assert!(!path_eq_ci("C:\\Repos\\Foo", "C:\\Repos\\Bar"));
+        assert!(!path_eq_ci("foo", "foobar"));
     }
 }
