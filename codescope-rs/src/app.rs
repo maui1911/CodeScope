@@ -3251,29 +3251,6 @@ impl Render for AppShell {
             group_panes.push(pane.into_any_element());
         }
 
-        // Sidebar toggle (chevron). 32×32 cell in the caption row,
-        // immediately right of the brand mark. `«` when the sidebar
-        // is visible (click to collapse), `»` when hidden (click to
-        // expand). Pure client-area click — `on_mouse_down` is the
-        // primary path.
-        let toggle_glyph = if self.sidebar_visible { "«" } else { "»" };
-        let sidebar_toggle = div()
-            .id("titlebar-sidebar-toggle")
-            .h(px(40.0))
-            .w(px(32.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_size(px(14.0))
-            .text_color(ink_dim)
-            .cursor_pointer()
-            .hover(move |s| s.bg(frost_hover).text_color(ink))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)),
-            )
-            .child(toggle_glyph);
-
         // ─── Title bar (40 px) ────────────────────────────────────
         // Single row, Chrome / VS Code / Windows Terminal layout:
         // tabs live in the title bar so we don't waste a second
@@ -3295,20 +3272,24 @@ impl Render for AppShell {
         // tab/"+" content normally lives well to the left of the
         // overlap so it stays clickable.
         //
-        // `strip_left_pad` keeps the *left* side of the tab area
-        // aligned with the *left* side of the work area (panes start
-        // at `sidebar_width + handle`). When the sidebar is collapsed
-        // the padding is zero so tabs sit flush against the toggle.
-        // The padding is itself a drag region so the user can grab
-        // the empty bit between the toggle and the first tab to
-        // drag the window — same behaviour as the brand-mark.
-        // brand mark + brand wordmark/version label + sidebar toggle.
-        let chrome_left_w = 40.0 + BRAND_LABEL_W + 32.0;
-        let strip_left_pad_w = if self.sidebar_visible {
-            (self.sidebar_width + DIVIDER_VISUAL_WIDTH - chrome_left_w).max(0.0)
+        // The brand cluster (mark + wordmark/version label) spans
+        // the full width above the sidebar so the column header
+        // visually "owns" the sidebar — the wordmark label grows
+        // to fill `(sidebar_width + divider) - brand_mark` when the
+        // sidebar is visible. When the sidebar is collapsed it
+        // falls back to a fixed 150 px so the wordmark still has a
+        // readable footprint. With the wordmark absorbing the
+        // space the strip pad below stays a 0 px placeholder; the
+        // brand cluster runs straight into the first tab.
+        let brand_label_w = if self.sidebar_visible {
+            (self.sidebar_width + DIVIDER_VISUAL_WIDTH - 40.0).max(BRAND_LABEL_FALLBACK_W)
         } else {
-            0.0
+            BRAND_LABEL_FALLBACK_W
         };
+        // The strip pad is no longer needed (the wordmark absorbs
+        // the column width), but kept as a 0 px drag region so the
+        // assembly below stays structurally identical.
+        let strip_left_pad_w: f32 = 0.0;
         // Drag spots route through `handle_titlebar_press` for
         // shared single-vs-double-click discrimination.
         let strip_left_pad = div()
@@ -3341,15 +3322,16 @@ impl Render for AppShell {
         // caption-row hot path doesn't pay for a `format!` on
         // every render.
         const VERSION_DISPLAY: &str = concat!("V", env!("CODESCOPE_VERSION_DISPLAY"));
-        // Fixed width keeps the `chrome_left_w` calculation below
-        // predictable so the per-group tab strip dividers can still
-        // line up with the splitters between panes. Long dev-build
-        // slugs (`V0.2.6-52-g…-dirty`) get clipped via
-        // `overflow_hidden` rather than pushing the tabs around.
-        const BRAND_LABEL_W: f32 = 150.0;
+        // Fallback width when the sidebar is collapsed — the
+        // wordmark + slug fit comfortably; long dev-build slugs
+        // (`V0.2.6-52-g…-dirty`) get clipped via `overflow_hidden`
+        // rather than pushing the tabs around. With the sidebar
+        // visible the label grows to span the column (see
+        // `brand_label_w` above).
+        const BRAND_LABEL_FALLBACK_W: f32 = 150.0;
         let brand_label = div()
             .id("titlebar-brand-label")
-            .w(px(BRAND_LABEL_W))
+            .w(px(brand_label_w))
             .h(px(40.0))
             .pl(px(2.0))
             .pr(px(10.0))
@@ -3422,7 +3404,6 @@ impl Render for AppShell {
             .bg(theme::elevated(&theme))
             .child(brand_mark)
             .child(brand_label)
-            .child(sidebar_toggle)
             .child(strip_left_pad)
             .child(tab_strip_inline)
             .child(caption_controls);
