@@ -26,6 +26,7 @@ pub mod session;
 pub mod settings;
 pub mod theme;
 pub mod time;
+pub mod update_check;
 pub mod window_state;
 
 pub use claude_discovery::{AdoptionCandidate, POLL_INTERVAL_MS as CLAUDE_DISCOVERY_POLL_MS};

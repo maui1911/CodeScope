@@ -441,6 +441,12 @@ pub struct AppShell {
     /// (0, 0). Refreshed every frame, so window resizes / status-bar
     /// reflows track the popover automatically.
     bell_bounds: Option<gpui::Bounds<gpui::Pixels>>,
+    /// The last release version we've already announced to the user
+    /// this process lifetime. Mirrors `_stagedVersion` in C#
+    /// `UpdateService` — keeps the 3-hourly re-poll from re-pushing the
+    /// same notification entry on every tick. `None` until the first
+    /// poll surfaces an `Available` result.
+    last_announced_update: Option<String>,
 }
 
 impl AppShell {
@@ -741,9 +747,11 @@ impl AppShell {
             notifications: crate::notifications::Notifications::new(),
             telemetry_tails: HashMap::new(),
             bell_bounds: None,
+            last_announced_update: None,
         };
         shell.start_telemetry_poll(cx);
         shell.start_claude_discovery_poll(cx);
+        shell.start_update_check_poll(cx);
         shell.rehydrate_or_cold_start(window, cx);
         shell
     }
@@ -1029,6 +1037,86 @@ impl AppShell {
                     Ok(next) => interval = next,
                     Err(_) => break,
                 }
+            }
+        })
+        .detach();
+    }
+
+    /// Spawn the GitHub release polling loop — Velopack parity for the
+    /// Rust port.
+    ///
+    /// Runs once after `update_check::INITIAL_DELAY` (10 s) and every
+    /// `update_check::POLL_INTERVAL` (3 h) thereafter — the same
+    /// cadence the C# `App.xaml.cs` uses for `UpdateService.CheckAsync`.
+    /// Network work is dispatched through `cx.background_executor()`
+    /// so the UI thread never sees a blocking `ureq::call`. On
+    /// `UpdateStatus::Available` we push a single `Generic`
+    /// notification per unique version per process lifetime; the C#
+    /// build's `_stagedVersion` field plays the same role.
+    ///
+    /// Skipped entirely under `CODESCOPE_DEV=1` — mirrors C#
+    /// `UpdateService.CheckAsync`'s `IsDevMode` early return.
+    fn start_update_check_poll(&self, cx: &mut Context<Self>) {
+        let paths = self.paths.clone();
+        if !codescope_core::update_check::should_poll(&paths) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            // Initial 10 s delay — keeps the first network call off
+            // the startup-critical path.
+            cx.background_executor()
+                .timer(codescope_core::update_check::INITIAL_DELAY)
+                .await;
+            loop {
+                if this.upgrade().is_none() {
+                    break;
+                }
+                let status = cx
+                    .background_executor()
+                    .spawn(async move {
+                        codescope_core::update_check::check_once(env!(
+                            "CODESCOPE_VERSION_DISPLAY"
+                        ))
+                    })
+                    .await;
+                if this.upgrade().is_none() {
+                    break;
+                }
+                if let codescope_core::update_check::UpdateStatus::Available {
+                    version,
+                    url,
+                    body: _,
+                } = status
+                {
+                    let _ = this.update(cx, |this, cx| {
+                        // Suppress duplicate announcements for the
+                        // same version this process lifetime, the
+                        // way C# `_stagedVersion` does.
+                        if this
+                            .last_announced_update
+                            .as_deref()
+                            .map(|v| v == version)
+                            .unwrap_or(false)
+                        {
+                            return;
+                        }
+                        this.last_announced_update = Some(version.clone());
+                        let title: SharedString =
+                            format!("CodeScope {version} available").into();
+                        let detail: SharedString =
+                            format!("A newer release is published. {url}").into();
+                        this.push_notification(
+                            crate::notifications::NotificationKind::Generic,
+                            title,
+                            detail,
+                            None,
+                            cx,
+                        );
+                    });
+                }
+                cx.background_executor()
+                    .timer(codescope_core::update_check::POLL_INTERVAL)
+                    .await;
             }
         })
         .detach();
