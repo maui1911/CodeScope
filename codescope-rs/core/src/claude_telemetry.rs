@@ -600,6 +600,72 @@ impl TranscriptTail {
     }
 }
 
+/// Drop the `claude-` prefix and the `[1m]` extended-context suffix
+/// so the status-bar model column reads `opus-4-7` rather than
+/// `claude-opus-4-7[1m]`. Empty input falls back to "claude" so the
+/// column never goes blank.
+///
+/// This is *not* a parity port of C# `AgentProfile.DisplayName` —
+/// that returns a registry-supplied label like "Claude Code". This
+/// function specifically shortens the JSONL `message.model` id for
+/// the status-bar's right-cluster model slot; the C# build does the
+/// same inline shortening when no agent profile is registered.
+pub fn model_display_name(model: &str) -> String {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return "claude".into();
+    }
+    let stripped = trimmed.strip_prefix("claude-").unwrap_or(trimmed);
+    let bracket = stripped.find('[').unwrap_or(stripped.len());
+    stripped[..bracket].trim_end_matches('-').to_owned()
+}
+
+/// Format a token count for the status bar: raw integer below 10k,
+/// `.1f k` between 10k–100k, `Nk` between 100k–1M, `.2f M` between
+/// 1M–10M, `.1f M` above. Independent thresholds from the C# build
+/// (`MainViewModel.FormatTokens` switches to `k` at 1k); the Rust
+/// version keeps small values raw because session telemetry stays
+/// well under 10k for short Claude sessions and an `8.5k` rendering
+/// reads worse than `8500` at that scale.
+pub fn format_tokens(n: u64) -> String {
+    if n < 10_000 {
+        return n.to_string();
+    }
+    if n < 1_000_000 {
+        let k = n as f64 / 1_000.0;
+        if k < 100.0 {
+            return format!("{k:.1}k");
+        }
+        return format!("{}k", k.round() as u64);
+    }
+    let m = n as f64 / 1_000_000.0;
+    if m < 10.0 {
+        format!("{m:.2}M")
+    } else {
+        format!("{m:.1}M")
+    }
+}
+
+/// Format `0.0..=1.0` as `"0%"` / `"3%"` / `"6.2%"` / `"87%"`.
+/// Mirrors C# `MainViewModel.StatusTokensPercentText` rounding:
+/// integer rounding at and above 10%, otherwise C#'s `0.#` format
+/// (one decimal *only when non-zero*; whole numbers under 10%
+/// drop the trailing `.0`).
+pub fn format_context_pct(pct: f32) -> String {
+    let p = (pct * 100.0).clamp(0.0, 999.0);
+    if p >= 10.0 {
+        return format!("{:.0}%", p.round());
+    }
+    // C#'s `0.#` keeps one decimal only when it isn't zero — i.e.
+    // `6.2%`, `9.9%`, but `7%` (not `7.0%`).
+    let one_dp = (p * 10.0).round() / 10.0;
+    if (one_dp - one_dp.trunc()).abs() < f32::EPSILON {
+        format!("{:.0}%", one_dp)
+    } else {
+        format!("{one_dp:.1}%")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -966,5 +1032,80 @@ mod tests {
             TranscriptTail::format_duration(Duration::from_secs(60)),
             "1:00"
         );
+    }
+
+    // --- model_display_name ---
+
+    #[test]
+    fn model_display_name_strips_claude_prefix_and_bracket_tag() {
+        assert_eq!(model_display_name("claude-opus-4-7[1m]"), "opus-4-7");
+        assert_eq!(model_display_name("claude-sonnet-4-6"), "sonnet-4-6");
+    }
+
+    #[test]
+    fn model_display_name_handles_no_prefix() {
+        assert_eq!(model_display_name("custom-model"), "custom-model");
+    }
+
+    #[test]
+    fn model_display_name_empty_falls_back_to_claude() {
+        assert_eq!(model_display_name(""), "claude");
+        assert_eq!(model_display_name("   "), "claude");
+    }
+
+    // --- format_tokens ---
+
+    #[test]
+    fn format_tokens_under_10k_uses_raw() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(123), "123");
+        assert_eq!(format_tokens(9_999), "9999");
+    }
+
+    #[test]
+    fn format_tokens_10k_to_100k_uses_one_decimal_k() {
+        assert_eq!(format_tokens(10_000), "10.0k");
+        assert_eq!(format_tokens(12_345), "12.3k");
+        assert_eq!(format_tokens(99_999), "100.0k");
+    }
+
+    #[test]
+    fn format_tokens_100k_to_1m_uses_integer_k() {
+        assert_eq!(format_tokens(123_456), "123k");
+        assert_eq!(format_tokens(999_999), "1000k");
+    }
+
+    #[test]
+    fn format_tokens_over_1m_uses_decimal_m() {
+        assert_eq!(format_tokens(1_000_000), "1.00M");
+        assert_eq!(format_tokens(1_234_567), "1.23M");
+        assert_eq!(format_tokens(12_345_678), "12.3M");
+    }
+
+    // --- format_context_pct ---
+
+    #[test]
+    fn format_context_pct_under_10_uses_one_decimal_when_non_zero() {
+        // Whole numbers drop the trailing `.0` (matches C# `0.#`).
+        assert_eq!(format_context_pct(0.0), "0%");
+        assert_eq!(format_context_pct(0.07), "7%");
+        // Non-zero fractional digit keeps one decimal.
+        assert_eq!(format_context_pct(0.062), "6.2%");
+        assert_eq!(format_context_pct(0.099), "9.9%");
+    }
+
+    #[test]
+    fn format_context_pct_at_or_above_10_rounds_to_int() {
+        assert_eq!(format_context_pct(0.1), "10%");
+        assert_eq!(format_context_pct(0.873), "87%");
+        assert_eq!(format_context_pct(0.999), "100%");
+    }
+
+    #[test]
+    fn format_context_pct_clamps_above_one() {
+        // Defensive: TelemetrySnapshot already clamps but the formatter
+        // shouldn't blow up if a caller hands it 1.5.
+        assert_eq!(format_context_pct(1.5), "150%");
+        assert_eq!(format_context_pct(99.0), "999%");
     }
 }
