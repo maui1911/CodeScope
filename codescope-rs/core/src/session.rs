@@ -49,13 +49,16 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 
 use crate::paths::AppPaths;
 use crate::projects::{ProjectsConfig, Session};
+use crate::time::parse_iso8601_secs;
+
+pub use crate::time::now_iso8601;
 
 /// Closed-session retention policy. Mirrors C#
 /// `NoScope.CodeScope.Core.Services.SessionRetentionPolicy`.
@@ -334,7 +337,13 @@ impl SessionManager {
             let mut keep: Vec<Session> = Vec::with_capacity(project.sessions.len());
             // Bucket by worktree_id (None collapses to a single
             // orphan bucket, matching C#'s `s.WorktreeId ?? string.Empty`).
-            let mut buckets: HashMap<String, Vec<Session>> = HashMap::new();
+            // BTreeMap rather than HashMap so iteration is in stable
+            // bucket-key order — without this, two consecutive
+            // soft-closes that hit the cap would re-shuffle
+            // `project.sessions` and write a different `projects.json`
+            // each run, generating noisy diffs and hard-to-reproduce
+            // ordering bugs (Copilot review on PR #114).
+            let mut buckets: BTreeMap<String, Vec<Session>> = BTreeMap::new();
 
             for s in std::mem::take(&mut project.sessions) {
                 let Some(closed_at) = s.closed_at.as_deref() else {
@@ -353,7 +362,7 @@ impl SessionManager {
                 buckets.entry(key).or_default().push(s);
             }
 
-            for (_, mut bucket) in buckets.drain() {
+            for (_, mut bucket) in buckets {
                 if bucket.len() <= RetentionPolicy::MAX_PER_WORKTREE {
                     keep.extend(bucket);
                     continue;
@@ -380,121 +389,10 @@ impl SessionManager {
     }
 }
 
-// ---- timestamp helpers -------------------------------------------
-
-/// Parse the ISO-8601 subset CodeScope writes (`YYYY-MM-DDTHH:MM:SS`
-/// optionally followed by `.fff` and a `Z` or `+00:00` suffix) into
-/// seconds since the Unix epoch.
-///
-/// We only handle UTC because that's what `DateTimeOffset.UtcNow` and
-/// `chrono::Utc::now()` both round-trip. A non-UTC offset returns
-/// `None`, which the retention sweep treats as "leave it alone" —
-/// safer than gambling on the offset's sign.
-fn parse_iso8601_secs(s: &str) -> Option<f64> {
-    // Strip trailing UTC marker.
-    let s = if let Some(stripped) = s.strip_suffix('Z') {
-        stripped
-    } else if let Some(stripped) = s.strip_suffix("+00:00") {
-        stripped
-    } else if let Some(stripped) = s.strip_suffix("-00:00") {
-        stripped
-    } else {
-        // No UTC marker at all — common output from `DateTimeOffset`'s
-        // `o` format string includes the offset; without one we treat
-        // the timestamp as already-UTC (the C# build's
-        // `DateTimeOffset.UtcNow.ToString("o")` always emits one, but
-        // hand-edited fixtures sometimes don't).
-        s
-    };
-
-    let t_pos = s.find('T')?;
-    let (date, time_full) = (&s[..t_pos], &s[t_pos + 1..]);
-
-    let mut date_parts = date.split('-');
-    let year: i64 = date_parts.next()?.parse().ok()?;
-    let month: i64 = date_parts.next()?.parse().ok()?;
-    let day: i64 = date_parts.next()?.parse().ok()?;
-
-    let (hms, frac) = match time_full.find('.') {
-        Some(dot) => (&time_full[..dot], &time_full[dot + 1..]),
-        None => (time_full, ""),
-    };
-    let mut hms_parts = hms.split(':');
-    let hour: i64 = hms_parts.next()?.parse().ok()?;
-    let minute: i64 = hms_parts.next()?.parse().ok()?;
-    let sec: i64 = hms_parts.next()?.parse().ok()?;
-
-    let days = days_since_epoch(year, month, day)?;
-    let mut total = days as f64 * 86_400.0
-        + hour as f64 * 3_600.0
-        + minute as f64 * 60.0
-        + sec as f64;
-    if !frac.is_empty() {
-        let n: f64 = frac.parse().ok()?;
-        total += n / 10f64.powi(frac.len() as i32);
-    }
-    Some(total)
-}
-
-/// Days between 1970-01-01 and the given UTC date — Howard Hinnant's
-/// civil-from-days algorithm
-/// (<https://howardhinnant.github.io/date_algorithms.html>). Kept
-/// local so this module has no cross-module dependency on a private
-/// helper.
-fn days_since_epoch(year: i64, month: i64, day: i64) -> Option<i64> {
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    // Shift Jan/Feb to the previous year so the leap-day always falls
-    // at the end of the adjusted year — Hinnant's formulation expects
-    // months in [3, 14].
-    let y = year - i64::from(month <= 2);
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let m_adj = if month > 2 { month - 3 } else { month + 9 };
-    let doy = (153 * m_adj + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Some(era * 146_097 + doe - 719_468)
-}
-
-/// Format the current UTC wall-clock time the same way C#
-/// `DateTimeOffset.UtcNow.ToString("o")` does — `YYYY-MM-DDTHH:MM:SS.fffffffZ`
-/// — minus the ticks-resolution fractional seconds. Production callers
-/// use this; tests pass fixed strings.
-pub fn now_iso8601() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    iso8601_from_unix_secs(secs)
-}
-
-fn iso8601_from_unix_secs(secs: i64) -> String {
-    let (y, m, d, hh, mm, ss) = unix_secs_to_civil(secs);
-    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
-}
-
-/// Inverse of `days_since_epoch` — Howard Hinnant's algorithm.
-fn unix_secs_to_civil(secs: i64) -> (i64, i64, i64, i64, i64, i64) {
-    let days = secs.div_euclid(86_400);
-    let secs_of_day = secs.rem_euclid(86_400);
-    let hh = secs_of_day / 3_600;
-    let mm = (secs_of_day % 3_600) / 60;
-    let ss = secs_of_day % 60;
-
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d, hh, mm, ss)
-}
+// Timestamp helpers live in [`crate::time`] so [`crate::claude_telemetry`]
+// can share them — both call sites need the same narrow ISO-8601
+// subset and were on the verge of drifting before consolidation
+// (Copilot review on PR #114). [`now_iso8601`] is re-exported above.
 
 /// Convenience: persist `cfg` via the standard
 /// [`ProjectsConfig::save`] path. Wrapped here so future call sites
@@ -508,6 +406,7 @@ pub fn save(cfg: &ProjectsConfig, paths: &AppPaths) -> Result<()> {
 mod tests {
     use super::*;
     use crate::projects::{Project, Session, Worktree};
+    use crate::time::iso8601_from_unix_secs;
 
     fn fixed_now() -> &'static str { "2026-05-10T12:00:00Z" }
 

@@ -263,76 +263,14 @@ fn parse_line(line: &str) -> Option<Entry> {
     })
 }
 
-/// Parse an ISO 8601 timestamp string (e.g. `2026-04-22T08:59:44.811Z`)
-/// into seconds since the Unix epoch as `f64`.
-///
-/// We only handle the subset Claude Code emits: UTC with a `Z` or
-/// `+00:00` suffix, optional sub-second precision. A full RFC 3339
-/// parser would be nicer but would need an extra crate.
+/// Thin re-export of [`crate::time::parse_iso8601_secs`] kept under
+/// the original name so existing call sites and tests don't churn.
+/// The shared helper covers the same Claude-Code ISO-8601 subset
+/// (UTC with `Z` / `+00:00` suffix, optional fractional seconds) and
+/// is also used by [`crate::session`]; collapsing the two avoided
+/// the drift risk Copilot flagged on PR #114.
 fn parse_iso8601(s: &str) -> Option<f64> {
-    // Strip trailing 'Z' or '+00:00' and split at 'T'.
-    let s = s.trim_end_matches('Z').trim_end_matches("+00:00");
-    let t_pos = s.find('T')?;
-    let date = &s[..t_pos];
-    let time = &s[t_pos + 1..];
-
-    let mut parts = date.split('-');
-    let year: i64 = parts.next()?.parse().ok()?;
-    let month: i64 = parts.next()?.parse().ok()?;
-    let day: i64 = parts.next()?.parse().ok()?;
-
-    // Split time on '.' to separate seconds from sub-seconds.
-    let (hms, frac) = if let Some(dot) = time.find('.') {
-        (&time[..dot], &time[dot + 1..])
-    } else {
-        (time, "")
-    };
-
-    let mut parts = hms.split(':');
-    let hour: i64 = parts.next()?.parse().ok()?;
-    let minute: i64 = parts.next()?.parse().ok()?;
-    let sec: i64 = parts.next()?.parse().ok()?;
-
-    // Days since Unix epoch using the proleptic Gregorian calendar.
-    // Algorithm from https://www.tondering.dk/claus/cal/julperiod.php
-    // adjusted for Unix epoch (1970-01-01).
-    let days = days_since_epoch(year, month, day)?;
-
-    let total_secs: f64 = days as f64 * 86_400.0
-        + hour as f64 * 3_600.0
-        + minute as f64 * 60.0
-        + sec as f64;
-
-    // Sub-second fraction.
-    let subsec: f64 = if frac.is_empty() {
-        0.0
-    } else {
-        let n: f64 = frac.parse().ok()?;
-        n / 10f64.powi(frac.len() as i32)
-    };
-
-    Some(total_secs + subsec)
-}
-
-/// Days between 1970-01-01 and the given date (UTC). Returns `None`
-/// for obviously invalid dates.
-fn days_since_epoch(year: i64, month: i64, day: i64) -> Option<i64> {
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    // Shift Jan/Feb to previous year so the leap-day always falls at
-    // the end of the adjusted year.
-    let (y, m) = if month <= 2 {
-        (year - 1, month + 9)
-    } else {
-        (year, month - 3)
-    };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400; // [0, 399]
-    let doy = (153 * m + 2) / 5 + day - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    let jd = era * 146_097 + doe - 719_468; // days since 1970-01-01
-    Some(jd)
+    crate::time::parse_iso8601_secs(s)
 }
 
 // ---------------------------------------------------------------------------
