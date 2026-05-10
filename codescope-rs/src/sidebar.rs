@@ -197,6 +197,16 @@ pub struct Sidebar {
     /// C# build's `WorktreePoller` but adds the richer data the
     /// status bar needs.
     git_status: HashMap<String, GitStatus>,
+    /// Cached "open PR URL for this worktree" lookup, keyed by the
+    /// worktree's absolute path. `None` means a `gh pr list` call has
+    /// already returned "no open PR for this branch" (or the call
+    /// failed) — render that as no row in the menu. A missing key
+    /// means we haven't asked yet; opening the menu kicks off a
+    /// fetch. Mirrors the cached `WorktreeViewModel.PullRequest` slot
+    /// the C# build's `PullRequestStatusPoller` writes into. Cache is
+    /// per-process, in-memory only — no on-disk persistence, since
+    /// the URL can shift if the PR is closed and re-opened.
+    pr_urls: HashMap<String, Option<String>>,
     /// Project ids the user has explicitly collapsed. Projects start
     /// expanded by default; toggling the chevron adds/removes the id
     /// here. Mirrors the C# `TreeViewItem.IsExpanded` state per
@@ -234,6 +244,7 @@ impl Sidebar {
             dialog: None,
             dirty_state: HashMap::new(),
             git_status: HashMap::new(),
+            pr_urls: HashMap::new(),
             collapsed_projects: HashSet::new(),
         }
     }
@@ -628,8 +639,36 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         let Some(project) = self.projects.projects.get(project_idx) else { return };
-        if !project.worktrees.iter().any(|wt| wt.id == worktree_id) {
+        let Some(worktree) = project.worktrees.iter().find(|wt| wt.id == worktree_id) else {
             return;
+        };
+        // Kick off a one-shot `gh pr list` lookup the first time the
+        // user opens the menu for a given worktree path. Subsequent
+        // opens read the cached value — no per-render gh spawns. The
+        // result populates the "Copy PR URL" row, which is hidden
+        // when the cache resolves to `None`.
+        if !self.pr_urls.contains_key(&worktree.path) {
+            if let Some(branch) = worktree.branch.clone() {
+                let path = worktree.path.clone();
+                let path_for_task = std::path::PathBuf::from(&path);
+                let branch_for_task = branch;
+                cx.spawn(async move |this, cx| {
+                    let url = cx
+                        .background_spawn(async move {
+                            codescope_core::pr::detect_pr_url(&path_for_task, &branch_for_task)
+                        })
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.pr_urls.insert(path, url);
+                        cx.notify();
+                    });
+                })
+                .detach();
+            } else {
+                // Detached HEAD or unknown branch — record `None` so we
+                // don't re-spawn on every menu open.
+                self.pr_urls.insert(worktree.path.clone(), None);
+            }
         }
         self.menu = Some(OpenMenu::Worktree { project_idx, worktree_id, position });
         cx.notify();
@@ -731,6 +770,34 @@ impl Sidebar {
             .and_then(|wt| wt.branch.clone());
         if let Some(branch) = branch {
             cx.write_to_clipboard(ClipboardItem::new_string(branch));
+        }
+        self.close_menu(cx);
+    }
+
+    /// Copy the cached PR URL for the worktree to the system
+    /// clipboard, then surface a toast confirming the action. The
+    /// menu row that drives this is gated on the cache holding a
+    /// `Some(url)` value, so this is normally infallible by the time
+    /// it runs — the inner `if let` is defensive against the cache
+    /// being evicted between render and click. Mirrors C#'s
+    /// `SidebarViewModel.CopyPullRequestUrlCommand`.
+    fn copy_worktree_pr_url(
+        &mut self,
+        project_idx: usize,
+        worktree_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let path = self.worktree_path(project_idx, worktree_id);
+        if let Some(path) = path
+            && let Some(Some(url)) = self.pr_urls.get(&path)
+        {
+            let url = url.clone();
+            cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+            cx.emit(SidebarEvent::Toast {
+                kind: ToastSeverity::Ok,
+                title: "PR URL copied".into(),
+                detail: Some(url.into()),
+            });
         }
         self.close_menu(cx);
     }
@@ -2047,6 +2114,28 @@ impl Sidebar {
                     }),
                 )
             }))
+            // "Copy PR URL" — only when the cached `gh pr list` lookup
+            // resolved to an open PR for this worktree's branch. The
+            // fetch is kicked off in `open_worktree_menu` and lands
+            // asynchronously; until then the row stays hidden so a
+            // half-loaded menu doesn't flash an unusable entry.
+            // Mirrors C#'s `wt.HasPullRequest`-gated row.
+            .children(
+                self.pr_urls
+                    .get(&worktree.path)
+                    .and_then(|opt| opt.as_ref())
+                    .map(|_url| {
+                        let id_for_copy_pr = worktree_id.clone();
+                        item(
+                            "wt-menu-copy-pr-url",
+                            "Copy PR URL",
+                            false,
+                            Box::new(move |this, _window, cx| {
+                                this.copy_worktree_pr_url(project_idx, &id_for_copy_pr, cx);
+                            }),
+                        )
+                    }),
+            )
             .child({
                 let id_for_remote = worktree_id.clone();
                 item(

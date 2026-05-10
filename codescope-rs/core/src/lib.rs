@@ -18,6 +18,7 @@ pub mod claude_telemetry;
 pub mod git;
 pub mod layout;
 pub mod paths;
+pub mod pr;
 pub mod projects;
 pub mod settings;
 pub mod theme;
