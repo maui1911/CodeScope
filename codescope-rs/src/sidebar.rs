@@ -1203,7 +1203,13 @@ impl Render for Sidebar {
             // dim row, indented to align with the worktree children
             // that *would* live here.
             if worktrees.is_empty() {
+                // Stable id keyed off the project id (same hash
+                // strategy `project_row` and `wt_row` use) so gpui
+                // can track this placeholder across renders without
+                // confusing it with a real worktree child when the
+                // user adds the project's first worktree.
                 let placeholder = div()
+                    .id(("worktree-placeholder", id_hash(&id)))
                     .h(px(28.0))
                     .flex()
                     .flex_row()
