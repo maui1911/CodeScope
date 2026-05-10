@@ -22,11 +22,15 @@
 //!   model id and context window cap.
 //! * `user.message` — anchors the start of a turn for duration
 //!   accounting. Sets activity to Composing.
-//! * `assistant.turn_start` / `tool.execution_start` — keep activity at
-//!   Composing during multi-tool turns.
+//! * `assistant.turn_start` — flips activity back to Composing if the
+//!   agent had been waiting on a tool result (i.e. exiting
+//!   PendingToolUse).
 //! * `assistant.message` — bumps the turn counter when it carries
 //!   `outputTokens > 0`. `toolRequests: [...]` flips activity to
 //!   PendingToolUse.
+//! * `tool.execution_start` — bookkeeping ping; activity stays at
+//!   PendingToolUse (the next state transition is driven by
+//!   `tool.execution_complete` or `assistant.turn_start`).
 //! * `tool.execution_complete` — back to Composing while the agent
 //!   resumes streaming.
 //! * `assistant.turn_end` / `session.shutdown` — Idle.
@@ -262,7 +266,18 @@ pub fn process_new_lines(
     }
 
     if clean_eof {
-        tail.last_pos = file_len;
+        // Use the reader's stream position rather than the pre-read
+        // `file_len`. Append-only logs can grow during the read — if
+        // the writer landed extra bytes between our `metadata()` stat
+        // and the BufReader hitting EOF, those bytes were already
+        // parsed into the snapshot. Pinning `last_pos` to `file_len`
+        // would re-read them next poll and double-bump turn counters.
+        // Mirrors C# `CopilotTelemetryService.TryRead`'s `fs.Position`.
+        let advanced_to = reader
+            .stream_position()
+            .unwrap_or(file_len)
+            .max(file_len);
+        tail.last_pos = advanced_to;
         tail.last_mtime = meta.modified().ok();
     }
 
@@ -614,6 +629,48 @@ mod tests {
         let changed = process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts);
         assert!(!changed);
         assert!(snap.is_none());
+    }
+
+    /// `last_pos` advances to the reader's actual stream position, not
+    /// the pre-read `metadata.len()`. This matters for append-only logs
+    /// that can grow during the read: pinning to the stale `file_len`
+    /// would re-read (and double-count) bytes that were already parsed.
+    #[test]
+    fn cursor_advances_past_pre_read_file_len_when_log_grew_during_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("events.jsonl");
+        // Two valid events written in one go — by the time
+        // `process_new_lines` snaps the file length and starts reading,
+        // the file is already at its full length, so `last_pos` should
+        // land at end-of-file. The previous bug was that `last_pos`
+        // could lag behind in that case; this test pins down the new
+        // contract: cursor lands at >= file_len, never below.
+        write_lines(
+            &path,
+            &[
+                r#"{"type":"user.message","timestamp":"2026-04-22T08:00:00Z","data":{"text":"a"}}"#,
+                r#"{"type":"assistant.message","timestamp":"2026-04-22T08:00:01Z","data":{"outputTokens":1}}"#,
+            ],
+        );
+        let len = std::fs::metadata(&path).unwrap().len();
+
+        let mut tail = FileTail::default();
+        let mut snap: Option<TelemetrySnapshot> = None;
+        let mut last_user_ts = None;
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts);
+
+        assert!(
+            tail.last_pos >= len,
+            "last_pos {} should be >= file_len {}",
+            tail.last_pos,
+            len
+        );
+        assert_eq!(snap.as_ref().unwrap().turn_count, 1);
+
+        // No new bytes — re-poll must be a no-op (idle-tick).
+        let changed = process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts);
+        assert!(!changed);
+        assert_eq!(snap.unwrap().turn_count, 1);
     }
 
     /// Read errors must leave `last_pos` unchanged so the next poll
