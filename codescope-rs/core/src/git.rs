@@ -257,6 +257,34 @@ pub fn remove_worktree(repo: &Path, path: &Path, force: bool) -> Result<()> {
     run_git(repo, &args).map(|_| ())
 }
 
+/// Compute the short right-aligned status slug shown on a sidebar
+/// worktree row.  Mirrors C# `WorktreeViewModel.StatusLabel`; the
+/// `busy` (active agent) and `ci!` (failing PR CI) cases the C#
+/// build supports aren't included here yet — the Rust port has no
+/// per-tab session model and no PR integration. Returns:
+///
+/// * `"chg"` — working tree is dirty (numstat or untracked-only),
+/// * `"↑N"` / `"↓N"` / `"↑N ↓N"` — clean but out of sync,
+/// * `"idle"` — clean and in sync with upstream,
+/// * `""`     — no upstream and not dirty (the C# build still
+///              shows "idle"; we hide the label so a brand-new
+///              standalone branch doesn't claim sync state).
+pub fn worktree_status_label(status: &GitStatus) -> String {
+    if status.added > 0 || status.removed > 0 || status.has_changes {
+        return "chg".into();
+    }
+    if status.has_upstream {
+        match (status.ahead, status.behind) {
+            (0, 0) => "idle".into(),
+            (a, 0) => format!("\u{2191}{a}"),
+            (0, b) => format!("\u{2193}{b}"),
+            (a, b) => format!("\u{2191}{a} \u{2193}{b}"),
+        }
+    } else {
+        String::new()
+    }
+}
+
 /// Snapshot of a worktree's git state at a point in time.
 /// Produced by [`git_status`] and cached by the sidebar poller.
 /// Mirrors the data the C# build's `WorktreePoller` gathers per
@@ -1050,5 +1078,74 @@ some-future-field foo bar\n";
             "missing path should return None, got {:?}",
             result
         );
+    }
+
+    // --- worktree_status_label ---
+
+    fn status(
+        added: u32,
+        removed: u32,
+        has_changes: bool,
+        ahead: u32,
+        behind: u32,
+        has_upstream: bool,
+    ) -> GitStatus {
+        GitStatus {
+            branch: "main".into(),
+            added,
+            removed,
+            has_changes,
+            ahead,
+            behind,
+            has_upstream,
+        }
+    }
+
+    #[test]
+    fn status_label_clean_in_sync_is_idle() {
+        let s = status(0, 0, false, 0, 0, true);
+        assert_eq!(worktree_status_label(&s), "idle");
+    }
+
+    #[test]
+    fn status_label_dirty_with_numstat_is_chg() {
+        let s = status(3, 1, false, 0, 0, true);
+        assert_eq!(worktree_status_label(&s), "chg");
+    }
+
+    #[test]
+    fn status_label_untracked_only_is_chg() {
+        let s = status(0, 0, true, 0, 0, true);
+        assert_eq!(worktree_status_label(&s), "chg");
+    }
+
+    #[test]
+    fn status_label_ahead_only() {
+        let s = status(0, 0, false, 3, 0, true);
+        assert_eq!(worktree_status_label(&s), "\u{2191}3");
+    }
+
+    #[test]
+    fn status_label_behind_only() {
+        let s = status(0, 0, false, 0, 5, true);
+        assert_eq!(worktree_status_label(&s), "\u{2193}5");
+    }
+
+    #[test]
+    fn status_label_both_ahead_and_behind() {
+        let s = status(0, 0, false, 2, 7, true);
+        assert_eq!(worktree_status_label(&s), "\u{2191}2 \u{2193}7");
+    }
+
+    #[test]
+    fn status_label_no_upstream_is_blank_when_clean() {
+        let s = status(0, 0, false, 0, 0, false);
+        assert_eq!(worktree_status_label(&s), "");
+    }
+
+    #[test]
+    fn status_label_dirty_wins_over_no_upstream() {
+        let s = status(1, 0, false, 0, 0, false);
+        assert_eq!(worktree_status_label(&s), "chg");
     }
 }
