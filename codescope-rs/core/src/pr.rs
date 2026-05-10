@@ -3,12 +3,11 @@
 //! Shells out to `gh pr list --head <branch> --state open --json url
 //! --limit 1` and returns the first PR's URL (or `None` if no open PR
 //! is associated with the branch). Mirrors the C# build's
-//! [`GitHubPullRequestService.GetOpenPrForBranchAsync`] — we keep the
-//! `--state open` filter and the `--limit 1` cap so the invocation is
-//! identical, but parse the JSON ourselves rather than relying on the
-//! local `jq` binary (gh ships its own `--jq` evaluator, but JSON
-//! parsing in pure Rust is small enough that we'd rather not depend on
-//! external eval semantics for a single field).
+//! [`GitHubPullRequestService.GetOpenPrForBranchAsync`] — same `gh`
+//! invocation shape (`--state open`, `--limit 1`), parsed with
+//! `serde_json` rather than relying on a local `jq` (gh's bundled
+//! `--jq` would also work, but routing the result through the same
+//! parser the rest of `core` uses keeps error handling consistent).
 //!
 //! Caching: this module is intentionally stateless — callers (the
 //! sidebar) own the cache. The C# build polls every 30 s with
@@ -21,6 +20,13 @@
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct GhPrRow {
+    url: String,
+}
 
 /// Look up the open pull request URL for `branch` in the repo at
 /// `working_dir`. Returns `None` when no open PR is associated, when
@@ -55,40 +61,23 @@ pub fn detect_pr_url(working_dir: &Path, branch: &str) -> Option<String> {
 }
 
 /// Parse the output of `gh pr list --json url --limit 1`. The shape
-/// is a JSON array — empty when there's no PR, otherwise objects with
-/// a `"url"` string field. We parse the first entry by hand to avoid
-/// pulling `serde_json` into `core` for one tiny use site.
-///
-/// Returns the URL string on success, `None` otherwise. Tolerant of
-/// trailing whitespace and CRLF — gh on Windows occasionally emits
-/// CRLF in piped output.
+/// is a JSON array of `{ "url": "<string>" }`; we deserialise the
+/// first row and return its URL. Empty arrays / missing url / parse
+/// errors all collapse to `None` so the caller can render "no row"
+/// without branching on the failure mode.
 pub(crate) fn parse_pr_url_json(stdout: &str) -> Option<String> {
     let trimmed = stdout.trim();
-    if trimmed.is_empty() || trimmed == "[]" {
+    if trimmed.is_empty() {
         return None;
     }
-    // We expect `[{"url":"https://github.com/owner/repo/pull/42"}]`.
-    // Find the first `"url"` key, then the next `"…"` value after the
-    // colon. This is dumb-but-safe: gh's `--json url` emits exactly
-    // one field per row, so there's no ambiguity with nested objects.
-    let key_idx = trimmed.find("\"url\"")?;
-    let after_key = &trimmed[key_idx + "\"url\"".len()..];
-    let colon_idx = after_key.find(':')?;
-    let after_colon = after_key[colon_idx + 1..].trim_start();
-    let rest = after_colon.strip_prefix('"')?;
-    let end = rest.find('"')?;
-    let url = &rest[..end];
-    if url.is_empty() {
-        None
-    } else {
-        Some(url.to_owned())
-    }
+    let rows: Vec<GhPrRow> = serde_json::from_str(trimmed).ok()?;
+    let url = rows.into_iter().next()?.url;
+    if url.is_empty() { None } else { Some(url) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn parse_typical_gh_output() {
@@ -137,34 +126,51 @@ mod tests {
     }
 
     #[test]
+    fn parse_invalid_json_returns_none() {
+        // gh shouldn't ever emit garbage, but a half-printed buffer
+        // (e.g. SIGPIPE on the stream) shouldn't panic the UI.
+        assert_eq!(parse_pr_url_json("not json"), None);
+        assert_eq!(parse_pr_url_json("[{"), None);
+    }
+
+    #[test]
+    fn parse_url_with_escaped_chars() {
+        // Real PRs don't have escapes in the URL, but `serde_json`
+        // handling them correctly (vs the previous manual substring
+        // parser, which would have stopped at the first `"`) is the
+        // safer behaviour to lock in.
+        let json = "[{\"url\":\"https://example.com/a\\u0026b\"}]";
+        assert_eq!(
+            parse_pr_url_json(json).as_deref(),
+            Some("https://example.com/a&b")
+        );
+    }
+
+    #[test]
     fn detect_rejects_dash_prefixed_branch() {
         // Security: `--state` must not be reinterpreted as a flag.
         // We can't easily intercept the spawn, but the function
         // returns None up-front without spawning gh.
-        let result = detect_pr_url(&PathBuf::from("."), "--state");
+        let result = detect_pr_url(std::path::Path::new("."), "--state");
         assert!(result.is_none());
     }
 
     #[test]
     fn detect_rejects_empty_branch() {
-        let result = detect_pr_url(&PathBuf::from("."), "");
+        let result = detect_pr_url(std::path::Path::new("."), "");
         assert!(result.is_none());
     }
 
     #[test]
-    fn detect_returns_none_when_gh_missing() {
-        // We intentionally don't gate this test on `gh` being absent —
-        // if gh *is* installed, the call below still returns None
-        // because the temp dir isn't a git repo. Either way the
-        // contract holds: "no PR" / "no gh" / "no repo" all collapse
-        // to None.
-        let temp = std::env::temp_dir().join(format!(
-            "codescope_pr_test_{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&temp).expect("create temp dir");
-        let result = detect_pr_url(&temp, "no-such-branch-xyz");
-        let _ = std::fs::remove_dir_all(&temp);
+    fn detect_returns_none_when_gh_missing_or_no_repo() {
+        // Use `tempfile::tempdir()` so the directory cleans up even
+        // if the assertion below fires unexpectedly. We don't gate
+        // the test on `gh` being absent — if gh *is* installed, the
+        // call still returns None because the temp dir isn't a git
+        // repo. Either way the contract holds: "no PR" / "no gh" /
+        // "no repo" all collapse to None.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let result = detect_pr_url(temp.path(), "no-such-branch-xyz");
         assert!(result.is_none());
     }
 }
