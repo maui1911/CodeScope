@@ -15,6 +15,7 @@
 
 pub mod claude_discovery;
 pub mod claude_telemetry;
+pub mod copilot_telemetry;
 pub mod crash_log;
 pub mod git;
 pub mod layout;
