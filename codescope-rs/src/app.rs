@@ -424,15 +424,17 @@ pub struct AppShell {
     /// `telemetry_for(session_id)` exposes the latest snapshot without
     /// taking a mutable reference.
     telemetry_tails: HashMap<String, codescope_core::TranscriptTail>,
-    /// Window-coordinate anchor captured from the last bell-button
-    /// click. Used by `render_notifications_popover` to position the
-    /// popover above the bell via `gpui::anchored().position(...)`,
-    /// mirroring the C# `BellPopup` `PlacementTarget=BellButton`
-    /// `Placement=Top` `VerticalOffset=-6` rule. `None` until the
-    /// user has clicked the bell at least once; the popover falls
-    /// back to a window-corner anchor in that case so it never
-    /// renders at (0, 0).
-    bell_anchor: Option<gpui::Point<gpui::Pixels>>,
+    /// Window-coordinate bounds of the bell button as recorded by the
+    /// `canvas` overlay child during the most recent layout pass.
+    /// Used by `render_notifications_popover` to position the popover
+    /// above the bell via `gpui::anchored().position(...)`, mirroring
+    /// the C# `BellPopup` `PlacementTarget=BellButton`,
+    /// `Placement=Top`, `VerticalOffset=-6` rule. `None` until the
+    /// status bar has rendered at least once; the popover falls back
+    /// to a window-corner anchor in that case so it never renders at
+    /// (0, 0). Refreshed every frame, so window resizes / status-bar
+    /// reflows track the popover automatically.
+    bell_bounds: Option<gpui::Bounds<gpui::Pixels>>,
 }
 
 impl AppShell {
@@ -732,7 +734,7 @@ impl AppShell {
             last_titlebar_press_at: None,
             notifications: crate::notifications::Notifications::new(),
             telemetry_tails: HashMap::new(),
-            bell_anchor: None,
+            bell_bounds: None,
         };
         shell.start_telemetry_poll(cx);
         shell.start_claude_discovery_poll(cx);
@@ -1961,23 +1963,18 @@ impl AppShell {
 
         // Mirror the C# `BellPopup` anchor:
         // `PlacementTarget=BellButton`, `Placement=Top`,
-        // `VerticalOffset=-6`. In gpui we anchor the popover's
-        // `BottomRight` corner to a point at the bell button's
-        // top-right edge minus the 6 px gap. The bell button is
-        // 22×22 (see `bell_btn` above) and `bell_anchor` records
-        // the click position, which lands inside the button — we
-        // treat it as the button centre and offset by half the
-        // button width / height to derive the top-right corner.
+        // `VerticalOffset=-6`. The bell button's window-space rect
+        // is recorded each frame by the `canvas` overlay attached to
+        // `bell_btn`, so `bell_bounds.top_right()` is the button's
+        // actual top-right corner regardless of layout. We move that
+        // point up by 6 px and anchor the popover's `BottomRight`
+        // corner there.
         //
-        // If `bell_anchor` is `None` (popover opened by some path
-        // other than a bell click — defensive only, the toggle is
-        // bell-only today) we fall back to a window-corner anchor
-        // so the popover never renders at (0, 0).
-        const BELL_HALF_W: f32 = 11.0;
-        const BELL_HALF_H: f32 = 11.0;
+        // `bell_bounds` is `None` for the very first render before
+        // the canvas has had a chance to lay out; we fall back to a
+        // window-corner snap in that case so the popover never
+        // renders at (0, 0).
         const POPOVER_GAP_PX: f32 = 6.0;
-        // Window-edge inset used by both the anchored and the
-        // fallback path so the popover never kisses the right edge.
         const SNAP_MARGIN_PX: f32 = 8.0;
         let snap_edges = gpui::Edges {
             top: px(SNAP_MARGIN_PX),
@@ -1985,13 +1982,11 @@ impl AppShell {
             bottom: px(SNAP_MARGIN_PX),
             left: px(SNAP_MARGIN_PX),
         };
-        let anchored = if let Some(click) = self.bell_anchor {
-            // Top-right of the bell button, then move up by the
-            // 6 px C# `VerticalOffset` so the popover bottom edge
-            // sits 6 px above the bell.
+        let anchored = if let Some(bell) = self.bell_bounds {
+            let top_right = bell.top_right();
             let anchor_point = gpui::point(
-                click.x + px(BELL_HALF_W),
-                click.y - px(BELL_HALF_H) - px(POPOVER_GAP_PX),
+                top_right.x,
+                top_right.y - px(POPOVER_GAP_PX),
             );
             gpui::anchored()
                 .position(anchor_point)
@@ -2465,21 +2460,37 @@ impl AppShell {
             .hover(move |s| s.bg(gpui::Hsla { h: 0.0, s: 0.0, l: 1.0, a: 0.08 }))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
-                    // Capture the click position in window coordinates
-                    // so the popover can anchor relative to the bell
-                    // button instead of snapping above the status bar
-                    // with a hard-coded edge offset. The bell button
-                    // is 22×22, centred on the click; we treat the
-                    // click point as ~the button centre and let the
-                    // popover render compute the actual anchor (top
-                    // edge of the bell, with the C# `VerticalOffset=
-                    // -6` gap baked in).
-                    this.bell_anchor = Some(event.position);
+                cx.listener(|this, _, _, cx| {
                     this.notifications.toggle();
                     cx.notify();
                 }),
             )
+            // Invisible `canvas` child stretched to the bell's hit area
+            // — its prepaint callback receives the bell button's
+            // window-space `Bounds<Pixels>` and stashes them on the
+            // entity so `render_notifications_popover` can anchor to
+            // the actual button rect. Updates every frame, so resizes
+            // / status-bar reflows keep the popover stuck to the
+            // bell. `pointer-events: none` (no listeners on the
+            // canvas itself) so it doesn't shadow the bell's click.
+            .child({
+                let entity = cx.entity();
+                gpui::canvas(
+                    move |bounds, _window, cx| {
+                        entity.update(cx, |this, _cx| {
+                            // Avoid re-notifying when the bounds are
+                            // unchanged — prepaint runs every frame
+                            // and we don't want a render loop.
+                            if this.bell_bounds != Some(bounds) {
+                                this.bell_bounds = Some(bounds);
+                            }
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full()
+            })
             // Bell glyph — fall back to a unicode symbol since we don't
             // ship vector icons. The C# uses an SVG path; the unicode
             // bell ringer (U+1F514) is a close visual stand-in at this
