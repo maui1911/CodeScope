@@ -1150,12 +1150,12 @@ impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme.clone();
         let selected = self.selected;
-        // Snapshot project + non-primary worktree metadata up front so
-        // each row's `cx.listener` closure can hold owned values
-        // without overlapping the immutable borrow `iter()` would
-        // otherwise extend across the rest of `render`. Primary
-        // worktrees are implicit at `Project::path`; we only emit
-        // child rows for the extras.
+        // Snapshot project + worktree metadata (every worktree,
+        // primary included — see the per-project comment below for
+        // why) up front so each row's `cx.listener` closure can hold
+        // owned values without overlapping the immutable borrow
+        // `iter()` would otherwise extend across the rest of
+        // `render`.
         let rows: Vec<(usize, String, SharedString, String, Vec<WorktreeRowData>)> = self
             .projects
             .projects
@@ -1416,8 +1416,13 @@ impl Render for Sidebar {
                     Some(false) => theme::status_clean(&theme),
                     None => theme::ink_ghost(&theme),
                 };
+                // Element id is keyed off `(project.id, worktree.id)`
+                // so primary rows from different projects (which all
+                // share `wt.id == "primary"`) don't collide in gpui's
+                // id-based element reuse table.
+                let wt_row_id = format!("{}/{}", id, wt.id);
                 let wt_row = div()
-                    .id(("worktree", id_hash(&wt.id)))
+                    .id(("worktree", id_hash(&wt_row_id)))
                     .h(px(28.0))
                     .flex()
                     .flex_row()

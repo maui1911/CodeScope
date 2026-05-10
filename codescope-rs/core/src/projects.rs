@@ -47,7 +47,11 @@ pub struct Project {
     /// Sessions persisted across restarts.
     #[serde(default)]
     pub sessions: Vec<Session>,
-    /// Tracked worktrees. The primary worktree at `path` is implicit.
+    /// Tracked worktrees. Includes the primary worktree at `path`
+    /// (the one with `is_primary: true`) as an explicit row;
+    /// `Project::new` seeds it on creation, and
+    /// [`ProjectsConfig::migrate`] back-fills it for legacy configs
+    /// that don't have one yet.
     #[serde(default)]
     pub worktrees: Vec<Worktree>,
 }
@@ -102,9 +106,12 @@ impl Project {
     }
 }
 
-/// One git worktree under a [`Project`]. Every project has an
-/// implicit primary worktree at `Project::path`; additional ones live
-/// here and get `is_primary = false`.
+/// One git worktree under a [`Project`]. Every project carries an
+/// explicit primary row (`is_primary: true`) pointing at
+/// `Project::path` plus zero or more additional worktrees with
+/// `is_primary: false`. The primary row is seeded by `Project::new`
+/// and back-filled by [`ProjectsConfig::migrate`] for legacy
+/// configs that predate that rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Worktree {
@@ -190,22 +197,35 @@ impl ProjectsConfig {
     /// C# `ProjectStore.Migrate`.
     ///
     /// **Rule 1 — primary worktree synthesis.** Every project with a
-    /// non-empty `path` and an empty `worktrees` list gets a synthetic
-    /// `Worktree { id: "primary", path, is_primary: true, branch: None }`.
-    /// Without this, the sidebar's worktree row loop skips the primary
-    /// checkout and a project added via `Project::new` (which seeds
-    /// `worktrees: Vec::new()`) renders as if it had no checkouts at
-    /// all, hiding the branch the user is actually on. The
-    /// `WorktreeStatusPoller` fills in the branch on its first tick.
+    /// non-empty `path` and *no* worktree marked `is_primary: true`
+    /// gets a synthetic `Worktree { id: "primary", path,
+    /// is_primary: true, branch: None }`. Without this, the sidebar
+    /// can't render a row for the project's own checkout and the
+    /// branch the user is currently on stays invisible.
+    ///
+    /// We key on the `is_primary` flag rather than "list is empty"
+    /// because legacy `projects.json` files written by the Rust UI
+    /// before this rule landed could have one or more *non-primary*
+    /// rows added later but still no primary entry — hitting only
+    /// the empty-list case would leave those projects in the broken
+    /// state. The `WorktreeStatusPoller` fills in the branch on its
+    /// first tick.
     pub fn migrate(&mut self) {
         for p in &mut self.projects {
-            if p.worktrees.is_empty() && !p.path.is_empty() {
-                p.worktrees.push(Worktree {
-                    id: "primary".to_owned(),
-                    path: p.path.clone(),
-                    branch: None,
-                    is_primary: true,
-                });
+            if p.path.is_empty() {
+                continue;
+            }
+            let has_primary = p.worktrees.iter().any(|wt| wt.is_primary);
+            if !has_primary {
+                p.worktrees.insert(
+                    0,
+                    Worktree {
+                        id: "primary".to_owned(),
+                        path: p.path.clone(),
+                        branch: None,
+                        is_primary: true,
+                    },
+                );
             }
         }
     }
@@ -329,6 +349,44 @@ mod tests {
         assert!(p.worktrees[0].is_primary);
         assert_eq!(p.worktrees[0].path, "C:\\repos\\repo");
         assert_eq!(p.worktrees[0].id, "primary");
+    }
+
+    #[test]
+    fn migrate_back_fills_primary_when_only_secondary_worktrees_exist() {
+        // Legacy projects.json from a Rust UI that had no
+        // primary-seeding rule but did support adding secondary
+        // worktrees via "New worktree from branch…". The user could
+        // end up with a project that has secondaries but no primary,
+        // which the original empty-list-only migration would skip.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "version": 1,
+              "projects": [
+                {
+                  "id": "p1",
+                  "name": "Repo",
+                  "path": "C:\\repos\\repo",
+                  "defaultBranch": "main",
+                  "worktrees": [
+                    { "id": "feat-x", "path": "C:\\repos\\repo.worktrees\\feat-x", "branch": "feat/x", "isPrimary": false }
+                  ]
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let cfg = ProjectsConfig::load_from(&path).unwrap();
+        let p = &cfg.projects[0];
+        assert_eq!(p.worktrees.len(), 2, "primary back-filled in addition to existing secondary");
+        assert!(p.worktrees[0].is_primary, "primary inserted at index 0");
+        assert_eq!(p.worktrees[0].id, "primary");
+        assert_eq!(p.worktrees[0].path, "C:\\repos\\repo");
+        assert!(!p.worktrees[1].is_primary, "secondary preserved");
+        assert_eq!(p.worktrees[1].id, "feat-x");
     }
 
     #[test]
