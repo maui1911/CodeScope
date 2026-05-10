@@ -1197,6 +1197,30 @@ impl Render for Sidebar {
                 .child(div().flex_grow().truncate().child(name));
             project_and_worktree_rows.push(project_row.into_any_element());
 
+            // Empty-state placeholder when a project has no non-primary
+            // worktrees. Mirrors the `(no worktrees)` row C# renders
+            // under an expanded project with empty `Worktrees`. Single
+            // dim row, indented to align with the worktree children
+            // that *would* live here.
+            if worktrees.is_empty() {
+                // Stable id keyed off the project id (same hash
+                // strategy `project_row` and `wt_row` use) so gpui
+                // can track this placeholder across renders without
+                // confusing it with a real worktree child when the
+                // user adds the project's first worktree.
+                let placeholder = div()
+                    .id(("worktree-placeholder", id_hash(&id)))
+                    .h(px(28.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .pl(px(34.0))
+                    .pr_3()
+                    .text_color(theme::ink_ghost(&theme))
+                    .text_size(px(11.5))
+                    .child("(no worktrees)");
+                project_and_worktree_rows.push(placeholder.into_any_element());
+            }
             // Non-primary worktree rows. Indented to make the parent /
             // child relationship obvious; click emits `OpenSession`
             // which the AppShell catches to spawn a tab pinned to the
