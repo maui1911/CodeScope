@@ -153,18 +153,37 @@ fn read_yaml_cwd(path: &Path) -> Option<String> {
 }
 
 /// Peek `events.jsonl` for the first `session.start` event and return
-/// its `data.context.cwd`. Mirrors C# `CopilotSessionDiscovery.CwdMatchesFromEvents`.
+/// its `data.context.cwd`. Mirrors C# `CopilotSessionDiscovery.CwdMatchesFromEvents`,
+/// which skips malformed/non-`session.start` lines while peeking the
+/// first few records (a partial / garbled line landing before the
+/// real `session.start` is rare but does happen during a save race
+/// and shouldn't poison adoption).
+///
+/// Bounded to the first [`MAX_HEADER_LINES`] lines so a corrupt or
+/// arbitrarily-large file can't turn this peek into a full file
+/// scan.
 fn read_session_start_cwd(path: &Path) -> Option<String> {
     use std::io::{BufRead, BufReader};
+    const MAX_HEADER_LINES: usize = 5;
     let file = std::fs::File::open(path).ok()?;
     let reader = BufReader::new(file);
+    let mut inspected = 0usize;
     for line in reader.lines() {
         let Ok(line) = line else { return None };
         if line.trim().is_empty() {
             continue;
         }
-        let v: serde_json::Value = serde_json::from_str(&line).ok()?;
-        let obj = v.as_object()?;
+        inspected += 1;
+        if inspected > MAX_HEADER_LINES {
+            return None;
+        }
+        let v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            // Skip a partial / garbled line and keep peeking — same
+            // posture as the C# `try { ParseLine } catch { continue }`.
+            Err(_) => continue,
+        };
+        let Some(obj) = v.as_object() else { continue };
         if obj.get("type").and_then(serde_json::Value::as_str) != Some("session.start") {
             continue;
         }
@@ -244,6 +263,26 @@ mod tests {
         std::fs::write(
             session_dir.join("events.jsonl"),
             br#"{"type":"session.start","timestamp":"2026-04-22T08:00:00Z","data":{"sessionId":"x","selectedModel":"gpt-5","context":{"cwd":"C:/dev/x"}}}
+"#,
+        )
+        .unwrap();
+
+        let res = scan(tmp.path(), "C:/dev/x", SystemTime::UNIX_EPOCH);
+        assert_eq!(res.len(), 1, "got {res:?}");
+    }
+
+    #[test]
+    fn events_jsonl_peek_skips_garbled_first_line() {
+        // A partial line landing before the real `session.start`
+        // shouldn't poison adoption — mirrors C# `try { ParseLine }
+        // catch { continue }` posture.
+        let tmp = TempDir::new().unwrap();
+        let session_dir = tmp.path().join(SID_A);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("events.jsonl"),
+            br#"{"type":"sessio
+{"type":"session.start","timestamp":"2026-04-22T08:00:00Z","data":{"sessionId":"x","selectedModel":"gpt-5","context":{"cwd":"C:/dev/x"}}}
 "#,
         )
         .unwrap();
