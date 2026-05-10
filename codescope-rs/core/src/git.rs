@@ -177,6 +177,23 @@ pub fn fetch_all_prune(repo: &Path) -> Result<()> {
     run_git(repo, &["fetch", "--all", "--prune"]).map(|_| ())
 }
 
+/// `git rebase <base_ref>` against the worktree at `repo`. Mirrors
+/// the C# `GitService.RebaseOntoAsync` — the bare `git rebase` form
+/// rather than `--onto`, because the C# build uses the simpler
+/// "replay current branch on top of `<base_ref>`" semantics for the
+/// "Rebase onto origin/<default>…" sidebar action.
+///
+/// Returns the trimmed stdout on success (commit summary lines that
+/// can surface in a toast). Failures usually mean conflicts the user
+/// has to resolve manually in the worktree — the caller surfaces the
+/// stderr verbatim because that's where git puts the conflict
+/// breadcrumbs.
+pub fn rebase_onto(repo: &Path, base_ref: &str) -> Result<String> {
+    let output = run_git(repo, &["rebase", base_ref])?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(stdout)
+}
+
 /// `git config --get remote.origin.url`. Returns the trimmed URL
 /// string, or `Ok(None)` when the remote isn't configured. Other
 /// failure modes (not a git repo, unreadable config, …) bubble up
