@@ -61,6 +61,12 @@ use crate::sidebar::{
 };
 use crate::theme;
 
+/// Pixel height of the bottom status bar. Shared between
+/// `render_status_bar` (the actual bar's `h(...)`) and
+/// `render_notifications_popover` (first-frame fallback bottom inset
+/// when the bell button's bounds haven't been recorded yet).
+const STATUS_BAR_HEIGHT_PX: f32 = 32.0;
+
 /// How often the window-state debounce loop wakes up to check whether
 /// the latest pending save has been stable long enough.
 const WINDOW_SAVE_POLL: Duration = Duration::from_millis(150);
@@ -424,6 +430,17 @@ pub struct AppShell {
     /// `telemetry_for(session_id)` exposes the latest snapshot without
     /// taking a mutable reference.
     telemetry_tails: HashMap<String, codescope_core::TranscriptTail>,
+    /// Window-coordinate bounds of the bell button as recorded by the
+    /// `canvas` overlay child during the most recent layout pass.
+    /// Used by `render_notifications_popover` to position the popover
+    /// above the bell via `gpui::anchored().position(...)`, mirroring
+    /// the C# `BellPopup` `PlacementTarget=BellButton`,
+    /// `Placement=Top`, `VerticalOffset=-6` rule. `None` until the
+    /// status bar has rendered at least once; the popover falls back
+    /// to a window-corner anchor in that case so it never renders at
+    /// (0, 0). Refreshed every frame, so window resizes / status-bar
+    /// reflows track the popover automatically.
+    bell_bounds: Option<gpui::Bounds<gpui::Pixels>>,
 }
 
 impl AppShell {
@@ -723,6 +740,7 @@ impl AppShell {
             last_titlebar_press_at: None,
             notifications: crate::notifications::Notifications::new(),
             telemetry_tails: HashMap::new(),
+            bell_bounds: None,
         };
         shell.start_telemetry_poll(cx);
         shell.start_claude_discovery_poll(cx);
@@ -1949,36 +1967,56 @@ impl AppShell {
             .child(body)
             .child(footer);
 
-        // The C# `BellPopup` anchors to the bell button itself
-        // (`PlacementTarget=BellButton`, `Placement=Top`,
-        // `VerticalOffset=-6`). We don't have the bell button yet
-        // (lands with the integrating PR), but we can already snap
-        // above the status bar so the popover doesn't overlap it.
-        // Bottom margin = status-bar height (32 px) + the XAML's
-        // -6 offset, expressed as a positive bottom edge so
-        // `snap_to_window_with_margin` keeps the panel clear of
-        // the bar. Once the bell button exists the integrating PR
-        // will swap this to an `anchored().position(button_rect)`
-        // call so the popover tracks the button's actual screen
-        // position.
-        const STATUS_BAR_HEIGHT_PX: f32 = 32.0;
-        const POPOVER_BOTTOM_GAP_PX: f32 = 6.0;
-        let edges = gpui::Edges {
-            top: px(8.0),
-            right: px(8.0),
-            bottom: px(STATUS_BAR_HEIGHT_PX + POPOVER_BOTTOM_GAP_PX),
-            left: px(8.0),
+        // Mirror the C# `BellPopup` anchor:
+        // `PlacementTarget=BellButton`, `Placement=Top`,
+        // `VerticalOffset=-6`. The bell button's window-space rect
+        // is recorded each frame by the `canvas` overlay attached to
+        // `bell_btn`, so `bell_bounds.top_right()` is the button's
+        // actual top-right corner regardless of layout. We move that
+        // point up by 6 px and anchor the popover's `BottomRight`
+        // corner there.
+        //
+        // `bell_bounds` is `None` for the very first render before
+        // the canvas has had a chance to lay out; we fall back to a
+        // window-corner snap in that case so the popover never
+        // renders at (0, 0).
+        const POPOVER_GAP_PX: f32 = 6.0;
+        const SNAP_MARGIN_PX: f32 = 8.0;
+        let snap_edges = gpui::Edges {
+            top: px(SNAP_MARGIN_PX),
+            right: px(SNAP_MARGIN_PX),
+            bottom: px(SNAP_MARGIN_PX),
+            left: px(SNAP_MARGIN_PX),
         };
-        Some(
-            gpui::deferred(
-                gpui::anchored()
-                    .position(gpui::point(px(0.0), px(0.0)))
-                    .anchor(gpui::Corner::BottomRight)
-                    .snap_to_window_with_margin(edges)
-                    .child(panel),
-            )
-            .into_any_element(),
-        )
+        let anchored = if let Some(bell) = self.bell_bounds {
+            let top_right = bell.top_right();
+            let anchor_point = gpui::point(
+                top_right.x,
+                top_right.y - px(POPOVER_GAP_PX),
+            );
+            gpui::anchored()
+                .position(anchor_point)
+                .anchor(gpui::Corner::BottomRight)
+                .snap_to_window_with_margin(snap_edges)
+                .child(panel)
+        } else {
+            // Keep the panel clear of the bar by snapping above the
+            // bar plus the same 6 px gap (status bar height comes
+            // from the shared `STATUS_BAR_HEIGHT_PX` constant the
+            // bar's own `h(...)` uses, so they can't drift).
+            let fallback_edges = gpui::Edges {
+                top: px(SNAP_MARGIN_PX),
+                right: px(SNAP_MARGIN_PX),
+                bottom: px(STATUS_BAR_HEIGHT_PX + POPOVER_GAP_PX),
+                left: px(SNAP_MARGIN_PX),
+            };
+            gpui::anchored()
+                .position(gpui::point(px(0.0), px(0.0)))
+                .anchor(gpui::Corner::BottomRight)
+                .snap_to_window_with_margin(fallback_edges)
+                .child(panel)
+        };
+        Some(gpui::deferred(anchored).into_any_element())
     }
 
     /// Build the tab right-click menu when one is open. Returns
@@ -2434,6 +2472,40 @@ impl AppShell {
                     cx.notify();
                 }),
             )
+            // Invisible `canvas` child stretched to the bell's hit area
+            // — its prepaint callback receives the bell button's
+            // window-space `Bounds<Pixels>` and stashes them on the
+            // entity so `render_notifications_popover` can anchor to
+            // the actual button rect. Updates every frame, so resizes
+            // / status-bar reflows keep the popover stuck to the bell.
+            // The canvas registers no mouse listeners; the parent
+            // `bell_btn`'s `on_mouse_down` still receives the click.
+            .child({
+                let entity = cx.entity();
+                gpui::canvas(
+                    move |bounds, _window, cx| {
+                        entity.update(cx, |this, cx| {
+                            // Only notify when the bounds actually
+                            // change — prepaint runs every frame and
+                            // we don't want a render loop. The
+                            // notify is needed so the popover (a
+                            // sibling element built earlier in the
+                            // same render) repaints with the new
+                            // anchor on the next frame after a
+                            // resize / reflow; without it the
+                            // popover would only refresh when some
+                            // unrelated event triggered a paint.
+                            if this.bell_bounds != Some(bounds) {
+                                this.bell_bounds = Some(bounds);
+                                cx.notify();
+                            }
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full()
+            })
             // Bell glyph — fall back to a unicode symbol since we don't
             // ship vector icons. The C# uses an SVG path; the unicode
             // bell ringer (U+1F514) is a close visual stand-in at this
@@ -2454,7 +2526,7 @@ impl AppShell {
 
         // ─── Bar ─────────────────────────────────────────────────
         let mut bar = div()
-            .h(px(32.0))
+            .h(px(STATUS_BAR_HEIGHT_PX))
             .flex()
             .flex_row()
             .items_center()
