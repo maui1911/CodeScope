@@ -91,7 +91,7 @@ project's first worktree.
   reviews resolved in one fix-commit.
 - C# parity claims are easy to over-state in docstrings.
   Several review threads landed on "you say 'mirrors X' but it
-  diverges in <small detail>" — fix is to spell out *what*
+  diverges in some small detail" — fix is to spell out *what*
   diverges + *why*, not silently hand-wave.
 - `Box::leak` is a tempting shortcut for dynamic
   `&'static str` labels in gpui menus; it leaks on every
@@ -122,8 +122,9 @@ falls into roughly four sizes:
    rollup beyond Claude tabs, PR detection, etc.
 
 The audit run earlier in the session lives in the conversation
-transcript — full inventory at
-`C:\Users\maui\.claude\projects\C--dev-codescope-public\<id>.jsonl`.
+transcript — see the Claude Code session log under your local
+`~/.claude/projects/C--dev-codescope-public/` (the file name is
+the session UUID; on Windows that's `%USERPROFILE%\.claude\…`).
 
 ### Earlier sessions
 
