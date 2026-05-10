@@ -595,6 +595,19 @@ impl AppShell {
                     };
                     this.push_toast(kind, title.clone(), detail.clone(), cx);
                 }
+                SidebarEvent::OpenOverview => {
+                    // Placeholder until the C# `OverviewView` is
+                    // ported to gpui. Until then, surface a subtle
+                    // info toast so the click is acknowledged. The
+                    // sidebar footer button stays useful as a
+                    // discoverability hook for the upcoming feature.
+                    this.push_toast(
+                        ToastKind::Info,
+                        SharedString::new_static("Overview"),
+                        Some(SharedString::new_static("Coming soon — full Overview view not ported yet.")),
+                        cx,
+                    );
+                }
             }
         })
         .detach();

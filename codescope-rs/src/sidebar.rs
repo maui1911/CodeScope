@@ -153,6 +153,13 @@ pub enum SidebarEvent {
     /// user can't see them. Severity drives the toast colour stripe
     /// and lifetime.
     Toast { kind: ToastSeverity, title: SharedString, detail: Option<SharedString> },
+    /// User clicked the sidebar's "Overview" footer button. The C#
+    /// build maps Ctrl+Shift+O / this button to a full-window
+    /// `OverviewView` that replaces the workspace layer. The Rust
+    /// port doesn't have that view yet — AppShell currently surfaces
+    /// a "coming soon" toast — so this event is a placeholder hook
+    /// the host can wire up to the real Overview once it lands.
+    OpenOverview,
 }
 
 /// Toast severity emitted by the sidebar. AppShell maps these to its
@@ -1744,11 +1751,145 @@ impl Render for Sidebar {
         let mut body = div()
             .flex()
             .flex_col()
+            .flex_grow()
             .py_1()
             .children(project_and_worktree_rows);
         if let Some(es) = empty_state {
             body = body.child(es);
         }
+
+        // ── Footer: Overview + New Project, stacked, separated from
+        //    the tree by a 1 px divider. Mirrors the bottom block in
+        //    `src/CodeScope.Ui/Views/SidebarView.xaml`:
+        //
+        //    <Border BorderThickness="0,1,0,0" Padding="8">
+        //      <StackPanel>
+        //        <Button (Sidebar.OverviewButton, h=36)>
+        //          <Grid> Overview | ⌃⇧O keycap </Grid>
+        //        </Button>
+        //        <Button (Sidebar.NewProjectButton, h=40, mt=6)
+        //                BorderThickness="2,0,0,0" /* accent rail */>
+        //          <StackPanel> + | New Project </StackPanel>
+        //        </Button>
+        //      </StackPanel>
+        //    </Border>
+        //
+        //    Overview: emits `SidebarEvent::OpenOverview`. The C#
+        //    Overview view isn't ported yet, so AppShell catches the
+        //    event and surfaces a "coming soon" toast — wiring stays
+        //    correct for the future port.
+        //    New Project: routes to `open_new_project_dialog`, the
+        //    same entry point the `+` glyph in the heading uses (PR
+        //    #124). Mutually exclusive with the "+" via the same
+        //    `new_project_dialog().is_none() && dialog().is_none()`
+        //    gate the heading glyph relies on.
+        let footer = {
+            let frost_hover = theme::frost_10(&theme);
+            let ink_hover = theme::ink(&theme);
+            let elev = theme::elevated(&theme);
+            let divider = theme::divider(&theme);
+            let ink_dim = theme::ink_dim(&theme);
+            let ink_ghost = theme::ink_ghost(&theme);
+            let accent = theme::accent(&theme);
+
+            // Overview button — 36 px tall, dim text, mono ⌃⇧O keycap
+            // on the right inside a 1 px outlined pill. Mirrors
+            // `Sidebar.OverviewButton` in `SidebarView.xaml`. The
+            // active state (Overview view visible) isn't represented
+            // here yet because the Rust port has no Overview view to
+            // be active in — once the view lands, swap the bg/text/
+            // rail to the same active palette the C# DataTrigger uses
+            // (`Surface.AccentRowBg` + `Accent.Primary` foreground +
+            // 2 px accent rail on the left edge).
+            let overview_btn = div()
+                .id("sidebar-footer-overview")
+                .h(px(36.0))
+                .px_3()
+                .flex()
+                .flex_row()
+                .items_center()
+                .rounded(px(6.0))
+                .bg(elev)
+                .text_color(ink_dim)
+                .text_size(px(12.0))
+                .cursor_pointer()
+                .hover(move |s| s.bg(frost_hover).text_color(ink_hover))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _, _, cx| {
+                        cx.emit(SidebarEvent::OpenOverview);
+                    }),
+                )
+                .child(div().flex_grow().child("Overview"))
+                .child(
+                    div()
+                        .px(px(5.0))
+                        .py(px(1.0))
+                        .border_1()
+                        .border_color(divider)
+                        .rounded(px(3.0))
+                        .text_size(px(10.0))
+                        .text_color(ink_ghost)
+                        .font(theme::font_mono())
+                        .child("⌃⇧ O"),
+                );
+
+            // New Project — 40 px tall signature CTA. Flush-left 2 px
+            // accent rail, accent-coloured `+` glyph, sans-serif label.
+            // Mirrors `Sidebar.NewProjectButton` in `SidebarView.xaml`.
+            // `mt(px(6.0))` reproduces the StackPanel's `Margin="0,6,0,0"`
+            // gap between the two buttons.
+            let new_project_btn = div()
+                .id("sidebar-footer-newproject")
+                .mt(px(6.0))
+                .h(px(40.0))
+                .pl(px(12.0))
+                .pr(px(12.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .border_l_2()
+                .border_color(accent)
+                .rounded(px(6.0))
+                .bg(elev)
+                .text_color(ink_dim)
+                .text_size(px(13.0))
+                .cursor_pointer()
+                .hover(move |s| s.bg(frost_hover).text_color(ink_hover))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        // Same gate as the "+" glyph in the heading —
+                        // skip when another modal is already showing
+                        // so we never stack two on top of each other.
+                        if this.new_project_dialog().is_some() || this.dialog().is_some() {
+                            return;
+                        }
+                        this.open_new_project_dialog(window, cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .text_color(accent)
+                        .font(theme::font_mono())
+                        .child("+"),
+                )
+                .child(
+                    div()
+                        .ml(px(8.0))
+                        .child("New Project"),
+                );
+
+            div()
+                .flex()
+                .flex_col()
+                .border_t_1()
+                .border_color(divider)
+                .p_2()
+                .child(overview_btn)
+                .child(new_project_btn)
+        };
 
         // Width is set by the parent wrapper in `AppShell` so the
         // sidebar can be drag-resized + collapsed at the shell level.
@@ -1769,7 +1910,8 @@ impl Render for Sidebar {
             .font(theme::font_sans())
             .child(heading)
             .child(div().h_px().bg(theme::divider(&theme)))
-            .child(body);
+            .child(body)
+            .child(footer);
 
         // Build whichever context menu is open (project / worktree /
         // none). Snapshot indices + position up-front so the closure-
