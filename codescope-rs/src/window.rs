@@ -97,13 +97,22 @@ fn main() -> Result<()> {
     let theme = Arc::new(builtin::by_name(&settings.theme));
     let settings = Arc::new(settings);
 
-    // Load projects via `SessionManager::load_with_sweep` so the
-    // closed-session retention policy runs once per launch, mirroring
-    // C# `SessionStore.LoadAsync` which fires a one-shot migration
-    // sweep on every load. Pre-PR this called `ProjectsConfig::load`
-    // directly, which left expired closed-history rows around forever.
-    let projects = match SessionManager::load_with_sweep(&paths, &now_iso8601()) {
-        Ok(p) => p,
+    // Load projects via `SessionManager::load_with_sweep_persisting`
+    // so the closed-session retention policy runs once per launch and
+    // any pruned rows are written back to disk in the same step,
+    // mirroring C# `SessionStore.LoadAsync`'s finally-block. Without
+    // the persisting save, expired closed-history rows would linger
+    // on disk forever even after the in-memory state had dropped them.
+    let projects = match SessionManager::load_with_sweep_persisting(&paths, &now_iso8601()) {
+        Ok((p, save_err)) => {
+            if let Some(err) = save_err {
+                eprintln!(
+                    "warning: post-load retention sweep persisted state \
+                     but failed to save: {err:#}"
+                );
+            }
+            p
+        }
         Err(err) => {
             eprintln!(
                 "warning: failed to load {} ({}); starting with no projects",

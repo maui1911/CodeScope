@@ -174,18 +174,27 @@ struct SplitterDrag {
     px_per_unit: f32,
 }
 
-/// Case-insensitive equality for filesystem paths after stripping
-/// any trailing separator. Windows paths persisted under different
-/// casings ("C:\\Repo" vs "c:\\repo") still need to compare equal so
-/// `locate_project_for_path` lands on the right project on every
-/// platform our build targets.
+/// Filesystem path equality after stripping any trailing separator.
+/// Case-insensitive on Windows (NTFS / ReFS are case-preserving but
+/// case-insensitive by default, so "C:\\Repo" and "c:\\repo" must
+/// compare equal); case-sensitive everywhere else (Linux ext4 / APFS
+/// in its default case-sensitive mode treat them as distinct paths,
+/// and a case-insensitive compare here would mis-route a tab to the
+/// wrong project / worktree).
 fn path_eq_ci(a: &str, b: &str) -> bool {
     fn norm(s: &str) -> &str {
         s.trim_end_matches(|c| c == '\\' || c == '/')
     }
     let a = norm(a);
     let b = norm(b);
-    a.len() == b.len() && a.chars().zip(b.chars()).all(|(x, y)| x.eq_ignore_ascii_case(&y))
+    if cfg!(windows) {
+        a.len() == b.len()
+            && a.chars()
+                .zip(b.chars())
+                .all(|(x, y)| x.eq_ignore_ascii_case(&y))
+    } else {
+        a == b
+    }
 }
 
 /// `mtime` for the watcher loop's "did the file change?" check.
@@ -1228,14 +1237,16 @@ impl AppShell {
             let title = SharedString::from(tab.title);
             let auto = tab.auto_type.map(SharedString::from);
             // Rehydrate path lets `spawn_tab_in` mint a fresh session
-            // id rather than try to map back to a stored row — the
-            // launch-time `restore_live_sessions` pass handles the
-            // session-restore flow separately, mirroring C# where the
-            // tab list and the session list are adopted via two
-            // distinct entry points (`SessionStore.LoadAsync` for the
-            // store; `MainViewModel.RestoreClosedWorktreeSessionsAsync`
-            // for the tab side, but here unified into
-            // `restore_live_sessions`).
+            // id and append a new row through `SessionManager::open`,
+            // even though the tab is logically "the same" tab the
+            // user closed in the previous launch. This is a known
+            // limitation: `LayoutState::open_tabs` does not yet carry
+            // the persisted `Session.id`, so we can't map back to the
+            // stored row. The follow-up that unifies the rehydrate
+            // path with `SessionManager::live` will tighten this up;
+            // until then, accept the duplicate row as the cost of
+            // landing the lifecycle plumbing without a coordinated
+            // schema change.
             self.spawn_tab_in(Some(path), Some(title), auto, None, window, cx);
             spawned_any = true;
             if tab.active_in_group {
@@ -1338,14 +1349,14 @@ impl AppShell {
         let Some(wd) = working_directory else {
             return new_id;
         };
-        let Some((project_id, worktree_id)) = self.locate_project_for_path(wd) else {
-            return new_id;
-        };
-        // Reload from disk before mutating — the sidebar may have
-        // persisted a project / worktree change since our last
-        // snapshot. Mirrors C# `SessionStore`'s read-then-write
-        // pattern (it owns the in-memory list under a lock; we don't,
-        // so re-reading is the cheapest equivalent).
+        // Reload from disk *before* the project lookup — the sidebar
+        // may have added or removed a project / worktree since our
+        // last snapshot. Looking up against a stale in-memory copy
+        // would miss a freshly-added worktree (no persistence) or
+        // stamp the session with a stale `worktree_id` that the
+        // sidebar has since deleted. Mirrors C# `SessionStore`'s
+        // read-then-mutate pattern (it owns the in-memory list under
+        // a lock; we don't, so re-reading is the cheapest equivalent).
         match ProjectsConfig::load(&self.paths) {
             Ok(cfg) => {
                 self.projects = cfg;
@@ -1354,6 +1365,9 @@ impl AppShell {
                 eprintln!("warning: failed to reload projects.json before SessionManager::open: {err:#}");
             }
         }
+        let Some((project_id, worktree_id)) = self.locate_project_for_path(wd) else {
+            return new_id;
+        };
         let session = Session {
             id: new_id.clone(),
             worktree_path: wd.to_string_lossy().into_owned(),
@@ -4345,11 +4359,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn path_eq_ci_handles_case_and_trailing_slash() {
-        assert!(path_eq_ci("C:\\Repos\\Foo", "c:\\repos\\foo"));
-        assert!(path_eq_ci("C:\\Repos\\Foo\\", "C:\\Repos\\Foo"));
+    fn path_eq_ci_handles_trailing_slash_on_every_platform() {
+        // Trailing-separator stripping is platform-independent — both
+        // POSIX `/` and Windows `\` get trimmed regardless of host.
         assert!(path_eq_ci("/usr/local/bin/", "/usr/local/bin"));
-        assert!(!path_eq_ci("C:\\Repos\\Foo", "C:\\Repos\\Bar"));
+        assert!(path_eq_ci("C:\\Repos\\Foo\\", "C:\\Repos\\Foo"));
         assert!(!path_eq_ci("foo", "foobar"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_eq_ci_on_windows_is_case_insensitive() {
+        assert!(path_eq_ci("C:\\Repos\\Foo", "c:\\repos\\foo"));
+        assert!(!path_eq_ci("C:\\Repos\\Foo", "C:\\Repos\\Bar"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn path_eq_ci_off_windows_is_case_sensitive() {
+        // Linux ext4 / case-sensitive APFS treat "/Repo" and "/repo"
+        // as distinct paths — comparing case-insensitively here would
+        // route a tab to the wrong project.
+        assert!(!path_eq_ci("/repos/Foo", "/repos/foo"));
+        assert!(path_eq_ci("/repos/foo", "/repos/foo"));
     }
 }
