@@ -13,6 +13,7 @@
 
 mod app;
 mod new_worktree_dialog;
+mod notifications;
 mod sidebar;
 mod theme;
 #[cfg(target_os = "windows")]

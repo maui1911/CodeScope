@@ -387,6 +387,12 @@ pub struct AppShell {
     /// double-clicks are 100 ms+ apart. Anything under 10 ms is
     /// treated as the synthetic echo and ignored.
     last_titlebar_press_at: Option<std::time::Instant>,
+    /// Persistent notification ring buffer + popover visibility state.
+    /// Mirrors `INotificationService` / `NotificationService` from the
+    /// C# build.  The bell button (landing in the integrating PR) calls
+    /// `notifications.toggle()` and the render calls
+    /// `render_notifications_popover` alongside `render_toasts`.
+    pub(crate) notifications: crate::notifications::Notifications,
 }
 
 impl AppShell {
@@ -648,6 +654,7 @@ impl AppShell {
             theme,
             sidebar,
             last_titlebar_press_at: None,
+            notifications: crate::notifications::Notifications::new(),
         };
         shell.rehydrate_or_cold_start(window, cx);
         shell
@@ -1327,6 +1334,258 @@ impl AppShell {
         )
     }
 
+    /// Build the floating notifications popover.  Anchored bottom-right
+    /// (same corner as the toast stack), deferred so it paints over all
+    /// chrome.  Returns `None` when the popover is closed so the root
+    /// render's `.children(...)` stays an empty iterator.
+    ///
+    /// Geometry mirrors `BellPopup` in `StatusBarView.xaml` exactly:
+    /// - 360 px wide, max-height 420 px
+    /// - Header: 14 l / 12 t / 10 r / 10 b — title + conditional "Clear"
+    /// - Entry rows: 14 l/r, 10 t/b, 1 px top divider between consecutive rows
+    /// - Kind dot: 6×6, `margin-top: 5`, `margin-right: 10`, top-aligned
+    /// - Footer: 14 l/r, 8 t/b, 1 px top border, dim hint text
+    fn render_notifications_popover(
+        &self,
+        theme: &Arc<Theme>,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if !self.notifications.is_open() {
+            return None;
+        }
+
+        let elevated = theme::elevated(theme);
+        let divider = theme::divider(theme);
+        let ink = theme::ink(theme);
+        let ink_dim = theme::ink_dim(theme);
+        let ink_muted = theme::ink_muted(theme);
+        let frost = theme::frost_10(theme);
+        let accent = theme::accent(theme);
+        // Signal.Warn from DesignTokens.xaml: Signal.Color.Warn = #FFFF5A5A.
+        // HSL: hue=0 (red), sat=1.0, lum=0.671.
+        let signal_warn = gpui::Hsla {
+            h: 0.0,
+            s: 1.0,
+            l: 0.671,
+            a: 1.0,
+        };
+
+        let has_any = self.notifications.has_any();
+
+        // Header: "Notifications" label + conditional "Clear" button.
+        let clear_btn = if has_any {
+            Some(
+                div()
+                    .id("notif-clear-btn")
+                    .px(px(6.0))
+                    .py(px(3.0))
+                    .rounded_md()
+                    .text_size(px(11.0))
+                    .text_color(ink_dim)
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(frost))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.notifications.clear_all();
+                            cx.notify();
+                        }),
+                    )
+                    .child("Clear"),
+            )
+        } else {
+            None
+        };
+
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .pl(px(14.0))
+            .pt(px(12.0))
+            .pr(px(10.0))
+            .pb(px(10.0))
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(ink)
+                    .child("Notifications"),
+            )
+            .children(clear_btn);
+
+        // Body — either the "No notifications yet." empty state or the
+        // scrollable entry list.
+        let body: gpui::AnyElement = if !has_any {
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .mt(px(28.0))
+                .mb(px(36.0))
+                .text_size(px(11.5))
+                .text_color(ink_dim)
+                .child("No notifications yet.")
+                .into_any_element()
+        } else {
+            let entries: Vec<gpui::AnyElement> = self
+                .notifications
+                .entries()
+                .iter()
+                .enumerate()
+                .map(|(i, entry)| {
+                    let id = entry.id;
+                    let dot_color = match entry.kind {
+                        crate::notifications::NotificationKind::Generic => ink_dim,
+                        crate::notifications::NotificationKind::SessionWaiting => signal_warn,
+                        crate::notifications::NotificationKind::SessionReady => accent,
+                    };
+                    let title = entry.title.clone();
+                    let detail = entry.detail.clone();
+                    let session_title = entry.session_title.clone();
+                    let timestamp =
+                        crate::notifications::format_hhmm(entry.timestamp);
+                    let has_divider = i > 0;
+
+                    // Hover tint: #0EFFFFFF = ink at ~5.5 % alpha.
+                    let hover_tint = gpui::Hsla {
+                        h: 1.0,
+                        s: 1.0,
+                        l: 1.0,
+                        a: 0.055,
+                    };
+
+                    let mut row = div()
+                        .id(("notif-entry", id))
+                        .flex()
+                        .flex_row()
+                        .items_start()
+                        .pl(px(14.0))
+                        .pr(px(14.0))
+                        .pt(px(10.0))
+                        .pb(px(10.0))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(hover_tint));
+
+                    if has_divider {
+                        row = row.border_t_1().border_color(divider);
+                    }
+
+                    row = row
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.notifications.activate(id);
+                                this.notifications.set_open(false);
+                                cx.notify();
+                            }),
+                        )
+                        // Kind dot — 6×6, top-aligned, 10 px right margin.
+                        .child(
+                            div()
+                                .w(px(6.0))
+                                .h(px(6.0))
+                                .mt(px(5.0))
+                                .mr(px(10.0))
+                                .flex_shrink_0()
+                                .rounded_full()
+                                .bg(dot_color),
+                        )
+                        // Text column: title / detail / session_title (mono).
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_grow()
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(ink)
+                                        .child(title),
+                                )
+                                .child(
+                                    div()
+                                        .mt(px(2.0))
+                                        .text_size(px(11.0))
+                                        .text_color(ink_muted)
+                                        .child(detail),
+                                )
+                                .children(session_title.map(|st| {
+                                    div()
+                                        .mt(px(3.0))
+                                        .text_size(px(10.5))
+                                        .text_color(ink_dim)
+                                        .child(st)
+                                })),
+                        )
+                        // Timestamp — top-aligned dim mono label.
+                        .child(
+                            div()
+                                .ml(px(10.0))
+                                .mt(px(1.0))
+                                .flex_shrink_0()
+                                .text_size(px(10.5))
+                                .text_color(ink_dim)
+                                .child(timestamp),
+                        );
+
+                    row.into_any_element()
+                })
+                .collect();
+
+            div()
+                .id("notif-entry-list")
+                .flex()
+                .flex_col()
+                .overflow_y_scroll()
+                .children(entries)
+                .into_any_element()
+        };
+
+        // Footer: 1 px top border, dim hint text.
+        let footer = div()
+            .border_t_1()
+            .border_color(divider)
+            .pl(px(14.0))
+            .pr(px(14.0))
+            .pt(px(8.0))
+            .pb(px(8.0))
+            .text_size(px(10.5))
+            .text_color(ink_dim)
+            .child("Click an entry to jump to its session.");
+
+        // Outer panel — 360 px wide, max-height 420 px, anchored
+        // bottom-right above the status bar (mirroring the Popup
+        // `Placement="Top"` in the XAML, offset from the bell button).
+        let panel = div()
+            .id("notif-popover")
+            .w(px(360.0))
+            .max_h(px(420.0))
+            .flex()
+            .flex_col()
+            .bg(elevated)
+            .border_1()
+            .border_color(divider)
+            .rounded_md()
+            .shadow_lg()
+            .child(header)
+            .child(body)
+            .child(footer);
+
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position(gpui::point(px(0.0), px(0.0)))
+                    .anchor(gpui::Corner::BottomRight)
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(panel),
+            )
+            .into_any_element(),
+        )
+    }
+
     /// Build the tab right-click menu when one is open. Returns
     /// `None` when no menu is showing — caller uses `.children(...)`
     /// so 0 / 1 children both work without splitting the chain.
@@ -1638,6 +1897,26 @@ impl AppShell {
             self.toasts.pop_back();
         }
         cx.notify();
+    }
+
+    /// Push a persistent notification entry.  Unlike toasts these
+    /// accumulate in the ring buffer until the user clears them or the
+    /// ring reaches its cap (50).  Returns the id of the new entry.
+    ///
+    /// The bell button (integrating PR) wires this up for session events;
+    /// callers can also call it directly for generic system events.
+    #[allow(dead_code)]
+    pub(crate) fn push_notification(
+        &mut self,
+        kind: crate::notifications::NotificationKind,
+        title: impl Into<SharedString>,
+        detail: impl Into<SharedString>,
+        session_title: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        let id = self.notifications.push(kind, title, detail, session_title);
+        cx.notify();
+        id
     }
 
     /// Dismiss a toast immediately by id. Wired to a small `×` on
@@ -2493,6 +2772,7 @@ impl Render for AppShell {
             .child(self.render_status_bar(&theme, cx))
             .children(self.render_tab_menu(&theme, cx))
             .children(self.render_toasts(&theme, cx))
+            .children(self.render_notifications_popover(&theme, cx))
     }
 }
 
