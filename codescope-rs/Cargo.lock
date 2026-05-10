@@ -985,6 +985,7 @@ dependencies = [
  "linkify",
  "open",
  "parking_lot",
+ "windows 0.61.3",
 ]
 
 [[package]]

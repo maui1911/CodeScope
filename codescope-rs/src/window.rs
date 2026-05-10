@@ -69,6 +69,16 @@ fn main() -> Result<()> {
     // `App/Diagnostics/MemoryWatchdog.cs`). No-op in production.
     codescope_core::memory_watchdog::start_if_dev(paths.dev_mode);
 
+    // Create the process-wide job object before any pty spawns, so
+    // every Claude / Codex / pwsh descendant is killed when CodeScope
+    // exits — even on a hard crash. Mirrors C# `App.OnStartup`'s
+    // `_appKiller = new ProcessTreeKiller(); _appKiller.Adopt(...)`.
+    // No-op on non-Windows targets. A failure here would only mean
+    // orphaned children are possible on crash; do not abort startup.
+    if let Err(err) = codescope_terminal::process_group::ensure() {
+        eprintln!("process_group: failed to initialise job object: {err:#}");
+    }
+
     let settings = match Settings::load(&paths) {
         Ok(s) => s,
         Err(err) => {

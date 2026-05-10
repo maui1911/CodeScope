@@ -186,6 +186,28 @@ impl Backend {
         let pty = tty::new(&tty_options, size, /* window_id */ 0)
             .context("failed to spawn PTY child process")?;
 
+        // Adopt the freshly-spawned child into the process-wide job
+        // object so it (and every grandchild — claude/codex/etc.) is
+        // killed when CodeScope exits, even on a hard crash. Mirrors
+        // `ProcessTreeKiller.Adopt` in the C# build. No-op on non-
+        // Windows targets.
+        #[cfg(windows)]
+        {
+            // SAFETY: `child_watcher().raw_handle()` returns a valid
+            // process handle owned by alacritty for the lifetime of
+            // the `Pty`. We only borrow it long enough to call
+            // `AssignProcessToJobObject`, which copies what it needs.
+            let raw = pty.child_watcher().raw_handle();
+            let handle = windows::Win32::Foundation::HANDLE(raw as *mut _);
+            if let Err(err) = crate::process_group::adopt_handle(handle) {
+                // Non-fatal: a failure here means orphaned children
+                // are *possible* on hard crash, but normal operation
+                // is unaffected. Log loudly so a regression is
+                // noticeable in the dev console.
+                eprintln!("process_group: failed to adopt pty child: {err:#}");
+            }
+        }
+
         // EventProxy answers colour / text-area-size queries directly
         // on the event-loop thread, so it needs a palette to resolve
         // against. We hand it a clone of whatever the caller chose

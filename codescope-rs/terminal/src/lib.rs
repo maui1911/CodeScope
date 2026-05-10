@@ -19,6 +19,7 @@ pub mod event;
 pub mod input;
 pub mod mouse;
 pub mod paint;
+pub mod process_group;
 pub mod view;
 
 pub use alacritty_terminal::tty::Shell;
