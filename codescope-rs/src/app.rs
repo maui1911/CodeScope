@@ -3337,8 +3337,10 @@ impl Render for AppShell {
         // so tagging a release flips every consumer automatically.
         // Both elements participate in the window-drag region so the
         // user can grab the chrome anywhere along the brand cluster.
-        let version_display: SharedString =
-            format!("V{}", env!("CODESCOPE_VERSION_DISPLAY")).into();
+        // `concat!` keeps the slug as a `&'static str` so the
+        // caption-row hot path doesn't pay for a `format!` on
+        // every render.
+        const VERSION_DISPLAY: &str = concat!("V", env!("CODESCOPE_VERSION_DISPLAY"));
         // Fixed width keeps the `chrome_left_w` calculation below
         // predictable so the per-group tab strip dividers can still
         // line up with the splitters between panes. Long dev-build
@@ -3369,7 +3371,7 @@ impl Render for AppShell {
                     .text_size(px(10.0))
                     .text_color(theme::ink_ghost(&theme))
                     .truncate()
-                    .child(version_display),
+                    .child(VERSION_DISPLAY),
             )
             .on_mouse_down(
                 MouseButton::Left,
