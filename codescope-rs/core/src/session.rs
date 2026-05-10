@@ -76,11 +76,11 @@ impl RetentionPolicy {
 /// `Services/SessionDescriptor.cs` 1:1: pure data, no terminal-control
 /// dependency, so `core` stays UI-free.
 ///
-/// Producers (the future Rust analogue of C# `SessionManager.Create*`)
-/// build one of these, the UI layer consumes it to wire up the pty.
-/// Not consumed yet on the Rust side — kept here so the agent-launch
-/// port can land in a separate PR without re-litigating the shape.
-#[allow(dead_code)] // Consumed by a follow-up PR (agent-launch port).
+/// Producers (the agent-launch path and the closed-session reopen
+/// flow) build one of these; the UI layer consumes it to wire up the
+/// pty. The reopen path constructs one via [`SessionDescriptor::for_session`]
+/// so the persisted `Session` row drives the next live tab's working
+/// directory + title without UI code reaching into the row directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionDescriptor {
     pub id: String,
@@ -88,6 +88,65 @@ pub struct SessionDescriptor {
     pub shell: String,
     pub shell_args: Vec<String>,
     pub title: String,
+}
+
+impl SessionDescriptor {
+    /// Build a descriptor that re-opens `session` in `shell`. Used by
+    /// the sidebar's "click a closed-session row" reopen flow: the
+    /// caller hands us the system shell + the persisted row, we hand
+    /// back the data the pty layer needs. Matches C#
+    /// `SessionManager.BuildDescriptorForSession`.
+    pub fn for_session(session: &Session, shell: String, shell_args: Vec<String>) -> Self {
+        let title = session
+            .display_name
+            .clone()
+            .unwrap_or_else(|| session.branch.clone().unwrap_or_else(|| session.id.clone()));
+        Self {
+            id: session.id.clone(),
+            working_directory: session.worktree_path.clone(),
+            shell,
+            shell_args,
+            title,
+        }
+    }
+}
+
+/// Format a closed-session timestamp as a short relative string —
+/// `just now` / `Nm ago` / `Nh ago` / `yesterday` / `Nd ago` / `MMM d`
+/// (older). Mirrors C# `SessionTabViewModel.ClosedAtRelative`.
+///
+/// Returns an empty string when `closed_at_iso` is `None` or fails to
+/// parse, mirroring the WPF binding's empty-string fallback for live
+/// rows.
+pub fn format_closed_at_relative(closed_at_iso: Option<&str>, now_iso: &str) -> String {
+    let Some(closed_at_iso) = closed_at_iso else { return String::new() };
+    let Some(closed_secs) = parse_iso8601_secs(closed_at_iso) else { return String::new() };
+    let Some(now_secs) = parse_iso8601_secs(now_iso) else { return String::new() };
+    let delta = (now_secs - closed_secs).max(0.0);
+    if delta < 60.0 {
+        return "just now".to_string();
+    }
+    if delta < 3_600.0 {
+        return format!("{}m ago", (delta / 60.0) as i64);
+    }
+    if delta < 86_400.0 {
+        return format!("{}h ago", (delta / 3_600.0) as i64);
+    }
+    if delta < 2.0 * 86_400.0 {
+        return "yesterday".to_string();
+    }
+    if delta < 7.0 * 86_400.0 {
+        return format!("{}d ago", (delta / 86_400.0) as i64);
+    }
+    // Older than a week — fall back to "MMM d" of the closed_at date.
+    let (_y, m, d, _hh, _mm, _ss) = crate::time::unix_secs_to_civil(closed_secs as i64);
+    let month = match m {
+        1 => "Jan", 2 => "Feb", 3 => "Mar", 4 => "Apr",
+        5 => "May", 6 => "Jun", 7 => "Jul", 8 => "Aug",
+        9 => "Sep", 10 => "Oct", 11 => "Nov", 12 => "Dec",
+        _ => "",
+    };
+    format!("{month} {d}")
 }
 
 /// In-memory orchestration over the persisted `Session` rows in a
@@ -555,6 +614,131 @@ mod tests {
         cfg.projects.push(make_project("p1"));
         let err = SessionManager::soft_close(&mut cfg, "ghost", fixed_now()).unwrap_err();
         assert!(err.to_string().contains("ghost"));
+    }
+
+    #[test]
+    fn reopen_round_trip_live_to_closed_to_live() {
+        // Open → soft_close → reopen → soft_close → reopen, asserting
+        // the row goes back and forth between the live and closed
+        // partitions exactly. This is the contract the sidebar's
+        // history-disclosure → AppShell::reopen flow relies on.
+        let mut cfg = ProjectsConfig::default();
+        cfg.projects.push(make_project("p1"));
+
+        // 1. Open: lands in `live`, missing from `closed`.
+        let opened = SessionManager::open(
+            &mut cfg,
+            "p1",
+            make_session("s1", Some("primary")),
+            "2026-05-10T10:00:00Z",
+        )
+        .unwrap();
+        assert!(opened.closed_at.is_none());
+        assert_eq!(SessionManager::live(&cfg).len(), 1);
+        assert!(SessionManager::closed(&cfg).is_empty());
+
+        // 2. Soft-close: moves to `closed`, drops from `live`.
+        SessionManager::soft_close(&mut cfg, "s1", "2026-05-10T11:00:00Z").unwrap();
+        assert!(SessionManager::live(&cfg).is_empty());
+        assert_eq!(SessionManager::closed(&cfg).len(), 1);
+        assert_eq!(
+            cfg.projects[0].sessions[0].closed_at.as_deref(),
+            Some("2026-05-10T11:00:00Z")
+        );
+
+        // 3. Reopen: clears closed_at, bumps last_opened, moves back
+        //    to `live`.
+        let restored = SessionManager::reopen(&mut cfg, "s1", "2026-05-10T12:00:00Z").unwrap();
+        assert!(restored.closed_at.is_none());
+        assert_eq!(restored.last_opened.as_deref(), Some("2026-05-10T12:00:00Z"));
+        assert_eq!(SessionManager::live(&cfg).len(), 1);
+        assert!(SessionManager::closed(&cfg).is_empty());
+
+        // 4. Soft-close again: a second cycle is symmetric — re-closing
+        //    after a reopen produces a fresh `closed_at`, not the old
+        //    one.
+        SessionManager::soft_close(&mut cfg, "s1", "2026-05-10T13:00:00Z").unwrap();
+        assert_eq!(
+            cfg.projects[0].sessions[0].closed_at.as_deref(),
+            Some("2026-05-10T13:00:00Z")
+        );
+        // 5. And one more reopen flips back cleanly. Same row id —
+        //    the reopen must not append a duplicate.
+        SessionManager::reopen(&mut cfg, "s1", "2026-05-10T14:00:00Z").unwrap();
+        assert_eq!(cfg.projects[0].sessions.len(), 1);
+        assert_eq!(SessionManager::live(&cfg).len(), 1);
+    }
+
+    #[test]
+    fn reopen_unknown_session_errors() {
+        let mut cfg = ProjectsConfig::default();
+        cfg.projects.push(make_project("p1"));
+        let err = SessionManager::reopen(&mut cfg, "ghost", fixed_now()).unwrap_err();
+        assert!(err.to_string().contains("ghost"));
+    }
+
+    #[test]
+    fn descriptor_for_session_uses_display_name_then_branch_then_id() {
+        let mut s = make_session("s1", Some("primary"));
+        s.worktree_path = "C:\\repo\\feat-x".into();
+
+        // 1. With display_name set, that wins.
+        s.display_name = Some("Pretty name".into());
+        s.branch = Some("feat-x".into());
+        let d = SessionDescriptor::for_session(&s, "pwsh.exe".into(), Vec::new());
+        assert_eq!(d.id, "s1");
+        assert_eq!(d.working_directory, "C:\\repo\\feat-x");
+        assert_eq!(d.shell, "pwsh.exe");
+        assert_eq!(d.title, "Pretty name");
+
+        // 2. No display_name, branch wins.
+        s.display_name = None;
+        let d = SessionDescriptor::for_session(&s, "pwsh.exe".into(), Vec::new());
+        assert_eq!(d.title, "feat-x");
+
+        // 3. No display_name, no branch, falls back to id.
+        s.branch = None;
+        let d = SessionDescriptor::for_session(&s, "pwsh.exe".into(), Vec::new());
+        assert_eq!(d.title, "s1");
+    }
+
+    #[test]
+    fn closed_at_relative_buckets() {
+        let now = "2026-05-10T12:00:00Z";
+        // Live rows (no closed_at) → empty string.
+        assert_eq!(format_closed_at_relative(None, now), "");
+        // Unparseable timestamps → empty string (fail closed).
+        assert_eq!(format_closed_at_relative(Some("nope"), now), "");
+        // < 1 minute.
+        assert_eq!(
+            format_closed_at_relative(Some("2026-05-10T11:59:30Z"), now),
+            "just now"
+        );
+        // Minutes.
+        assert_eq!(
+            format_closed_at_relative(Some("2026-05-10T11:55:00Z"), now),
+            "5m ago"
+        );
+        // Hours.
+        assert_eq!(
+            format_closed_at_relative(Some("2026-05-10T09:00:00Z"), now),
+            "3h ago"
+        );
+        // Yesterday (between 24h and 48h).
+        assert_eq!(
+            format_closed_at_relative(Some("2026-05-09T08:00:00Z"), now),
+            "yesterday"
+        );
+        // Within the past week.
+        assert_eq!(
+            format_closed_at_relative(Some("2026-05-07T12:00:00Z"), now),
+            "3d ago"
+        );
+        // Older than a week — short month + day.
+        assert_eq!(
+            format_closed_at_relative(Some("2026-04-15T12:00:00Z"), now),
+            "Apr 15"
+        );
     }
 
     #[test]

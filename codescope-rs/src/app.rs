@@ -608,6 +608,9 @@ impl AppShell {
                         cx,
                     );
                 }
+                SidebarEvent::ReopenSession { session_id } => {
+                    this.reopen_session(session_id.clone(), window, cx);
+                }
             }
         })
         .detach();
@@ -1435,6 +1438,94 @@ impl AppShell {
                 // is null.
             }
         }
+    }
+
+    /// Reopen the soft-closed session `session_id`: clear `closed_at`,
+    /// stamp `last_opened`, persist, mirror the updated config to the
+    /// sidebar so the row leaves the history list, then spawn a tab
+    /// pinned to the persisted `worktree_path` and (where applicable)
+    /// the persisted `agent_id`'s auto-type command. Mirrors C#
+    /// `MainViewModel.ReopenClosedSessionAsync`.
+    ///
+    /// Best-effort: a `session_id` not found on disk (race with a
+    /// retention sweep, or stale event from a closed sidebar that has
+    /// since rebuilt) is logged and swallowed — there's nothing useful
+    /// to spawn at that point.
+    fn reopen_session(
+        &mut self,
+        session_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Reload-then-mutate-then-save mirrors the pattern around
+        // `allocate_session_id` / `soft_close_session`: a sidebar
+        // write between two of ours can otherwise clobber the
+        // sessions array.
+        match ProjectsConfig::load(&self.paths) {
+            Ok(cfg) => {
+                self.projects = cfg;
+            }
+            Err(err) => {
+                eprintln!("warning: failed to reload projects.json before reopen: {err:#}");
+            }
+        }
+        let restored = match SessionManager::reopen(
+            &mut self.projects,
+            &session_id,
+            &now_iso8601(),
+        ) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!("warning: SessionManager::reopen failed: {err:#}");
+                return;
+            }
+        };
+        if let Err(err) = codescope_core::session::save(&self.projects, &self.paths) {
+            eprintln!("warning: failed to persist session reopen: {err:#}");
+        }
+        // Mirror the updated config into the sidebar so the closed
+        // row disappears from the history disclosure on the same
+        // frame as the new tab opens. Without this push the sidebar
+        // would still see the row in its `closed_at = Some(_)` state
+        // until the next sidebar-side mutation (add/remove project)
+        // refreshes the snapshot.
+        let projects_for_sidebar = self.projects.clone();
+        self.sidebar.update(cx, |sidebar, _| {
+            sidebar.replace_projects(projects_for_sidebar);
+        });
+
+        // Build a working SessionDescriptor for the spawn. The shell
+        // value is informational here — `spawn_tab_in` resolves the
+        // shell from `CODESCOPE_SHELL` / pwsh — but constructing the
+        // descriptor ties the reopen flow to the same data shape the
+        // agent-launch path already uses, matching C#
+        // `SessionManager.BuildDescriptorForSession`.
+        let descriptor = codescope_core::session::SessionDescriptor::for_session(
+            &restored,
+            std::env::var("CODESCOPE_SHELL").unwrap_or_else(|_| "pwsh.exe".into()),
+            Vec::new(),
+        );
+        let working_directory = std::path::PathBuf::from(&descriptor.working_directory);
+        let title: SharedString = descriptor.title.clone().into();
+
+        // `agent_id` → auto-type command. Only the `claude*` family
+        // round-trips today; future agent profiles can extend this
+        // map as their auto-launch verbs are added. Plain shell
+        // sessions (no agent_id) come back as plain shells.
+        let auto_type: Option<SharedString> = restored
+            .agent_id
+            .as_deref()
+            .filter(|id| id.starts_with("claude"))
+            .map(|_| "claude".into());
+
+        self.spawn_tab_in(
+            Some(working_directory),
+            Some(title),
+            auto_type,
+            Some(restored.id),
+            window,
+            cx,
+        );
     }
 
     fn focused_group(&self) -> &Group {
@@ -3405,10 +3496,29 @@ impl Render for AppShell {
                     .tabs
                     .iter()
                     .enumerate()
-                    .map(|(t_idx, tab)| TabRenderData {
-                        tab_idx: t_idx,
-                        tab_id: tab.id,
-                        title: tab.title.clone(),
+                    .map(|(t_idx, tab)| {
+                        // Resolve the tab's telemetry-derived busy
+                        // state. Tabs without an adopted Claude
+                        // session id have no telemetry to read and
+                        // sit calm (`busy: false`), matching C#
+                        // `SessionTabViewModel.Status`'s default of
+                        // `TabStatus.Idle` for plain shell tabs.
+                        let busy = tab
+                            .adopted_session_id
+                            .as_deref()
+                            .and_then(|sid| self.telemetry_for(sid))
+                            .map(|s| matches!(
+                                s.state,
+                                codescope_core::SessionState::Busy
+                                    | codescope_core::SessionState::PendingToolUse
+                            ))
+                            .unwrap_or(false);
+                        TabRenderData {
+                            tab_idx: t_idx,
+                            tab_id: tab.id,
+                            title: tab.title.clone(),
+                            busy,
+                        }
                     })
                     .collect(),
                 active_terminal: group
@@ -3930,6 +4040,14 @@ struct TabRenderData {
     tab_idx: usize,
     tab_id: u64,
     title: SharedString,
+    /// Tab activity state derived from the latest telemetry snapshot,
+    /// mirroring C# `SessionTabViewModel.Status` (`TabStatus.Idle` /
+    /// `TabStatus.Busy`). Drives the colour of the 6 px dot on the
+    /// tab strip — green for idle / no-telemetry, red for the agent
+    /// composing or paused on a tool call. Snapshotted up front so
+    /// the per-tab render closure doesn't have to re-borrow
+    /// `self.telemetry_tails`.
+    busy: bool,
 }
 
 /// Frame-local snapshot for one group. We snapshot `Entity<TerminalView>`
@@ -4037,6 +4155,14 @@ impl AppShell {
         let divider = theme::divider(theme);
 
         let theme_for_drag = theme.clone();
+        // Tab-strip status dot colours — 6 px dot per tab, mirrors
+        // C# `GroupStripView`'s `TabStatusToBrushConverter`. Busy
+        // ⇒ Signal.Warn (red, agent composing / paused on tool),
+        // idle ⇒ Signal.Ok (green, awaiting your input). Sourced via
+        // `theme::signal_*` so the values stay in sync with
+        // DesignTokens.xaml without hard-coded hex.
+        let signal_ok = theme::signal_ok();
+        let signal_warn = theme::signal_warn();
         let tabs = gmeta.tabs.iter().map(|tmeta| {
             let tab_idx = tmeta.tab_idx;
             let tab_id = tmeta.tab_id;
@@ -4046,11 +4172,13 @@ impl AppShell {
             let bg = if card { canvas } else { gpui::transparent_black() };
             let text_color = if active { ink } else { ink_dim };
             let top_border = if active { accent } else { gpui::transparent_black() };
-            let status_dot = if active {
-                theme::status_running()
-            } else {
-                ink_ghost
-            };
+            // Status dot: green when idle / no telemetry, red when
+            // the agent is busy (Composing / PendingToolUse). Selection
+            // chrome lives elsewhere (text colour, top accent rail) so
+            // the dot is reserved for agent state, exactly the way C#
+            // `GroupStripView` keeps the dot tied to `Status` rather
+            // than `IsSelected`.
+            let status_dot = if tmeta.busy { signal_warn } else { signal_ok };
             // Drag payload — stable ids + the title so the drag
             // preview can render without holding a borrow on
             // `self.groups`.

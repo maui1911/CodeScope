@@ -77,6 +77,11 @@ pub fn ink_ghost(theme: &Theme) -> Hsla { with_alpha(theme.chrome.ink, 0.40) }
 
 /// Status-dot colour. Hard-coded across themes for now — a green dot
 /// reads as "running" in every dark theme we ship. Themable later.
+/// Superseded for the tab-strip dot by [`signal_ok`] / [`signal_warn`]
+/// (see `app.rs::render_group`); kept for any future non-tab caller
+/// that wants a generic "running" green without going through the
+/// signal pair's busy/idle semantics.
+#[allow(dead_code)]
 pub fn status_running() -> Hsla { rgb_to_hsla(Rgb::from_hex(0x22c55e)) }
 
 /// Worktree dirty indicator. Amber, distinct enough from

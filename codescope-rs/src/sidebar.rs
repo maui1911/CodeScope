@@ -160,6 +160,11 @@ pub enum SidebarEvent {
     /// a "coming soon" toast — so this event is a placeholder hook
     /// the host can wire up to the real Overview once it lands.
     OpenOverview,
+    /// Reopen a soft-closed session by id. AppShell looks up the row,
+    /// calls `SessionManager::reopen`, then spawns a tab pinned to
+    /// the persisted `worktree_path` + `agent_id`. Mirrors C#
+    /// `MainViewModel.ReopenClosedSessionAsync`.
+    ReopenSession { session_id: String },
 }
 
 /// Toast severity emitted by the sidebar. AppShell maps these to its
@@ -181,6 +186,24 @@ struct WorktreeRowData {
     id: String,
     path: String,
     branch: Option<String>,
+    /// Closed sessions belonging to this worktree, newest-first
+    /// (matches `SessionManager::closed`'s sort). Already capped by
+    /// the retention sweep, so we render every row here without a
+    /// per-render slice. Used to drive the per-worktree history
+    /// disclosure in the sidebar — mirrors C#
+    /// `WorktreeViewModel.History`.
+    closed_sessions: Vec<ClosedSessionRow>,
+}
+
+/// Display data for a single closed-session row inside a worktree's
+/// history disclosure. Snapshotted at render time so the per-row
+/// listener closure can hold an owned `session_id` without keeping
+/// a borrow on `self.projects`.
+#[derive(Clone)]
+struct ClosedSessionRow {
+    session_id: String,
+    label: SharedString,
+    closed_at: Option<String>,
 }
 
 pub struct Sidebar {
@@ -249,6 +272,13 @@ pub struct Sidebar {
     /// flushed back via `save_layout` whenever the user toggles a
     /// chevron, so the disclosure state survives a restart.
     collapsed_projects: HashSet<String>,
+    /// Worktree rows whose closed-session history disclosure is
+    /// expanded. Keyed by `"{project_id}/{worktree_id}"` so primary
+    /// rows from different projects don't collide. Defaults to
+    /// collapsed; toggling the chevron flips the entry. Process-local
+    /// only — mirrors `WorktreeViewModel.IsExpanded` in the C# build,
+    /// which is also a per-process flag (WPF tree-view state).
+    expanded_worktrees: HashSet<String>,
 }
 
 impl Sidebar {
@@ -298,7 +328,19 @@ impl Sidebar {
             git_status: HashMap::new(),
             pr_urls: HashMap::new(),
             collapsed_projects,
+            expanded_worktrees: HashSet::new(),
         }
+    }
+
+    /// Flip the expand / collapse state for a worktree's history
+    /// disclosure. Default is collapsed. Re-renders via `cx.notify`.
+    fn toggle_worktree_expanded(&mut self, key: &str, cx: &mut Context<Self>) {
+        if self.expanded_worktrees.contains(key) {
+            self.expanded_worktrees.remove(key);
+        } else {
+            self.expanded_worktrees.insert(key.to_owned());
+        }
+        cx.notify();
     }
 
     /// Flip the collapse / expand state for the project at `id`.
@@ -1403,13 +1445,61 @@ impl Render for Sidebar {
                 // perfectly normal "single repo on main" project
                 // render with the misleading "(no worktrees)"
                 // placeholder from #101.
+                // Pre-bucket the project's closed sessions by
+                // worktree id so each `WorktreeRowData` carries its
+                // own already-sorted history slice. The bucket key
+                // matches the retention sweep's
+                // `s.worktree_id.unwrap_or_default()` so primary
+                // rows whose worktree id was never written collapse
+                // cleanly into the orphan bucket.
+                let mut closed_by_wt: HashMap<String, Vec<ClosedSessionRow>> = HashMap::new();
+                for s in &p.sessions {
+                    if s.closed_at.is_none() {
+                        continue;
+                    }
+                    let key = s.worktree_id.clone().unwrap_or_default();
+                    let label: SharedString = s
+                        .display_name
+                        .clone()
+                        .or_else(|| s.branch.clone())
+                        .unwrap_or_else(|| s.id.clone())
+                        .into();
+                    closed_by_wt
+                        .entry(key)
+                        .or_default()
+                        .push(ClosedSessionRow {
+                            session_id: s.id.clone(),
+                            label,
+                            closed_at: s.closed_at.clone(),
+                        });
+                }
+                // Newest-first by `closed_at` — mirrors
+                // `SessionManager::closed` so the sidebar disclosure
+                // shows the most recently closed row at the top.
+                for bucket in closed_by_wt.values_mut() {
+                    bucket.sort_by(|a, b| {
+                        let ka = a
+                            .closed_at
+                            .as_deref()
+                            .and_then(codescope_core::time::parse_iso8601_secs);
+                        let kb = b
+                            .closed_at
+                            .as_deref()
+                            .and_then(codescope_core::time::parse_iso8601_secs);
+                        kb.partial_cmp(&ka).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
                 let worktrees = p
                     .worktrees
                     .iter()
-                    .map(|wt| WorktreeRowData {
-                        id: wt.id.clone(),
-                        path: wt.path.clone(),
-                        branch: wt.branch.clone(),
+                    .map(|wt| {
+                        let closed_sessions = closed_by_wt.remove(&wt.id).unwrap_or_default();
+                        WorktreeRowData {
+                            id: wt.id.clone(),
+                            path: wt.path.clone(),
+                            branch: wt.branch.clone(),
+                            closed_sessions,
+                        }
                     })
                     .collect();
                 (
@@ -1744,7 +1834,123 @@ impl Render for Sidebar {
                             .child(status_slug),
                     )
                 };
+                // History disclosure chevron — only when the worktree
+                // has any closed-session rows. Mirrors C# `SidebarView`'s
+                // chevron Border which is gated on `HasHistory`.
+                // ▸ collapsed, ▾ expanded; click flips
+                // `expanded_worktrees`. Hit-target is a 14×14 box so the
+                // glyph is comfortable to click without the user having
+                // to land on the 8 px arrow itself.
+                let wt_key = wt_row_id.clone();
+                let has_history = !wt.closed_sessions.is_empty();
+                let history_expanded = self.expanded_worktrees.contains(&wt_key);
+                let wt_row = if has_history {
+                    let glyph = if history_expanded { "\u{25BE}" } else { "\u{25B8}" };
+                    let key_for_toggle = wt_key.clone();
+                    wt_row.child(
+                        div()
+                            .id(("worktree-history-chevron", id_hash(&wt_key)))
+                            .w(px(14.0))
+                            .h(px(14.0))
+                            .ml(px(4.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(10.0))
+                            .text_color(theme::ink_ghost(&theme))
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_worktree_expanded(&key_for_toggle, cx);
+                                }),
+                            )
+                            .child(glyph),
+                    )
+                } else {
+                    wt_row
+                };
                 project_and_worktree_rows.push(wt_row.into_any_element());
+
+                // Closed-session history rows. Hidden unless the user
+                // has expanded this worktree's chevron. Each row is dim
+                // (mirrors C#'s `Opacity=0.55` data template) with a
+                // hollow outline dot, the session label in mono, and a
+                // right-aligned relative-time stamp. Click emits
+                // `ReopenSession` so AppShell can run
+                // `SessionManager::reopen` and spawn a fresh tab.
+                if has_history && history_expanded {
+                    let now_iso = codescope_core::session::now_iso8601();
+                    let outline_color = theme::ink_ghost(&theme);
+                    let label_color = theme::ink_dim(&theme);
+                    let ts_color = theme::ink_ghost(&theme);
+                    let frost_hover = theme::frost_10(&theme);
+                    let ink_hover = theme::ink(&theme);
+                    for row in wt.closed_sessions.into_iter() {
+                        let session_id = row.session_id.clone();
+                        let id_for_click = session_id.clone();
+                        let relative = codescope_core::session::format_closed_at_relative(
+                            row.closed_at.as_deref(),
+                            &now_iso,
+                        );
+                        let history_id = format!("{}/{}", wt_key, session_id);
+                        let history_row = div()
+                            .id(("history", id_hash(&history_id)))
+                            .h(px(24.0))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .pl(px(46.0)) // indent under the parent worktree's branch label
+                            .pr_3()
+                            .gap_2()
+                            .text_size(px(11.0))
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(frost_hover).text_color(ink_hover))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |_, _, _, cx| {
+                                    cx.emit(SidebarEvent::ReopenSession {
+                                        session_id: id_for_click.clone(),
+                                    });
+                                }),
+                            )
+                            // Hollow outline dot — `border_1` + transparent
+                            // bg matches the WPF `Stroke=Text.Faint`
+                            // ellipse on the closed-row template, marking
+                            // the row as inactive at a glance.
+                            .child(
+                                div()
+                                    .w(px(6.0))
+                                    .h(px(6.0))
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(outline_color),
+                            )
+                            // Strikethrough on the session label — soft
+                            // close visual cue mirroring the dimmer
+                            // history palette in the C# build's history
+                            // data template.
+                            .child(
+                                div()
+                                    .flex_grow()
+                                    .truncate()
+                                    .font(theme::font_mono())
+                                    .text_color(label_color)
+                                    .line_through()
+                                    .child(row.label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .ml(px(8.0))
+                                    .text_size(px(10.0))
+                                    .text_color(ts_color)
+                                    .font(theme::font_mono())
+                                    .child(relative),
+                            );
+                        project_and_worktree_rows.push(history_row.into_any_element());
+                    }
+                }
             }
         }
 
