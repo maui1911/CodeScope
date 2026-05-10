@@ -20,6 +20,7 @@ pub mod crash_log;
 pub mod git;
 pub mod layout;
 pub mod memory_watchdog;
+pub mod opencode_telemetry;
 pub mod paths;
 pub mod pi_telemetry;
 pub mod pr;
