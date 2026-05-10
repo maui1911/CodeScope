@@ -252,6 +252,38 @@ impl ProjectsConfig {
     pub fn project(&self, id: &str) -> Option<&Project> {
         self.projects.iter().find(|p| p.id == id)
     }
+
+    /// Return the index of the first project whose path normalises to
+    /// the same value as `path`. Used by the "Add project" dialog to
+    /// reject duplicates before mutating state. The match is path-
+    /// normalised (trailing separators stripped, Windows backslashes
+    /// folded to `/`, case-insensitive) so the same folder reached
+    /// via different spellings is treated as already added. Mirrors
+    /// the C# `SessionStore.AddProjectAsync` duplicate check, which
+    /// runs against `Path.GetFullPath` of both sides.
+    pub fn find_project_index_by_path(&self, path: &str) -> Option<usize> {
+        let needle = normalise_project_path(path);
+        if needle.is_empty() {
+            return None;
+        }
+        self.projects
+            .iter()
+            .position(|p| normalise_project_path(&p.path) == needle)
+    }
+}
+
+/// Normalise a project path for duplicate-detection. Trims trailing
+/// path separators, folds backslashes to forward slashes, and lower-
+/// cases on Windows (Win32 paths are case-insensitive). Pure helper —
+/// extracted so the dialog and the tests can call it directly.
+pub fn normalise_project_path(path: &str) -> String {
+    let trimmed = path.trim().trim_end_matches(['\\', '/']);
+    let unified: String = trimmed.chars().map(|c| if c == '\\' { '/' } else { c }).collect();
+    if cfg!(windows) {
+        unified.to_lowercase()
+    } else {
+        unified
+    }
 }
 
 #[cfg(test)]
@@ -619,6 +651,33 @@ mod tests {
         assert_eq!(s.last_opened.as_deref(), Some("2026-04-01T10:00:00+00:00"));
         assert_eq!(s.agent_session_id.as_deref(), Some("abc-123"));
         assert!(p.worktrees[0].is_primary, "is_primary must survive");
+    }
+
+    #[test]
+    fn normalise_project_path_handles_trailing_separators_and_backslashes() {
+        let canonical = normalise_project_path("C:\\repos\\repo");
+        assert_eq!(normalise_project_path("C:\\repos\\repo\\"), canonical);
+        assert_eq!(normalise_project_path("C:/repos/repo"), canonical);
+        assert_eq!(normalise_project_path("  C:\\repos\\repo  "), canonical);
+    }
+
+    #[test]
+    fn find_project_index_by_path_dedups_across_spellings() {
+        let cfg = ProjectsConfig {
+            version: CURRENT_VERSION,
+            agents: Vec::new(),
+            projects: vec![Project::new("C:\\repos\\repo".into())],
+        };
+        // Trailing slash and forward-slash variants resolve to the
+        // same project; case-insensitive on Windows.
+        assert_eq!(cfg.find_project_index_by_path("C:\\repos\\repo"), Some(0));
+        assert_eq!(cfg.find_project_index_by_path("C:\\repos\\repo\\"), Some(0));
+        assert_eq!(cfg.find_project_index_by_path("C:/repos/repo"), Some(0));
+        if cfg!(windows) {
+            assert_eq!(cfg.find_project_index_by_path("c:\\REPOS\\repo"), Some(0));
+        }
+        assert_eq!(cfg.find_project_index_by_path("C:\\repos\\other"), None);
+        assert_eq!(cfg.find_project_index_by_path(""), None);
     }
 
     /// Load a file containing agent overrides → mutate projects → save

@@ -88,6 +88,37 @@ pub fn add_worktree(
     run_git(repo, &args).map(|_| ())
 }
 
+/// `git clone <url> <name>` from `parent`. Returns the absolute
+/// destination path on success. Mirrors C# `GitService.CloneAsync`,
+/// which is the engine behind the "Clone from URL" mode of the
+/// "Add project" dialog. Stderr from a non-zero exit is propagated
+/// verbatim — `git`'s clone errors ("Repository not found",
+/// "Authentication failed", etc.) read fine in a UI without rewording.
+///
+/// We deliberately do *not* let `git` overwrite an existing destination
+/// directory; a non-empty `<parent>/<name>` short-circuits with a
+/// dedicated error so the caller can render a clearer message than
+/// `git clone`'s "destination path already exists" wording.
+pub fn clone_repo(url: &str, parent: &Path, name: &str) -> Result<std::path::PathBuf> {
+    if !parent.is_dir() {
+        return Err(anyhow!("parent folder does not exist: {}", parent.display()));
+    }
+    let target = parent.join(name);
+    if target.exists() {
+        let mut iter = std::fs::read_dir(&target)
+            .with_context(|| format!("read {}", target.display()))?;
+        if iter.next().is_some() {
+            return Err(anyhow!(
+                "destination already exists and is not empty: {}",
+                target.display()
+            ));
+        }
+    }
+    let target_str = target.to_string_lossy().into_owned();
+    let args = ["clone", url, &target_str];
+    run_git(parent, &args).map(|_| target)
+}
+
 /// `git for-each-ref` for both local heads and remotes — the union
 /// drives the base-branch picker in the "New worktree" dialog. Mirrors
 /// the C# `GitService.ListBranchesAsync`: format
