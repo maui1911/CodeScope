@@ -78,6 +78,16 @@ fn resolve_shell() -> String {
 }
 
 fn main() -> Result<()> {
+    // Spike binary still gets the crash-log panic hook so a fault during
+    // PTY/gpui bring-up lands in `%LOCALAPPDATA%\CodeScope\crash.log`
+    // (or the dev-mode sibling). See `core::crash_log` for the format.
+    let paths = codescope_core::AppPaths::detect();
+    let _ = paths.ensure_dirs();
+    codescope_core::crash_log::install_panic_hook(
+        paths,
+        env!("CODESCOPE_VERSION_DISPLAY").to_string(),
+    );
+
     let app = gpui::Application::new();
 
     app.run(move |cx| {
