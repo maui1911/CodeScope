@@ -19,6 +19,7 @@ pub mod copilot_telemetry;
 pub mod crash_log;
 pub mod git;
 pub mod layout;
+pub mod memory_watchdog;
 pub mod paths;
 pub mod pr;
 pub mod projects;

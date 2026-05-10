@@ -63,6 +63,12 @@ fn main() -> Result<()> {
         env!("CODESCOPE_VERSION_DISPLAY").to_string(),
     );
 
+    // Dev-only memory watchdog — surfaces working-set creep every 5 min
+    // so per-session terminal scrollback regressions don't go unnoticed
+    // during long dev runs (parity with the C# build's
+    // `App/Diagnostics/MemoryWatchdog.cs`). No-op in production.
+    codescope_core::memory_watchdog::start_if_dev(paths.dev_mode);
+
     let settings = match Settings::load(&paths) {
         Ok(s) => s,
         Err(err) => {
