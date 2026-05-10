@@ -387,6 +387,12 @@ pub struct AppShell {
     /// double-clicks are 100 ms+ apart. Anything under 10 ms is
     /// treated as the synthetic echo and ignored.
     last_titlebar_press_at: Option<std::time::Instant>,
+    /// Live telemetry tails, keyed by Claude session id. Entries are
+    /// registered via `register_telemetry` and polled by the background
+    /// task spawned in `AppShell::new`. The accessor
+    /// `telemetry_for(session_id)` exposes the latest snapshot without
+    /// taking a mutable reference.
+    telemetry_tails: HashMap<String, codescope_core::TranscriptTail>,
 }
 
 impl AppShell {
@@ -652,7 +658,9 @@ impl AppShell {
             theme,
             sidebar,
             last_titlebar_press_at: None,
+            telemetry_tails: HashMap::new(),
         };
+        shell.start_telemetry_poll(cx);
         shell.rehydrate_or_cold_start(window, cx);
         shell
     }
@@ -694,6 +702,126 @@ impl AppShell {
         }
         self.layout = on_disk;
     }
+
+    // -----------------------------------------------------------------------
+    // Claude telemetry
+    // -----------------------------------------------------------------------
+
+    /// Register a Claude Code transcript tail for `session_id` under
+    /// `working_directory`.  Safe to call multiple times with the same
+    /// id — the old tail is replaced (e.g. after a session resume that
+    /// kept the same session id).
+    ///
+    /// Mirrors `IClaudeTelemetryService.Register` from the C# build.
+    pub fn register_telemetry(&mut self, session_id: String, working_directory: &str) {
+        // Resolve `~/.claude/projects/`. Without USERPROFILE / HOME a
+        // `unwrap_or_default()` would yield `".claude/projects"`
+        // relative to the CWD — almost always wrong, and confusing
+        // when telemetry silently reads from a path the user doesn't
+        // own. Bail out instead so callers see "no telemetry" rather
+        // than misleading data.
+        let Some(home) = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+        else {
+            eprintln!(
+                "[claude_telemetry] no USERPROFILE / HOME — skipping registration for {session_id}"
+            );
+            return;
+        };
+        let projects_root = std::path::PathBuf::from(home)
+            .join(".claude")
+            .join("projects");
+        let tail = codescope_core::TranscriptTail::for_session(
+            &projects_root,
+            working_directory,
+            &session_id,
+        );
+        self.telemetry_tails.insert(session_id, tail);
+    }
+
+    /// Remove a tail and drop its snapshot. Mirrors `Unregister` in the
+    /// C# build.
+    pub fn unregister_telemetry(&mut self, session_id: &str) {
+        self.telemetry_tails.remove(session_id);
+    }
+
+    /// Return the latest telemetry snapshot for `session_id`, or `None`
+    /// when the session has not been registered or has not yet produced
+    /// any parseable entries.
+    ///
+    /// Callers (e.g. `render_status_bar` in a parallel agent) use this
+    /// accessor to read data without touching the poll state.
+    pub fn telemetry_for(&self, session_id: &str) -> Option<codescope_core::TelemetrySnapshot> {
+        self.telemetry_tails
+            .get(session_id)
+            .and_then(|t| t.snapshot.clone())
+    }
+
+    /// Spawn the background transcript-tail polling loop.
+    ///
+    /// Uses an adaptive interval: 250 ms while any session is busy /
+    /// pending-tool-use; 2 s when all sessions are idle or unknown.
+    /// Mirrors the C# `ClaudeTelemetryService` 250 ms poll (the C#
+    /// build also uses FSWatcher; here we rely on polling only to avoid
+    /// adding the `notify` crate dependency).
+    ///
+    /// Called from `AppShell::new` after the struct is constructed.
+    fn start_telemetry_poll(&self, cx: &mut Context<Self>) {
+        // Adaptive cadence — three rates so we don't burn CPU when
+        // there's nothing to read:
+        //
+        // - 250 ms while any registered tail is in `Busy` /
+        //   `PendingToolUse` (assistant streaming).
+        // - 2 s while at least one tail is registered but every
+        //   snapshot is idle.
+        // - 30 s when there are no tails at all (the "armed-only-
+        //   when-needed" pattern from the C# `RefreshTimerArmed`
+        //   model — we don't fully tear down the task to keep the
+        //   spawn site simple, but we stop hammering the executor).
+        //
+        // The first tick fires after construction is done (avoids the
+        // borrow-at-construction race that `start_dirty_poll` also
+        // guards against).
+        cx.spawn(async move |this, cx| {
+            let mut interval = Duration::from_secs(2);
+            loop {
+                cx.background_executor().timer(interval).await;
+                if this.upgrade().is_none() {
+                    break;
+                }
+                let result = this.update(cx, |this, _cx| {
+                    if this.telemetry_tails.is_empty() {
+                        return Duration::from_secs(30);
+                    }
+                    let mut any_busy = false;
+                    for tail in this.telemetry_tails.values_mut() {
+                        tail.poll();
+                        if matches!(
+                            tail.snapshot.as_ref().map(|s| s.state),
+                            Some(codescope_core::SessionState::Busy)
+                                | Some(codescope_core::SessionState::PendingToolUse)
+                        ) {
+                            any_busy = true;
+                        }
+                    }
+                    if any_busy {
+                        Duration::from_millis(250)
+                    } else {
+                        Duration::from_secs(2)
+                    }
+                });
+                match result {
+                    Ok(next) => interval = next,
+                    Err(_) => break,
+                }
+            }
+        })
+        .detach();
+    }
+
+    // -----------------------------------------------------------------------
+    // Layout persistence
+    // -----------------------------------------------------------------------
 
     /// Build a `RestoreTab` for every currently-open tab. Tabs
     /// without a known working directory are skipped — we'd have
