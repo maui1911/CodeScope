@@ -3251,29 +3251,6 @@ impl Render for AppShell {
             group_panes.push(pane.into_any_element());
         }
 
-        // Sidebar toggle (chevron). 32×32 cell in the caption row,
-        // immediately right of the brand mark. `«` when the sidebar
-        // is visible (click to collapse), `»` when hidden (click to
-        // expand). Pure client-area click — `on_mouse_down` is the
-        // primary path.
-        let toggle_glyph = if self.sidebar_visible { "«" } else { "»" };
-        let sidebar_toggle = div()
-            .id("titlebar-sidebar-toggle")
-            .h(px(40.0))
-            .w(px(32.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_size(px(14.0))
-            .text_color(ink_dim)
-            .cursor_pointer()
-            .hover(move |s| s.bg(frost_hover).text_color(ink))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)),
-            )
-            .child(toggle_glyph);
-
         // ─── Title bar (40 px) ────────────────────────────────────
         // Single row, Chrome / VS Code / Windows Terminal layout:
         // tabs live in the title bar so we don't waste a second
@@ -3302,8 +3279,10 @@ impl Render for AppShell {
         // The padding is itself a drag region so the user can grab
         // the empty bit between the toggle and the first tab to
         // drag the window — same behaviour as the brand-mark.
-        // brand mark + brand wordmark/version label + sidebar toggle.
-        let chrome_left_w = 40.0 + BRAND_LABEL_W + 32.0;
+        // brand mark + brand wordmark/version label. The sidebar
+        // visibility is now keyboard-only (Ctrl+B); the title-bar
+        // chevron has been removed at user request.
+        let chrome_left_w = 40.0 + BRAND_LABEL_W;
         let strip_left_pad_w = if self.sidebar_visible {
             (self.sidebar_width + DIVIDER_VISUAL_WIDTH - chrome_left_w).max(0.0)
         } else {
@@ -3422,7 +3401,6 @@ impl Render for AppShell {
             .bg(theme::elevated(&theme))
             .child(brand_mark)
             .child(brand_label)
-            .child(sidebar_toggle)
             .child(strip_left_pad)
             .child(tab_strip_inline)
             .child(caption_controls);
