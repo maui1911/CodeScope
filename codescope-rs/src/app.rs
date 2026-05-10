@@ -1628,13 +1628,31 @@ impl AppShell {
         // Reload-then-mutate-then-save mirrors the pattern around
         // `allocate_session_id` / `soft_close_session`: a sidebar
         // write between two of ours can otherwise clobber the
-        // sessions array.
+        // sessions array. Bail on load failure rather than mutating
+        // a stale snapshot and persisting it on top of newer disk
+        // state — surfaces the failure as a toast so the user sees
+        // the row stay in the history disclosure instead of silently
+        // racing the on-disk file.
         match ProjectsConfig::load(&self.paths) {
             Ok(cfg) => {
                 self.projects = cfg;
             }
             Err(err) => {
                 eprintln!("warning: failed to reload projects.json before reopen: {err:#}");
+                // `{err:#}` matches the rest of the toast surface
+                // (e.g. the agent-launch error path) — pretty-formats
+                // the full anyhow error chain so the user sees the
+                // root cause, not just the outer "could not read"
+                // wrapper.
+                self.push_toast(
+                    ToastKind::Err,
+                    SharedString::from("Reopen failed"),
+                    Some(SharedString::from(format!(
+                        "Could not read projects.json: {err:#}"
+                    ))),
+                    cx,
+                );
+                return;
             }
         }
         let restored = match SessionManager::reopen(
@@ -1656,10 +1674,13 @@ impl AppShell {
         // frame as the new tab opens. Without this push the sidebar
         // would still see the row in its `closed_at = Some(_)` state
         // until the next sidebar-side mutation (add/remove project)
-        // refreshes the snapshot.
+        // refreshes the snapshot. `cx.notify()` inside the update
+        // forces a redraw — `Sidebar::replace_projects` is data-only
+        // and does not notify on its own.
         let projects_for_sidebar = self.projects.clone();
-        self.sidebar.update(cx, |sidebar, _| {
+        self.sidebar.update(cx, |sidebar, cx| {
             sidebar.replace_projects(projects_for_sidebar);
+            cx.notify();
         });
 
         // Build a working SessionDescriptor for the spawn. The shell
@@ -1674,7 +1695,36 @@ impl AppShell {
             Vec::new(),
         );
         let working_directory = std::path::PathBuf::from(&descriptor.working_directory);
-        let title: SharedString = descriptor.title.clone().into();
+
+        // Prefer the same `<Project> · <branch>` convention plain
+        // worktree clicks produce — falling back to the descriptor's
+        // own title (display_name → branch → id) only when the
+        // project / branch pair can't be resolved. An explicit
+        // `display_name` override on the persisted row still wins
+        // (descriptor's `for_session` already tries that first), so
+        // user-renamed sessions come back with their custom name.
+        let title: SharedString = if restored.display_name.is_some() {
+            descriptor.title.clone().into()
+        } else {
+            // Single sidebar snapshot for both lookups so they share
+            // the same in-memory state and we don't pay the entity
+            // borrow twice for one decision.
+            let sidebar = self.sidebar.read(cx);
+            let project_name = sidebar
+                .projects()
+                .projects
+                .iter()
+                .find(|p| p.sessions.iter().any(|s| s.id == restored.id))
+                .map(|p| p.name.clone());
+            let branch_label = sidebar
+                .git_status_for(&descriptor.working_directory)
+                .map(|g| g.branch.clone())
+                .or_else(|| restored.branch.clone());
+            match (project_name, branch_label) {
+                (Some(p), Some(b)) => format!("{p} · {b}").into(),
+                _ => descriptor.title.clone().into(),
+            }
+        };
 
         // `agent_id` → auto-type command. Only the `claude*` family
         // round-trips today; future agent profiles can extend this
