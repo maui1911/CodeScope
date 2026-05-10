@@ -2888,18 +2888,18 @@ impl AppShell {
         if !app_mod || mods.alt {
             return;
         }
-        // Bindings match Windows Terminal / VS Code so users have
-        // the muscle memory: Ctrl+Shift+T new tab, Ctrl+Shift+W
-        // close. Plain Ctrl+T / Ctrl+W stay with the shell (`yank`
-        // / `unix-word-rubout` in readline, transpose-words in
-        // PSReadLine) — the View deliberately leaves the shifted
-        // variants for us to pick up.
+        // Bindings mirror C#'s `MainWindow.InputBindings`: Ctrl+T new
+        // tab, Ctrl+W close tab, Ctrl+Tab / Ctrl+Shift+Tab cycle,
+        // Ctrl+1..9 jump, Ctrl+\ split. Ctrl+Shift+T / Ctrl+Shift+W
+        // are kept as alternates — they never collide with shell
+        // word-shortcuts, so power users typing in readline /
+        // PSReadLine can still hit the chord without rebinding.
         match key {
-            "t" if mods.shift => {
+            "t" => {
                 cx.stop_propagation();
                 self.spawn_tab(window, cx);
             }
-            "w" if mods.shift => {
+            "w" => {
                 cx.stop_propagation();
                 let g = self.focused_group;
                 let group = self.focused_group();

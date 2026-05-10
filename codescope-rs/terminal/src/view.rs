@@ -762,11 +762,17 @@ fn is_app_level_shortcut(key: &str, mods: &gpui::Modifiers) -> bool {
     {
         return true;
     }
-    // Ctrl+Shift+T / Ctrl+Shift+W — explicit "always" bindings that
-    // never conflict with anything readline-shaped. Plain Ctrl+T /
-    // Ctrl+W would clash with the shell's word/transpose, so the
-    // app-shell uses the shifted variants by convention.
-    if mods.shift && (key == "t" || key == "w") {
+    // Ctrl+T (new tab), Ctrl+W (close tab) — both shifted and
+    // unshifted bubble. C# `MainWindow.InputBindings` binds plain
+    // Ctrl+T / Ctrl+W to NewSession / CloseTab, so for parity we
+    // hand the chord to the app shell. Shift variants stay as
+    // long-standing alternates so muscle memory keeps working.
+    if key == "t" || key == "w" {
+        return true;
+    }
+    // Ctrl+\ / Ctrl+| (split right). C# binds `OemPipe` (Ctrl+|);
+    // on US layouts that's Shift+\, so we accept both shapes.
+    if key == "\\" {
         return true;
     }
     false
@@ -898,6 +904,96 @@ impl Render for TerminalView {
             root = root.cursor_pointer();
         }
         root.child(canvas_element)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_app_level_shortcut;
+    use gpui::Modifiers;
+
+    fn ctrl() -> Modifiers {
+        Modifiers {
+            control: true,
+            ..Default::default()
+        }
+    }
+
+    fn ctrl_shift() -> Modifiers {
+        Modifiers {
+            control: true,
+            shift: true,
+            ..Default::default()
+        }
+    }
+
+    fn ctrl_alt() -> Modifiers {
+        Modifiers {
+            control: true,
+            alt: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ctrl_t_bubbles_to_app_shell() {
+        // C# `MainWindow.InputBindings` binds Ctrl+T → NewSession.
+        // Mirror that on the Rust side.
+        assert!(is_app_level_shortcut("t", &ctrl()));
+        assert!(is_app_level_shortcut("t", &ctrl_shift()));
+    }
+
+    #[test]
+    fn ctrl_w_bubbles_to_app_shell() {
+        assert!(is_app_level_shortcut("w", &ctrl()));
+        assert!(is_app_level_shortcut("w", &ctrl_shift()));
+    }
+
+    #[test]
+    fn ctrl_tab_and_shift_tab_bubble() {
+        assert!(is_app_level_shortcut("tab", &ctrl()));
+        assert!(is_app_level_shortcut("tab", &ctrl_shift()));
+    }
+
+    #[test]
+    fn ctrl_digit_bubbles_only_for_one_through_nine() {
+        for d in '1'..='9' {
+            let key = d.to_string();
+            assert!(is_app_level_shortcut(&key, &ctrl()), "digit {d}");
+        }
+        // Ctrl+0 stays with the shell — C# doesn't bind it either.
+        assert!(!is_app_level_shortcut("0", &ctrl()));
+    }
+
+    #[test]
+    fn ctrl_backslash_bubbles_for_split() {
+        // Both bare Ctrl+\ and the shifted Ctrl+| variant land here
+        // with `key == "\\"` on US layouts; Ctrl+| is what C# binds.
+        assert!(is_app_level_shortcut("\\", &ctrl()));
+        assert!(is_app_level_shortcut("\\", &ctrl_shift()));
+    }
+
+    #[test]
+    fn alt_chord_stays_with_terminal() {
+        // Alt+Left/Right etc. are app-level for group focus, but
+        // they aren't app-level *here* — gpui delivers them at the
+        // window root, not via terminal bubbling.
+        assert!(!is_app_level_shortcut("left", &ctrl_alt()));
+    }
+
+    #[test]
+    fn ctrl_c_v_stay_with_terminal() {
+        // Copy / paste are handled inside the terminal (selection
+        // semantics + bracketed paste), not bubbled to AppShell.
+        assert!(!is_app_level_shortcut("c", &ctrl()));
+        assert!(!is_app_level_shortcut("v", &ctrl()));
+    }
+
+    #[test]
+    fn unmodified_keys_stay_with_terminal() {
+        let plain = Modifiers::default();
+        assert!(!is_app_level_shortcut("t", &plain));
+        assert!(!is_app_level_shortcut("a", &plain));
     }
 }
 
