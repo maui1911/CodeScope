@@ -600,6 +600,57 @@ impl TranscriptTail {
     }
 }
 
+/// Drop the `claude-` prefix and the `[1m]` extended-context suffix
+/// so the status-bar model column reads `opus-4-7` rather than
+/// `claude-opus-4-7[1m]`. Empty input falls back to "claude" so the
+/// column never goes blank.
+///
+/// Mirrors the human-readable output of C#
+/// `AgentProfile.DisplayName` for Claude profiles.
+pub fn model_display_name(model: &str) -> String {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return "claude".into();
+    }
+    let stripped = trimmed.strip_prefix("claude-").unwrap_or(trimmed);
+    let bracket = stripped.find('[').unwrap_or(stripped.len());
+    stripped[..bracket].trim_end_matches('-').to_owned()
+}
+
+/// Format a token count as `N`, `N.Mk`, `Mk`, `N.MM`, or `N.MM` so
+/// the status bar stays readable at large context windows. Mirrors
+/// C# `MainViewModel.FormatTokens`.
+pub fn format_tokens(n: u64) -> String {
+    if n < 10_000 {
+        return n.to_string();
+    }
+    if n < 1_000_000 {
+        let k = n as f64 / 1_000.0;
+        if k < 100.0 {
+            return format!("{k:.1}k");
+        }
+        return format!("{}k", k.round() as u64);
+    }
+    let m = n as f64 / 1_000_000.0;
+    if m < 10.0 {
+        format!("{m:.2}M")
+    } else {
+        format!("{m:.1}M")
+    }
+}
+
+/// Format `0.0..=1.0` as `"3%"` / `"6.2%"` / `"87%"`. Mirrors C#
+/// `MainViewModel.StatusTokensPercentText` rounding rules: one
+/// decimal under 10%, integer rounding above.
+pub fn format_context_pct(pct: f32) -> String {
+    let p = (pct * 100.0).clamp(0.0, 999.0);
+    if p >= 10.0 {
+        format!("{:.0}%", p.round())
+    } else {
+        format!("{p:.1}%")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -966,5 +1017,77 @@ mod tests {
             TranscriptTail::format_duration(Duration::from_secs(60)),
             "1:00"
         );
+    }
+
+    // --- model_display_name ---
+
+    #[test]
+    fn model_display_name_strips_claude_prefix_and_bracket_tag() {
+        assert_eq!(model_display_name("claude-opus-4-7[1m]"), "opus-4-7");
+        assert_eq!(model_display_name("claude-sonnet-4-6"), "sonnet-4-6");
+    }
+
+    #[test]
+    fn model_display_name_handles_no_prefix() {
+        assert_eq!(model_display_name("custom-model"), "custom-model");
+    }
+
+    #[test]
+    fn model_display_name_empty_falls_back_to_claude() {
+        assert_eq!(model_display_name(""), "claude");
+        assert_eq!(model_display_name("   "), "claude");
+    }
+
+    // --- format_tokens ---
+
+    #[test]
+    fn format_tokens_under_10k_uses_raw() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(123), "123");
+        assert_eq!(format_tokens(9_999), "9999");
+    }
+
+    #[test]
+    fn format_tokens_10k_to_100k_uses_one_decimal_k() {
+        assert_eq!(format_tokens(10_000), "10.0k");
+        assert_eq!(format_tokens(12_345), "12.3k");
+        assert_eq!(format_tokens(99_999), "100.0k");
+    }
+
+    #[test]
+    fn format_tokens_100k_to_1m_uses_integer_k() {
+        assert_eq!(format_tokens(123_456), "123k");
+        assert_eq!(format_tokens(999_999), "1000k");
+    }
+
+    #[test]
+    fn format_tokens_over_1m_uses_decimal_m() {
+        assert_eq!(format_tokens(1_000_000), "1.00M");
+        assert_eq!(format_tokens(1_234_567), "1.23M");
+        assert_eq!(format_tokens(12_345_678), "12.3M");
+    }
+
+    // --- format_context_pct ---
+
+    #[test]
+    fn format_context_pct_under_10_uses_one_decimal() {
+        assert_eq!(format_context_pct(0.0), "0.0%");
+        assert_eq!(format_context_pct(0.062), "6.2%");
+        assert_eq!(format_context_pct(0.099), "9.9%");
+    }
+
+    #[test]
+    fn format_context_pct_at_or_above_10_rounds_to_int() {
+        assert_eq!(format_context_pct(0.1), "10%");
+        assert_eq!(format_context_pct(0.873), "87%");
+        assert_eq!(format_context_pct(0.999), "100%");
+    }
+
+    #[test]
+    fn format_context_pct_clamps_above_one() {
+        // Defensive: TelemetrySnapshot already clamps but the formatter
+        // shouldn't blow up if a caller hands it 1.5.
+        assert_eq!(format_context_pct(1.5), "150%");
+        assert_eq!(format_context_pct(99.0), "999%");
     }
 }

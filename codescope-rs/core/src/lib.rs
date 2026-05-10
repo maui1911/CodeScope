@@ -26,6 +26,7 @@ pub mod window_state;
 pub use claude_discovery::{AdoptionCandidate, POLL_INTERVAL_MS as CLAUDE_DISCOVERY_POLL_MS};
 pub use claude_telemetry::{
     SessionState, TelemetrySnapshot, TranscriptTail, context_window_for_model, encode_cwd,
+    format_context_pct, format_tokens, model_display_name,
 };
 pub use layout::{LayoutState, RestoreTab};
 pub use paths::AppPaths;

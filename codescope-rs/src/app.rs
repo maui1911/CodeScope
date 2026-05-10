@@ -47,6 +47,7 @@ use codescope_terminal::{
     TerminalView,
 };
 use gpui::StatefulInteractiveElement;
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
     KeyDownEvent, MouseButton, ParentElement, Render, SharedString, Styled, Window, WindowBounds,
@@ -2094,50 +2095,257 @@ impl AppShell {
         )
     }
 
-    /// Build the bottom status bar. 32 px tall, two clusters: the
-    /// active tab's title truncates on the left as a flex-grow span,
-    /// and the right cluster surfaces the workspace summary
-    /// (`N worktrees · M dirty`), an optional `N groups` label
-    /// (only when more than one group), and the tab counter,
-    /// separated by 1×14 vertical rules.
+    /// Build the bottom status bar. 32 px tall, two clusters mirroring
+    /// the C# `StatusBarView`:
     ///
-    /// Mirrors the C# `StatusBarView` skeleton; the slots that
-    /// depend on data we don't have yet (session context dot +
-    /// branch + halo, git numstat / ahead-behind, model / tokens /
-    /// turns / agent rollup, notifications bell) land with their
-    /// respective polling / telemetry / notification PRs.
+    /// - **Left cluster** — session context dot (green = idle, amber =
+    ///   busy / pending tool use) + branch name from
+    ///   [`Sidebar::git_status_for`]; git diff `+N −N` (white added,
+    ///   dim removed, "changes" fallback when only untracked files
+    ///   are present); remote ahead/behind (`↑N` / `↓N` / `↑N ↓N`).
+    ///   Hidden entirely on tabs with no working directory (e.g.
+    ///   plain pwsh launched without a project).
+    /// - **Right cluster** — Claude transcript-derived slots (model,
+    ///   tokens + percent, turn count, last turn duration), agent
+    ///   rollup `N busy · M idle` across all adopted Claude tabs,
+    ///   optional `N groups` label, workspace summary, and the
+    ///   notifications bell with a 4 px unread dot.
+    ///
+    /// Data sources: [`Sidebar::git_status_for`] (branch + numstat +
+    /// ahead/behind), [`AppShell::telemetry_for`] (per-session model
+    /// / tokens / turns / state), [`Sidebar::worktree_counts`]
+    /// (workspace summary), [`AppShell::notifications`] (bell + dot).
     fn render_status_bar(
         &self,
         theme: &Arc<Theme>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        // ─── Inputs ──────────────────────────────────────────────
         let group_count = self.groups.len();
         let focused_group = self.focused_group();
         let tab_count = focused_group.tabs.len();
-        let active_tab = focused_group.active_tab;
-        let active_title: Option<SharedString> = focused_group
-            .tabs
-            .get(active_tab)
-            .map(|t| t.title.clone());
+        let active_tab_idx = focused_group.active_tab;
+        let active_tab = focused_group.tabs.get(active_tab_idx);
 
-        // ─── Right cluster pieces ────────────────────────────────
-        // Mirrors the C# `StatusBarView` right cluster, *minus* the
-        // telemetry-driven slots (model, tokens, turns, agent
-        // rollup) and the notifications bell — those land when the
-        // Claude transcript tail and the notifications subsystem
-        // come online. For now we ship the bits whose data already
-        // exists in `AppShell` / `Sidebar`:
-        //   - group count (only when there's more than one group,
-        //     same conditional as C#'s `StatusGroupCountVisible`)
-        //   - workspace summary: `N worktrees · M dirty`, fed by
-        //     `Sidebar::worktree_counts`. Dirty-segment hides when
-        //     no worktree is currently dirty (matches C#'s
-        //     `StatusDirtyVisible`).
-        // The active-tab title takes the left cluster as a
-        // truncating flex-grow span until session/branch/git-state
-        // pollers exist to populate the proper left cluster.
-        let (worktree_total, worktree_dirty) =
-            self.sidebar.read(cx).worktree_counts();
+        let active_working_dir: Option<String> = active_tab
+            .and_then(|t| t.working_directory.as_ref())
+            .map(|p| p.to_string_lossy().into_owned());
+        let active_session_id: Option<String> = active_tab
+            .and_then(|t| t.adopted_session_id.clone());
+        let active_title: Option<SharedString> = active_tab.map(|t| t.title.clone());
+
+        let (git, worktree_total, worktree_dirty) = {
+            let sidebar = self.sidebar.read(cx);
+            let g = active_working_dir
+                .as_deref()
+                .and_then(|p| sidebar.git_status_for(p))
+                .cloned();
+            let (t, d) = sidebar.worktree_counts();
+            (g, t, d)
+        };
+
+        let snapshot = active_session_id
+            .as_deref()
+            .and_then(|sid| self.telemetry_for(sid));
+        let (agent_busy, agent_idle) = self.agent_rollup_counts();
+
+        // ─── Theme tokens ───────────────────────────────────────
+        let ink = theme::ink(theme);
+        let ink_dim = theme::ink_dim(theme);
+        let ink_muted = theme::ink_muted(theme);
+        let divider_clr = theme::divider(theme);
+        let accent = theme::accent(theme);
+        // Signal.Ok / Signal.Warn from DesignTokens.xaml.
+        let signal_ok = gpui::Hsla { h: 158.0 / 360.0, s: 0.66, l: 0.50, a: 1.0 };
+        let signal_warn = gpui::Hsla { h: 0.0, s: 1.0, l: 0.671, a: 1.0 };
+
+        // ─── Helpers ────────────────────────────────────────────
+        let sep = move || div().w_px().h(px(14.0)).bg(divider_clr);
+
+        // ─── Left cluster ───────────────────────────────────────
+        let session_dot_color = match snapshot.as_ref().map(|s| s.state) {
+            Some(codescope_core::SessionState::Busy)
+            | Some(codescope_core::SessionState::PendingToolUse) => signal_warn,
+            _ => signal_ok,
+        };
+        let branch_text: Option<SharedString> = git
+            .as_ref()
+            .map(|g| g.branch.clone().into())
+            .or_else(|| active_title.clone());
+        let session_cluster = branch_text.as_ref().map(|branch| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .w(px(6.0))
+                        .h(px(6.0))
+                        .rounded_full()
+                        .bg(session_dot_color),
+                )
+                .child(
+                    div()
+                        .text_color(ink)
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .child(branch.clone()),
+                )
+        });
+
+        // Git diff segment — only when we have a `GitStatus` snapshot
+        // and either a numstat result or `has_changes` (untracked-only
+        // fallback). Mirrors `StatusHasDiffStats` in the C#.
+        let diff_segment = git.as_ref().and_then(|g| {
+            if g.added == 0 && g.removed == 0 && !g.has_changes {
+                return None;
+            }
+            let mut row = div().flex().flex_row().items_center().gap(px(4.0));
+            if g.added > 0 {
+                row = row.child(div().text_color(ink).child(format!("+{}", g.added)));
+            }
+            if g.removed > 0 {
+                row = row
+                    .child(div().text_color(ink_dim).child(format!("\u{2212}{}", g.removed)));
+            }
+            if g.added == 0 && g.removed == 0 && g.has_changes {
+                row = row.child(div().text_color(ink_dim).child("changes"));
+            }
+            Some(row)
+        });
+
+        // Remote sync ↑/↓ — only when we have an upstream and a delta.
+        let ahead_behind_text: Option<String> = git.as_ref().and_then(|g| {
+            if !g.has_upstream {
+                return None;
+            }
+            match (g.ahead, g.behind) {
+                (0, 0) => None,
+                (a, 0) => Some(format!("\u{2191}{a}")),
+                (0, b) => Some(format!("\u{2193}{b}")),
+                (a, b) => Some(format!("\u{2191}{a} \u{2193}{b}")),
+            }
+        });
+        let remote_segment = ahead_behind_text.map(|t| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .text_color(ink)
+                .child(t)
+        });
+
+        // ─── Right cluster (telemetry-driven) ───────────────────
+        let model_label = snapshot
+            .as_ref()
+            .and_then(|s| s.model.as_deref())
+            .map(codescope_core::model_display_name);
+        let model_segment = model_label.map(|m| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0))
+                .text_color(ink_muted)
+                .child(div().text_color(ink_muted).child("\u{25C6}"))
+                .child(m)
+        });
+
+        let tokens_segment = snapshot.as_ref().filter(|s| s.tokens_used > 0).map(|s| {
+            let used = codescope_core::format_tokens(s.tokens_used);
+            let mut row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .text_color(ink)
+                        .child(used),
+                )
+                .child(div().text_color(ink_dim).child("tok"));
+            if let Some(pct) = s.context_pct {
+                let pct_text = codescope_core::format_context_pct(pct);
+                row = row.child(div().text_color(ink_dim).child(pct_text));
+            }
+            row
+        });
+
+        let turns_segment = snapshot.as_ref().filter(|s| s.turn_count > 0).map(|s| {
+            let suffix = if s.turn_count == 1 { "turn" } else { "turns" };
+            div()
+                .text_color(ink_dim)
+                .child(format!("{} {}", s.turn_count, suffix))
+        });
+
+        let duration_segment = snapshot
+            .as_ref()
+            .and_then(|s| s.last_turn_duration)
+            .map(|d| {
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .text_color(ink_dim)
+                    .child(div().text_color(ink_muted).child("\u{25CB}"))
+                    .child(codescope_core::TranscriptTail::format_duration(d))
+            });
+
+        let agent_summary_visible = agent_busy + agent_idle > 0;
+        let agent_segment = if agent_summary_visible {
+            Some(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.0))
+                            .child(
+                                div()
+                                    .w(px(6.0))
+                                    .h(px(6.0))
+                                    .rounded_full()
+                                    .bg(signal_warn),
+                            )
+                            .child(
+                                div()
+                                    .text_color(ink)
+                                    .child(format!("{}", agent_busy)),
+                            )
+                            .child(div().text_color(ink_dim).child("busy")),
+                    )
+                    .child(div().text_color(ink_dim).child("·"))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.0))
+                            .child(
+                                div()
+                                    .w(px(6.0))
+                                    .h(px(6.0))
+                                    .rounded_full()
+                                    .bg(signal_ok),
+                            )
+                            .child(
+                                div()
+                                    .text_color(ink)
+                                    .child(format!("{}", agent_idle)),
+                            )
+                            .child(div().text_color(ink_dim).child("idle")),
+                    ),
+            )
+        } else {
+            None
+        };
+
         let group_label = if group_count > 1 {
             Some(format!("{} groups", group_count))
         } else {
@@ -2146,22 +2354,7 @@ impl AppShell {
         let tab_label = if tab_count == 0 {
             "no tabs".to_string()
         } else {
-            format!("tab {}/{}", active_tab + 1, tab_count)
-        };
-        let title_text: SharedString = active_title
-            .unwrap_or_else(|| SharedString::from("(empty group)"));
-
-        let ink = theme::ink(theme);
-        let ink_dim = theme::ink_dim(theme);
-        let divider_clr = theme::divider(theme);
-
-        // 1×14 vertical separator between right-cluster items.
-        // Same colour and proportions as the C# `SbSep` style.
-        let sep = move || {
-            div()
-                .w_px()
-                .h(px(14.0))
-                .bg(divider_clr)
+            format!("tab {}/{}", active_tab_idx + 1, tab_count)
         };
 
         // Workspace summary — `N worktrees · M dirty`. The middle
@@ -2184,43 +2377,129 @@ impl AppShell {
                 .child(div().child(format!("{} dirty", worktree_dirty)));
         }
 
+        // ─── Bell button ─────────────────────────────────────────
+        let has_unread = self.notifications.has_unread();
+        let bell_btn = div()
+            .id("status-bell-btn")
+            .relative()
+            .w(px(22.0))
+            .h(px(22.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(move |s| s.bg(gpui::Hsla { h: 0.0, s: 0.0, l: 1.0, a: 0.08 }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.notifications.toggle();
+                    cx.notify();
+                }),
+            )
+            // Bell glyph — fall back to a unicode symbol since we don't
+            // ship vector icons. The C# uses an SVG path; the unicode
+            // bell ringer (U+1F514) is a close visual stand-in at this
+            // size and stays inside the design-tokens font stack.
+            .child(div().text_color(ink_muted).text_size(px(13.0)).child("\u{1F514}"))
+            .when(has_unread, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top(px(2.0))
+                        .right(px(2.0))
+                        .w(px(4.0))
+                        .h(px(4.0))
+                        .rounded_full()
+                        .bg(accent),
+                )
+            });
+
         // ─── Bar ─────────────────────────────────────────────────
-        // 32 px tall (matches C# `<Border Height="32">`), 12 px
-        // horizontal padding, 1 px top divider, elevated bg.
         let mut bar = div()
             .h(px(32.0))
             .flex()
             .flex_row()
             .items_center()
             .px(px(12.0))
-            .gap(px(14.0))
+            .gap(px(10.0))
             .border_t_1()
             .border_color(divider_clr)
             .bg(theme::elevated(theme))
             .text_size(px(11.5))
             .text_color(ink_dim);
 
-        // Left cluster — active tab title (placeholder for the
-        // session-context cluster the C# build shows once we have
-        // branch / git-state data).
-        bar = bar.child(
-            div()
-                .flex_grow()
-                .truncate()
-                .text_color(ink)
-                .child(title_text),
-        );
-
-        // Right cluster — workspace summary, optional group count,
-        // tab counter. Each pair is separated by a 1×14 vertical
-        // rule; the rules collapse together with their items
-        // (group-count rule only renders when there's >1 group).
-        bar = bar.child(workspace_summary).child(sep());
-        if let Some(gl) = group_label {
-            bar = bar.child(div().child(gl)).child(sep());
+        // Left cluster: session dot + branch, then optional git diff,
+        // then optional ahead/behind. A truncating spacer pushes the
+        // right cluster all the way to the edge.
+        if let Some(seg) = session_cluster {
+            bar = bar.child(seg);
+        } else {
+            // Empty-state — show the active tab title (or "(empty
+            // group)") so the left side isn't blank when no
+            // working_directory has yet been resolved.
+            let title_text: SharedString = active_title
+                .unwrap_or_else(|| SharedString::from("(empty group)"));
+            bar = bar.child(div().truncate().text_color(ink).child(title_text));
         }
+        if let Some(seg) = diff_segment {
+            bar = bar.child(sep()).child(seg);
+        }
+        if let Some(seg) = remote_segment {
+            bar = bar.child(sep()).child(seg);
+        }
+        // Flexible spacer between left and right clusters.
+        bar = bar.child(div().flex_grow());
+
+        // Right cluster — model · tokens · turns · duration ·
+        // agent rollup · group count · workspace summary · bell.
+        if let Some(seg) = model_segment {
+            bar = bar.child(seg);
+        }
+        if let Some(seg) = tokens_segment {
+            bar = bar.child(sep()).child(seg);
+        }
+        if let Some(seg) = turns_segment {
+            bar = bar.child(sep()).child(seg);
+        }
+        if let Some(seg) = duration_segment {
+            bar = bar.child(sep()).child(seg);
+        }
+        if let Some(seg) = agent_segment {
+            bar = bar.child(sep()).child(seg);
+        }
+        if let Some(gl) = group_label {
+            bar = bar.child(sep()).child(div().child(gl));
+        }
+        bar = bar.child(sep()).child(workspace_summary);
         bar = bar.child(div().child(tab_label));
+        bar = bar.child(sep()).child(bell_btn);
         bar
+    }
+
+    /// Walk every tab across every group and count adopted Claude
+    /// sessions by activity state. Mirrors C#'s `StatusAgentBusy` /
+    /// `StatusAgentIdle`. Tabs without an `adopted_session_id`
+    /// (plain pwsh, or Claude tabs whose `.jsonl` hasn't surfaced
+    /// yet) don't contribute to either count.
+    fn agent_rollup_counts(&self) -> (u32, u32) {
+        let mut busy = 0;
+        let mut idle = 0;
+        for group in &self.groups {
+            for tab in &group.tabs {
+                let Some(sid) = tab.adopted_session_id.as_deref() else {
+                    continue;
+                };
+                let Some(snap) = self.telemetry_for(sid) else { continue };
+                match snap.state {
+                    codescope_core::SessionState::Busy
+                    | codescope_core::SessionState::PendingToolUse => busy += 1,
+                    codescope_core::SessionState::Idle => idle += 1,
+                    codescope_core::SessionState::Unknown => {}
+                }
+            }
+        }
+        (busy, idle)
     }
 
     /// Push a toast onto the top of the floating stack. Each kind
