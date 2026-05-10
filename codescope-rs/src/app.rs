@@ -46,7 +46,6 @@ use codescope_terminal::{
     Backend, ColorPalette, CursorStylePreset, FontConfig, Shell, SpawnConfig, TerminalSize,
     TerminalView,
 };
-use gpui::ClickEvent;
 use gpui::StatefulInteractiveElement;
 use gpui::{
     AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
@@ -158,7 +157,33 @@ const MIN_GROUP_WEIGHT: f32 = 0.15;
 /// Width of the actual splitter hit-target. Wider than the painted
 /// 1px divider so the user can actually grab it without pixel-perfect
 /// aiming.
+/// Width of the splitter / sidebar-handle / strip-divider hit zone
+/// in pixels. The hit zone is wider than the visible line so the
+/// user can grab the divider without pixel-perfect aiming. Layout
+/// itself uses `DIVIDER_VISUAL_WIDTH`; the extra width comes from
+/// an absolute-positioned overlay centered on the visible line that
+/// extends `(HIT - VISUAL) / 2` pixels into each adjacent pane.
 const SPLITTER_HIT_WIDTH: f32 = 6.0;
+
+/// Visible width of the splitter / sidebar-handle / strip-divider
+/// line. Kept at 1 px for a clean, single-pixel rule between panes;
+/// the hit area is enlarged to `SPLITTER_HIT_WIDTH` via an absolute-
+/// positioned overlay div nested inside the splitter / sidebar-handle
+/// element (search for `cursor_col_resize` in `render` /
+/// `render_group` to find them — there are no named helpers, the
+/// overlays are inlined where they're built). Layout math
+/// (`strip_left_pad_w`, alignment between tab-strip dividers and
+/// pane splitters, `begin_splitter_drag`'s sidebar-pixels subtraction)
+/// uses *this* width so both rows divide the same horizontal extent
+/// by the same `weight` factor.
+const DIVIDER_VISUAL_WIDTH: f32 = 1.0;
+
+/// Width of the right-side caption-controls cluster in the title
+/// bar (split + min + max + close, each 46 px). The rightmost
+/// group's tab strip reserves this much space at its right edge so
+/// tabs don't slide *under* the absolute-positioned buttons when
+/// the user drags a divider hard right.
+const CAPTION_CTRLS_W: f32 = 4.0 * 46.0;
 
 /// One on-screen toast — short status notification anchored bottom-
 /// right of the window. Mirrors C# `ToastHost` shape (Ok / Err /
@@ -347,6 +372,21 @@ pub struct AppShell {
     /// Left rail. Lives behind a feature flag in the layout state —
     /// hidden when the user collapses the sidebar (later).
     sidebar: Entity<Sidebar>,
+    /// Timestamp of the most recent left-mouse-down inside any of the
+    /// title-bar drag regions. Used to detect titlebar double-clicks
+    /// while filtering out the *synthetic* `WM_NCLBUTTONDOWN` event
+    /// our own `start_drag` posts: when we `PostMessageW(WM_NCLBUTTONDOWN,
+    /// HTCAPTION)` the OS turns it back into a non-client mouse-down
+    /// that gpui re-dispatches through our listener stack with
+    /// `click_count` already bumped to 2 (gpui's `ClickState` treats
+    /// the synthetic press as a continuation of the real click).
+    /// That would otherwise toggle maximize on every single click and
+    /// no-op on every real double-click. We discriminate by
+    /// time-delta from the previous press: synthetic events arrive
+    /// in the same message-loop tick (sub-millisecond), real human
+    /// double-clicks are 100 ms+ apart. Anything under 10 ms is
+    /// treated as the synthetic echo and ignored.
+    last_titlebar_press_at: Option<std::time::Instant>,
 }
 
 impl AppShell {
@@ -499,25 +539,40 @@ impl AppShell {
         // longest possible lifetime) so an idle app barely wakes
         // for this. Keeps the floating stack auto-clearing without
         // burning watts when there's nothing on screen.
+        //
+        // **Timer first, update second.** Calling `this.update(...)`
+        // as the very first thing in a freshly-spawned foreground
+        // task can race the in-flight startup borrow (window open
+        // + first render path) and trip a `RefCell already
+        // borrowed` panic. Sleeping for `TOAST_POLL_IDLE` up front
+        // gets us safely past construction; subsequent ticks then
+        // do `update → check → adjust interval → timer → update`
+        // in that order so we never `update` immediately after
+        // entering the loop body.
         cx.spawn(async move |this, cx| {
+            let mut interval = TOAST_POLL_IDLE;
             loop {
-                let interval = match this.update(cx, |this, _| this.toasts.is_empty()) {
-                    Ok(true) => TOAST_POLL_IDLE,
-                    Ok(false) => TOAST_POLL,
-                    Err(_) => break,
-                };
                 cx.background_executor().timer(interval).await;
                 if this.upgrade().is_none() {
                     break;
                 }
-                let _ = this.update(cx, |this, cx| {
+                let result = this.update(cx, |this, cx| {
                     let now = Instant::now();
                     let before = this.toasts.len();
                     this.toasts.retain(|t| t.expires_at > now);
                     if this.toasts.len() != before {
                         cx.notify();
                     }
+                    if this.toasts.is_empty() {
+                        TOAST_POLL_IDLE
+                    } else {
+                        TOAST_POLL
+                    }
                 });
+                match result {
+                    Ok(next) => interval = next,
+                    Err(_) => break,
+                }
             }
         })
         .detach();
@@ -592,6 +647,7 @@ impl AppShell {
             settings,
             theme,
             sidebar,
+            last_titlebar_press_at: None,
         };
         shell.rehydrate_or_cold_start(window, cx);
         shell
@@ -1100,14 +1156,17 @@ impl AppShell {
         // feel that we ignore them here). Total weight is the sum of
         // all current weights.
         let viewport: f32 = window.viewport_size().width.into();
-        // The sidebar wrapper takes `sidebar_width` plus the 6 px
+        // The sidebar wrapper takes `sidebar_width` plus the 1 px
         // resize handle that sits between sidebar and work area;
-        // both are gone when collapsed. Subtracting the handle here
-        // (and not just the sidebar) keeps `px_per_unit` accurate so
-        // a group-splitter drag tracks the cursor 1:1 instead of
-        // drifting by 6 px after the first move.
+        // both are gone when collapsed. We subtract `DIVIDER_VISUAL_WIDTH`
+        // (not `SPLITTER_HIT_WIDTH`) here because the handle's flex
+        // contribution to the layout is just the visible line — the
+        // 6 px hit zone is an absolute overlay that doesn't displace
+        // adjacent content. Using the wrong constant would shave 5
+        // extra pixels off `work_width` and the splitter drag would
+        // drift relative to the cursor.
         let sidebar_pixels = if self.sidebar_visible {
-            self.sidebar_width + SPLITTER_HIT_WIDTH
+            self.sidebar_width + DIVIDER_VISUAL_WIDTH
         } else {
             0.0
         };
@@ -1867,6 +1926,7 @@ impl Render for AppShell {
         // overlapping the immutable borrow `self.groups.iter()` would
         // otherwise extend across the rest of `render`.
         let focused_group_idx = self.focused_group;
+        let total_groups = self.groups.len();
         let groups_meta: Vec<GroupRenderData> = self
             .groups
             .iter()
@@ -1876,6 +1936,7 @@ impl Render for AppShell {
                 group_id: group.id,
                 active_tab: group.active_tab,
                 is_focused: g_idx == focused_group_idx,
+                is_last_group: g_idx + 1 == total_groups,
                 weight: self.group_weights.get(g_idx).copied().unwrap_or(1.0),
                 tabs: group
                     .tabs
@@ -1894,63 +1955,8 @@ impl Render for AppShell {
             })
             .collect();
 
-        // The drag region fills the gap between the strips and the
-        // caption controls so the user can grab the bar to move the
-        // window. `window_control_area(Drag)` annotates the hitbox so
-        // Windows hit-tests it as `HTCAPTION` — that gets us native
-        // drag, snap-layouts, and *correct* double-click toggle
-        // (maximize ↔ restore) for free. We deliberately don't attach
-        // an `on_mouse_down(start_window_move)` or
-        // `on_click(zoom_window)` here on Windows: both fight the
-        // native NC handling. `zoom_window()` in particular is
-        // `SW_MAXIMIZE`-only on Windows (no toggle), so wiring it
-        // would maximize on click and never restore.
-        //
-        // Caption-row drag region. On Windows we issue the
-        // `ReleaseCapture` + `WM_NCLBUTTONDOWN(HTCAPTION)` pair
-        // ourselves (see `win32_titlebar`) — gpui's
-        // `WindowControlArea::Drag` is supposed to map to HTCAPTION
-        // via the hit-test callback but doesn't fire reliably for
-        // our windows. Double-click toggles maximize via the same
-        // module; the OS animates and snap-integrates the way it
-        // does for any HTCAPTION drag.
-        //
-        // On Wayland / X11 the compositor needs `start_window_move`
-        // because there's no NC-area hit-test model. Keep the gpui
-        // path there; macOS gets the cocoa equivalent for free.
-        let drag_region = {
-            let base = div()
-                .id("titlebar-drag")
-                .flex_grow()
-                .h(px(32.0))
-                .window_control_area(WindowControlArea::Drag);
-            #[cfg(target_os = "windows")]
-            let base = base
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|_, _, window, _| crate::win32_titlebar::start_drag(window)),
-                )
-                .on_click(cx.listener(|_, event: &ClickEvent, window, _| {
-                    if event.click_count() >= 2 {
-                        crate::win32_titlebar::toggle_maximize(window);
-                    }
-                }));
-            #[cfg(not(target_os = "windows"))]
-            let base = base
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|_, _, window, _| window.start_window_move()),
-                )
-                .on_click(cx.listener(|_, event: &ClickEvent, window, _| {
-                    if event.click_count() >= 2 {
-                        window.zoom_window();
-                    }
-                }));
-            base
-        };
-
         // Caption controls: minimise, maximise/restore, close.
-        // 46×32 hitboxes hugging the right edge of the caption row.
+        // 46×40 hitboxes hugging the right edge of the caption row.
         //
         // On Windows the `WindowControlArea::*` annotations + the
         // gpui NC-mouse-up handler give us a *correct* maximize ↔
@@ -1971,7 +1977,7 @@ impl Render for AppShell {
         let caption_base = move |id: &'static str, area: WindowControlArea, glyph: &'static str| {
             div()
                 .id(id)
-                .h(px(32.0))
+                .h(px(40.0))
                 .w(px(46.0))
                 .flex()
                 .items_center()
@@ -1996,20 +2002,36 @@ impl Render for AppShell {
         let close_btn = caption_base("titlebar-close", WindowControlArea::Close, "✕")
             .hover(move |s| s.bg(close_hover_bg).text_color(ink));
 
+        // The Win32 paths (`minimize` / `toggle_maximize` / `close` in
+        // `win32_titlebar`) all post via `PostMessageW` — async,
+        // non-blocking, no synchronous WndProc re-entry — so the
+        // re-entrant-borrow problem `start_drag` had with `SendMessage`
+        // doesn't apply here. The `window.defer` is kept anyway for
+        // consistency with the title-bar drag region (which *does*
+        // need it because `WM_NCLBUTTONDOWN(HTCAPTION)` enters the
+        // OS's modal NC drag loop on the next pump iteration) and as
+        // insurance against any future change to the win32 helper
+        // that swaps `PostMessageW` for a synchronous send.
         #[cfg(target_os = "windows")]
         let minimize_btn = minimize_btn.on_mouse_down(
             MouseButton::Left,
-            cx.listener(|_, _, window, _| crate::win32_titlebar::minimize(window)),
+            cx.listener(|_, _, window, cx| {
+                window.defer(cx, |window, _| crate::win32_titlebar::minimize(window));
+            }),
         );
         #[cfg(target_os = "windows")]
         let maximize_btn = maximize_btn.on_mouse_down(
             MouseButton::Left,
-            cx.listener(|_, _, window, _| crate::win32_titlebar::toggle_maximize(window)),
+            cx.listener(|_, _, window, cx| {
+                window.defer(cx, |window, _| crate::win32_titlebar::toggle_maximize(window));
+            }),
         );
         #[cfg(target_os = "windows")]
         let close_btn = close_btn.on_mouse_down(
             MouseButton::Left,
-            cx.listener(|_, _, window, _| crate::win32_titlebar::close(window)),
+            cx.listener(|_, _, window, cx| {
+                window.defer(cx, |window, _| crate::win32_titlebar::close(window));
+            }),
         );
 
         #[cfg(not(target_os = "windows"))]
@@ -2034,7 +2056,7 @@ impl Render for AppShell {
         // primary click path on every platform.
         let split_btn = div()
             .id("titlebar-split")
-            .h(px(32.0))
+            .h(px(40.0))
             .w(px(46.0))
             .flex()
             .items_center()
@@ -2083,7 +2105,7 @@ impl Render for AppShell {
         let accent_clr = theme::accent(&theme);
         let brand_mark = div()
             .w(px(40.0))
-            .h(px(32.0))
+            .h(px(40.0))
             .flex()
             .items_center()
             .justify_center()
@@ -2124,32 +2146,53 @@ impl Render for AppShell {
                 // wider interactive splitter so the user can grab it
                 // without pixel-perfect aiming.
                 let split_idx = col_idx - 1;
+                // Strip divider — single-pixel rule. Matches the
+                // visual width of the work-area splitter below
+                // (which is also 1 px visible plus a 6 px absolute
+                // hit overlay) so column boundaries in the tab
+                // strip and the splitters between panes line up
+                // pixel-for-pixel.
                 strip_sections.push(
                     div()
-                        .w_px()
+                        .w(px(DIVIDER_VISUAL_WIDTH))
                         .h_full()
                         .bg(divider_color)
                         .into_any_element(),
                 );
+                // Splitter between two panes. Visually a single-
+                // pixel rule painted in `divider_color`, with a
+                // 6 px transparent hit-target overlaid on top so
+                // the user can grab it without pixel-perfect
+                // aiming. The overlay is absolute-positioned and
+                // *extends beyond* the 1 px line into the adjacent
+                // panes — that's the only way to get a wider grab
+                // zone without making the visible line itself
+                // wider (which would show two seams of canvas
+                // colour around the line, the symptom the user
+                // reported).
+                let hit_overhang = (SPLITTER_HIT_WIDTH - DIVIDER_VISUAL_WIDTH) / 2.0;
                 let splitter = div()
                     .id(("group-splitter", split_idx as u64))
-                    .w(px(SPLITTER_HIT_WIDTH))
+                    .relative()
+                    .w(px(DIVIDER_VISUAL_WIDTH))
                     .h_full()
-                    .flex()
-                    .flex_row()
-                    .justify_center()
-                    .cursor_col_resize()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            this.begin_splitter_drag(split_idx, event.position.x, window, cx);
-                        }),
-                    )
-                    // 1 px painted line, vertically centred inside the
-                    // 6 px hit-target. Keeps the visual identical to
-                    // the strip divider above so columns line up.
-                    .child(div().w_px().h_full().bg(divider_color));
+                    .bg(divider_color)
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left(px(-hit_overhang))
+                            .w(px(SPLITTER_HIT_WIDTH))
+                            .h_full()
+                            .cursor_col_resize()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    this.begin_splitter_drag(split_idx, event.position.x, window, cx);
+                                }),
+                            ),
+                    );
                 group_panes.push(splitter.into_any_element());
             }
             let (strip, pane) = self.render_group(&theme, &gmeta, cx);
@@ -2165,7 +2208,7 @@ impl Render for AppShell {
         let toggle_glyph = if self.sidebar_visible { "«" } else { "»" };
         let sidebar_toggle = div()
             .id("titlebar-sidebar-toggle")
-            .h(px(32.0))
+            .h(px(40.0))
             .w(px(32.0))
             .flex()
             .items_center()
@@ -2180,13 +2223,94 @@ impl Render for AppShell {
             )
             .child(toggle_glyph);
 
-        // ─── Caption row (32 px) ──────────────────────────────────
-        // Holds all chrome elements. Sits ABOVE the strip row so the
-        // strip and the work area below it share the same horizontal
-        // extent — that's what keeps strip-column dividers aligned
-        // with the splitters between panes.
+        // ─── Title bar (40 px) ────────────────────────────────────
+        // Single row, Chrome / VS Code / Windows Terminal layout:
+        // tabs live in the title bar so we don't waste a second
+        // chrome row.
+        //
+        // Caption controls (split, min, max, close) are
+        // **absolute-positioned** in the top-right corner instead of
+        // being normal flex children. Reason: the per-group tab
+        // strips need to span the *same horizontal extent* as the
+        // panes below them so column-dividers line up with
+        // splitters — both sides have to divide the same total
+        // width by the same `weight` factor. If the caption
+        // controls were inline flex children they'd eat ~184 px from
+        // the right of the tab area, the tab strips would compute
+        // off a shorter total, and dividers would drift left of the
+        // splitters. Floating them on top means the rightmost
+        // group's strip extends to the window edge (its trailing
+        // whitespace just sits visually under the caption controls);
+        // tab/"+" content normally lives well to the left of the
+        // overlap so it stays clickable.
+        //
+        // `strip_left_pad` keeps the *left* side of the tab area
+        // aligned with the *left* side of the work area (panes start
+        // at `sidebar_width + handle`). When the sidebar is collapsed
+        // the padding is zero so tabs sit flush against the toggle.
+        // The padding is itself a drag region so the user can grab
+        // the empty bit between the toggle and the first tab to
+        // drag the window — same behaviour as the brand-mark.
+        let chrome_left_w = 40.0 + 32.0; // brand + sidebar_toggle
+        let strip_left_pad_w = if self.sidebar_visible {
+            (self.sidebar_width + DIVIDER_VISUAL_WIDTH - chrome_left_w).max(0.0)
+        } else {
+            0.0
+        };
+        // Drag spots route through `handle_titlebar_press` for
+        // shared single-vs-double-click discrimination.
+        let strip_left_pad = div()
+            .id("titlebar-strip-pad")
+            .w(px(strip_left_pad_w))
+            .h_full()
+            .window_control_area(WindowControlArea::Drag)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    this.handle_titlebar_press(event, window, cx);
+                }),
+            );
+        let brand_mark = brand_mark.id("titlebar-brand").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                this.handle_titlebar_press(event, window, cx);
+            }),
+        );
+        let tab_strip_inline = div()
+            .flex()
+            .flex_row()
+            .flex_grow()
+            .h_full()
+            .children(strip_sections);
+        // Right-side caption-controls cluster — absolute-positioned
+        // so it overlays the rightmost portion of the tab area
+        // without consuming flex width. See the long comment above
+        // for the alignment rationale.
+        //
+        // Opaque `bg(elevated)` so any tab content from the
+        // rightmost group's strip that bleeds underneath (when the
+        // user drags a divider hard right and tabs no longer fit in
+        // the reduced strip) is hidden behind the buttons instead
+        // of poking through. The reserve+overflow_hidden inside the
+        // last-group strip is the *primary* clip; this opaque
+        // overlay is the safety net for the cases gpui's flex
+        // layout doesn't fully shrink the inner content past its
+        // children's `min_w`.
+        let caption_controls = div()
+            .absolute()
+            .top_0()
+            .right_0()
+            .h(px(40.0))
+            .flex()
+            .flex_row()
+            .bg(theme::elevated(&theme))
+            .child(split_btn)
+            .child(minimize_btn)
+            .child(maximize_btn)
+            .child(close_btn);
         let caption_row = div()
-            .h(px(32.0))
+            .relative()
+            .h(px(40.0))
             .flex()
             .flex_row()
             .border_b_1()
@@ -2194,39 +2318,9 @@ impl Render for AppShell {
             .bg(theme::elevated(&theme))
             .child(brand_mark)
             .child(sidebar_toggle)
-            .child(drag_region)
-            .child(split_btn)
-            .child(minimize_btn)
-            .child(maximize_btn)
-            .child(close_btn);
-
-        // ─── Strip row (40 px) ────────────────────────────────────
-        // Mirrors the body row's left side exactly so strip columns
-        // line up with their panes. When the sidebar is visible the
-        // padding equals `sidebar_width + handle (6)`; when collapsed
-        // it's zero so the strip extends edge-to-edge just like the
-        // work area below.
-        let strip_left_pad_w = if self.sidebar_visible {
-            px(self.sidebar_width + SPLITTER_HIT_WIDTH)
-        } else {
-            px(0.0)
-        };
-        let tab_strip = div()
-            .h(px(40.0))
-            .flex()
-            .flex_row()
-            .border_b_1()
-            .border_color(theme::divider(&theme))
-            .bg(theme::elevated(&theme))
-            .child(div().w(strip_left_pad_w).h_full())
-            .child(
-                div()
-                    .flex_grow()
-                    .flex()
-                    .flex_row()
-                    .h_full()
-                    .children(strip_sections),
-            );
+            .child(strip_left_pad)
+            .child(tab_strip_inline)
+            .child(caption_controls);
 
         let work_area = div()
             .flex_grow()
@@ -2241,22 +2335,32 @@ impl Render for AppShell {
         // 6 px right-edge handle is the resize hit-target — same
         // width / cursor / drag pattern as the group splitter.
         let sidebar_drag_color = theme::divider(&theme);
+        // Sidebar resize handle — same single-pixel-with-wide-hit
+        // overlay pattern as the group splitter. See the long
+        // comment on `splitter` for the rationale.
+        let sidebar_hit_overhang = (SPLITTER_HIT_WIDTH - DIVIDER_VISUAL_WIDTH) / 2.0;
         let sidebar_handle = div()
             .id("sidebar-resize-handle")
-            .w(px(SPLITTER_HIT_WIDTH))
+            .relative()
+            .w(px(DIVIDER_VISUAL_WIDTH))
             .h_full()
-            .flex()
-            .flex_row()
-            .justify_center()
-            .cursor_col_resize()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
-                    cx.stop_propagation();
-                    this.begin_sidebar_drag(event.position.x, cx);
-                }),
-            )
-            .child(div().w_px().h_full().bg(sidebar_drag_color));
+            .bg(sidebar_drag_color)
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(px(-sidebar_hit_overhang))
+                    .w(px(SPLITTER_HIT_WIDTH))
+                    .h_full()
+                    .cursor_col_resize()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.begin_sidebar_drag(event.position.x, cx);
+                        }),
+                    ),
+            );
 
         let main_row = if self.sidebar_visible {
             div()
@@ -2313,7 +2417,6 @@ impl Render for AppShell {
             .bg(theme::canvas(&theme))
             .text_color(theme::ink(&theme))
             .child(caption_row)
-            .child(tab_strip)
             .child(main_row)
             .child(self.render_status_bar(&theme))
             .children(self.render_tab_menu(&theme, cx))
@@ -2339,6 +2442,13 @@ struct GroupRenderData {
     group_id: u64,
     active_tab: usize,
     is_focused: bool,
+    /// True for the rightmost group in the workspace. The strip for
+    /// the last group reserves the trailing
+    /// `CAPTION_CTRLS_W` pixels for the absolute-positioned caption
+    /// controls (split / min / max / close) and clips its tab/"+"
+    /// content with `overflow_hidden` so tabs can't slide *under*
+    /// the buttons when the user drags a divider hard right.
+    is_last_group: bool,
     /// Flex weight for this group's column; mapped to `flex_grow` on
     /// both the strip section and the pane below so they stay
     /// column-aligned. `1.0` = equal share, `1.5` = 1.5× a sibling at
@@ -2353,6 +2463,60 @@ impl AppShell {
     /// pair so `render` can interleave dividers between adjacent
     /// groups while keeping the strip and the pane below it in the
     /// same column.
+
+    /// Handle a left-press on any of the title-bar drag regions
+    /// (brand mark, strip-left padding, per-group trailing
+    /// whitespace). Discriminates real human clicks from the
+    /// *synthetic* `WM_NCLBUTTONDOWN` echo our own `start_drag` posts:
+    ///
+    /// 1. Sub-10 ms after the previous press ⇒ synthetic, ignore.
+    /// 2. 10–500 ms after the previous press ⇒ real double-click,
+    ///    toggle maximize.
+    /// 3. Otherwise ⇒ first press of a real click sequence, start
+    ///    the OS drag (or window-move on non-Windows).
+    ///
+    /// On non-Windows there's no synthetic echo because we use
+    /// `start_window_move` instead of `PostMessage`, but the same
+    /// time-delta logic still gives us double-click → zoom_window.
+    #[allow(unused_variables)]
+    fn handle_titlebar_press(
+        &mut self,
+        event: &gpui::MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let now = std::time::Instant::now();
+        let prev = self.last_titlebar_press_at;
+        self.last_titlebar_press_at = Some(now);
+
+        if let Some(prev_t) = prev {
+            let dt = now.duration_since(prev_t);
+            if dt < std::time::Duration::from_millis(10) {
+                // Synthetic echo from our own PostMessage(WM_NCLBUTTONDOWN).
+                // Roll the timestamp back so a *real* second click
+                // measures from the original press, not from the echo.
+                self.last_titlebar_press_at = Some(prev_t);
+                return;
+            }
+            if dt < std::time::Duration::from_millis(500) {
+                #[cfg(target_os = "windows")]
+                window.defer(cx, |window, _| {
+                    crate::win32_titlebar::toggle_maximize(window);
+                });
+                #[cfg(not(target_os = "windows"))]
+                window.zoom_window();
+                return;
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        window.defer(cx, |window, _| {
+            crate::win32_titlebar::start_drag(window);
+        });
+        #[cfg(not(target_os = "windows"))]
+        window.start_window_move();
+    }
+
     fn render_group(
         &self,
         theme: &Arc<Theme>,
@@ -2510,6 +2674,41 @@ impl AppShell {
         // because gpui's chainable `.flex_grow()` only sets the value
         // to 1.0 — we need arbitrary weights for the column layout.
         let target_group_id = group_id;
+        // Empty trailing region inside the strip. Doubles as a drag
+        // region in the merged title bar — the rightmost group's
+        // trailing whitespace is the gap under the caption controls,
+        // and intermediate groups' trailing whitespace is the
+        // "between tabs and next group's divider" gap. Annotated as
+        // `WindowControlArea::Drag` and wired with the same Win32
+        // start_drag + double-click→toggle_maximize handlers as the
+        // brand-mark/strip_left_pad drag spots.
+        // Drag-region wiring routes through `handle_titlebar_press`,
+        // which time-discriminates real clicks from the synthetic
+        // `WM_NCLBUTTONDOWN` echo our own `start_drag` posts. See
+        // that method for the full rationale.
+        let trailing_drag = div()
+            .id(("strip-trailing", group_id))
+            .flex_grow()
+            .h_full()
+            .window_control_area(WindowControlArea::Drag)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    this.handle_titlebar_press(event, window, cx);
+                }),
+            );
+        // For the rightmost group we wrap the tab content (tabs +
+        // "+" + trailing drag) in an inner flex-row with
+        // `overflow_hidden`, then add a fixed-width transparent
+        // reserve sibling whose width matches the caption-controls
+        // cluster. The reserve sits exactly under the absolute-
+        // positioned caption controls; the inner content area is
+        // therefore bounded to `strip_width - CAPTION_CTRLS_W` and
+        // any overflow (when the user drags a divider hard right and
+        // tabs no longer fit) is clipped at the buttons' left edge
+        // instead of bleeding under them. Non-last groups don't need
+        // this — their right edge is the divider before the next
+        // group, well clear of the caption-controls overlay.
         let mut strip = div()
             .id(("group-strip", group_id))
             .h_full()
@@ -2533,12 +2732,30 @@ impl AppShell {
                         cx,
                     );
                 }),
-            )
-            .children(tabs)
-            .child(new_tab_button)
-            // Empty trailing region — gives the user something to
-            // click for "focus this group" without hitting a tab.
-            .child(div().flex_grow().h_full());
+            );
+        if gmeta.is_last_group {
+            let mut content = div()
+                .h_full()
+                .flex()
+                .flex_row()
+                .overflow_hidden()
+                .children(tabs)
+                .child(new_tab_button)
+                .child(trailing_drag);
+            content.style().flex_grow = Some(1.0);
+            content.style().flex_basis = Some(gpui::Length::Definite(px(0.0).into()));
+            content.style().min_size.width = Some(gpui::Length::Definite(px(0.0).into()));
+            let reserve = div()
+                .w(px(CAPTION_CTRLS_W))
+                .h_full()
+                .flex_shrink_0();
+            strip = strip.child(content).child(reserve);
+        } else {
+            strip = strip
+                .children(tabs)
+                .child(new_tab_button)
+                .child(trailing_drag);
+        }
         strip.style().flex_grow = Some(gmeta.weight);
         strip.style().flex_basis = Some(gpui::Length::Definite(px(0.0).into()));
 

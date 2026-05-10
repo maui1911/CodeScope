@@ -26,8 +26,8 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    HTCAPTION, IsZoomed, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SW_SHOWNORMAL,
-    SendMessageW, WM_NCLBUTTONDOWN, WM_SYSCOMMAND,
+    HTCAPTION, IsZoomed, PostMessageW, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE,
+    SW_SHOWNORMAL, WM_NCLBUTTONDOWN, WM_SYSCOMMAND,
 };
 use windows::core::HSTRING;
 
@@ -43,29 +43,46 @@ fn hwnd(window: &Window) -> Option<HWND> {
 }
 
 /// Start a window drag from a press on the title bar. Mirrors the
-/// `ReleaseCapture` + `SendMessage(WM_NCLBUTTONDOWN, HTCAPTION, …)`
-/// pattern Microsoft documents for custom-titlebar apps.
+/// `ReleaseCapture` + `WM_NCLBUTTONDOWN(HTCAPTION)` pattern
+/// Microsoft documents for custom-titlebar apps, but uses
+/// `PostMessageW` instead of `SendMessageW`.
+///
+/// **Why post, not send.** `SendMessageW(WM_NCLBUTTONDOWN, HTCAPTION)`
+/// from the same thread that owns the window is *synchronous*: it
+/// calls our `WndProc` directly, which `DefWindowProc` handles by
+/// entering a modal move loop. Inside that loop Windows pumps
+/// queued messages — including gpui's own foreground tasks (toast
+/// timer, dirty poll, settings reload, terminal snapshot drains).
+/// Those tasks call `app.borrow_mut()`, but the App is **already
+/// borrowed** by the dispatch chain that's currently running our
+/// `on_mouse_down` listener. Result: `RefCell already borrowed`
+/// panic on every titlebar drag.
+///
+/// `PostMessageW` queues the message and returns immediately. The
+/// modal move loop kicks in on the next outer message pump
+/// (after the dispatch chain unwinds and the App borrow is
+/// released), so gpui events fired *during* the drag find a clean
+/// borrow state.
 pub fn start_drag(window: &Window) {
     let Some(hwnd) = hwnd(window) else { return };
     unsafe {
-        // Required: tell the OS we're handing off mouse capture so
-        // the subsequent `WM_NCLBUTTONDOWN` actually starts a move
-        // loop instead of just being delivered.
+        // Releasing capture is fine to call synchronously — it's a
+        // simple state flip with no nested message pumping.
         let _ = ReleaseCapture();
-        SendMessageW(
-            hwnd,
+        let _ = PostMessageW(
+            Some(hwnd),
             WM_NCLBUTTONDOWN,
-            Some(WPARAM(HTCAPTION as usize)),
-            Some(LPARAM(0)),
+            WPARAM(HTCAPTION as usize),
+            LPARAM(0),
         );
     }
 }
 
-/// Toggle maximize ↔ restore. `IsZoomed` is the canonical Win32
-/// "is this window maximized?" check; we send `SC_RESTORE` when it
-/// is and `SC_MAXIMIZE` otherwise. Posts as `WM_SYSCOMMAND` so the
-/// OS owns the animation + snap-layout integration instead of us
-/// poking `ShowWindow` directly.
+/// Toggle maximize ↔ restore via `WM_SYSCOMMAND`. `IsZoomed` is the
+/// canonical "is this window maximized?" check; we post
+/// `SC_RESTORE` when it is and `SC_MAXIMIZE` otherwise. Posts so
+/// the message is processed *after* our dispatch chain unwinds —
+/// see `start_drag` for the full reason.
 pub fn toggle_maximize(window: &Window) {
     let Some(hwnd) = hwnd(window) else { return };
     unsafe {
@@ -74,39 +91,39 @@ pub fn toggle_maximize(window: &Window) {
         } else {
             SC_MAXIMIZE
         };
-        SendMessageW(
-            hwnd,
+        let _ = PostMessageW(
+            Some(hwnd),
             WM_SYSCOMMAND,
-            Some(WPARAM(cmd as usize)),
-            Some(LPARAM(0)),
+            WPARAM(cmd as usize),
+            LPARAM(0),
         );
     }
 }
 
-/// Send a `SC_MINIMIZE`. Equivalent to `Window::minimize_window` but
+/// Post `SC_MINIMIZE`. Equivalent to `Window::minimize_window` but
 /// goes through the same `WM_SYSCOMMAND` channel as the rest of the
 /// caption controls so taskbar / animation behavior is consistent.
 pub fn minimize(window: &Window) {
     let Some(hwnd) = hwnd(window) else { return };
     unsafe {
-        SendMessageW(
-            hwnd,
+        let _ = PostMessageW(
+            Some(hwnd),
             WM_SYSCOMMAND,
-            Some(WPARAM(SC_MINIMIZE as usize)),
-            Some(LPARAM(0)),
+            WPARAM(SC_MINIMIZE as usize),
+            LPARAM(0),
         );
     }
 }
 
-/// Send a `SC_CLOSE`. Equivalent to `Window::remove_window`.
+/// Post `SC_CLOSE`. Equivalent to `Window::remove_window`.
 pub fn close(window: &Window) {
     let Some(hwnd) = hwnd(window) else { return };
     unsafe {
-        SendMessageW(
-            hwnd,
+        let _ = PostMessageW(
+            Some(hwnd),
             WM_SYSCOMMAND,
-            Some(WPARAM(SC_CLOSE as usize)),
-            Some(LPARAM(0)),
+            WPARAM(SC_CLOSE as usize),
+            LPARAM(0),
         );
     }
 }
