@@ -89,10 +89,11 @@ enum OpenMenu {
 /// its end).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PrLookup {
-    /// A `detect_pr_url` task is already in flight for this worktree
-    /// — guards against rapid menu re-opens spawning duplicate `gh`
-    /// processes.
-    Pending,
+    /// A `detect_pr_url` task is already in flight for this worktree.
+    /// Records the branch the call was launched against so the
+    /// completion handler can detect a branch-switch-during-fetch and
+    /// drop the now-stale result instead of caching it.
+    Pending { branch: String },
     /// The most recent lookup completed against `branch` and resolved
     /// to `url` (`None` for "no open PR / call failed").
     Resolved { branch: String, url: Option<String> },
@@ -361,6 +362,10 @@ impl Sidebar {
                         if this.dirty_state.len() != prev_len {
                             changed = true;
                         }
+                        // Same prune for the PR URL cache — paths that
+                        // are no longer in any project must drop their
+                        // cached `Resolved` / `Pending` entries.
+                        this.pr_urls.retain(|path, _| known.contains(path));
                         for (path, dirty) in updates {
                             let prev = this.dirty_state.insert(path, dirty);
                             if prev != Some(dirty) {
@@ -682,14 +687,22 @@ impl Sidebar {
         if let Some(branch) = live_branch {
             let needs_fetch = match self.pr_urls.get(&worktree.path) {
                 None => true,
-                Some(PrLookup::Pending) => false,
+                // An in-flight lookup against the *same* branch is
+                // fine — let it complete. If the branch under the
+                // pending fetch differs from the live branch, the
+                // user switched mid-fetch; we'll spawn a fresh task
+                // and the older one will be discarded on completion.
+                Some(PrLookup::Pending { branch: pending }) => *pending != branch,
                 // Branch switched out from under the cached lookup —
                 // refetch. This fixes the "user switched branches and
                 // the menu still shows the old PR / no PR" race.
                 Some(PrLookup::Resolved { branch: cached, .. }) => *cached != branch,
             };
             if needs_fetch {
-                self.pr_urls.insert(worktree.path.clone(), PrLookup::Pending);
+                self.pr_urls.insert(
+                    worktree.path.clone(),
+                    PrLookup::Pending { branch: branch.clone() },
+                );
                 let path = worktree.path.clone();
                 let path_for_task = std::path::PathBuf::from(&path);
                 let branch_for_task = branch.clone();
@@ -700,11 +713,23 @@ impl Sidebar {
                         })
                         .await;
                     let _ = this.update(cx, |this, cx| {
-                        this.pr_urls.insert(
-                            path,
-                            PrLookup::Resolved { branch: branch.clone(), url },
+                        // Branch may have shifted while the gh call
+                        // was running. If the slot we wrote `Pending`
+                        // into has been taken over by another lookup
+                        // (or by a `Resolved` with a different
+                        // branch), drop our result on the floor — the
+                        // newer task will produce a fresher answer.
+                        let still_ours = matches!(
+                            this.pr_urls.get(&path),
+                            Some(PrLookup::Pending { branch: b }) if b == &branch
                         );
-                        cx.notify();
+                        if still_ours {
+                            this.pr_urls.insert(
+                                path,
+                                PrLookup::Resolved { branch: branch.clone(), url },
+                            );
+                            cx.notify();
+                        }
                     });
                 })
                 .detach();
@@ -828,9 +853,29 @@ impl Sidebar {
         worktree_id: &str,
         cx: &mut Context<Self>,
     ) {
-        let path = self.worktree_path(project_idx, worktree_id);
-        if let Some(path) = path
-            && let Some(PrLookup::Resolved { url: Some(url), .. }) = self.pr_urls.get(&path)
+        let Some(path) = self.worktree_path(project_idx, worktree_id) else {
+            self.close_menu(cx);
+            return;
+        };
+        // Re-derive the live branch and only copy when the cached
+        // `Resolved.branch` still matches — if the user switched
+        // branches between render and click the row is about to
+        // disappear on the next open anyway, but a click that already
+        // landed shouldn't paste the wrong URL.
+        let live_branch = self
+            .git_status
+            .get(&path)
+            .map(|s| s.branch.clone())
+            .or_else(|| {
+                self.projects
+                    .projects
+                    .get(project_idx)
+                    .and_then(|p| p.worktrees.iter().find(|wt| wt.id == worktree_id))
+                    .and_then(|wt| wt.branch.clone())
+            });
+        if let (Some(live), Some(PrLookup::Resolved { branch, url: Some(url) })) =
+            (live_branch.as_ref(), self.pr_urls.get(&path))
+            && branch == live
         {
             let url = url.clone();
             cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
@@ -2156,16 +2201,27 @@ impl Sidebar {
                 )
             }))
             // "Copy PR URL" — only when the cached `gh pr list` lookup
-            // resolved to an open PR for this worktree's branch. The
-            // fetch is kicked off in `open_worktree_menu` and lands
-            // asynchronously; until then the row stays hidden so a
-            // half-loaded menu doesn't flash an unusable entry.
+            // resolved to an open PR for this worktree's *current*
+            // branch (live `git_status` first, persisted `branch`
+            // fallback — same logic `open_worktree_menu` uses to
+            // decide whether to refetch). The fetch is kicked off in
+            // `open_worktree_menu` and lands asynchronously; until
+            // then the row stays hidden so a half-loaded menu doesn't
+            // flash an unusable entry, and a stale `Resolved` from a
+            // prior branch is also hidden until the refetch lands.
             // Mirrors C#'s `wt.HasPullRequest`-gated row.
-            .children(
-                self.pr_urls
+            .children({
+                let live_branch = self
+                    .git_status
                     .get(&worktree.path)
-                    .and_then(|lookup| match lookup {
-                        PrLookup::Resolved { url: Some(url), .. } => Some(url),
+                    .map(|s| s.branch.clone())
+                    .or_else(|| worktree.branch.clone());
+                live_branch
+                    .as_ref()
+                    .and_then(|live| match self.pr_urls.get(&worktree.path) {
+                        Some(PrLookup::Resolved { branch, url: Some(url) }) if branch == live => {
+                            Some(url)
+                        }
                         _ => None,
                     })
                     .map(|_url| {
@@ -2178,8 +2234,8 @@ impl Sidebar {
                                 this.copy_worktree_pr_url(project_idx, &id_for_copy_pr, cx);
                             }),
                         )
-                    }),
-            )
+                    })
+            })
             .child({
                 let id_for_remote = worktree_id.clone();
                 item(
