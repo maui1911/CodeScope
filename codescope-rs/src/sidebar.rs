@@ -297,6 +297,32 @@ impl Sidebar {
         &self.paths
     }
 
+    /// Workspace-wide worktree counts for the status bar's right
+    /// cluster. Returns `(total, dirty)`:
+    /// - `total` — every distinct worktree path across every project
+    ///   (primary trees included), de-duplicated so a path that
+    ///   appears in two projects (or as both primary and an explicit
+    ///   `worktrees[]` entry) is only counted once.
+    /// - `dirty` — number of those paths whose `dirty_state` lookup
+    ///   is `Some(true)`. Paths with no recorded state yet (still
+    ///   loading) and `Some(false)` (clean) don't count.
+    pub(crate) fn worktree_counts(&self) -> (usize, usize) {
+        let mut paths: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
+        for project in &self.projects.projects {
+            paths.insert(project.path.as_str());
+            for wt in &project.worktrees {
+                paths.insert(wt.path.as_str());
+            }
+        }
+        let total = paths.len();
+        let dirty = paths
+            .iter()
+            .filter(|p| self.dirty_state.get(**p).copied().unwrap_or(false))
+            .count();
+        (total, dirty)
+    }
+
     /// Commit a freshly-built `ProjectsConfig` into in-memory state
     /// after the dialog has already saved it to disk. Save-then-commit
     /// ordering matches `add_project` / `remove_project`.
