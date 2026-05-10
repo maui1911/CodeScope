@@ -123,10 +123,39 @@ impl SessionManager {
     /// Missing files surface as an empty config, matching
     /// [`ProjectsConfig::load_from`] semantics — the legacy upgrade
     /// path the C# `LoadAsync` walks for first-launch users.
+    ///
+    /// **In-memory only.** Production launch paths should call
+    /// [`Self::load_with_sweep_persisting`] so a sweep that prunes
+    /// rows actually persists, mirroring the C# `LoadAsync`'s
+    /// `if (prunedSessionIds.Count > 0) { await SaveSnapshotAsync(); }`
+    /// finally-block.
     pub fn load_with_sweep(paths: &AppPaths, now_iso: &str) -> Result<ProjectsConfig> {
         let mut cfg = ProjectsConfig::load(paths)?;
         Self::apply_retention(&mut cfg, now_iso, None);
         Ok(cfg)
+    }
+
+    /// Load + sweep + persist when the sweep actually pruned anything.
+    /// Mirrors the C# `SessionStore.LoadAsync` finally-block — without
+    /// the persisting save, expired closed-session rows would linger
+    /// on disk forever even after the in-memory state had dropped them.
+    ///
+    /// Persistence failure is non-fatal: the in-memory state is
+    /// already pruned and is returned as-is so the runtime can
+    /// proceed; the next mutation will retry the save. The error is
+    /// surfaced via the second tuple element so the caller can log
+    /// without aborting startup.
+    pub fn load_with_sweep_persisting(
+        paths: &AppPaths,
+        now_iso: &str,
+    ) -> Result<(ProjectsConfig, Option<anyhow::Error>)> {
+        let mut cfg = ProjectsConfig::load(paths)?;
+        let pruned = Self::apply_retention(&mut cfg, now_iso, None);
+        if pruned.is_empty() {
+            return Ok((cfg, None));
+        }
+        let save_err = save(&cfg, paths).err();
+        Ok((cfg, save_err))
     }
 
     /// Same as [`Self::load_with_sweep`] but reads from an explicit
@@ -951,6 +980,87 @@ mod tests {
         // sweep would early-return on every call.
         let now = now_iso8601();
         assert!(parse_iso8601_secs(&now).is_some(), "produced: {now}");
+    }
+
+    // ---- load + sweep + persist --------------------------------
+
+    #[test]
+    fn load_with_sweep_persisting_writes_back_when_pruning_happens() {
+        // The whole point of the persisting variant: a TTL-expired
+        // closed row that gets pruned in-memory must also disappear
+        // from `projects.json`, otherwise the next launch sees the
+        // same stale row and re-prunes it forever (effectively a
+        // no-op on disk). Mirrors C# `SessionStore.LoadAsync`'s
+        // post-prune `SaveSnapshotAsync`.
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::paths::rooted_for_tests(false, root.path());
+        paths.ensure_dirs().unwrap();
+
+        let mut cfg = ProjectsConfig::default();
+        let mut p = make_project("p1");
+        let mut old = make_session("old", Some("primary"));
+        old.closed_at = Some(iso_days_ago(180));
+        p.sessions.push(old);
+        p.sessions.push(make_session("live", Some("primary")));
+        cfg.projects.push(p);
+        cfg.save(&paths).unwrap();
+
+        let (loaded, save_err) =
+            SessionManager::load_with_sweep_persisting(&paths, fixed_now()).unwrap();
+        assert!(save_err.is_none(), "the save should succeed");
+        let ids: Vec<_> = loaded.projects[0]
+            .sessions
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        assert!(!ids.iter().any(|id| id == "old"));
+        assert!(ids.iter().any(|id| id == "live"));
+
+        // And the on-disk file reflects the prune.
+        let on_disk = ProjectsConfig::load(&paths).unwrap();
+        let disk_ids: Vec<_> = on_disk.projects[0]
+            .sessions
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        assert!(
+            !disk_ids.iter().any(|id| id == "old"),
+            "pruned row must not survive on disk"
+        );
+    }
+
+    #[test]
+    fn load_with_sweep_persisting_skips_save_when_nothing_pruned() {
+        // No-op write when nothing was pruned keeps the file mtime
+        // stable across launches. Useful both for predictable file
+        // timestamps and for skipping a write entirely on the
+        // happy-path startup.
+        let root = tempfile::tempdir().unwrap();
+        let paths = crate::paths::rooted_for_tests(false, root.path());
+        paths.ensure_dirs().unwrap();
+
+        let mut cfg = ProjectsConfig::default();
+        cfg.projects.push(make_project("p1"));
+        cfg.save(&paths).unwrap();
+        let mtime_before = std::fs::metadata(paths.projects_file())
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        // Sleep a tiny amount so a write would *visibly* bump mtime.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let (_loaded, save_err) =
+            SessionManager::load_with_sweep_persisting(&paths, fixed_now()).unwrap();
+        assert!(save_err.is_none());
+
+        let mtime_after = std::fs::metadata(paths.projects_file())
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "no prune ⇒ no rewrite ⇒ file mtime must be unchanged"
+        );
     }
 
     // ---- AppShell ↔ SessionManager persistence wiring ----------
