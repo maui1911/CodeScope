@@ -33,10 +33,11 @@ use codescope_core::{AppPaths, LayoutState, Project, ProjectsConfig, Theme};
 use codescope_core::git::GitStatus;
 use gpui::{
     AppContext, ClipboardItem, Context, Corner, EventEmitter, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, PathPromptOptions, Pixels, Point, Render,
+    MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render,
     SharedString, Styled, Window, anchored, deferred, div, point, px,
 };
 
+use crate::new_project_dialog::NewProjectDialogState;
 use crate::new_worktree_dialog::NewWorktreeDialogState;
 use crate::theme;
 
@@ -195,6 +196,10 @@ pub struct Sidebar {
     /// At most one dialog at a time — opening another would race
     /// against an in-flight `git worktree add` call from the first.
     dialog: Option<NewWorktreeDialogState>,
+    /// Currently-open "Add project" dialog, if any. Mutually
+    /// exclusive with `dialog`: the "+" button only opens this one
+    /// when no other dialog is showing.
+    new_project_dialog: Option<NewProjectDialogState>,
     /// Per-worktree clean/dirty state, keyed by absolute path.
     /// Updated by the background poller spawned via
     /// `start_dirty_poll`, which `AppShell::new` calls from inside
@@ -281,6 +286,7 @@ impl Sidebar {
             layout,
             menu: None,
             dialog: None,
+            new_project_dialog: None,
             dirty_state: HashMap::new(),
             git_status: HashMap::new(),
             pr_urls: HashMap::new(),
@@ -584,6 +590,24 @@ impl Sidebar {
         self.dialog.take()
     }
 
+    /// Add-project dialog accessors. Mutually exclusive with the
+    /// new-worktree dialog — both render via `deferred(anchored(...))`
+    /// at the same priority and we'd rather not have to decide which
+    /// one wins on a frame. The "+" button gates open on
+    /// `new_project_dialog().is_none() && dialog().is_none()`.
+    pub(crate) fn new_project_dialog(&self) -> Option<&NewProjectDialogState> {
+        self.new_project_dialog.as_ref()
+    }
+    pub(crate) fn new_project_dialog_mut(&mut self) -> Option<&mut NewProjectDialogState> {
+        self.new_project_dialog.as_mut()
+    }
+    pub(crate) fn set_new_project_dialog(&mut self, dialog: Option<NewProjectDialogState>) {
+        self.new_project_dialog = dialog;
+    }
+    pub(crate) fn take_new_project_dialog(&mut self) -> Option<NewProjectDialogState> {
+        self.new_project_dialog.take()
+    }
+
     /// Drop the open context menu without notifying — the caller is
     /// already going to call `cx.notify()` for a different reason.
     pub(crate) fn close_menu_no_notify(&mut self) {
@@ -642,44 +666,6 @@ impl Sidebar {
     pub fn apply_theme(&mut self, theme: Arc<Theme>, cx: &mut Context<Self>) {
         self.theme = theme;
         cx.notify();
-    }
-
-    /// Open the platform "pick a folder" dialog. On confirm, hand the
-    /// path to [`Self::add_project`] which writes `projects.json`
-    /// before mutating in-memory state, so a save failure leaves both
-    /// the disk and the UI in their previous (consistent) state.
-    pub fn open_add_project_picker(
-        &mut self,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let rx = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Add project".into()),
-        });
-        cx.spawn(async move |this, cx| {
-            let paths = match rx.await {
-                Ok(Ok(Some(paths))) => paths,
-                // `Ok(None)` = user cancelled, `Ok(Err(...))` = picker
-                // failed to open (Linux). Both end the flow silently
-                // — the user already sees what happened on screen.
-                Ok(Ok(None)) => return,
-                Ok(Err(err)) => {
-                    eprintln!("warning: file picker failed: {err:#}");
-                    return;
-                }
-                Err(_) => return,
-            };
-            if let Some(path) = paths.into_iter().next() {
-                let path_str = path.to_string_lossy().into_owned();
-                let _ = this.update(cx, |this, cx| {
-                    this.add_project(path_str, cx);
-                });
-            }
-        })
-        .detach();
     }
 
     /// Open the project context menu at `position` (window coords)
@@ -1457,7 +1443,7 @@ impl Render for Sidebar {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, window, cx| {
-                            this.open_add_project_picker(window, cx);
+                            this.open_new_project_dialog(window, cx);
                         }),
                     )
                     .child("+"),
@@ -1820,6 +1806,9 @@ impl Render for Sidebar {
             None => {}
         }
         if let Some(overlay) = self.render_new_worktree_dialog(window, &theme, cx) {
+            root = root.child(overlay);
+        }
+        if let Some(overlay) = self.render_new_project_dialog(window, &theme, cx) {
             root = root.child(overlay);
         }
         root

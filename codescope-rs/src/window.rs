@@ -12,6 +12,7 @@
 //!    initial terminal tab and owns everything from there.
 
 mod app;
+mod new_project_dialog;
 mod new_worktree_dialog;
 mod notifications;
 mod sidebar;
