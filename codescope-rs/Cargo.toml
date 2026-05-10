@@ -15,7 +15,7 @@ name = "spike"
 path = "src/main.rs"
 
 [[bin]]
-name = "window"
+name = "codescope-rs"
 path = "src/window.rs"
 
 [[example]]

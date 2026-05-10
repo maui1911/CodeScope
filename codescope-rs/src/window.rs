@@ -1,4 +1,4 @@
-//! `cargo run --bin window` — launches the gpui app shell.
+//! `cargo run --bin codescope-rs` — launches the gpui app shell.
 //!
 //! Boot sequence:
 //!
