@@ -104,7 +104,19 @@ struct Tab {
     /// has written its first jsonl line — and stays `None` for plain
     /// pwsh tabs (no `claude` auto-type). On adoption we register the
     /// telemetry tail; on close we unregister.
+    ///
+    /// Updates again on `/clear` rotations (Claude Code mints a new
+    /// `.jsonl` and a new id under the same encoded-cwd directory).
+    /// In that case the discovery loop unregisters the previous tail
+    /// before swapping in the new id, mirroring C# `WatchHandle._fired`
+    /// + `ApplyAdoption`.
     adopted_session_id: Option<String>,
+    /// Every Claude session id we've already registered telemetry for
+    /// on this tab — i.e. the historical adoption set.  Kept so the
+    /// discovery loop can dedupe when re-scanning after `/clear`
+    /// rotations and avoid registering the same tail twice.  Mirrors
+    /// the C# `WatchHandle._fired` HashSet.
+    fired_session_ids: std::collections::HashSet<String>,
 }
 
 /// One column in the work area: a tab strip + the currently-selected
@@ -851,12 +863,16 @@ impl AppShell {
     /// Spawn the background per-tab Claude session adoption loop.
     ///
     /// Mirrors `ClaudeSessionDiscovery.Watch` from the C# build: every
-    /// 350 ms while at least one tab is awaiting adoption, scan
-    /// `~/.claude/projects/<encoded-cwd>/` for `.jsonl` files written
-    /// at or after the tab's `spawned_at`. On a hit, register the
-    /// telemetry tail and stamp `adopted_session_id` on the tab so
-    /// subsequent ticks skip it. Idle (no Claude tabs awaiting
-    /// adoption) bumps the cadence to 5 s.
+    /// 350 ms while at least one Claude tab is alive, scan
+    /// `~/.claude/projects/<encoded-cwd>/` for `.jsonl` transcripts
+    /// written at or after `spawned_at`. The watch stays armed for
+    /// the tab's full lifetime (`/clear` rotates the session id and
+    /// writes a fresh `.jsonl`; the C# `WatchHandle._fired` HashSet
+    /// remembers paths already fired so each new id triggers exactly
+    /// one re-adoption). On rotation we unregister the previous
+    /// tail before registering the new one so `telemetry_tails`
+    /// doesn't accumulate stale entries. With no Claude tabs the
+    /// cadence drops to 5 s.
     ///
     /// Called from `AppShell::new` after the struct is constructed.
     fn start_claude_discovery_poll(&self, cx: &mut Context<Self>) {
@@ -873,59 +889,86 @@ impl AppShell {
                     let Some(root) = Self::claude_projects_root() else {
                         return idle;
                     };
-                    // Walk every tab, adopt fresh transcripts in place.
-                    // Two-pass (collect candidates, then mutate) keeps
-                    // the borrow rules happy: `register_telemetry`
-                    // takes `&mut self`, so we can't hold a `&mut Tab`
-                    // across the call.
+                    // Two-pass scan/mutate so we can't deadlock on
+                    // `register_telemetry`'s `&mut self` borrow:
+                    // collect candidates first (ids the tab hasn't
+                    // fired yet), then perform the register / un-
+                    // register dance. Keeps the watch alive for the
+                    // tab's full lifetime so `/clear` rotations are
+                    // adopted as new id-paths appear.
                     struct Found {
                         group_idx: usize,
                         tab_idx: usize,
-                        session_id: String,
+                        previous_session_id: Option<String>,
+                        new_session_id: String,
                         working_directory: String,
                     }
                     let mut found = Vec::new();
-                    let mut any_pending = false;
+                    let mut any_active = false;
                     for (g_idx, group) in this.groups.iter().enumerate() {
                         for (t_idx, tab) in group.tabs.iter().enumerate() {
-                            if tab.adopted_session_id.is_some() {
-                                continue;
-                            }
                             if !codescope_core::claude_discovery::is_claude_auto_type(
                                 tab.auto_type.as_ref().map(|s| s.as_ref()),
                             ) {
                                 continue;
                             }
                             let Some(ref wd) = tab.working_directory else { continue };
-                            any_pending = true;
+                            any_active = true;
                             let wd_str = wd.to_string_lossy().into_owned();
-                            let mut hits = codescope_core::claude_discovery::scan(
+                            let hits = codescope_core::claude_discovery::scan(
                                 &root, &wd_str, tab.spawned_at,
                             );
-                            // Multiple hits: keep the lowest-id (any
-                            // deterministic pick will do — we'll
-                            // re-fire on subsequent rotations as the
-                            // file modtimes update).
-                            hits.sort_by(|a, b| a.session_id.cmp(&b.session_id));
-                            if let Some(c) = hits.into_iter().next() {
+                            // Pick the newest unseen candidate by
+                            // last-modified mtime so a `/clear`
+                            // rotation supplants the previous id
+                            // rather than the loop oscillating
+                            // between concurrent transcripts.
+                            let mut newest: Option<(SystemTime, codescope_core::AdoptionCandidate)> = None;
+                            for c in hits {
+                                if tab.fired_session_ids.contains(&c.session_id) {
+                                    continue;
+                                }
+                                let mtime = std::fs::metadata(&c.path)
+                                    .ok()
+                                    .and_then(|m| m.modified().ok())
+                                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                                let take = newest
+                                    .as_ref()
+                                    .map(|(prev, _)| mtime >= *prev)
+                                    .unwrap_or(true);
+                                if take {
+                                    newest = Some((mtime, c));
+                                }
+                            }
+                            if let Some((_, c)) = newest {
                                 found.push(Found {
                                     group_idx: g_idx,
                                     tab_idx: t_idx,
-                                    session_id: c.session_id,
+                                    previous_session_id: tab.adopted_session_id.clone(),
+                                    new_session_id: c.session_id,
                                     working_directory: wd_str,
                                 });
                             }
                         }
                     }
                     for f in found {
-                        this.register_telemetry(f.session_id.clone(), &f.working_directory);
+                        if let Some(prev) = f.previous_session_id.as_deref() {
+                            if prev != f.new_session_id {
+                                this.unregister_telemetry(prev);
+                            }
+                        }
+                        this.register_telemetry(
+                            f.new_session_id.clone(),
+                            &f.working_directory,
+                        );
                         if let Some(group) = this.groups.get_mut(f.group_idx) {
                             if let Some(tab) = group.tabs.get_mut(f.tab_idx) {
-                                tab.adopted_session_id = Some(f.session_id);
+                                tab.adopted_session_id = Some(f.new_session_id.clone());
+                                tab.fired_session_ids.insert(f.new_session_id);
                             }
                         }
                     }
-                    if any_pending {
+                    if any_active {
                         Duration::from_millis(codescope_core::CLAUDE_DISCOVERY_POLL_MS)
                     } else {
                         idle
@@ -1161,6 +1204,7 @@ impl AppShell {
             auto_type: auto_type.clone(),
             spawned_at: SystemTime::now(),
             adopted_session_id: None,
+            fired_session_ids: std::collections::HashSet::new(),
         });
         let new_idx = group.tabs.len() - 1;
         self.activate_tab(group_idx, new_idx, window, cx);

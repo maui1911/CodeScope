@@ -102,8 +102,12 @@ pub fn is_claude_auto_type(auto_type: Option<&str>) -> bool {
 
 /// Recognise a Claude Code session id — the `.jsonl` filename without
 /// extension. The C# build uses `Guid.TryParseExact(id, "D")` which
-/// accepts the `8-4-4-4-12` lowercase-hex form. We mirror that exactly:
-/// 36 chars, ASCII hex digits with hyphens at 8/13/18/23.
+/// accepts the `8-4-4-4-12` UUID form *case-insensitively* (`D`
+/// allows either case for the hex digits). We mirror that: 36 chars,
+/// ASCII hex digits with hyphens at indices 8 / 13 / 18 / 23.
+/// Practical Claude Code transcripts always emit lowercase, but the
+/// validator stays permissive so a manually-renamed file or future
+/// CLI revision keeps working.
 pub fn is_session_id(s: &str) -> bool {
     if s.len() != 36 {
         return false;
