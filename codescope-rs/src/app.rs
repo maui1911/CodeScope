@@ -3302,7 +3302,8 @@ impl Render for AppShell {
         // The padding is itself a drag region so the user can grab
         // the empty bit between the toggle and the first tab to
         // drag the window — same behaviour as the brand-mark.
-        let chrome_left_w = 40.0 + 32.0; // brand + sidebar_toggle
+        // brand mark + brand wordmark/version label + sidebar toggle.
+        let chrome_left_w = 40.0 + BRAND_LABEL_W + 32.0;
         let strip_left_pad_w = if self.sidebar_visible {
             (self.sidebar_width + DIVIDER_VISUAL_WIDTH - chrome_left_w).max(0.0)
         } else {
@@ -3327,6 +3328,56 @@ impl Render for AppShell {
                 this.handle_titlebar_press(event, window, cx);
             }),
         );
+
+        // Brand label + version slug — mirrors the C# title bar's
+        // "CodeScope" wordmark + `V0.2.6` slug pair (MainWindow.xaml
+        // lines 166–184). Sans 16/SemiBold for the wordmark, mono-
+        // ish 10 dim for the slug; the slug is baked at build time
+        // from `git describe --tags --always --dirty` (see build.rs)
+        // so tagging a release flips every consumer automatically.
+        // Both elements participate in the window-drag region so the
+        // user can grab the chrome anywhere along the brand cluster.
+        let version_display: SharedString =
+            format!("V{}", env!("CODESCOPE_VERSION_DISPLAY")).into();
+        // Fixed width keeps the `chrome_left_w` calculation below
+        // predictable so the per-group tab strip dividers can still
+        // line up with the splitters between panes. Long dev-build
+        // slugs (`V0.2.6-52-g…-dirty`) get clipped via
+        // `overflow_hidden` rather than pushing the tabs around.
+        const BRAND_LABEL_W: f32 = 150.0;
+        let brand_label = div()
+            .id("titlebar-brand-label")
+            .w(px(BRAND_LABEL_W))
+            .h(px(40.0))
+            .pl(px(2.0))
+            .pr(px(10.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .overflow_hidden()
+            .window_control_area(WindowControlArea::Drag)
+            .child(
+                div()
+                    .text_size(px(16.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme::ink(&theme))
+                    .child("CodeScope"),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(theme::ink_ghost(&theme))
+                    .truncate()
+                    .child(version_display),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    this.handle_titlebar_press(event, window, cx);
+                }),
+            );
+
         let tab_strip_inline = div()
             .flex()
             .flex_row()
@@ -3368,6 +3419,7 @@ impl Render for AppShell {
             .border_color(theme::divider(&theme))
             .bg(theme::elevated(&theme))
             .child(brand_mark)
+            .child(brand_label)
             .child(sidebar_toggle)
             .child(strip_left_pad)
             .child(tab_strip_inline)
