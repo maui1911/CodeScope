@@ -33,13 +33,14 @@ use crate::pi_telemetry;
 /// `PiSessionDiscovery.PollInterval`.
 pub const POLL_INTERVAL_MS: u64 = 350;
 
-/// Inclusive bound on recursion depth when walking the sessions
-/// root. `walk` is invoked at depth 0 for the root and the guard
+/// Exclusive bound on recursion depth when walking the sessions
+/// root: `walk` is invoked at depth 0 for the root and the guard
 /// rejects calls at `depth >= MAX_RECURSION_DEPTH`, so the deepest
 /// directory ever read from is `MAX_RECURSION_DEPTH - 1` levels below
 /// the root. Pi typically only nests one level
-/// (`<root>/--<cwd>--/<file>.jsonl`) so 4 is plenty, while still
-/// terminating on a stray symlink loop.
+/// (`<root>/--<cwd>--/<file>.jsonl`) so 4 (i.e. up to 3 levels of
+/// nesting below the root) is plenty while still terminating on a
+/// stray symlink loop.
 const MAX_RECURSION_DEPTH: usize = 4;
 
 /// One adoption candidate found in a sessions-root scan.

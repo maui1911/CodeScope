@@ -159,23 +159,24 @@ fn read_yaml_cwd(path: &Path) -> Option<String> {
 /// real `session.start` is rare but does happen during a save race
 /// and shouldn't poison adoption).
 ///
-/// Bounded to the first [`MAX_HEADER_LINES`] lines so a corrupt or
-/// arbitrarily-large file can't turn this peek into a full file
-/// scan.
+/// Bounded to the first [`MAX_HEADER_LINES`] lines (counted as raw
+/// lines read, *including* blank lines) so a corrupt file with a
+/// large whitespace-only prefix can't turn this peek into a full
+/// file scan.
 fn read_session_start_cwd(path: &Path) -> Option<String> {
     use std::io::{BufRead, BufReader};
     const MAX_HEADER_LINES: usize = 5;
     let file = std::fs::File::open(path).ok()?;
     let reader = BufReader::new(file);
-    let mut inspected = 0usize;
+    let mut read = 0usize;
     for line in reader.lines() {
         let Ok(line) = line else { return None };
+        read += 1;
+        if read > MAX_HEADER_LINES {
+            return None;
+        }
         if line.trim().is_empty() {
             continue;
-        }
-        inspected += 1;
-        if inspected > MAX_HEADER_LINES {
-            return None;
         }
         let v: serde_json::Value = match serde_json::from_str(&line) {
             Ok(v) => v,
@@ -269,6 +270,31 @@ mod tests {
 
         let res = scan(tmp.path(), "C:/dev/x", SystemTime::UNIX_EPOCH);
         assert_eq!(res.len(), 1, "got {res:?}");
+    }
+
+    #[test]
+    fn events_jsonl_peek_bounded_by_total_lines_read() {
+        // A pathological file with a large whitespace-only prefix
+        // shouldn't bypass `MAX_HEADER_LINES` — we count *raw* lines
+        // read, not just non-empty ones, so the peek can't turn into
+        // a full file scan.
+        let tmp = TempDir::new().unwrap();
+        let session_dir = tmp.path().join(SID_A);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let mut content = String::new();
+        for _ in 0..50 {
+            content.push('\n');
+        }
+        content.push_str(r#"{"type":"session.start","timestamp":"2026-04-22T08:00:00Z","data":{"sessionId":"x","selectedModel":"gpt-5","context":{"cwd":"C:/dev/x"}}}"#);
+        content.push('\n');
+        std::fs::write(session_dir.join("events.jsonl"), content.as_bytes()).unwrap();
+
+        // The peek aborts after `MAX_HEADER_LINES` blank lines, so the
+        // session.start (50 lines down) never gets seen and adoption
+        // does not fire — exactly what we want when the file looks
+        // corrupted.
+        let res = scan(tmp.path(), "C:/dev/x", SystemTime::UNIX_EPOCH);
+        assert!(res.is_empty(), "got {res:?}");
     }
 
     #[test]

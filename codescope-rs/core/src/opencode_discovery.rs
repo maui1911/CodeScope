@@ -32,13 +32,14 @@ use crate::path_canon::canonicalize_path;
 /// `OpenCodeSessionDiscovery.PollInterval`.
 pub const POLL_INTERVAL_MS: u64 = 400;
 
-/// Inclusive bound on recursion depth when walking the data root.
+/// Exclusive bound on recursion depth when walking the data root:
 /// `walk` is invoked at depth 0 for the root and the guard rejects
 /// calls at `depth >= MAX_RECURSION_DEPTH`, so the deepest directory
 /// ever read from is `MAX_RECURSION_DEPTH - 1` levels below the root.
 /// The OpenCode layout is
-/// `project/<slug>/storage/message/<sid>/<msg>.json`, so 6 is plenty
-/// while still terminating on a stray symlink loop.
+/// `project/<slug>/storage/message/<sid>/<msg>.json` — 5 levels of
+/// nesting below the root — so 6 covers it cleanly while still
+/// terminating on a stray symlink loop.
 const MAX_RECURSION_DEPTH: usize = 6;
 
 /// One adoption candidate found in a data-root scan.
