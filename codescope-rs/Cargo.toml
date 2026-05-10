@@ -3,16 +3,12 @@ members = ["core", "terminal"]
 exclude = ["vendor/gpui-terminal"]
 
 [package]
-name = "codescope-rs-spike"
+name = "codescope-rs"
 version = "0.0.1"
 edition = "2024"
 publish = false
-description = "Spike: gpui window with one embedded terminal running pwsh."
+description = "CodeScope (Rust port): gpui shell that orchestrates parallel AI coding agent CLI sessions with Git worktree isolation."
 build = "build.rs"
-
-[[bin]]
-name = "spike"
-path = "src/main.rs"
 
 [[bin]]
 name = "codescope-rs"
