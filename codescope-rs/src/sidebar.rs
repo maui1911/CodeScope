@@ -373,6 +373,11 @@ impl Sidebar {
     /// or for paths that are not git repos. Callers should treat `None`
     /// as "loading" and fall back to a neutral display (e.g. no branch
     /// label, no ahead/behind count).
+    ///
+    /// `allow(dead_code)` until the status-bar integration PR wires
+    /// the consumer — the cache itself is populated by the polling
+    /// loop and remains useful for the next consumer to pick up.
+    #[allow(dead_code)]
     pub fn git_status_for(&self, path: &str) -> Option<&GitStatus> {
         self.git_status.get(path)
     }

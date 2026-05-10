@@ -412,8 +412,12 @@ impl AppShell {
             // Kick off the per-worktree dirty-state poll. Has to be
             // called from inside the `cx.new` callback because that's
             // where we have a `Context<Sidebar>` to register the
-            // background task against.
+            // background task against. The git-status poll
+            // (branch + numstat + ahead/behind) runs alongside it on
+            // the same 5 s cadence; both feed the status bar's left
+            // cluster and the sidebar dot.
             sidebar.start_dirty_poll(cx);
+            sidebar.start_git_status_poll(cx);
             sidebar
         });
 

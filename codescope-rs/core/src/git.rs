@@ -288,17 +288,34 @@ pub struct GitStatus {
 }
 
 /// Collect the three git status signals for a single worktree at
-/// `path`. Returns `None` only when the path is not a git repo at
-/// all (or `git` is not on PATH) — partial failures within the
-/// three queries degrade gracefully (branch falls back to SHA;
+/// `path`. Returns `None` when the path is not a git repo (or
+/// `git` is not on PATH); partial failures *within* the three
+/// follow-up queries degrade gracefully (branch falls back to SHA;
 /// numstat skips; ahead/behind hides).
 ///
-/// Shells out to `git` three times; all calls are independent so
-/// the total wall time is bounded by the slowest one (typically
-/// `symbolic-ref`, under 10 ms on local repos). Mirrors the
+/// Shells out to `git` four times *sequentially*: an early
+/// `rev-parse --is-inside-work-tree` probe gates the rest, then
+/// `symbolic-ref` (or `rev-parse --short HEAD` fallback for
+/// detached HEAD), `diff --numstat HEAD`, and
+/// `rev-list --left-right --count HEAD...@{u}`. Mirrors the
 /// per-tick work the C# `WorktreePoller` does per worktree.
+/// Typical total under 30 ms on local repos.
 pub fn git_status(path: &str) -> Option<GitStatus> {
     let repo = std::path::Path::new(path);
+
+    // ── 0. Early repo probe ────────────────────────────────────────
+    // `rev-parse --is-inside-work-tree` exits 0 / prints "true" only
+    // inside an actual worktree. Anything else (path doesn't exist,
+    // not a git repo, git missing) → bail with `None` so callers can
+    // distinguish "no data yet" from "valid repo but quiet".
+    let probe = run_git(repo, &["rev-parse", "--is-inside-work-tree"]).ok()?;
+    if !probe.status.success() {
+        return None;
+    }
+    let probe_stdout = String::from_utf8_lossy(&probe.stdout);
+    if probe_stdout.trim() != "true" {
+        return None;
+    }
 
     // ── 1. Current branch ──────────────────────────────────────────
     let branch = current_branch(repo);
@@ -996,14 +1013,42 @@ some-future-field foo bar\n";
     }
 
     #[test]
-    fn git_status_invalid_path_returns_none() {
-        // A path that is not a git repo at all should return None.
-        // We pass a non-existent path which will cause git to fail.
-        let result = git_status("C:\\does_not_exist_xyz_codescope_test");
-        // On non-Windows hosts the absolute path format doesn't matter —
-        // git will still exit non-zero for a missing directory.
-        // We accept None; Some is also fine if the OS happens to have
-        // a git repo there (extremely unlikely).
-        let _ = result; // no panic is the important assertion
+    fn git_status_non_repo_returns_none() {
+        // Create a temp directory that's NOT a git repo. `git_status`
+        // must return `None` so callers can distinguish "no data" from
+        // "valid repo but no signal yet".
+        let temp = std::env::temp_dir()
+            .join(format!("codescope_git_status_test_{}", std::process::id()));
+        std::fs::create_dir_all(&temp).expect("create temp dir");
+
+        // Sanity-check: temp is fresh and contains no .git directory.
+        assert!(
+            !temp.join(".git").exists(),
+            "test precondition: temp dir must not be a git repo"
+        );
+
+        let result = git_status(temp.to_str().expect("temp path is utf-8"));
+
+        // Cleanup before assertion so a failing assert still removes
+        // the directory.
+        let _ = std::fs::remove_dir_all(&temp);
+
+        assert!(
+            result.is_none(),
+            "non-repo path should return None, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn git_status_missing_path_returns_none() {
+        // A path that doesn't exist at all. `rev-parse` exits non-zero
+        // → `git_status` returns None.
+        let result = git_status("C:\\does_not_exist_xyz_codescope_test_42");
+        assert!(
+            result.is_none(),
+            "missing path should return None, got {:?}",
+            result
+        );
     }
 }
