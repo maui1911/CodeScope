@@ -1162,10 +1162,18 @@ impl Render for Sidebar {
             .iter()
             .enumerate()
             .map(|(idx, p)| {
+                // Render every worktree, primary included. The C#
+                // sidebar template is keyed off the same flat
+                // `Worktrees` list and shows the primary row too so
+                // the user sees the branch they're currently on. The
+                // earlier `!wt.is_primary` filter was a porting
+                // mistake — it hid the primary checkout and made a
+                // perfectly normal "single repo on main" project
+                // render with the misleading "(no worktrees)"
+                // placeholder from #101.
                 let worktrees = p
                     .worktrees
                     .iter()
-                    .filter(|wt| !wt.is_primary)
                     .map(|wt| WorktreeRowData {
                         id: wt.id.clone(),
                         path: wt.path.clone(),
@@ -1359,14 +1367,20 @@ impl Render for Sidebar {
             // worktree's path. Right-click opens the worktree context
             // menu (Reveal / Open in WT / Copy path / Remove…).
             for wt in worktrees.into_iter() {
-                let wt_label: SharedString = wt
-                    .branch
-                    .clone()
+                // Prefer the live branch from `git_status` over the
+                // persisted `worktree.branch` — primary worktrees in
+                // `projects.json` carry `branch: None` (the migration
+                // synthesises them without a branch label) and the
+                // git poller fills in the real value within a few
+                // seconds of launch. Falling back to the persisted
+                // branch then to the folder leaf keeps the row
+                // useful while the first poll is still in flight.
+                let wt_label: SharedString = self
+                    .git_status
+                    .get(&wt.path)
+                    .map(|g| g.branch.clone())
+                    .or_else(|| wt.branch.clone())
                     .unwrap_or_else(|| {
-                        // Fallback when the worktree row in
-                        // `projects.json` predates branch tracking:
-                        // surface the folder leaf so the user still
-                        // sees something useful.
                         std::path::Path::new(&wt.path)
                             .file_name()
                             .and_then(|s| s.to_str())
