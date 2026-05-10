@@ -153,18 +153,38 @@ fn read_yaml_cwd(path: &Path) -> Option<String> {
 }
 
 /// Peek `events.jsonl` for the first `session.start` event and return
-/// its `data.context.cwd`. Mirrors C# `CopilotSessionDiscovery.CwdMatchesFromEvents`.
+/// its `data.context.cwd`. Mirrors C# `CopilotSessionDiscovery.CwdMatchesFromEvents`,
+/// which skips malformed/non-`session.start` lines while peeking the
+/// first few records (a partial / garbled line landing before the
+/// real `session.start` is rare but does happen during a save race
+/// and shouldn't poison adoption).
+///
+/// Bounded to the first [`MAX_HEADER_LINES`] lines (counted as raw
+/// lines read, *including* blank lines) so a corrupt file with a
+/// large whitespace-only prefix can't turn this peek into a full
+/// file scan.
 fn read_session_start_cwd(path: &Path) -> Option<String> {
     use std::io::{BufRead, BufReader};
+    const MAX_HEADER_LINES: usize = 5;
     let file = std::fs::File::open(path).ok()?;
     let reader = BufReader::new(file);
+    let mut read = 0usize;
     for line in reader.lines() {
         let Ok(line) = line else { return None };
+        read += 1;
+        if read > MAX_HEADER_LINES {
+            return None;
+        }
         if line.trim().is_empty() {
             continue;
         }
-        let v: serde_json::Value = serde_json::from_str(&line).ok()?;
-        let obj = v.as_object()?;
+        let v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            // Skip a partial / garbled line and keep peeking — same
+            // posture as the C# `try { ParseLine } catch { continue }`.
+            Err(_) => continue,
+        };
+        let Some(obj) = v.as_object() else { continue };
         if obj.get("type").and_then(serde_json::Value::as_str) != Some("session.start") {
             continue;
         }
@@ -244,6 +264,51 @@ mod tests {
         std::fs::write(
             session_dir.join("events.jsonl"),
             br#"{"type":"session.start","timestamp":"2026-04-22T08:00:00Z","data":{"sessionId":"x","selectedModel":"gpt-5","context":{"cwd":"C:/dev/x"}}}
+"#,
+        )
+        .unwrap();
+
+        let res = scan(tmp.path(), "C:/dev/x", SystemTime::UNIX_EPOCH);
+        assert_eq!(res.len(), 1, "got {res:?}");
+    }
+
+    #[test]
+    fn events_jsonl_peek_bounded_by_total_lines_read() {
+        // A pathological file with a large whitespace-only prefix
+        // shouldn't bypass `MAX_HEADER_LINES` — we count *raw* lines
+        // read, not just non-empty ones, so the peek can't turn into
+        // a full file scan.
+        let tmp = TempDir::new().unwrap();
+        let session_dir = tmp.path().join(SID_A);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let mut content = String::new();
+        for _ in 0..50 {
+            content.push('\n');
+        }
+        content.push_str(r#"{"type":"session.start","timestamp":"2026-04-22T08:00:00Z","data":{"sessionId":"x","selectedModel":"gpt-5","context":{"cwd":"C:/dev/x"}}}"#);
+        content.push('\n');
+        std::fs::write(session_dir.join("events.jsonl"), content.as_bytes()).unwrap();
+
+        // The peek aborts after `MAX_HEADER_LINES` blank lines, so the
+        // session.start (50 lines down) never gets seen and adoption
+        // does not fire — exactly what we want when the file looks
+        // corrupted.
+        let res = scan(tmp.path(), "C:/dev/x", SystemTime::UNIX_EPOCH);
+        assert!(res.is_empty(), "got {res:?}");
+    }
+
+    #[test]
+    fn events_jsonl_peek_skips_garbled_first_line() {
+        // A partial line landing before the real `session.start`
+        // shouldn't poison adoption — mirrors C# `try { ParseLine }
+        // catch { continue }` posture.
+        let tmp = TempDir::new().unwrap();
+        let session_dir = tmp.path().join(SID_A);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("events.jsonl"),
+            br#"{"type":"sessio
+{"type":"session.start","timestamp":"2026-04-22T08:00:00Z","data":{"sessionId":"x","selectedModel":"gpt-5","context":{"cwd":"C:/dev/x"}}}
 "#,
         )
         .unwrap();

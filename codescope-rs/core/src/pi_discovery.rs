@@ -33,9 +33,14 @@ use crate::pi_telemetry;
 /// `PiSessionDiscovery.PollInterval`.
 pub const POLL_INTERVAL_MS: u64 = 350;
 
-/// Bound on recursion depth when walking the sessions root. Pi
-/// typically only nests one level (`<root>/--<cwd>--/<file>.jsonl`)
-/// so 4 is plenty, while still terminating on a stray symlink loop.
+/// Exclusive bound on recursion depth when walking the sessions
+/// root: `walk` is invoked at depth 0 for the root and the guard
+/// rejects calls at `depth >= MAX_RECURSION_DEPTH`, so the deepest
+/// directory ever read from is `MAX_RECURSION_DEPTH - 1` levels below
+/// the root. Pi typically only nests one level
+/// (`<root>/--<cwd>--/<file>.jsonl`) so 4 (i.e. up to 3 levels of
+/// nesting below the root) is plenty while still terminating on a
+/// stray symlink loop.
 const MAX_RECURSION_DEPTH: usize = 4;
 
 /// One adoption candidate found in a sessions-root scan.
@@ -76,7 +81,7 @@ fn walk(
     depth: usize,
     out: &mut Vec<AdoptionCandidate>,
 ) {
-    if depth > MAX_RECURSION_DEPTH {
+    if depth >= MAX_RECURSION_DEPTH {
         return;
     }
     let entries = match std::fs::read_dir(dir) {

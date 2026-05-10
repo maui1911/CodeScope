@@ -32,9 +32,14 @@ use crate::path_canon::canonicalize_path;
 /// `OpenCodeSessionDiscovery.PollInterval`.
 pub const POLL_INTERVAL_MS: u64 = 400;
 
-/// Bound on recursion depth when walking the data root. The OpenCode
-/// layout is `project/<slug>/storage/message/<sid>/<msg>.json`, so 6
-/// is plenty while still terminating on a stray symlink loop.
+/// Exclusive bound on recursion depth when walking the data root:
+/// `walk` is invoked at depth 0 for the root and the guard rejects
+/// calls at `depth >= MAX_RECURSION_DEPTH`, so the deepest directory
+/// ever read from is `MAX_RECURSION_DEPTH - 1` levels below the root.
+/// The OpenCode layout is
+/// `project/<slug>/storage/message/<sid>/<msg>.json` — 5 levels of
+/// nesting below the root — so 6 covers it cleanly while still
+/// terminating on a stray symlink loop.
 const MAX_RECURSION_DEPTH: usize = 6;
 
 /// One adoption candidate found in a data-root scan.
@@ -79,7 +84,7 @@ fn walk(
     seen: &mut std::collections::HashSet<String>,
     out: &mut Vec<AdoptionCandidate>,
 ) {
-    if depth > MAX_RECURSION_DEPTH {
+    if depth >= MAX_RECURSION_DEPTH {
         return;
     }
     let entries = match std::fs::read_dir(dir) {
@@ -138,7 +143,19 @@ fn walk(
 }
 
 fn is_message_file(name: &str) -> bool {
-    name.starts_with("msg_") && name.to_ascii_lowercase().ends_with(".json")
+    if !name.starts_with("msg_") {
+        return false;
+    }
+    // Suffix-match `.json` case-insensitively without allocating a
+    // new lowercase `String` per directory entry — the recursive walk
+    // can hit large data roots, so the per-entry allocation is hot.
+    const EXT: &[u8] = b".json";
+    let bytes = name.as_bytes();
+    if bytes.len() <= EXT.len() {
+        return false;
+    }
+    let tail = &bytes[bytes.len() - EXT.len()..];
+    tail.eq_ignore_ascii_case(EXT)
 }
 
 fn cwd_matches(path: &Path, canon_cwd: &str) -> bool {

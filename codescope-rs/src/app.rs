@@ -402,6 +402,21 @@ impl AgentTail {
         }
     }
 
+    /// Cheap probe used by the busy/idle adaptive cadence in
+    /// [`AppShell::start_telemetry_poll`]: returns the latest
+    /// `SessionState` without cloning the surrounding snapshot.
+    /// `SessionState` is `Copy`, so this is `O(1)` per tail. The
+    /// owned-snapshot path goes through [`AgentTail::snapshot`] /
+    /// [`AppShell::telemetry_for`].
+    fn state(&self) -> Option<codescope_core::SessionState> {
+        match self {
+            AgentTail::Claude(t) => t.snapshot.as_ref().map(|s| s.state),
+            AgentTail::Copilot(t) => t.snapshot.as_ref().map(|s| s.state),
+            AgentTail::OpenCode(t) => t.snapshot().map(|s| s.state),
+            AgentTail::Pi(t) => t.snapshot.as_ref().map(|s| s.state),
+        }
+    }
+
     fn snapshot(&self) -> Option<codescope_core::TelemetrySnapshot> {
         match self {
             AgentTail::Claude(t) => t.snapshot.clone(),
@@ -1061,7 +1076,7 @@ impl AppShell {
                     for tail in this.telemetry_tails.values_mut() {
                         tail.poll();
                         if matches!(
-                            tail.snapshot().map(|s| s.state),
+                            tail.state(),
                             Some(codescope_core::SessionState::Busy)
                                 | Some(codescope_core::SessionState::PendingToolUse)
                         ) {
