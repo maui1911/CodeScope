@@ -142,18 +142,24 @@ fn sans_fallbacks() -> Vec<String> {
 }
 
 /// Primary monospace family for sidebar code-like data (branch
-/// labels, status slugs, keymap hints).
+/// labels, status slugs, keymap hints). Matches the head of the
+/// `Fig.Font.Mono` chain in `DesignTokens.xaml`; the embedded
+/// terminal also defaults to FiraCode Nerd Font when present
+/// (`vendor/gpui-terminal`'s default config), so when both this
+/// font and the terminal's are installed the sidebar's branch
+/// labels and the shell render in the same metal.
 fn mono_primary() -> SharedString {
-    SharedString::new_static("Cascadia Mono")
+    SharedString::new_static("FiraCode Nerd Font Mono")
 }
 
 /// Monospace fallback chain. Order mirrors `Fig.Font.Mono` from
-/// `DesignTokens.xaml`, minus the Nerd-Font variant which is rarely
-/// installed on the dev target. Cascadia Mono is the Windows 11
-/// default and the same family the terminal ships with, so the
-/// sidebar's mono and the embedded shell render in the same metal.
+/// `DesignTokens.xaml` minus the primary above. Cascadia Mono is
+/// the Windows-11 native default, so on machines without the
+/// Nerd Font the sidebar still renders in a sensible monospace
+/// instead of falling back to a sans system default.
 fn mono_fallbacks() -> Vec<String> {
     vec![
+        "Cascadia Mono".to_string(),
         "Cascadia Code".to_string(),
         "Consolas".to_string(),
         "Azeret Mono".to_string(),
@@ -191,24 +197,43 @@ pub fn font_mono() -> Font {
 mod tests {
     use super::*;
 
+    /// Lock the full `Fig.Font.Sans` ordering. Asserting the exact
+    /// list (not just `contains`) catches accidental reorders /
+    /// omissions / additions that would silently drift the chrome
+    /// away from the C# build's typography.
     #[test]
-    fn font_sans_uses_segoe_ui_variable_display_with_fallbacks() {
+    fn font_sans_chain_matches_fig_font_sans() {
         let f = font_sans();
         assert_eq!(f.family.as_ref(), "Segoe UI Variable Display");
         let fallbacks = f.fallbacks.expect("sans fallbacks present");
-        let list = fallbacks.fallback_list();
-        assert!(list.contains(&"Segoe UI Variable".to_string()));
-        assert!(list.contains(&"Segoe UI".to_string()));
-        assert!(list.contains(&"Inter".to_string()));
+        assert_eq!(
+            fallbacks.fallback_list(),
+            &[
+                "Segoe UI Variable".to_string(),
+                "Segoe UI".to_string(),
+                "Inter".to_string(),
+                "system-ui".to_string(),
+            ]
+        );
     }
 
+    /// Lock the full `Fig.Font.Mono` ordering — same reasoning as
+    /// the sans test: a parity helper is only useful if drift gets
+    /// caught at compile time.
     #[test]
-    fn font_mono_uses_cascadia_mono_with_fallbacks() {
+    fn font_mono_chain_matches_fig_font_mono() {
         let f = font_mono();
-        assert_eq!(f.family.as_ref(), "Cascadia Mono");
+        assert_eq!(f.family.as_ref(), "FiraCode Nerd Font Mono");
         let fallbacks = f.fallbacks.expect("mono fallbacks present");
-        let list = fallbacks.fallback_list();
-        assert!(list.contains(&"Cascadia Code".to_string()));
-        assert!(list.contains(&"Consolas".to_string()));
+        assert_eq!(
+            fallbacks.fallback_list(),
+            &[
+                "Cascadia Mono".to_string(),
+                "Cascadia Code".to_string(),
+                "Consolas".to_string(),
+                "Azeret Mono".to_string(),
+                "Menlo".to_string(),
+            ]
+        );
     }
 }
