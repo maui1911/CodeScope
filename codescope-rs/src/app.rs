@@ -61,6 +61,12 @@ use crate::sidebar::{
 };
 use crate::theme;
 
+/// Pixel height of the bottom status bar. Shared between
+/// `render_status_bar` (the actual bar's `h(...)`) and
+/// `render_notifications_popover` (first-frame fallback bottom inset
+/// when the bell button's bounds haven't been recorded yet).
+const STATUS_BAR_HEIGHT_PX: f32 = 32.0;
+
 /// How often the window-state debounce loop wakes up to check whether
 /// the latest pending save has been stable long enough.
 const WINDOW_SAVE_POLL: Duration = Duration::from_millis(150);
@@ -1994,9 +2000,10 @@ impl AppShell {
                 .snap_to_window_with_margin(snap_edges)
                 .child(panel)
         } else {
-            // Status bar is 32 px tall; keep the panel clear of it
-            // by snapping above the bar plus the same 6 px gap.
-            const STATUS_BAR_HEIGHT_PX: f32 = 32.0;
+            // Keep the panel clear of the bar by snapping above the
+            // bar plus the same 6 px gap (status bar height comes
+            // from the shared `STATUS_BAR_HEIGHT_PX` constant the
+            // bar's own `h(...)` uses, so they can't drift).
             let fallback_edges = gpui::Edges {
                 top: px(SNAP_MARGIN_PX),
                 right: px(SNAP_MARGIN_PX),
@@ -2477,12 +2484,20 @@ impl AppShell {
                 let entity = cx.entity();
                 gpui::canvas(
                     move |bounds, _window, cx| {
-                        entity.update(cx, |this, _cx| {
-                            // Avoid re-notifying when the bounds are
-                            // unchanged — prepaint runs every frame
-                            // and we don't want a render loop.
+                        entity.update(cx, |this, cx| {
+                            // Only notify when the bounds actually
+                            // change — prepaint runs every frame and
+                            // we don't want a render loop. The
+                            // notify is needed so the popover (a
+                            // sibling element built earlier in the
+                            // same render) repaints with the new
+                            // anchor on the next frame after a
+                            // resize / reflow; without it the
+                            // popover would only refresh when some
+                            // unrelated event triggered a paint.
                             if this.bell_bounds != Some(bounds) {
                                 this.bell_bounds = Some(bounds);
+                                cx.notify();
                             }
                         });
                     },
@@ -2511,7 +2526,7 @@ impl AppShell {
 
         // ─── Bar ─────────────────────────────────────────────────
         let mut bar = div()
-            .h(px(32.0))
+            .h(px(STATUS_BAR_HEIGHT_PX))
             .flex()
             .flex_row()
             .items_center()
