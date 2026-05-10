@@ -23,7 +23,7 @@
 //! └───────────────┘
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -179,6 +179,16 @@ pub struct Sidebar {
     /// C# build's `WorktreePoller` but adds the richer data the
     /// status bar needs.
     git_status: HashMap<String, GitStatus>,
+    /// Project ids the user has explicitly collapsed. Projects start
+    /// expanded by default; toggling the chevron adds/removes the id
+    /// here. Mirrors the C# `TreeViewItem.IsExpanded` state per
+    /// project — except the C# build hangs that off WPF's tree
+    /// control, while we keep an explicit `HashSet<String>` so the
+    /// render loop can decide visibility without per-row state.
+    /// In-memory only for now; persisting to `layout.json` is a
+    /// follow-up (matches what the C# build does — TreeView state
+    /// is also session-scoped over there).
+    collapsed_projects: HashSet<String>,
 }
 
 impl Sidebar {
@@ -206,7 +216,20 @@ impl Sidebar {
             dialog: None,
             dirty_state: HashMap::new(),
             git_status: HashMap::new(),
+            collapsed_projects: HashSet::new(),
         }
+    }
+
+    /// Flip the collapse / expand state for the project at `id`.
+    /// Default is expanded; toggling for the first time collapses,
+    /// next toggle expands. Re-renders via `cx.notify`.
+    fn toggle_project_collapsed(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.collapsed_projects.contains(id) {
+            self.collapsed_projects.remove(id);
+        } else {
+            self.collapsed_projects.insert(id.to_owned());
+        }
+        cx.notify();
     }
 
     /// Spawn the dirty-state polling loop. Runs every
@@ -231,7 +254,7 @@ impl Sidebar {
                 // into a `HashSet` so duplicates (primary worktree
                 // also listed under `worktrees`, two projects sharing
                 // a path, …) only run `git status` once per tick.
-                let paths: std::collections::HashSet<String> = match this.update(cx, |this, _| {
+                let paths: HashSet<String> = match this.update(cx, |this, _| {
                     this.projects
                         .projects
                         .iter()
@@ -250,7 +273,7 @@ impl Sidebar {
                     Ok(p) => p,
                     Err(_) => break,
                 };
-                let known: std::collections::HashSet<String> = paths.clone();
+                let known: HashSet<String> = paths.clone();
                 let updates: Vec<(String, bool)> = cx
                     .background_spawn(async move {
                         paths
@@ -315,7 +338,7 @@ impl Sidebar {
                 }
                 // Snapshot every worktree path into a de-duplicated set
                 // (same de-dup rationale as start_dirty_poll).
-                let paths: std::collections::HashSet<String> = match this.update(cx, |this, _| {
+                let paths: HashSet<String> = match this.update(cx, |this, _| {
                     this.projects
                         .projects
                         .iter()
@@ -329,7 +352,7 @@ impl Sidebar {
                     Ok(p) => p,
                     Err(_) => break,
                 };
-                let known: std::collections::HashSet<String> = paths.clone();
+                let known: HashSet<String> = paths.clone();
                 let updates: Vec<(String, GitStatus)> = cx
                     .background_spawn(async move {
                         paths
@@ -408,8 +431,8 @@ impl Sidebar {
     ///   confirmed clean, and `true` means dirty. Both unknown and
     ///   clean paths are excluded from the count.
     pub(crate) fn worktree_counts(&self) -> (usize, usize) {
-        let mut paths: std::collections::HashSet<&str> =
-            std::collections::HashSet::new();
+        let mut paths: HashSet<&str> =
+            HashSet::new();
         for project in &self.projects.projects {
             paths.insert(project.path.as_str());
             for wt in &project.worktrees {
@@ -1232,6 +1255,34 @@ impl Render for Sidebar {
             let frost_hover = theme::frost_10(&theme);
             let ink_hover = theme::ink(&theme);
 
+            let collapsed = self.collapsed_projects.contains(&id);
+            // Chevron — points right when the project is collapsed,
+            // down when expanded. Mirrors the C# `TreeViewItem`
+            // chevron template (RotateTransform 0°/90° driven by
+            // `IsExpanded`). Click toggles; the click handler stops
+            // propagation so the chevron doesn't double-fire `select`.
+            let chevron_glyph = if collapsed { "\u{25B8}" } else { "\u{25BE}" };
+            let id_for_toggle = id.clone();
+            let chevron = div()
+                .id(("project-chevron", id_hash(&id)))
+                .w(px(14.0))
+                .h(px(14.0))
+                .mr(px(6.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(10.0))
+                .text_color(theme::ink_ghost(&theme))
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_project_collapsed(&id_for_toggle, cx);
+                    }),
+                )
+                .child(chevron_glyph);
+
             let project_row = div()
                 .id(("project", id_hash(&id)))
                 .h(px(32.0))
@@ -1241,7 +1292,14 @@ impl Render for Sidebar {
                 .pr_3()
                 .border_l_2()
                 .border_color(rail)
-                .pl(px(10.0)) // 12px - 2px border = 10
+                // 4 px row inset; the chevron (14 px wide + 6 px right
+                // margin) sits between the rail and the project name.
+                // This is a small rightward shift versus the pre-chevron
+                // 10 px inset (project name now starts ~14 px further
+                // right), matching the C# TreeViewItem template's
+                // disclosure indent rather than trying to claw the name
+                // back to its old origin.
+                .pl(px(4.0))
                 .bg(bg)
                 .text_color(text_color)
                 .text_size(px(13.0))
@@ -1259,8 +1317,17 @@ impl Render for Sidebar {
                         this.open_project_menu(idx, event.position, cx);
                     }),
                 )
+                .child(chevron)
                 .child(div().flex_grow().truncate().child(name));
             project_and_worktree_rows.push(project_row.into_any_element());
+
+            // Skip rendering the worktree children + placeholder
+            // entirely when the user has collapsed the project.
+            // The chevron icon flipping right is the only visible
+            // change in that case.
+            if collapsed {
+                continue;
+            }
 
             // Empty-state placeholder when a project has no non-primary
             // worktrees. Mirrors the `(no worktrees)` row C# renders
