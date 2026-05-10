@@ -401,9 +401,12 @@ impl Sidebar {
     ///   (primary trees included), de-duplicated so a path that
     ///   appears in two projects (or as both primary and an explicit
     ///   `worktrees[]` entry) is only counted once.
-    /// - `dirty` — number of those paths whose `dirty_state` lookup
-    ///   is `Some(true)`. Paths with no recorded state yet (still
-    ///   loading) and `Some(false)` (clean) don't count.
+    /// - `dirty` — number of those paths whose `dirty_state` entry
+    ///   is `true`. `dirty_state` is a `HashMap<String, bool>`
+    ///   keyed by absolute path: a missing key means the first poll
+    ///   tick has not landed yet ("unknown"), `false` means
+    ///   confirmed clean, and `true` means dirty. Both unknown and
+    ///   clean paths are excluded from the count.
     pub(crate) fn worktree_counts(&self) -> (usize, usize) {
         let mut paths: std::collections::HashSet<&str> =
             std::collections::HashSet::new();
