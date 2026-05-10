@@ -156,10 +156,14 @@ pub fn font_sans() -> Font {
 /// Monospace `Font` for chrome data — pass to `.font(...)` on a
 /// gpui element. Equivalent to applying `Fig.Font.Mono` in the C#
 /// build's XAML. The primary family is `FiraCode Nerd Font Mono`,
-/// which is also the embedded terminal's default
-/// (`vendor/gpui-terminal`'s default config), so when that font is
-/// installed sidebar branch labels and the shell render in the
-/// same metal. Cached + cloned the same way as `font_sans`.
+/// which is the same family the embedded terminal lists as a
+/// fallback (its primary is `FiraCode Nerd Font` —
+/// non-monospace-suffix variant, see
+/// `codescope-rs/terminal/src/view.rs` `FontConfig::default`,
+/// overridable via `CODESCOPE_FONT`). Both render in the same
+/// FiraCode Nerd Font family on a typical install, so the
+/// sidebar's branch labels and the shell match visually. Cached +
+/// cloned the same way as `font_sans`.
 pub fn font_mono() -> Font {
     static FONT: OnceLock<Font> = OnceLock::new();
     FONT.get_or_init(|| Font {
@@ -227,16 +231,19 @@ mod tests {
     }
 
     /// Both helpers cache their `Font` in a `OnceLock`, so repeated
-    /// calls return the same `Arc<Vec<String>>` underneath the
-    /// `FontFallbacks` clone — no per-render allocation.
+    /// calls share the same backing storage. We assert that via the
+    /// public `fallback_list()` API rather than reaching into
+    /// `FontFallbacks`' internal `Arc`: equal `as_ptr()` proves the
+    /// returned slices point at the same allocation, which is only
+    /// possible if both calls received the cached `Font`.
     #[test]
     fn font_helpers_share_cached_fallbacks_across_calls() {
         let a = font_sans().fallbacks.expect("sans fallbacks");
         let b = font_sans().fallbacks.expect("sans fallbacks");
-        assert!(std::sync::Arc::ptr_eq(&a.0, &b.0));
+        assert_eq!(a.fallback_list().as_ptr(), b.fallback_list().as_ptr());
 
         let m1 = font_mono().fallbacks.expect("mono fallbacks");
         let m2 = font_mono().fallbacks.expect("mono fallbacks");
-        assert!(std::sync::Arc::ptr_eq(&m1.0, &m2.0));
+        assert_eq!(m1.fallback_list().as_ptr(), m2.fallback_list().as_ptr());
     }
 }
