@@ -22,7 +22,10 @@ mod win32_titlebar;
 use std::sync::Arc;
 
 use anyhow::Result;
-use codescope_core::{AppPaths, LayoutState, ProjectsConfig, Settings, Theme, WindowState, builtin};
+use codescope_core::{
+    AppPaths, LayoutState, ProjectsConfig, SessionManager, Settings, Theme, WindowState, builtin,
+    now_iso8601,
+};
 use gpui::{
     AppContext, Bounds, Context, IntoElement, ParentElement, Render, Styled, TitlebarOptions,
     Window, WindowBounds, WindowOptions, div, point, px, size,
@@ -93,7 +96,12 @@ fn main() -> Result<()> {
     let theme = Arc::new(builtin::by_name(&settings.theme));
     let settings = Arc::new(settings);
 
-    let projects = match ProjectsConfig::load(&paths) {
+    // Load projects via `SessionManager::load_with_sweep` so the
+    // closed-session retention policy runs once per launch, mirroring
+    // C# `SessionStore.LoadAsync` which fires a one-shot migration
+    // sweep on every load. Pre-PR this called `ProjectsConfig::load`
+    // directly, which left expired closed-history rows around forever.
+    let projects = match SessionManager::load_with_sweep(&paths, &now_iso8601()) {
         Ok(p) => p,
         Err(err) => {
             eprintln!(
