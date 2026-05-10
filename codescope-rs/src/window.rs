@@ -54,6 +54,15 @@ fn main() -> Result<()> {
         );
     }
 
+    // Install the crash-log panic hook before any gpui state spins up so a
+    // panic during early boot still writes `%LOCALAPPDATA%\CodeScope\crash.log`
+    // (parity with C# `App.LogFatal`). Dev mode redirects to `CodeScope.Dev`
+    // automatically via `AppPaths`.
+    codescope_core::crash_log::install_panic_hook(
+        paths.clone(),
+        env!("CODESCOPE_VERSION_DISPLAY").to_string(),
+    );
+
     let settings = match Settings::load(&paths) {
         Ok(s) => s,
         Err(err) => {
