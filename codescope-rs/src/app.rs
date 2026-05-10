@@ -466,7 +466,39 @@ impl AppShell {
         // focus inline.
         cx.subscribe_in(&sidebar, window, |this, _sidebar, event, window, cx| {
             match event {
-                SidebarEvent::OpenSession { working_directory, title, auto_type } => {
+                SidebarEvent::OpenSession {
+                    working_directory,
+                    title,
+                    auto_type,
+                    force_new,
+                } => {
+                    // Focus-or-open by default: walk every group's
+                    // tabs for one whose `working_directory` matches
+                    // and activate it. Only fall through to a fresh
+                    // spawn when nothing matches *or* the caller
+                    // explicitly asked for `force_new` (the
+                    // "New session" / "New Claude session" menu
+                    // rows). This is what the user means by
+                    // "clicking a worktree shouldn't pile up new
+                    // sessions every time".
+                    if !*force_new {
+                        let mut focus_target: Option<(usize, usize)> = None;
+                        for (g_idx, group) in this.groups.iter().enumerate() {
+                            for (t_idx, tab) in group.tabs.iter().enumerate() {
+                                if tab.working_directory.as_deref() == Some(working_directory.as_path()) {
+                                    focus_target = Some((g_idx, t_idx));
+                                    break;
+                                }
+                            }
+                            if focus_target.is_some() {
+                                break;
+                            }
+                        }
+                        if let Some((g_idx, t_idx)) = focus_target {
+                            this.activate_tab(g_idx, t_idx, window, cx);
+                            return;
+                        }
+                    }
                     this.spawn_tab_in(
                         Some(working_directory.clone()),
                         Some(title.clone()),
