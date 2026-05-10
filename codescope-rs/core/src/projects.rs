@@ -47,7 +47,11 @@ pub struct Project {
     /// Sessions persisted across restarts.
     #[serde(default)]
     pub sessions: Vec<Session>,
-    /// Tracked worktrees. The primary worktree at `path` is implicit.
+    /// Tracked worktrees. Includes the primary worktree at `path`
+    /// (the one with `is_primary: true`) as an explicit row;
+    /// `Project::new` seeds it on creation, and
+    /// [`ProjectsConfig::migrate`] back-fills it for legacy configs
+    /// that don't have one yet.
     #[serde(default)]
     pub worktrees: Vec<Worktree>,
 }
@@ -68,6 +72,18 @@ impl Project {
             .and_then(|s| s.to_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| "project".to_string());
+        // Seed a primary worktree row so the sidebar has a child row
+        // to bind to immediately. Mirrors C# `SessionStore.AddProjectAsync`,
+        // which synthesises the same primary entry — without it the
+        // newly-added project renders as an empty shell. Branch is
+        // left None; the dirty / git-status pollers fill it in on the
+        // first tick.
+        let primary = Worktree {
+            id: "primary".to_owned(),
+            path: path.clone(),
+            branch: None,
+            is_primary: true,
+        };
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             name,
@@ -76,7 +92,7 @@ impl Project {
             worktree_root: None,
             default_agent_id: None,
             sessions: Vec::new(),
-            worktrees: Vec::new(),
+            worktrees: vec![primary],
         }
     }
 
@@ -90,9 +106,12 @@ impl Project {
     }
 }
 
-/// One git worktree under a [`Project`]. Every project has an
-/// implicit primary worktree at `Project::path`; additional ones live
-/// here and get `is_primary = false`.
+/// One git worktree under a [`Project`]. Every project carries an
+/// explicit primary row (`is_primary: true`) pointing at
+/// `Project::path` plus zero or more additional worktrees with
+/// `is_primary: false`. The primary row is seeded by `Project::new`
+/// and back-filled by [`ProjectsConfig::migrate`] for legacy
+/// configs that predate that rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Worktree {
@@ -162,12 +181,52 @@ impl ProjectsConfig {
     }
 
     pub fn load_from(path: &Path) -> Result<Self> {
-        match std::fs::read(path) {
-            Ok(bytes) if bytes.is_empty() => Ok(Self::default()),
+        let mut config: Self = match std::fs::read(path) {
+            Ok(bytes) if bytes.is_empty() => Self::default(),
             Ok(bytes) => serde_json::from_slice(&bytes)
-                .with_context(|| format!("parse {}", path.display())),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
+                .with_context(|| format!("parse {}", path.display()))?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+        };
+        config.migrate();
+        Ok(config)
+    }
+
+    /// Apply schema migrations to an in-memory config. Idempotent —
+    /// rerunning is a no-op once every rule has converged. Mirrors
+    /// C# `ProjectStore.Migrate`.
+    ///
+    /// **Rule 1 — primary worktree synthesis.** Every project with a
+    /// non-empty `path` and *no* worktree marked `is_primary: true`
+    /// gets a synthetic `Worktree { id: "primary", path,
+    /// is_primary: true, branch: None }`. Without this, the sidebar
+    /// can't render a row for the project's own checkout and the
+    /// branch the user is currently on stays invisible.
+    ///
+    /// We key on the `is_primary` flag rather than "list is empty"
+    /// because legacy `projects.json` files written by the Rust UI
+    /// before this rule landed could have one or more *non-primary*
+    /// rows added later but still no primary entry — hitting only
+    /// the empty-list case would leave those projects in the broken
+    /// state. The `WorktreeStatusPoller` fills in the branch on its
+    /// first tick.
+    pub fn migrate(&mut self) {
+        for p in &mut self.projects {
+            if p.path.is_empty() {
+                continue;
+            }
+            let has_primary = p.worktrees.iter().any(|wt| wt.is_primary);
+            if !has_primary {
+                p.worktrees.insert(
+                    0,
+                    Worktree {
+                        id: "primary".to_owned(),
+                        path: p.path.clone(),
+                        branch: None,
+                        is_primary: true,
+                    },
+                );
+            }
         }
     }
 
@@ -258,6 +317,114 @@ mod tests {
         assert_eq!(p.default_branch, "main");
         // UUIDv4 is 36 chars including the dashes.
         assert_eq!(p.id.len(), 36);
+    }
+
+    #[test]
+    fn new_project_seeds_a_primary_worktree() {
+        let p = Project::new("/home/me/codescope".into());
+        assert_eq!(p.worktrees.len(), 1);
+        let wt = &p.worktrees[0];
+        assert_eq!(wt.id, "primary");
+        assert_eq!(wt.path, "/home/me/codescope");
+        assert!(wt.is_primary);
+        assert!(wt.branch.is_none());
+    }
+
+    #[test]
+    fn migrate_synthesises_primary_for_legacy_projects_without_worktrees() {
+        // Old projects.json from before the seed-on-create rule:
+        // a project entry with no `worktrees` field. The migration
+        // should add a primary so the sidebar isn't blank for it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"projects":[{"id":"p1","name":"Repo","path":"C:\\repos\\repo","defaultBranch":"main"}]}"#,
+        )
+        .unwrap();
+
+        let cfg = ProjectsConfig::load_from(&path).unwrap();
+        let p = &cfg.projects[0];
+        assert_eq!(p.worktrees.len(), 1, "primary should be synthesised");
+        assert!(p.worktrees[0].is_primary);
+        assert_eq!(p.worktrees[0].path, "C:\\repos\\repo");
+        assert_eq!(p.worktrees[0].id, "primary");
+    }
+
+    #[test]
+    fn migrate_back_fills_primary_when_only_secondary_worktrees_exist() {
+        // Legacy projects.json from a Rust UI that had no
+        // primary-seeding rule but did support adding secondary
+        // worktrees via "New worktree from branch…". The user could
+        // end up with a project that has secondaries but no primary,
+        // which the original empty-list-only migration would skip.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "version": 1,
+              "projects": [
+                {
+                  "id": "p1",
+                  "name": "Repo",
+                  "path": "C:\\repos\\repo",
+                  "defaultBranch": "main",
+                  "worktrees": [
+                    { "id": "feat-x", "path": "C:\\repos\\repo.worktrees\\feat-x", "branch": "feat/x", "isPrimary": false }
+                  ]
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let cfg = ProjectsConfig::load_from(&path).unwrap();
+        let p = &cfg.projects[0];
+        assert_eq!(p.worktrees.len(), 2, "primary back-filled in addition to existing secondary");
+        assert!(p.worktrees[0].is_primary, "primary inserted at index 0");
+        assert_eq!(p.worktrees[0].id, "primary");
+        assert_eq!(p.worktrees[0].path, "C:\\repos\\repo");
+        assert!(!p.worktrees[1].is_primary, "secondary preserved");
+        assert_eq!(p.worktrees[1].id, "feat-x");
+    }
+
+    #[test]
+    fn migrate_is_idempotent_on_already_migrated_config() {
+        // Project that already has a primary should *not* get a
+        // second one. Migration is idempotent.
+        let mut cfg = ProjectsConfig {
+            version: CURRENT_VERSION,
+            agents: Vec::new(),
+            projects: vec![Project::new("/home/me/repo".into())],
+        };
+        let before_len = cfg.projects[0].worktrees.len();
+        cfg.migrate();
+        cfg.migrate();
+        assert_eq!(cfg.projects[0].worktrees.len(), before_len);
+    }
+
+    #[test]
+    fn migrate_skips_projects_with_empty_path() {
+        // No path = no checkout to bind the primary to. Don't
+        // synthesise a worktree pointing at "" — that would render
+        // a broken row in the sidebar.
+        let mut cfg = ProjectsConfig {
+            version: CURRENT_VERSION,
+            agents: Vec::new(),
+            projects: vec![Project {
+                id: "p1".into(),
+                name: "Empty".into(),
+                path: String::new(),
+                default_branch: "main".into(),
+                worktree_root: None,
+                default_agent_id: None,
+                sessions: Vec::new(),
+                worktrees: Vec::new(),
+            }],
+        };
+        cfg.migrate();
+        assert!(cfg.projects[0].worktrees.is_empty());
     }
 
     #[test]

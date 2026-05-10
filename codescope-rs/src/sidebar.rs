@@ -1150,22 +1150,30 @@ impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme.clone();
         let selected = self.selected;
-        // Snapshot project + non-primary worktree metadata up front so
-        // each row's `cx.listener` closure can hold owned values
-        // without overlapping the immutable borrow `iter()` would
-        // otherwise extend across the rest of `render`. Primary
-        // worktrees are implicit at `Project::path`; we only emit
-        // child rows for the extras.
+        // Snapshot project + worktree metadata (every worktree,
+        // primary included — see the per-project comment below for
+        // why) up front so each row's `cx.listener` closure can hold
+        // owned values without overlapping the immutable borrow
+        // `iter()` would otherwise extend across the rest of
+        // `render`.
         let rows: Vec<(usize, String, SharedString, String, Vec<WorktreeRowData>)> = self
             .projects
             .projects
             .iter()
             .enumerate()
             .map(|(idx, p)| {
+                // Render every worktree, primary included. The C#
+                // sidebar template is keyed off the same flat
+                // `Worktrees` list and shows the primary row too so
+                // the user sees the branch they're currently on. The
+                // earlier `!wt.is_primary` filter was a porting
+                // mistake — it hid the primary checkout and made a
+                // perfectly normal "single repo on main" project
+                // render with the misleading "(no worktrees)"
+                // placeholder from #101.
                 let worktrees = p
                     .worktrees
                     .iter()
-                    .filter(|wt| !wt.is_primary)
                     .map(|wt| WorktreeRowData {
                         id: wt.id.clone(),
                         path: wt.path.clone(),
@@ -1359,14 +1367,20 @@ impl Render for Sidebar {
             // worktree's path. Right-click opens the worktree context
             // menu (Reveal / Open in WT / Copy path / Remove…).
             for wt in worktrees.into_iter() {
-                let wt_label: SharedString = wt
-                    .branch
-                    .clone()
+                // Prefer the live branch from `git_status` over the
+                // persisted `worktree.branch` — primary worktrees in
+                // `projects.json` carry `branch: None` (the migration
+                // synthesises them without a branch label) and the
+                // git poller fills in the real value within a few
+                // seconds of launch. Falling back to the persisted
+                // branch then to the folder leaf keeps the row
+                // useful while the first poll is still in flight.
+                let wt_label: SharedString = self
+                    .git_status
+                    .get(&wt.path)
+                    .map(|g| g.branch.clone())
+                    .or_else(|| wt.branch.clone())
                     .unwrap_or_else(|| {
-                        // Fallback when the worktree row in
-                        // `projects.json` predates branch tracking:
-                        // surface the folder leaf so the user still
-                        // sees something useful.
                         std::path::Path::new(&wt.path)
                             .file_name()
                             .and_then(|s| s.to_str())
@@ -1402,8 +1416,13 @@ impl Render for Sidebar {
                     Some(false) => theme::status_clean(&theme),
                     None => theme::ink_ghost(&theme),
                 };
+                // Element id is keyed off `(project.id, worktree.id)`
+                // so primary rows from different projects (which all
+                // share `wt.id == "primary"`) don't collide in gpui's
+                // id-based element reuse table.
+                let wt_row_id = format!("{}/{}", id, wt.id);
                 let wt_row = div()
-                    .id(("worktree", id_hash(&wt.id)))
+                    .id(("worktree", id_hash(&wt_row_id)))
                     .h(px(28.0))
                     .flex()
                     .flex_row()
