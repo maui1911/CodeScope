@@ -1489,7 +1489,7 @@ impl Render for Sidebar {
                         kb.partial_cmp(&ka).unwrap_or(std::cmp::Ordering::Equal)
                     });
                 }
-                let worktrees = p
+                let mut worktrees: Vec<WorktreeRowData> = p
                     .worktrees
                     .iter()
                     .map(|wt| {
@@ -1502,6 +1502,47 @@ impl Render for Sidebar {
                         }
                     })
                     .collect();
+                // Orphan / stale-worktree closed sessions — rows
+                // whose `worktree_id` is `None` (collapses to "")
+                // or refers to a worktree that no longer exists in
+                // `p.worktrees` would otherwise drop off the UI
+                // entirely (Copilot review on PR #127). Fold them
+                // into the primary worktree's bucket so the user
+                // can still reopen them; re-sort so the merged set
+                // stays newest-first.
+                if !closed_by_wt.is_empty() {
+                    let leftover: Vec<ClosedSessionRow> = closed_by_wt
+                        .into_values()
+                        .flatten()
+                        .collect();
+                    // Resolve the target index in two steps so the
+                    // primary lookup and the `first_mut` fallback
+                    // don't both hold a `&mut` to `worktrees`.
+                    let target_idx = worktrees
+                        .iter()
+                        .position(|w| w.id == "primary")
+                        .or_else(|| (!worktrees.is_empty()).then_some(0));
+                    if let Some(idx) = target_idx {
+                        let target = &mut worktrees[idx];
+                        target.closed_sessions.extend(leftover);
+                        target.closed_sessions.sort_by(|a, b| {
+                            let ka = a
+                                .closed_at
+                                .as_deref()
+                                .and_then(codescope_core::time::parse_iso8601_secs);
+                            let kb = b
+                                .closed_at
+                                .as_deref()
+                                .and_then(codescope_core::time::parse_iso8601_secs);
+                            kb.partial_cmp(&ka).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                    }
+                    // If the project has zero worktrees the leftover
+                    // rows still vanish — but that's a malformed
+                    // projects.json (every project gets a synthetic
+                    // primary at migration time), so we don't carve
+                    // out a separate orphan disclosure for it.
+                }
                 (
                     idx,
                     p.id.clone(),
