@@ -753,11 +753,26 @@ impl Sidebar {
                 })
                 .await;
             let _ = this.update(cx, |_, cx| match result {
-                Ok(_) => cx.emit(SidebarEvent::Toast {
-                    kind: ToastSeverity::Ok,
-                    title: format!("Rebased '{label}' onto {base_ref}").into(),
-                    detail: None,
-                }),
+                Ok(stdout) => {
+                    // Surface the trimmed `git rebase` stdout in the
+                    // toast detail when it has anything to show
+                    // ("Successfully rebased and updated <ref>." or
+                    // a list of cherry-picked commit summaries) —
+                    // gives the user a one-glance confirmation
+                    // beyond just the title. Empty stdout (rare,
+                    // happens when the branch was already up to
+                    // date) drops the detail line.
+                    let detail = if stdout.is_empty() {
+                        None
+                    } else {
+                        Some(stdout.into())
+                    };
+                    cx.emit(SidebarEvent::Toast {
+                        kind: ToastSeverity::Ok,
+                        title: format!("Rebased '{label}' onto {base_ref}").into(),
+                        detail,
+                    });
+                }
                 Err(err) => cx.emit(SidebarEvent::Toast {
                     kind: ToastSeverity::Err,
                     title: format!("Rebase failed for '{label}'").into(),
@@ -1826,24 +1841,33 @@ impl Sidebar {
                     }),
                 )
             })
-            // "Rebase onto origin/<default>…" — mirrors the C#
-            // `RebaseOntoDefaultCommand` row. Hidden when the
-            // worktree is already on the project's default branch
-            // (rebasing main onto origin/main is just a fancy
-            // pull). Built inline rather than through the `item`
-            // helper because the label is dynamic (the project's
-            // default branch can shift via `projects.json` edits)
-            // and the helper takes a `&'static str` to avoid
-            // per-render allocations on the more common rows.
+            // "Rebase onto origin/<default>" — mirrors the C#
+            // `RebaseOntoDefaultCommand` row. Visible only when the
+            // worktree is currently checked out on a named branch
+            // that isn't the project default: detached HEAD
+            // (`branch is None`) would fail the rebase outright,
+            // and rebasing `main` onto `origin/main` is just a
+            // fancy pull. The C# build also confirms via a prompt
+            // before rebasing — we ship the simpler immediate form
+            // here, so no trailing ellipsis on the label (which
+            // elsewhere implies a follow-up dialog). Plumbing a
+            // `Window` into the handler so we can prompt is a
+            // separate follow-up.
+            //
+            // Built inline rather than through the `item` helper
+            // because the label is dynamic (the default branch can
+            // shift via `projects.json` edits) and the helper
+            // takes a `&'static str` to avoid per-render
+            // allocations on the more common rows.
             .children({
-                let on_default_branch = worktree
+                let show_rebase = worktree
                     .branch
                     .as_ref()
-                    .is_some_and(|b| b == &project.default_branch);
-                (!on_default_branch).then(|| {
+                    .is_some_and(|b| b != &project.default_branch);
+                show_rebase.then(|| {
                     let id_for_rebase = worktree_id.clone();
                     let label: SharedString = format!(
-                        "Rebase onto origin/{}…",
+                        "Rebase onto origin/{}",
                         project.default_branch
                     )
                     .into();

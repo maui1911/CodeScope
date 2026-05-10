@@ -181,14 +181,27 @@ pub fn fetch_all_prune(repo: &Path) -> Result<()> {
 /// the C# `GitService.RebaseOntoAsync` — the bare `git rebase` form
 /// rather than `--onto`, because the C# build uses the simpler
 /// "replay current branch on top of `<base_ref>`" semantics for the
-/// "Rebase onto origin/<default>…" sidebar action.
+/// "Rebase onto origin/<default>" sidebar action.
 ///
 /// Returns the trimmed stdout on success (commit summary lines that
 /// can surface in a toast). Failures usually mean conflicts the user
 /// has to resolve manually in the worktree — the caller surfaces the
 /// stderr verbatim because that's where git puts the conflict
 /// breadcrumbs.
+///
+/// `base_ref` must not start with `-` — that would be interpreted
+/// as a `git rebase` flag (e.g. `--abort`, `--continue`) and could
+/// destroy in-progress rebase state. The ref ultimately comes from
+/// `projects.json::default_branch`, which the user *can* edit, so we
+/// reject up-front rather than trust the caller. Returns an `Err`
+/// describing the rejection without spawning git.
 pub fn rebase_onto(repo: &Path, base_ref: &str) -> Result<String> {
+    if base_ref.starts_with('-') {
+        return Err(anyhow!(
+            "refusing to rebase onto a ref that starts with '-': {base_ref:?} \
+             would be parsed as a git option, not a revision"
+        ));
+    }
     let output = run_git(repo, &["rebase", base_ref])?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Ok(stdout)
@@ -749,6 +762,50 @@ some-future-field foo bar\n";
             "git {} failed: {}",
             args.join(" "),
             String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    #[test]
+    fn rebase_onto_replays_commits_on_default_branch() {
+        let Some((_guard, repo, _wts)) = init_repo() else { return };
+        // Branch off the seed commit, add one local commit, then move
+        // `main` forward by one commit so the topology actually
+        // requires a rebase. `rebase_onto(repo, "main")` should
+        // replay `feat/x`'s commit on top of the new `main`.
+        run(&repo, &["checkout", "-b", "feat/x", "-q"]);
+        std::fs::write(repo.join("a.txt"), "feat\n").unwrap();
+        run(&repo, &["add", "a.txt"]);
+        run(&repo, &["commit", "-m", "feat", "-q"]);
+        run(&repo, &["checkout", "main", "-q"]);
+        run(&repo, &["commit", "--allow-empty", "-m", "main forward", "-q"]);
+        run(&repo, &["checkout", "feat/x", "-q"]);
+
+        rebase_onto(&repo, "main").expect("rebase succeeds in clean topology");
+
+        // After the rebase `feat/x` should descend from the new main
+        // tip — confirm by checking `git log main..feat/x` lists the
+        // single feat commit.
+        let output = Command::new("git")
+            .args(["log", "--oneline", "main..feat/x"])
+            .current_dir(&repo)
+            .output()
+            .expect("spawn git log");
+        let log = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            log.lines().count(),
+            1,
+            "feat/x should be one commit ahead of main after rebase, got: {log:?}"
+        );
+    }
+
+    #[test]
+    fn rebase_onto_rejects_dash_prefixed_ref() {
+        let Some((_guard, repo, _wts)) = init_repo() else { return };
+        let err = rebase_onto(&repo, "--abort").expect_err("must reject");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("starts with '-'"),
+            "error should explain why; got: {msg}"
         );
     }
 
