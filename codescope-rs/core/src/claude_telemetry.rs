@@ -605,8 +605,11 @@ impl TranscriptTail {
 /// `claude-opus-4-7[1m]`. Empty input falls back to "claude" so the
 /// column never goes blank.
 ///
-/// Mirrors the human-readable output of C#
-/// `AgentProfile.DisplayName` for Claude profiles.
+/// This is *not* a parity port of C# `AgentProfile.DisplayName` —
+/// that returns a registry-supplied label like "Claude Code". This
+/// function specifically shortens the JSONL `message.model` id for
+/// the status-bar's right-cluster model slot; the C# build does the
+/// same inline shortening when no agent profile is registered.
 pub fn model_display_name(model: &str) -> String {
     let trimmed = model.trim();
     if trimmed.is_empty() {
@@ -617,9 +620,13 @@ pub fn model_display_name(model: &str) -> String {
     stripped[..bracket].trim_end_matches('-').to_owned()
 }
 
-/// Format a token count as `N`, `N.Mk`, `Mk`, `N.MM`, or `N.MM` so
-/// the status bar stays readable at large context windows. Mirrors
-/// C# `MainViewModel.FormatTokens`.
+/// Format a token count for the status bar: raw integer below 10k,
+/// `.1f k` between 10k–100k, `Nk` between 100k–1M, `.2f M` between
+/// 1M–10M, `.1f M` above. Independent thresholds from the C# build
+/// (`MainViewModel.FormatTokens` switches to `k` at 1k); the Rust
+/// version keeps small values raw because session telemetry stays
+/// well under 10k for short Claude sessions and an `8.5k` rendering
+/// reads worse than `8500` at that scale.
 pub fn format_tokens(n: u64) -> String {
     if n < 10_000 {
         return n.to_string();
@@ -639,15 +646,23 @@ pub fn format_tokens(n: u64) -> String {
     }
 }
 
-/// Format `0.0..=1.0` as `"3%"` / `"6.2%"` / `"87%"`. Mirrors C#
-/// `MainViewModel.StatusTokensPercentText` rounding rules: one
-/// decimal under 10%, integer rounding above.
+/// Format `0.0..=1.0` as `"0%"` / `"3%"` / `"6.2%"` / `"87%"`.
+/// Mirrors C# `MainViewModel.StatusTokensPercentText` rounding:
+/// integer rounding at and above 10%, otherwise C#'s `0.#` format
+/// (one decimal *only when non-zero*; whole numbers under 10%
+/// drop the trailing `.0`).
 pub fn format_context_pct(pct: f32) -> String {
     let p = (pct * 100.0).clamp(0.0, 999.0);
     if p >= 10.0 {
-        format!("{:.0}%", p.round())
+        return format!("{:.0}%", p.round());
+    }
+    // C#'s `0.#` keeps one decimal only when it isn't zero — i.e.
+    // `6.2%`, `9.9%`, but `7%` (not `7.0%`).
+    let one_dp = (p * 10.0).round() / 10.0;
+    if (one_dp - one_dp.trunc()).abs() < f32::EPSILON {
+        format!("{:.0}%", one_dp)
     } else {
-        format!("{p:.1}%")
+        format!("{one_dp:.1}%")
     }
 }
 
@@ -1070,8 +1085,11 @@ mod tests {
     // --- format_context_pct ---
 
     #[test]
-    fn format_context_pct_under_10_uses_one_decimal() {
-        assert_eq!(format_context_pct(0.0), "0.0%");
+    fn format_context_pct_under_10_uses_one_decimal_when_non_zero() {
+        // Whole numbers drop the trailing `.0` (matches C# `0.#`).
+        assert_eq!(format_context_pct(0.0), "0%");
+        assert_eq!(format_context_pct(0.07), "7%");
+        // Non-zero fractional digit keeps one decimal.
         assert_eq!(format_context_pct(0.062), "6.2%");
         assert_eq!(format_context_pct(0.099), "9.9%");
     }

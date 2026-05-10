@@ -92,3 +92,15 @@ pub fn status_clean(theme: &Theme) -> Hsla { accent(theme) }
 /// `ContextMenuStyles.xaml`. Hard-coded — a danger red that reads
 /// across every theme. Themable later.
 pub fn danger(_theme: &Theme) -> Hsla { rgb_to_hsla(Rgb::from_hex(0xff8a8a)) }
+
+/// `Signal.Color.Ok` from `DesignTokens.xaml` (#FF4BD87B). Used for
+/// the status-bar session dot when the focused Claude session is
+/// idle, the agent rollup's idle counter dot, and any other
+/// "everything is fine" green in the chrome.
+pub fn signal_ok() -> Hsla { rgb_to_hsla(Rgb::from_hex(0x4BD87B)) }
+
+/// `Signal.Color.Warn` from `DesignTokens.xaml` (#FFFF5A5A). Used for
+/// the status-bar session dot when the focused Claude session is
+/// busy / pending tool use, the agent rollup's busy counter dot,
+/// and the notifications popover's `SessionWaiting` kind dot.
+pub fn signal_warn() -> Hsla { rgb_to_hsla(Rgb::from_hex(0xFF5A5A)) }

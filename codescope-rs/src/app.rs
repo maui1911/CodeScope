@@ -2155,24 +2155,29 @@ impl AppShell {
         let ink_muted = theme::ink_muted(theme);
         let divider_clr = theme::divider(theme);
         let accent = theme::accent(theme);
-        // Signal.Ok / Signal.Warn from DesignTokens.xaml.
-        let signal_ok = gpui::Hsla { h: 158.0 / 360.0, s: 0.66, l: 0.50, a: 1.0 };
-        let signal_warn = gpui::Hsla { h: 0.0, s: 1.0, l: 0.671, a: 1.0 };
+        // Signal.Ok / Signal.Warn pulled from DesignTokens.xaml via
+        // `theme::signal_ok` / `theme::signal_warn` so the dot colour
+        // tracks any future theme override and stays exactly in
+        // sync with the WPF brushes (#FF4BD87B / #FFFF5A5A).
+        let signal_ok = theme::signal_ok();
+        let signal_warn = theme::signal_warn();
 
         // ─── Helpers ────────────────────────────────────────────
         let sep = move || div().w_px().h(px(14.0)).bg(divider_clr);
 
         // ─── Left cluster ───────────────────────────────────────
+        // Only render the session dot + branch when we actually have
+        // a git context (worktree resolved → `GitStatus` cached).
+        // Plain shell tabs and tabs whose working directory has not
+        // yet surfaced fall through to the title-only branch below,
+        // matching the docstring's `StatusHasSession` rule.
         let session_dot_color = match snapshot.as_ref().map(|s| s.state) {
             Some(codescope_core::SessionState::Busy)
             | Some(codescope_core::SessionState::PendingToolUse) => signal_warn,
             _ => signal_ok,
         };
-        let branch_text: Option<SharedString> = git
-            .as_ref()
-            .map(|g| g.branch.clone().into())
-            .or_else(|| active_title.clone());
-        let session_cluster = branch_text.as_ref().map(|branch| {
+        let session_cluster = git.as_ref().map(|g| {
+            let branch: SharedString = g.branch.clone().into();
             div()
                 .flex()
                 .flex_row()
@@ -2189,7 +2194,7 @@ impl AppShell {
                     div()
                         .text_color(ink)
                         .font_weight(gpui::FontWeight::MEDIUM)
-                        .child(branch.clone()),
+                        .child(branch),
                 )
         });
 
@@ -2429,51 +2434,70 @@ impl AppShell {
             .text_size(px(11.5))
             .text_color(ink_dim);
 
-        // Left cluster: session dot + branch, then optional git diff,
-        // then optional ahead/behind. A truncating spacer pushes the
-        // right cluster all the way to the edge.
-        if let Some(seg) = session_cluster {
-            bar = bar.child(seg);
-        } else {
-            // Empty-state — show the active tab title (or "(empty
-            // group)") so the left side isn't blank when no
-            // working_directory has yet been resolved.
-            let title_text: SharedString = active_title
-                .unwrap_or_else(|| SharedString::from("(empty group)"));
-            bar = bar.child(div().truncate().text_color(ink).child(title_text));
-        }
-        if let Some(seg) = diff_segment {
-            bar = bar.child(sep()).child(seg);
-        }
-        if let Some(seg) = remote_segment {
-            bar = bar.child(sep()).child(seg);
-        }
-        // Flexible spacer between left and right clusters.
-        bar = bar.child(div().flex_grow());
-
-        // Right cluster — model · tokens · turns · duration ·
-        // agent rollup · group count · workspace summary · bell.
+        // Build the left cluster as a list of optional segments,
+        // then intersperse `sep()` so a missing segment never leaves
+        // a stray separator behind. Same pattern for the right
+        // cluster — both mirror the C# `StatusBarView` 1×14 rule
+        // placement: rules sit *between* visible items only.
+        let left_segments: Vec<gpui::AnyElement> = {
+            let mut v: Vec<gpui::AnyElement> = Vec::new();
+            if let Some(seg) = session_cluster {
+                v.push(seg.into_any_element());
+            } else {
+                let title_text: SharedString = active_title
+                    .unwrap_or_else(|| SharedString::from("(empty group)"));
+                v.push(
+                    div()
+                        .truncate()
+                        .text_color(ink)
+                        .child(title_text)
+                        .into_any_element(),
+                );
+            }
+            if let Some(seg) = diff_segment {
+                v.push(seg.into_any_element());
+            }
+            if let Some(seg) = remote_segment {
+                v.push(seg.into_any_element());
+            }
+            v
+        };
+        let mut right_segments: Vec<gpui::AnyElement> = Vec::new();
         if let Some(seg) = model_segment {
-            bar = bar.child(seg);
+            right_segments.push(seg.into_any_element());
         }
         if let Some(seg) = tokens_segment {
-            bar = bar.child(sep()).child(seg);
+            right_segments.push(seg.into_any_element());
         }
         if let Some(seg) = turns_segment {
-            bar = bar.child(sep()).child(seg);
+            right_segments.push(seg.into_any_element());
         }
         if let Some(seg) = duration_segment {
-            bar = bar.child(sep()).child(seg);
+            right_segments.push(seg.into_any_element());
         }
         if let Some(seg) = agent_segment {
-            bar = bar.child(sep()).child(seg);
+            right_segments.push(seg.into_any_element());
         }
         if let Some(gl) = group_label {
-            bar = bar.child(sep()).child(div().child(gl));
+            right_segments.push(div().child(gl).into_any_element());
         }
-        bar = bar.child(sep()).child(workspace_summary);
-        bar = bar.child(div().child(tab_label));
-        bar = bar.child(sep()).child(bell_btn);
+        right_segments.push(workspace_summary.into_any_element());
+        right_segments.push(div().child(tab_label).into_any_element());
+        right_segments.push(bell_btn.into_any_element());
+
+        for (i, seg) in left_segments.into_iter().enumerate() {
+            if i > 0 {
+                bar = bar.child(sep());
+            }
+            bar = bar.child(seg);
+        }
+        bar = bar.child(div().flex_grow());
+        for (i, seg) in right_segments.into_iter().enumerate() {
+            if i > 0 {
+                bar = bar.child(sep());
+            }
+            bar = bar.child(seg);
+        }
         bar
     }
 
