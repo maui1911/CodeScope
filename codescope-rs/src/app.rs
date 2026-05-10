@@ -118,24 +118,35 @@ struct Tab {
     /// as "this tab's session". Mirrors the `since` arg of
     /// `ClaudeSessionDiscovery.Watch`.
     spawned_at: SystemTime,
-    /// Adopted Claude session id, set once `claude_discovery::scan`
-    /// returns a fresh transcript for this tab. `None` until the agent
-    /// has written its first jsonl line — and stays `None` for plain
-    /// pwsh tabs (no `claude` auto-type). On adoption we register the
-    /// telemetry tail; on close we unregister.
+    /// Adopted agent session id, set once the agent-specific discovery
+    /// scan returns a fresh transcript / message dir / session dir for
+    /// this tab. `None` until the agent has written its first
+    /// recognisable file — and stays `None` for plain shell tabs
+    /// (no agent `auto_type`). On adoption we register the telemetry
+    /// tail via the per-`agent_id` dispatch in `register_telemetry`;
+    /// on close we unregister.
     ///
-    /// Updates again on `/clear` rotations (Claude Code mints a new
-    /// `.jsonl` and a new id under the same encoded-cwd directory).
-    /// In that case the discovery loop unregisters the previous tail
-    /// before swapping in the new id, mirroring C# `WatchHandle._fired`
-    /// + `ApplyAdoption`.
+    /// For Claude this id rotates on `/clear` (a new `.jsonl` lands
+    /// under the same encoded-cwd directory). For Pi the discovery
+    /// loop also keeps re-firing as the user re-invokes `pi`. In both
+    /// cases the loop unregisters the previous tail before swapping
+    /// in the new id, mirroring C# `WatchHandle._fired` +
+    /// `MainViewModel.ApplyAdoption`.
     adopted_session_id: Option<String>,
-    /// Every Claude session id we've already registered telemetry for
+    /// Every agent session id we've already registered telemetry for
     /// on this tab — i.e. the historical adoption set.  Kept so the
     /// discovery loop can dedupe when re-scanning after `/clear`
-    /// rotations and avoid registering the same tail twice.  Mirrors
-    /// the C# `WatchHandle._fired` HashSet.
+    /// rotations (or successive `pi` invocations) and avoid registering
+    /// the same tail twice.  Mirrors the C# `WatchHandle._fired`
+    /// HashSet.
     fired_session_ids: std::collections::HashSet<String>,
+    /// Detected agent backend, derived from `auto_type` at spawn time
+    /// via [`codescope_core::agent_id_from_auto_type`]. `None` for
+    /// plain shell tabs (no auto-type) and tabs whose first token
+    /// doesn't match a known agent. Drives discovery + telemetry
+    /// dispatch — mirrors the `agentId` string the C#
+    /// `MainViewModel.RegisterAgentTelemetry` branches on.
+    agent_id: Option<codescope_core::AgentId>,
 }
 
 /// One column in the work area: a tab strip + the currently-selected
@@ -364,6 +375,43 @@ impl Render for DraggedTab {
     }
 }
 
+/// One live telemetry tail for an adopted session. The variant is
+/// chosen by the owning tab's [`Tab::agent_id`]; all variants expose
+/// the same poll/snapshot surface so [`AppShell::telemetry_for`] can
+/// return a uniform `TelemetrySnapshot` regardless of which parser
+/// produced it.
+///
+/// Mirrors the four `*TelemetryService` instances the C#
+/// `MainViewModel` keeps as separate fields — Rust collapses them
+/// into one heterogeneous map so the discovery / poll plumbing stays
+/// agent-agnostic.
+enum AgentTail {
+    Claude(codescope_core::TranscriptTail),
+    Copilot(codescope_core::CopilotTranscriptTail),
+    OpenCode(codescope_core::OpenCodeMessageTail),
+    Pi(codescope_core::PiTranscriptTail),
+}
+
+impl AgentTail {
+    fn poll(&mut self) -> bool {
+        match self {
+            AgentTail::Claude(t) => t.poll(),
+            AgentTail::Copilot(t) => t.poll(),
+            AgentTail::OpenCode(t) => t.poll(),
+            AgentTail::Pi(t) => t.poll(),
+        }
+    }
+
+    fn snapshot(&self) -> Option<codescope_core::TelemetrySnapshot> {
+        match self {
+            AgentTail::Claude(t) => t.snapshot.clone(),
+            AgentTail::Copilot(t) => t.snapshot.clone(),
+            AgentTail::OpenCode(t) => t.snapshot().cloned(),
+            AgentTail::Pi(t) => t.snapshot.clone(),
+        }
+    }
+}
+
 pub struct AppShell {
     /// Flat list of tab groups laid out left-to-right. Always at
     /// least one entry — `close_tab` collapses an emptied group only
@@ -459,12 +507,16 @@ pub struct AppShell {
     /// `notifications.toggle()` and the render calls
     /// `render_notifications_popover` alongside `render_toasts`.
     pub(crate) notifications: crate::notifications::Notifications,
-    /// Live telemetry tails, keyed by Claude session id. Entries are
-    /// registered via `register_telemetry` and polled by the background
-    /// task spawned in `AppShell::new`. The accessor
-    /// `telemetry_for(session_id)` exposes the latest snapshot without
-    /// taking a mutable reference.
-    telemetry_tails: HashMap<String, codescope_core::TranscriptTail>,
+    /// Live telemetry tails, keyed by adopted-agent session id.
+    /// Entries are registered via `register_telemetry` (per-agent
+    /// dispatch) and polled by the background task spawned in
+    /// `AppShell::new`. The accessor `telemetry_for(session_id)`
+    /// exposes the latest snapshot without taking a mutable reference.
+    /// The map is heterogeneous via [`AgentTail`] so all four agent
+    /// backends share one lookup surface — mirrors C#
+    /// `MainViewModel.RegisterAgentTelemetry` / `UnregisterAgentTelemetry`
+    /// dispatching to four distinct `*TelemetryService` instances.
+    telemetry_tails: HashMap<String, AgentTail>,
     /// Window-coordinate bounds of the bell button as recorded by the
     /// `canvas` overlay child during the most recent layout pass.
     /// Used by `render_notifications_popover` to position the popover
@@ -808,7 +860,7 @@ impl AppShell {
             projects: projects_for_sessions,
         };
         shell.start_telemetry_poll(cx);
-        shell.start_claude_discovery_poll(cx);
+        shell.start_agent_discovery_poll(cx);
         shell.start_update_check_poll(cx);
         shell.rehydrate_or_cold_start(window, cx);
         shell
@@ -856,40 +908,86 @@ impl AppShell {
     // Claude telemetry
     // -----------------------------------------------------------------------
 
-    /// Register a Claude Code transcript tail for `session_id` under
-    /// `working_directory`.  Safe to call multiple times with the same
-    /// id — the old tail is replaced (e.g. after a session resume that
-    /// kept the same session id).
+    /// Register a transcript tail for `session_id` under
+    /// `working_directory`, dispatching by `agent_id`. Safe to call
+    /// multiple times with the same id — the old tail is replaced
+    /// (e.g. after a Claude session resume that kept the same id).
     ///
-    /// Mirrors `IClaudeTelemetryService.Register` from the C# build.
-    pub fn register_telemetry(&mut self, session_id: String, working_directory: &str) {
-        // Resolve `~/.claude/projects/`. Without USERPROFILE / HOME a
-        // `unwrap_or_default()` would yield `".claude/projects"`
-        // relative to the CWD — almost always wrong, and confusing
-        // when telemetry silently reads from a path the user doesn't
-        // own. Bail out instead so callers see "no telemetry" rather
-        // than misleading data.
-        let Some(home) = std::env::var_os("USERPROFILE")
-            .or_else(|| std::env::var_os("HOME"))
-        else {
-            eprintln!(
-                "[claude_telemetry] no USERPROFILE / HOME — skipping registration for {session_id}"
-            );
-            return;
+    /// Mirrors `MainViewModel.RegisterAgentTelemetry` in the C#
+    /// build — branches by agent id, no-ops cleanly for unknown
+    /// backends or when the per-agent root can't be resolved.
+    pub fn register_telemetry(
+        &mut self,
+        agent_id: codescope_core::AgentId,
+        session_id: String,
+        working_directory: &str,
+    ) {
+        let tail = match agent_id {
+            codescope_core::AgentId::Claude => {
+                let Some(root) = Self::claude_projects_root() else {
+                    eprintln!(
+                        "[telemetry] no USERPROFILE / HOME — skipping claude registration for {session_id}"
+                    );
+                    return;
+                };
+                AgentTail::Claude(codescope_core::TranscriptTail::for_session(
+                    &root,
+                    working_directory,
+                    &session_id,
+                ))
+            }
+            codescope_core::AgentId::Copilot => {
+                let Some(root) = codescope_core::copilot_telemetry::default_session_state_root()
+                else {
+                    eprintln!(
+                        "[telemetry] no USERPROFILE / HOME — skipping copilot registration for {session_id}"
+                    );
+                    return;
+                };
+                AgentTail::Copilot(codescope_core::CopilotTranscriptTail::for_session(
+                    &root,
+                    &session_id,
+                ))
+            }
+            codescope_core::AgentId::OpenCode => {
+                let Some(root) = codescope_core::opencode_telemetry::default_data_root() else {
+                    eprintln!(
+                        "[telemetry] no USERPROFILE / HOME — skipping opencode registration for {session_id}"
+                    );
+                    return;
+                };
+                AgentTail::OpenCode(codescope_core::OpenCodeMessageTail::new(
+                    root,
+                    session_id.clone(),
+                ))
+            }
+            codescope_core::AgentId::Pi => {
+                let Some(root) = codescope_core::pi_telemetry::default_sessions_root() else {
+                    eprintln!(
+                        "[telemetry] no USERPROFILE / HOME — skipping pi registration for {session_id}"
+                    );
+                    return;
+                };
+                // Pi locates the transcript by suffix-matching
+                // `*_<sid>.jsonl`. The file may not exist yet on the
+                // first call (the discovery loop racing the agent
+                // starting up); skip the registration in that case
+                // and let the next discovery tick retry.
+                let Some(tail) = codescope_core::PiTranscriptTail::for_session(&root, &session_id)
+                else {
+                    eprintln!(
+                        "[telemetry] pi transcript not yet on disk — skipping pi registration for {session_id}"
+                    );
+                    return;
+                };
+                AgentTail::Pi(tail)
+            }
         };
-        let projects_root = std::path::PathBuf::from(home)
-            .join(".claude")
-            .join("projects");
-        let tail = codescope_core::TranscriptTail::for_session(
-            &projects_root,
-            working_directory,
-            &session_id,
-        );
         self.telemetry_tails.insert(session_id, tail);
     }
 
-    /// Remove a tail and drop its snapshot. Mirrors `Unregister` in the
-    /// C# build.
+    /// Remove a tail and drop its snapshot. Mirrors `UnregisterAgentTelemetry`
+    /// in the C# build — agent-agnostic (we drop by id, not by type).
     pub fn unregister_telemetry(&mut self, session_id: &str) {
         self.telemetry_tails.remove(session_id);
     }
@@ -898,12 +996,13 @@ impl AppShell {
     /// when the session has not been registered or has not yet produced
     /// any parseable entries.
     ///
-    /// Callers (e.g. `render_status_bar` in a parallel agent) use this
-    /// accessor to read data without touching the poll state.
+    /// Agent-agnostic: the heterogeneous [`AgentTail`] enum normalises
+    /// every parser onto the shared
+    /// [`codescope_core::TelemetrySnapshot`] shape, so callers (e.g.
+    /// `render_status_bar`) don't need to know which backend produced
+    /// the data.
     pub fn telemetry_for(&self, session_id: &str) -> Option<codescope_core::TelemetrySnapshot> {
-        self.telemetry_tails
-            .get(session_id)
-            .and_then(|t| t.snapshot.clone())
+        self.telemetry_tails.get(session_id).and_then(|t| t.snapshot())
     }
 
     /// Spawn the background transcript-tail polling loop.
@@ -946,7 +1045,7 @@ impl AppShell {
                     for tail in this.telemetry_tails.values_mut() {
                         tail.poll();
                         if matches!(
-                            tail.snapshot.as_ref().map(|s| s.state),
+                            tail.snapshot().map(|s| s.state),
                             Some(codescope_core::SessionState::Busy)
                                 | Some(codescope_core::SessionState::PendingToolUse)
                         ) {
@@ -977,45 +1076,54 @@ impl AppShell {
         Some(std::path::PathBuf::from(home).join(".claude").join("projects"))
     }
 
-    /// Spawn the background per-tab Claude session adoption loop.
+    /// Spawn the background per-tab agent session adoption loop.
     ///
-    /// Mirrors `ClaudeSessionDiscovery.Watch` from the C# build: every
-    /// 350 ms while at least one Claude tab is alive, scan
-    /// `~/.claude/projects/<encoded-cwd>/` for `.jsonl` transcripts
-    /// written at or after `spawned_at`. The watch stays armed for
-    /// the tab's full lifetime (`/clear` rotates the session id and
-    /// writes a fresh `.jsonl`; the C# `WatchHandle._fired` HashSet
-    /// remembers paths already fired so each new id triggers exactly
-    /// one re-adoption). On rotation we unregister the previous
-    /// tail before registering the new one so `telemetry_tails`
-    /// doesn't accumulate stale entries. With no Claude tabs the
-    /// cadence drops to 5 s.
+    /// Mirrors C# `MainViewModel.BeginAgentAdoption`: every tick, scan
+    /// each agent's filesystem layout for transcripts whose
+    /// `created_at` or `last_modified` is at or after the tab's
+    /// `spawned_at`, then dedupe per-tab via `fired_session_ids` and
+    /// register the corresponding telemetry tail. Each tab's
+    /// `agent_id` selects which discovery scan runs:
+    ///
+    /// * Claude — `~/.claude/projects/<encoded-cwd>/<sid>.jsonl`
+    /// * Pi      — `~/.pi/agent/sessions/.../*_<sid>.jsonl` (recursive)
+    /// * OpenCode — `~/.local/share/opencode/.../message/<sid>/msg_*.json`
+    /// * Copilot  — `~/.copilot/session-state/<sid>/`
+    ///
+    /// All four scans match by canonicalised cwd (Claude uses an
+    /// encoded-cwd directory; the others peek at a header field) so
+    /// transcripts from a different workspace don't get adopted into
+    /// the wrong tab.
+    ///
+    /// The watch stays armed for the tab's full lifetime so Claude's
+    /// `/clear` rotations and Pi's per-invocation session ids both
+    /// flow through cleanly. Tabs without a recognised `agent_id`
+    /// (plain shell, unknown command) are skipped.
+    ///
+    /// Cadence: the fastest of the four agent-specific intervals
+    /// (350 ms — Claude / Pi / Copilot all match) while any agent
+    /// tab is alive, dropping to 5 s when none are.
     ///
     /// Called from `AppShell::new` after the struct is constructed.
-    fn start_claude_discovery_poll(&self, cx: &mut Context<Self>) {
+    fn start_agent_discovery_poll(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            let mut interval =
-                Duration::from_millis(codescope_core::CLAUDE_DISCOVERY_POLL_MS);
+            let active = Duration::from_millis(codescope_core::CLAUDE_DISCOVERY_POLL_MS);
             let idle = Duration::from_secs(5);
+            let mut interval = active;
             loop {
                 cx.background_executor().timer(interval).await;
                 if this.upgrade().is_none() {
                     break;
                 }
                 let result = this.update(cx, |this, _cx| {
-                    let Some(root) = Self::claude_projects_root() else {
-                        return idle;
-                    };
                     // Two-pass scan/mutate so we can't deadlock on
                     // `register_telemetry`'s `&mut self` borrow:
-                    // collect candidates first (ids the tab hasn't
-                    // fired yet), then perform the register / un-
-                    // register dance. Keeps the watch alive for the
-                    // tab's full lifetime so `/clear` rotations are
-                    // adopted as new id-paths appear.
+                    // collect candidates first, then perform the
+                    // register / un-register dance.
                     struct Found {
                         group_idx: usize,
                         tab_idx: usize,
+                        agent_id: codescope_core::AgentId,
                         previous_session_id: Option<String>,
                         new_session_id: String,
                         working_directory: String,
@@ -1024,28 +1132,75 @@ impl AppShell {
                     let mut any_active = false;
                     for (g_idx, group) in this.groups.iter().enumerate() {
                         for (t_idx, tab) in group.tabs.iter().enumerate() {
-                            if !codescope_core::claude_discovery::is_claude_auto_type(
-                                tab.auto_type.as_ref().map(|s| s.as_ref()),
-                            ) {
-                                continue;
-                            }
+                            let Some(agent_id) = tab.agent_id else { continue };
                             let Some(ref wd) = tab.working_directory else { continue };
                             any_active = true;
                             let wd_str = wd.to_string_lossy().into_owned();
-                            let hits = codescope_core::claude_discovery::scan(
-                                &root, &wd_str, tab.spawned_at,
-                            );
-                            // Pick the newest unseen candidate by
-                            // last-modified mtime so a `/clear`
-                            // rotation supplants the previous id
-                            // rather than the loop oscillating
-                            // between concurrent transcripts.
-                            let mut newest: Option<(SystemTime, codescope_core::AdoptionCandidate)> = None;
-                            for c in hits {
-                                if tab.fired_session_ids.contains(&c.session_id) {
+                            // Each agent scan returns
+                            // `(session_id, mtime_source_path)` so we
+                            // can pick the newest unseen candidate per
+                            // tab — the "/clear rotation supplants the
+                            // previous id" rule from PR #98 still
+                            // applies for Claude, and the same logic
+                            // covers Pi's per-invocation ids.
+                            let hits: Vec<(String, std::path::PathBuf)> = match agent_id {
+                                codescope_core::AgentId::Claude => {
+                                    let Some(root) = Self::claude_projects_root() else {
+                                        continue;
+                                    };
+                                    codescope_core::claude_discovery::scan(
+                                        &root, &wd_str, tab.spawned_at,
+                                    )
+                                    .into_iter()
+                                    .map(|c| (c.session_id, c.path))
+                                    .collect()
+                                }
+                                codescope_core::AgentId::Pi => {
+                                    let Some(root) =
+                                        codescope_core::pi_telemetry::default_sessions_root()
+                                    else {
+                                        continue;
+                                    };
+                                    codescope_core::pi_discovery::scan(
+                                        &root, &wd_str, tab.spawned_at,
+                                    )
+                                    .into_iter()
+                                    .map(|c| (c.session_id, c.path))
+                                    .collect()
+                                }
+                                codescope_core::AgentId::OpenCode => {
+                                    let Some(root) =
+                                        codescope_core::opencode_telemetry::default_data_root()
+                                    else {
+                                        continue;
+                                    };
+                                    codescope_core::opencode_discovery::scan(
+                                        &root, &wd_str, tab.spawned_at,
+                                    )
+                                    .into_iter()
+                                    .map(|c| (c.session_id, c.message_path))
+                                    .collect()
+                                }
+                                codescope_core::AgentId::Copilot => {
+                                    let Some(root) =
+                                        codescope_core::copilot_telemetry::default_session_state_root()
+                                    else {
+                                        continue;
+                                    };
+                                    codescope_core::copilot_discovery::scan(
+                                        &root, &wd_str, tab.spawned_at,
+                                    )
+                                    .into_iter()
+                                    .map(|c| (c.session_id, c.session_dir))
+                                    .collect()
+                                }
+                            };
+                            let mut newest: Option<(SystemTime, String)> = None;
+                            for (sid, path) in hits {
+                                if tab.fired_session_ids.contains(&sid) {
                                     continue;
                                 }
-                                let mtime = std::fs::metadata(&c.path)
+                                let mtime = std::fs::metadata(&path)
                                     .ok()
                                     .and_then(|m| m.modified().ok())
                                     .unwrap_or(SystemTime::UNIX_EPOCH);
@@ -1054,15 +1209,16 @@ impl AppShell {
                                     .map(|(prev, _)| mtime >= *prev)
                                     .unwrap_or(true);
                                 if take {
-                                    newest = Some((mtime, c));
+                                    newest = Some((mtime, sid));
                                 }
                             }
-                            if let Some((_, c)) = newest {
+                            if let Some((_, sid)) = newest {
                                 found.push(Found {
                                     group_idx: g_idx,
                                     tab_idx: t_idx,
+                                    agent_id,
                                     previous_session_id: tab.adopted_session_id.clone(),
-                                    new_session_id: c.session_id,
+                                    new_session_id: sid,
                                     working_directory: wd_str,
                                 });
                             }
@@ -1075,6 +1231,7 @@ impl AppShell {
                             }
                         }
                         this.register_telemetry(
+                            f.agent_id,
                             f.new_session_id.clone(),
                             &f.working_directory,
                         );
@@ -1085,11 +1242,7 @@ impl AppShell {
                             }
                         }
                     }
-                    if any_active {
-                        Duration::from_millis(codescope_core::CLAUDE_DISCOVERY_POLL_MS)
-                    } else {
-                        idle
-                    }
+                    if any_active { active } else { idle }
                 });
                 match result {
                     Ok(next) => interval = next,
@@ -1563,6 +1716,9 @@ impl AppShell {
         // Capture the entity so an `auto_type` job can write to it
         // without re-borrowing `self.groups` after the await point.
         let terminal_for_autotype = terminal.clone();
+        let agent_id = codescope_core::agent_id_from_auto_type(
+            auto_type.as_ref().map(|s| s.as_ref()),
+        );
         group.tabs.push(Tab {
             id,
             session_id,
@@ -1573,6 +1729,7 @@ impl AppShell {
             spawned_at: SystemTime::now(),
             adopted_session_id: None,
             fired_session_ids: std::collections::HashSet::new(),
+            agent_id,
         });
         let new_idx = group.tabs.len() - 1;
         self.activate_tab(group_idx, new_idx, window, cx);
@@ -2502,11 +2659,13 @@ impl AppShell {
     ///   are present); remote ahead/behind (`↑N` / `↓N` / `↑N ↓N`).
     ///   Hidden entirely on tabs with no working directory (e.g.
     ///   plain pwsh launched without a project).
-    /// - **Right cluster** — Claude transcript-derived slots (model,
+    /// - **Right cluster** — agent-transcript-derived slots (model,
     ///   tokens + percent, turn count, last turn duration), agent
-    ///   rollup `N busy · M idle` across all adopted Claude tabs,
-    ///   optional `N groups` label, workspace summary, and the
-    ///   notifications bell with a 4 px unread dot.
+    ///   rollup `N busy · M idle` across all adopted agent tabs
+    ///   (Claude / Copilot / OpenCode / Pi — whichever the active
+    ///   tab's `agent_id` selected at spawn), optional `N groups`
+    ///   label, workspace summary, and the notifications bell with
+    ///   a 4 px unread dot.
     ///
     /// Data sources: [`Sidebar::git_status_for`] (branch + numstat +
     /// ahead/behind), [`AppShell::telemetry_for`] (per-session model
@@ -2932,11 +3091,12 @@ impl AppShell {
         bar
     }
 
-    /// Walk every tab across every group and count adopted Claude
-    /// sessions by activity state. Mirrors C#'s `StatusAgentBusy` /
-    /// `StatusAgentIdle`. Tabs without an `adopted_session_id`
-    /// (plain pwsh, or Claude tabs whose `.jsonl` hasn't surfaced
-    /// yet) don't contribute to either count.
+    /// Walk every tab across every group and count adopted agent
+    /// sessions by activity state, regardless of agent backend.
+    /// Mirrors C#'s `StatusAgentBusy` / `StatusAgentIdle`. Tabs without
+    /// an `adopted_session_id` (plain pwsh, or agent tabs whose
+    /// transcript hasn't surfaced yet) don't contribute to either
+    /// count.
     fn agent_rollup_counts(&self) -> (u32, u32) {
         let mut busy = 0;
         let mut idle = 0;
