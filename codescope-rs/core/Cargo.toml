@@ -13,9 +13,10 @@ uuid = { version = "1", features = ["v4"] }
 # `ureq` powers the GitHub release poll in `update_check`. Picked over
 # `reqwest` because it's blocking (so it composes cleanly with
 # `cx.background_spawn` from app.rs), has no tokio runtime requirement,
-# and rolls up to ~1/4 the compile-time of `reqwest`. `rustls-tls`
-# selects the rustls backend already in our dep tree (pulled by gpui),
-# avoiding a second TLS implementation.
+# and rolls up to ~1/4 the compile-time of `reqwest`. The `tls` feature
+# (ureq 2.x's name for the rustls backend, see `ureq/src/tls.rs`) reuses
+# the rustls already in our dep tree (pulled by gpui), avoiding a
+# second TLS implementation.
 ureq = { version = "2", default-features = false, features = ["tls"] }
 
 [dev-dependencies]

@@ -37,8 +37,8 @@
 //! # Notification surface
 //!
 //! `app.rs` reads `UpdateStatus::Available` and pushes a `Generic`
-//! notification with a fixed title (`"Update available"`) and a detail
-//! line containing the new version + release URL. The C# build uses a
+//! notification titled `CodeScope <version> available` with a detail
+//! line containing the release URL. The C# build uses a
 //! `ToastSeverity.Ok` snackbar plus a confirmation dialog; we use the
 //! existing Notification ring buffer because (a) the Rust port has no
 //! restart-and-apply path, so the dialog wouldn't have anything
@@ -56,8 +56,9 @@
 //!
 //! # Network-failure semantics
 //!
-//! Every error path collapses to `UpdateStatus::Unknown` — the caller
-//! logs a single line and tries again on the next interval. We never
+//! Every error path collapses to `UpdateStatus::Unknown`. We log one
+//! `eprintln!` line at the failure site (fetch error, JSON parse
+//! error) and the caller just retries on the next interval. We never
 //! panic, never propagate a `Result`, and never re-toast the same
 //! version twice in a single process lifetime (the caller dedupes by
 //! holding the last-announced version in `AppShell` state).
@@ -212,15 +213,24 @@ pub fn evaluate(json_body: &str, current_version: &str) -> UpdateStatus {
     }
 }
 
+/// Maximum response body we'll buffer from the release endpoint.
+/// Real GitHub `/releases/latest` payloads are ~10 KiB; anything
+/// larger almost certainly means we got an HTML error page or a
+/// MITM is feeding us garbage. Refuse to read beyond this so a
+/// hostile (or just broken) endpoint can't OOM the process.
+const MAX_RESPONSE_BYTES: u64 = 1 << 20;
+
 /// HTTP GET against GitHub's API. Returns the response body on 2xx,
 /// `Err(message)` for any failure — including non-2xx, network error,
-/// timeout, or oversized response. Caller treats every error as
-/// "skip this tick".
+/// timeout, or response larger than `MAX_RESPONSE_BYTES`. Caller
+/// treats every error as "skip this tick".
 ///
-/// `pub(crate)` rather than `pub` because the only legitimate caller
-/// is `check_once`; tests that need to exercise parse + version
-/// logic go through `evaluate` with a fixture JSON string.
+/// Private (not `pub(crate)`) because the only legitimate caller is
+/// `check_once`; tests that need to exercise parse + version logic
+/// go through `evaluate` with a fixture JSON string.
 fn fetch_latest_release_json(url: &str, current_version: &str) -> Result<String, String> {
+    use std::io::Read;
+
     let response = ureq::get(url)
         .set("User-Agent", &user_agent(current_version))
         .set("Accept", "application/vnd.github+json")
@@ -230,12 +240,20 @@ fn fetch_latest_release_json(url: &str, current_version: &str) -> Result<String,
     if response.status() < 200 || response.status() >= 300 {
         return Err(format!("HTTP {}", response.status()));
     }
-    // Cap the body at 1 MiB. Real responses are ~10 KiB; anything
-    // larger almost certainly means GitHub returned an HTML error
-    // page or our endpoint is being MITMed.
-    response
-        .into_string()
-        .map_err(|e| format!("read body failed: {e}"))
+    // Read at most MAX_RESPONSE_BYTES + 1 so we can tell the
+    // difference between "exactly the cap" and "exceeded the cap".
+    // The `+ 1` byte read is the canary: if the limited reader
+    // delivered anything past the cap, we know the source had more
+    // and we refuse to deserialise a truncated JSON document.
+    let mut buf = Vec::with_capacity(16 * 1024);
+    let mut limited = response.into_reader().take(MAX_RESPONSE_BYTES + 1);
+    limited
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read body failed: {e}"))?;
+    if buf.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err(format!("response exceeded {} bytes", MAX_RESPONSE_BYTES));
+    }
+    String::from_utf8(buf).map_err(|e| format!("response not utf-8: {e}"))
 }
 
 /// Strip a leading `v` or `V` from a version string. Mirrors
@@ -362,9 +380,12 @@ mod tests {
 
     #[test]
     fn normalise_current_unknown_passes_through() {
-        // The "0.0-unknown" build.rs fallback. Comparison against any
-        // semver tag will fail (no patch number) and `evaluate`
-        // returns UpToDate.
+        // The "0.0-unknown" build.rs fallback reduces to "0.0" here.
+        // That string would parse as the triple (0, 0, 0) and
+        // compare false-newer against every published tag, which is
+        // why `evaluate` short-circuits via `is_unknown_fallback`
+        // before this normalisation result is fed to
+        // `compare_versions`.
         assert_eq!(normalise_current("0.0-unknown"), "0.0");
     }
 
@@ -469,8 +490,11 @@ mod tests {
 
     #[test]
     fn evaluate_uptodate_when_current_is_unknown_fallback() {
-        // The build.rs `0.0-unknown` fallback — no patch number, parse
-        // fails, comparison ambiguous → UpToDate (don't spam).
+        // The build.rs `0.0-unknown` fallback. `normalise_current`
+        // would otherwise reduce this to `0.0` (parsing as the triple
+        // `(0, 0, 0)`) and compare false-newer against every published
+        // tag — `is_unknown_fallback` short-circuits before that and
+        // returns UpToDate so we don't spam notifications.
         let json = release_json("v0.2.5", "https://example.invalid", None);
         assert_eq!(evaluate(&json, "0.0-unknown"), UpdateStatus::UpToDate);
     }
