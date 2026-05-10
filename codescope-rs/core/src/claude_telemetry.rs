@@ -17,7 +17,7 @@
 //! thread inside it.
 
 use std::io::{BufRead as _, BufReader, Seek as _, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
@@ -134,7 +134,7 @@ pub struct FileTail {
     /// (truncated / rewritten).
     pub last_pos: u64,
     /// mtime of the last `stat` that produced a read. Unused for
-    /// correctness but handy for debuggging; callers can use
+    /// correctness but handy for debugging; callers can use
     /// `metadata.len()` instead.
     pub last_mtime: Option<SystemTime>,
 }
@@ -352,7 +352,7 @@ fn days_since_epoch(year: i64, month: i64, day: i64) -> Option<i64> {
 ///
 /// Mirrors `ClaudeTelemetryService.TryRead` from the C# build.
 pub fn process_new_lines(
-    path: &PathBuf,
+    path: &Path,
     tail: &mut FileTail,
     snapshot: &mut Option<TelemetrySnapshot>,
     last_user_ts: &mut Option<f64>,
@@ -397,12 +397,21 @@ pub fn process_new_lines(
     let mut changed = false;
 
     let mut line = String::new();
+    let mut clean_eof = false;
     loop {
         line.clear();
         match reader.read_line(&mut line) {
-            Ok(0) => break,
+            Ok(0) => {
+                clean_eof = true;
+                break;
+            }
             Ok(_) => {}
             Err(err) => {
+                // Read failure (transient mid-flush, sharing race,
+                // truncation between stat and read…). Bail out
+                // *without* advancing `last_pos` — a future poll
+                // will retry from the same offset rather than
+                // permanently skipping unread bytes.
                 eprintln!("[claude_telemetry] read error for {path:?}: {err}");
                 break;
             }
@@ -415,10 +424,11 @@ pub fn process_new_lines(
         match entry.kind {
             EntryKind::User => {
                 state = SessionState::Busy;
-                // Only track fresh prompts for the last-turn timer.
+                // Anchor for the last-turn duration; tool-result
+                // entries don't reset the anchor (they're internal
+                // to a turn the user already kicked off).
                 if !entry.user_carries_tool_result {
                     *last_user_ts = entry.timestamp_secs;
-                    turn_count += 1;
                 }
                 changed = true;
             }
@@ -449,6 +459,15 @@ pub fn process_new_lines(
                         + entry.cache_creation_tokens
                         + entry.output_tokens;
 
+                    // Mirror C# `ClaudeTelemetryService`: a *turn* is
+                    // a completed assistant reply with usage, not a
+                    // user prompt. Counting on user prompts would
+                    // make the badge tick up the moment the user
+                    // hits enter (even mid-compose in some clients)
+                    // and would diverge from the Claude transcript's
+                    // own definition.
+                    turn_count += 1;
+
                     // Compute turn duration from last fresh user prompt.
                     if let (Some(user_ts), Some(asst_ts)) = (*last_user_ts, entry.timestamp_secs) {
                         if asst_ts > user_ts {
@@ -467,13 +486,22 @@ pub fn process_new_lines(
         }
     }
 
-    // Advance position only after a clean read to the end.
-    tail.last_pos = file_len;
-    tail.last_mtime = meta.modified().ok();
+    // Only advance `last_pos` on a clean walk to EOF. Aborted
+    // mid-stream (read error) leaves the cursor where it was so the
+    // next poll re-reads from the same offset.
+    if clean_eof {
+        tail.last_pos = file_len;
+        tail.last_mtime = meta.modified().ok();
+    }
 
     if changed {
         let context_window = model.as_deref().and_then(context_window_for_model);
-        let context_pct = context_window.map(|cap| tokens_used as f32 / cap as f32);
+        // Clamp to [0.0, 1.0] — the doc-comment promises the value
+        // is a fraction in that range, and a token count above the
+        // window cap (possible while the agent winds down a long
+        // conversation) would otherwise leak >100% into the UI.
+        let context_pct =
+            context_window.map(|cap| (tokens_used as f32 / cap as f32).clamp(0.0, 1.0));
         *snapshot = Some(TelemetrySnapshot {
             model,
             tokens_used,
@@ -528,7 +556,7 @@ impl TranscriptTail {
     /// and a Claude session id. Returns the path regardless of whether
     /// the file exists — the caller should handle missing-file
     /// gracefully via `poll()`.
-    pub fn for_session(projects_root: &PathBuf, working_directory: &str, session_id: &str) -> Self {
+    pub fn for_session(projects_root: &Path, working_directory: &str, session_id: &str) -> Self {
         let encoded = encode_cwd(working_directory);
         let path = projects_root
             .join(encoded)
@@ -541,7 +569,7 @@ impl TranscriptTail {
     /// Returns `true` when the snapshot changed.
     pub fn poll(&mut self) -> bool {
         process_new_lines(
-            &self.path.clone(),
+            &self.path,
             &mut self.tail,
             &mut self.snapshot,
             &mut self.last_user_ts,
@@ -811,16 +839,24 @@ mod tests {
     }
 
     #[test]
-    fn turn_count_excludes_tool_results() {
+    fn turn_count_counts_assistant_entries_with_usage() {
+        // Mirrors the C# `ClaudeTelemetryService` rule: a *turn* is a
+        // completed assistant reply with usage, not a user prompt.
+        // The fixture below contains two assistant entries with
+        // usage (one ending in tool_use, one in end_turn) and one
+        // tool-result user entry that must NOT count as its own
+        // turn — the latter is verified indirectly via
+        // `last_turn_duration` anchoring on the last fresh user
+        // prompt rather than the tool-result entry.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("session.jsonl");
         write_lines(
             &path,
             &[
-                // Fresh prompt — turn 1
                 r#"{"type":"user","sessionId":"s","timestamp":"2026-04-22T08:00:00Z","message":{"role":"user","content":"do it"}}"#,
                 r#"{"type":"assistant","sessionId":"s","timestamp":"2026-04-22T08:01:00Z","message":{"role":"assistant","stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
-                // Tool result — should NOT increment turn_count
+                // Tool result — does not advance the
+                // last-turn anchor and does not bump the counter.
                 r#"{"type":"user","sessionId":"s","timestamp":"2026-04-22T08:01:05Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"ok"}]}}"#,
                 r#"{"type":"assistant","sessionId":"s","timestamp":"2026-04-22T08:02:00Z","message":{"role":"assistant","stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
             ],
@@ -829,9 +865,15 @@ mod tests {
         let mut tail = FileTail::default();
         let mut snap: Option<TelemetrySnapshot> = None;
         let mut last_user_ts = None;
-        process_new_lines(&path.to_path_buf(), &mut tail, &mut snap, &mut last_user_ts);
+        process_new_lines(path.as_path(), &mut tail, &mut snap, &mut last_user_ts);
 
-        assert_eq!(snap.unwrap().turn_count, 1);
+        let s = snap.unwrap();
+        // Two assistant-with-usage entries → two turns.
+        assert_eq!(s.turn_count, 2);
+        // Last turn duration is computed from the *fresh* user prompt
+        // at 08:00:00, not the tool-result user entry at 08:01:05.
+        // 08:02:00 − 08:00:00 = 120 s.
+        assert_eq!(s.last_turn_duration, Some(Duration::from_secs(120)));
     }
 
     #[test]

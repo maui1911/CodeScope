@@ -710,12 +710,23 @@ impl AppShell {
     ///
     /// Mirrors `IClaudeTelemetryService.Register` from the C# build.
     pub fn register_telemetry(&mut self, session_id: String, working_directory: &str) {
-        let projects_root = {
-            let home = std::env::var("USERPROFILE")
-                .or_else(|_| std::env::var("HOME"))
-                .unwrap_or_default();
-            std::path::PathBuf::from(home).join(".claude").join("projects")
+        // Resolve `~/.claude/projects/`. Without USERPROFILE / HOME a
+        // `unwrap_or_default()` would yield `".claude/projects"`
+        // relative to the CWD — almost always wrong, and confusing
+        // when telemetry silently reads from a path the user doesn't
+        // own. Bail out instead so callers see "no telemetry" rather
+        // than misleading data.
+        let Some(home) = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+        else {
+            eprintln!(
+                "[claude_telemetry] no USERPROFILE / HOME — skipping registration for {session_id}"
+            );
+            return;
         };
+        let projects_root = std::path::PathBuf::from(home)
+            .join(".claude")
+            .join("projects");
         let tail = codescope_core::TranscriptTail::for_session(
             &projects_root,
             working_directory,
@@ -752,9 +763,21 @@ impl AppShell {
     ///
     /// Called from `AppShell::new` after the struct is constructed.
     fn start_telemetry_poll(&self, cx: &mut Context<Self>) {
-        // Start with the idle interval — the first tick fires after
-        // construction is done (avoids the borrow-at-construction race
-        // that `start_dirty_poll` also guards against).
+        // Adaptive cadence — three rates so we don't burn CPU when
+        // there's nothing to read:
+        //
+        // - 250 ms while any registered tail is in `Busy` /
+        //   `PendingToolUse` (assistant streaming).
+        // - 2 s while at least one tail is registered but every
+        //   snapshot is idle.
+        // - 30 s when there are no tails at all (the "armed-only-
+        //   when-needed" pattern from the C# `RefreshTimerArmed`
+        //   model — we don't fully tear down the task to keep the
+        //   spawn site simple, but we stop hammering the executor).
+        //
+        // The first tick fires after construction is done (avoids the
+        // borrow-at-construction race that `start_dirty_poll` also
+        // guards against).
         cx.spawn(async move |this, cx| {
             let mut interval = Duration::from_secs(2);
             loop {
@@ -763,6 +786,9 @@ impl AppShell {
                     break;
                 }
                 let result = this.update(cx, |this, _cx| {
+                    if this.telemetry_tails.is_empty() {
+                        return Duration::from_secs(30);
+                    }
                     let mut any_busy = false;
                     for tail in this.telemetry_tails.values_mut() {
                         tail.poll();
