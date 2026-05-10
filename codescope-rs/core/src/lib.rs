@@ -19,6 +19,7 @@ pub mod git;
 pub mod layout;
 pub mod paths;
 pub mod projects;
+pub mod session;
 pub mod settings;
 pub mod theme;
 pub mod window_state;
