@@ -94,55 +94,67 @@ impl NotificationEntry {
 
 /// Format a Unix-epoch second value as "HH:mm" in local time.
 ///
-/// We avoid the `chrono` crate (not in the dependency tree).  The UTC
-/// offset is probed via `GetLocalTime` / `GetSystemTime` on Windows.
-/// Accuracy to the minute is all the popover timestamp column needs.
+/// Converts the *specific* timestamp to local time (not "current
+/// offset applied to arbitrary timestamp"), so entries straddling
+/// a DST boundary render with the offset that actually applied
+/// when they occurred. We avoid the `chrono` crate (not in the
+/// dependency tree); instead we go epoch_secs → FILETIME →
+/// SystemTime UTC → SystemTime local via Win32 directly.
+///
+/// Falls back to UTC HH:mm if any step fails (the conversion can
+/// only fail for timestamps before 1601 or after ~30828 AD, plus
+/// non-Windows hosts).
 pub fn format_hhmm(epoch_secs: u64) -> SharedString {
-    let utc_offset_secs = local_utc_offset_secs();
-    // Wrapping add is safe: even at epoch 0 with a +14 h offset the
-    // result is positive, and u64 wrapping at year ~584 billion is fine.
-    let local_secs = (epoch_secs as i64).wrapping_add(utc_offset_secs) as u64;
-    let secs_of_day = local_secs % 86400;
-    let hours = secs_of_day / 3600;
-    let minutes = (secs_of_day % 3600) / 60;
-    format!("{:02}:{:02}", hours, minutes).into()
+    let (h, m) = local_hh_mm(epoch_secs).unwrap_or_else(|| utc_hh_mm(epoch_secs));
+    format!("{:02}:{:02}", h, m).into()
 }
 
-/// Attempt to determine the local UTC offset in whole seconds.
-/// Returns 0 (UTC) when the platform gives us nothing useful.
-fn local_utc_offset_secs() -> i64 {
+/// Convert a specific Unix-epoch second value to local-time
+/// `(hour, minute)` using the OS's per-instant timezone rules
+/// (handles DST transitions correctly, unlike "current offset
+/// applied uniformly").
+fn local_hh_mm(epoch_secs: u64) -> Option<(u16, u16)> {
     #[cfg(target_os = "windows")]
     {
-        use windows::Win32::System::SystemInformation::{GetLocalTime, GetSystemTime};
-        // SAFETY: GetLocalTime / GetSystemTime have no preconditions —
-        // they simply return the current time as a SYSTEMTIME struct.
-        // The `windows-0.61` bindings expose them as zero-arg functions
-        // that return the value directly (no out-pointer).
+        use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+        use windows::Win32::System::Time::{
+            FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime,
+        };
+
+        // Unix epoch (1970-01-01) in 100-ns ticks since the Win32
+        // FILETIME epoch (1601-01-01). Constant: 11644473600 seconds.
+        const UNIX_TO_FILETIME_OFFSET_TICKS: u64 = 11_644_473_600 * 10_000_000;
+        let ticks = UNIX_TO_FILETIME_OFFSET_TICKS
+            .checked_add(epoch_secs.checked_mul(10_000_000)?)?;
+        let ft = FILETIME {
+            dwLowDateTime: (ticks & 0xFFFF_FFFF) as u32,
+            dwHighDateTime: (ticks >> 32) as u32,
+        };
+
+        // SAFETY: both calls take `*const FILETIME` / `*const SYSTEMTIME`
+        // pointing at locals we own, and write to `*mut SYSTEMTIME`
+        // pointing at locals we own. The `Option<*const TIME_ZONE_INFORMATION>`
+        // is None to use the system's current rules.
         unsafe {
-            let local = GetLocalTime();
-            let utc = GetSystemTime();
-            let local_secs = (local.wHour as i64 * 3600)
-                + (local.wMinute as i64 * 60)
-                + local.wSecond as i64;
-            let utc_secs = (utc.wHour as i64 * 3600)
-                + (utc.wMinute as i64 * 60)
-                + utc.wSecond as i64;
-            // Guard against midnight rollover (offset can be at most ±14 h).
-            let mut diff = local_secs - utc_secs;
-            if diff > 14 * 3600 {
-                diff -= 86400;
-            }
-            if diff < -14 * 3600 {
-                diff += 86400;
-            }
-            diff
+            let mut utc_st = SYSTEMTIME::default();
+            FileTimeToSystemTime(&ft, &mut utc_st).ok()?;
+            let mut local_st = SYSTEMTIME::default();
+            SystemTimeToTzSpecificLocalTime(None, &utc_st, &mut local_st).ok()?;
+            Some((local_st.wHour, local_st.wMinute))
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
-        // The Rust port only targets Windows; return UTC for any other host.
-        0
+        let _ = epoch_secs;
+        None
     }
+}
+
+/// Pure-arithmetic UTC fallback used when the Win32 conversion
+/// chain fails (or on non-Windows hosts).
+fn utc_hh_mm(epoch_secs: u64) -> (u16, u16) {
+    let secs_of_day = epoch_secs % 86_400;
+    ((secs_of_day / 3_600) as u16, ((secs_of_day % 3_600) / 60) as u16)
 }
 
 // ─── Ring buffer state ─────────────────────────────────────────────────────

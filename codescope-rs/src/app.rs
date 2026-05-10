@@ -393,6 +393,12 @@ pub struct AppShell {
     /// `notifications.toggle()` and the render calls
     /// `render_notifications_popover` alongside `render_toasts`.
     pub(crate) notifications: crate::notifications::Notifications,
+    /// Live telemetry tails, keyed by Claude session id. Entries are
+    /// registered via `register_telemetry` and polled by the background
+    /// task spawned in `AppShell::new`. The accessor
+    /// `telemetry_for(session_id)` exposes the latest snapshot without
+    /// taking a mutable reference.
+    telemetry_tails: HashMap<String, codescope_core::TranscriptTail>,
 }
 
 impl AppShell {
@@ -418,8 +424,12 @@ impl AppShell {
             // Kick off the per-worktree dirty-state poll. Has to be
             // called from inside the `cx.new` callback because that's
             // where we have a `Context<Sidebar>` to register the
-            // background task against.
+            // background task against. The git-status poll
+            // (branch + numstat + ahead/behind) runs alongside it on
+            // the same 5 s cadence; both feed the status bar's left
+            // cluster and the sidebar dot.
             sidebar.start_dirty_poll(cx);
+            sidebar.start_git_status_poll(cx);
             sidebar
         });
 
@@ -655,7 +665,9 @@ impl AppShell {
             sidebar,
             last_titlebar_press_at: None,
             notifications: crate::notifications::Notifications::new(),
+            telemetry_tails: HashMap::new(),
         };
+        shell.start_telemetry_poll(cx);
         shell.rehydrate_or_cold_start(window, cx);
         shell
     }
@@ -697,6 +709,126 @@ impl AppShell {
         }
         self.layout = on_disk;
     }
+
+    // -----------------------------------------------------------------------
+    // Claude telemetry
+    // -----------------------------------------------------------------------
+
+    /// Register a Claude Code transcript tail for `session_id` under
+    /// `working_directory`.  Safe to call multiple times with the same
+    /// id — the old tail is replaced (e.g. after a session resume that
+    /// kept the same session id).
+    ///
+    /// Mirrors `IClaudeTelemetryService.Register` from the C# build.
+    pub fn register_telemetry(&mut self, session_id: String, working_directory: &str) {
+        // Resolve `~/.claude/projects/`. Without USERPROFILE / HOME a
+        // `unwrap_or_default()` would yield `".claude/projects"`
+        // relative to the CWD — almost always wrong, and confusing
+        // when telemetry silently reads from a path the user doesn't
+        // own. Bail out instead so callers see "no telemetry" rather
+        // than misleading data.
+        let Some(home) = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+        else {
+            eprintln!(
+                "[claude_telemetry] no USERPROFILE / HOME — skipping registration for {session_id}"
+            );
+            return;
+        };
+        let projects_root = std::path::PathBuf::from(home)
+            .join(".claude")
+            .join("projects");
+        let tail = codescope_core::TranscriptTail::for_session(
+            &projects_root,
+            working_directory,
+            &session_id,
+        );
+        self.telemetry_tails.insert(session_id, tail);
+    }
+
+    /// Remove a tail and drop its snapshot. Mirrors `Unregister` in the
+    /// C# build.
+    pub fn unregister_telemetry(&mut self, session_id: &str) {
+        self.telemetry_tails.remove(session_id);
+    }
+
+    /// Return the latest telemetry snapshot for `session_id`, or `None`
+    /// when the session has not been registered or has not yet produced
+    /// any parseable entries.
+    ///
+    /// Callers (e.g. `render_status_bar` in a parallel agent) use this
+    /// accessor to read data without touching the poll state.
+    pub fn telemetry_for(&self, session_id: &str) -> Option<codescope_core::TelemetrySnapshot> {
+        self.telemetry_tails
+            .get(session_id)
+            .and_then(|t| t.snapshot.clone())
+    }
+
+    /// Spawn the background transcript-tail polling loop.
+    ///
+    /// Uses an adaptive interval: 250 ms while any session is busy /
+    /// pending-tool-use; 2 s when all sessions are idle or unknown.
+    /// Mirrors the C# `ClaudeTelemetryService` 250 ms poll (the C#
+    /// build also uses FSWatcher; here we rely on polling only to avoid
+    /// adding the `notify` crate dependency).
+    ///
+    /// Called from `AppShell::new` after the struct is constructed.
+    fn start_telemetry_poll(&self, cx: &mut Context<Self>) {
+        // Adaptive cadence — three rates so we don't burn CPU when
+        // there's nothing to read:
+        //
+        // - 250 ms while any registered tail is in `Busy` /
+        //   `PendingToolUse` (assistant streaming).
+        // - 2 s while at least one tail is registered but every
+        //   snapshot is idle.
+        // - 30 s when there are no tails at all (the "armed-only-
+        //   when-needed" pattern from the C# `RefreshTimerArmed`
+        //   model — we don't fully tear down the task to keep the
+        //   spawn site simple, but we stop hammering the executor).
+        //
+        // The first tick fires after construction is done (avoids the
+        // borrow-at-construction race that `start_dirty_poll` also
+        // guards against).
+        cx.spawn(async move |this, cx| {
+            let mut interval = Duration::from_secs(2);
+            loop {
+                cx.background_executor().timer(interval).await;
+                if this.upgrade().is_none() {
+                    break;
+                }
+                let result = this.update(cx, |this, _cx| {
+                    if this.telemetry_tails.is_empty() {
+                        return Duration::from_secs(30);
+                    }
+                    let mut any_busy = false;
+                    for tail in this.telemetry_tails.values_mut() {
+                        tail.poll();
+                        if matches!(
+                            tail.snapshot.as_ref().map(|s| s.state),
+                            Some(codescope_core::SessionState::Busy)
+                                | Some(codescope_core::SessionState::PendingToolUse)
+                        ) {
+                            any_busy = true;
+                        }
+                    }
+                    if any_busy {
+                        Duration::from_millis(250)
+                    } else {
+                        Duration::from_secs(2)
+                    }
+                });
+                match result {
+                    Ok(next) => interval = next,
+                    Err(_) => break,
+                }
+            }
+        })
+        .detach();
+    }
+
+    // -----------------------------------------------------------------------
+    // Layout persistence
+    // -----------------------------------------------------------------------
 
     /// Build a `RestoreTab` for every currently-open tab. Tabs
     /// without a known working directory are skipped — we'd have
@@ -1456,7 +1588,8 @@ impl AppShell {
                         a: 0.055,
                     };
 
-                    let mut row = div()
+                    let _ = has_divider;
+                    let row = div()
                         .id(("notif-entry", id))
                         .flex()
                         .flex_row()
@@ -1466,17 +1599,47 @@ impl AppShell {
                         .pt(px(10.0))
                         .pb(px(10.0))
                         .cursor_pointer()
-                        .hover(move |s| s.bg(hover_tint));
+                        .hover(move |s| s.bg(hover_tint))
+                        // Top divider on *every* row (matches the
+                        // XAML `BorderThickness="0,1,0,0"` on the
+                        // entry button — that's also what gives
+                        // the header→first-entry separator). Was
+                        // previously gated on `i > 0` which left
+                        // the first entry visually disconnected
+                        // from the header.
+                        .border_t_1()
+                        .border_color(divider);
 
-                    if has_divider {
-                        row = row.border_t_1().border_color(divider);
-                    }
-
-                    row = row
+                    let row = row
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
-                                this.notifications.activate(id);
+                            cx.listener(move |this, _, window, cx| {
+                                // `activate` returns the originating
+                                // session title (when one was attached
+                                // to the entry). If we can find a tab
+                                // with that exact title, focus it —
+                                // otherwise the entry just gets marked
+                                // read. This is what the footer hint
+                                // ("Click an entry to jump to its
+                                // session.") promises.
+                                if let Some(session_title) =
+                                    this.notifications.activate(id)
+                                {
+                                    let target = this
+                                        .groups
+                                        .iter()
+                                        .enumerate()
+                                        .find_map(|(g_idx, group)| {
+                                            group
+                                                .tabs
+                                                .iter()
+                                                .position(|t| t.title == session_title)
+                                                .map(|t_idx| (g_idx, t_idx))
+                                        });
+                                    if let Some((g_idx, t_idx)) = target {
+                                        this.activate_tab(g_idx, t_idx, window, cx);
+                                    }
+                                }
                                 this.notifications.set_open(false);
                                 cx.notify();
                             }),
@@ -1535,13 +1698,21 @@ impl AppShell {
                 })
                 .collect();
 
-            div()
+            // `flex_grow` + `min_h(0)` so the list takes the
+            // remaining height in the panel's flex column (mirrors
+            // the XAML `RowDefinition Height="*"`) and lets
+            // `overflow_y_scroll` actually clip + scroll instead of
+            // pushing the panel taller than `max_h`.
+            let mut entry_list = div()
                 .id("notif-entry-list")
                 .flex()
                 .flex_col()
+                .flex_grow()
                 .overflow_y_scroll()
-                .children(entries)
-                .into_any_element()
+                .children(entries);
+            entry_list.style().min_size.height =
+                Some(gpui::Length::Definite(px(0.0).into()));
+            entry_list.into_any_element()
         };
 
         // Footer: 1 px top border, dim hint text.
@@ -1574,12 +1745,32 @@ impl AppShell {
             .child(body)
             .child(footer);
 
+        // The C# `BellPopup` anchors to the bell button itself
+        // (`PlacementTarget=BellButton`, `Placement=Top`,
+        // `VerticalOffset=-6`). We don't have the bell button yet
+        // (lands with the integrating PR), but we can already snap
+        // above the status bar so the popover doesn't overlap it.
+        // Bottom margin = status-bar height (32 px) + the XAML's
+        // -6 offset, expressed as a positive bottom edge so
+        // `snap_to_window_with_margin` keeps the panel clear of
+        // the bar. Once the bell button exists the integrating PR
+        // will swap this to an `anchored().position(button_rect)`
+        // call so the popover tracks the button's actual screen
+        // position.
+        const STATUS_BAR_HEIGHT_PX: f32 = 32.0;
+        const POPOVER_BOTTOM_GAP_PX: f32 = 6.0;
+        let edges = gpui::Edges {
+            top: px(8.0),
+            right: px(8.0),
+            bottom: px(STATUS_BAR_HEIGHT_PX + POPOVER_BOTTOM_GAP_PX),
+            left: px(8.0),
+        };
         Some(
             gpui::deferred(
                 gpui::anchored()
                     .position(gpui::point(px(0.0), px(0.0)))
                     .anchor(gpui::Corner::BottomRight)
-                    .snap_to_window_with_margin(px(8.0))
+                    .snap_to_window_with_margin(edges)
                     .child(panel),
             )
             .into_any_element(),
@@ -1732,20 +1923,24 @@ impl AppShell {
         )
     }
 
-    /// Build the bottom status bar (24 px). Compact line that
-    /// surfaces the focused group, the focused tab's title, and
-    /// counts so the user has a single place to verify "where am I"
-    /// at a glance — useful especially with multiple groups + many
-    /// tabs. Mirrors the C# build's `StatusBarView` minus the live
-    /// git-status / agent-state badges (those land when the polling
-    /// infra does).
+    /// Build the bottom status bar. 32 px tall, two clusters: the
+    /// active tab's title truncates on the left as a flex-grow span,
+    /// and the right cluster surfaces the workspace summary
+    /// (`N worktrees · M dirty`), an optional `N groups` label
+    /// (only when more than one group), and the tab counter,
+    /// separated by 1×14 vertical rules.
+    ///
+    /// Mirrors the C# `StatusBarView` skeleton; the slots that
+    /// depend on data we don't have yet (session context dot +
+    /// branch + halo, git numstat / ahead-behind, model / tokens /
+    /// turns / agent rollup, notifications bell) land with their
+    /// respective polling / telemetry / notification PRs.
     fn render_status_bar(
         &self,
         theme: &Arc<Theme>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let group_count = self.groups.len();
-        let focused_group_idx = self.focused_group;
         let focused_group = self.focused_group();
         let tab_count = focused_group.tabs.len();
         let active_tab = focused_group.active_tab;
@@ -1782,7 +1977,6 @@ impl AppShell {
         } else {
             format!("tab {}/{}", active_tab + 1, tab_count)
         };
-        let _ = focused_group_idx;
         let title_text: SharedString = active_title
             .unwrap_or_else(|| SharedString::from("(empty group)"));
 
