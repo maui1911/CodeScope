@@ -108,6 +108,14 @@ pub enum SidebarEvent {
         /// Codex session" rows to launch the agent inline; `None`
         /// just opens a plain shell. The host adds the trailing CR.
         auto_type: Option<SharedString>,
+        /// When `true`, the host should always spawn a fresh tab
+        /// (used by the worktree menu's explicit "New session" /
+        /// "New Claude session" rows). When `false`, the host
+        /// activates an existing tab whose working directory matches
+        /// `working_directory` and only spawns a new one if no match
+        /// is found — the desired behaviour for a plain row click,
+        /// which would otherwise pile up a new tab on every click.
+        force_new: bool,
     },
     /// Surface a status notification to the user. The sidebar emits
     /// these from menu actions (pull / fetch / open remote / discard)
@@ -1437,10 +1445,17 @@ impl Render for Sidebar {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |_, _, _, cx| {
+                            // Plain row click — focus an existing
+                            // tab for this worktree if one is open,
+                            // otherwise spawn one. The "New session"
+                            // / "New Claude session" rows in the
+                            // worktree context menu still pass
+                            // `force_new: true` to always spawn.
                             cx.emit(SidebarEvent::OpenSession {
                                 working_directory: PathBuf::from(&wt_path_for_event),
                                 title: title_label.clone(),
                                 auto_type: None,
+                                force_new: false,
                             });
                         }),
                     )
@@ -1662,6 +1677,7 @@ impl Sidebar {
                             working_directory: PathBuf::from(&project_path),
                             title: project_title.clone(),
                             auto_type: None,
+                            force_new: true,
                         });
                         this.close_menu(cx);
                     }),
@@ -1679,6 +1695,7 @@ impl Sidebar {
                             working_directory: PathBuf::from(&project_path),
                             title: project_title.clone(),
                             auto_type: Some(claude_command().into()),
+                            force_new: true,
                         });
                         this.close_menu(cx);
                     }),
@@ -1872,10 +1889,17 @@ impl Sidebar {
                     "Open session",
                     false,
                     Box::new(move |this, _window, cx| {
+                        // The worktree menu's "Open session" row is a
+                        // synonym for clicking the row itself —
+                        // focus-or-open rather than always-spawn —
+                        // so a user already running a session for
+                        // this worktree gets routed to it instead of
+                        // accidentally piling up duplicates.
                         cx.emit(SidebarEvent::OpenSession {
                             working_directory: path_for_open.clone(),
                             title: title_for_open.clone(),
                             auto_type: None,
+                            force_new: false,
                         });
                         this.close_menu(cx);
                     }),
@@ -1905,6 +1929,7 @@ impl Sidebar {
                             working_directory: path.clone(),
                             title: title.clone(),
                             auto_type: Some(claude_command().into()),
+                            force_new: true,
                         });
                         this.close_menu(cx);
                     }),

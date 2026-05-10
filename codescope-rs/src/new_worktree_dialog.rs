@@ -505,10 +505,15 @@ impl Sidebar {
                 // `$"{project.Name} · {branch}"` convention in
                 // `MainViewModel.RefreshTabTitlesForWorktree`.
                 if spawn_session {
+                    // Just-created worktree → there's no existing
+                    // tab for it; force a fresh spawn rather than
+                    // letting the focus-or-open path no-op against
+                    // an unrelated tab in the same path.
                     cx.emit(crate::sidebar::SidebarEvent::OpenSession {
                         working_directory: std::path::PathBuf::from(&folder),
                         title: format!("{project_name} · {branch}").into(),
                         auto_type: None,
+                        force_new: true,
                     });
                 }
             }
