@@ -7,6 +7,8 @@
 //! `AppShell` gets swapped and every accessor here returns the new
 //! values on the next render — no touch required in the call sites.
 
+use std::sync::OnceLock;
+
 use codescope_core::{Rgb, Theme};
 use gpui::{Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, Hsla, SharedString, hsla};
 
@@ -123,74 +125,60 @@ pub fn signal_warn() -> Hsla { rgb_to_hsla(Rgb::from_hex(0xFF5A5A)) }
 // we hand it the same chains so missing-on-this-machine families
 // degrade the same way they do in WPF.
 
-/// Primary sans-serif family for sidebar prose / UI labels (project
-/// names, "(no worktrees)" placeholder, headings).
-fn sans_primary() -> SharedString {
-    SharedString::new_static("Segoe UI Variable Display")
-}
-
-/// Sans-serif fallback chain. Order mirrors `Fig.Font.Sans` from
-/// `DesignTokens.xaml`. The primary above is excluded — gpui only
-/// uses fallbacks when the primary fails to resolve.
-fn sans_fallbacks() -> Vec<String> {
-    vec![
-        "Segoe UI Variable".to_string(),
-        "Segoe UI".to_string(),
-        "Inter".to_string(),
-        "system-ui".to_string(),
-    ]
-}
-
-/// Primary monospace family for sidebar code-like data (branch
-/// labels, status slugs, keymap hints). Matches the head of the
-/// `Fig.Font.Mono` chain in `DesignTokens.xaml`; the embedded
-/// terminal also defaults to FiraCode Nerd Font when present
-/// (`vendor/gpui-terminal`'s default config), so when both this
-/// font and the terminal's are installed the sidebar's branch
-/// labels and the shell render in the same metal.
-fn mono_primary() -> SharedString {
-    SharedString::new_static("FiraCode Nerd Font Mono")
-}
-
-/// Monospace fallback chain. Order mirrors `Fig.Font.Mono` from
-/// `DesignTokens.xaml` minus the primary above. Cascadia Mono is
-/// the Windows-11 native default, so on machines without the
-/// Nerd Font the sidebar still renders in a sensible monospace
-/// instead of falling back to a sans system default.
-fn mono_fallbacks() -> Vec<String> {
-    vec![
-        "Cascadia Mono".to_string(),
-        "Cascadia Code".to_string(),
-        "Consolas".to_string(),
-        "Azeret Mono".to_string(),
-        "Menlo".to_string(),
-    ]
-}
-
 /// Sans-serif `Font` for chrome labels — pass to `.font(...)` on a
 /// gpui element. Equivalent to applying `Fig.Font.Sans` in the C#
-/// build's XAML.
+/// build's XAML. Both the primary family and the ordered fallback
+/// list mirror `<FontFamily x:Key="Fig.Font.Sans">` from
+/// `DesignTokens.xaml`. The result is built once and cached in a
+/// `OnceLock`; callers get a cheap `Font` clone (the inner
+/// `FontFallbacks` is `Arc<Vec<String>>`, so the clone is two
+/// `Arc::clone`s, no per-render heap churn).
 pub fn font_sans() -> Font {
-    Font {
-        family: sans_primary(),
+    static FONT: OnceLock<Font> = OnceLock::new();
+    FONT.get_or_init(|| Font {
+        family: SharedString::new_static("Segoe UI Variable Display"),
         features: FontFeatures::default(),
-        fallbacks: Some(FontFallbacks::from_fonts(sans_fallbacks())),
+        // Fallback chain copied verbatim (case included) from
+        // `Fig.Font.Sans` so a `cargo test` failure on the ordered-
+        // list assertion catches accidental drift.
+        fallbacks: Some(FontFallbacks::from_fonts(vec![
+            "Segoe UI Variable".to_string(),
+            "Segoe UI".to_string(),
+            "Inter".to_string(),
+            "system-ui".to_string(),
+        ])),
         weight: FontWeight::default(),
         style: FontStyle::default(),
-    }
+    })
+    .clone()
 }
 
 /// Monospace `Font` for chrome data — pass to `.font(...)` on a
 /// gpui element. Equivalent to applying `Fig.Font.Mono` in the C#
-/// build's XAML.
+/// build's XAML. The primary family is `FiraCode Nerd Font Mono`,
+/// which is also the embedded terminal's default
+/// (`vendor/gpui-terminal`'s default config), so when that font is
+/// installed sidebar branch labels and the shell render in the
+/// same metal. Cached + cloned the same way as `font_sans`.
 pub fn font_mono() -> Font {
-    Font {
-        family: mono_primary(),
+    static FONT: OnceLock<Font> = OnceLock::new();
+    FONT.get_or_init(|| Font {
+        family: SharedString::new_static("FiraCode Nerd Font Mono"),
         features: FontFeatures::default(),
-        fallbacks: Some(FontFallbacks::from_fonts(mono_fallbacks())),
+        // Fallback chain copied verbatim (case included) from
+        // `Fig.Font.Mono` — note `menlo` is intentionally lower-
+        // case to match the XAML token character-for-character.
+        fallbacks: Some(FontFallbacks::from_fonts(vec![
+            "Cascadia Mono".to_string(),
+            "Cascadia Code".to_string(),
+            "Consolas".to_string(),
+            "Azeret Mono".to_string(),
+            "menlo".to_string(),
+        ])),
         weight: FontWeight::default(),
         style: FontStyle::default(),
-    }
+    })
+    .clone()
 }
 
 #[cfg(test)]
@@ -219,7 +207,8 @@ mod tests {
 
     /// Lock the full `Fig.Font.Mono` ordering — same reasoning as
     /// the sans test: a parity helper is only useful if drift gets
-    /// caught at compile time.
+    /// caught at compile time. `menlo` is lowercase on purpose to
+    /// match the XAML token character-for-character.
     #[test]
     fn font_mono_chain_matches_fig_font_mono() {
         let f = font_mono();
@@ -232,8 +221,22 @@ mod tests {
                 "Cascadia Code".to_string(),
                 "Consolas".to_string(),
                 "Azeret Mono".to_string(),
-                "Menlo".to_string(),
+                "menlo".to_string(),
             ]
         );
+    }
+
+    /// Both helpers cache their `Font` in a `OnceLock`, so repeated
+    /// calls return the same `Arc<Vec<String>>` underneath the
+    /// `FontFallbacks` clone — no per-render allocation.
+    #[test]
+    fn font_helpers_share_cached_fallbacks_across_calls() {
+        let a = font_sans().fallbacks.expect("sans fallbacks");
+        let b = font_sans().fallbacks.expect("sans fallbacks");
+        assert!(std::sync::Arc::ptr_eq(&a.0, &b.0));
+
+        let m1 = font_mono().fallbacks.expect("mono fallbacks");
+        let m2 = font_mono().fallbacks.expect("mono fallbacks");
+        assert!(std::sync::Arc::ptr_eq(&m1.0, &m2.0));
     }
 }
