@@ -19,5 +19,15 @@ uuid = { version = "1", features = ["v4"] }
 # second TLS implementation.
 ureq = { version = "2", default-features = false, features = ["tls"] }
 
+[target.'cfg(windows)'.dependencies]
+# `K32GetProcessMemoryInfo` for the dev-only memory watchdog. Mirrors
+# the version pinned by the binary crate's `Cargo.toml` so we're not
+# pulling two copies of `windows` into the workspace.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tempfile = "3"
