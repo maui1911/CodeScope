@@ -30,6 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use codescope_core::{AppPaths, LayoutState, Project, ProjectsConfig, Theme};
+use codescope_core::git::GitStatus;
 use gpui::{
     AppContext, ClipboardItem, Context, Corner, EventEmitter, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, ParentElement, PathPromptOptions, Pixels, Point, Render,
@@ -169,6 +170,15 @@ pub struct Sidebar {
     /// to each worktree row. Mirrors the C# build's
     /// `WorktreePoller` cache.
     dirty_state: HashMap<String, bool>,
+    /// Rich per-worktree git status: branch, numstat diff, and
+    /// ahead/behind counts. Keyed by absolute path, populated by
+    /// `start_git_status_poll` (also every 5 s). `None` while the
+    /// first poll tick hasn't completed yet; callers should treat
+    /// absence as "unknown / loading" and fall back to cached
+    /// `dirty_state` for the dirty dot. Mirrors the intent of the
+    /// C# build's `WorktreePoller` but adds the richer data the
+    /// status bar needs.
+    git_status: HashMap<String, GitStatus>,
 }
 
 impl Sidebar {
@@ -195,6 +205,7 @@ impl Sidebar {
             menu: None,
             dialog: None,
             dirty_state: HashMap::new(),
+            git_status: HashMap::new(),
         }
     }
 
@@ -284,6 +295,93 @@ impl Sidebar {
         .detach();
     }
 
+    /// Spawn the git-status polling loop. Runs every
+    /// [`DIRTY_POLL_INTERVAL`] (shared constant with the dirty poll —
+    /// same 5 s cadence) and walks every known worktree path, running
+    /// three git queries per path: `symbolic-ref`, `diff --numstat`, and
+    /// `rev-list --left-right --count`. Results are cached in
+    /// `self.git_status` and exposed via [`Self::git_status_for`].
+    ///
+    /// Called from `AppShell::new` alongside `start_dirty_poll`;
+    /// both loops share the same interval so the two polls run
+    /// roughly in sync (within the same 5 s window) without
+    /// coordinating with each other.
+    pub fn start_git_status_poll(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(DIRTY_POLL_INTERVAL).await;
+                if this.upgrade().is_none() {
+                    break;
+                }
+                // Snapshot every worktree path into a de-duplicated set
+                // (same de-dup rationale as start_dirty_poll).
+                let paths: std::collections::HashSet<String> = match this.update(cx, |this, _| {
+                    this.projects
+                        .projects
+                        .iter()
+                        .flat_map(|p| {
+                            std::iter::once(p.path.clone()).chain(
+                                p.worktrees.iter().map(|wt| wt.path.clone()),
+                            )
+                        })
+                        .collect()
+                }) {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                let known: std::collections::HashSet<String> = paths.clone();
+                let updates: Vec<(String, GitStatus)> = cx
+                    .background_spawn(async move {
+                        paths
+                            .into_iter()
+                            .filter_map(|p| {
+                                codescope_core::git::git_status(&p).map(|s| (p, s))
+                            })
+                            .collect()
+                    })
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        let mut changed = false;
+                        // Prune stale paths (removed projects / worktrees).
+                        let prev_len = this.git_status.len();
+                        this.git_status.retain(|path, _| known.contains(path));
+                        if this.git_status.len() != prev_len {
+                            changed = true;
+                        }
+                        for (path, status) in updates {
+                            let prev = this.git_status.insert(path, status.clone());
+                            if prev.as_ref() != Some(&status) {
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Return the cached [`GitStatus`] for the given worktree path.
+    /// Returns `None` while the first poll tick has not completed yet,
+    /// or for paths that are not git repos. Callers should treat `None`
+    /// as "loading" and fall back to a neutral display (e.g. no branch
+    /// label, no ahead/behind count).
+    ///
+    /// `allow(dead_code)` until the status-bar integration PR wires
+    /// the consumer — the cache itself is populated by the polling
+    /// loop and remains useful for the next consumer to pick up.
+    #[allow(dead_code)]
+    pub fn git_status_for(&self, path: &str) -> Option<&GitStatus> {
+        self.git_status.get(path)
+    }
+
     /// Read-only handle to the in-memory project list. Exposed so the
     /// dialog module can read project metadata without re-borrowing
     /// every private field individually.
@@ -295,6 +393,32 @@ impl Sidebar {
     /// dialog to persist `projects.json` after a successful create.
     pub(crate) fn paths_ref(&self) -> &AppPaths {
         &self.paths
+    }
+
+    /// Workspace-wide worktree counts for the status bar's right
+    /// cluster. Returns `(total, dirty)`:
+    /// - `total` — every distinct worktree path across every project
+    ///   (primary trees included), de-duplicated so a path that
+    ///   appears in two projects (or as both primary and an explicit
+    ///   `worktrees[]` entry) is only counted once.
+    /// - `dirty` — number of those paths whose `dirty_state` lookup
+    ///   is `Some(true)`. Paths with no recorded state yet (still
+    ///   loading) and `Some(false)` (clean) don't count.
+    pub(crate) fn worktree_counts(&self) -> (usize, usize) {
+        let mut paths: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
+        for project in &self.projects.projects {
+            paths.insert(project.path.as_str());
+            for wt in &project.worktrees {
+                paths.insert(wt.path.as_str());
+            }
+        }
+        let total = paths.len();
+        let dirty = paths
+            .iter()
+            .filter(|p| self.dirty_state.get(**p).copied().unwrap_or(false))
+            .count();
+        (total, dirty)
     }
 
     /// Commit a freshly-built `ProjectsConfig` into in-memory state

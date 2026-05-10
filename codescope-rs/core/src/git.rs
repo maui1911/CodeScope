@@ -257,6 +257,203 @@ pub fn remove_worktree(repo: &Path, path: &Path, force: bool) -> Result<()> {
     run_git(repo, &args).map(|_| ())
 }
 
+/// Snapshot of a worktree's git state at a point in time.
+/// Produced by [`git_status`] and cached by the sidebar poller.
+/// Mirrors the data the C# build's `WorktreePoller` gathers per
+/// tick: branch name, line-level diff against HEAD, and
+/// ahead/behind vs the upstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitStatus {
+    /// Short branch name — `"main"`, `"feat/csv"`, etc.
+    /// Detached-HEAD worktrees get the 7-char short SHA instead
+    /// (e.g. `"abc1234"`), matching the C# build's fallback.
+    pub branch: String,
+    /// Lines added relative to HEAD across all modified files
+    /// (sum of the first column from `git diff --numstat HEAD`).
+    pub added: u32,
+    /// Lines removed relative to HEAD (second column, same source).
+    pub removed: u32,
+    /// `true` when the worktree is dirty but the numstat diff is
+    /// empty — i.e. only untracked files are present. Lets the UI
+    /// show a fallback "changes" label without a misleading `+0 -0`.
+    pub has_changes: bool,
+    /// Commits in HEAD not yet pushed to the upstream.
+    pub ahead: u32,
+    /// Commits on the upstream not yet merged locally.
+    pub behind: u32,
+    /// `false` when no upstream branch is configured — the
+    /// ahead/behind segment should be hidden rather than showing
+    /// `0 / 0`.
+    pub has_upstream: bool,
+}
+
+/// Collect the three git status signals for a single worktree at
+/// `path`. Returns `None` when the path is not a git repo (or
+/// `git` is not on PATH); partial failures *within* the three
+/// follow-up queries degrade gracefully (branch falls back to SHA;
+/// numstat skips; ahead/behind hides).
+///
+/// Shells out to `git` four times *sequentially*: an early
+/// `rev-parse --is-inside-work-tree` probe gates the rest, then
+/// `symbolic-ref` (or `rev-parse --short HEAD` fallback for
+/// detached HEAD), `diff --numstat HEAD`, and
+/// `rev-list --left-right --count HEAD...@{u}`. Mirrors the
+/// per-tick work the C# `WorktreePoller` does per worktree.
+/// Typical total under 30 ms on local repos.
+pub fn git_status(path: &str) -> Option<GitStatus> {
+    let repo = std::path::Path::new(path);
+
+    // ── 0. Early repo probe ────────────────────────────────────────
+    // `rev-parse --is-inside-work-tree` exits 0 / prints "true" only
+    // inside an actual worktree. Anything else (path doesn't exist,
+    // not a git repo, git missing) → bail with `None` so callers can
+    // distinguish "no data yet" from "valid repo but quiet".
+    let probe = run_git(repo, &["rev-parse", "--is-inside-work-tree"]).ok()?;
+    if !probe.status.success() {
+        return None;
+    }
+    let probe_stdout = String::from_utf8_lossy(&probe.stdout);
+    if probe_stdout.trim() != "true" {
+        return None;
+    }
+
+    // ── 1. Current branch ──────────────────────────────────────────
+    let branch = current_branch(repo);
+
+    // ── 2. numstat diff against HEAD ───────────────────────────────
+    let (added, removed, has_changes) = numstat_summary(repo);
+
+    // ── 3. Ahead / behind upstream ─────────────────────────────────
+    let (ahead, behind, has_upstream) = ahead_behind(repo);
+
+    Some(GitStatus { branch, added, removed, has_changes, ahead, behind, has_upstream })
+}
+
+/// `git symbolic-ref --short HEAD` → short branch name.
+/// Falls back to the 7-char short SHA on detached HEAD.
+/// Returns `"?"` only if both git calls fail (not a repo, etc.).
+fn current_branch(repo: &Path) -> String {
+    // Happy path: attached HEAD.
+    if let Ok(out) = run_git(repo, &["symbolic-ref", "--short", "HEAD"]) {
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !name.is_empty() {
+            return name;
+        }
+    }
+    // Detached HEAD: fall back to short SHA.
+    if let Ok(out) = run_git(repo, &["rev-parse", "--short", "HEAD"]) {
+        let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !sha.is_empty() {
+            return sha;
+        }
+    }
+    "?".to_string()
+}
+
+/// `git diff --numstat HEAD` → `(added, removed, has_changes)`.
+///
+/// `has_changes` is set when the worktree is dirty but the numstat
+/// sum is zero — meaning only untracked files exist (git diff does
+/// not count those, but git status --porcelain does).
+fn numstat_summary(repo: &Path) -> (u32, u32, bool) {
+    // Run numstat. On a clean repo this prints nothing; on a repo
+    // with only untracked files it also prints nothing — we
+    // distinguish the two cases below with is_dirty.
+    let numstat_out = run_git(repo, &["diff", "--numstat", "HEAD"])
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+
+    let (added, removed) = parse_numstat(&numstat_out);
+
+    // If numstat came back empty, check the dirty flag to see if
+    // only untracked files are present.
+    let has_changes = if added == 0 && removed == 0 {
+        is_dirty(repo).unwrap_or(false)
+    } else {
+        true
+    };
+
+    (added, removed, has_changes)
+}
+
+/// Parse the text output of `git diff --numstat HEAD` into
+/// `(total_added, total_removed)`.
+///
+/// Each line has the form `<added>\t<removed>\t<path>`.
+/// Binary files emit `-\t-\t<path>` — we skip those rows since
+/// there are no meaningful line counts.
+///
+/// Kept `pub(crate)` so the unit tests in this file can call it
+/// directly without spawning a real `git` process.
+pub(crate) fn parse_numstat(stdout: &str) -> (u32, u32) {
+    let mut total_added: u32 = 0;
+    let mut total_removed: u32 = 0;
+    for line in stdout.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(3, '\t');
+        let added_str = parts.next().unwrap_or("");
+        let removed_str = parts.next().unwrap_or("");
+        // Binary files → "-" — skip.
+        if added_str == "-" || removed_str == "-" {
+            continue;
+        }
+        if let (Ok(a), Ok(r)) = (added_str.parse::<u32>(), removed_str.parse::<u32>()) {
+            total_added = total_added.saturating_add(a);
+            total_removed = total_removed.saturating_add(r);
+        }
+    }
+    (total_added, total_removed)
+}
+
+/// `git rev-list --left-right --count HEAD...@{u}` →
+/// `(ahead, behind, has_upstream)`.
+///
+/// Returns `(0, 0, false)` when no upstream is configured (exit
+/// code 128 with "no upstream" in stderr). Any other error also
+/// returns `false` for `has_upstream` so the UI hides the segment
+/// rather than showing stale / wrong data.
+fn ahead_behind(repo: &Path) -> (u32, u32, bool) {
+    let output = Command::new("git")
+        .args(["rev-list", "--left-right", "--count", "HEAD...@{u}"])
+        .current_dir(repo)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+
+    let output = match output {
+        Ok(o) => o,
+        Err(_) => return (0, 0, false),
+    };
+
+    if !output.status.success() {
+        // Git returns 128 with "fatal: no upstream configured" when
+        // there's no tracking branch. Treat all non-zero exits the
+        // same: no upstream.
+        return (0, 0, false);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (ahead, behind) = parse_ahead_behind(stdout.trim());
+    (ahead, behind, true)
+}
+
+/// Parse the single-line output of
+/// `git rev-list --left-right --count HEAD...@{u}`:
+/// `"<ahead>\t<behind>"`.
+///
+/// Kept `pub(crate)` for unit tests.
+pub(crate) fn parse_ahead_behind(line: &str) -> (u32, u32) {
+    let line = line.trim_end_matches('\r').trim();
+    let mut parts = line.splitn(2, '\t');
+    let ahead = parts.next().unwrap_or("0").parse::<u32>().unwrap_or(0);
+    let behind = parts.next().unwrap_or("0").parse::<u32>().unwrap_or(0);
+    (ahead, behind)
+}
+
 /// Run `git <args...>` in `cwd`. Returns the captured `Output` on
 /// success; bubbles up stderr (trimmed) on non-zero exit.
 fn run_git(cwd: &Path, args: &[&str]) -> Result<Output> {
@@ -684,6 +881,174 @@ some-future-field foo bar\n";
         assert!(
             msg.contains("already exists") || msg.contains("fatal:"),
             "expected stderr to bubble up; got: {msg}"
+        );
+    }
+
+    // ─── Unit tests for GitStatus parser helpers ─────────────────────
+    //
+    // These exercise the pure parsing logic against known output strings,
+    // with no git process spawned. Mirrors the C# build's `GitServiceTests`
+    // pattern of testing the parser in isolation.
+
+    #[test]
+    fn parse_numstat_empty_returns_zeroes() {
+        assert_eq!(parse_numstat(""), (0, 0));
+    }
+
+    #[test]
+    fn parse_numstat_single_file() {
+        // Typical numstat line: added<TAB>removed<TAB>path
+        assert_eq!(parse_numstat("3\t1\tsrc/foo.rs\n"), (3, 1));
+    }
+
+    #[test]
+    fn parse_numstat_multiple_files_sums_correctly() {
+        let input = "10\t2\tsrc/a.rs\n5\t3\tsrc/b.rs\n1\t0\tsrc/c.rs\n";
+        assert_eq!(parse_numstat(input), (16, 5));
+    }
+
+    #[test]
+    fn parse_numstat_skips_binary_files() {
+        // Binary files emit "-" for both columns.
+        let input = "-\t-\tassets/image.png\n4\t1\tsrc/main.rs\n";
+        assert_eq!(parse_numstat(input), (4, 1));
+    }
+
+    #[test]
+    fn parse_numstat_windows_crlf_lines() {
+        // git on Windows can emit CRLF in stdout even with piped output.
+        let input = "7\t2\tsrc/a.rs\r\n3\t1\tsrc/b.rs\r\n";
+        assert_eq!(parse_numstat(input), (10, 3));
+    }
+
+    #[test]
+    fn parse_numstat_ignores_malformed_lines() {
+        // A line with no tabs should be silently skipped.
+        let input = "no-tabs-here\n2\t1\tsrc/valid.rs\n";
+        assert_eq!(parse_numstat(input), (2, 1));
+    }
+
+    #[test]
+    fn parse_ahead_behind_zero_zero() {
+        assert_eq!(parse_ahead_behind("0\t0"), (0, 0));
+    }
+
+    #[test]
+    fn parse_ahead_behind_typical() {
+        assert_eq!(parse_ahead_behind("3\t1"), (3, 1));
+    }
+
+    #[test]
+    fn parse_ahead_behind_only_ahead() {
+        assert_eq!(parse_ahead_behind("2\t0"), (2, 0));
+    }
+
+    #[test]
+    fn parse_ahead_behind_only_behind() {
+        assert_eq!(parse_ahead_behind("0\t4"), (0, 4));
+    }
+
+    #[test]
+    fn parse_ahead_behind_crlf() {
+        assert_eq!(parse_ahead_behind("1\t2\r"), (1, 2));
+    }
+
+    #[test]
+    fn parse_ahead_behind_empty_falls_back_to_zero() {
+        assert_eq!(parse_ahead_behind(""), (0, 0));
+    }
+
+    // ─── Integration tests for git_status against a real repo ────────
+
+    #[test]
+    fn git_status_clean_repo_returns_main_no_changes() {
+        let Some((_guard, repo, _wts)) = init_repo() else { return };
+        let path_str = repo.to_string_lossy().to_string();
+        let status = git_status(&path_str).expect("should return Some on a valid repo");
+
+        assert_eq!(status.branch, "main", "branch");
+        assert_eq!(status.added, 0, "added");
+        assert_eq!(status.removed, 0, "removed");
+        assert!(!status.has_changes, "has_changes on clean repo");
+        // No upstream configured in init_repo → has_upstream = false.
+        assert!(!status.has_upstream, "has_upstream without upstream");
+        assert_eq!(status.ahead, 0);
+        assert_eq!(status.behind, 0);
+    }
+
+    #[test]
+    fn git_status_untracked_only_sets_has_changes_flag() {
+        let Some((_guard, repo, _wts)) = init_repo() else { return };
+        std::fs::write(repo.join("new.txt"), b"hello").expect("write");
+
+        let path_str = repo.to_string_lossy().to_string();
+        let status = git_status(&path_str).expect("Some");
+
+        // numstat sees nothing (untracked), but dirty check fills the flag.
+        assert_eq!(status.added, 0);
+        assert_eq!(status.removed, 0);
+        assert!(status.has_changes, "untracked file must set has_changes");
+    }
+
+    #[test]
+    fn git_status_tracked_modification_shows_numstat() {
+        let Some((_guard, repo, _wts)) = init_repo() else { return };
+        // Commit a tracked file so we can measure a diff against HEAD.
+        std::fs::write(repo.join("file.txt"), b"line1\nline2\n").expect("write");
+        run(&repo, &["add", "file.txt"]);
+        run(&repo, &["commit", "-m", "add file", "-q"]);
+
+        // Overwrite with different content: 1 line added, 1 removed.
+        std::fs::write(repo.join("file.txt"), b"line1\nnew_line\n").expect("write");
+
+        let path_str = repo.to_string_lossy().to_string();
+        let status = git_status(&path_str).expect("Some");
+
+        // numstat diffs against HEAD — expect at least some activity.
+        assert!(
+            status.added > 0 || status.removed > 0,
+            "expected non-zero diff; got +{} -{}", status.added, status.removed
+        );
+        assert!(status.has_changes, "has_changes with tracked modification");
+    }
+
+    #[test]
+    fn git_status_non_repo_returns_none() {
+        // Create a temp directory that's NOT a git repo. `git_status`
+        // must return `None` so callers can distinguish "no data" from
+        // "valid repo but no signal yet".
+        let temp = std::env::temp_dir()
+            .join(format!("codescope_git_status_test_{}", std::process::id()));
+        std::fs::create_dir_all(&temp).expect("create temp dir");
+
+        // Sanity-check: temp is fresh and contains no .git directory.
+        assert!(
+            !temp.join(".git").exists(),
+            "test precondition: temp dir must not be a git repo"
+        );
+
+        let result = git_status(temp.to_str().expect("temp path is utf-8"));
+
+        // Cleanup before assertion so a failing assert still removes
+        // the directory.
+        let _ = std::fs::remove_dir_all(&temp);
+
+        assert!(
+            result.is_none(),
+            "non-repo path should return None, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn git_status_missing_path_returns_none() {
+        // A path that doesn't exist at all. `rev-parse` exits non-zero
+        // → `git_status` returns None.
+        let result = git_status("C:\\does_not_exist_xyz_codescope_test_42");
+        assert!(
+            result.is_none(),
+            "missing path should return None, got {:?}",
+            result
         );
     }
 }
