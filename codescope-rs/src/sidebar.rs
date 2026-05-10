@@ -203,9 +203,9 @@ pub struct Sidebar {
     /// project — except the C# build hangs that off WPF's tree
     /// control, while we keep an explicit `HashSet<String>` so the
     /// render loop can decide visibility without per-row state.
-    /// In-memory only for now; persisting to `layout.json` is a
-    /// follow-up (matches what the C# build does — TreeView state
-    /// is also session-scoped over there).
+    /// Hydrated from `layout.collapsed_projects` on construction and
+    /// flushed back via `save_layout` whenever the user toggles a
+    /// chevron, so the disclosure state survives a restart.
     collapsed_projects: HashSet<String>,
 }
 
@@ -224,6 +224,25 @@ impl Sidebar {
             None => None,
         }
         .or_else(|| (!projects.projects.is_empty()).then_some(0));
+        // Restore collapsed-project ids from disk, dropping any ids
+        // that no longer match a known project so a removed-then-
+        // re-added project doesn't inherit a stale collapsed flag.
+        // Mirror the filtered set back into `layout.collapsed_projects`
+        // (sorted) so any later `save_layout()` (selection change,
+        // add/remove project) doesn't resurrect the stale ids we
+        // dropped here.
+        let live: HashSet<&str> =
+            projects.projects.iter().map(|p| p.id.as_str()).collect();
+        let collapsed_projects: HashSet<String> = layout
+            .collapsed_projects
+            .iter()
+            .filter(|id| live.contains(id.as_str()))
+            .cloned()
+            .collect();
+        let mut layout = layout;
+        let mut filtered: Vec<String> = collapsed_projects.iter().cloned().collect();
+        filtered.sort();
+        layout.collapsed_projects = filtered;
         Self {
             projects,
             selected,
@@ -234,7 +253,7 @@ impl Sidebar {
             dialog: None,
             dirty_state: HashMap::new(),
             git_status: HashMap::new(),
-            collapsed_projects: HashSet::new(),
+            collapsed_projects,
         }
     }
 
@@ -247,7 +266,19 @@ impl Sidebar {
         } else {
             self.collapsed_projects.insert(id.to_owned());
         }
+        self.sync_layout_collapsed_projects();
+        self.save_layout();
         cx.notify();
+    }
+
+    /// Mirror the in-memory `collapsed_projects` set onto the in-memory
+    /// `LayoutState` copy so the next `save_layout` writes the current
+    /// disclosure state. Sorted for stable on-disk ordering — handy
+    /// for diffs and hand-edits.
+    fn sync_layout_collapsed_projects(&mut self) {
+        let mut ids: Vec<String> = self.collapsed_projects.iter().cloned().collect();
+        ids.sort();
+        self.layout.collapsed_projects = ids;
     }
 
     /// Drop any `collapsed_projects` entries that no longer exist in
@@ -261,7 +292,18 @@ impl Sidebar {
             return;
         }
         let live: HashSet<&str> = self.projects.projects.iter().map(|p| p.id.as_str()).collect();
+        let before = self.collapsed_projects.len();
         self.collapsed_projects.retain(|id| live.contains(id.as_str()));
+        if self.collapsed_projects.len() != before {
+            // Pruning ran before persistence existed, so callers got
+            // away with leaving the on-disk copy alone. Now that we
+            // persist, mirror the cleaned set back into `layout` so
+            // the next save reflects reality. Caller decides whether
+            // to flush — keeping it lockstep with the existing
+            // `replace_projects` / `remove_project` write order is
+            // their job.
+            self.sync_layout_collapsed_projects();
+        }
     }
 
     /// Spawn the dirty-state polling loop. Runs every
@@ -484,7 +526,11 @@ impl Sidebar {
     /// ordering matches `add_project` / `remove_project`.
     pub(crate) fn replace_projects(&mut self, next: ProjectsConfig) {
         self.projects = next;
+        let prev_collapsed = self.layout.collapsed_projects.clone();
         self.prune_collapsed_projects();
+        if self.layout.collapsed_projects != prev_collapsed {
+            self.save_layout();
+        }
     }
 
     /// Dialog accessors used by the dialog module's helpers. Kept
@@ -543,6 +589,7 @@ impl Sidebar {
             }
         };
         on_disk.selected_project_id = self.layout.selected_project_id.clone();
+        on_disk.collapsed_projects = self.layout.collapsed_projects.clone();
         if let Err(err) = on_disk.save(&self.paths) {
             eprintln!("warning: failed to save layout.json: {err:#}");
         }
@@ -1109,6 +1156,7 @@ impl Sidebar {
             return;
         }
         let prev_selected_id = self.layout.selected_project_id.clone();
+        let prev_collapsed = self.layout.collapsed_projects.clone();
         let mut next = self.projects.clone();
         next.projects.remove(idx);
         if let Err(err) = next.save(&self.paths) {
@@ -1131,10 +1179,14 @@ impl Sidebar {
         };
         self.layout.selected_project_id =
             self.selected.and_then(|i| self.projects.projects.get(i).map(|p| p.id.clone()));
-        // Only persist layout when the persisted id actually changed —
-        // i.e. when the removed project was the active one. Removing
-        // a row before/after the active one leaves the id intact.
-        if self.layout.selected_project_id != prev_selected_id {
+        // Persist layout when either the persisted id or the
+        // collapsed-projects list actually changed — removing the
+        // active row rewrites the id, and removing a collapsed row
+        // prunes its entry. Removing an unrelated, expanded row
+        // leaves both intact and skips the write.
+        if self.layout.selected_project_id != prev_selected_id
+            || self.layout.collapsed_projects != prev_collapsed
+        {
             self.save_layout();
         }
         self.close_menu(cx);
