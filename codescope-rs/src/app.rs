@@ -39,7 +39,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use codescope_core::{AppPaths, LayoutState, ProjectsConfig, Settings, Theme, WindowState};
 use codescope_terminal::{
@@ -93,6 +93,18 @@ struct Tab {
     /// agent-launch tabs). Persisted so "New Claude session" comes
     /// back as claude on restore.
     auto_type: Option<SharedString>,
+    /// Wall-clock spawn time, captured at `spawn_tab_in`. Used as the
+    /// `since` filter for Claude session adoption — only `.jsonl`
+    /// transcripts created/modified at or after this point qualify
+    /// as "this tab's session". Mirrors the `since` arg of
+    /// `ClaudeSessionDiscovery.Watch`.
+    spawned_at: SystemTime,
+    /// Adopted Claude session id, set once `claude_discovery::scan`
+    /// returns a fresh transcript for this tab. `None` until the agent
+    /// has written its first jsonl line — and stays `None` for plain
+    /// pwsh tabs (no `claude` auto-type). On adoption we register the
+    /// telemetry tail; on close we unregister.
+    adopted_session_id: Option<String>,
 }
 
 /// One column in the work area: a tab strip + the currently-selected
@@ -668,6 +680,7 @@ impl AppShell {
             telemetry_tails: HashMap::new(),
         };
         shell.start_telemetry_poll(cx);
+        shell.start_claude_discovery_poll(cx);
         shell.rehydrate_or_cold_start(window, cx);
         shell
     }
@@ -815,6 +828,107 @@ impl AppShell {
                         Duration::from_millis(250)
                     } else {
                         Duration::from_secs(2)
+                    }
+                });
+                match result {
+                    Ok(next) => interval = next,
+                    Err(_) => break,
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Resolve `~/.claude/projects/`. Returns `None` when neither
+    /// USERPROFILE nor HOME is set — same gate `register_telemetry`
+    /// uses, kept here so the discovery poll skips silently instead
+    /// of repeatedly logging.
+    fn claude_projects_root() -> Option<std::path::PathBuf> {
+        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+        Some(std::path::PathBuf::from(home).join(".claude").join("projects"))
+    }
+
+    /// Spawn the background per-tab Claude session adoption loop.
+    ///
+    /// Mirrors `ClaudeSessionDiscovery.Watch` from the C# build: every
+    /// 350 ms while at least one tab is awaiting adoption, scan
+    /// `~/.claude/projects/<encoded-cwd>/` for `.jsonl` files written
+    /// at or after the tab's `spawned_at`. On a hit, register the
+    /// telemetry tail and stamp `adopted_session_id` on the tab so
+    /// subsequent ticks skip it. Idle (no Claude tabs awaiting
+    /// adoption) bumps the cadence to 5 s.
+    ///
+    /// Called from `AppShell::new` after the struct is constructed.
+    fn start_claude_discovery_poll(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let mut interval =
+                Duration::from_millis(codescope_core::CLAUDE_DISCOVERY_POLL_MS);
+            let idle = Duration::from_secs(5);
+            loop {
+                cx.background_executor().timer(interval).await;
+                if this.upgrade().is_none() {
+                    break;
+                }
+                let result = this.update(cx, |this, _cx| {
+                    let Some(root) = Self::claude_projects_root() else {
+                        return idle;
+                    };
+                    // Walk every tab, adopt fresh transcripts in place.
+                    // Two-pass (collect candidates, then mutate) keeps
+                    // the borrow rules happy: `register_telemetry`
+                    // takes `&mut self`, so we can't hold a `&mut Tab`
+                    // across the call.
+                    struct Found {
+                        group_idx: usize,
+                        tab_idx: usize,
+                        session_id: String,
+                        working_directory: String,
+                    }
+                    let mut found = Vec::new();
+                    let mut any_pending = false;
+                    for (g_idx, group) in this.groups.iter().enumerate() {
+                        for (t_idx, tab) in group.tabs.iter().enumerate() {
+                            if tab.adopted_session_id.is_some() {
+                                continue;
+                            }
+                            if !codescope_core::claude_discovery::is_claude_auto_type(
+                                tab.auto_type.as_ref().map(|s| s.as_ref()),
+                            ) {
+                                continue;
+                            }
+                            let Some(ref wd) = tab.working_directory else { continue };
+                            any_pending = true;
+                            let wd_str = wd.to_string_lossy().into_owned();
+                            let mut hits = codescope_core::claude_discovery::scan(
+                                &root, &wd_str, tab.spawned_at,
+                            );
+                            // Multiple hits: keep the lowest-id (any
+                            // deterministic pick will do — we'll
+                            // re-fire on subsequent rotations as the
+                            // file modtimes update).
+                            hits.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+                            if let Some(c) = hits.into_iter().next() {
+                                found.push(Found {
+                                    group_idx: g_idx,
+                                    tab_idx: t_idx,
+                                    session_id: c.session_id,
+                                    working_directory: wd_str,
+                                });
+                            }
+                        }
+                    }
+                    for f in found {
+                        this.register_telemetry(f.session_id.clone(), &f.working_directory);
+                        if let Some(group) = this.groups.get_mut(f.group_idx) {
+                            if let Some(tab) = group.tabs.get_mut(f.tab_idx) {
+                                tab.adopted_session_id = Some(f.session_id);
+                            }
+                        }
+                    }
+                    if any_pending {
+                        Duration::from_millis(codescope_core::CLAUDE_DISCOVERY_POLL_MS)
+                    } else {
+                        idle
                     }
                 });
                 match result {
@@ -1045,6 +1159,8 @@ impl AppShell {
             terminal,
             working_directory: working_directory_for_tab,
             auto_type: auto_type.clone(),
+            spawned_at: SystemTime::now(),
+            adopted_session_id: None,
         });
         let new_idx = group.tabs.len() - 1;
         self.activate_tab(group_idx, new_idx, window, cx);
@@ -1082,6 +1198,17 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Look up the closing tab's adopted Claude session id (if any)
+        // *before* mutating, so we can drop the telemetry tail without
+        // holding `&mut group` across the call.
+        let adopted = self
+            .groups
+            .get(group_idx)
+            .and_then(|g| g.tabs.get(tab_idx))
+            .and_then(|t| t.adopted_session_id.clone());
+        if let Some(sid) = adopted {
+            self.unregister_telemetry(&sid);
+        }
         let Some(group) = self.groups.get_mut(group_idx) else { return };
         if tab_idx >= group.tabs.len() {
             return;

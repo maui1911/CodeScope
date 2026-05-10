@@ -13,6 +13,7 @@
 //! lives in the `app` crate. Anything terminal-protocol-bound lives in
 //! `codescope-terminal`.
 
+pub mod claude_discovery;
 pub mod claude_telemetry;
 pub mod git;
 pub mod layout;
@@ -22,6 +23,7 @@ pub mod settings;
 pub mod theme;
 pub mod window_state;
 
+pub use claude_discovery::{AdoptionCandidate, POLL_INTERVAL_MS as CLAUDE_DISCOVERY_POLL_MS};
 pub use claude_telemetry::{
     SessionState, TelemetrySnapshot, TranscriptTail, context_window_for_model, encode_cwd,
 };
