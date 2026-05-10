@@ -1624,11 +1624,16 @@ impl AppShell {
             }
             Err(err) => {
                 eprintln!("warning: failed to reload projects.json before reopen: {err:#}");
+                // `{err:#}` matches the rest of the toast surface
+                // (e.g. the agent-launch error path) — pretty-formats
+                // the full anyhow error chain so the user sees the
+                // root cause, not just the outer "could not read"
+                // wrapper.
                 self.push_toast(
                     ToastKind::Err,
                     SharedString::from("Reopen failed"),
                     Some(SharedString::from(format!(
-                        "could not read projects.json: {err}"
+                        "Could not read projects.json: {err:#}"
                     ))),
                     cx,
                 );
@@ -1686,17 +1691,17 @@ impl AppShell {
         let title: SharedString = if restored.display_name.is_some() {
             descriptor.title.clone().into()
         } else {
-            let project_name = self
-                .sidebar
-                .read(cx)
+            // Single sidebar snapshot for both lookups so they share
+            // the same in-memory state and we don't pay the entity
+            // borrow twice for one decision.
+            let sidebar = self.sidebar.read(cx);
+            let project_name = sidebar
                 .projects()
                 .projects
                 .iter()
                 .find(|p| p.sessions.iter().any(|s| s.id == restored.id))
                 .map(|p| p.name.clone());
-            let branch_label = self
-                .sidebar
-                .read(cx)
+            let branch_label = sidebar
                 .git_status_for(&descriptor.working_directory)
                 .map(|g| g.branch.clone())
                 .or_else(|| restored.branch.clone());
