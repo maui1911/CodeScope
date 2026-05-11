@@ -4573,21 +4573,22 @@ impl AppShell {
 
     /// Activate the row at index `row_idx` *within the filtered list*.
     /// Bound from the row's mouse-down so a single click runs the
-    /// action even if the user hadn't navigated to that row first.
-    pub fn activate_palette_row(&mut self, row_idx: usize, cx: &mut Context<Self>) {
-        if let Some(state) = self.command_palette.as_mut() {
-            if row_idx < state.filtered.len() {
-                state.selected = row_idx;
-            }
+    /// action even if the user hadn't navigated to that row first. We
+    /// move the highlight and then immediately dispatch through the
+    /// same path Enter takes so the click and keyboard arms remain
+    /// behaviourally identical.
+    pub fn activate_palette_row(
+        &mut self,
+        row_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = self.command_palette.as_mut()
+            && row_idx < state.filtered.len()
+        {
+            state.selected = row_idx;
         }
-        // Defer the actual dispatch to `submit_command_palette` so the
-        // mouse-down path and the keyboard path share one execution
-        // arm. We need `&mut Window` for any palette action that
-        // spawns a tab, so the listener that calls this method also
-        // hands us a window — but this helper doesn't — so we just
-        // notify here and let the next-frame dispatch arm run via
-        // `submit_command_palette` from the same listener.
-        cx.notify();
+        self.submit_command_palette(window, cx);
     }
 
     /// Dispatch the currently selected action and close the palette.

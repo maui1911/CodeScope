@@ -400,9 +400,9 @@ pub(crate) fn render_palette(
                 .cursor_pointer()
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
+                    cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        this.activate_palette_row(row_idx, cx);
+                        this.activate_palette_row(row_idx, window, cx);
                     }),
                 )
                 .child(title_block)
