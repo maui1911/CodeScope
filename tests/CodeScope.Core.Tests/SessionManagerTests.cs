@@ -74,7 +74,10 @@ public sealed class SessionManagerTests
 
         var d = manager.CreateAgentSession(Path.GetTempPath(), agent);
 
-        d.Shell.Should().Be("pwsh.exe");
+        // Agent sessions go through ResolveShell() — same fallback chain as shell sessions —
+        // so the result is the absolute pwsh/powershell path (quoted when it contains spaces).
+        var shellLower = d.Shell.Trim('"').ToLowerInvariant();
+        shellLower.Should().Match(s => s.EndsWith("pwsh.exe") || s.EndsWith("powershell.exe"));
         d.ShellArgs.Should().Contain("-NoExit");
         d.ShellArgs.Should().Contain("-Command");
         var payload = string.Join(' ', d.ShellArgs);

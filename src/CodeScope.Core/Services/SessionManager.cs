@@ -99,11 +99,18 @@ public sealed class SessionManager : ISessionManager
             folderName = workingDirectory;
         }
 
+        // Resolve through the same probe as shell sessions so machines without pwsh 7
+        // fall back to Windows PowerShell 5.1 / cmd.exe instead of silently failing to
+        // spawn — hard-coding "pwsh.exe" left fresh Windows 11 boxes with a black agent
+        // terminal (CreateProcess ERROR_FILE_NOT_FOUND, eaten by SessionTabView.term.Start).
+        var shell = ResolveShell();
+        if (shell.Contains(' ') && shell[0] != '"') { shell = $"\"{shell}\""; }
+
         return new SessionDescriptor
         {
             Id = id ?? Guid.NewGuid().ToString("n"),
             WorkingDirectory = workingDirectory,
-            Shell = "pwsh.exe",
+            Shell = shell,
             ShellArgs =
             [
                 "-NoExit",
