@@ -29,15 +29,17 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use codescope_core::{AppPaths, LayoutState, Project, ProjectsConfig, Theme};
+use codescope_core::{
+    AgentProfile, AgentRegistry, AppPaths, LayoutState, Project, ProjectsConfig, Theme,
+};
 use codescope_core::git::GitStatus;
 use codescope_core::pr::{CiStatus, PullRequestInfo};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     Animation, AnimationExt, AppContext, ClipboardItem, Context, Corner, EventEmitter,
-    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point,
-    Render, SharedString, StatefulInteractiveElement, Styled, Window, anchored, deferred, div,
-    point, px,
+    ExternalPaths, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, ParentElement, Pixels, Point, Render, SharedString,
+    StatefulInteractiveElement, Styled, Window, anchored, deferred, div, point, px,
 };
 
 use crate::new_project_dialog::NewProjectDialogState;
@@ -365,6 +367,24 @@ pub struct Sidebar {
     /// Mirrors the C# `Sidebar.OverviewButton`'s `IsOverviewVisible`
     /// DataTrigger.
     overview_visible: bool,
+    /// Registry of agent profiles (claude / codex / opencode / copilot
+    /// / pi by default, plus any `settings.agents` overrides). Threaded
+    /// in from `AppShell` so the worktree + project context menus can
+    /// render one "New {DisplayName} session" row per profile and pick
+    /// the user-flagged default. Mirrors C# `SidebarViewModel.AvailableAgents`
+    /// driving `BuildAgentChoices` in `SidebarView.xaml.cs`.
+    agent_registry: AgentRegistry,
+    /// Case-insensitive substring filter applied to project and
+    /// worktree rows (matched against project name, worktree branch,
+    /// and folder leaf). Empty → no filtering. Lives in memory only;
+    /// not persisted to `layout.json` because a stale filter on next
+    /// launch would just look like the projects vanished. Mirrors C#
+    /// `SidebarViewModel.FilterText` (process-local).
+    filter: String,
+    /// Focus handle for the filter input so on_key_down fires only
+    /// when the user has clicked into the search box. Without it, the
+    /// sidebar would swallow every keystroke globally.
+    filter_focus: FocusHandle,
 }
 
 impl Sidebar {
@@ -373,6 +393,8 @@ impl Sidebar {
         layout: LayoutState,
         theme: Arc<Theme>,
         paths: Arc<AppPaths>,
+        agent_registry: AgentRegistry,
+        filter_focus: FocusHandle,
     ) -> Self {
         // Restore last-opened project if it still exists. Falls back
         // to the first project when the saved id is gone (project
@@ -418,6 +440,9 @@ impl Sidebar {
             busy_paths: HashSet::new(),
             active_paths: HashSet::new(),
             overview_visible: false,
+            agent_registry,
+            filter: String::new(),
+            filter_focus,
         }
     }
 
@@ -1894,6 +1919,40 @@ impl Render for Sidebar {
             })
             .collect();
 
+        // Apply the filter input (case-insensitive substring match).
+        // A project is kept when its name matches; an unmatched
+        // project is still kept when at least one of its worktrees
+        // matches by branch or folder leaf, in which case its
+        // worktree list narrows to the matching subset. Empty filter
+        // is the identity transform. Mirrors C#
+        // `SidebarViewModel.FilterText` filtering — project hits keep
+        // every worktree, worktree hits hoist the parent project.
+        let rows: Vec<(usize, String, SharedString, String, Vec<WorktreeRowData>)> = {
+            let needle = self.filter.trim().to_ascii_lowercase();
+            if needle.is_empty() {
+                rows
+            } else {
+                rows.into_iter()
+                    .filter_map(|(idx, id, name, project_name, worktrees)| {
+                        let project_match =
+                            project_name.to_ascii_lowercase().contains(&needle);
+                        if project_match {
+                            return Some((idx, id, name, project_name, worktrees));
+                        }
+                        let kept: Vec<WorktreeRowData> = worktrees
+                            .into_iter()
+                            .filter(|wt| worktree_row_matches(wt, &needle))
+                            .collect();
+                        if kept.is_empty() {
+                            None
+                        } else {
+                            Some((idx, id, name, project_name, kept))
+                        }
+                    })
+                    .collect()
+            }
+        };
+
         let heading = div()
             .h(px(40.0))
             .flex()
@@ -2732,6 +2791,13 @@ impl Render for Sidebar {
                 .child(new_project_btn)
         };
 
+        // Filter input — text field above the project tree that
+        // hides rows whose project name / worktree branch / folder
+        // leaf don't match (case-insensitive substring). Mirrors C#
+        // `SidebarViewModel.FilterText`; the empty filter shows every
+        // row.
+        let filter_input = self.render_filter_input(&theme, window, cx);
+
         // Width is set by the parent wrapper in `AppShell` so the
         // sidebar can be drag-resized + collapsed at the shell level.
         // We just fill what we're given.
@@ -2749,7 +2815,24 @@ impl Render for Sidebar {
             // on their own `div`, matching the per-element
             // `Fig.Font.Mono` overrides on those XAML nodes.
             .font(theme::font_sans())
+            // Drag-a-folder onto the sidebar adds it as a project —
+            // mirrors C# `SidebarView.xaml.cs::OnDrop`. gpui translates
+            // the OS file-drop into an internal drag with an
+            // `ExternalPaths` payload; we receive it via `on_drop` and
+            // dispatch each existing directory through the same
+            // `add_project` entry point the `+ New Project` button uses.
+            // Files / non-existent paths are silently skipped — matches
+            // C# `PayloadFolders` filtering on `Directory.Exists`.
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                for path in paths.paths() {
+                    if path.is_dir() {
+                        let path_str = path.to_string_lossy().into_owned();
+                        this.add_project(path_str, cx);
+                    }
+                }
+            }))
             .child(heading)
+            .child(filter_input)
             .child(div().h_px().bg(theme::divider(&theme)))
             .child(body)
             .child(footer);
@@ -2799,6 +2882,175 @@ impl Render for Sidebar {
 }
 
 impl Sidebar {
+    /// Render the worktree menu's "New {DisplayName} session" rows —
+    /// one per agent in `agent_registry`. Default agent first
+    /// (matches C# `BuildAgentChoices`'s "Default" entry pinned to the
+    /// top), then the rest in registration order. The default row gets
+    /// a subtle accent dot to mirror the C# `Tag = "primary"` styling.
+    ///
+    /// Each row emits the same `OpenSession` event the legacy single
+    /// "New Claude session" row emitted, but with the agent's argv
+    /// (joined by spaces) as `auto_type` and a per-agent suffix on the
+    /// tab title (` · claude`, ` · codex`, …) so multiple agents on
+    /// the same worktree stay distinguishable in the tab strip.
+    ///
+    /// `id_prefix` is used to derive stable gpui ids per row
+    /// (`"{id_prefix}-{agent_id}"`); pick a prefix that's unique
+    /// inside its parent menu so multiple invocations on the same
+    /// frame don't collide.
+    fn build_new_agent_rows(
+        &self,
+        worktree_path: &str,
+        title_prefix: &SharedString,
+        id_prefix: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let theme = self.theme.clone();
+        let ink = theme::ink(&theme);
+        let ink_dim = theme::ink_dim(&theme);
+        let frost = theme::frost_10(&theme);
+        let accent = theme::accent(&theme);
+
+        // Order: default first, then the rest in registration order.
+        let default_id = self.agent_registry.get_default().map(|a| a.id.clone());
+        let mut profiles: Vec<&AgentProfile> = Vec::new();
+        if let Some(def_id) = default_id.as_deref()
+            && let Some(def) = self.agent_registry.get_by_id(def_id)
+        {
+            profiles.push(def);
+        }
+        for a in self.agent_registry.get_all() {
+            if Some(a.id.as_str()) == default_id.as_deref() {
+                continue;
+            }
+            profiles.push(a);
+        }
+
+        profiles
+            .into_iter()
+            .map(|profile| {
+                let is_default = Some(profile.id.as_str()) == default_id.as_deref();
+                let label = SharedString::from(format!("New {} session", profile.display_name));
+                let row_id = SharedString::from(format!("{id_prefix}-{}", profile.id));
+                let path = PathBuf::from(worktree_path);
+                let title = SharedString::from(format!(
+                    "{} · {}",
+                    title_prefix.as_ref(),
+                    profile.id,
+                ));
+                // Join argv with spaces — the receiver runs it through
+                // the shell, fine for our built-in profiles (single
+                // tokens like `claude`, `codex`, …). Custom agent argv
+                // containing spaces would need quoting; the C# build
+                // has the same caveat (`string.Join(" ", argv)` in
+                // `AgentCommandJoiner`).
+                let mut argv: Vec<String> =
+                    Vec::with_capacity(1 + profile.new_session_args.len());
+                argv.push(profile.command.clone());
+                argv.extend(profile.new_session_args.iter().cloned());
+                let cmd = argv.join(" ");
+
+                let base_color = if is_default { ink } else { ink_dim };
+                let hover_color = ink;
+                let frost_hover = frost;
+
+                let mut row = div()
+                    .id(row_id)
+                    .h(px(28.0))
+                    .px_3()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .text_size(px(12.5))
+                    .text_color(base_color)
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(frost_hover).text_color(hover_color))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            cx.emit(SidebarEvent::OpenSession {
+                                working_directory: path.clone(),
+                                title: title.clone(),
+                                auto_type: Some(cmd.clone().into()),
+                                force_new: true,
+                            });
+                            this.close_menu(cx);
+                        }),
+                    )
+                    .child(div().flex_grow().child(label));
+                if is_default {
+                    // Accent dot — subtle marker for the default agent,
+                    // mirrors C# `Tag = "primary"` rendering hint.
+                    row = row.child(
+                        div()
+                            .ml(px(6.0))
+                            .w(px(6.0))
+                            .h(px(6.0))
+                            .rounded_full()
+                            .bg(accent),
+                    );
+                }
+                row.into_any_element()
+            })
+            .collect()
+    }
+
+    /// The filter text box that lives between the "PROJECTS" header
+    /// and the project tree. Single-line, in-place editing — click to
+    /// focus, then characters / backspace / escape edit the value.
+    /// Esc clears the filter (mirrors the C# behaviour of the
+    /// `FilterText` clear button). Empty filter renders dim
+    /// placeholder text.
+    fn render_filter_input(
+        &self,
+        theme: &Arc<Theme>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let elevated = theme::elevated(theme);
+        let divider = theme::divider(theme);
+        let ink = theme::ink(theme);
+        let ink_ghost = theme::ink_ghost(theme);
+        let focused = self.filter_focus.is_focused(window);
+        let border_color = if focused { theme::accent(theme) } else { divider };
+
+        let (value_text, text_color): (SharedString, _) = if self.filter.is_empty() {
+            ("Filter…".into(), ink_ghost)
+        } else {
+            (SharedString::from(self.filter.clone()), ink)
+        };
+
+        let filter_focus = self.filter_focus.clone();
+        div()
+            .id("sidebar-filter")
+            .mx_2()
+            .my_1()
+            .h(px(24.0))
+            .px(px(8.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .rounded(px(4.0))
+            .bg(elevated)
+            .border_1()
+            .border_color(border_color)
+            .text_size(px(11.5))
+            .text_color(text_color)
+            .cursor_pointer()
+            .track_focus(&self.filter_focus)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |_, _, window, cx| {
+                    filter_focus.focus(window);
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .on_key_down(cx.listener(handle_filter_key_down))
+            .child(value_text)
+    }
+
     /// Build the floating project context menu. Anchored to the
     /// click position and `deferred` so it paints over the rest of
     /// the chrome instead of being clipped by the sidebar's bounds.
@@ -3055,6 +3307,18 @@ impl Sidebar {
         ));
         let is_primary = worktree.is_primary;
 
+        // Precompute the multi-agent "New … session" rows up-front so
+        // we don't try to re-borrow `cx` mutably inside the menu_body
+        // chain (the `item` closure below captures `cx.listener`,
+        // which holds an immutable borrow). Builds Vec<AnyElement>;
+        // dropped straight into `.children(...)` later.
+        let agent_rows = self.build_new_agent_rows(
+            &worktree.path,
+            &open_session_title,
+            "wt-menu-new-agent",
+            cx,
+        );
+
         let elevated = theme::elevated(theme);
         let divider = theme::divider(theme);
         let ink = theme::ink(theme);
@@ -3149,36 +3413,20 @@ impl Sidebar {
                     }),
                 )
             })
-            // "New Claude session" — same as Open session but auto-
-            // types `claude` after the shell is up. Lands above the
-            // Reveal/Copy/Remove rows so the agent-launch path stays
-            // close to the plain Open session row.
+            // Multi-agent "New {DisplayName} session" rows — one per
+            // profile in `agent_registry`. The default profile lands
+            // first (matches the C# `BuildAgentChoices` "Default" entry
+            // sitting at the top of the picker) and gets an accent dot.
+            // Mirrors `SidebarView.xaml.cs::BuildAgentChoices` minus
+            // the Shell sentinel and the global-default fallback —
+            // those land when the Settings dialog grows agent-picker
+            // UI.
             //
-            // Title derives from the same `open_session_title` shape
-            // (`{project} · {branch}`) plus a ` · claude` suffix so
+            // Title derives from `open_session_title`
+            // (`{project} · {branch}`) plus a per-agent suffix so
             // multiple worktrees stay distinguishable in the tab strip
             // when the user has agents running in several of them.
-            .child({
-                let path = PathBuf::from(&worktree.path);
-                let title = SharedString::from(format!(
-                    "{} · claude",
-                    open_session_title.clone()
-                ));
-                item(
-                    "wt-menu-new-claude",
-                    "New Claude session",
-                    false,
-                    Box::new(move |this, _window, cx| {
-                        cx.emit(SidebarEvent::OpenSession {
-                            working_directory: path.clone(),
-                            title: title.clone(),
-                            auto_type: Some(claude_command().into()),
-                            force_new: true,
-                        });
-                        this.close_menu(cx);
-                    }),
-                )
-            })
+            .children(agent_rows)
             // ── Git ─────────────────────────────────────────────
             // Pull / Copy branch / Open remote in browser. The
             // dirty-state aware Rebase + Discard rows from the C#
@@ -3637,6 +3885,71 @@ fn open_path_in_windows_terminal(path: &str) {
     }
 }
 
+/// Sidebar filter input keystroke handler. Mirrors the
+/// `new_project_dialog::handle_key_down` pattern: backspace pops a
+/// char, escape clears the field, printable characters append. No
+/// "submit" key — filtering is live as the user types.
+fn handle_filter_key_down(
+    sidebar: &mut Sidebar,
+    event: &KeyDownEvent,
+    _window: &mut Window,
+    cx: &mut Context<Sidebar>,
+) {
+    let key = event.keystroke.key.as_str();
+    match key {
+        "escape" => {
+            if !sidebar.filter.is_empty() {
+                sidebar.filter.clear();
+                cx.notify();
+            }
+            cx.stop_propagation();
+            return;
+        }
+        "backspace" => {
+            if sidebar.filter.pop().is_some() {
+                cx.notify();
+            }
+            cx.stop_propagation();
+            return;
+        }
+        _ => {}
+    }
+    let Some(key_char) = event.keystroke.key_char.as_deref() else {
+        return;
+    };
+    if key_char.is_empty() {
+        return;
+    }
+    let mut changed = false;
+    for ch in key_char.chars() {
+        if !ch.is_control() {
+            sidebar.filter.push(ch);
+            changed = true;
+        }
+    }
+    if changed {
+        cx.stop_propagation();
+        cx.notify();
+    }
+}
+
+/// Does a worktree row match the lowercased filter needle? Matches
+/// the branch (when set) and the folder leaf (always). Caller has
+/// already lowercased `needle` and confirmed the project name didn't
+/// match.
+fn worktree_row_matches(wt: &WorktreeRowData, needle: &str) -> bool {
+    if let Some(branch) = wt.branch.as_deref()
+        && branch.to_ascii_lowercase().contains(needle)
+    {
+        return true;
+    }
+    let leaf = std::path::Path::new(&wt.path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    leaf.to_ascii_lowercase().contains(needle)
+}
+
 /// The command we auto-type for "New Claude session". Bare `claude`
 /// — relies on the user's PATH to resolve it (npm-global on Windows,
 /// homebrew/npm on macOS, /usr/local/bin or similar on Linux). When
@@ -3710,5 +4023,42 @@ mod tests {
         assert_eq!(history_agent_display_name(""), None);
         assert_eq!(history_agent_display_name("gemini"), None);
         assert_eq!(history_agent_display_name("-"), None);
+    }
+
+    fn row(branch: Option<&str>, path: &str) -> WorktreeRowData {
+        WorktreeRowData {
+            id: "test".into(),
+            canonical_path: path.into(),
+            path: path.into(),
+            branch: branch.map(|s| s.to_string()),
+            closed_sessions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn filter_matches_branch_case_insensitively() {
+        // `worktree_row_matches` expects the caller to lowercase the
+        // needle (the render-side caller does — `self.filter.to_ascii_lowercase()`).
+        let r = row(Some("Feat/Foo"), "/repos/bar");
+        assert!(worktree_row_matches(&r, "feat"));
+        assert!(worktree_row_matches(&r, "foo"));
+    }
+
+    #[test]
+    fn filter_matches_folder_leaf() {
+        // Cross-platform path — `/` works as a separator on Windows
+        // and Unix, so `Path::file_name` yields `my-proj` on both.
+        let r = row(None, "/repos/my-proj");
+        assert!(worktree_row_matches(&r, "my-proj"));
+        assert!(worktree_row_matches(&r, "proj"));
+        // "repos" is part of the parent path, not the leaf — must
+        // NOT match.
+        assert!(!worktree_row_matches(&r, "repos"));
+    }
+
+    #[test]
+    fn filter_no_match_returns_false() {
+        let r = row(Some("main"), "/repos/bar");
+        assert!(!worktree_row_matches(&r, "missing"));
     }
 }

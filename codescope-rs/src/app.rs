@@ -613,25 +613,47 @@ impl AppShell {
         // copy used purely for session bookkeeping; both converge
         // through the shared `projects.json`.
         let projects_for_sessions = projects.clone();
-        let sidebar = cx.new(|cx| {
-            let sidebar =
-                Sidebar::new(projects, layout.clone(), theme.clone(), paths.clone());
-            // Kick off the per-worktree dirty-state poll. Has to be
-            // called from inside the `cx.new` callback because that's
-            // where we have a `Context<Sidebar>` to register the
-            // background task against. The git-status poll
-            // (branch + numstat + ahead/behind) runs alongside it on
-            // the same 5 s cadence; both feed the status bar's left
-            // cluster and the sidebar dot.
-            sidebar.start_dirty_poll(cx);
-            sidebar.start_git_status_poll(cx);
-            // PR poll runs on a slower (60 s) cadence — `gh pr list`
-            // is the heaviest of the three pollers (network + auth)
-            // and the data changes much less frequently than the
-            // working tree.
-            sidebar.start_pr_poll(cx);
-            sidebar
-        });
+        // Build the agent registry up-front so the sidebar can consume
+        // it on construction — its worktree-menu "New {DisplayName}
+        // session" rows iterate this list. Mirrors C#
+        // `AgentRegistry.FromConfig`, honouring `settings.agents`
+        // overrides + the `default_agent` flag.
+        let agent_registry = codescope_core::AgentRegistry::from_settings(&settings);
+        // One focus handle for the sidebar's filter input — owned at
+        // the shell level so it survives sidebar entity recreation.
+        let sidebar_filter_focus = cx.focus_handle();
+        let sidebar = {
+            let agent_registry_for_sidebar = agent_registry.clone();
+            let filter_focus = sidebar_filter_focus.clone();
+            let layout_for_sidebar = layout.clone();
+            let theme_for_sidebar = theme.clone();
+            let paths_for_sidebar = paths.clone();
+            cx.new(move |cx| {
+                let sidebar = Sidebar::new(
+                    projects,
+                    layout_for_sidebar,
+                    theme_for_sidebar,
+                    paths_for_sidebar,
+                    agent_registry_for_sidebar,
+                    filter_focus,
+                );
+                // Kick off the per-worktree dirty-state poll. Has to be
+                // called from inside the `cx.new` callback because that's
+                // where we have a `Context<Sidebar>` to register the
+                // background task against. The git-status poll
+                // (branch + numstat + ahead/behind) runs alongside it on
+                // the same 5 s cadence; both feed the status bar's left
+                // cluster and the sidebar dot.
+                sidebar.start_dirty_poll(cx);
+                sidebar.start_git_status_poll(cx);
+                // PR poll runs on a slower (60 s) cadence — `gh pr list`
+                // is the heaviest of the three pollers (network + auth)
+                // and the data changes much less frequently than the
+                // working tree.
+                sidebar.start_pr_poll(cx);
+                sidebar
+            })
+        };
 
         // Spawn a tab whenever the sidebar asks us to — fired by a
         // worktree-row click in the project list and by a successful
@@ -888,11 +910,9 @@ impl AppShell {
             .focused_group_index
             .min(groups.len().saturating_sub(1));
 
-        // Build the agent registry up-front from the loaded settings so
-        // user overrides in `settings.agents` are honoured, otherwise
-        // the shipped 5-agent defaults (claude/codex/opencode/copilot/pi)
-        // are used. Cheap — just a `Vec<AgentProfile>` clone.
-        let agent_registry = codescope_core::AgentRegistry::from_settings(&settings);
+        // `agent_registry` was built earlier (before the sidebar) so
+        // the sidebar entity could consume a clone for its worktree-
+        // menu rows. We reuse the same registry here for the shell.
 
         let mut shell = Self {
             groups,
