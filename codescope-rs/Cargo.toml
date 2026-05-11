@@ -46,6 +46,7 @@ windows = { version = "0.61", features = [
     "Win32_System_SystemInformation",
     "Win32_System_Time",
 ] }
+winreg = "0.55"
 
 [target.'cfg(windows)'.build-dependencies]
 # Embed `assets/codescope.ico` as the Windows resource icon for the

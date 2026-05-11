@@ -42,8 +42,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use codescope_core::{
-    AppPaths, LayoutState, ProjectsConfig, Session, SessionManager, Settings, Theme, WindowState,
-    now_iso8601,
+    AppPaths, FontSettings, LayoutState, ProjectsConfig, Session, SessionManager, Settings, Theme,
+    WindowState, now_iso8601,
 };
 use codescope_terminal::{
     Backend, ColorPalette, CursorStylePreset, FontConfig, Shell, SpawnConfig, TerminalSize,
@@ -4691,19 +4691,10 @@ fn cursor_shape_from_str(s: &str) -> codescope_terminal::CursorShape {
 }
 
 fn build_font_config(settings: &Settings) -> FontConfig {
-    let family: SharedString = if settings.font.family.is_empty() {
-        // Empty `font.family` in settings.json falls back to whatever
-        // `FontConfig::default()` picks — currently the same Nerd-Font-
-        // first chain, just sourced from the env (`CODESCOPE_FONT`) or
-        // hard-coded, *not* an OS-supplied "platform default monospace".
-        // True system-default font picking would need a platform-
-        // specific resolver (DirectWrite IDWriteSystemFontCollection on
-        // Windows, NSFont/userFixedPitchFont on macOS, fontconfig on
-        // Linux). Land that the day someone actually asks for it.
-        FontConfig::default().family
-    } else {
-        settings.font.family.clone().into()
-    };
+    let env_family = std::env::var("CODESCOPE_FONT").ok();
+    let family_candidates = terminal_font_candidates(settings, env_family.as_deref());
+    let family = theme::resolve_font_family(&family_candidates)
+        .unwrap_or_else(|| FontConfig::default().family);
     let fallbacks = settings.font.fallbacks.iter().map(|s| s.clone().into()).collect();
     let size = px(settings.font.size.max(1.0));
     // line_height_multiplier is recorded for later — gpui's
@@ -4720,9 +4711,71 @@ fn build_font_config(settings: &Settings) -> FontConfig {
     }
 }
 
+fn terminal_font_candidates(settings: &Settings, env_family: Option<&str>) -> Vec<String> {
+    let mut candidates = Vec::new();
+    push_non_empty_font_candidate(&mut candidates, &settings.font.family);
+
+    if let Some(env_family) = env_family {
+        push_non_empty_font_candidate(&mut candidates, env_family);
+    }
+
+    for fallback in &settings.font.fallbacks {
+        push_non_empty_font_candidate(&mut candidates, fallback);
+    }
+
+    if candidates.is_empty() {
+        let defaults = FontSettings::default();
+        push_non_empty_font_candidate(&mut candidates, &defaults.family);
+        for fallback in defaults.fallbacks {
+            push_non_empty_font_candidate(&mut candidates, &fallback);
+        }
+    }
+
+    candidates
+}
+
+fn push_non_empty_font_candidate(candidates: &mut Vec<String>, family: &str) {
+    let family = family.trim();
+    if !family.is_empty() {
+        candidates.push(family.to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_font_candidates_keep_settings_ahead_of_env() {
+        let mut settings = Settings::default();
+        settings.font.family = "Settings Mono".into();
+        settings.font.fallbacks = vec!["Fallback Mono".into()];
+
+        let candidates = terminal_font_candidates(&settings, Some("Env Mono"));
+
+        assert_eq!(
+            candidates,
+            vec![
+                "Settings Mono".to_string(),
+                "Env Mono".to_string(),
+                "Fallback Mono".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_font_candidates_restore_mono_defaults_when_user_clears_everything() {
+        let mut settings = Settings::default();
+        settings.font.family = "  ".into();
+        settings.font.fallbacks = vec!["".into(), "  ".into()];
+
+        let candidates = terminal_font_candidates(&settings, None);
+        let defaults = FontSettings::default();
+
+        assert_eq!(candidates.first(), Some(&defaults.family));
+        assert!(candidates.contains(&"Cascadia Mono".to_string()));
+        assert!(candidates.contains(&"Consolas".to_string()));
+    }
 
     #[test]
     fn path_eq_ci_handles_trailing_slash_on_every_platform() {

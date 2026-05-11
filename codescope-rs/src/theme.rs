@@ -7,6 +7,8 @@
 //! `AppShell` gets swapped and every accessor here returns the new
 //! values on the next render — no touch required in the call sites.
 
+#[cfg(windows)]
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use codescope_core::{Rgb, Theme};
@@ -127,8 +129,103 @@ pub fn signal_warn() -> Hsla { rgb_to_hsla(Rgb::from_hex(0xFF5A5A)) }
 //                       Cascadia Code, Consolas, Azeret Mono, menlo
 //
 // gpui resolves a single primary family + an optional fallback list;
-// we hand it the same chains so missing-on-this-machine families
-// degrade the same way they do in WPF.
+// unlike WPF, a missing primary can produce ugly platform fallback on
+// some machines, so we resolve the primary to the first installed
+// family in the C# chain and keep the rest as per-glyph fallbacks.
+
+const FIG_FONT_SANS: &[&str] = &[
+    "Segoe UI Variable Display",
+    "Segoe UI Variable",
+    "Segoe UI",
+    "Inter",
+    "system-ui",
+];
+
+const FIG_FONT_MONO: &[&str] = &[
+    "FiraCode Nerd Font Mono",
+    "Cascadia Mono",
+    "Cascadia Code",
+    "Consolas",
+    "Azeret Mono",
+    "menlo",
+];
+
+/// Resolve a font stack to the first family that appears installed on
+/// this machine. If probing is unavailable or nothing matches, return
+/// the first entry so non-Windows platforms keep their normal gpui / OS
+/// fallback behaviour.
+pub fn resolve_font_family(candidates: &[String]) -> Option<SharedString> {
+    let borrowed: Vec<&str> = candidates.iter().map(String::as_str).collect();
+    resolve_font_family_names(&borrowed)
+}
+
+fn resolve_font_family_names(candidates: &[&str]) -> Option<SharedString> {
+    let family = candidates
+        .iter()
+        .copied()
+        .find(|candidate| font_family_is_installed(candidate))
+        .or_else(|| candidates.first().copied())?;
+    Some(family.to_string().into())
+}
+
+#[cfg(windows)]
+fn font_family_is_installed(family: &str) -> bool {
+    installed_font_entries()
+        .iter()
+        .any(|entry| font_entry_matches_family(entry, family))
+}
+
+#[cfg(not(windows))]
+fn font_family_is_installed(_family: &str) -> bool { false }
+
+#[cfg(windows)]
+fn installed_font_entries() -> &'static HashSet<String> {
+    static FONTS: OnceLock<HashSet<String>> = OnceLock::new();
+    FONTS.get_or_init(|| {
+        let mut fonts = HashSet::new();
+        collect_windows_font_entries(winreg::enums::HKEY_LOCAL_MACHINE, &mut fonts);
+        collect_windows_font_entries(winreg::enums::HKEY_CURRENT_USER, &mut fonts);
+        fonts
+    })
+}
+
+#[cfg(windows)]
+fn collect_windows_font_entries(root: winreg::HKEY, fonts: &mut HashSet<String>) {
+    use winreg::RegKey;
+
+    let root = RegKey::predef(root);
+    let Ok(key) = root.open_subkey("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts") else {
+        return;
+    };
+
+    for value in key.enum_values().filter_map(Result::ok) {
+        fonts.insert(value.0.to_ascii_lowercase());
+    }
+}
+
+#[cfg(windows)]
+fn font_entry_matches_family(entry: &str, family: &str) -> bool {
+    let family = family.to_ascii_lowercase();
+    let Some(rest) = entry.strip_prefix(&family) else {
+        return false;
+    };
+
+    if rest.is_empty() || rest.starts_with(" (") || rest.starts_with('(') {
+        return true;
+    }
+
+    const STYLE_SUFFIXES: &[&str] = &[
+        "regular", "bold", "italic", "bold italic", "black", "black italic", "light",
+        "light italic", "semibold", "semibold italic", "semilight", "semilight italic",
+    ];
+
+    STYLE_SUFFIXES.iter().any(|style| {
+        let suffix = format!(" {style}");
+        rest == suffix
+            || rest.starts_with(&format!("{suffix} "))
+            || rest.starts_with(&format!("{suffix}("))
+    })
+}
 
 /// Sans-serif `Font` for chrome labels — pass to `.font(...)` on a
 /// gpui element. Equivalent to applying `Fig.Font.Sans` in the C#
@@ -141,17 +238,15 @@ pub fn signal_warn() -> Hsla { rgb_to_hsla(Rgb::from_hex(0xFF5A5A)) }
 pub fn font_sans() -> Font {
     static FONT: OnceLock<Font> = OnceLock::new();
     FONT.get_or_init(|| Font {
-        family: SharedString::new_static("Segoe UI Variable Display"),
+        family: resolve_font_family_names(FIG_FONT_SANS)
+            .unwrap_or_else(|| SharedString::new_static("Segoe UI")),
         features: FontFeatures::default(),
         // Fallback chain copied verbatim (case included) from
         // `Fig.Font.Sans` so a `cargo test` failure on the ordered-
         // list assertion catches accidental drift.
-        fallbacks: Some(FontFallbacks::from_fonts(vec![
-            "Segoe UI Variable".to_string(),
-            "Segoe UI".to_string(),
-            "Inter".to_string(),
-            "system-ui".to_string(),
-        ])),
+        fallbacks: Some(FontFallbacks::from_fonts(
+            FIG_FONT_SANS.iter().map(|family| (*family).to_string()).collect(),
+        )),
         weight: FontWeight::default(),
         style: FontStyle::default(),
     })
@@ -160,30 +255,23 @@ pub fn font_sans() -> Font {
 
 /// Monospace `Font` for chrome data — pass to `.font(...)` on a
 /// gpui element. Equivalent to applying `Fig.Font.Mono` in the C#
-/// build's XAML. The primary family is `FiraCode Nerd Font Mono`,
-/// which is the same family the embedded terminal lists as a
-/// fallback (its primary is `FiraCode Nerd Font` —
-/// non-monospace-suffix variant, see
-/// `codescope-rs/terminal/src/view.rs` `FontConfig::default`,
-/// overridable via `CODESCOPE_FONT`). Both render in the same
-/// FiraCode Nerd Font family on a typical install, so the
-/// sidebar's branch labels and the shell match visually. Cached +
-/// cloned the same way as `font_sans`.
+/// build's XAML. The preferred family is `FiraCode Nerd Font Mono`
+/// when installed; otherwise Windows machines fall back to the first
+/// available built-in mono face from the C# stack (`Cascadia Mono`,
+/// then `Cascadia Code`, then `Consolas`). Cached + cloned the same
+/// way as `font_sans`.
 pub fn font_mono() -> Font {
     static FONT: OnceLock<Font> = OnceLock::new();
     FONT.get_or_init(|| Font {
-        family: SharedString::new_static("FiraCode Nerd Font Mono"),
+        family: resolve_font_family_names(FIG_FONT_MONO)
+            .unwrap_or_else(|| SharedString::new_static("Cascadia Mono")),
         features: FontFeatures::default(),
         // Fallback chain copied verbatim (case included) from
         // `Fig.Font.Mono` — note `menlo` is intentionally lower-
         // case to match the XAML token character-for-character.
-        fallbacks: Some(FontFallbacks::from_fonts(vec![
-            "Cascadia Mono".to_string(),
-            "Cascadia Code".to_string(),
-            "Consolas".to_string(),
-            "Azeret Mono".to_string(),
-            "menlo".to_string(),
-        ])),
+        fallbacks: Some(FontFallbacks::from_fonts(
+            FIG_FONT_MONO.iter().map(|family| (*family).to_string()).collect(),
+        )),
         weight: FontWeight::default(),
         style: FontStyle::default(),
     })
@@ -201,16 +289,11 @@ mod tests {
     #[test]
     fn font_sans_chain_matches_fig_font_sans() {
         let f = font_sans();
-        assert_eq!(f.family.as_ref(), "Segoe UI Variable Display");
+        assert!(FIG_FONT_SANS.contains(&f.family.as_ref()));
         let fallbacks = f.fallbacks.expect("sans fallbacks present");
         assert_eq!(
             fallbacks.fallback_list(),
-            &[
-                "Segoe UI Variable".to_string(),
-                "Segoe UI".to_string(),
-                "Inter".to_string(),
-                "system-ui".to_string(),
-            ]
+            &FIG_FONT_SANS.iter().map(|family| (*family).to_string()).collect::<Vec<_>>()
         );
     }
 
@@ -221,17 +304,11 @@ mod tests {
     #[test]
     fn font_mono_chain_matches_fig_font_mono() {
         let f = font_mono();
-        assert_eq!(f.family.as_ref(), "FiraCode Nerd Font Mono");
+        assert!(FIG_FONT_MONO.contains(&f.family.as_ref()));
         let fallbacks = f.fallbacks.expect("mono fallbacks present");
         assert_eq!(
             fallbacks.fallback_list(),
-            &[
-                "Cascadia Mono".to_string(),
-                "Cascadia Code".to_string(),
-                "Consolas".to_string(),
-                "Azeret Mono".to_string(),
-                "menlo".to_string(),
-            ]
+            &FIG_FONT_MONO.iter().map(|family| (*family).to_string()).collect::<Vec<_>>()
         );
     }
 
@@ -241,6 +318,24 @@ mod tests {
     /// `FontFallbacks`' internal `Arc`: equal `as_ptr()` proves the
     /// returned slices point at the same allocation, which is only
     /// possible if both calls received the cached `Font`.
+    #[cfg(windows)]
+    #[test]
+    fn windows_font_entry_matching_handles_registry_names_without_overmatching() {
+        assert!(font_entry_matches_family(
+            "cascadia mono regular (truetype)",
+            "Cascadia Mono"
+        ));
+        assert!(font_entry_matches_family("consolas (truetype)", "Consolas"));
+        assert!(font_entry_matches_family(
+            "segoe ui variable (truetype)",
+            "Segoe UI Variable"
+        ));
+        assert!(!font_entry_matches_family(
+            "segoe ui variable (truetype)",
+            "Segoe UI"
+        ));
+    }
+
     #[test]
     fn font_helpers_share_cached_fallbacks_across_calls() {
         let a = font_sans().fallbacks.expect("sans fallbacks");
