@@ -370,3 +370,38 @@ system-wide install for other apps.
   security update to the VC runtime. The refresh script + NOTICE table
   make this a 30-second operation.
 - Velopack installer payload grows by ~709 KB.
+
+---
+
+## ADR-0018 — Rust port adds an in-app Settings dialog (forced deviation)
+
+**Date:** 2026-05-11
+**Status:** Accepted
+
+The C# build configures the equivalent fields via hand-edited `settings.json`
+(plus a handful of `App.config` entries); there is no in-product Settings UI on
+that side. The Rust port adds one — `Ctrl+,` opens a centered modal that
+surfaces the existing [`codescope_core::Settings`] fields (theme, default agent,
+font family / size / line-height, scrollback, cursor shape + blink) through
+form controls. This is a one-way deviation from the C# build: nothing about
+the on-disk schema changes, the dialog merely renders the existing struct.
+
+**Why deviate:** hand-editing JSON is a poor first-run experience and the
+Rust port has no separate `App.config` surface to fall back on. The visual
+idiom mirrors the in-app modals (`new_project_dialog.rs`,
+`new_worktree_dialog.rs`) so the chrome stays consistent.
+
+**Consequences:**
+- The Rust port ships `src/settings_dialog.rs` with no C# counterpart.
+- Saves go through [`Settings::save`] — the existing settings-file watcher
+  in `app.rs` picks up the change on its next tick, and `apply_settings`
+  is also called inline so the swap is instant.
+- The dialog can preview the theme live as the user clicks through the
+  list; Cancel discards the preview cleanly because the on-disk file is
+  untouched. Font + scrollback edits only take effect for newly-spawned
+  tabs (running terminals keep their baked-in palette / scrollback); the
+  dialog surfaces a small "Applies to new tabs only." hint to make this
+  explicit.
+- No new schema fields — anything not yet representable in `Settings`
+  (e.g. per-theme overrides for an external theme bundle) stays out of
+  reach of the dialog until the underlying struct grows the capability.
