@@ -2,11 +2,14 @@
 //!
 //! Mirrors the `agentId` strings the C# build threads through
 //! `MainViewModel.RegisterAgentTelemetry` / `BeginAgentAdoption`:
-//! `"claude"`, `"copilot"`, `"opencode"`, `"pi"`. The Rust port doesn't
-//! yet have a settings-driven agent picker (the sidebar today only
-//! offers a "New Claude session" menu row), but the dispatch surface
-//! needs an enum so the telemetry / discovery layer can fan out
-//! correctly when other agents land.
+//! `"claude"`, `"codex"`, `"copilot"`, `"opencode"`, `"pi"`. The Rust
+//! port doesn't yet have a settings-driven agent picker (the sidebar
+//! today only offers a "New Claude session" menu row), but the
+//! dispatch surface needs an enum so the telemetry / discovery layer
+//! can fan out correctly when other agents land. The [`crate::agent_registry`]
+//! module owns the richer `AgentProfile` shape (argv, icons,
+//! context-window tokens); this enum is the narrow id used by the
+//! per-agent telemetry dispatch.
 //!
 //! Detection is currently based on the auto-typed launch command
 //! recorded on each [`crate::projects::Session`]'s tab — the same
@@ -14,13 +17,17 @@
 //! Anything else (plain `pwsh`, no auto-type, an unknown agent) maps
 //! to `None`, leaving the tab telemetry-less just like a shell tab.
 
-/// One of the four supported agent backends. Names match the
+/// One of the five supported agent backends. Names match the
 /// `agentId` strings the C# `MainViewModel` branches on; keep them
 /// stable so on-disk session records (which carry `AgentId` as a
-/// plain string) round-trip cleanly between builds.
+/// plain string) round-trip cleanly between builds. Codex was added
+/// alongside the [`crate::agent_registry::AgentRegistry`] port — the
+/// telemetry/discovery layer for it is a follow-up, but the id needs
+/// to round-trip now so registry consumers can use it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AgentId {
     Claude,
+    Codex,
     Copilot,
     OpenCode,
     Pi,
@@ -32,6 +39,7 @@ impl AgentId {
     pub const fn as_str(self) -> &'static str {
         match self {
             AgentId::Claude => "claude",
+            AgentId::Codex => "codex",
             AgentId::Copilot => "copilot",
             AgentId::OpenCode => "opencode",
             AgentId::Pi => "pi",
@@ -44,6 +52,8 @@ impl AgentId {
     pub fn from_str(s: &str) -> Option<Self> {
         if s.eq_ignore_ascii_case("claude") {
             Some(AgentId::Claude)
+        } else if s.eq_ignore_ascii_case("codex") {
+            Some(AgentId::Codex)
         } else if s.eq_ignore_ascii_case("copilot") {
             Some(AgentId::Copilot)
         } else if s.eq_ignore_ascii_case("opencode") {
@@ -80,7 +90,13 @@ mod tests {
 
     #[test]
     fn from_str_round_trip() {
-        for id in [AgentId::Claude, AgentId::Copilot, AgentId::OpenCode, AgentId::Pi] {
+        for id in [
+            AgentId::Claude,
+            AgentId::Codex,
+            AgentId::Copilot,
+            AgentId::OpenCode,
+            AgentId::Pi,
+        ] {
             assert_eq!(AgentId::from_str(id.as_str()), Some(id));
         }
     }
@@ -88,6 +104,7 @@ mod tests {
     #[test]
     fn from_str_is_case_insensitive() {
         assert_eq!(AgentId::from_str("CLAUDE"), Some(AgentId::Claude));
+        assert_eq!(AgentId::from_str("Codex"), Some(AgentId::Codex));
         assert_eq!(AgentId::from_str("Copilot"), Some(AgentId::Copilot));
         assert_eq!(AgentId::from_str("OPENCODE"), Some(AgentId::OpenCode));
         assert_eq!(AgentId::from_str("Pi"), Some(AgentId::Pi));
@@ -112,6 +129,7 @@ mod tests {
     #[test]
     fn auto_type_resolves_each_agent() {
         assert_eq!(agent_id_from_auto_type(Some("claude")), Some(AgentId::Claude));
+        assert_eq!(agent_id_from_auto_type(Some("codex")), Some(AgentId::Codex));
         assert_eq!(agent_id_from_auto_type(Some("copilot")), Some(AgentId::Copilot));
         assert_eq!(agent_id_from_auto_type(Some("opencode")), Some(AgentId::OpenCode));
         assert_eq!(agent_id_from_auto_type(Some("pi")), Some(AgentId::Pi));

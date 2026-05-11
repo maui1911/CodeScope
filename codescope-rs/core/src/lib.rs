@@ -14,6 +14,7 @@
 //! `codescope-terminal`.
 
 pub mod agent;
+pub mod agent_registry;
 pub mod claude_discovery;
 pub mod claude_telemetry;
 pub mod copilot_discovery;
@@ -38,6 +39,7 @@ pub mod update_check;
 pub mod window_state;
 
 pub use agent::{AgentId, agent_id_from_auto_type};
+pub use agent_registry::{AgentProfile, AgentRegistry, built_in_defaults};
 pub use claude_discovery::{AdoptionCandidate, POLL_INTERVAL_MS as CLAUDE_DISCOVERY_POLL_MS};
 pub use claude_telemetry::{
     SessionState, TelemetrySnapshot, TranscriptTail, context_window_for_model, encode_cwd,
@@ -53,6 +55,6 @@ pub use layout::{LayoutState, RestoreTab};
 pub use paths::AppPaths;
 pub use projects::{Project, ProjectsConfig, Session, Worktree};
 pub use session::{RetentionPolicy, SessionManager, now_iso8601};
-pub use settings::{CursorSettings, FontSettings, Settings};
+pub use settings::{CursorSettings, DEFAULT_AGENT_ID, FontSettings, Settings};
 pub use theme::{Rgb, Theme, ThemePalette, builtin};
 pub use window_state::WindowState;
