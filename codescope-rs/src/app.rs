@@ -1831,15 +1831,31 @@ impl AppShell {
             }
         };
 
-        // `agent_id` → auto-type command. Only the `claude*` family
-        // round-trips today; future agent profiles can extend this
-        // map as their auto-launch verbs are added. Plain shell
-        // sessions (no agent_id) come back as plain shells.
+        // `agent_id` → auto-type command. Looks up the persisted id
+        // in `agent_registry` so non-Claude reopens
+        // (Codex / OpenCode / Copilot / Pi, plus any
+        // `settings.agents` overrides) come back with the right
+        // command instead of dropping to a plain shell. Resume args
+        // are preferred when present (`claude --resume <id>`,
+        // `pi -c`, `copilot --continue`, …) so the agent reattaches
+        // to the previous conversation; falls back to `new_session_args`
+        // when the profile has no resume verb. Plain shell sessions
+        // (no `agent_id`) come back as plain shells.
         let auto_type: Option<SharedString> = restored
             .agent_id
             .as_deref()
-            .filter(|id| id.starts_with("claude"))
-            .map(|_| "claude".into());
+            .and_then(|id| self.agent_registry.get_by_id(id))
+            .map(|profile| {
+                let resume_args = if profile.resume_args.is_empty() {
+                    profile.new_session_args.as_slice()
+                } else {
+                    profile.resume_args.as_slice()
+                };
+                let mut argv: Vec<&str> = Vec::with_capacity(1 + resume_args.len());
+                argv.push(profile.command.as_str());
+                argv.extend(resume_args.iter().map(|s| s.as_str()));
+                SharedString::from(argv.join(" "))
+            });
 
         self.spawn_tab_in(
             Some(working_directory),
