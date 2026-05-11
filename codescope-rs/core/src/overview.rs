@@ -1,0 +1,297 @@
+//! Pure-data helpers for the Overview panel.
+//!
+//! The Rust Overview view (see `codescope-rs/src/overview.rs`) shows
+//! every open + recently-closed session across every project in one
+//! grid. The on-screen sort + filter belong on the gpui side, but the
+//! row-building + sort key derivation are pure-data so they live here
+//! and ship with unit tests.
+//!
+//! Mirrors the C# `OverviewViewModel.Rebuild` flow: walk every project,
+//! enumerate live tabs (`closed_at = None`) plus closed rows
+//! (`closed_at = Some`), and surface them ordered "live first, closed
+//! sorted newest-first by `closed_at`". The C# view only renders live
+//! sessions; the Rust port surfaces closed history too because the
+//! brief explicitly asks for "open + recently-closed sessions" in one
+//! panel.
+
+use crate::projects::{Project, ProjectsConfig, Session};
+use crate::time::parse_iso8601_secs;
+
+/// Live vs. closed discriminator for an Overview row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverviewLifecycle {
+    /// `closed_at == None` — the session row is live on disk; the
+    /// runtime may or may not have a matching tab open.
+    Live,
+    /// `closed_at == Some(_)` — soft-closed session row, eligible for
+    /// reopen via [`crate::SessionManager::reopen`].
+    Closed,
+}
+
+/// One row in the Overview grid. Built from a [`Session`] + its
+/// owning [`Project`]; the gpui-side renderer joins live rows with
+/// the runtime `Tab` state (for "Focus" actions) and the telemetry
+/// tail (for tokens / duration / live state).
+#[derive(Debug, Clone)]
+pub struct OverviewRow {
+    /// Stable session id — the join key against the runtime tab list
+    /// and the closed-session reopen flow.
+    pub session_id: String,
+    /// Display name for the project that owns the session. Mirrors
+    /// C# `OverviewCardViewModel.ProjectName`.
+    pub project_name: String,
+    /// Branch label — falls back to the worktree id when `branch` is
+    /// `None`. Matches C# `WorktreeViewModel.DisplayBranch`'s shape.
+    pub branch_label: String,
+    /// Absolute path the session was opened in. Used by the renderer
+    /// to look up the matching live tab (group + tab index).
+    pub working_directory: String,
+    /// The persisted `agent_id` ("claude", "codex", "copilot",
+    /// "opencode", "pi") or `None` for plain shell sessions.
+    pub agent_id: Option<String>,
+    /// `closed_at` raw ISO 8601 string. `None` for live rows; the
+    /// renderer formats this via
+    /// [`crate::session::format_closed_at_relative`].
+    pub closed_at: Option<String>,
+    /// `last_opened` ISO 8601 string. Used as the live-row tiebreaker
+    /// in [`sort_rows`] so the newest-opened session lands at the top.
+    pub last_opened: Option<String>,
+    pub lifecycle: OverviewLifecycle,
+}
+
+impl OverviewRow {
+    fn from_session(project: &Project, session: &Session) -> Self {
+        let branch_label = session
+            .branch
+            .clone()
+            .or_else(|| session.worktree_id.clone())
+            .unwrap_or_default();
+        let lifecycle = if session.closed_at.is_some() {
+            OverviewLifecycle::Closed
+        } else {
+            OverviewLifecycle::Live
+        };
+        Self {
+            session_id: session.id.clone(),
+            project_name: project.name.clone(),
+            branch_label,
+            working_directory: session.worktree_path.clone(),
+            agent_id: session.agent_id.clone(),
+            closed_at: session.closed_at.clone(),
+            last_opened: session.last_opened.clone(),
+            lifecycle,
+        }
+    }
+}
+
+/// Build the flat row list from a [`ProjectsConfig`] snapshot,
+/// already sorted via [`sort_rows`]. Mirrors C#
+/// `OverviewViewModel.Rebuild` minus the per-card preview lines (the
+/// Rust port builds those in the gpui layer so it can fold in live
+/// telemetry without re-running this pass).
+pub fn build_rows(cfg: &ProjectsConfig) -> Vec<OverviewRow> {
+    let mut rows: Vec<OverviewRow> = cfg
+        .projects
+        .iter()
+        .flat_map(|p| p.sessions.iter().map(move |s| OverviewRow::from_session(p, s)))
+        .collect();
+    sort_rows(&mut rows);
+    rows
+}
+
+/// Sort an Overview row list in display order:
+///
+/// 1. Live rows first (live before closed),
+/// 2. within live: newest `last_opened` first (missing values sort last),
+/// 3. within closed: newest `closed_at` first (matches
+///    [`crate::SessionManager::closed`]).
+///
+/// Mirrors the visual reading order of the C# Overview's
+/// `FilteredCards` — active sessions read top-to-bottom, closed
+/// history trails below.
+pub fn sort_rows(rows: &mut [OverviewRow]) {
+    rows.sort_by(|a, b| {
+        match (a.lifecycle, b.lifecycle) {
+            (OverviewLifecycle::Live, OverviewLifecycle::Closed) => std::cmp::Ordering::Less,
+            (OverviewLifecycle::Closed, OverviewLifecycle::Live) => std::cmp::Ordering::Greater,
+            (OverviewLifecycle::Live, OverviewLifecycle::Live) => {
+                // Newest last_opened first; missing values sort last
+                // (treated as "really old") so a freshly-spawned tab
+                // without a stamped `last_opened` doesn't accidentally
+                // outrank a recently-opened row.
+                let ka = a.last_opened.as_deref().and_then(parse_iso8601_secs);
+                let kb = b.last_opened.as_deref().and_then(parse_iso8601_secs);
+                cmp_desc_with_none_last(ka, kb)
+            }
+            (OverviewLifecycle::Closed, OverviewLifecycle::Closed) => {
+                let ka = a.closed_at.as_deref().and_then(parse_iso8601_secs);
+                let kb = b.closed_at.as_deref().and_then(parse_iso8601_secs);
+                cmp_desc_with_none_last(ka, kb)
+            }
+        }
+    });
+}
+
+/// Compare two `Option<f64>` keys with "newer first" semantics
+/// (descending) where `None` sorts *last* rather than the
+/// `partial_cmp` default of "None < Some". Without this any row
+/// missing the key would float to the top and bury rows with real
+/// timestamps.
+fn cmp_desc_with_none_last(a: Option<f64>, b: Option<f64>) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(ka), Some(kb)) => kb.partial_cmp(&ka).unwrap_or(std::cmp::Ordering::Equal),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::projects::{Project, Session, Worktree};
+
+    fn mk_project(id: &str, name: &str, sessions: Vec<Session>) -> Project {
+        Project {
+            id: id.into(),
+            name: name.into(),
+            path: format!("C:\\dev\\{name}"),
+            default_branch: "main".into(),
+            worktree_root: None,
+            default_agent_id: None,
+            sessions,
+            worktrees: vec![Worktree {
+                id: "primary".into(),
+                path: format!("C:\\dev\\{name}"),
+                branch: None,
+                is_primary: true,
+            }],
+        }
+    }
+
+    fn mk_session(id: &str, last_opened: Option<&str>, closed_at: Option<&str>) -> Session {
+        Session {
+            id: id.into(),
+            worktree_path: "C:\\dev\\demo".into(),
+            branch: Some("main".into()),
+            agent_id: Some("claude".into()),
+            display_name: None,
+            worktree_id: Some("primary".into()),
+            last_opened: last_opened.map(|s| s.to_string()),
+            agent_session_id: None,
+            closed_at: closed_at.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn build_rows_flattens_every_project() {
+        let cfg = ProjectsConfig {
+            version: 1,
+            agents: vec![],
+            projects: vec![
+                mk_project("p1", "alpha", vec![mk_session("s1", Some("2026-05-11T12:00:00Z"), None)]),
+                mk_project("p2", "beta", vec![mk_session("s2", Some("2026-05-11T11:00:00Z"), None)]),
+            ],
+        };
+
+        let rows = build_rows(&cfg);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].project_name, "alpha"); // newer last_opened
+        assert_eq!(rows[1].project_name, "beta");
+    }
+
+    #[test]
+    fn live_rows_sort_before_closed_rows() {
+        let cfg = ProjectsConfig {
+            version: 1,
+            agents: vec![],
+            projects: vec![mk_project(
+                "p1",
+                "alpha",
+                vec![
+                    // closed but recent
+                    mk_session("closed_recent", None, Some("2026-05-11T12:30:00Z")),
+                    // live but stale
+                    mk_session("live_old", Some("2026-05-01T08:00:00Z"), None),
+                ],
+            )],
+        };
+
+        let rows = build_rows(&cfg);
+        assert_eq!(rows[0].session_id, "live_old"); // live always before closed
+        assert_eq!(rows[0].lifecycle, OverviewLifecycle::Live);
+        assert_eq!(rows[1].session_id, "closed_recent");
+        assert_eq!(rows[1].lifecycle, OverviewLifecycle::Closed);
+    }
+
+    #[test]
+    fn closed_rows_sort_newest_first() {
+        let cfg = ProjectsConfig {
+            version: 1,
+            agents: vec![],
+            projects: vec![mk_project(
+                "p1",
+                "alpha",
+                vec![
+                    mk_session("oldest", None, Some("2026-05-09T09:00:00Z")),
+                    mk_session("newest", None, Some("2026-05-11T09:00:00Z")),
+                    mk_session("middle", None, Some("2026-05-10T09:00:00Z")),
+                ],
+            )],
+        };
+
+        let rows = build_rows(&cfg);
+        assert_eq!(rows[0].session_id, "newest");
+        assert_eq!(rows[1].session_id, "middle");
+        assert_eq!(rows[2].session_id, "oldest");
+    }
+
+    #[test]
+    fn missing_last_opened_sorts_after_real_timestamps() {
+        let cfg = ProjectsConfig {
+            version: 1,
+            agents: vec![],
+            projects: vec![mk_project(
+                "p1",
+                "alpha",
+                vec![
+                    mk_session("no_ts", None, None),
+                    mk_session("with_ts", Some("2026-05-11T10:00:00Z"), None),
+                ],
+            )],
+        };
+
+        let rows = build_rows(&cfg);
+        assert_eq!(rows[0].session_id, "with_ts");
+        assert_eq!(rows[1].session_id, "no_ts");
+    }
+
+    #[test]
+    fn branch_label_falls_back_to_worktree_id() {
+        let mut s = mk_session("s1", None, None);
+        s.branch = None;
+        let cfg = ProjectsConfig {
+            version: 1,
+            agents: vec![],
+            projects: vec![mk_project("p1", "alpha", vec![s])],
+        };
+
+        let rows = build_rows(&cfg);
+        assert_eq!(rows[0].branch_label, "primary");
+    }
+
+    #[test]
+    fn lifecycle_derives_from_closed_at() {
+        let live = OverviewRow::from_session(
+            &mk_project("p1", "a", vec![]),
+            &mk_session("s1", None, None),
+        );
+        assert_eq!(live.lifecycle, OverviewLifecycle::Live);
+
+        let closed = OverviewRow::from_session(
+            &mk_project("p1", "a", vec![]),
+            &mk_session("s2", None, Some("2026-05-11T10:00:00Z")),
+        );
+        assert_eq!(closed.lifecycle, OverviewLifecycle::Closed);
+    }
+}

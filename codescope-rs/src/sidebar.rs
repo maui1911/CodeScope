@@ -32,6 +32,7 @@ use std::time::Duration;
 use codescope_core::{AppPaths, LayoutState, Project, ProjectsConfig, Theme};
 use codescope_core::git::GitStatus;
 use codescope_core::pr::{CiStatus, PullRequestInfo};
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
     Animation, AnimationExt, AppContext, ClipboardItem, Context, Corner, EventEmitter,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point,
@@ -357,6 +358,13 @@ pub struct Sidebar {
     /// the C# `WorktreeViewModel.HasActiveSession` boolean — same
     /// 2 px rail trigger on the sidebar row chrome.
     active_paths: HashSet<String>,
+    /// Whether the Overview panel is currently on stage. Pushed by
+    /// `AppShell::set_show_overview`; drives the footer "Overview"
+    /// button's active look (accent rail + accent foreground) so the
+    /// user can see at a glance which mode the workspace is in.
+    /// Mirrors the C# `Sidebar.OverviewButton`'s `IsOverviewVisible`
+    /// DataTrigger.
+    overview_visible: bool,
 }
 
 impl Sidebar {
@@ -409,7 +417,21 @@ impl Sidebar {
             expanded_worktrees: HashSet::new(),
             busy_paths: HashSet::new(),
             active_paths: HashSet::new(),
+            overview_visible: false,
         }
+    }
+
+    /// Push the current Overview-panel visibility into the sidebar so
+    /// the footer "Overview" button renders the right active look.
+    /// Called by `AppShell::set_show_overview` so the indicator stays
+    /// in lockstep with the panel state. No-op when the flag is
+    /// unchanged so we don't notify on idle ticks.
+    pub fn set_overview_visible(&mut self, value: bool, cx: &mut Context<Self>) {
+        if self.overview_visible == value {
+            return;
+        }
+        self.overview_visible = value;
+        cx.notify();
     }
 
     /// Refresh the per-path agent activity snapshot used to colour
@@ -2611,13 +2633,13 @@ impl Render for Sidebar {
 
             // Overview button — 36 px tall, dim text, mono ⌃⇧O keycap
             // on the right inside a 1 px outlined pill. Mirrors
-            // `Sidebar.OverviewButton` in `SidebarView.xaml`. The
-            // active state (Overview view visible) isn't represented
-            // here yet because the Rust port has no Overview view to
-            // be active in — once the view lands, swap the bg/text/
-            // rail to the same active palette the C# DataTrigger uses
-            // (`Surface.AccentRowBg` + `Accent.Primary` foreground +
-            // 2 px accent rail on the left edge).
+            // `Sidebar.OverviewButton` in `SidebarView.xaml`. When the
+            // Overview panel is on stage (`overview_visible == true`)
+            // the row picks up the accent palette (accent foreground,
+            // 2 px accent rail on the left edge) — same DataTrigger
+            // the C# `IsOverviewVisible` binding fires for the WPF
+            // button.
+            let overview_active = self.overview_visible;
             let overview_btn = div()
                 .id("sidebar-footer-overview")
                 .h(px(36.0))
@@ -2627,8 +2649,13 @@ impl Render for Sidebar {
                 .items_center()
                 .rounded(px(6.0))
                 .bg(elev)
-                .text_color(ink_dim)
                 .text_size(px(12.0))
+                .when(overview_active, |s| {
+                    s.border_l_2()
+                        .border_color(accent)
+                        .text_color(accent)
+                })
+                .when(!overview_active, |s| s.text_color(ink_dim))
                 .cursor_pointer()
                 .hover(move |s| s.bg(frost_hover).text_color(ink_hover))
                 .on_mouse_down(
