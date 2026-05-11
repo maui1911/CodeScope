@@ -293,4 +293,35 @@ mod tests {
         std::fs::write(&path, "{ invalid").unwrap();
         assert!(Settings::load_from(&path).is_err());
     }
+
+    /// Sanity check that the full surface area the Settings dialog
+    /// can edit (theme, font family + size + line-height, scrollback,
+    /// cursor shape + blink, default agent) all round-trips through
+    /// serde. Catches accidental schema breaks if any of the fields
+    /// ever swaps serde shape under the dialog.
+    #[test]
+    fn full_dialog_surface_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut settings = Settings::default();
+        settings.theme = "tokyo-night".into();
+        settings.font.family = "JetBrains Mono".into();
+        settings.font.size = 15.0;
+        settings.font.line_height_multiplier = 1.2;
+        settings.scrollback = 25_000;
+        settings.cursor.shape = "underline".into();
+        settings.cursor.blinking = false;
+        settings.default_agent = "codex".into();
+        settings.save_to(&path).unwrap();
+
+        let loaded = Settings::load_from(&path).unwrap();
+        assert_eq!(loaded.theme, "tokyo-night");
+        assert_eq!(loaded.font.family, "JetBrains Mono");
+        assert_eq!(loaded.font.size, 15.0);
+        assert_eq!(loaded.font.line_height_multiplier, 1.2);
+        assert_eq!(loaded.scrollback, 25_000);
+        assert_eq!(loaded.cursor.shape, "underline");
+        assert!(!loaded.cursor.blinking);
+        assert_eq!(loaded.default_agent, "codex");
+    }
 }

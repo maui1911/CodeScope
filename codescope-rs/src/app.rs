@@ -582,6 +582,12 @@ pub struct AppShell {
     /// shortcut, and the in-panel "← Back to workspace" link.
     /// Mirrors C# `MainViewModel.IsOverviewVisible`.
     show_overview: bool,
+    /// Open Settings dialog, if any. Surfaces `settings.json` fields
+    /// via a centered modal — the Rust port's replacement for the C#
+    /// build's hand-edit-the-file workflow. See ADR-0018. Visible
+    /// fields mirror exactly what's in [`codescope_core::Settings`];
+    /// no schema additions.
+    pub(crate) settings_dialog: Option<crate::settings_dialog::SettingsDialogState>,
 }
 
 impl AppShell {
@@ -915,6 +921,7 @@ impl AppShell {
             projects: projects_for_sessions,
             agent_registry,
             show_overview: false,
+            settings_dialog: None,
         };
         shell.start_telemetry_poll(cx);
         shell.start_agent_discovery_poll(cx);
@@ -1894,7 +1901,7 @@ impl AppShell {
     /// Live-reapplying palette / font to running terminals lands
     /// when the renderer exposes that knob — until then a settings
     /// edit fully takes over only after the next Ctrl+Shift+T.
-    fn apply_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
+    pub(crate) fn apply_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
         let theme = Arc::new(codescope_core::theme::builtin::by_name(&settings.theme));
         self.settings = Arc::new(settings);
         self.theme = theme.clone();
@@ -1902,6 +1909,35 @@ impl AppShell {
             sidebar.apply_theme(theme, cx);
         });
         cx.notify();
+    }
+
+    /// Swap the active theme for live preview without touching the
+    /// `Settings` on disk or in memory. Used by the Settings dialog
+    /// as the user clicks through the theme list — gives them a
+    /// real-time look at each theme before committing via Save.
+    /// Cancel explicitly reapplies the snapshot taken at open-time
+    /// (see `cancel_settings_dialog`); the file-watch poller cannot
+    /// undo the preview by itself because `settings.json` is never
+    /// touched during a preview.
+    pub(crate) fn set_theme_preview(&mut self, theme: Arc<Theme>, cx: &mut Context<Self>) {
+        self.theme = theme.clone();
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.apply_theme(theme, cx);
+        });
+        cx.notify();
+    }
+
+    /// Read-only borrow of the on-disk path bundle. Used by the
+    /// Settings dialog to write `settings.json`.
+    pub(crate) fn paths_ref(&self) -> &Arc<AppPaths> {
+        &self.paths
+    }
+
+    /// Read-only borrow of the current `Settings`. Used by the
+    /// Settings dialog to seed its draft from the live in-memory
+    /// state.
+    pub(crate) fn settings_ref(&self) -> &Arc<Settings> {
+        &self.settings
     }
 
     /// Open a fresh shell session and append it as a new tab. The new
@@ -3869,6 +3905,14 @@ impl AppShell {
         // word-shortcuts, so power users typing in readline /
         // PSReadLine can still hit the chord without rebinding.
         match key {
+            // Ctrl+, opens the Settings dialog. Windows convention,
+            // also the VS Code binding. The Rust port adds an
+            // in-app Settings UI (the C# build hand-edits
+            // `settings.json`); see ADR-0018.
+            "," => {
+                cx.stop_propagation();
+                self.open_settings_dialog(window, cx);
+            }
             "t" => {
                 cx.stop_propagation();
                 self.spawn_tab(window, cx);
@@ -3950,7 +3994,7 @@ impl Focusable for AppShell {
 impl Render for AppShell {
     fn render(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme.clone();
@@ -4540,6 +4584,7 @@ impl Render for AppShell {
             .children(self.render_tab_menu(&theme, cx))
             .children(self.render_toasts(&theme, cx))
             .children(self.render_notifications_popover(&theme, cx))
+            .children(self.render_settings_dialog(window, &theme, cx))
     }
 }
 
