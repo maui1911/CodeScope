@@ -9,6 +9,34 @@
 >
 > **The Rust port (`codescope-rs/`) is a 1:1 functional port of the C# CodeScope build (`src/CodeScope.App/`, `src/CodeScope.Core/`, `src/CodeScope.AgentCli/`).** Before implementing any feature on the Rust side, **read the equivalent C# code first** and mirror its behavior, button labels, dialogs, data shapes, and persistence layout. Functional parity is the goal — we are not redesigning. If a `HANDOFF.md` entry, README line, or "next entry point" disagrees with what the C# code actually does, the C# code wins; update the doc. Genuine platform-forced deviations (gpui vs WPF idiom) get a one-line comment and an entry in `docs/DECISIONS.md`. "Cleaner" or "more elegant" is not a reason on its own. (Reinforced in session 33 after PR #56 invented a non-existent UX.)
 
+**Last updated:** 2026-05-11 (sidebar agent-state dots — parity with C#)
+
+### Sidebar agent-state dots (this session)
+
+`feat/rs/sidebar-agent-state-dots` ports the C# `WorktreeViewModel.DotState`
+/ `HasBusyChild` semantics into `codescope-rs/src/sidebar.rs` so the
+6 px worktree dot tracks adopted agent activity (busy → red + pulsing
+halo, idle → green, rest → dim grey) instead of clean/dirty git
+state — dirty information already lives in the right-aligned `chg`
+slug. Collapsed projects now show a small `Signal.Warn` propagation
+dot next to the row when any child worktree's session is busy
+(C# `ProjectViewModel.HasBusyChild`). Worktree rows render the
+2 px accent rail on the left edge when at least one live session is
+pinned to that path (C# `HasActiveSession`). The pulsing halo runs
+via `gpui::AnimationExt::with_animation` on a 1.4 s repeat — opacity-
+only (no scale transform on `div` yet) but visually reads as the
+spec'd red bloom. Plumbing: `Sidebar::set_session_paths(busy,
+active, cx)` is pushed from `AppShell::start_telemetry_poll` after
+every tail poll; cheap diff guards a notify so the 250 ms busy
+cadence doesn't redraw on every tick. Path comparison uses a new
+`codescope_core::path_canon::paths_match` (4 unit tests added).
+
+**Sidebar filter input — deferred.** The Rust sidebar has no filter
+text-box equivalent to the C# `SidebarView` filter. Skipped for this
+PR per its scope; pick this up next.
+
+### Older entry
+
 **Last updated:** 2026-05-10 (session 37 — status bar wired + sidebar parity sweep)
 **Branch:** `main` (PRs #98–#101 merged; #102 + #103 in flight pending review)
 **Head:** main, in sync with origin

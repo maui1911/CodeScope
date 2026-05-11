@@ -15,6 +15,20 @@
 //! assert_eq!(canonicalize_path("c:/dev/codescope"),  "c/dev/codescope");
 //! ```
 
+/// Compare two paths for logical equivalence — same on-disk location
+/// even when one form uses backslashes / lower case / a `/c/...`
+/// MSYS-style mount and the other a Windows drive letter. Cheap
+/// wrapper over [`canonicalize_path`] so callers (sidebar busy-state
+/// lookup, session-restore matching) don't have to do the canonicalise
+/// dance inline. Returns `false` when either input is empty so a
+/// missing working-directory never collides with another missing one.
+pub fn paths_match(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    canonicalize_path(a) == canonicalize_path(b)
+}
+
 /// Canonicalise a path for cross-platform comparison: lowercase,
 /// forward-slashes, drive-colon stripped, trimmed leading and trailing
 /// slashes. Mirrors C# `PiSessionDiscovery.CanonicalizePath`.
@@ -55,5 +69,27 @@ mod tests {
     #[test]
     fn case_insensitive() {
         assert_eq!(canonicalize_path("C:/Dev/CodeScope"), "c/dev/codescope");
+    }
+
+    #[test]
+    fn paths_match_collapses_slash_direction_and_case() {
+        assert!(paths_match("C:\\dev\\codescope", "c:/dev/codescope"));
+        assert!(paths_match("C:/Dev/CodeScope", "/c/dev/codescope"));
+        assert!(paths_match("C:/dev/codescope/", "c:/dev/codescope"));
+    }
+
+    #[test]
+    fn paths_match_rejects_distinct_paths() {
+        assert!(!paths_match("C:/dev/codescope", "C:/dev/other"));
+    }
+
+    #[test]
+    fn paths_match_empty_inputs_never_collide() {
+        // Two missing working-directories shouldn't be treated as the
+        // "same path" — bug-prone for callers iterating tabs/sessions
+        // looking for matches by working dir.
+        assert!(!paths_match("", ""));
+        assert!(!paths_match("", "C:/dev/codescope"));
+        assert!(!paths_match("C:/dev/codescope", ""));
     }
 }

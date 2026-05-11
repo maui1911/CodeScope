@@ -37,7 +37,7 @@
 //! thread. When the last tab in a non-only group is closed the group
 //! itself collapses (mirroring `MainViewModel.CloseGroup`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -1068,8 +1068,13 @@ impl AppShell {
                 if this.upgrade().is_none() {
                     break;
                 }
-                let result = this.update(cx, |this, _cx| {
+                let result = this.update(cx, |this, cx| {
                     if this.telemetry_tails.is_empty() {
+                        // Even with zero tails, the sidebar might
+                        // still be holding stale busy/active sets
+                        // from a session that just closed. Push
+                        // empties so the dots fade back to `rest`.
+                        this.push_sidebar_session_paths(cx);
                         return Duration::from_secs(30);
                     }
                     let mut any_busy = false;
@@ -1083,6 +1088,16 @@ impl AppShell {
                             any_busy = true;
                         }
                     }
+                    // After every poll, recompute the per-path
+                    // active/busy snapshot the sidebar uses to colour
+                    // its worktree dots and propagate "agent busy" up
+                    // to a collapsed project row. Cheap — one map
+                    // lookup per tab; the sidebar `set_session_paths`
+                    // call short-circuits with no notify when nothing
+                    // changed, so a 250 ms busy cadence doesn't drive
+                    // a redraw every tick unless a tab actually
+                    // flipped state.
+                    this.push_sidebar_session_paths(cx);
                     if any_busy {
                         Duration::from_millis(250)
                     } else {
@@ -3305,6 +3320,57 @@ impl AppShell {
             }
         }
         bar
+    }
+
+    /// Recompute the per-path "has an active session" / "has a busy
+    /// session" snapshot and push it into the sidebar so worktree
+    /// rows can colour their state dot (rest/idle/busy) and project
+    /// rows can show the red propagation dot. Paths are canonicalised
+    /// via `path_canon::canonicalize_path` so a tab's
+    /// `working_directory` matches the projects.json worktree path
+    /// regardless of slash direction / case / drive-colon spelling
+    /// (Windows users routinely mix `C:\dev` and `c:/dev`).
+    ///
+    /// Mirrors the implicit data flow C# gets from
+    /// `WorktreeViewModel`'s subscription to its child
+    /// `SessionTabViewModel.Status` changes — without observable
+    /// bindings on the Rust side, this method is the explicit "tick
+    /// the sidebar's session-state cache" hook called from
+    /// `start_telemetry_poll`. Sidebar `set_session_paths` is a no-op
+    /// when neither set changed, so this is cheap to call every poll.
+    fn push_sidebar_session_paths(&self, cx: &mut Context<Self>) {
+        let mut busy: HashSet<String> = HashSet::new();
+        let mut active: HashSet<String> = HashSet::new();
+        for group in &self.groups {
+            for tab in &group.tabs {
+                let Some(ref wd) = tab.working_directory else { continue };
+                let Some(sid) = tab.adopted_session_id.as_deref() else { continue };
+                let canon = codescope_core::path_canon::canonicalize_path(
+                    &wd.to_string_lossy(),
+                );
+                if canon.is_empty() {
+                    continue;
+                }
+                // Every tab with an adopted session counts as
+                // "active" for that path — the C# `HasActiveSession`
+                // bool is just `Sessions.Count > 0`. Busy is the
+                // subset whose telemetry state is `Busy` or
+                // `PendingToolUse`.
+                active.insert(canon.clone());
+                if let Some(snap) = self.telemetry_for(sid) {
+                    if matches!(
+                        snap.state,
+                        codescope_core::SessionState::Busy
+                            | codescope_core::SessionState::PendingToolUse
+                    ) {
+                        busy.insert(canon);
+                    }
+                }
+            }
+        }
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_session_paths(busy, active, cx);
+        });
     }
 
     /// Walk every tab across every group and count adopted agent
