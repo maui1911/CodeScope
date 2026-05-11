@@ -55,6 +55,14 @@ pub struct SettingsDialogState {
     pub font_size_text: String,
     pub line_height_text: String,
     pub scrollback_text: String,
+    /// Snapshot of the on-disk settings + theme captured at the moment
+    /// the dialog opened. The dialog mutates [`AppShell::theme`]
+    /// directly for live preview as the user clicks through the theme
+    /// list; on Cancel we hand `original_settings` back to
+    /// `apply_settings` so the in-memory state matches disk again
+    /// (the file-watch poller would not catch this because the file
+    /// itself is never touched during a preview).
+    pub original_settings: Settings,
     /// Inline validation error, rendered above the footer. Cleared on
     /// any user edit.
     pub error: Option<String>,
@@ -69,6 +77,7 @@ impl SettingsDialogState {
             line_height_text: format_f32(settings.font.line_height_multiplier),
             scrollback_text: settings.scrollback.to_string(),
             draft: settings.clone(),
+            original_settings: settings.clone(),
             error: None,
         }
     }
@@ -76,32 +85,15 @@ impl SettingsDialogState {
     /// Parse the text buffers back into the draft `Settings`. Returns
     /// `Ok(())` and updates `draft` on success; returns the first
     /// validation error on failure so the caller can render it
-    /// inline.
+    /// inline. Delegates to [`parse_numeric_fields`] so both the
+    /// runtime path and the unit tests share the exact same
+    /// validation rules.
     pub fn commit_text_buffers(&mut self) -> Result<(), String> {
-        let size: f32 = self
-            .font_size_text
-            .trim()
-            .parse()
-            .map_err(|_| "Font size must be a number between 8 and 24.".to_string())?;
-        if !(8.0..=24.0).contains(&size) {
-            return Err("Font size must be between 8 and 24.".into());
-        }
-        let line: f32 = self
-            .line_height_text
-            .trim()
-            .parse()
-            .map_err(|_| "Line height must be a number between 0.9 and 1.5.".to_string())?;
-        if !(0.9..=1.5).contains(&line) {
-            return Err("Line height must be between 0.9 and 1.5.".into());
-        }
-        let scrollback: usize = self
-            .scrollback_text
-            .trim()
-            .parse()
-            .map_err(|_| "Scrollback must be a whole number between 1000 and 100000.".to_string())?;
-        if !(1_000..=100_000).contains(&scrollback) {
-            return Err("Scrollback must be between 1000 and 100000.".into());
-        }
+        let (size, line, scrollback) = parse_numeric_fields(
+            &self.font_size_text,
+            &self.line_height_text,
+            &self.scrollback_text,
+        )?;
         self.draft.font.size = size;
         self.draft.font.line_height_multiplier = line;
         self.draft.scrollback = scrollback;
@@ -153,6 +145,53 @@ impl SettingsDialogState {
     }
 }
 
+/// Pure validation helper for the three numeric input buffers
+/// (font size, line-height multiplier, scrollback). Returns the
+/// parsed triple on success, or the first user-facing error message
+/// on failure. Pulled out as a free function so [`commit_text_buffers`]
+/// and the unit tests exercise the exact same code path — the
+/// previous arrangement had a parallel `test_commit` shim that could
+/// silently drift from production.
+fn parse_numeric_fields(
+    font_size_text: &str,
+    line_height_text: &str,
+    scrollback_text: &str,
+) -> Result<(f32, f32, usize), String> {
+    let size: f32 = font_size_text
+        .trim()
+        .parse()
+        .map_err(|_| "Font size must be a number between 8 and 24.".to_string())?;
+    if !(8.0..=24.0).contains(&size) {
+        return Err("Font size must be between 8 and 24.".into());
+    }
+    let line: f32 = line_height_text
+        .trim()
+        .parse()
+        .map_err(|_| "Line height must be a number between 0.9 and 1.5.".to_string())?;
+    if !(0.9..=1.5).contains(&line) {
+        return Err("Line height must be between 0.9 and 1.5.".into());
+    }
+    let scrollback: usize = scrollback_text
+        .trim()
+        .parse()
+        .map_err(|_| "Scrollback must be a whole number between 1000 and 100000.".to_string())?;
+    if !(1_000..=100_000).contains(&scrollback) {
+        return Err("Scrollback must be between 1000 and 100000.".into());
+    }
+    Ok((size, line, scrollback))
+}
+
+/// Hash a string id seed to a `u64` for use in gpui's `(static_str,
+/// u64)` element ids. Mirrors the helper in `sidebar.rs` — keeping
+/// each dialog file's id seeds collision-resistant prevents gpui
+/// from confusing distinct rows that happen to share a byte-sum.
+fn id_hash(id: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Format an `f32` for the text buffer: trim trailing zeros so `13.0`
 /// renders as `13` (less noisy in the input), `1.25` stays `1.25`.
 fn format_f32(value: f32) -> String {
@@ -191,9 +230,20 @@ impl AppShell {
         cx.notify();
     }
 
-    /// Close the dialog without saving.
+    /// Close the dialog without saving. If a live theme preview is
+    /// in-flight (i.e. the user clicked through the theme list before
+    /// hitting Cancel), restore the chrome to the on-disk settings —
+    /// `settings.json` is never touched during a preview, so the
+    /// file-watch poller would otherwise leave the preview-theme
+    /// pinned until the next real edit.
     pub fn cancel_settings_dialog(&mut self, cx: &mut Context<Self>) {
-        if self.settings_dialog.take().is_some() {
+        let Some(state) = self.settings_dialog.take() else { return };
+        // Reapply the original on-disk settings to revert any live
+        // theme preview cleanly. `apply_settings` only swaps
+        // in-memory state, so this is cheap and side-effect free.
+        if state.original_settings.theme != self.settings_ref().theme {
+            self.apply_settings(state.original_settings, cx);
+        } else {
             cx.notify();
         }
     }
@@ -352,7 +402,7 @@ impl AppShell {
             let row_fg = if is_selected { canvas } else { ink };
             let row_label: SharedString = built_in.display_name.clone().into();
             let row = div()
-                .id(("settings-theme-row", built_in.name.len() as u64 + built_in.name.bytes().fold(0u64, |a, b| a.wrapping_add(b as u64))))
+                .id(("settings-theme-row", id_hash(&built_in.name)))
                 .px_3()
                 .py_2()
                 .rounded(px(6.0))
@@ -381,9 +431,8 @@ impl AppShell {
             let row_bg = if is_selected { accent } else { canvas };
             let row_fg = if is_selected { canvas } else { ink };
             let display: SharedString = profile.display_name.clone().into();
-            let id_seed = profile.id.bytes().fold(1u64, |a, b| a.wrapping_add(b as u64));
             let row = div()
-                .id(("settings-agent-row", id_seed))
+                .id(("settings-agent-row", id_hash(&profile.id)))
                 .px_3()
                 .py_2()
                 .rounded(px(6.0))
@@ -783,56 +832,83 @@ fn handle_key_down(
 mod tests {
     use super::*;
 
+    // `SettingsDialogState` holds a `FocusHandle` and so can't be
+    // constructed outside a gpui app, but the validation rules live
+    // in the free function `parse_numeric_fields` — the runtime
+    // `commit_text_buffers` and the tests below both call it, so a
+    // change to the rules can never silently desync the two.
+
     #[test]
-    fn commit_text_buffers_round_trips_valid_values() {
-        let mut s = Settings::default();
-        s.font.size = 14.0;
-        s.font.line_height_multiplier = 1.1;
-        s.scrollback = 20_000;
-        // Construct without a real FocusHandle — can't easily; build
-        // the helper manually instead.
-        let mut state = SettingsDialogStateForTest {
-            font_size_text: "15".into(),
-            line_height_text: "1.2".into(),
-            scrollback_text: "30000".into(),
-        };
-        let result = test_commit(&mut state);
-        assert!(result.is_ok(), "{result:?}");
-        assert_eq!(state.font_size_text.as_str(), "15");
+    fn parse_numeric_fields_accepts_valid_values() {
+        let (size, line, scrollback) =
+            parse_numeric_fields("15", "1.2", "30000").expect("valid");
+        assert_eq!(size, 15.0);
+        assert_eq!(line, 1.2);
+        assert_eq!(scrollback, 30_000);
     }
 
     #[test]
-    fn commit_text_buffers_rejects_out_of_range() {
-        let mut state = SettingsDialogStateForTest {
-            font_size_text: "100".into(),
-            line_height_text: "1.0".into(),
-            scrollback_text: "10000".into(),
-        };
-        assert!(test_commit(&mut state).is_err());
-
-        let mut state = SettingsDialogStateForTest {
-            font_size_text: "13".into(),
-            line_height_text: "2.0".into(),
-            scrollback_text: "10000".into(),
-        };
-        assert!(test_commit(&mut state).is_err());
-
-        let mut state = SettingsDialogStateForTest {
-            font_size_text: "13".into(),
-            line_height_text: "1.0".into(),
-            scrollback_text: "999".into(),
-        };
-        assert!(test_commit(&mut state).is_err());
+    fn parse_numeric_fields_accepts_decimal_font_size_within_range() {
+        let (size, _, _) =
+            parse_numeric_fields("12.5", "1.0", "10000").expect("12.5 is in [8,24]");
+        assert_eq!(size, 12.5);
     }
 
     #[test]
-    fn commit_text_buffers_rejects_garbage() {
-        let mut state = SettingsDialogStateForTest {
-            font_size_text: "thirteen".into(),
-            line_height_text: "1.0".into(),
-            scrollback_text: "10000".into(),
-        };
-        assert!(test_commit(&mut state).is_err());
+    fn parse_numeric_fields_rejects_font_size_out_of_range() {
+        assert!(parse_numeric_fields("100", "1.0", "10000").is_err());
+        assert!(parse_numeric_fields("7", "1.0", "10000").is_err());
+    }
+
+    #[test]
+    fn parse_numeric_fields_rejects_line_height_out_of_range() {
+        assert!(parse_numeric_fields("13", "2.0", "10000").is_err());
+        assert!(parse_numeric_fields("13", "0.5", "10000").is_err());
+    }
+
+    #[test]
+    fn parse_numeric_fields_rejects_scrollback_out_of_range() {
+        assert!(parse_numeric_fields("13", "1.0", "999").is_err());
+        assert!(parse_numeric_fields("13", "1.0", "100001").is_err());
+    }
+
+    #[test]
+    fn parse_numeric_fields_rejects_garbage() {
+        assert!(parse_numeric_fields("thirteen", "1.0", "10000").is_err());
+        assert!(parse_numeric_fields("13", "abc", "10000").is_err());
+        assert!(parse_numeric_fields("13", "1.0", "lots").is_err());
+    }
+
+    #[test]
+    fn parse_numeric_fields_messages_are_user_facing() {
+        // Spot-check that the error strings are the ones the dialog
+        // actually shows — if these drift, the dialog's inline error
+        // would show a stale message.
+        let err = parse_numeric_fields("100", "1.0", "10000").unwrap_err();
+        assert!(err.contains("Font size"), "{err}");
+        let err = parse_numeric_fields("13", "2.0", "10000").unwrap_err();
+        assert!(err.contains("Line height"), "{err}");
+        let err = parse_numeric_fields("13", "1.0", "999").unwrap_err();
+        assert!(err.contains("Scrollback"), "{err}");
+    }
+
+    #[test]
+    fn id_hash_distinguishes_different_strings() {
+        // Byte-sum hashing would collide on "ab" / "ba"; the real
+        // `DefaultHasher` does not. This guards the dialog from row-
+        // confusion glitches if a future theme / agent id happens to
+        // share characters with an existing one.
+        assert_ne!(id_hash("ab"), id_hash("ba"));
+        assert_ne!(id_hash("claude"), id_hash("codex"));
+        assert_ne!(id_hash("one-dark"), id_hash("tokyo-night"));
+    }
+
+    #[test]
+    fn id_hash_is_stable_for_same_input() {
+        // Two calls with the same input must return the same hash in
+        // the same process — gpui ties element identity to it across
+        // frames.
+        assert_eq!(id_hash("codescope-default"), id_hash("codescope-default"));
     }
 
     #[test]
@@ -841,48 +917,5 @@ mod tests {
         assert_eq!(format_f32(1.0), "1");
         assert_eq!(format_f32(1.25), "1.25");
         assert_eq!(format_f32(1.5), "1.5");
-    }
-
-    // ─── Mini-state harness ─────────────────────────────────────────
-    //
-    // `SettingsDialogState` holds a `FocusHandle`, which can't be
-    // constructed outside a gpui app. We mirror the commit logic on a
-    // minimal POD so the validation rules can still be unit-tested.
-
-    struct SettingsDialogStateForTest {
-        font_size_text: String,
-        line_height_text: String,
-        scrollback_text: String,
-    }
-
-    fn test_commit(state: &mut SettingsDialogStateForTest) -> Result<(), String> {
-        let size: f32 = state
-            .font_size_text
-            .trim()
-            .parse()
-            .map_err(|_| "size".to_string())?;
-        if !(8.0..=24.0).contains(&size) {
-            return Err("size range".into());
-        }
-        let line: f32 = state
-            .line_height_text
-            .trim()
-            .parse()
-            .map_err(|_| "line".to_string())?;
-        if !(0.9..=1.5).contains(&line) {
-            return Err("line range".into());
-        }
-        let scrollback: usize = state
-            .scrollback_text
-            .trim()
-            .parse()
-            .map_err(|_| "scrollback".to_string())?;
-        if !(1_000..=100_000).contains(&scrollback) {
-            return Err("scrollback range".into());
-        }
-        let _ = size;
-        let _ = line;
-        let _ = scrollback;
-        Ok(())
     }
 }

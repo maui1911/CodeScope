@@ -1915,9 +1915,10 @@ impl AppShell {
     /// `Settings` on disk or in memory. Used by the Settings dialog
     /// as the user clicks through the theme list — gives them a
     /// real-time look at each theme before committing via Save.
-    /// Cancel reverts to the on-disk settings (the dialog discards
-    /// its draft, and the next `apply_settings` from a real save or
-    /// the file-watch reload restores `self.theme`).
+    /// Cancel explicitly reapplies the snapshot taken at open-time
+    /// (see `cancel_settings_dialog`); the file-watch poller cannot
+    /// undo the preview by itself because `settings.json` is never
+    /// touched during a preview.
     pub(crate) fn set_theme_preview(&mut self, theme: Arc<Theme>, cx: &mut Context<Self>) {
         self.theme = theme.clone();
         self.sidebar.update(cx, |sidebar, cx| {

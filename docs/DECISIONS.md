@@ -397,11 +397,13 @@ idiom mirrors the in-app modals (`new_project_dialog.rs`,
   in `app.rs` picks up the change on its next tick, and `apply_settings`
   is also called inline so the swap is instant.
 - The dialog can preview the theme live as the user clicks through the
-  list; Cancel discards the preview cleanly because the on-disk file is
-  untouched. Font + scrollback edits only take effect for newly-spawned
-  tabs (running terminals keep their baked-in palette / scrollback); the
-  dialog surfaces a small "Applies to new tabs only." hint to make this
-  explicit.
+  list; Cancel explicitly reapplies the snapshot of `Settings` captured
+  when the dialog opened, reverting any in-flight preview (the file-watch
+  poller cannot do this on its own because `settings.json` is untouched
+  during a preview). Font + scrollback edits only take effect for
+  newly-spawned tabs (running terminals keep their baked-in palette /
+  scrollback); the dialog surfaces a small "Applies to new tabs only."
+  hint to make this explicit.
 - No new schema fields — anything not yet representable in `Settings`
   (e.g. per-theme overrides for an external theme bundle) stays out of
   reach of the dialog until the underlying struct grows the capability.
