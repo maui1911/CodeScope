@@ -186,6 +186,14 @@ pub enum ToastSeverity {
 struct WorktreeRowData {
     id: String,
     path: String,
+    /// Cached canonical form of `path`
+    /// (`codescope_core::path_canon::canonicalize_path`). Stored once
+    /// per row build so the per-row + per-project busy/active lookups
+    /// don't allocate a fresh `String` every render frame — the busy
+    /// halo animation requests a per-frame redraw, and a project
+    /// with many worktrees would otherwise turn into a steady
+    /// allocation hotspot (Copilot review on PR #136).
+    canonical_path: String,
     branch: Option<String>,
     /// Closed sessions belonging to this worktree, newest-first
     /// (matches `SessionManager::closed`'s sort). Already capped by
@@ -1543,6 +1551,8 @@ impl Render for Sidebar {
                         let closed_sessions = closed_by_wt.remove(&wt.id).unwrap_or_default();
                         WorktreeRowData {
                             id: wt.id.clone(),
+                            canonical_path:
+                                codescope_core::path_canon::canonicalize_path(&wt.path),
                             path: wt.path.clone(),
                             branch: wt.branch.clone(),
                             closed_sessions,
@@ -1661,12 +1671,13 @@ impl Render for Sidebar {
             // Mirrors C# `ProjectViewModel.HasBusyChild` — surfaces
             // as a small `signal_warn` dot next to the count badge so
             // a collapsed project still tells the user something is
-            // running underneath. Canonicalise once per row; the
-            // active/busy sets are pre-canonicalised by the caller
-            // (`AppShell::start_telemetry_poll`).
+            // running underneath. Uses the per-row cached
+            // `canonical_path` (computed once when `rows` was built)
+            // so the busy halo's per-frame redraw doesn't keep
+            // canonicalising paths from raw strings every tick.
             let any_busy_child = worktrees.iter().any(|wt| {
-                let canon = codescope_core::path_canon::canonicalize_path(&wt.path);
-                !canon.is_empty() && self.busy_paths.contains(&canon)
+                !wt.canonical_path.is_empty()
+                    && self.busy_paths.contains(&wt.canonical_path)
             });
             let bg = if active {
                 theme::frost_10(&theme)
@@ -1862,11 +1873,14 @@ impl Render for Sidebar {
                 // colour any more — that lives in the right-aligned
                 // `chg` status slug already. The old dirty colouring
                 // was a porting mistake; see PR #133 / docs handoff.
-                let wt_canon = codescope_core::path_canon::canonicalize_path(&wt.path);
+                // Reuse the canonical form cached on `WorktreeRowData`
+                // — see `any_busy_child` above for why we don't
+                // canonicalise here per render frame.
+                let wt_canon = wt.canonical_path.as_str();
                 let has_active_session =
-                    !wt_canon.is_empty() && self.active_paths.contains(&wt_canon);
+                    !wt_canon.is_empty() && self.active_paths.contains(wt_canon);
                 let has_busy_session =
-                    !wt_canon.is_empty() && self.busy_paths.contains(&wt_canon);
+                    !wt_canon.is_empty() && self.busy_paths.contains(wt_canon);
                 let dot_color = if has_busy_session {
                     theme::signal_warn()
                 } else if has_active_session {
@@ -1982,6 +1996,15 @@ impl Render for Sidebar {
                             let halo_id = ("worktree-halo", id_hash(&wt_row_id));
                             let halo = div()
                                 .absolute()
+                                // Centre the 12 px halo inside the
+                                // 14 px container so it overlaps the
+                                // 6 px dot in the middle. Without
+                                // explicit top/left offsets gpui
+                                // defaults to (0,0), pinning the
+                                // halo to the corner — Copilot
+                                // review on PR #136.
+                                .top(px(1.0))
+                                .left(px(1.0))
                                 .w(px(12.0))
                                 .h(px(12.0))
                                 .rounded_full()
