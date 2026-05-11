@@ -204,6 +204,46 @@ struct WorktreeRowData {
     closed_sessions: Vec<ClosedSessionRow>,
 }
 
+/// Resolve a persisted `Session.agent_id` to the display name the
+/// sidebar's closed-session history row should show ("Claude Code",
+/// "Copilot CLI", …). Routed through [`codescope_core::AgentRegistry`]
+/// so the registry stays the single source of truth — no hard-coded
+/// id → label map drifts out of sync when an agent is renamed.
+///
+/// Normalises the id before lookup so legacy / loosely-spelled values
+/// resolve too:
+/// - ASCII-lowercase (registry lookup is already case-insensitive,
+///   this just lets us split on a known case).
+/// - First `-` / `_` / whitespace-delimited token, so `"claude-code"`
+///   (an alias the C# build round-trips in some configs) maps to
+///   `"claude"`.
+///
+/// Returns `None` for unknown / empty ids; the caller falls back to
+/// `"shell"` so plain pty tabs still render with a friendly label.
+fn history_agent_display_name(agent_id: &str) -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<codescope_core::AgentRegistry> = OnceLock::new();
+    let registry = REGISTRY.get_or_init(codescope_core::AgentRegistry::with_built_ins);
+
+    let normalized = agent_id.to_ascii_lowercase();
+    let first_token = normalized
+        .split(|c: char| c == '-' || c == '_' || c.is_whitespace())
+        .find(|s| !s.is_empty())?;
+    let profile = registry.get_by_id(first_token)?;
+    // Match the agent id back to a `&'static str` literal so the
+    // closed-row label can stay a non-allocating return type — the
+    // five built-in defaults are stable strings, and any custom
+    // override would arrive via a different code path.
+    Some(match profile.id.as_str() {
+        "claude" => "Claude Code",
+        "copilot" => "Copilot CLI",
+        "opencode" => "OpenCode",
+        "pi" => "Pi",
+        "codex" => "Codex",
+        _ => return None,
+    })
+}
+
 /// Display data for a single closed-session row inside a worktree's
 /// history disclosure. Snapshotted at render time so the per-row
 /// listener closure can hold an owned `session_id` without keeping
@@ -1513,11 +1553,22 @@ impl Render for Sidebar {
                         continue;
                     }
                     let key = s.worktree_id.clone().unwrap_or_default();
+                    // History rows show the agent type that was
+                    // running — "Claude Code", "Copilot CLI",
+                    // "OpenCode", "Pi", "Codex", or "shell" for a
+                    // plain pty tab. Custom `display_name` (set by
+                    // explicit rename) still wins so a user-chosen
+                    // label survives, but the bare session UUID is
+                    // never the visible label anymore.
+                    let agent_label = s
+                        .agent_id
+                        .as_deref()
+                        .and_then(history_agent_display_name);
                     let label: SharedString = s
                         .display_name
                         .clone()
-                        .or_else(|| s.branch.clone())
-                        .unwrap_or_else(|| s.id.clone())
+                        .or_else(|| agent_label.map(|s| s.to_string()))
+                        .unwrap_or_else(|| "shell".to_string())
                         .into();
                     closed_by_wt
                         .entry(key)
@@ -2162,17 +2213,17 @@ impl Render for Sidebar {
                                     .border_1()
                                     .border_color(outline_color),
                             )
-                            // Strikethrough on the session label — soft
-                            // close visual cue mirroring the dimmer
-                            // history palette in the C# build's history
-                            // data template.
+                            // Dim label — `Opacity=0.55` on the C#
+                            // history DataTemplate, approximated here
+                            // by `text_color = ink_dim`. No
+                            // strikethrough in the WPF reference, so
+                            // we don't add one.
                             .child(
                                 div()
                                     .flex_grow()
                                     .truncate()
                                     .font(theme::font_mono())
                                     .text_color(label_color)
-                                    .line_through()
                                     .child(row.label.clone()),
                             )
                             .child(
@@ -3225,4 +3276,41 @@ fn id_hash(id: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut hasher);
     hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_agent_label_resolves_built_in_ids() {
+        assert_eq!(history_agent_display_name("claude"), Some("Claude Code"));
+        assert_eq!(history_agent_display_name("copilot"), Some("Copilot CLI"));
+        assert_eq!(history_agent_display_name("opencode"), Some("OpenCode"));
+        assert_eq!(history_agent_display_name("pi"), Some("Pi"));
+        assert_eq!(history_agent_display_name("codex"), Some("Codex"));
+    }
+
+    #[test]
+    fn history_agent_label_is_case_insensitive() {
+        assert_eq!(history_agent_display_name("Claude"), Some("Claude Code"));
+        assert_eq!(history_agent_display_name("CLAUDE"), Some("Claude Code"));
+        assert_eq!(history_agent_display_name("Copilot"), Some("Copilot CLI"));
+    }
+
+    #[test]
+    fn history_agent_label_normalizes_legacy_aliases() {
+        // `claude-code` and similar dash/underscore variants resolve
+        // to the canonical first-token id used by the registry.
+        assert_eq!(history_agent_display_name("claude-code"), Some("Claude Code"));
+        assert_eq!(history_agent_display_name("claude_code"), Some("Claude Code"));
+        assert_eq!(history_agent_display_name("copilot-cli"), Some("Copilot CLI"));
+    }
+
+    #[test]
+    fn history_agent_label_unknown_returns_none() {
+        assert_eq!(history_agent_display_name(""), None);
+        assert_eq!(history_agent_display_name("gemini"), None);
+        assert_eq!(history_agent_display_name("-"), None);
+    }
 }
