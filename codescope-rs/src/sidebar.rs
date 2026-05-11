@@ -32,9 +32,10 @@ use std::time::Duration;
 use codescope_core::{AppPaths, LayoutState, Project, ProjectsConfig, Theme};
 use codescope_core::git::GitStatus;
 use gpui::{
-    AppContext, ClipboardItem, Context, Corner, EventEmitter, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render,
-    SharedString, StatefulInteractiveElement, Styled, Window, anchored, deferred, div, point, px,
+    Animation, AnimationExt, AppContext, ClipboardItem, Context, Corner, EventEmitter,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point,
+    Render, SharedString, StatefulInteractiveElement, Styled, Window, anchored, deferred, div,
+    point, px,
 };
 
 use crate::new_project_dialog::NewProjectDialogState;
@@ -279,6 +280,20 @@ pub struct Sidebar {
     /// only — mirrors `WorktreeViewModel.IsExpanded` in the C# build,
     /// which is also a per-process flag (WPF tree-view state).
     expanded_worktrees: HashSet<String>,
+    /// Canonicalised paths (via [`codescope_core::path_canon::canonicalize_path`])
+    /// whose adopted agent session is currently in `Busy` or
+    /// `PendingToolUse` state. Drives the red `busy` dot on the
+    /// worktree row plus the red propagation dot on a collapsed
+    /// project row. Pushed by [`Sidebar::set_session_paths`] from
+    /// `AppShell::start_telemetry_poll`. Mirrors the C# build's
+    /// `WorktreeViewModel.HasBusySession`/`DotState` derived state.
+    busy_paths: HashSet<String>,
+    /// Canonicalised paths that have at least one live adopted
+    /// session (regardless of busy/idle). Drives the left-edge accent
+    /// rail on worktree rows and the idle (green) dot state. Mirrors
+    /// the C# `WorktreeViewModel.HasActiveSession` boolean — same
+    /// 2 px rail trigger on the sidebar row chrome.
+    active_paths: HashSet<String>,
 }
 
 impl Sidebar {
@@ -329,7 +344,39 @@ impl Sidebar {
             pr_urls: HashMap::new(),
             collapsed_projects,
             expanded_worktrees: HashSet::new(),
+            busy_paths: HashSet::new(),
+            active_paths: HashSet::new(),
         }
+    }
+
+    /// Refresh the per-path agent activity snapshot used to colour
+    /// the worktree-row state dot and surface the busy-child marker
+    /// on collapsed project rows. Inputs are already canonicalised by
+    /// the caller (see `codescope_core::path_canon::canonicalize_path`)
+    /// — folding two paths to the same key here would either duplicate
+    /// the work on every poll or hide subtle bugs where the caller
+    /// forgot to canonicalise. No-op + no notify when neither set
+    /// changed, so the 250 ms busy-poll doesn't trigger a redraw on
+    /// every tick.
+    ///
+    /// Mirrors the implicit data flow the C# build gets for free:
+    /// `WorktreeViewModel` listens to its child `SessionTabViewModel`s'
+    /// `Status` changes and republishes `DotState` / `HasBusySession`.
+    /// The Rust port doesn't have per-VM observable bindings, so
+    /// `AppShell::start_telemetry_poll` recomputes both sets after
+    /// each poll and pushes them down here.
+    pub fn set_session_paths(
+        &mut self,
+        busy: HashSet<String>,
+        active: HashSet<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if busy == self.busy_paths && active == self.active_paths {
+            return;
+        }
+        self.busy_paths = busy;
+        self.active_paths = active;
+        cx.notify();
     }
 
     /// Flip the expand / collapse state for a worktree's history
@@ -1608,6 +1655,19 @@ impl Render for Sidebar {
         let mut project_and_worktree_rows: Vec<gpui::AnyElement> = Vec::new();
         for (idx, id, name, project_name, worktrees) in rows.into_iter() {
             let active = selected == Some(idx);
+            // Compute the "any child worktree currently has a busy
+            // agent session" propagation flag up-front so the project
+            // row (rendered before the child rows) can pull it in.
+            // Mirrors C# `ProjectViewModel.HasBusyChild` — surfaces
+            // as a small `signal_warn` dot next to the count badge so
+            // a collapsed project still tells the user something is
+            // running underneath. Canonicalise once per row; the
+            // active/busy sets are pre-canonicalised by the caller
+            // (`AppShell::start_telemetry_poll`).
+            let any_busy_child = worktrees.iter().any(|wt| {
+                let canon = codescope_core::path_canon::canonicalize_path(&wt.path);
+                !canon.is_empty() && self.busy_paths.contains(&canon)
+            });
             let bg = if active {
                 theme::frost_10(&theme)
             } else {
@@ -1690,6 +1750,24 @@ impl Render for Sidebar {
                 )
                 .child(chevron)
                 .child(div().flex_grow().truncate().child(name));
+            // C# `SidebarView.xaml` lines 553-561: collapsed (or just
+            // expanded) project surfaces a small `Signal.Warn` (red)
+            // dot when any child worktree's adopted session is busy.
+            // The C# template gates this on `HasBusyChild` regardless
+            // of collapse state — the dot is "attention propagates"
+            // signalling, not a collapsed-only affordance.
+            let project_row = if any_busy_child {
+                project_row.child(
+                    div()
+                        .ml(px(6.0))
+                        .w(px(6.0))
+                        .h(px(6.0))
+                        .rounded_full()
+                        .bg(theme::signal_warn()),
+                )
+            } else {
+                project_row
+            };
             project_and_worktree_rows.push(project_row.into_any_element());
 
             // Skip rendering the worktree children + placeholder
@@ -1770,27 +1848,64 @@ impl Render for Sidebar {
                 ));
                 let frost_hover = theme::frost_10(&theme);
                 let ink_hover = theme::ink(&theme);
-                // Resolve dirty-state for this worktree. `None` (still
-                // loading) gets a dim ghost dot; `Some(false)` (clean)
-                // a small accent-coloured dot; `Some(true)` (dirty) a
-                // warning-coloured dot.
-                let dirty_dot_color = match self.dirty_state.get(&wt.path) {
-                    Some(true) => theme::status_dirty(&theme),
-                    Some(false) => theme::status_clean(&theme),
-                    None => theme::ink_ghost(&theme),
+                // Resolve agent-state for this worktree's 6 px dot.
+                // Mirrors C# `WorktreeViewModel.DotState`:
+                //   * `busy` — at least one adopted session is in
+                //     `Busy` / `PendingToolUse` → `signal_warn` (red)
+                //     plus a pulsing halo behind the dot.
+                //   * `idle` — at least one adopted session live but
+                //     none busy → `signal_ok` (green).
+                //   * `rest` — no live sessions for this path → dim
+                //     `#2A2A2A` grey (C# WPF DataTemplate constant;
+                //     `ink_ghost` is the closest themeable analogue).
+                // Dirty state intentionally does *not* feed the dot
+                // colour any more — that lives in the right-aligned
+                // `chg` status slug already. The old dirty colouring
+                // was a porting mistake; see PR #133 / docs handoff.
+                let wt_canon = codescope_core::path_canon::canonicalize_path(&wt.path);
+                let has_active_session =
+                    !wt_canon.is_empty() && self.active_paths.contains(&wt_canon);
+                let has_busy_session =
+                    !wt_canon.is_empty() && self.busy_paths.contains(&wt_canon);
+                let dot_color = if has_busy_session {
+                    theme::signal_warn()
+                } else if has_active_session {
+                    theme::signal_ok()
+                } else {
+                    theme::ink_ghost(&theme)
                 };
                 // Element id is keyed off `(project.id, worktree.id)`
                 // so primary rows from different projects (which all
                 // share `wt.id == "primary"`) don't collide in gpui's
                 // id-based element reuse table.
                 let wt_row_id = format!("{}/{}", id, wt.id);
+                // 2 px accent rail on the left edge when the worktree
+                // has a live session. Mirrors C# `SidebarView.xaml`
+                // lines 308-334 — the Rectangle in column 0 of the
+                // worktree DataTemplate whose Opacity flips to 1 on
+                // `HasActiveSession`. There is no worktree-row
+                // selection state in the Rust port yet, so the
+                // `IsSelected` half of the WPF trigger is a no-op
+                // here; if/when that lands, OR it in alongside
+                // `has_active_session`.
+                let rail_color = if has_active_session {
+                    theme::accent(&theme)
+                } else {
+                    gpui::transparent_black()
+                };
                 let wt_row = div()
                     .id(("worktree", id_hash(&wt_row_id)))
                     .h(px(28.0))
                     .flex()
                     .flex_row()
                     .items_center()
-                    .pl(px(34.0)) // align under the project text past the rail + indent
+                    .border_l_2()
+                    .border_color(rail_color)
+                    // 32 px content inset (was 34 before the 2 px rail
+                    // was added) so the dot sits at the same column as
+                    // before. Border lives outside `pl` in gpui's box
+                    // model, so total left offset is still 34 px.
+                    .pl(px(32.0))
                     .pr_3()
                     .gap_2()
                     .text_color(theme::ink_ghost(&theme))
@@ -1830,13 +1945,69 @@ impl Render for Sidebar {
                             }
                         }),
                     )
-                    .child(
-                        div()
+                    // Dot + halo container. The dot is always 6 px;
+                    // the halo is a larger ellipse rendered *behind*
+                    // it via absolute positioning, animating opacity
+                    // from 0.55→0 on a 1.4 s repeat. Mirrors the WPF
+                    // Storyboard in `SidebarView.xaml` lines 339-401
+                    // — gpui doesn't ship a `ScaleTransform`-style
+                    // transform on `div`, so we fix the halo at a
+                    // bigger diameter (12 px) and animate opacity
+                    // only. Visually it reads the same: a soft red
+                    // pulse that radiates and fades. Per-frame
+                    // redraws only run while at least one busy row
+                    // is on-screen — `AnimationExt::with_animation`
+                    // calls `window.request_animation_frame()` only
+                    // for the duration of the animation.
+                    .child({
+                        let dot = div()
                             .w(px(6.0))
                             .h(px(6.0))
                             .rounded_full()
-                            .bg(dirty_dot_color),
-                    )
+                            .bg(dot_color);
+                        let container = div()
+                            .relative()
+                            .w(px(14.0))
+                            .h(px(14.0))
+                            .flex()
+                            .items_center()
+                            .justify_center();
+                        if has_busy_session {
+                            // Halo: 12 px circle, signal_warn, faded.
+                            // Absolute-positioned so it overlaps the
+                            // 6 px dot rather than displacing it in
+                            // the flex row. Animation id is keyed off
+                            // the worktree row id so multiple busy
+                            // rows animate independently.
+                            let halo_id = ("worktree-halo", id_hash(&wt_row_id));
+                            let halo = div()
+                                .absolute()
+                                .w(px(12.0))
+                                .h(px(12.0))
+                                .rounded_full()
+                                .bg(theme::signal_warn())
+                                .with_animation(
+                                    halo_id,
+                                    Animation::new(Duration::from_millis(1400)).repeat(),
+                                    |this, delta| {
+                                        // Match the WPF keyframe shape:
+                                        // 0.0s → 0.55, 1.0s → 0, hold
+                                        // until 1.4s. Convert the 0..1
+                                        // animation delta accordingly.
+                                        let pulse_end = 1.0_f32 / 1.4_f32; // ≈ 0.7143
+                                        let opacity = if delta < pulse_end {
+                                            0.55_f32 * (1.0_f32 - delta / pulse_end)
+                                        } else {
+                                            0.0_f32
+                                        };
+                                        this.opacity(opacity)
+                                    },
+                                );
+                            container.child(halo).child(dot)
+                        } else {
+                            container.child(dot)
+                        }
+                    })
                     // Branch label — mono, mirrors `Fig.Font.Mono` on
                     // the `DisplayBranch` TextBlock in
                     // `SidebarView.xaml` (worktree DataTemplate).

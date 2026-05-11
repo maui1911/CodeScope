@@ -88,7 +88,13 @@ pub fn status_running() -> Hsla { rgb_to_hsla(Rgb::from_hex(0x22c55e)) }
 
 /// Worktree dirty indicator. Amber, distinct enough from
 /// `status_running` (green) and `danger` (red) that the user can
-/// tell at a glance.
+/// tell at a glance. Was previously used for the sidebar worktree
+/// dot; the C# build colours that dot by agent activity instead
+/// (`WorktreeViewModel.DotState`), so the sidebar now surfaces dirty
+/// state through the right-aligned `chg` status slug. Kept as a
+/// theme helper for any future caller that wants an amber "dirty"
+/// signal without re-deriving the hex.
+#[allow(dead_code)]
 pub fn status_dirty(_theme: &Theme) -> Hsla { rgb_to_hsla(Rgb::from_hex(0xf5a623)) }
 
 /// Worktree clean indicator. Reuses the accent colour so a fully-
