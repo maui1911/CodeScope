@@ -611,6 +611,11 @@ impl AppShell {
             // cluster and the sidebar dot.
             sidebar.start_dirty_poll(cx);
             sidebar.start_git_status_poll(cx);
+            // PR poll runs on a slower (60 s) cadence — `gh pr list`
+            // is the heaviest of the three pollers (network + auth)
+            // and the data changes much less frequently than the
+            // working tree.
+            sidebar.start_pr_poll(cx);
             sidebar
         });
 

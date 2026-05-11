@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use codescope_core::{AppPaths, LayoutState, Project, ProjectsConfig, Theme};
 use codescope_core::git::GitStatus;
+use codescope_core::pr::{CiStatus, PullRequestInfo};
 use gpui::{
     Animation, AnimationExt, AppContext, ClipboardItem, Context, Corner, EventEmitter,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point,
@@ -49,6 +50,13 @@ use crate::theme;
 /// thousand-file repos. Mirrors the C# build's
 /// `WorktreePoller.Interval`.
 const DIRTY_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often the PR-status poller wakes up. 60 s matches the C# build's
+/// `PullRequestStatusPoller.Interval` baseline (the C# build then layers
+/// per-worktree exponential backoff up to 5 minutes; the Rust port
+/// doesn't model backoff yet, but `gh` failures cache as
+/// `Resolved { info: None }` so they don't retry hot anyway).
+const PR_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Default sidebar width when none is persisted in `layout.json`.
 /// Mirrors the C# build's initial 240 px. The actual rendered width
@@ -91,14 +99,21 @@ enum OpenMenu {
 /// its end).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PrLookup {
-    /// A `detect_pr_url` task is already in flight for this worktree.
-    /// Records the branch the call was launched against so the
-    /// completion handler can detect a branch-switch-during-fetch and
-    /// drop the now-stale result instead of caching it.
+    /// A `fetch_for_branch` task is already in flight for this
+    /// worktree. Records the branch the call was launched against so
+    /// the completion handler can detect a branch-switch-during-fetch
+    /// and drop the now-stale result instead of caching it.
     Pending { branch: String },
     /// The most recent lookup completed against `branch` and resolved
-    /// to `url` (`None` for "no open PR / call failed").
-    Resolved { branch: String, url: Option<String> },
+    /// to `info` (`None` for "no open PR / call failed / gh not
+    /// installed"). Carries the full [`PullRequestInfo`] when present
+    /// so the sidebar can render the badge + CI glyph and surface
+    /// "Open PR in browser" / "Copy PR URL" menu rows without
+    /// re-fetching.
+    Resolved {
+        branch: String,
+        info: Option<PullRequestInfo>,
+    },
 }
 
 /// Click handler for a context-menu row. Boxed so we can stash it in
@@ -650,6 +665,163 @@ impl Sidebar {
         .detach();
     }
 
+    /// Spawn the PR-status polling loop. Runs every
+    /// [`PR_POLL_INTERVAL`] (60 s) and walks every worktree whose live
+    /// branch is known, shelling out to `gh pr list` once per
+    /// (path, branch) pair. Results land in `self.pr_urls` as
+    /// `Resolved { info: Some(_) | None }` — `None` covers "no open
+    /// PR / gh not installed / call failed" and stays cached so the
+    /// next tick doesn't re-spawn until the branch changes.
+    ///
+    /// Network work is dispatched through `cx.background_spawn` so
+    /// the UI thread never blocks on `gh`. Mirrors the C# build's
+    /// `PullRequestStatusPoller` minus the per-worktree exponential
+    /// backoff (which only kicks in on persistent failures; the
+    /// uniform 60 s cadence is cheap enough at the typical worktree
+    /// count to justify deferring backoff to a follow-up).
+    ///
+    /// Called from `AppShell::new` alongside `start_dirty_poll` and
+    /// `start_git_status_poll`. Same lifetime — dies when the entity
+    /// drops.
+    pub fn start_pr_poll(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(PR_POLL_INTERVAL).await;
+                if this.upgrade().is_none() {
+                    break;
+                }
+                // Snapshot every (path, branch) pair we should poll.
+                // A worktree without a live branch (no git_status tick
+                // yet and no persisted branch) is skipped — the next
+                // tick will pick it up once the git-status poller
+                // populates the cache. Pairs are de-duplicated by
+                // path to avoid double-polling when the same path is
+                // listed under multiple projects.
+                let targets: Vec<(String, String)> = match this
+                    .update(cx, |this, _| {
+                        let mut seen: HashSet<String> = HashSet::new();
+                        let mut out: Vec<(String, String)> = Vec::new();
+                        for project in &this.projects.projects {
+                            let entries = std::iter::once((
+                                project.path.clone(),
+                                None::<String>,
+                            ))
+                            .chain(
+                                project.worktrees.iter().map(|wt| {
+                                    (wt.path.clone(), wt.branch.clone())
+                                }),
+                            );
+                            for (path, persisted_branch) in entries {
+                                if !seen.insert(path.clone()) {
+                                    continue;
+                                }
+                                let branch = this
+                                    .git_status
+                                    .get(&path)
+                                    .map(|s| s.branch.clone())
+                                    .or(persisted_branch);
+                                if let Some(branch) = branch
+                                    && !branch.is_empty()
+                                {
+                                    out.push((path, branch));
+                                }
+                            }
+                        }
+                        out
+                    }) {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+
+                if targets.is_empty() {
+                    continue;
+                }
+
+                // Run all `gh` calls sequentially on the background
+                // executor. Per-call latency is the dominant cost
+                // here (network + auth), but gh's own concurrency
+                // story is best-effort and we'd rather not fan out
+                // and hammer the API — at worst a 60 s tick walks N
+                // worktrees serially and finishes well inside the
+                // next tick window. Each result records the branch
+                // it was fetched against so the apply step below can
+                // detect a branch switch between dispatch and
+                // completion (rare but possible).
+                let results: Vec<(String, String, Option<PullRequestInfo>)> = cx
+                    .background_spawn(async move {
+                        targets
+                            .into_iter()
+                            .map(|(path, branch)| {
+                                let info = codescope_core::pr::fetch_for_branch(
+                                    std::path::Path::new(&path),
+                                    &branch,
+                                );
+                                (path, branch, info)
+                            })
+                            .collect()
+                    })
+                    .await;
+
+                if this
+                    .update(cx, |this, cx| {
+                        let mut changed = false;
+                        for (path, branch, info) in results {
+                            // Drop the result if the worktree was
+                            // removed or its branch shifted while gh
+                            // was running. The lazy `open_worktree_menu`
+                            // fetch + the next tick will reconverge.
+                            let live_branch = this
+                                .git_status
+                                .get(&path)
+                                .map(|s| s.branch.clone())
+                                .or_else(|| {
+                                    this.projects
+                                        .projects
+                                        .iter()
+                                        .flat_map(|p| {
+                                            std::iter::once((p.path.clone(), None))
+                                                .chain(p.worktrees.iter().map(|wt| {
+                                                    (wt.path.clone(), wt.branch.clone())
+                                                }))
+                                        })
+                                        .find(|(p, _)| p == &path)
+                                        .and_then(|(_, b)| b)
+                                });
+                            if live_branch.as_deref() != Some(branch.as_str()) {
+                                continue;
+                            }
+                            // A `Pending` against a different branch
+                            // means a fresher lazy fetch is in flight;
+                            // don't clobber it with this poll's stale
+                            // answer.
+                            if matches!(
+                                this.pr_urls.get(&path),
+                                Some(PrLookup::Pending { branch: b }) if b != &branch
+                            ) {
+                                continue;
+                            }
+                            let next = PrLookup::Resolved {
+                                branch: branch.clone(),
+                                info,
+                            };
+                            let prev = this.pr_urls.insert(path, next.clone());
+                            if prev.as_ref() != Some(&next) {
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     /// Return the cached [`GitStatus`] for the given worktree path.
     /// Returns `None` while the first poll tick has not completed yet,
     /// or for paths that are not git repos. Callers should treat `None`
@@ -884,9 +1056,12 @@ impl Sidebar {
                 let path_for_task = std::path::PathBuf::from(&path);
                 let branch_for_task = branch.clone();
                 cx.spawn(async move |this, cx| {
-                    let url = cx
+                    let info = cx
                         .background_spawn(async move {
-                            codescope_core::pr::detect_pr_url(&path_for_task, &branch_for_task)
+                            codescope_core::pr::fetch_for_branch(
+                                &path_for_task,
+                                &branch_for_task,
+                            )
                         })
                         .await;
                     let _ = this.update(cx, |this, cx| {
@@ -903,7 +1078,7 @@ impl Sidebar {
                         if still_ours {
                             this.pr_urls.insert(
                                 path,
-                                PrLookup::Resolved { branch: branch.clone(), url },
+                                PrLookup::Resolved { branch: branch.clone(), info },
                             );
                             cx.notify();
                         }
@@ -1050,17 +1225,53 @@ impl Sidebar {
                     .and_then(|p| p.worktrees.iter().find(|wt| wt.id == worktree_id))
                     .and_then(|wt| wt.branch.clone())
             });
-        if let (Some(live), Some(PrLookup::Resolved { branch, url: Some(url) })) =
+        if let (Some(live), Some(PrLookup::Resolved { branch, info: Some(info) })) =
             (live_branch.as_ref(), self.pr_urls.get(&path))
             && branch == live
         {
-            let url = url.clone();
+            let url = info.url.clone();
             cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
             cx.emit(SidebarEvent::Toast {
                 kind: ToastSeverity::Ok,
                 title: "PR URL copied".into(),
                 detail: Some(url.into()),
             });
+        }
+        self.close_menu(cx);
+    }
+
+    /// Open the cached PR URL for the worktree in the user's default
+    /// browser. The menu row that drives this is gated on the cache
+    /// holding a `Some(info)` value for the *current* branch — same
+    /// guard as `copy_worktree_pr_url`. Mirrors C#'s
+    /// `WorktreeViewModel.OpenPullRequestCommand`.
+    fn open_worktree_pr_in_browser(
+        &mut self,
+        project_idx: usize,
+        worktree_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self.worktree_path(project_idx, worktree_id) else {
+            self.close_menu(cx);
+            return;
+        };
+        let live_branch = self
+            .git_status
+            .get(&path)
+            .map(|s| s.branch.clone())
+            .or_else(|| {
+                self.projects
+                    .projects
+                    .get(project_idx)
+                    .and_then(|p| p.worktrees.iter().find(|wt| wt.id == worktree_id))
+                    .and_then(|wt| wt.branch.clone())
+            });
+        if let (Some(live), Some(PrLookup::Resolved { branch, info: Some(info) })) =
+            (live_branch.as_ref(), self.pr_urls.get(&path))
+            && branch == live
+        {
+            let url = info.url.clone();
+            open_url_in_browser(&url);
         }
         self.close_menu(cx);
     }
@@ -2111,20 +2322,43 @@ impl Render for Sidebar {
                             .font(theme::font_mono())
                             .child(wt_label),
                     );
+                // Resolve the PR cache for this worktree (matched on
+                // the *current* branch, same logic the menu uses) so
+                // both the status slug and the badge can read from a
+                // single source. `pr_info` is `Some` only when the
+                // cached `Resolved.branch` still matches the live one
+                // — a branch switch invalidates the cached view until
+                // the next poll lands.
+                let pr_info: Option<&PullRequestInfo> = {
+                    let live_branch = self
+                        .git_status
+                        .get(&wt.path)
+                        .map(|s| s.branch.clone())
+                        .or_else(|| wt.branch.clone());
+                    match (live_branch.as_ref(), self.pr_urls.get(&wt.path)) {
+                        (
+                            Some(live),
+                            Some(PrLookup::Resolved { branch, info: Some(info) }),
+                        ) if branch == live => Some(info),
+                        _ => None,
+                    }
+                };
+                let ci_status = pr_info.map(|i| i.ci_status).unwrap_or(CiStatus::None);
+
                 // Right-aligned status slug — `chg` / `↑N ↓N` / `idle`
-                // computed by
-                // `codescope_core::git::worktree_status_label` from
-                // the cached `git_status` snapshot. Renders the same
-                // information the C# `WorktreeViewModel.StatusLabel`
-                // slot shows, in `Fig.Font.Mono` at 10 pt with a
-                // dim `ink_ghost` foreground. The C# build also
-                // surfaces `busy` (active agent) and `ci!` (failing
-                // PR CI); those land alongside session and PR
-                // tracking.
+                // computed by `worktree_status_label_with_ci` from the
+                // cached `git_status` snapshot + the PR's CI rollup.
+                // Renders the same information the C#
+                // `WorktreeViewModel.StatusLabel` slot shows, in
+                // `Fig.Font.Mono` at 10 pt with a dim `ink_ghost`
+                // foreground. `busy` (active agent) is still TODO —
+                // the Rust port has no per-tab session model yet.
                 let status_slug = self
                     .git_status
                     .get(&wt.path)
-                    .map(codescope_core::git::worktree_status_label)
+                    .map(|s| {
+                        codescope_core::git::worktree_status_label_with_ci(s, ci_status)
+                    })
                     .unwrap_or_default();
                 let wt_row = if status_slug.is_empty() {
                     wt_row
@@ -2136,11 +2370,61 @@ impl Render for Sidebar {
                             .text_size(px(10.0))
                             // Status slug — `Text.Faint` (#606060) in
                             // the C# `WorktreeViewModel.StatusLabel`
-                            // TextBlock, mono.
+                            // TextBlock, mono. The `ci!` slug stays in
+                            // `text_faint` (matches the C# binding) —
+                            // the dedicated CI glyph in the PR badge
+                            // is where the failure colour lives.
                             .text_color(theme::text_faint())
                             .font(theme::font_mono())
                             .child(status_slug),
                     )
+                };
+
+                // PR badge — `#42 ✓` style, rendered to the right of
+                // the status slug. Hidden when no PR is cached for
+                // this worktree (lazy fetch in `open_worktree_menu` +
+                // 60 s `start_pr_poll` warmup means the badge appears
+                // within a minute of the worktree being visible). The
+                // CI glyph colour shifts with the rollup:
+                //   ✓ success  → `signal_ok`
+                //   ✗ failure  → `signal_warn`
+                //   ◐ pending  → `text_faint` (no signal colour yet)
+                //   ·  none    → `text_faint`
+                // Mirrors C# `WorktreeViewModel.PrBadgeText` +
+                // `CiGlyph` on the sidebar's `BadgeBox` template.
+                let wt_row = if let Some(info) = pr_info {
+                    let glyph_color = match info.ci_status {
+                        CiStatus::Success => theme::signal_ok(),
+                        CiStatus::Failure => theme::signal_warn(),
+                        CiStatus::Pending | CiStatus::None => theme::text_faint(),
+                    };
+                    let glyph: &'static str = match info.ci_status {
+                        CiStatus::Success => "\u{2713}", // ✓
+                        CiStatus::Pending => "\u{25D0}", // ◐
+                        CiStatus::Failure => "\u{2717}", // ✗
+                        CiStatus::None => "\u{00B7}",    // ·
+                    };
+                    let pr_number_label = format!("#{}", info.number);
+                    wt_row
+                        .child(
+                            div()
+                                .ml(px(6.0))
+                                .text_size(px(10.0))
+                                .text_color(theme::text_faint())
+                                .font(theme::font_mono())
+                                .child(pr_number_label),
+                        )
+                        .child(
+                            div()
+                                .ml(px(3.0))
+                                .mr(px(4.0))
+                                .text_size(px(10.0))
+                                .text_color(glyph_color)
+                                .font(theme::font_mono())
+                                .child(glyph),
+                        )
+                } else {
+                    wt_row
                 };
                 // History disclosure chevron — only when the worktree
                 // has any closed-session rows. Mirrors C# `SidebarView`'s
@@ -2953,32 +3237,55 @@ impl Sidebar {
                     }),
                 )
             }))
-            // "Copy PR URL" — only when the cached `gh pr list` lookup
-            // resolved to an open PR for this worktree's *current*
-            // branch (live `git_status` first, persisted `branch`
-            // fallback — same logic `open_worktree_menu` uses to
-            // decide whether to refetch). The fetch is kicked off in
-            // `open_worktree_menu` and lands asynchronously; until
-            // then the row stays hidden so a half-loaded menu doesn't
-            // flash an unusable entry, and a stale `Resolved` from a
-            // prior branch is also hidden until the refetch lands.
-            // Mirrors C#'s `wt.HasPullRequest`-gated row.
+            // "Open PR in browser" + "Copy PR URL" — only when the
+            // cached `gh pr list` lookup resolved to an open PR for
+            // this worktree's *current* branch (live `git_status`
+            // first, persisted `branch` fallback — same logic
+            // `open_worktree_menu` uses to decide whether to refetch).
+            // The fetch is kicked off in `open_worktree_menu` (lazy)
+            // and warmed by the 60 s `start_pr_poll` loop; until
+            // either lands the rows stay hidden so a half-loaded menu
+            // doesn't flash unusable entries. A stale `Resolved` from
+            // a prior branch is also hidden until the refetch lands.
+            // Mirrors C#'s `wt.HasPullRequest`-gated
+            // `OpenPullRequestCommand` + `CopyPullRequestUrlCommand`
+            // pair.
             .children({
                 let live_branch = self
                     .git_status
                     .get(&worktree.path)
                     .map(|s| s.branch.clone())
                     .or_else(|| worktree.branch.clone());
-                live_branch
+                let has_pr = live_branch
                     .as_ref()
-                    .and_then(|live| match self.pr_urls.get(&worktree.path) {
-                        Some(PrLookup::Resolved { branch, url: Some(url) }) if branch == live => {
-                            Some(url)
-                        }
-                        _ => None,
+                    .map(|live| {
+                        matches!(
+                            self.pr_urls.get(&worktree.path),
+                            Some(PrLookup::Resolved { branch, info: Some(_) })
+                                if branch == live
+                        )
                     })
-                    .map(|_url| {
-                        let id_for_copy_pr = worktree_id.clone();
+                    .unwrap_or(false);
+                let mut rows: Vec<gpui::AnyElement> = Vec::new();
+                if has_pr {
+                    let id_for_open_pr = worktree_id.clone();
+                    rows.push(
+                        item(
+                            "wt-menu-open-pr",
+                            "Open PR in browser",
+                            false,
+                            Box::new(move |this, _window, cx| {
+                                this.open_worktree_pr_in_browser(
+                                    project_idx,
+                                    &id_for_open_pr,
+                                    cx,
+                                );
+                            }),
+                        )
+                        .into_any_element(),
+                    );
+                    let id_for_copy_pr = worktree_id.clone();
+                    rows.push(
                         item(
                             "wt-menu-copy-pr-url",
                             "Copy PR URL",
@@ -2987,7 +3294,10 @@ impl Sidebar {
                                 this.copy_worktree_pr_url(project_idx, &id_for_copy_pr, cx);
                             }),
                         )
-                    })
+                        .into_any_element(),
+                    );
+                }
+                rows
             })
             .child({
                 let id_for_remote = worktree_id.clone();
