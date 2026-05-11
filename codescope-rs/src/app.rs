@@ -4806,16 +4806,13 @@ impl AppShell {
             }
             PaletteActionKind::Command(cmd) => match cmd {
                 BuiltInCommand::ToggleOverview => {
-                    // The Rust port's overview lands in a parallel PR;
-                    // for now we surface a toast so the chord is at
-                    // least observable. Replaced with the real toggle
-                    // call once that view ships.
-                    self.push_toast(
-                        ToastKind::Info,
-                        SharedString::from("Overview: coming soon"),
-                        None,
-                        cx,
-                    );
+                    // Toggle the overview pane. Mirrors the Ctrl+Shift+O
+                    // chord (and the sidebar footer "Overview" button)
+                    // — same `set_show_overview` entry point so the
+                    // palette never has to duplicate the panel-flip
+                    // bookkeeping.
+                    let next = !self.show_overview;
+                    self.set_show_overview(next, cx);
                 }
                 BuiltInCommand::ToggleSidebar => {
                     self.toggle_sidebar(cx);
@@ -4872,7 +4869,15 @@ impl AppShell {
         let mut out: Vec<PaletteAction> = Vec::new();
 
         // Static built-in commands — always available, regardless of
-        // sidebar state.
+        // sidebar state. We leave `subtitle = None`: the renderer
+        // already shows `cmd.hint()` as the right-aligned chord text
+        // for `PaletteActionKind::Command` rows, so duplicating it in
+        // the subtitle would paint the same chord twice on the same
+        // row. The chord still feeds the fuzzy scorer because the
+        // renderer's hint path is independent of search input — the
+        // search target is `PaletteAction::display`, and a user
+        // typing the chord (e.g. "Ctrl+B") still finds Toggle sidebar
+        // via the title fragment.
         for cmd in [
             BuiltInCommand::NewSession,
             BuiltInCommand::ToggleSidebar,
@@ -4884,7 +4889,7 @@ impl AppShell {
             out.push(PaletteAction {
                 kind: PaletteActionKind::Command(cmd),
                 title: cmd.title().into(),
-                subtitle: Some(cmd.hint().into()),
+                subtitle: None,
                 group: PaletteGroup::Commands,
             });
         }
@@ -5024,10 +5029,13 @@ impl AppShell {
 }
 
 /// Open a path with the platform's default handler. Windows routes
-/// through `ShellExecuteW`; macOS / Linux shell out to `open` /
-/// `xdg-open`. Used by the palette's "Open settings" row — we hand
-/// `settings.json` to the OS and the user's preferred editor takes
-/// over. Returns the underlying error so the caller can toast it.
+/// through `ShellExecuteW` and is fire-and-forget — `shell_open_url`
+/// doesn't surface failure, so the Windows arm always returns
+/// `Ok(())` even if the shell can't find a handler for the file. The
+/// macOS / Linux arms shell out to `open` / `xdg-open` and propagate
+/// the spawn error so a missing binary surfaces as a toast. Used by
+/// the palette's "Open settings" row to hand `settings.json` off to
+/// the user's preferred editor.
 fn open_in_native_browser(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {

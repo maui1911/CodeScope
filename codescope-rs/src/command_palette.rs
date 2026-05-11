@@ -32,7 +32,7 @@ use std::sync::Arc;
 use codescope_core::Theme;
 use gpui::{
     Context, FocusHandle, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    SharedString, Styled, Window, anchored, deferred, div, point, px,
+    SharedString, StatefulInteractiveElement, Styled, Window, anchored, deferred, div, point, px,
 };
 
 use crate::theme;
@@ -255,7 +255,10 @@ impl CommandPaletteState {
 
 // ─── Render helpers ────────────────────────────────────────────────────
 
-/// Render the palette overlay. Returns `None` when closed. Layered via
+/// Render the palette overlay. The caller (`AppShell::render_command_palette`)
+/// gates this on `self.command_palette.is_some()` and returns `None` itself
+/// when the palette is closed, so this function is only invoked while the
+/// state is live and always returns a concrete element. Layered via
 /// `deferred(anchored(...))` so it paints on top of everything else —
 /// same trick the dialog modules use.
 pub(crate) fn render_palette(
@@ -317,13 +320,22 @@ pub(crate) fn render_palette(
 
     // Result rows. Iterate the filtered indices so the order matches
     // the ranker exactly.
+    //
+    // `flex_grow` + `min_h(0)` + `overflow_y_scroll` so a long action
+    // list (every project × worktree × theme × agent) clips + scrolls
+    // inside the card instead of getting cut off by the `max_h(520px)`
+    // outer bound. Same pattern the sidebar's project tree uses. Without
+    // `min_h(0)` a flex child defaults to its intrinsic height and the
+    // overflow setting is ignored.
     let mut rows = div()
         .id("palette-results")
         .flex()
         .flex_col()
+        .flex_grow()
         .px_2()
         .pb_3()
-        .overflow_hidden();
+        .overflow_y_scroll();
+    rows.style().min_size.height = Some(gpui::Length::Definite(px(0.0).into()));
 
     if state.filtered.is_empty() {
         rows = rows.child(
@@ -483,6 +495,17 @@ fn handle_key_down(
 ) {
     let key = event.keystroke.key.as_str();
     cx.stop_propagation();
+
+    // Ctrl+P / Ctrl+Shift+P while the palette is focused — the chord
+    // can't bubble to `AppShell::on_key_down` (we `stop_propagation`
+    // above), so we mirror its toggle-close behaviour locally. Without
+    // this, the open chord becomes a one-way trip and the user has to
+    // hit Esc or click the backdrop. Matches the menu / overview /
+    // sidebar single-chord toggle pattern across the rest of the chrome.
+    if key == "p" && event.keystroke.modifiers.control {
+        shell.close_command_palette(cx);
+        return;
+    }
 
     match key {
         "escape" => {
