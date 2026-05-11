@@ -2796,7 +2796,9 @@ impl AppShell {
                 .flex()
                 .flex_row()
                 .items_center()
-                .text_size(px(13.0))
+                // Tab context-menu items: `FontSize="12.5"` from
+                // `ContextMenuStyles.xaml` default MenuItem style.
+                .text_size(px(12.5))
                 .text_color(base_color)
                 .child(label);
             if enabled {
@@ -3281,6 +3283,12 @@ impl AppShell {
             .border_t_1()
             .border_color(divider_clr)
             .bg(theme::elevated(theme))
+            // C# `StatusBarView` SbText / SbBranch / SbTextMeta all
+            // share `FontFamily="{DynamicResource Fig.Font.Mono}"`
+            // and `FontSize="11.5"`. Setting the font + size on the
+            // root so every segment inherits — segments override
+            // colour only.
+            .font(theme::font_mono())
             .text_size(px(11.5))
             .text_color(ink_dim);
 
@@ -4250,14 +4258,21 @@ impl Render for AppShell {
             .overflow_hidden()
             .window_control_area(WindowControlArea::Drag)
             .child(
+                // CodeScope wordmark — `Fig.Font.Sans` @
+                // `FontSize="16"` SemiBold, see `MainWindow.xaml`.
                 div()
+                    .font(theme::font_sans())
                     .text_size(px(16.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme::ink(&theme))
                     .child("CodeScope"),
             )
             .child(
+                // Version slug — `Fig.Font.Mono` @ `FontSize="10"` in
+                // `MainWindow.xaml` (Text.Faint foreground; the closest
+                // themable analogue here is `ink_ghost`).
                 div()
+                    .font(theme::font_mono())
                     .text_size(px(10.0))
                     .text_color(theme::ink_ghost(&theme))
                     .truncate()
@@ -4589,6 +4604,15 @@ impl AppShell {
                 .border_color(top_border)
                 .bg(bg)
                 .text_color(text_color)
+                // Tab title font — `Fig.Font.Sans` @ `FontSize="13"`
+                // from `GroupStripView.xaml`. The C# template also
+                // dials FontWeight from 340 (unselected) to Medium
+                // (selected); gpui's variable-axis support is uneven
+                // across platforms so we keep a single weight here
+                // and rely on the ink_dim → ink contrast to mark the
+                // active tab.
+                .font(theme::font_sans())
+                .text_size(px(13.0))
                 .hover(move |s| {
                     if active { s } else { s.bg(frost_10).text_color(ink) }
                 })
@@ -4634,6 +4658,10 @@ impl AppShell {
                         .items_center()
                         .justify_center()
                         .rounded_full()
+                        // Close glyph — `FontSize="14"` on the WPF
+                        // `Button.Template` `TextBlock` (see
+                        // `GroupStripView.xaml`).
+                        .text_size(px(14.0))
                         .text_color(ink_ghost)
                         .hover(move |s| s.bg(frost_20).text_color(ink))
                         .on_mouse_down(
@@ -4661,7 +4689,11 @@ impl AppShell {
             .items_center()
             .justify_center()
             .text_color(ink_dim)
-            .text_size(px(18.0))
+            // `+` glyph — `FontSize="20"` on the new-session Button in
+            // `GroupStripView.xaml`. The button is 40×40 on Rust
+            // (vs 32×32 in C# since the Rust strip is merged with
+            // the title-bar row); the glyph itself stays at 20.
+            .text_size(px(20.0))
             .cursor_pointer()
             .hover(move |s| s.bg(new_tab_frost).text_color(new_tab_accent))
             .on_mouse_down(

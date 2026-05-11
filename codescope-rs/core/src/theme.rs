@@ -120,6 +120,12 @@ pub struct ThemeChrome {
     pub canvas: Rgb,
     /// Slightly elevated surface — tab strip, sidebar, status bar.
     pub elevated: Rgb,
+    /// Even-more-elevated surface — used for sidebar row hover /
+    /// selection fill. Mirrors `Surface.Color.Elev = #FF141414` from
+    /// `DesignTokens.xaml`; semantically the "card" / "active row"
+    /// surface that sits one tier above the panel `elevated` colour.
+    #[serde(default = "default_surface_elev")]
+    pub surface_elev: Rgb,
     /// Primary text on canvas / elevated.
     pub ink: Rgb,
     /// Muted text (timestamps, hints).
@@ -130,6 +136,11 @@ pub struct ThemeChrome {
     /// border. DESIGN.md §7 explicitly forbids a second accent.
     pub accent: Rgb,
 }
+
+/// `Surface.Color.Elev` from `DesignTokens.xaml` (`#FF141414`).
+/// Serde default for `ThemeChrome::surface_elev` so older `settings.json`
+/// files that omit the field still load.
+fn default_surface_elev() -> Rgb { Rgb::from_hex(0x141414) }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Theme {
