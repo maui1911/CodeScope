@@ -1513,11 +1513,26 @@ impl Render for Sidebar {
                         continue;
                     }
                     let key = s.worktree_id.clone().unwrap_or_default();
+                    // History rows show the agent type that was
+                    // running — "Claude Code", "Copilot CLI",
+                    // "OpenCode", "Pi", "Codex", or "shell" for a
+                    // plain pty tab. Custom `display_name` (set by
+                    // explicit rename) still wins so a user-chosen
+                    // label survives, but the bare session UUID is
+                    // never the visible label anymore.
+                    let agent_label = s.agent_id.as_deref().map(|id| match id {
+                        "claude" => "Claude Code",
+                        "copilot" => "Copilot CLI",
+                        "opencode" => "OpenCode",
+                        "pi" => "Pi",
+                        "codex" => "Codex",
+                        other => other,
+                    });
                     let label: SharedString = s
                         .display_name
                         .clone()
-                        .or_else(|| s.branch.clone())
-                        .unwrap_or_else(|| s.id.clone())
+                        .or_else(|| agent_label.map(|s| s.to_string()))
+                        .unwrap_or_else(|| "shell".to_string())
                         .into();
                     closed_by_wt
                         .entry(key)
@@ -2162,17 +2177,17 @@ impl Render for Sidebar {
                                     .border_1()
                                     .border_color(outline_color),
                             )
-                            // Strikethrough on the session label — soft
-                            // close visual cue mirroring the dimmer
-                            // history palette in the C# build's history
-                            // data template.
+                            // Dim label — `Opacity=0.55` on the C#
+                            // history DataTemplate, approximated here
+                            // by `text_color = ink_dim`. No
+                            // strikethrough in the WPF reference, so
+                            // we don't add one.
                             .child(
                                 div()
                                     .flex_grow()
                                     .truncate()
                                     .font(theme::font_mono())
                                     .text_color(label_color)
-                                    .line_through()
                                     .child(row.label.clone()),
                             )
                             .child(
