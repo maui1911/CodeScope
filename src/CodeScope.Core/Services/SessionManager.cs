@@ -25,12 +25,9 @@ public sealed class SessionManager : ISessionManager
             _logger.LogWarning("Session working directory does not exist: {Path}", workingDirectory);
         }
 
-        // Absolute pwsh path, quoted if it contains spaces — ConPTY's CreateProcess takes a single
-        // lpCommandLine string and won't correctly identify the exe otherwise.
         // -WorkingDirectory lands pwsh in the session folder while still loading the user profile,
         // so oh-my-posh / PSReadLine / aliases all come up as in Windows Terminal.
-        var shell = ResolveShell();
-        if (shell.Contains(' ') && shell[0] != '"') { shell = $"\"{shell}\""; }
+        var shell = ResolveShellQuoted();
         // `-NoExit -NoLogo` keep pwsh interactive after profile load — without it the pty
         // sometimes sees stdin close and pwsh exits immediately, producing the dreaded
         // "Session Terminated" pane. Mirrors the agent-session launch line.
@@ -100,11 +97,10 @@ public sealed class SessionManager : ISessionManager
         }
 
         // Resolve through the same probe as shell sessions so machines without pwsh 7
-        // fall back to Windows PowerShell 5.1 / cmd.exe instead of silently failing to
-        // spawn — hard-coding "pwsh.exe" left fresh Windows 11 boxes with a black agent
-        // terminal (CreateProcess ERROR_FILE_NOT_FOUND, eaten by SessionTabView.term.Start).
-        var shell = ResolveShell();
-        if (shell.Contains(' ') && shell[0] != '"') { shell = $"\"{shell}\""; }
+        // fall back to Windows PowerShell 5.1 instead of silently failing to spawn —
+        // hard-coding "pwsh.exe" left fresh Windows 11 boxes with a black agent terminal
+        // (CreateProcess ERROR_FILE_NOT_FOUND, eaten by SessionTabView.term.Start).
+        var shell = ResolveShellQuoted();
 
         return new SessionDescriptor
         {
@@ -151,16 +147,33 @@ public sealed class SessionManager : ISessionManager
         return [.. resumeByIdArgs, sessionId];
     }
 
+    /// <summary>
+    /// Single source of truth for the ConPTY shell path used by both shell and agent
+    /// sessions. Returns an absolute path, double-quoted when it contains spaces —
+    /// ConPTY's CreateProcess takes one lpCommandLine string and won't correctly
+    /// identify the exe otherwise.
+    /// </summary>
+    private static string ResolveShellQuoted()
+    {
+        var shell = ResolveShell();
+        return shell.Length > 0 && shell[0] != '"' && shell.Contains(' ')
+            ? $"\"{shell}\""
+            : shell;
+    }
+
     private static string ResolveShell()
     {
-        // Prefer pwsh 7 (cross-platform PowerShell) so oh-my-posh / PSReadLine / user profile
-        // all light up. Fall back to Windows PowerShell, then cmd as a last resort.
+        // Prefer pwsh 7 (cross-platform PowerShell) so oh-my-posh / PSReadLine / user
+        // profile all light up. Fall back to Windows PowerShell 5.1, which ships with
+        // every supported Windows version (10/11) so it is effectively always present.
+        // No cmd.exe fallback: both shell and agent launch lines are PowerShell-specific
+        // (`-NoExit -NoLogo -WorkingDirectory [-Command "& { ... }"]`) and would fail
+        // against cmd.exe — better to keep the contract honest.
         string[] candidates =
         [
             @"C:\Program Files\PowerShell\7\pwsh.exe",
             @"C:\Program Files\PowerShell\7-preview\pwsh.exe",
             @"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
-            @"C:\Windows\System32\cmd.exe",
         ];
         foreach (var c in candidates)
         {
