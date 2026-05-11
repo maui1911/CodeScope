@@ -52,6 +52,14 @@ pub struct Settings {
     /// to match the C# build's `AgentRegistry.BuildDefaults` flag.
     /// Lookup against `AgentRegistry` is case-insensitive, so a
     /// hand-edited `"Codex"` resolves to the `codex` profile.
+    ///
+    /// Serialised as `defaultAgent` to match the camelCase shape
+    /// used by every other on-disk config in the app
+    /// (`ProjectsConfig`, `AgentProfile`). The `default_agent` alias
+    /// keeps any settings.json hand-rolled against an early build of
+    /// this PR — when the field briefly serialised as snake_case —
+    /// loading without surprise.
+    #[serde(rename = "defaultAgent", alias = "default_agent")]
     pub default_agent: String,
 
     /// Optional user-defined agent overrides. When non-empty, the
@@ -249,6 +257,33 @@ mod tests {
 
         let loaded = Settings::load_from(&path).unwrap();
         assert_eq!(loaded.default_agent, "codex");
+    }
+
+    #[test]
+    fn default_agent_serialises_as_camel_case() {
+        let mut settings = Settings::default();
+        settings.default_agent = "codex".into();
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(
+            json.contains("\"defaultAgent\""),
+            "settings.json must use camelCase for defaultAgent: {json}"
+        );
+        assert!(
+            !json.contains("\"default_agent\""),
+            "settings.json must not emit snake_case key: {json}"
+        );
+    }
+
+    #[test]
+    fn default_agent_snake_case_alias_still_loads() {
+        // Early builds of the agent-registry PR wrote `default_agent`
+        // (snake_case). The alias keeps those files round-tripping
+        // cleanly — they reload as if the key had been camelCase.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"default_agent":"codex"}"#).unwrap();
+        let settings = Settings::load_from(&path).unwrap();
+        assert_eq!(settings.default_agent, "codex");
     }
 
     #[test]

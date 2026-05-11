@@ -109,11 +109,42 @@ impl AgentRegistry {
     /// `settings.agents` is non-empty those overrides are used as-is;
     /// otherwise the built-in defaults are returned. Mirrors C#
     /// `AgentRegistry.FromConfig`.
+    ///
+    /// `settings.default_agent` is then reconciled onto the resulting
+    /// list — the profile whose id matches (case-insensitive) is
+    /// flagged `is_default = true` and every other profile is demoted
+    /// to `false`. This keeps `get_default()` honest no matter which
+    /// of the two settings surfaces the user touched. Empty or
+    /// unknown ids leave the list untouched, so a typo in
+    /// `settings.json` doesn't silently wipe the built-in default.
     pub fn from_settings(settings: &Settings) -> Self {
-        if settings.agents.is_empty() {
-            Self::with_built_ins()
+        let agents = if settings.agents.is_empty() {
+            built_in_defaults()
         } else {
-            Self::new(settings.agents.clone())
+            settings.agents.clone()
+        };
+        let mut reg = Self::new(agents);
+        reg.apply_default_agent(&settings.default_agent);
+        reg
+    }
+
+    /// Apply a `settings.default_agent` id onto the in-memory list:
+    /// the matching profile is flagged default and all others are
+    /// demoted. No-op when the id is empty or not present in the
+    /// registry — preserves whatever `is_default` flags were already
+    /// baked in (built-in defaults flag Claude; custom overrides
+    /// might flag something else).
+    fn apply_default_agent(&mut self, default_agent_id: &str) {
+        if default_agent_id.is_empty() {
+            return;
+        }
+        let target_idx = self
+            .agents
+            .iter()
+            .position(|a| a.id.eq_ignore_ascii_case(default_agent_id));
+        let Some(idx) = target_idx else { return };
+        for (i, agent) in self.agents.iter_mut().enumerate() {
+            agent.is_default = i == idx;
         }
     }
 
@@ -351,6 +382,45 @@ mod tests {
         let reg = AgentRegistry::from_settings(&settings);
         assert_eq!(reg.get_all().len(), 1);
         assert_eq!(reg.get_default().unwrap().id, "custom");
+    }
+
+    #[test]
+    fn from_settings_honours_default_agent_setting() {
+        // `settings.default_agent = "codex"` must flip `is_default`
+        // on the codex profile and demote every other built-in
+        // (Claude included) so `get_default()` returns Codex without
+        // the caller having to hand-edit per-profile flags.
+        let mut settings = Settings::default();
+        settings.default_agent = "codex".into();
+        let reg = AgentRegistry::from_settings(&settings);
+        let def = reg.get_default().expect("default present");
+        assert_eq!(def.id, "codex");
+        assert!(def.is_default);
+        // Claude must have been demoted.
+        let claude = reg.get_by_id("claude").unwrap();
+        assert!(!claude.is_default);
+    }
+
+    #[test]
+    fn from_settings_default_agent_lookup_is_case_insensitive() {
+        // Hand-edited `settings.json` with `"defaultAgent": "Codex"`
+        // (mixed case) still resolves — matches the lookup behaviour
+        // of `get_by_id`.
+        let mut settings = Settings::default();
+        settings.default_agent = "CODEX".into();
+        let reg = AgentRegistry::from_settings(&settings);
+        assert_eq!(reg.get_default().unwrap().id, "codex");
+    }
+
+    #[test]
+    fn from_settings_unknown_default_agent_leaves_built_in_flag_intact() {
+        // Typos must not silently wipe the baked-in default — the
+        // user should still get Claude back when they fat-finger an
+        // unknown id.
+        let mut settings = Settings::default();
+        settings.default_agent = "gemini".into();
+        let reg = AgentRegistry::from_settings(&settings);
+        assert_eq!(reg.get_default().unwrap().id, "claude");
     }
 
     #[test]

@@ -1193,6 +1193,17 @@ impl AppShell {
                         for (t_idx, tab) in group.tabs.iter().enumerate() {
                             let Some(agent_id) = tab.agent_id else { continue };
                             let Some(ref wd) = tab.working_directory else { continue };
+                            // Codex has no discovery wired in the Rust
+                            // port yet — skip before flipping
+                            // `any_active`, otherwise an all-Codex
+                            // workspace would pin the poll at the
+                            // 350 ms active rate while the loop does
+                            // no work. Drop it through with the same
+                            // "no agent" handling so the cadence
+                            // relaxes to the 5 s idle interval.
+                            if matches!(agent_id, codescope_core::AgentId::Codex) {
+                                continue;
+                            }
                             any_active = true;
                             let wd_str = wd.to_string_lossy().into_owned();
                             // Each agent scan returns
@@ -1254,9 +1265,12 @@ impl AppShell {
                                     .collect()
                                 }
                                 codescope_core::AgentId::Codex => {
-                                    // Codex discovery isn't wired in
-                                    // the Rust port yet — skip scanning
-                                    // so the polling loop keeps moving.
+                                    // Unreachable: short-circuited
+                                    // above so the active-poll rate
+                                    // doesn't stay pinned for an
+                                    // all-Codex workspace. Kept as a
+                                    // belt-and-braces fallback in case
+                                    // someone removes the early skip.
                                     continue;
                                 }
                             };
