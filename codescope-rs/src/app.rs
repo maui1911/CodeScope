@@ -2848,9 +2848,7 @@ impl AppShell {
         // ─── Inputs ──────────────────────────────────────────────
         let group_count = self.groups.len();
         let focused_group = self.focused_group();
-        let tab_count = focused_group.tabs.len();
-        let active_tab_idx = focused_group.active_tab;
-        let active_tab = focused_group.tabs.get(active_tab_idx);
+        let active_tab = focused_group.tabs.get(focused_group.active_tab);
 
         let active_working_dir: Option<String> = active_tab
             .and_then(|t| t.working_directory.as_ref())
@@ -2859,14 +2857,15 @@ impl AppShell {
             .and_then(|t| t.adopted_session_id.clone());
         let active_title: Option<SharedString> = active_tab.map(|t| t.title.clone());
 
-        let (git, worktree_total, worktree_dirty) = {
+        let (git, worktree_total, worktree_dirty, projects_empty) = {
             let sidebar = self.sidebar.read(cx);
             let g = active_working_dir
                 .as_deref()
                 .and_then(|p| sidebar.git_status_for(p))
                 .cloned();
             let (t, d) = sidebar.worktree_counts();
-            (g, t, d)
+            let empty = sidebar.projects().projects.is_empty();
+            (g, t, d, empty)
         };
 
         let snapshot = active_session_id
@@ -2891,18 +2890,27 @@ impl AppShell {
         let sep = move || div().w_px().h(px(14.0)).bg(divider_clr);
 
         // ─── Left cluster ───────────────────────────────────────
-        // Only render the session dot + branch when we actually have
-        // a git context (worktree resolved → `GitStatus` cached).
-        // Plain shell tabs and tabs whose working directory has not
-        // yet surfaced fall through to the title-only branch below,
-        // matching the docstring's `StatusHasSession` rule.
+        // The session dot + branch/title renders whenever any tab is
+        // focused — matches C# `StatusHasSession = SelectedTab is not
+        // null`. The dot itself is coloured by telemetry state below;
+        // shell tabs without a snapshot fall through to `signal_ok`.
         let session_dot_color = match snapshot.as_ref().map(|s| s.state) {
             Some(codescope_core::SessionState::Busy)
             | Some(codescope_core::SessionState::PendingToolUse) => signal_warn,
             _ => signal_ok,
         };
-        let session_cluster = git.as_ref().map(|g| {
-            let branch: SharedString = g.branch.clone().into();
+        // C# `StatusHasSession` = `SelectedTab is not null` — so the
+        // session cluster (dot + branch/title) renders whenever there's
+        // any focused tab, even when no git context has surfaced yet
+        // (shell tabs, unresolved working dir). Branch comes from the
+        // worktree's `DisplayBranch` when available; otherwise we fall
+        // back to the tab title, exactly like the C# `StatusBranch`.
+        let session_cluster = active_tab.map(|_| {
+            let branch_text: SharedString = match (git.as_ref(), active_title.clone()) {
+                (Some(g), _) => g.branch.clone().into(),
+                (None, Some(t)) => t,
+                (None, None) => SharedString::from(""),
+            };
             div()
                 .flex()
                 .flex_row()
@@ -2916,10 +2924,16 @@ impl AppShell {
                         .bg(session_dot_color),
                 )
                 .child(
+                    // `flex_grow` + `truncate` so a long tab title /
+                    // branch name doesn't shove the right cluster off
+                    // the bar — matches the WPF `TextTrimming` on the
+                    // C# `StatusBranch` TextBlock.
                     div()
+                        .flex_grow()
+                        .truncate()
                         .text_color(ink)
                         .font_weight(gpui::FontWeight::MEDIUM)
-                        .child(branch),
+                        .child(branch_text),
                 )
         });
 
@@ -3081,31 +3095,45 @@ impl AppShell {
         } else {
             None
         };
-        let tab_label = if tab_count == 0 {
-            "no tabs".to_string()
-        } else {
-            format!("tab {}/{}", active_tab_idx + 1, tab_count)
-        };
+        // C# `StatusBarView` has no tab counter — the count is implied
+        // by the tab strip itself, so we no longer render a "tab N/M"
+        // segment here.
 
-        // Workspace summary — `N worktrees · M dirty`. The middle
-        // dot only appears when the dirty segment is visible.
-        let worktree_text = format!(
-            "{} {}",
-            worktree_total,
-            if worktree_total == 1 { "worktree" } else { "worktrees" }
-        );
-        let mut workspace_summary = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(6.0))
-            .text_color(ink_dim)
-            .child(div().child(worktree_text));
-        if worktree_dirty > 0 {
-            workspace_summary = workspace_summary
-                .child(div().child("·"))
-                .child(div().child(format!("{} dirty", worktree_dirty)));
-        }
+        // Workspace summary — `N worktrees · M dirty`. Only rendered
+        // when at least one worktree is tracked; the middle dot only
+        // appears when the dirty segment is visible. Mirrors
+        // C# `StatusWorkspaceVisible` / `StatusDirtyVisible`.
+        let workspace_summary = (worktree_total > 0).then(|| {
+            let worktree_text = format!(
+                "{} {}",
+                worktree_total,
+                if worktree_total == 1 { "worktree" } else { "worktrees" }
+            );
+            let mut row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .text_color(ink_dim)
+                .child(div().child(worktree_text));
+            if worktree_dirty > 0 {
+                row = row
+                    .child(div().child("·"))
+                    .child(div().child(format!("{} dirty", worktree_dirty)));
+            }
+            row
+        });
+
+        // Empty-state tagline — `StatusEmptyVisible` in C# is
+        // `Projects.Count == 0`, regardless of whether a tab is
+        // focused. The session cluster yields to it below so the
+        // status bar reads as the empty-state hint even if a stray
+        // shell tab is open.
+        let empty_state = projects_empty.then(|| {
+            div()
+                .text_color(ink_dim)
+                .child("CodeScope — add a project to begin.")
+        });
 
         // ─── Bell button ─────────────────────────────────────────
         let has_unread = self.notifications.has_unread();
@@ -3193,69 +3221,88 @@ impl AppShell {
             .text_size(px(11.5))
             .text_color(ink_dim);
 
-        // Build the left cluster as a list of optional segments,
-        // then intersperse `sep()` so a missing segment never leaves
-        // a stray separator behind. Same pattern for the right
-        // cluster — both mirror the C# `StatusBarView` 1×14 rule
-        // placement: rules sit *between* visible items only.
-        let left_segments: Vec<gpui::AnyElement> = {
-            let mut v: Vec<gpui::AnyElement> = Vec::new();
-            if let Some(seg) = session_cluster {
-                v.push(seg.into_any_element());
-            } else {
-                let title_text: SharedString = active_title
-                    .unwrap_or_else(|| SharedString::from("(empty group)"));
-                v.push(
-                    div()
-                        .truncate()
-                        .text_color(ink)
-                        .child(title_text)
-                        .into_any_element(),
-                );
+        // Segments are grouped into *clusters*; separators sit
+        // between non-empty clusters only, matching the C#
+        // `StatusBarView` layout where Rectangle separators appear at
+        // specific boundaries (session→git, model-cluster→agents,
+        // agents→groups, groups/workspace→bell) rather than between
+        // every neighbouring segment.
+        //
+        // Left clusters:
+        //   [session dot + branch] | [git diff, remote sync]
+        // Right clusters:
+        //   [model, tokens, turns, duration] | [agents] | [groups]
+        //   | [workspace summary] | [bell]
+        let left_clusters: Vec<Vec<gpui::AnyElement>> = {
+            let mut clusters: Vec<Vec<gpui::AnyElement>> = Vec::new();
+            // Empty-state wins over the session cluster — matches
+            // C#: with 0 projects the bar reads "add a project to
+            // begin." even if a shell tab happens to be open.
+            if let Some(seg) = empty_state {
+                clusters.push(vec![seg.into_any_element()]);
+            } else if let Some(seg) = session_cluster {
+                clusters.push(vec![seg.into_any_element()]);
             }
+            let mut git_cluster: Vec<gpui::AnyElement> = Vec::new();
             if let Some(seg) = diff_segment {
-                v.push(seg.into_any_element());
+                git_cluster.push(seg.into_any_element());
             }
             if let Some(seg) = remote_segment {
-                v.push(seg.into_any_element());
+                git_cluster.push(seg.into_any_element());
             }
-            v
+            if !git_cluster.is_empty() {
+                clusters.push(git_cluster);
+            }
+            clusters
         };
-        let mut right_segments: Vec<gpui::AnyElement> = Vec::new();
-        if let Some(seg) = model_segment {
-            right_segments.push(seg.into_any_element());
-        }
-        if let Some(seg) = tokens_segment {
-            right_segments.push(seg.into_any_element());
-        }
-        if let Some(seg) = turns_segment {
-            right_segments.push(seg.into_any_element());
-        }
-        if let Some(seg) = duration_segment {
-            right_segments.push(seg.into_any_element());
-        }
-        if let Some(seg) = agent_segment {
-            right_segments.push(seg.into_any_element());
-        }
-        if let Some(gl) = group_label {
-            right_segments.push(div().child(gl).into_any_element());
-        }
-        right_segments.push(workspace_summary.into_any_element());
-        right_segments.push(div().child(tab_label).into_any_element());
-        right_segments.push(bell_btn.into_any_element());
 
-        for (i, seg) in left_segments.into_iter().enumerate() {
-            if i > 0 {
+        let right_clusters: Vec<Vec<gpui::AnyElement>> = {
+            let mut clusters: Vec<Vec<gpui::AnyElement>> = Vec::new();
+            let mut model_cluster: Vec<gpui::AnyElement> = Vec::new();
+            if let Some(seg) = model_segment {
+                model_cluster.push(seg.into_any_element());
+            }
+            if let Some(seg) = tokens_segment {
+                model_cluster.push(seg.into_any_element());
+            }
+            if let Some(seg) = turns_segment {
+                model_cluster.push(seg.into_any_element());
+            }
+            if let Some(seg) = duration_segment {
+                model_cluster.push(seg.into_any_element());
+            }
+            if !model_cluster.is_empty() {
+                clusters.push(model_cluster);
+            }
+            if let Some(seg) = agent_segment {
+                clusters.push(vec![seg.into_any_element()]);
+            }
+            if let Some(gl) = group_label {
+                clusters.push(vec![div().child(gl).into_any_element()]);
+            }
+            if let Some(seg) = workspace_summary {
+                clusters.push(vec![seg.into_any_element()]);
+            }
+            clusters.push(vec![bell_btn.into_any_element()]);
+            clusters
+        };
+
+        for (ci, cluster) in left_clusters.into_iter().enumerate() {
+            if ci > 0 {
                 bar = bar.child(sep());
             }
-            bar = bar.child(seg);
+            for seg in cluster {
+                bar = bar.child(seg);
+            }
         }
         bar = bar.child(div().flex_grow());
-        for (i, seg) in right_segments.into_iter().enumerate() {
-            if i > 0 {
+        for (ci, cluster) in right_clusters.into_iter().enumerate() {
+            if ci > 0 {
                 bar = bar.child(sep());
             }
-            bar = bar.child(seg);
+            for seg in cluster {
+                bar = bar.child(seg);
+            }
         }
         bar
     }
