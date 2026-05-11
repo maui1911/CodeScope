@@ -564,6 +564,16 @@ pub struct AppShell {
     /// the C# build where `SessionStore` is the orchestrator and
     /// `SidebarViewModel.StoreSync` projects from it.
     projects: ProjectsConfig,
+    /// Registry of agent profiles built from `settings.agents`
+    /// overrides (or the shipped built-in defaults when none are
+    /// configured). Mirrors C# `AgentRegistry` — owned at the shell
+    /// level so the future new-session menu can list agents, pick the
+    /// user's preferred default, and look up by id on session restore.
+    /// Not yet consumed by any view; held here so the registry is live
+    /// from cold-start and the sidebar integration in a follow-up PR
+    /// only has to wire the consumer side.
+    #[allow(dead_code)]
+    agent_registry: codescope_core::AgentRegistry,
 }
 
 impl AppShell {
@@ -864,6 +874,12 @@ impl AppShell {
             .focused_group_index
             .min(groups.len().saturating_sub(1));
 
+        // Build the agent registry up-front from the loaded settings so
+        // user overrides in `settings.agents` are honoured, otherwise
+        // the shipped 5-agent defaults (claude/codex/opencode/copilot/pi)
+        // are used. Cheap — just a `Vec<AgentProfile>` clone.
+        let agent_registry = codescope_core::AgentRegistry::from_settings(&settings);
+
         let mut shell = Self {
             groups,
             focused_group,
@@ -889,6 +905,7 @@ impl AppShell {
             bell_bounds: None,
             last_announced_update: None,
             projects: projects_for_sessions,
+            agent_registry,
         };
         shell.start_telemetry_poll(cx);
         shell.start_agent_discovery_poll(cx);
@@ -991,6 +1008,17 @@ impl AppShell {
                     root,
                     session_id.clone(),
                 ))
+            }
+            codescope_core::AgentId::Codex => {
+                // Codex telemetry isn't wired in the Rust port yet (the
+                // AgentRegistry entry exists ahead of the discovery
+                // layer); skip registration so the rest of the agent
+                // surface keeps working until the dedicated Codex
+                // discovery / telemetry modules land.
+                eprintln!(
+                    "[telemetry] codex telemetry not yet wired — skipping registration for {session_id}"
+                );
+                return;
             }
             codescope_core::AgentId::Pi => {
                 let Some(root) = codescope_core::pi_telemetry::default_sessions_root() else {
@@ -1180,6 +1208,17 @@ impl AppShell {
                         for (t_idx, tab) in group.tabs.iter().enumerate() {
                             let Some(agent_id) = tab.agent_id else { continue };
                             let Some(ref wd) = tab.working_directory else { continue };
+                            // Codex has no discovery wired in the Rust
+                            // port yet — skip before flipping
+                            // `any_active`, otherwise an all-Codex
+                            // workspace would pin the poll at the
+                            // 350 ms active rate while the loop does
+                            // no work. Drop it through with the same
+                            // "no agent" handling so the cadence
+                            // relaxes to the 5 s idle interval.
+                            if matches!(agent_id, codescope_core::AgentId::Codex) {
+                                continue;
+                            }
                             any_active = true;
                             let wd_str = wd.to_string_lossy().into_owned();
                             // Each agent scan returns
@@ -1239,6 +1278,15 @@ impl AppShell {
                                     .into_iter()
                                     .map(|c| (c.session_id, c.session_dir))
                                     .collect()
+                                }
+                                codescope_core::AgentId::Codex => {
+                                    // Unreachable: short-circuited
+                                    // above so the active-poll rate
+                                    // doesn't stay pinned for an
+                                    // all-Codex workspace. Kept as a
+                                    // belt-and-braces fallback in case
+                                    // someone removes the early skip.
+                                    continue;
                                 }
                             };
                             let mut newest: Option<(SystemTime, String)> = None;
