@@ -2890,11 +2890,10 @@ impl AppShell {
         let sep = move || div().w_px().h(px(14.0)).bg(divider_clr);
 
         // ─── Left cluster ───────────────────────────────────────
-        // Only render the session dot + branch when we actually have
-        // a git context (worktree resolved → `GitStatus` cached).
-        // Plain shell tabs and tabs whose working directory has not
-        // yet surfaced fall through to the title-only branch below,
-        // matching the docstring's `StatusHasSession` rule.
+        // The session dot + branch/title renders whenever any tab is
+        // focused — matches C# `StatusHasSession = SelectedTab is not
+        // null`. The dot itself is coloured by telemetry state below;
+        // shell tabs without a snapshot fall through to `signal_ok`.
         let session_dot_color = match snapshot.as_ref().map(|s| s.state) {
             Some(codescope_core::SessionState::Busy)
             | Some(codescope_core::SessionState::PendingToolUse) => signal_warn,
@@ -2925,7 +2924,13 @@ impl AppShell {
                         .bg(session_dot_color),
                 )
                 .child(
+                    // `flex_grow` + `truncate` so a long tab title /
+                    // branch name doesn't shove the right cluster off
+                    // the bar — matches the WPF `TextTrimming` on the
+                    // C# `StatusBranch` TextBlock.
                     div()
+                        .flex_grow()
+                        .truncate()
                         .text_color(ink)
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .child(branch_text),
@@ -3119,10 +3124,12 @@ impl AppShell {
             row
         });
 
-        // Empty-state tagline — `StatusEmptyVisible` in C#. Shown in
-        // the left cluster only when the user hasn't added any
-        // projects yet (no tabs to focus, no git context to surface).
-        let empty_state = (projects_empty && active_tab.is_none()).then(|| {
+        // Empty-state tagline — `StatusEmptyVisible` in C# is
+        // `Projects.Count == 0`, regardless of whether a tab is
+        // focused. The session cluster yields to it below so the
+        // status bar reads as the empty-state hint even if a stray
+        // shell tab is open.
+        let empty_state = projects_empty.then(|| {
             div()
                 .text_color(ink_dim)
                 .child("CodeScope — add a project to begin.")
@@ -3228,9 +3235,12 @@ impl AppShell {
         //   | [workspace summary] | [bell]
         let left_clusters: Vec<Vec<gpui::AnyElement>> = {
             let mut clusters: Vec<Vec<gpui::AnyElement>> = Vec::new();
-            if let Some(seg) = session_cluster {
+            // Empty-state wins over the session cluster — matches
+            // C#: with 0 projects the bar reads "add a project to
+            // begin." even if a shell tab happens to be open.
+            if let Some(seg) = empty_state {
                 clusters.push(vec![seg.into_any_element()]);
-            } else if let Some(seg) = empty_state {
+            } else if let Some(seg) = session_cluster {
                 clusters.push(vec![seg.into_any_element()]);
             }
             let mut git_cluster: Vec<gpui::AnyElement> = Vec::new();

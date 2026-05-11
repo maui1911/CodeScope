@@ -1089,8 +1089,10 @@ mod tests {
 
     #[test]
     fn format_tokens_extremely_large_uses_one_decimal_m() {
-        // Far above the largest known context window — must still
-        // produce a stable two-or-three-char-with-suffix string.
+        // Far above the largest known context window — the function
+        // must still produce a non-panicking, consistent `<value>M`
+        // string with a single fractional digit (no scientific
+        // notation, no trailing zero stripping). Length isn't bounded.
         assert_eq!(format_tokens(999_999_999), "1000.0M");
     }
 
