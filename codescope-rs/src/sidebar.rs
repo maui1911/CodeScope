@@ -1668,7 +1668,9 @@ impl Render for Sidebar {
             .items_center()
             .px_3()
             .text_size(px(11.0))
-            .text_color(theme::ink_muted(&theme))
+            // C# `SidebarView.xaml` paints PROJECTS with `Text.Faint`
+            // (#FF606060), not `Text.Secondary`.
+            .text_color(theme::text_faint())
             .child(div().flex_grow().child("PROJECTS"))
             .child(
                 div()
@@ -1700,7 +1702,9 @@ impl Render for Sidebar {
                 div()
                     .px_3()
                     .py_4()
-                    .text_size(px(12.0))
+                    // C# `SidebarView.xaml` dashed-box hint uses
+                    // `FontSize="11.5"` for its body copy.
+                    .text_size(px(11.5))
                     .text_color(theme::ink_ghost(&theme))
                     .child("No projects yet. Click + to add one."),
             )
@@ -1730,8 +1734,13 @@ impl Render for Sidebar {
                 !wt.canonical_path.is_empty()
                     && self.busy_paths.contains(&wt.canonical_path)
             });
+            // Sidebar row hover / selection fill — `#141414`
+            // (Surface.Color.Elev). C# `SidebarView.xaml` hard-codes
+            // `#141414` on both `IsMouseOver` and `IsSelected` triggers,
+            // so both states resolve to this single colour instead of
+            // the `frost_10` overlay we used before.
             let bg = if active {
-                theme::frost_10(&theme)
+                theme::surface_elev(&theme)
             } else {
                 gpui::transparent_black()
             };
@@ -1740,12 +1749,13 @@ impl Render for Sidebar {
             } else {
                 gpui::transparent_black()
             };
-            let text_color = if active {
-                theme::ink(&theme)
-            } else {
-                theme::ink_dim(&theme)
-            };
-            let frost_hover = theme::frost_10(&theme);
+            // Project name colour stays `Text.Primary` (white) in C#
+            // `SidebarView.xaml` regardless of selection state — only
+            // the row background + accent rail switch on active. Mirror
+            // that: ink always; ink_dim was a previous Rust-side
+            // departure we're rolling back for parity.
+            let text_color = theme::ink(&theme);
+            let frost_hover = theme::surface_elev(&theme);
             let ink_hover = theme::ink(&theme);
 
             let collapsed = self.collapsed_projects.contains(&id);
@@ -1765,7 +1775,9 @@ impl Render for Sidebar {
                 .items_center()
                 .justify_center()
                 .text_size(px(10.0))
-                .text_color(theme::ink_ghost(&theme))
+                // Chevron stroke — `Text.Secondary` (ink_muted) in C#
+                // `SidebarView.xaml` (`Stroke="{DynamicResource Text.Secondary}"`).
+                .text_color(theme::ink_muted(&theme))
                 .cursor_pointer()
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1908,7 +1920,8 @@ impl Render for Sidebar {
                     project_name,
                     wt_label,
                 ));
-                let frost_hover = theme::frost_10(&theme);
+                // Worktree row hover — same `#141414` fill as project rows.
+                let frost_hover = theme::surface_elev(&theme);
                 let ink_hover = theme::ink(&theme);
                 // Resolve agent-state for this worktree's 6 px dot.
                 // Mirrors C# `WorktreeViewModel.DotState`:
@@ -1973,8 +1986,14 @@ impl Render for Sidebar {
                     .pl(px(32.0))
                     .pr_3()
                     .gap_2()
-                    .text_color(theme::ink_ghost(&theme))
-                    .text_size(px(12.0))
+                    // Branch label default — `Text.Secondary` =
+                    // `Fig.Color.InkMuted` (#A6A6A6) per the C# template.
+                    // Selected-row override (white + Medium) is a TODO —
+                    // tracking row selection lands with #133 follow-up.
+                    .text_color(theme::ink_muted(&theme))
+                    // Worktree row text size — mirrors `FontSize="11.5"` on
+                    // the `DisplayBranch` TextBlock in `SidebarView.xaml`.
+                    .text_size(px(11.5))
                     .cursor_pointer()
                     .hover(move |s| s.bg(frost_hover).text_color(ink_hover))
                     .on_mouse_down(
@@ -2115,7 +2134,10 @@ impl Render for Sidebar {
                             .ml(px(8.0))
                             .mr(px(4.0))
                             .text_size(px(10.0))
-                            .text_color(theme::ink_ghost(&theme))
+                            // Status slug — `Text.Faint` (#606060) in
+                            // the C# `WorktreeViewModel.StatusLabel`
+                            // TextBlock, mono.
+                            .text_color(theme::text_faint())
                             .font(theme::font_mono())
                             .child(status_slug),
                     )
@@ -2143,7 +2165,9 @@ impl Render for Sidebar {
                             .items_center()
                             .justify_center()
                             .text_size(px(10.0))
-                            .text_color(theme::ink_ghost(&theme))
+                            // History chevron — `Stroke="{DynamicResource Text.Faint}"`
+                            // in `SidebarView.xaml`.
+                            .text_color(theme::text_faint())
                             .cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -2168,10 +2192,17 @@ impl Render for Sidebar {
                 // `SessionManager::reopen` and spawn a fresh tab.
                 if has_history && history_expanded {
                     let now_iso = codescope_core::session::now_iso8601();
-                    let outline_color = theme::ink_ghost(&theme);
-                    let label_color = theme::ink_dim(&theme);
-                    let ts_color = theme::ink_ghost(&theme);
-                    let frost_hover = theme::frost_10(&theme);
+                    // Outline dot stroke + timestamp share `Text.Faint`
+                    // in the C# `SessionTabViewModel` history template
+                    // (`Stroke="{DynamicResource Text.Faint}"` and
+                    // `Foreground="{DynamicResource Text.Faint}"`).
+                    // Label foreground is `Text.Secondary` (ink_muted).
+                    let outline_color = theme::text_faint();
+                    let label_color = theme::ink_muted(&theme);
+                    let ts_color = theme::text_faint();
+                    // History row hover — same `#141414` fill as
+                    // every other row in the sidebar tree.
+                    let frost_hover = theme::surface_elev(&theme);
                     let ink_hover = theme::ink(&theme);
                     for row in wt.closed_sessions.into_iter() {
                         let session_id = row.session_id.clone();
@@ -2292,7 +2323,6 @@ impl Render for Sidebar {
             let elev = theme::elevated(&theme);
             let divider = theme::divider(&theme);
             let ink_dim = theme::ink_dim(&theme);
-            let ink_ghost = theme::ink_ghost(&theme);
             let accent = theme::accent(&theme);
 
             // Overview button — 36 px tall, dim text, mono ⌃⇧O keycap
@@ -2325,6 +2355,9 @@ impl Render for Sidebar {
                 )
                 .child(div().flex_grow().child("Overview"))
                 .child(
+                    // Overview keycap — `Foreground="{DynamicResource Text.Faint}"`
+                    // on the inner TextBlock in `SidebarView.xaml`,
+                    // mono.
                     div()
                         .px(px(5.0))
                         .py(px(1.0))
@@ -2332,7 +2365,7 @@ impl Render for Sidebar {
                         .border_color(divider)
                         .rounded(px(3.0))
                         .text_size(px(10.0))
-                        .text_color(ink_ghost)
+                        .text_color(theme::text_faint())
                         .font(theme::font_mono())
                         .child("⌃⇧ O"),
                 );
@@ -2492,7 +2525,9 @@ impl Sidebar {
                 .flex()
                 .flex_row()
                 .items_center()
-                .text_size(px(13.0))
+                // Context-menu items: `FontSize="12.5"` (Fig.Font.Sans)
+                // per `ContextMenuStyles.xaml` default MenuItem style.
+                .text_size(px(12.5))
                 .text_color(base_color)
                 .cursor_pointer()
                 .hover(move |s| s.bg(frost_hover).text_color(hover_color))
@@ -2516,15 +2551,27 @@ impl Sidebar {
             .border_color(divider)
             .rounded_md()
             .shadow_lg()
+            // Default MenuItem `FontFamily="Fig.Font.Sans"` from
+            // `ContextMenuStyles.xaml`. Per-row overrides (mono title
+            // in the header) re-apply `font_mono` themselves.
+            .font(theme::font_sans())
             // Header — non-interactive, mirrors the C# `BuildContextHeader`
-            // (project name dimmed, "project" qualifier).
+            // (`ContextMenuFactory.cs`): mono title at 11 px on the
+            // first line, sans subtitle at 10 px on the second.
             .child(
                 div()
                     .px_3()
                     .py_2()
-                    .text_size(px(11.0))
+                    .text_size(px(10.0))
                     .text_color(ink_ghost)
-                    .child(div().text_color(ink).text_size(px(13.0)).truncate().child(header_label))
+                    .child(
+                        div()
+                            .text_color(ink)
+                            .font(theme::font_mono())
+                            .text_size(px(11.0))
+                            .truncate()
+                            .child(header_label),
+                    )
                     .child(div().child("project")),
             )
             .child(div().h_px().bg(divider).my_1())
@@ -2720,7 +2767,9 @@ impl Sidebar {
                 .flex()
                 .flex_row()
                 .items_center()
-                .text_size(px(13.0))
+                // Context-menu items: `FontSize="12.5"` (Fig.Font.Sans)
+                // per `ContextMenuStyles.xaml` default MenuItem style.
+                .text_size(px(12.5))
                 .text_color(base_color)
                 .cursor_pointer()
                 .hover(move |s| s.bg(frost_hover).text_color(hover_color))
@@ -2744,13 +2793,24 @@ impl Sidebar {
             .border_color(divider)
             .rounded_md()
             .shadow_lg()
+            // Same default MenuItem sans family as the project menu.
+            .font(theme::font_sans())
             .child(
+                // Same `BuildContextHeader` layout as the project menu:
+                // mono title @ 11 px (branch / leaf), 10 px subtitle.
                 div()
                     .px_3()
                     .py_2()
-                    .text_size(px(11.0))
+                    .text_size(px(10.0))
                     .text_color(ink_ghost)
-                    .child(div().text_color(ink).text_size(px(13.0)).truncate().child(branch_label))
+                    .child(
+                        div()
+                            .text_color(ink)
+                            .font(theme::font_mono())
+                            .text_size(px(11.0))
+                            .truncate()
+                            .child(branch_label),
+                    )
                     .child(div().truncate().child(project_label)),
             )
             .child(div().h_px().bg(divider).my_1())
@@ -2863,7 +2923,8 @@ impl Sidebar {
                         .flex()
                         .flex_row()
                         .items_center()
-                        .text_size(px(13.0))
+                        // Same 12.5 px parity as the `item` helper above.
+                        .text_size(px(12.5))
                         .text_color(ink_dim)
                         .cursor_pointer()
                         .hover(move |s| s.bg(frost_hover).text_color(ink))

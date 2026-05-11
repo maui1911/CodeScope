@@ -61,6 +61,14 @@ pub fn with_alpha(rgb: Rgb, alpha: f32) -> Hsla {
 
 pub fn canvas(theme: &Theme) -> Hsla { rgb_to_hsla(theme.chrome.canvas) }
 pub fn elevated(theme: &Theme) -> Hsla { rgb_to_hsla(theme.chrome.elevated) }
+/// `Surface.Color.Elev` from `DesignTokens.xaml` (`#FF141414` on the
+/// default theme). Used as the sidebar row hover / selection fill —
+/// see `SidebarView.xaml` `IsMouseOver` / `IsSelected` triggers, which
+/// hard-set the row background to `#141414`. The frosted-glass
+/// `frost_10` overlay was the previous Rust approximation but renders
+/// noticeably lighter than C#; using the canonical elev colour gives
+/// pixel-level parity with the C# build.
+pub fn surface_elev(theme: &Theme) -> Hsla { rgb_to_hsla(theme.chrome.surface_elev) }
 pub fn ink(theme: &Theme) -> Hsla { rgb_to_hsla(theme.chrome.ink) }
 pub fn ink_muted(theme: &Theme) -> Hsla { rgb_to_hsla(theme.chrome.ink_muted) }
 pub fn divider(theme: &Theme) -> Hsla { rgb_to_hsla(theme.chrome.divider) }
@@ -101,6 +109,15 @@ pub fn status_dirty(_theme: &Theme) -> Hsla { rgb_to_hsla(Rgb::from_hex(0xf5a623
 /// clean worktree visually rhymes with the focus / accent rail
 /// elsewhere in the chrome.
 pub fn status_clean(theme: &Theme) -> Hsla { accent(theme) }
+
+/// `Text.Color.Faint` from `DesignTokens.xaml` (`#FF606060`). Used for
+/// the sidebar "PROJECTS" caption, status-slug labels, history
+/// timestamps, the Overview keycap, and any other tertiary-ink slot
+/// the C# build paints with `Text.Faint`. Hard-coded — themable later
+/// when a theme picker actually wants to override it; in the meantime
+/// every shipped chrome tier (default + the four guest themes) reads
+/// fine at this grey.
+pub fn text_faint() -> Hsla { rgb_to_hsla(Rgb::from_hex(0x606060)) }
 
 /// Foreground for destructive context-menu entries ("Remove project",
 /// "Discard changes…"). Mirrors `Ctx.Color.Danger` from the C# build's
@@ -287,6 +304,21 @@ pub fn font_mono() -> Font {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lock the canonical signal / text-faint hex values from
+    /// `DesignTokens.xaml`. `signal_ok` / `signal_warn` / `text_faint`
+    /// are hard-coded (themable later), so a regression here would
+    /// silently drift the chrome away from the C# build:
+    ///
+    /// * `Signal.Color.Ok`   = `#FF4BD87B`
+    /// * `Signal.Color.Warn` = `#FFFF5A5A`
+    /// * `Text.Color.Faint`  = `#FF606060`
+    #[test]
+    fn signal_and_text_faint_match_design_tokens() {
+        assert_eq!(signal_ok(),   rgb_to_hsla(Rgb::from_hex(0x4BD87B)));
+        assert_eq!(signal_warn(), rgb_to_hsla(Rgb::from_hex(0xFF5A5A)));
+        assert_eq!(text_faint(),  rgb_to_hsla(Rgb::from_hex(0x606060)));
+    }
 
     /// Lock the full `Fig.Font.Sans` ordering. Asserting the exact
     /// list (not just `contains`) catches accidental reorders /

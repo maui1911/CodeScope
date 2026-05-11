@@ -38,12 +38,23 @@ pub fn codescope_default() -> Theme {
         display_name: "CodeScope (Framer Blue)".into(),
         dark: true,
         chrome: ThemeChrome {
-            canvas:    Rgb::from_hex(0x000000),
-            elevated:  Rgb::from_hex(0x090909),
-            ink:       Rgb::from_hex(0xffffff),
-            ink_muted: Rgb::from_hex(0xa6a6a6),
-            divider:   Rgb::from_hex(0x222222),
-            accent:    Rgb::from_hex(0x0099ff),
+            // Canonical mapping from `DesignTokens.xaml`:
+            //   canvas        = Fig.Color.Canvas         = #FF000000
+            //   elevated      = Fig.Color.NearBlack      = #FF090909
+            //   surface_elev  = Surface.Color.Elev       = #FF141414
+            //   ink           = Fig.Color.Ink            = #FFFFFFFF
+            //   ink_muted     = Fig.Color.InkMuted       = #FFA6A6A6
+            //   divider       = Fig.Color.Divider (#22FFFFFF over #000000
+            //                   ≈ #222222), kept hex-flattened so a
+            //                   non-Hsla brush works the same.
+            //   accent        = Framer.Color.Blue        = #FF0099FF
+            canvas:       Rgb::from_hex(0x000000),
+            elevated:     Rgb::from_hex(0x090909),
+            surface_elev: Rgb::from_hex(0x141414),
+            ink:          Rgb::from_hex(0xffffff),
+            ink_muted:    Rgb::from_hex(0xa6a6a6),
+            divider:      Rgb::from_hex(0x222222),
+            accent:       Rgb::from_hex(0x0099ff),
         },
         palette: build_palette(
             // VS Code dark — same 16 colours as v0.x C# build.
@@ -64,12 +75,13 @@ pub fn vs_code_dark() -> Theme {
         display_name: "VS Code Dark".into(),
         dark: true,
         chrome: ThemeChrome {
-            canvas:    Rgb::from_hex(0x1e1e1e),
-            elevated:  Rgb::from_hex(0x252526),
-            ink:       Rgb::from_hex(0xcccccc),
-            ink_muted: Rgb::from_hex(0x9da5b4),
-            divider:   Rgb::from_hex(0x3c3c3c),
-            accent:    Rgb::from_hex(0x007acc),
+            canvas:       Rgb::from_hex(0x1e1e1e),
+            elevated:     Rgb::from_hex(0x252526),
+            surface_elev: Rgb::from_hex(0x2d2d30),
+            ink:          Rgb::from_hex(0xcccccc),
+            ink_muted:    Rgb::from_hex(0x9da5b4),
+            divider:      Rgb::from_hex(0x3c3c3c),
+            accent:       Rgb::from_hex(0x007acc),
         },
         palette: build_palette(
             [
@@ -91,12 +103,13 @@ pub fn one_dark() -> Theme {
         display_name: "One Dark".into(),
         dark: true,
         chrome: ThemeChrome {
-            canvas:    Rgb::from_hex(0x282c34),
-            elevated:  Rgb::from_hex(0x21252b),
-            ink:       Rgb::from_hex(0xabb2bf),
-            ink_muted: Rgb::from_hex(0x5c6370),
-            divider:   Rgb::from_hex(0x3e4452),
-            accent:    Rgb::from_hex(0x61afef),
+            canvas:       Rgb::from_hex(0x282c34),
+            elevated:     Rgb::from_hex(0x21252b),
+            surface_elev: Rgb::from_hex(0x2c313c),
+            ink:          Rgb::from_hex(0xabb2bf),
+            ink_muted:    Rgb::from_hex(0x5c6370),
+            divider:      Rgb::from_hex(0x3e4452),
+            accent:       Rgb::from_hex(0x61afef),
         },
         palette: build_palette(
             [
@@ -117,12 +130,13 @@ pub fn solarized_dark() -> Theme {
         display_name: "Solarized Dark".into(),
         dark: true,
         chrome: ThemeChrome {
-            canvas:    Rgb::from_hex(0x002b36),
-            elevated:  Rgb::from_hex(0x073642),
-            ink:       Rgb::from_hex(0x839496),
-            ink_muted: Rgb::from_hex(0x586e75),
-            divider:   Rgb::from_hex(0x094049),
-            accent:    Rgb::from_hex(0x268bd2),
+            canvas:       Rgb::from_hex(0x002b36),
+            elevated:     Rgb::from_hex(0x073642),
+            surface_elev: Rgb::from_hex(0x0a4452),
+            ink:          Rgb::from_hex(0x839496),
+            ink_muted:    Rgb::from_hex(0x586e75),
+            divider:      Rgb::from_hex(0x094049),
+            accent:       Rgb::from_hex(0x268bd2),
         },
         palette: build_palette(
             [
@@ -143,12 +157,13 @@ pub fn tokyo_night() -> Theme {
         display_name: "Tokyo Night".into(),
         dark: true,
         chrome: ThemeChrome {
-            canvas:    Rgb::from_hex(0x1a1b26),
-            elevated:  Rgb::from_hex(0x16161e),
-            ink:       Rgb::from_hex(0xc0caf5),
-            ink_muted: Rgb::from_hex(0x565f89),
-            divider:   Rgb::from_hex(0x2a2e3f),
-            accent:    Rgb::from_hex(0x7aa2f7),
+            canvas:       Rgb::from_hex(0x1a1b26),
+            elevated:     Rgb::from_hex(0x16161e),
+            surface_elev: Rgb::from_hex(0x24283b),
+            ink:          Rgb::from_hex(0xc0caf5),
+            ink_muted:    Rgb::from_hex(0x565f89),
+            divider:      Rgb::from_hex(0x2a2e3f),
+            accent:       Rgb::from_hex(0x7aa2f7),
         },
         palette: build_palette(
             [
@@ -204,4 +219,60 @@ fn build_extended(ansi: &[Rgb; 16]) -> Vec<Rgb> {
     }
     debug_assert_eq!(out.len(), 256);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    //! Lock the canonical chrome hex values shipped by the default
+    //! theme. These come straight from
+    //! `src/CodeScope.App/Styles/DesignTokens.xaml`:
+    //!
+    //! * `Fig.Color.Canvas`     = `#FF000000`
+    //! * `Fig.Color.NearBlack`  = `#FF090909` (the `Surface.Panel` brush)
+    //! * `Surface.Color.Elev`   = `#FF141414`
+    //! * `Fig.Color.Ink`        = `#FFFFFFFF`
+    //! * `Fig.Color.InkMuted`   = `#FFA6A6A6`
+    //! * `Fig.Color.Divider`    = `#22FFFFFF` (alpha-blended white over
+    //!    `Canvas` flattens to ≈ `#222222`)
+    //! * `Framer.Color.Blue`    = `#FF0099FF`
+    //!
+    //! Any accidental drift in these values silently shifts the chrome
+    //! away from the C# build — this test is the first thing that fails
+    //! when someone edits the hex.
+    use super::*;
+
+    #[test]
+    fn default_chrome_matches_design_tokens() {
+        let t = codescope_default();
+        assert_eq!(t.chrome.canvas,       Rgb::from_hex(0x000000));
+        assert_eq!(t.chrome.elevated,     Rgb::from_hex(0x090909));
+        assert_eq!(t.chrome.surface_elev, Rgb::from_hex(0x141414));
+        assert_eq!(t.chrome.ink,          Rgb::from_hex(0xffffff));
+        assert_eq!(t.chrome.ink_muted,    Rgb::from_hex(0xa6a6a6));
+        assert_eq!(t.chrome.divider,      Rgb::from_hex(0x222222));
+        assert_eq!(t.chrome.accent,       Rgb::from_hex(0x0099ff));
+    }
+
+    #[test]
+    fn surface_elev_serde_default_applies_when_field_absent() {
+        // External theme JSON predating `surface_elev` must still
+        // deserialise cleanly. `#[serde(default)]` should fall back
+        // to `default_surface_elev()` (= `#141414`) when the field is
+        // missing rather than failing the parse. Encoded inline as
+        // raw JSON so the test catches both the rename of the field
+        // and the removal of the default attribute.
+        let json = concat!(
+            "{",
+            "\"canvas\":\"#000000\",",
+            "\"elevated\":\"#090909\",",
+            "\"ink\":\"#ffffff\",",
+            "\"ink_muted\":\"#a6a6a6\",",
+            "\"divider\":\"#222222\",",
+            "\"accent\":\"#0099ff\"",
+            "}"
+        );
+        let chrome: ThemeChrome = serde_json::from_str(json)
+            .expect("legacy chrome JSON without surface_elev should deserialise");
+        assert_eq!(chrome.surface_elev, Rgb::from_hex(0x141414));
+    }
 }
