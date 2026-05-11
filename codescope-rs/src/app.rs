@@ -574,6 +574,11 @@ pub struct AppShell {
     /// only has to wire the consumer side.
     #[allow(dead_code)]
     agent_registry: codescope_core::AgentRegistry,
+    /// Open command palette state, if any. `Some` between Ctrl+P /
+    /// Ctrl+Shift+P press and Enter / Esc. Holds the action list,
+    /// search query, and selection cursor — see
+    /// [`crate::command_palette::CommandPaletteState`].
+    command_palette: Option<crate::command_palette::CommandPaletteState>,
     /// Overview-panel visibility. While `true`, the work area
     /// (group strip + terminal grid) is hidden and replaced by the
     /// full-pane [`crate::overview::AppShell::render_overview`]; the
@@ -940,6 +945,7 @@ impl AppShell {
             last_announced_update: None,
             projects: projects_for_sessions,
             agent_registry,
+            command_palette: None,
             show_overview: false,
             settings_dialog: None,
         };
@@ -3925,6 +3931,22 @@ impl AppShell {
         // word-shortcuts, so power users typing in readline /
         // PSReadLine can still hit the chord without rebinding.
         match key {
+            // Ctrl+P / Ctrl+Shift+P — open the command palette. Both
+            // chords share an opener so the user can use the one their
+            // muscle memory prefers; mirrors C#'s `OpenCommandPaletteCommand`
+            // input binding (the C# build wires Ctrl+P + Ctrl+Shift+P
+            // identically). Toggle behaviour: if the palette is already
+            // open, re-pressing the chord closes it — same as a
+            // single-key chord pattern across the rest of the chrome
+            // (sidebar / overview toggles).
+            "p" => {
+                cx.stop_propagation();
+                if self.command_palette.is_some() {
+                    self.close_command_palette(cx);
+                } else {
+                    self.open_command_palette(window, cx);
+                }
+            }
             // Ctrl+, opens the Settings dialog. Windows convention,
             // also the VS Code binding. The Rust port adds an
             // in-app Settings UI (the C# build hand-edits
@@ -4604,7 +4626,24 @@ impl Render for AppShell {
             .children(self.render_tab_menu(&theme, cx))
             .children(self.render_toasts(&theme, cx))
             .children(self.render_notifications_popover(&theme, cx))
+            .children(self.render_command_palette(window, &theme, cx))
             .children(self.render_settings_dialog(window, &theme, cx))
+    }
+}
+
+impl AppShell {
+    /// Render the palette overlay when one is open. Returned as an
+    /// `Option<AnyElement>` so the caller can `.children(...)` it
+    /// directly into the root layout — same pattern as the toast /
+    /// notifications popover renders.
+    fn render_command_palette(
+        &self,
+        window: &mut Window,
+        theme: &Arc<Theme>,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let state = self.command_palette.as_ref()?;
+        Some(crate::command_palette::render_palette(state, window, theme, cx))
     }
 }
 
@@ -4648,6 +4687,390 @@ struct GroupRenderData {
     weight: f32,
     tabs: Vec<TabRenderData>,
     active_terminal: Option<Entity<TerminalView>>,
+}
+
+// ─── Command palette ────────────────────────────────────────────────
+//
+// Ctrl+P / Ctrl+Shift+P open the palette modal. Action assembly +
+// dispatch live here so we have direct access to every AppShell
+// method we route to (spawn_tab_in, apply_settings, toggle_sidebar,
+// sidebar updates). The state struct and the render function live in
+// `crate::command_palette` — this block is just the glue.
+
+impl AppShell {
+    /// Accessor for the optional palette state — exposed so the
+    /// key-handler in `crate::command_palette` can mutate the query /
+    /// selection without us threading a `&mut Option` through every
+    /// frame.
+    pub(crate) fn command_palette_mut(
+        &mut self,
+    ) -> Option<&mut crate::command_palette::CommandPaletteState> {
+        self.command_palette.as_mut()
+    }
+
+    /// Open the palette. Idempotent — re-pressing Ctrl+P while the
+    /// palette is open closes it (the chord toggles, mirroring the
+    /// sidebar / overview chords). Builds the action list from the
+    /// current sidebar / settings snapshot the same way C#
+    /// `BuildPaletteActions` does on every open.
+    pub fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.command_palette.is_some() {
+            return;
+        }
+        let actions = self.build_palette_actions(cx);
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        let state =
+            crate::command_palette::CommandPaletteState::new(actions, focus_handle);
+        self.command_palette = Some(state);
+        cx.notify();
+    }
+
+    /// Close without dispatching. Drops the state; the focus handle is
+    /// dropped with it so a follow-up key press routes to the AppShell
+    /// root handler again.
+    pub fn close_command_palette(&mut self, cx: &mut Context<Self>) {
+        if self.command_palette.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Activate the row at index `row_idx` *within the filtered list*.
+    /// Bound from the row's mouse-down so a single click runs the
+    /// action even if the user hadn't navigated to that row first. We
+    /// move the highlight and then immediately dispatch through the
+    /// same path Enter takes so the click and keyboard arms remain
+    /// behaviourally identical.
+    pub fn activate_palette_row(
+        &mut self,
+        row_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = self.command_palette.as_mut()
+            && row_idx < state.filtered.len()
+        {
+            state.selected = row_idx;
+        }
+        self.submit_command_palette(window, cx);
+    }
+
+    /// Dispatch the currently selected action and close the palette.
+    /// Mirrors C# `CommandPaletteDialog.Commit`.
+    pub fn submit_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let action = match self.command_palette.as_ref().and_then(|s| s.selected_action()) {
+            Some(a) => a.clone(),
+            None => {
+                // Nothing to do — just close, same as Esc.
+                self.close_command_palette(cx);
+                return;
+            }
+        };
+        // Close first so the action runs against a "clean" frame and
+        // any toasts the action surfaces are visible underneath the
+        // dropped overlay.
+        self.close_command_palette(cx);
+        self.dispatch_palette_action(action, window, cx);
+    }
+
+    /// Run a palette action. Each variant maps to an existing
+    /// AppShell / Sidebar entry point — no new behaviour, the palette
+    /// is a thin keyboard-driven front-end over the same methods the
+    /// menus and shortcuts already use.
+    fn dispatch_palette_action(
+        &mut self,
+        action: crate::command_palette::PaletteAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::command_palette::{BuiltInCommand, PaletteActionKind};
+        match action.kind {
+            PaletteActionKind::Project { sidebar_index, .. } => {
+                self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.select(sidebar_index, cx);
+                });
+            }
+            PaletteActionKind::Worktree { working_directory, title, .. } => {
+                // Focus-or-open semantics, matching the worktree-row
+                // click default — `force_new: false` lets the existing
+                // tab-match logic in `spawn_tab_in`'s callers do the
+                // right thing. We go through the same path the
+                // sidebar's OpenSession event hits.
+                self.open_or_focus_session(working_directory, title, None, false, window, cx);
+            }
+            PaletteActionKind::Agent { command, display_name, .. } => {
+                // Start a fresh tab running the agent. `auto_type` is
+                // the command name; the shell will resolve it via PATH
+                // (claude / codex / opencode / etc — same UX as the
+                // sidebar's "New Claude session" rows).
+                let cwd = self.active_project_path(cx).map(std::path::PathBuf::from);
+                let title: SharedString = display_name.clone().into();
+                self.spawn_palette_agent_tab(cwd, title, command.into(), window, cx);
+            }
+            PaletteActionKind::Theme { id, display_name } => {
+                // Live-apply: rewrite settings.theme, persist, and
+                // re-resolve through `apply_settings` so the chrome
+                // and the sidebar repaint immediately.
+                let mut next = (*self.settings).clone();
+                next.theme = id.clone();
+                if let Err(err) = next.save(&self.paths) {
+                    eprintln!("warning: failed to persist theme change: {err:#}");
+                }
+                self.apply_settings(next, cx);
+                self.push_toast(
+                    ToastKind::Ok,
+                    SharedString::from(format!("Theme: {display_name}")),
+                    None,
+                    cx,
+                );
+            }
+            PaletteActionKind::Command(cmd) => match cmd {
+                BuiltInCommand::ToggleOverview => {
+                    // Toggle the overview pane. Mirrors the Ctrl+Shift+O
+                    // chord (and the sidebar footer "Overview" button)
+                    // — same `set_show_overview` entry point so the
+                    // palette never has to duplicate the panel-flip
+                    // bookkeeping.
+                    let next = !self.show_overview;
+                    self.set_show_overview(next, cx);
+                }
+                BuiltInCommand::ToggleSidebar => {
+                    self.toggle_sidebar(cx);
+                }
+                BuiltInCommand::NewProject => {
+                    self.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.open_new_project_dialog(window, cx);
+                    });
+                }
+                BuiltInCommand::NewSession => {
+                    self.spawn_tab(window, cx);
+                }
+                BuiltInCommand::OpenSettings => {
+                    let path = self.paths.settings_file();
+                    if let Err(err) = open_in_native_browser(&path) {
+                        eprintln!("warning: failed to open settings.json: {err:#}");
+                        self.push_toast(
+                            ToastKind::Err,
+                            SharedString::from("Couldn't open settings.json"),
+                            Some(format!("{err}").into()),
+                            cx,
+                        );
+                    }
+                }
+                BuiltInCommand::ReloadTheme => {
+                    // Re-resolve the theme from the current settings
+                    // value. If the user has hand-edited
+                    // `settings.json` to a different theme name, this
+                    // picks the change up without a restart.
+                    let settings_clone = (*self.settings).clone();
+                    self.apply_settings(settings_clone, cx);
+                    self.push_toast(
+                        ToastKind::Ok,
+                        SharedString::from("Theme reloaded"),
+                        None,
+                        cx,
+                    );
+                }
+            },
+        }
+    }
+
+    /// Build the palette's action list from the current sidebar /
+    /// settings snapshot. Captured at open time — re-runs only on a
+    /// fresh open, not on every keystroke. Mirrors C#
+    /// `MainViewModel.BuildPaletteActions`.
+    fn build_palette_actions(
+        &self,
+        cx: &Context<Self>,
+    ) -> Vec<crate::command_palette::PaletteAction> {
+        use crate::command_palette::{
+            BuiltInCommand, PaletteAction, PaletteActionKind, PaletteGroup,
+        };
+        let mut out: Vec<PaletteAction> = Vec::new();
+
+        // Static built-in commands — always available, regardless of
+        // sidebar state. We leave `subtitle = None`: the renderer
+        // already shows `cmd.hint()` as the right-aligned chord text
+        // for `PaletteActionKind::Command` rows, so duplicating it in
+        // the subtitle would paint the same chord twice on the same
+        // row. The chord still feeds the fuzzy scorer because the
+        // renderer's hint path is independent of search input — the
+        // search target is `PaletteAction::display`, and a user
+        // typing the chord (e.g. "Ctrl+B") still finds Toggle sidebar
+        // via the title fragment.
+        for cmd in [
+            BuiltInCommand::NewSession,
+            BuiltInCommand::ToggleSidebar,
+            BuiltInCommand::ToggleOverview,
+            BuiltInCommand::NewProject,
+            BuiltInCommand::OpenSettings,
+            BuiltInCommand::ReloadTheme,
+        ] {
+            out.push(PaletteAction {
+                kind: PaletteActionKind::Command(cmd),
+                title: cmd.title().into(),
+                subtitle: None,
+                group: PaletteGroup::Commands,
+            });
+        }
+
+        // Themes — one row per built-in. Live-applied on activate.
+        for theme in codescope_core::theme::builtin::all() {
+            out.push(PaletteAction {
+                kind: PaletteActionKind::Theme {
+                    id: theme.name.clone(),
+                    display_name: theme.display_name.clone(),
+                },
+                title: format!("Theme: {}", theme.display_name).into(),
+                subtitle: Some(theme.name.clone().into()),
+                group: PaletteGroup::Themes,
+            });
+        }
+
+        // Agents — one row per registered profile. Spawns a new tab in
+        // the active project's directory and auto-types the agent's
+        // command.
+        for agent in self.agent_registry.get_all() {
+            out.push(PaletteAction {
+                kind: PaletteActionKind::Agent {
+                    id: agent.id.clone(),
+                    display_name: agent.display_name.clone(),
+                    command: agent.command.clone(),
+                },
+                title: format!("Agent: {}", agent.display_name).into(),
+                subtitle: Some(agent.command.clone().into()),
+                group: PaletteGroup::Agents,
+            });
+        }
+
+        // Projects + their worktrees — one row each. Project row
+        // selects in the sidebar; worktree row opens / focuses a
+        // session.
+        let sidebar = self.sidebar.read(cx);
+        for (project_idx, project) in sidebar.projects().projects.iter().enumerate() {
+            out.push(PaletteAction {
+                kind: PaletteActionKind::Project {
+                    sidebar_index: project_idx,
+                    name: project.name.clone(),
+                },
+                title: format!("Project: {}", project.name).into(),
+                subtitle: Some(project.path.clone().into()),
+                group: PaletteGroup::Projects,
+            });
+
+            // `Project::worktrees` already includes the primary tree
+            // as a `is_primary: true` row (seeded in `Project::new`),
+            // so a single loop covers both the primary and any
+            // non-primary worktrees the user has created.
+            for wt in &project.worktrees {
+                let branch = wt
+                    .branch
+                    .clone()
+                    .unwrap_or_else(|| project.default_branch.clone());
+                out.push(PaletteAction {
+                    kind: PaletteActionKind::Worktree {
+                        working_directory: std::path::PathBuf::from(&wt.path),
+                        title: format!("{} · {}", project.name, branch).into(),
+                        branch: branch.clone(),
+                        project_name: project.name.clone(),
+                    },
+                    title: format!("Open: {} · {}", project.name, branch).into(),
+                    subtitle: Some(wt.path.clone().into()),
+                    group: PaletteGroup::Worktrees,
+                });
+            }
+        }
+
+        out
+    }
+
+    /// Open or focus a session for `working_directory`. Mirrors the
+    /// sidebar's `OpenSession` event handler the AppShell already has
+    /// wired up via `cx.subscribe_in` — we route through the same code
+    /// path so palette dispatch and a worktree-row click produce
+    /// identical results.
+    fn open_or_focus_session(
+        &mut self,
+        working_directory: std::path::PathBuf,
+        title: SharedString,
+        auto_type: Option<SharedString>,
+        force_new: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !force_new {
+            // Walk every group's tabs for a working-directory match.
+            // If we find one, activate it instead of spawning.
+            for g_idx in 0..self.groups.len() {
+                for t_idx in 0..self.groups[g_idx].tabs.len() {
+                    if self.groups[g_idx].tabs[t_idx].working_directory.as_deref()
+                        == Some(working_directory.as_path())
+                    {
+                        self.activate_tab(g_idx, t_idx, window, cx);
+                        return;
+                    }
+                }
+            }
+        }
+        self.spawn_tab_in(
+            Some(working_directory),
+            Some(title),
+            auto_type,
+            None,
+            window,
+            cx,
+        );
+    }
+
+    /// Spawn a new tab pinned to a working directory and auto-type a
+    /// command into it — used by the palette's Agent action. Wrapped
+    /// to keep the dispatch arm thin.
+    fn spawn_palette_agent_tab(
+        &mut self,
+        working_directory: Option<std::path::PathBuf>,
+        title: SharedString,
+        auto_type: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.spawn_tab_in(working_directory, Some(title), Some(auto_type), None, window, cx);
+    }
+
+    /// Active project's working directory, if any. Used by the agent
+    /// action to pick `cwd` for the spawn. Returns `None` when no
+    /// project is selected — the spawn falls back to the default cwd
+    /// (whatever `spawn_tab_in` resolves from settings).
+    fn active_project_path(&self, cx: &Context<Self>) -> Option<String> {
+        self.sidebar
+            .read(cx)
+            .active_project()
+            .map(|p| p.path.clone())
+    }
+}
+
+/// Open a path with the platform's default handler. Windows routes
+/// through `ShellExecuteW` and is fire-and-forget — `shell_open_url`
+/// doesn't surface failure, so the Windows arm always returns
+/// `Ok(())` even if the shell can't find a handler for the file. The
+/// macOS / Linux arms shell out to `open` / `xdg-open` and propagate
+/// the spawn error so a missing binary surfaces as a toast. Used by
+/// the palette's "Open settings" row to hand `settings.json` off to
+/// the user's preferred editor.
+fn open_in_native_browser(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let path_str = path.to_string_lossy().into_owned();
+        crate::win32_titlebar::shell_open_url(&path_str);
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(path).spawn().map(|_| ())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(path).spawn().map(|_| ())
+    }
 }
 
 impl AppShell {

@@ -17,6 +17,7 @@ pub mod agent;
 pub mod agent_registry;
 pub mod claude_discovery;
 pub mod claude_telemetry;
+pub mod command_palette;
 pub mod copilot_discovery;
 pub mod copilot_telemetry;
 pub mod crash_log;
