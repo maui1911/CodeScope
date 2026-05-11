@@ -526,15 +526,30 @@ impl TranscriptTail {
         }
     }
 
-    /// Format `last_turn_duration` as `m:ss` or `Xs` (mirrors the
-    /// C# status-bar formatting).
+    /// Format `last_turn_duration` for the status-bar turn-time
+    /// segment. Mirrors C# `MainViewModel.FormatDuration`:
+    /// - `< 10s` → one decimal, e.g. `"3.1s"`
+    /// - `< 60s` → integer seconds, e.g. `"42s"`
+    /// - `< 1h`  → `"2m 12s"`
+    /// - else   → `"1h 4m"`
     pub fn format_duration(d: Duration) -> String {
-        let total = d.as_secs();
-        if total < 60 {
-            format!("{total}s")
-        } else {
-            format!("{}:{:02}", total / 60, total % 60)
+        let secs = d.as_secs_f64();
+        if secs < 10.0 {
+            // C#'s `0.0` format uses banker's rounding but at this scale
+            // the difference is invisible — keep it simple.
+            return format!("{:.1}s", secs);
         }
+        if secs < 60.0 {
+            return format!("{}s", secs.floor() as u64);
+        }
+        if secs < 3600.0 {
+            let m = (secs / 60.0).floor() as u64;
+            let s = (secs % 60.0).floor() as u64;
+            return format!("{m}m {s}s");
+        }
+        let h = (secs / 3600.0).floor() as u64;
+        let m = ((secs % 3600.0) / 60.0).floor() as u64;
+        format!("{h}h {m}m")
     }
 }
 
@@ -952,23 +967,59 @@ mod tests {
     }
 
     #[test]
-    fn format_duration_under_minute() {
-        assert_eq!(TranscriptTail::format_duration(Duration::from_secs(45)), "45s");
-    }
-
-    #[test]
-    fn format_duration_minutes() {
+    fn format_duration_under_10s_keeps_one_decimal() {
+        // Mirrors C# `FormatDuration` "{seconds:0.0}s" branch.
         assert_eq!(
-            TranscriptTail::format_duration(Duration::from_secs(134)),
-            "2:14"
+            TranscriptTail::format_duration(Duration::from_millis(0)),
+            "0.0s"
+        );
+        assert_eq!(
+            TranscriptTail::format_duration(Duration::from_millis(3_100)),
+            "3.1s"
+        );
+        assert_eq!(
+            TranscriptTail::format_duration(Duration::from_millis(9_999)),
+            "10.0s"
         );
     }
 
     #[test]
-    fn format_duration_exactly_one_minute() {
+    fn format_duration_under_minute_uses_integer_seconds() {
+        assert_eq!(TranscriptTail::format_duration(Duration::from_secs(10)), "10s");
+        assert_eq!(TranscriptTail::format_duration(Duration::from_secs(45)), "45s");
+        assert_eq!(TranscriptTail::format_duration(Duration::from_secs(59)), "59s");
+    }
+
+    #[test]
+    fn format_duration_minutes_use_m_s_format() {
+        // C# emits `"{m}m {s}s"` — no leading zeros on seconds.
         assert_eq!(
             TranscriptTail::format_duration(Duration::from_secs(60)),
-            "1:00"
+            "1m 0s"
+        );
+        assert_eq!(
+            TranscriptTail::format_duration(Duration::from_secs(134)),
+            "2m 14s"
+        );
+        assert_eq!(
+            TranscriptTail::format_duration(Duration::from_secs(3_599)),
+            "59m 59s"
+        );
+    }
+
+    #[test]
+    fn format_duration_hours_use_h_m_format() {
+        assert_eq!(
+            TranscriptTail::format_duration(Duration::from_secs(3_600)),
+            "1h 0m"
+        );
+        assert_eq!(
+            TranscriptTail::format_duration(Duration::from_secs(3_900)),
+            "1h 5m"
+        );
+        assert_eq!(
+            TranscriptTail::format_duration(Duration::from_secs(7_265)),
+            "2h 1m"
         );
     }
 
@@ -989,6 +1040,14 @@ mod tests {
     fn model_display_name_empty_falls_back_to_claude() {
         assert_eq!(model_display_name(""), "claude");
         assert_eq!(model_display_name("   "), "claude");
+    }
+
+    #[test]
+    fn model_display_name_trims_trailing_dash_before_bracket() {
+        // A trailing `-` directly before the `[1m]` tag would otherwise
+        // produce `"opus-"` — guard against that for any future ids
+        // that hyphenate before the context-window suffix.
+        assert_eq!(model_display_name("claude-opus-[1m]"), "opus");
     }
 
     // --- format_tokens ---
@@ -1018,6 +1077,21 @@ mod tests {
         assert_eq!(format_tokens(1_000_000), "1.00M");
         assert_eq!(format_tokens(1_234_567), "1.23M");
         assert_eq!(format_tokens(12_345_678), "12.3M");
+    }
+
+    #[test]
+    fn format_tokens_at_thousands_boundary_stays_raw() {
+        // Rust port keeps small values raw — the `k` switchover is at
+        // 10k, *not* 1k like the C# build (documented deviation).
+        assert_eq!(format_tokens(1_000), "1000");
+        assert_eq!(format_tokens(5_500), "5500");
+    }
+
+    #[test]
+    fn format_tokens_extremely_large_uses_one_decimal_m() {
+        // Far above the largest known context window — must still
+        // produce a stable two-or-three-char-with-suffix string.
+        assert_eq!(format_tokens(999_999_999), "1000.0M");
     }
 
     // --- format_context_pct ---
