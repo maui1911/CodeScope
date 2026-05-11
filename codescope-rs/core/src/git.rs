@@ -320,9 +320,10 @@ pub fn remove_worktree(repo: &Path, path: &Path, force: bool) -> Result<()> {
 
 /// Compute the short right-aligned status slug shown on a sidebar
 /// worktree row.  Mirrors C# `WorktreeViewModel.StatusLabel`; the
-/// `busy` (active agent) and `ci!` (failing PR CI) cases the C#
-/// build supports aren't included here yet — the Rust port has no
-/// per-tab session model and no PR integration. Returns:
+/// `busy` (active agent) case isn't included here yet — the Rust port
+/// has no per-tab session model. The `ci!` PR-CI-failure case lives in
+/// [`worktree_status_label_with_ci`]; callers that already have a
+/// `CiStatus` in hand should prefer that variant. Returns:
 ///
 /// * `"chg"` — working tree is dirty (numstat or untracked-only),
 /// * `"↑N"` / `"↓N"` / `"↑N ↓N"` — clean but out of sync,
@@ -331,6 +332,17 @@ pub fn remove_worktree(repo: &Path, path: &Path, force: bool) -> Result<()> {
 ///              shows "idle"; we hide the label so a brand-new
 ///              standalone branch doesn't claim sync state).
 pub fn worktree_status_label(status: &GitStatus) -> String {
+    worktree_status_label_with_ci(status, crate::pr::CiStatus::None)
+}
+
+/// Same as [`worktree_status_label`] but also surfaces `"ci!"` when
+/// the worktree's PR has a failing CI rollup. Priority order matches
+/// C# `WorktreeViewModel.StatusLabel`: `busy` (caller-supplied, not
+/// modeled here) > `ci!` > `chg` > `↑N ↓N` > `idle`.
+pub fn worktree_status_label_with_ci(status: &GitStatus, ci: crate::pr::CiStatus) -> String {
+    if ci == crate::pr::CiStatus::Failure {
+        return "ci!".into();
+    }
     if status.added > 0 || status.removed > 0 || status.has_changes {
         return "chg".into();
     }
@@ -1252,5 +1264,41 @@ some-future-field foo bar\n";
     fn status_label_dirty_wins_over_no_upstream() {
         let s = status(1, 0, false, 0, 0, false);
         assert_eq!(worktree_status_label(&s), "chg");
+    }
+
+    #[test]
+    fn status_label_ci_failure_wins_over_dirty() {
+        let s = status(3, 1, false, 0, 0, true);
+        assert_eq!(
+            worktree_status_label_with_ci(&s, crate::pr::CiStatus::Failure),
+            "ci!"
+        );
+    }
+
+    #[test]
+    fn status_label_ci_failure_wins_over_idle() {
+        let s = status(0, 0, false, 0, 0, true);
+        assert_eq!(
+            worktree_status_label_with_ci(&s, crate::pr::CiStatus::Failure),
+            "ci!"
+        );
+    }
+
+    #[test]
+    fn status_label_ci_pending_does_not_change_slug() {
+        let s = status(0, 0, false, 0, 0, true);
+        assert_eq!(
+            worktree_status_label_with_ci(&s, crate::pr::CiStatus::Pending),
+            "idle"
+        );
+    }
+
+    #[test]
+    fn status_label_ci_success_does_not_change_slug() {
+        let s = status(2, 0, false, 0, 0, true);
+        assert_eq!(
+            worktree_status_label_with_ci(&s, crate::pr::CiStatus::Success),
+            "chg"
+        );
     }
 }
