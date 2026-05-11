@@ -574,6 +574,14 @@ pub struct AppShell {
     /// only has to wire the consumer side.
     #[allow(dead_code)]
     agent_registry: codescope_core::AgentRegistry,
+    /// Overview-panel visibility. While `true`, the work area
+    /// (group strip + terminal grid) is hidden and replaced by the
+    /// full-pane [`crate::overview::AppShell::render_overview`]; the
+    /// sidebar and status bar stay anchored. Toggled by the sidebar
+    /// footer "Overview" button (PR #126), the `Ctrl+Shift+O`
+    /// shortcut, and the in-panel "← Back to workspace" link.
+    /// Mirrors C# `MainViewModel.IsOverviewVisible`.
+    show_overview: bool,
 }
 
 impl AppShell {
@@ -678,17 +686,12 @@ impl AppShell {
                     this.push_toast(kind, title.clone(), detail.clone(), cx);
                 }
                 SidebarEvent::OpenOverview => {
-                    // Placeholder until the C# `OverviewView` is
-                    // ported to gpui. Until then, surface a subtle
-                    // info toast so the click is acknowledged. The
-                    // sidebar footer button stays useful as a
-                    // discoverability hook for the upcoming feature.
-                    this.push_toast(
-                        ToastKind::Info,
-                        SharedString::new_static("Overview"),
-                        Some(SharedString::new_static("Coming soon — full Overview view not ported yet.")),
-                        cx,
-                    );
+                    // Toggle the Overview panel — clicking the
+                    // sidebar footer button while the panel is open
+                    // dismisses it, mirroring the C# build's
+                    // `MainViewModel.ToggleOverview` command.
+                    let next = !this.show_overview;
+                    this.set_show_overview(next, cx);
                 }
                 SidebarEvent::ReopenSession { session_id } => {
                     this.reopen_session(session_id.clone(), window, cx);
@@ -911,6 +914,7 @@ impl AppShell {
             last_announced_update: None,
             projects: projects_for_sessions,
             agent_registry,
+            show_overview: false,
         };
         shell.start_telemetry_poll(cx);
         shell.start_agent_discovery_poll(cx);
@@ -1687,7 +1691,7 @@ impl AppShell {
     /// retention sweep, or stale event from a closed sidebar that has
     /// since rebuilt) is logged and swallowed — there's nothing useful
     /// to spawn at that point.
-    fn reopen_session(
+    pub(crate) fn reopen_session(
         &mut self,
         session_id: String,
         window: &mut Window,
@@ -1816,6 +1820,69 @@ impl AppShell {
 
     fn focused_group(&self) -> &Group {
         &self.groups[self.focused_group]
+    }
+
+    /// Toggle / set the Overview panel visibility. When flipped on the
+    /// work area (group strip + terminal grid) is replaced by the
+    /// full-pane Overview; the sidebar + status bar stay anchored.
+    /// Mirrors the `IsOverviewVisible` setter on the C#
+    /// `MainViewModel`. `cx.notify()` triggers a re-render so the
+    /// flip is visible on the next frame.
+    pub(crate) fn set_show_overview(&mut self, value: bool, cx: &mut Context<Self>) {
+        if self.show_overview == value {
+            return;
+        }
+        self.show_overview = value;
+        // Push the new state into the sidebar so its footer
+        // "Overview" button can flip into / out of the active look
+        // on the same frame. Mirrors C# `MainViewModel.OnIsOverviewVisibleChanged`
+        // updating the bound sidebar VM.
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_overview_visible(value, cx);
+        });
+        cx.notify();
+    }
+
+    /// Read accessor for the overview visibility flag. Used by
+    /// `render` to swap the work area for the Overview panel and by
+    /// the sidebar (via property forwarding in a future PR) to flip
+    /// its footer button into the "active" look.
+    #[allow(dead_code)]
+    pub(crate) fn show_overview(&self) -> bool {
+        self.show_overview
+    }
+
+    /// Read-only borrow of the session catalog. Exposed to the
+    /// Overview module so it can flatten the live + closed rows
+    /// without taking on a clone of the whole `ProjectsConfig` per
+    /// render.
+    pub(crate) fn projects_snapshot(&self) -> &ProjectsConfig {
+        &self.projects
+    }
+
+    /// Iterate `(group_idx, tab_idx, session_id, adopted_session_id)`
+    /// tuples across every group / tab. The Overview module joins
+    /// these against `OverviewRow.session_id` to discover the live
+    /// tab a "Focus" click should activate, and against the
+    /// telemetry tails to pull live model / token / state data.
+    /// Returning owned `String`s keeps the borrow short — the caller
+    /// can stash the snapshot in a hashmap without holding `&self`
+    /// across the render closure.
+    pub(crate) fn overview_tab_snapshot(
+        &self,
+    ) -> Vec<(usize, usize, String, Option<String>)> {
+        let mut out = Vec::new();
+        for (g_idx, group) in self.groups.iter().enumerate() {
+            for (t_idx, tab) in group.tabs.iter().enumerate() {
+                out.push((
+                    g_idx,
+                    t_idx,
+                    tab.session_id.clone(),
+                    tab.adopted_session_id.clone(),
+                ));
+            }
+        }
+        out
     }
 
     /// Apply a freshly-loaded `Settings` to the shell. Resolves the
@@ -2083,7 +2150,7 @@ impl AppShell {
     /// tab as the group's active one, and routes keyboard focus to the
     /// terminal so typing lands in the right pty without an extra
     /// click.
-    fn activate_tab(
+    pub(crate) fn activate_tab(
         &mut self,
         group_idx: usize,
         tab_idx: usize,
@@ -3841,6 +3908,14 @@ impl AppShell {
                 cx.stop_propagation();
                 self.toggle_sidebar(cx);
             }
+            // Ctrl+Shift+O — toggle the Overview panel. Mirrors the
+            // C# build's `Ctrl+Shift+O` input binding (see
+            // `MainViewModel.Palette` and `MainWindow.InputBindings`).
+            "o" if mods.shift => {
+                cx.stop_propagation();
+                let next = !self.show_overview;
+                self.set_show_overview(next, cx);
+            }
             "tab" if !mods.shift => {
                 cx.stop_propagation();
                 self.next_tab(window, cx);
@@ -4295,12 +4370,25 @@ impl Render for AppShell {
                 }),
             );
 
-        let tab_strip_inline = div()
-            .flex()
-            .flex_row()
-            .flex_grow()
-            .h_full()
-            .children(strip_sections);
+        // While the Overview is visible the per-group tab strip is
+        // structurally meaningless — its only target (the group
+        // grid below) is hidden. Render an empty placeholder so the
+        // caption row keeps the same layout footprint but doesn't
+        // surface stale tab affordances.
+        let tab_strip_inline = if self.show_overview {
+            div()
+                .flex()
+                .flex_row()
+                .flex_grow()
+                .h_full()
+        } else {
+            div()
+                .flex()
+                .flex_row()
+                .flex_grow()
+                .h_full()
+                .children(strip_sections)
+        };
         // Right-side caption-controls cluster — absolute-positioned
         // so it overlays the rightmost portion of the tab area
         // without consuming flex width. See the long comment above
@@ -4341,11 +4429,22 @@ impl Render for AppShell {
             .child(tab_strip_inline)
             .child(caption_controls);
 
-        let work_area = div()
-            .flex_grow()
-            .flex()
-            .flex_row()
-            .children(group_panes);
+        // Work area swap: when the Overview panel is up, hide the
+        // group strip + terminal grid entirely and render the
+        // Overview in their place. The sidebar + status bar stay
+        // anchored on either side / below so the user can dismiss
+        // via the same sidebar button. Mirrors the C# build's
+        // `IsOverviewVisible` DataTrigger swap in `MainWindow.xaml`.
+        let work_area: gpui::AnyElement = if self.show_overview {
+            self.render_overview(&theme, cx).into_any_element()
+        } else {
+            div()
+                .flex_grow()
+                .flex()
+                .flex_row()
+                .children(group_panes)
+                .into_any_element()
+        };
 
         // Sidebar wrapper — sized by AppShell so we can drag-resize
         // and collapse without poking the Sidebar entity. Hidden
