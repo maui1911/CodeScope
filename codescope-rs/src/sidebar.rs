@@ -1745,10 +1745,14 @@ impl Sidebar {
     /// row that disappears on relaunch — and (worse) a `layout.json`
     /// pointing at a project id that never made it to `projects.json`.
     pub fn add_project(&mut self, path: String, cx: &mut Context<Self>) {
-        // Refuse exact duplicates by path. Two rows pointing at the
-        // same directory would let a user "add" the same project
-        // twice and then wonder why both rows behave identically.
-        if let Some(idx) = self.projects.projects.iter().position(|p| p.path == path) {
+        // Refuse duplicates. Normalising-aware lookup (slash style,
+        // trailing separators, ASCII case) so different spellings of
+        // the same folder route to the same existing row instead of
+        // piling up duplicate entries — same rule the New Project
+        // dialog applies. Drag-dropping a folder with a trailing
+        // slash after it was added via the picker would otherwise
+        // create a parallel row that points at the same directory.
+        if let Some(idx) = self.projects.find_project_index_by_path(&path) {
             self.select(idx, cx);
             return;
         }
@@ -3889,15 +3893,27 @@ fn open_path_in_windows_terminal(path: &str) {
 /// `new_project_dialog::handle_key_down` pattern: backspace pops a
 /// char, escape clears the field, printable characters append. No
 /// "submit" key — filtering is live as the user types.
+///
+/// Chords with Ctrl / Cmd (= `platform` on gpui) / Alt held are
+/// intentionally *not* consumed. App-level shortcuts (Ctrl+B to
+/// toggle sidebar, Ctrl+T to spawn a tab, …) keep working while
+/// the filter has focus — without this gate `stop_propagation()`
+/// would swallow the chord at the filter and the shortcut would
+/// silently turn into a stray `b` / `t` in the filter buffer.
 fn handle_filter_key_down(
     sidebar: &mut Sidebar,
     event: &KeyDownEvent,
     _window: &mut Window,
     cx: &mut Context<Sidebar>,
 ) {
+    let mods = &event.keystroke.modifiers;
+    let app_chord = mods.control || mods.platform || mods.alt;
     let key = event.keystroke.key.as_str();
     match key {
         "escape" => {
+            if app_chord {
+                return;
+            }
             if !sidebar.filter.is_empty() {
                 sidebar.filter.clear();
                 cx.notify();
@@ -3906,6 +3922,9 @@ fn handle_filter_key_down(
             return;
         }
         "backspace" => {
+            if app_chord {
+                return;
+            }
             if sidebar.filter.pop().is_some() {
                 cx.notify();
             }
@@ -3913,6 +3932,11 @@ fn handle_filter_key_down(
             return;
         }
         _ => {}
+    }
+    if app_chord {
+        // Let app-level handlers (e.g. Ctrl+B / Ctrl+T in
+        // `AppShell::on_key_down`) see the chord.
+        return;
     }
     let Some(key_char) = event.keystroke.key_char.as_deref() else {
         return;

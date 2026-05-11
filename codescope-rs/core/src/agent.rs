@@ -49,6 +49,15 @@ impl AgentId {
     /// Parse a stable string id back into the enum (case-insensitive).
     /// Mirrors `string.Equals(agentId, "...", OrdinalIgnoreCase)` in
     /// the C# dispatch.
+    ///
+    /// A handful of *executable-name aliases* are accepted alongside
+    /// the canonical ids so first-token parsing of an `auto_type`
+    /// command (`agent_id_from_auto_type`) still classifies sessions
+    /// correctly when the registry's `command` differs from the id —
+    /// Windows ships OpenCode as `opencode-cli.exe`, for instance,
+    /// because `opencode` clashes with a reserved name. The alias list
+    /// is intentionally small and explicit; unknown binaries still
+    /// resolve to `None`.
     pub fn from_str(s: &str) -> Option<Self> {
         if s.eq_ignore_ascii_case("claude") {
             Some(AgentId::Claude)
@@ -56,7 +65,11 @@ impl AgentId {
             Some(AgentId::Codex)
         } else if s.eq_ignore_ascii_case("copilot") {
             Some(AgentId::Copilot)
-        } else if s.eq_ignore_ascii_case("opencode") {
+        } else if s.eq_ignore_ascii_case("opencode") || s.eq_ignore_ascii_case("opencode-cli") {
+            // `opencode-cli` is the Windows npm-package binary name —
+            // the built-in profile uses it as `command`, and
+            // `agent_id_from_auto_type` would otherwise classify
+            // OpenCode sessions as `None`.
             Some(AgentId::OpenCode)
         } else if s.eq_ignore_ascii_case("pi") {
             Some(AgentId::Pi)
@@ -165,5 +178,23 @@ mod tests {
         // `claudeflare` must NOT match Claude — same anti-substring rule
         // `is_claude_auto_type` enforced.
         assert_eq!(agent_id_from_auto_type(Some("claudeflare")), None);
+    }
+
+    #[test]
+    fn opencode_cli_alias_resolves_to_opencode() {
+        // Windows OpenCode npm package ships the binary as
+        // `opencode-cli.exe`; the alias keeps
+        // `agent_id_from_auto_type` honest when the sidebar's
+        // "New OpenCode session" row launches `opencode-cli`.
+        assert_eq!(AgentId::from_str("opencode-cli"), Some(AgentId::OpenCode));
+        assert_eq!(AgentId::from_str("OPENCODE-CLI"), Some(AgentId::OpenCode));
+        assert_eq!(
+            agent_id_from_auto_type(Some("opencode-cli")),
+            Some(AgentId::OpenCode),
+        );
+        assert_eq!(
+            agent_id_from_auto_type(Some("opencode-cli --continue")),
+            Some(AgentId::OpenCode),
+        );
     }
 }
