@@ -124,6 +124,12 @@ pub struct ThemeChrome {
     /// selection fill. Mirrors `Surface.Color.Elev = #FF141414` from
     /// `DesignTokens.xaml`; semantically the "card" / "active row"
     /// surface that sits one tier above the panel `elevated` colour.
+    ///
+    /// `#[serde(default)]` keeps older serialised theme JSON
+    /// deserialising cleanly when the field is absent — important for
+    /// any external theme bundle that pre-dates this field. The
+    /// shipped `settings.json` only references themes by `name` so it
+    /// is unaffected.
     #[serde(default = "default_surface_elev")]
     pub surface_elev: Rgb,
     /// Primary text on canvas / elevated.
@@ -138,8 +144,8 @@ pub struct ThemeChrome {
 }
 
 /// `Surface.Color.Elev` from `DesignTokens.xaml` (`#FF141414`).
-/// Serde default for `ThemeChrome::surface_elev` so older `settings.json`
-/// files that omit the field still load.
+/// Serde default for `ThemeChrome::surface_elev` so external theme
+/// bundles serialised before this field existed still deserialise.
 fn default_surface_elev() -> Rgb { Rgb::from_hex(0x141414) }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

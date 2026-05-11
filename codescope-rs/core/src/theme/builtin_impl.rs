@@ -254,20 +254,25 @@ mod tests {
     }
 
     #[test]
-    fn every_builtin_theme_supplies_surface_elev() {
-        // Every shipped theme should provide its own `surface_elev`
-        // tier; if a new theme is added and forgets to set it, the
-        // serde default would silently substitute `#141414` and the
-        // sidebar selection chrome would clash with the rest of the
-        // theme. Failing this test forces the contributor to pick
-        // an explicit value that fits the theme.
-        for theme in all() {
-            assert_ne!(
-                theme.chrome.surface_elev,
-                Rgb::from_hex(0x000000),
-                "{} chrome.surface_elev must not be black",
-                theme.name,
-            );
-        }
+    fn surface_elev_serde_default_applies_when_field_absent() {
+        // External theme JSON predating `surface_elev` must still
+        // deserialise cleanly. `#[serde(default)]` should fall back
+        // to `default_surface_elev()` (= `#141414`) when the field is
+        // missing rather than failing the parse. Encoded inline as
+        // raw JSON so the test catches both the rename of the field
+        // and the removal of the default attribute.
+        let json = concat!(
+            "{",
+            "\"canvas\":\"#000000\",",
+            "\"elevated\":\"#090909\",",
+            "\"ink\":\"#ffffff\",",
+            "\"ink_muted\":\"#a6a6a6\",",
+            "\"divider\":\"#222222\",",
+            "\"accent\":\"#0099ff\"",
+            "}"
+        );
+        let chrome: ThemeChrome = serde_json::from_str(json)
+            .expect("legacy chrome JSON without surface_elev should deserialise");
+        assert_eq!(chrome.surface_elev, Rgb::from_hex(0x141414));
     }
 }

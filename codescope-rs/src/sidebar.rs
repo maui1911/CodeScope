@@ -2551,6 +2551,10 @@ impl Sidebar {
             .border_color(divider)
             .rounded_md()
             .shadow_lg()
+            // Default MenuItem `FontFamily="Fig.Font.Sans"` from
+            // `ContextMenuStyles.xaml`. Per-row overrides (mono title
+            // in the header) re-apply `font_mono` themselves.
+            .font(theme::font_sans())
             // Header — non-interactive, mirrors the C# `BuildContextHeader`
             // (`ContextMenuFactory.cs`): mono title at 11 px on the
             // first line, sans subtitle at 10 px on the second.
@@ -2789,6 +2793,8 @@ impl Sidebar {
             .border_color(divider)
             .rounded_md()
             .shadow_lg()
+            // Same default MenuItem sans family as the project menu.
+            .font(theme::font_sans())
             .child(
                 // Same `BuildContextHeader` layout as the project menu:
                 // mono title @ 11 px (branch / leaf), 10 px subtitle.

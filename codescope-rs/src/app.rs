@@ -2826,6 +2826,11 @@ impl AppShell {
             .border_color(divider)
             .rounded_md()
             .shadow_lg()
+            // C# `ContextMenuStyles.xaml` default MenuItem style sets
+            // `FontFamily="{DynamicResource Fig.Font.Sans}"`. Apply at
+            // the menu root so every row inherits the sans face
+            // without each row builder having to repeat the call.
+            .font(theme::font_sans())
             .child(item(
                 "tab-menu-close",
                 "Close",
