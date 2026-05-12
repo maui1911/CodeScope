@@ -515,15 +515,30 @@ pub struct AppShell {
     /// over any strip and the matching drop / drag-cancel. Drives the
     /// 3 px blue drop-indicator that previews "drop here" and the
     /// target index passed to `move_tab_to_group` on drop.
+    ///
+    /// Cleared explicitly by:
+    /// - `on_drop` (drag completed by releasing over a strip);
+    /// - the top of `render` when `cx.has_active_drag()` is `false`
+    ///   (drag cancelled / released outside any strip). gpui 0.2.x
+    ///   has no `on_drag_end` hook on the drop target, so the
+    ///   per-frame poll is the safety net that keeps a stale
+    ///   indicator from lingering after a drop on empty space.
     tab_drag_hover: Option<TabDropHover>,
     /// Per-group cache of the tab bounds captured during the most
     /// recent render. Key = group id, value = list of
-    /// `(tab_id, strip-local-bounds)` in render order. Populated by
+    /// `(tab_id, window-space-bounds)` in render order. Populated by
     /// per-tab `canvas` prepaint hooks (mirroring the `bell_bounds`
-    /// pattern) so `on_drag_move` can resolve a cursor X to a
-    /// drop slot via [`compute_drop_index`] without re-deriving the
-    /// flex layout.
+    /// pattern). Reads (`on_drag_move`, drop-indicator) go through
+    /// [`AppShell::resolved_tab_rects`] which prefers `tab_rects` and
+    /// falls back to `prev_tab_rects` for the gap between
+    /// `render`'s clear and the same frame's prepaint pass.
     tab_rects: HashMap<u64, Vec<(u64, gpui::Bounds<gpui::Pixels>)>>,
+    /// Previous frame's `tab_rects`. Swapped in at the top of each
+    /// `render` so the drop-indicator math (which runs at render-time,
+    /// before the canvas prepaint callbacks fire) still has stable
+    /// bounds to read. Without this, the indicator clamps to `x=0`
+    /// for one frame after layout changes.
+    prev_tab_rects: HashMap<u64, Vec<(u64, gpui::Bounds<gpui::Pixels>)>>,
     /// Active toasts. Newest pushed at the front so the floating
     /// stack reads top-to-bottom from the recently-fired action.
     /// Auto-dismissed by the background poller spawned in
@@ -983,6 +998,7 @@ impl AppShell {
             tab_menu: None,
             tab_drag_hover: None,
             tab_rects: HashMap::new(),
+            prev_tab_rects: HashMap::new(),
             toasts: std::collections::VecDeque::new(),
             next_toast_id: 0,
             paths: paths.clone(),
@@ -4147,11 +4163,26 @@ impl Render for AppShell {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme.clone();
-        // Tab-drag rect cache rebuilds every frame — each tab's
-        // `canvas` prepaint pushes its window-space bounds into the
-        // per-group `Vec`. Clearing here avoids stale entries when
-        // tabs are closed / reparented between frames.
+        // Tab-drag rect cache: swap the just-built map into
+        // `prev_tab_rects` so the in-flight render can still answer
+        // "where is tab N right now" while the new frame's canvas
+        // prepaint callbacks repopulate `tab_rects` for the *next*
+        // frame. Without the swap, the drop indicator and
+        // on_drag_move resolver would read an empty cache during the
+        // render pass that follows the clear (canvas callbacks fire
+        // at prepaint time, after the render closure returns).
+        std::mem::swap(&mut self.tab_rects, &mut self.prev_tab_rects);
         self.tab_rects.clear();
+        // Drag-cancel safety net: when no drag is active any
+        // lingering hover state (cursor left the strip, OS dropped
+        // the drag elsewhere, …) would otherwise keep painting a
+        // stale drop indicator. gpui doesn't surface an
+        // `on_drag_end` hook on the drop target, so we re-check
+        // `cx.has_active_drag()` each frame and clear once the drag
+        // is no longer in flight.
+        if self.tab_drag_hover.is_some() && !cx.has_active_drag() {
+            self.tab_drag_hover = None;
+        }
         // Snapshot per-group + per-tab metadata up front so each
         // `cx.listener` closure can hold owned values without
         // overlapping the immutable borrow `self.groups.iter()` would
@@ -5497,22 +5528,35 @@ impl AppShell {
         // the way `compute_drop_index` computes it.
         let drop_indicator: Option<gpui::AnyElement> = match self.tab_drag_hover {
             Some(hover) if hover.group_id == group_id => {
-                let rects = self.tab_rects.get(&group_id);
+                // Prefer this frame's freshly-stored rects but fall
+                // back to the previous frame's copy: render runs
+                // before canvas prepaint, so on the *first* frame
+                // after a layout change `tab_rects` is empty here
+                // and only `prev_tab_rects` carries usable data.
+                let rects = self
+                    .tab_rects
+                    .get(&group_id)
+                    .filter(|v| !v.is_empty())
+                    .or_else(|| self.prev_tab_rects.get(&group_id));
                 let strip_origin_x: f32 = rects
                     .and_then(|v| v.first())
                     .map(|(_, b)| b.origin.x.into())
                     .unwrap_or(0.0);
+                // 3 px-wide bar: subtract half its width so the bar
+                // is centred on the boundary line regardless of
+                // whether we're rendering the append slot, the
+                // before-first slot, or a between-tabs slot.
+                const BAR_HALF_W: f32 = 1.5;
                 let indicator_x: f32 = if let Some(rs) = rects.filter(|v| !v.is_empty()) {
                     let idx = hover.drop_index.min(rs.len());
-                    if idx >= rs.len() {
+                    let boundary: f32 = if idx >= rs.len() {
                         let (_, b) = rs.last().unwrap();
-                        let right: f32 = (b.origin.x + b.size.width).into();
-                        right - strip_origin_x
+                        (b.origin.x + b.size.width).into()
                     } else {
                         let (_, b) = &rs[idx];
-                        let left: f32 = b.origin.x.into();
-                        left - strip_origin_x - 1.5
-                    }
+                        b.origin.x.into()
+                    };
+                    boundary - strip_origin_x - BAR_HALF_W
                 } else {
                     0.0
                 };
@@ -5563,9 +5607,17 @@ impl AppShell {
                     let cursor_x: f32 = event.event.position.x.into();
                     let strip_left: f32 = event.bounds.origin.x.into();
                     let rel_x = cursor_x - strip_left;
-                    let rects: Vec<codescope_core::TabRect> = this
+                    // Same fallback the indicator uses: this-frame
+                    // rects first (already populated on subsequent
+                    // frames), previous-frame copy second. Drag-move
+                    // events can fire mid-frame before the canvas
+                    // prepaint callbacks have run.
+                    let source = this
                         .tab_rects
                         .get(&target_group_id)
+                        .filter(|v| !v.is_empty())
+                        .or_else(|| this.prev_tab_rects.get(&target_group_id));
+                    let rects: Vec<codescope_core::TabRect> = source
                         .map(|v| {
                             v.iter()
                                 .map(|(_, b)| {
