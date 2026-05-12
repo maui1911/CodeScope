@@ -343,6 +343,23 @@ struct TabDragData {
     title: SharedString,
 }
 
+/// Live drop-cursor state: which group's strip is currently being
+/// hovered by an in-flight tab drag, and at what slot (between which
+/// two tabs) the user would drop. Cleared on drop and on drag exit.
+///
+/// Updated each frame by the `on_drag_move` handler on the strip
+/// element: the strip-relative cursor X is fed to
+/// [`compute_drop_index`] together with the snapshotted per-tab
+/// rects, and the result drives both the 3 px drop-indicator
+/// position and the index passed to `move_tab_to_group` on drop.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TabDropHover {
+    /// Stable id of the group whose strip the cursor is over.
+    group_id: u64,
+    /// Insert position in `0..=tabs.len()` of the target group.
+    drop_index: usize,
+}
+
 /// The little floating "card" the user drags around — gpui needs a
 /// `Render` entity to draw the drag image. We make it shape-light
 /// so it follows the cursor without lag and matches the active-tab
@@ -354,6 +371,29 @@ struct DraggedTab {
 
 impl Render for DraggedTab {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        // Drag-chip styling — mirrors the HTML spec at
+        // `docs/design/html/CodeScope - Tab Drag.html`:
+        //   - 1 px accent border
+        //   - dark canvas fill
+        //   - 3 px translucent accent "inner ring" + 24 px soft blue
+        //     outer glow via stacked box-shadows
+        //   - -1.5° rotation (NOT applied — gpui 0.2.x exposes
+        //     `with_rotation` only on SVG elements, not on `div`;
+        //     deferred until a future gpui release adds transform
+        //     support to the styled-element surface).
+        let accent = theme::accent(&self.theme);
+        let glow_inner = gpui::BoxShadow {
+            color: gpui::hsla(accent.h, accent.s, accent.l, 0.20),
+            offset: gpui::point(px(0.0), px(0.0)),
+            blur_radius: px(0.0),
+            spread_radius: px(3.0),
+        };
+        let glow_outer = gpui::BoxShadow {
+            color: gpui::hsla(accent.h, accent.s, accent.l, 0.35),
+            offset: gpui::point(px(0.0), px(0.0)),
+            blur_radius: px(24.0),
+            spread_radius: px(0.0),
+        };
         div()
             .h(px(32.0))
             .min_w(px(140.0))
@@ -365,12 +405,12 @@ impl Render for DraggedTab {
             .gap_2()
             .bg(theme::canvas(&self.theme))
             .border_1()
-            .border_color(theme::accent(&self.theme))
+            .border_color(accent)
             .rounded_md()
-            .shadow_lg()
+            .shadow(vec![glow_inner, glow_outer])
             .text_size(px(13.0))
             .text_color(theme::ink(&self.theme))
-            .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(theme::accent(&self.theme)))
+            .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(accent))
             .child(div().flex_grow().truncate().child(self.title.clone()))
     }
 }
@@ -471,6 +511,19 @@ pub struct AppShell {
     sidebar_drag: Option<SidebarDrag>,
     /// Open tab right-click menu, if any.
     tab_menu: Option<TabMenu>,
+    /// In-flight tab drag-hover state. `Some` between an `on_drag_move`
+    /// over any strip and the matching drop / drag-cancel. Drives the
+    /// 3 px blue drop-indicator that previews "drop here" and the
+    /// target index passed to `move_tab_to_group` on drop.
+    tab_drag_hover: Option<TabDropHover>,
+    /// Per-group cache of the tab bounds captured during the most
+    /// recent render. Key = group id, value = list of
+    /// `(tab_id, strip-local-bounds)` in render order. Populated by
+    /// per-tab `canvas` prepaint hooks (mirroring the `bell_bounds`
+    /// pattern) so `on_drag_move` can resolve a cursor X to a
+    /// drop slot via [`compute_drop_index`] without re-deriving the
+    /// flex layout.
+    tab_rects: HashMap<u64, Vec<(u64, gpui::Bounds<gpui::Pixels>)>>,
     /// Active toasts. Newest pushed at the front so the floating
     /// stack reads top-to-bottom from the recently-fired action.
     /// Auto-dismissed by the background poller spawned in
@@ -928,6 +981,8 @@ impl AppShell {
             sidebar_visible,
             sidebar_drag: None,
             tab_menu: None,
+            tab_drag_hover: None,
+            tab_rects: HashMap::new(),
             toasts: std::collections::VecDeque::new(),
             next_toast_id: 0,
             paths: paths.clone(),
@@ -3782,29 +3837,30 @@ impl AppShell {
         }
     }
 
-    /// Reparent a tab from one group to another by id. Triggered by
-    /// `on_drop` on a group's strip section after the user drags a
-    /// tab out. The terminal entity is moved unchanged — no
-    /// teardown / respawn — so the pty keeps running and any
-    /// agent (claude, …) keeps its session.
+    /// Move a tab to a (possibly different) group at the given insert
+    /// position. Triggered by `on_drop` on a group's strip section
+    /// after the user drags a tab. The terminal entity is moved
+    /// unchanged — no teardown / respawn — so the pty keeps running
+    /// and any agent (claude, …) keeps its session.
+    ///
+    /// `target_index` is an insert slot in `0..=target.tabs.len()`
+    /// (with `usize::MAX` accepted as "append"). For same-group
+    /// reorders the index is interpreted against the *post-removal*
+    /// vec, matching the C# `ObservableCollection.Move` semantics.
     ///
     /// Looking up by id (not index) keeps us robust to concurrent
-    /// list mutations between drag-start and drop. No-op when:
-    /// - source / target group can't be resolved
-    /// - source and target are the same group (within-group reorder
-    ///   isn't supported yet — the user can already pick the tab
-    ///   they want via click)
+    /// list mutations between drag-start and drop. No-op when source /
+    /// target group can't be resolved, or when the tab id isn't found
+    /// in the source group.
     fn move_tab_to_group(
         &mut self,
         source_group_id: u64,
         source_tab_id: u64,
         target_group_id: u64,
+        target_index: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if source_group_id == target_group_id {
-            return;
-        }
         let Some(source_idx) = self.groups.iter().position(|g| g.id == source_group_id)
         else {
             return;
@@ -3820,6 +3876,36 @@ impl AppShell {
         else {
             return;
         };
+
+        // Same-group reorder path. Adjust the insert index for the
+        // removal of `tab_pos`: if the cursor is past the dragged
+        // tab's slot, dropping at index N means inserting at N-1 in
+        // the post-removal vec. Mirrors C#
+        // `ObservableCollection.Move(currentIdx, targetIdx)`.
+        if source_group_id == target_group_id {
+            let len = self.groups[source_idx].tabs.len();
+            let raw_target = target_index.min(len);
+            // Clamp the insert slot to `[0, len-1]` for a same-group
+            // move: removing the source first means there's one
+            // fewer slot than the strip's gap count.
+            let mut insert_at = if raw_target > tab_pos {
+                raw_target - 1
+            } else {
+                raw_target
+            };
+            if insert_at >= len {
+                insert_at = len - 1;
+            }
+            if insert_at == tab_pos {
+                return;
+            }
+            let tab = self.groups[source_idx].tabs.remove(tab_pos);
+            self.groups[source_idx].tabs.insert(insert_at, tab);
+            self.groups[source_idx].active_tab = insert_at;
+            self.activate_tab(source_idx, insert_at, window, cx);
+            self.save_layout();
+            return;
+        }
 
         let tab = self.groups[source_idx].tabs.remove(tab_pos);
 
@@ -3845,9 +3931,10 @@ impl AppShell {
             .iter()
             .position(|g| g.id == target_group_id)
             .unwrap_or(target_idx.min(self.groups.len().saturating_sub(1)));
-        self.groups[target_idx].tabs.push(tab);
-        let new_active = self.groups[target_idx].tabs.len() - 1;
-        self.groups[target_idx].active_tab = new_active;
+        let target_tabs_len = self.groups[target_idx].tabs.len();
+        let insert_at = target_index.min(target_tabs_len);
+        self.groups[target_idx].tabs.insert(insert_at, tab);
+        self.groups[target_idx].active_tab = insert_at;
 
         // Collapse the source group if it's empty and we have
         // siblings. After this the target_idx may shift; re-resolve.
@@ -3865,7 +3952,11 @@ impl AppShell {
             .iter()
             .position(|g| g.id == target_group_id)
             .unwrap_or(0);
-        let final_active = self.groups[final_target_idx].tabs.len().saturating_sub(1);
+        let final_active = self.groups[final_target_idx]
+            .tabs
+            .iter()
+            .position(|t| t.id == source_tab_id)
+            .unwrap_or_else(|| self.groups[final_target_idx].tabs.len().saturating_sub(1));
         self.activate_tab(final_target_idx, final_active, window, cx);
         self.save_layout();
     }
@@ -4056,6 +4147,11 @@ impl Render for AppShell {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme.clone();
+        // Tab-drag rect cache rebuilds every frame — each tab's
+        // `canvas` prepaint pushes its window-space bounds into the
+        // per-group `Vec`. Clearing here avoids stale entries when
+        // tabs are closed / reparented between frames.
+        self.tab_rects.clear();
         // Snapshot per-group + per-tab metadata up front so each
         // `cx.listener` closure can hold owned values without
         // overlapping the immutable borrow `self.groups.iter()` would
@@ -5203,9 +5299,33 @@ impl AppShell {
             };
             let title_for_drag = title.clone();
             let theme_for_preview = theme_for_drag.clone();
+            // Bounds-capture canvas — stashes each tab's window-space
+            // rect into `tab_rects[group_id]` every frame so
+            // `on_drag_move` on the strip can resolve a cursor X to a
+            // drop slot via `compute_drop_index`. Same pattern as
+            // `bell_bounds`; the canvas is `absolute` + `size_full`
+            // inside the tab so it doesn't perturb layout.
+            let bounds_entity = cx.entity();
+            let bounds_group_id = group_id;
+            let bounds_tab_id = tab_id;
+            let bounds_canvas = gpui::canvas(
+                move |bounds, _window, cx| {
+                    bounds_entity.update(cx, |this, _| {
+                        let entry = this
+                            .tab_rects
+                            .entry(bounds_group_id)
+                            .or_default();
+                        entry.push((bounds_tab_id, bounds));
+                    });
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full();
             div()
                 .id(("tab", tab_id))
                 .h_full()
+                .relative()
                 .min_w(px(140.0))
                 .max_w(px(240.0))
                 .flex()
@@ -5217,6 +5337,7 @@ impl AppShell {
                 .border_color(top_border)
                 .bg(bg)
                 .text_color(text_color)
+                .child(bounds_canvas)
                 // Tab title font — `Fig.Font.Sans` @ `FontSize="13"`
                 // from `GroupStripView.xaml`. The C# template also
                 // dials FontWeight from 340 (unselected) to Medium
@@ -5367,9 +5488,59 @@ impl AppShell {
         // instead of bleeding under them. Non-last groups don't need
         // this — their right edge is the divider before the next
         // group, well clear of the caption-controls overlay.
+        // Drop indicator — 3 px-wide accent bar at the resolved drop
+        // slot for an in-flight tab drag over *this* strip. Mirrors
+        // the design HTML's `.drop-indicator` (vertical bar with a
+        // soft accent halo). Absolute-positioned inside the strip;
+        // X is derived from the per-tab `tab_rects` cache so the
+        // indicator snaps to the gap between tab midpoints exactly
+        // the way `compute_drop_index` computes it.
+        let drop_indicator: Option<gpui::AnyElement> = match self.tab_drag_hover {
+            Some(hover) if hover.group_id == group_id => {
+                let rects = self.tab_rects.get(&group_id);
+                let strip_origin_x: f32 = rects
+                    .and_then(|v| v.first())
+                    .map(|(_, b)| b.origin.x.into())
+                    .unwrap_or(0.0);
+                let indicator_x: f32 = if let Some(rs) = rects.filter(|v| !v.is_empty()) {
+                    let idx = hover.drop_index.min(rs.len());
+                    if idx >= rs.len() {
+                        let (_, b) = rs.last().unwrap();
+                        let right: f32 = (b.origin.x + b.size.width).into();
+                        right - strip_origin_x
+                    } else {
+                        let (_, b) = &rs[idx];
+                        let left: f32 = b.origin.x.into();
+                        left - strip_origin_x - 1.5
+                    }
+                } else {
+                    0.0
+                };
+                Some(
+                    div()
+                        .absolute()
+                        .left(px(indicator_x.max(0.0)))
+                        .top(px(4.0))
+                        .bottom(px(4.0))
+                        .w(px(3.0))
+                        .bg(accent)
+                        .rounded_sm()
+                        .shadow(vec![gpui::BoxShadow {
+                            color: gpui::hsla(accent.h, accent.s, accent.l, 0.6),
+                            offset: gpui::point(px(0.0), px(0.0)),
+                            blur_radius: px(10.0),
+                            spread_radius: px(0.0),
+                        }])
+                        .into_any_element(),
+                )
+            }
+            _ => None,
+        };
+
         let mut strip = div()
             .id(("group-strip", group_id))
             .h_full()
+            .relative()
             .flex()
             .flex_row()
             .flex_shrink()
@@ -5380,17 +5551,66 @@ impl AppShell {
                     this.focus_group(group_idx, window, cx);
                 }),
             )
+            // Track the in-flight tab drag's cursor over this strip
+            // so we can render the drop indicator at the right slot.
+            // The handler converts the window-coord cursor X into a
+            // strip-local X by subtracting the strip's left edge
+            // (provided by gpui via `event.bounds`), then resolves
+            // a drop index against the per-tab bounds captured this
+            // frame.
+            .on_drag_move(cx.listener(
+                move |this, event: &gpui::DragMoveEvent<TabDragData>, _window, cx| {
+                    let cursor_x: f32 = event.event.position.x.into();
+                    let strip_left: f32 = event.bounds.origin.x.into();
+                    let rel_x = cursor_x - strip_left;
+                    let rects: Vec<codescope_core::TabRect> = this
+                        .tab_rects
+                        .get(&target_group_id)
+                        .map(|v| {
+                            v.iter()
+                                .map(|(_, b)| {
+                                    let left: f32 = b.origin.x.into();
+                                    let right: f32 = (b.origin.x + b.size.width).into();
+                                    codescope_core::TabRect {
+                                        left: left - strip_left,
+                                        right: right - strip_left,
+                                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let drop_index = codescope_core::compute_drop_index(rel_x, &rects);
+                    let next = Some(TabDropHover {
+                        group_id: target_group_id,
+                        drop_index,
+                    });
+                    if this.tab_drag_hover != next {
+                        this.tab_drag_hover = next;
+                        cx.notify();
+                    }
+                },
+            ))
             .on_drop(
                 cx.listener(move |this, payload: &TabDragData, window, cx| {
+                    let drop_index = this
+                        .tab_drag_hover
+                        .filter(|h| h.group_id == target_group_id)
+                        .map(|h| h.drop_index)
+                        .unwrap_or(usize::MAX);
+                    this.tab_drag_hover = None;
                     this.move_tab_to_group(
                         payload.source_group_id,
                         payload.source_tab_id,
                         target_group_id,
+                        drop_index,
                         window,
                         cx,
                     );
                 }),
             );
+        if let Some(indicator) = drop_indicator {
+            strip = strip.child(indicator);
+        }
         if gmeta.is_last_group {
             let mut content = div()
                 .h_full()
