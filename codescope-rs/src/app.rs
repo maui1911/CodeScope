@@ -231,6 +231,36 @@ fn saved_group_weights(layout: &LayoutState) -> &[f32] {
 /// level; ours is in weight units rather than pixels because the
 /// total-width depends on the viewport.
 const MIN_GROUP_WEIGHT: f32 = 0.15;
+
+/// Rescale `weights` so the sum equals the slice length (i.e. mean is
+/// `1.0`) while preserving ratios. Used after any structural removal
+/// from `AppShell::group_weights` to keep the sum at `len() ≥ 1` —
+/// taffy's flex implementation truncates the distributed free-space
+/// to `sum_flex_grow * free_space` when `sum_flex_grow < 1.0`
+/// (`taffy-0.9.0/src/compute/flexbox.rs:1260`), so a survivor with
+/// weight `0.5` after a heavy splitter drag would otherwise occupy
+/// only half the work-area width and leave the other half blank.
+///
+/// Defensive on degenerate inputs: empty slices and non-finite or
+/// non-positive sums both fall back to assigning `1.0` to every
+/// element so the layout still gets a sane sum.
+fn normalise_group_weights(weights: &mut [f32]) {
+    let count = weights.len();
+    if count == 0 {
+        return;
+    }
+    let sum: f32 = weights.iter().copied().sum();
+    if !sum.is_finite() || sum <= 0.0 {
+        for w in weights.iter_mut() {
+            *w = 1.0;
+        }
+        return;
+    }
+    let scale = count as f32 / sum;
+    for w in weights.iter_mut() {
+        *w = (*w * scale).max(MIN_GROUP_WEIGHT);
+    }
+}
 /// Width of the actual splitter hit-target. Wider than the painted
 /// 1px divider so the user can actually grab it without pixel-perfect
 /// aiming.
@@ -2919,6 +2949,35 @@ impl AppShell {
             if group_idx < self.group_weights.len() {
                 self.group_weights.remove(group_idx);
             }
+            // Renormalise the surviving weights so they sum back to
+            // their length (i.e. average 1.0 each, ratios preserved).
+            //
+            // Taffy (gpui 0.2.2's flexbox engine) implements the CSS
+            // "flex factor < 1" rule literally: when the sum of
+            // `flex-grow` across a flex line is below `1.0`, only
+            // `sum * free_space` gets distributed and the rest stays
+            // blank. See
+            // `taffy-0.9.0/src/compute/flexbox.rs:1260`:
+            //
+            //     let free_space = if growing && sum_flex_grow < 1.0 {
+            //         initial_free_space * sum_flex_grow - …
+            //     };
+            //
+            // If the user drags a splitter hard (e.g. weights
+            // `[1.5, 0.5]`) and then closes the larger column, the
+            // survivor inherits `weight = 0.5`. With a single flex
+            // child and `sum_flex_grow = 0.5 < 1.0`, taffy hands it
+            // exactly 50 % of the work-area width and leaves the
+            // other 50 % empty — the symptom the user reported as
+            // "leftover empty space where the closed group used to
+            // be". WPF `*` columns sidestep the same edge case
+            // because they normalise the star sum on every layout
+            // pass; the Rust flex pipeline needs us to renormalise
+            // explicitly. Scaling so the sum equals the surviving
+            // count keeps every weight ≥ MIN_GROUP_WEIGHT (modulo
+            // rounding) and the layout proportional, while pinning
+            // the sum at ≥ 1.0 for any non-empty workspace.
+            normalise_group_weights(&mut self.group_weights);
             // If the focused group was at or after `group_idx`, slide
             // its index left so it keeps pointing at the same group.
             // Re-focus the (possibly new) focused group so keyboard
@@ -3016,6 +3075,14 @@ impl AppShell {
         if removed < self.group_weights.len() {
             self.group_weights.remove(removed);
         }
+        // See `close_tab` for the rationale: a lingering fractional
+        // weight sum (e.g. `0.5` after a heavy splitter drag, then
+        // closing the dominant column) triggers taffy's "flex factor
+        // < 1" branch and leaves the survivor occupying only that
+        // fraction of the work area. Rescaling so the sum equals the
+        // surviving count keeps ratios but pins the sum at the count,
+        // which lets gpui's flex layout fill the workspace.
+        normalise_group_weights(&mut self.group_weights);
         if self.focused_group >= self.groups.len() {
             self.focused_group = self.groups.len() - 1;
         }
@@ -5004,6 +5071,11 @@ impl AppShell {
             if source_idx < self.group_weights.len() {
                 self.group_weights.remove(source_idx);
             }
+            // Same rescale as `close_tab` / `close_focused_group`:
+            // taffy's "flex factor < 1" branch turns a sub-1.0
+            // weight sum into a partially-empty workspace, so renormalise
+            // to keep the sum at `len()` after the removal.
+            normalise_group_weights(&mut self.group_weights);
         }
 
         // Activate the moved tab in its new home so keyboard focus
@@ -7013,6 +7085,72 @@ fn default_agent_auto_type_for(settings: &Settings) -> Option<SharedString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── normalise_group_weights ───────────────────────────────────
+    //
+    // Guards against the taffy "flex factor < 1" footgun: once a
+    // splitter drag has pushed weights into the sub-unit range,
+    // removing a column without rescaling leaves the workspace half
+    // empty. Every removal path (`close_tab` / `close_focused_group` /
+    // `move_tab_to_group`) feeds the surviving slice through this
+    // helper, so its contract is load-bearing.
+
+    #[test]
+    fn normalise_group_weights_pins_lone_survivor_to_one() {
+        // Heaviest drag the UI allows: weight `2.5` against a peer that
+        // gets closed. The peer is dropped before this call, so the
+        // survivor stays alone at `2.5`. Rescaling normalises the
+        // single weight back to `1.0` (mean of one element) so the
+        // single flex item gets the standard `flex-grow: 1` treatment
+        // rather than taffy's truncated free-space distribution.
+        let mut weights = vec![2.5_f32];
+        normalise_group_weights(&mut weights);
+        assert_eq!(weights, vec![1.0]);
+    }
+
+    #[test]
+    fn normalise_group_weights_pulls_lone_sub_one_survivor_up() {
+        // Reproduces the bug report. Pre-fix the survivor stayed at
+        // `0.5`, taffy fed it `0.5 * free_space`, and half the
+        // workspace stayed blank.
+        let mut weights = vec![0.5_f32];
+        normalise_group_weights(&mut weights);
+        assert_eq!(weights, vec![1.0]);
+    }
+
+    #[test]
+    fn normalise_group_weights_rescales_two_survivors_preserving_ratio() {
+        // Weights `[0.4, 0.2]` (sum 0.6 < 1.0) — would trigger the
+        // same truncation. After rescale the sum is 2.0 (slice length)
+        // and the 2:1 ratio between the two survivors is intact.
+        let mut weights = vec![0.4_f32, 0.2_f32];
+        normalise_group_weights(&mut weights);
+        let sum: f32 = weights.iter().copied().sum();
+        assert!((sum - 2.0).abs() < 1e-5, "sum after rescale: {sum}");
+        // 2:1 ratio preserved.
+        assert!((weights[0] / weights[1] - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn normalise_group_weights_falls_back_when_sum_is_zero_or_invalid() {
+        // Pathological inputs (corrupt layout.json, NaN, all-zero
+        // sanitisation gap) round-trip to all-ones so the layout still
+        // has a sane sum to feed the flex layer.
+        let mut zeros = vec![0.0_f32, 0.0_f32];
+        normalise_group_weights(&mut zeros);
+        assert_eq!(zeros, vec![1.0_f32, 1.0_f32]);
+
+        let mut nans = vec![f32::NAN, 1.0];
+        normalise_group_weights(&mut nans);
+        assert_eq!(nans, vec![1.0_f32, 1.0_f32]);
+    }
+
+    #[test]
+    fn normalise_group_weights_no_op_on_empty_slice() {
+        let mut weights: Vec<f32> = Vec::new();
+        normalise_group_weights(&mut weights);
+        assert!(weights.is_empty());
+    }
 
     #[test]
     fn terminal_font_candidates_keep_settings_ahead_of_env() {
