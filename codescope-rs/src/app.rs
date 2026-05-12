@@ -54,7 +54,7 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, SharedString, Styled, Window,
-    WindowBounds, WindowControlArea, div, px,
+    WindowBounds, WindowControlArea, div, px, svg,
 };
 use parking_lot::Mutex;
 
@@ -471,8 +471,9 @@ pub struct AppShell {
     /// quits the app when invoked on the only remaining group.
     groups: Vec<Group>,
     /// Index into `groups` of the currently-focused column. Keyboard
-    /// shortcuts (Ctrl+T, Ctrl+\, Ctrl+W, Ctrl+1..9) target this
-    /// group; click on any pane / tab strip section moves the focus.
+    /// shortcuts (Ctrl+Shift+T, Ctrl+Shift+\, Ctrl+Shift+W,
+    /// Ctrl+Shift+1..9) target this group; click on any pane / tab
+    /// strip section moves the focus.
     focused_group: usize,
     /// Per-group flex weights. Length always matches `groups.len()`.
     /// `split_right` pushes 1.0; `close_tab`'s collapse drops the
@@ -639,7 +640,7 @@ pub struct AppShell {
     /// only has to wire the consumer side.
     #[allow(dead_code)]
     agent_registry: codescope_core::AgentRegistry,
-    /// Open command palette state, if any. `Some` between Ctrl+P /
+    /// Open command palette state, if any. `Some` between
     /// Ctrl+Shift+P press and Enter / Esc. Holds the action list,
     /// search query, and selection cursor — see
     /// [`crate::command_palette::CommandPaletteState`].
@@ -3654,7 +3655,15 @@ impl AppShell {
             if g.added == 0 && g.removed == 0 && !g.has_changes {
                 return None;
             }
-            let mut row = div().flex().flex_row().items_center().gap(px(4.0));
+            let mut row = div().flex().flex_row().items_center().gap(px(6.0)).child(
+                // Branch icon — matches the C# git-dirty Path (three
+                // commit dots joined by a branch).
+                svg()
+                    .path("icons/branch.svg")
+                    .w(px(12.0))
+                    .h(px(12.0))
+                    .text_color(ink_dim),
+            );
             if g.added > 0 {
                 row = row.child(div().text_color(ink).child(format!("+{}", g.added)));
             }
@@ -3685,7 +3694,17 @@ impl AppShell {
                 .flex()
                 .flex_row()
                 .items_center()
+                .gap(px(6.0))
                 .text_color(ink)
+                .child(
+                    // Sync icon — down-arrow + base line, matches
+                    // the C# remote-delta Path.
+                    svg()
+                        .path("icons/sync.svg")
+                        .w(px(12.0))
+                        .h(px(12.0))
+                        .text_color(ink_dim),
+                )
                 .child(t)
         });
 
@@ -3699,9 +3718,17 @@ impl AppShell {
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(4.0))
+                .gap(px(6.0))
                 .text_color(ink_muted)
-                .child(div().text_color(ink_muted).child("\u{25C6}"))
+                .child(
+                    // Cube icon — matches the C# `StatusBarView`
+                    // model Path (12 × 12, stroke=currentColor).
+                    svg()
+                        .path("icons/model.svg")
+                        .w(px(12.0))
+                        .h(px(12.0))
+                        .text_color(ink_dim),
+                )
                 .child(m)
         });
 
@@ -3711,7 +3738,16 @@ impl AppShell {
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(4.0))
+                .gap(px(6.0))
+                .child(
+                    // Tokens / lines icon — matches the C# token
+                    // Path (three horizontal lines).
+                    svg()
+                        .path("icons/tokens.svg")
+                        .w(px(12.0))
+                        .h(px(12.0))
+                        .text_color(ink_dim),
+                )
                 .child(
                     div()
                         .text_color(ink)
@@ -3740,9 +3776,17 @@ impl AppShell {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(4.0))
+                    .gap(px(6.0))
                     .text_color(ink_dim)
-                    .child(div().text_color(ink_muted).child("\u{25CB}"))
+                    .child(
+                        // Clock icon — matches the C# duration
+                        // Path (circle + minute hand).
+                        svg()
+                            .path("icons/clock.svg")
+                            .w(px(12.0))
+                            .h(px(12.0))
+                            .text_color(ink_dim),
+                    )
                     .child(codescope_core::TranscriptTail::format_duration(d))
             });
 
@@ -3825,6 +3869,18 @@ impl AppShell {
                 .items_center()
                 .gap(px(6.0))
                 .text_color(ink_dim)
+                .child(
+                    // Worktree (folder) icon — a small folder glyph
+                    // signals the workspace-summary cluster. The C#
+                    // build leans on the small-caps "N worktrees"
+                    // label alone; in the dense Rust port the icon
+                    // makes the cluster scannable.
+                    svg()
+                        .path("icons/worktree.svg")
+                        .w(px(12.0))
+                        .h(px(12.0))
+                        .text_color(ink_dim),
+                )
                 .child(div().child(worktree_text));
             if worktree_dirty > 0 {
                 row = row
@@ -3899,11 +3955,18 @@ impl AppShell {
                 .absolute()
                 .size_full()
             })
-            // Bell glyph — fall back to a unicode symbol since we don't
-            // ship vector icons. The C# uses an SVG path; the unicode
-            // bell ringer (U+1F514) is a close visual stand-in at this
-            // size and stays inside the design-tokens font stack.
-            .child(div().text_color(ink_muted).text_size(px(13.0)).child("\u{1F514}"))
+            // Bell SVG — same path the C# `StatusBarView` Bell
+            // Path uses (14 × 14 viewBox, stroke=currentColor). The
+            // svg element picks up `text_color`, so the bell tints
+            // to match the surrounding muted ink without any extra
+            // wiring.
+            .child(
+                svg()
+                    .path("icons/bell.svg")
+                    .w(px(14.0))
+                    .h(px(14.0))
+                    .text_color(ink_muted),
+            )
             .when(has_unread, |this| {
                 this.child(
                     div()
@@ -4478,22 +4541,41 @@ impl AppShell {
         if !app_mod || mods.alt {
             return;
         }
-        // Bindings mirror C#'s `MainWindow.InputBindings`: Ctrl+T new
-        // tab, Ctrl+W close tab, Ctrl+Tab / Ctrl+Shift+Tab cycle,
-        // Ctrl+1..9 jump, Ctrl+\ split. Ctrl+Shift+T / Ctrl+Shift+W
-        // are kept as alternates — they never collide with shell
-        // word-shortcuts, so power users typing in readline /
-        // PSReadLine can still hit the chord without rebinding.
+        // ─── App-level chord set (Ctrl+Shift universal) ─────────
+        //
+        // Every app chord here requires Ctrl+Shift. Reason: coding
+        // agents inside the terminal lean heavily on plain Ctrl+letter
+        // (Ctrl+W = backward-kill-word, Ctrl+P = previous history,
+        // Ctrl+T = transpose, Ctrl+B = backward-char, Ctrl+, often
+        // mapped by tooling, …). Plain Ctrl+letter is left alone so
+        // it falls through to the terminal; Ctrl+Shift+letter is
+        // unambiguous "app, not terminal".
+        //
+        // Chord table — kept in sync with
+        // `codescope_terminal::view::is_app_level_shortcut`:
+        //
+        //   Ctrl+Shift+T            new tab
+        //   Ctrl+Shift+W            close tab / collapse empty group
+        //   Ctrl+Tab                next tab     (shift already encodes "prev")
+        //   Ctrl+Shift+Tab          prev tab
+        //   Ctrl+Shift+1..9         focus tab N
+        //   Ctrl+Shift+B            toggle sidebar
+        //   Ctrl+Shift+,            settings dialog
+        //   Ctrl+Shift+P            command palette (toggle)
+        //   Ctrl+Shift+O            overview pane (toggle)
+        //   Ctrl+Shift+\            split right
+        //   Alt+Left / Alt+Right    cycle focus group
+        //   Alt+1..9                focus group N
+        //
+        // The legacy C# WPF build binds the plain Ctrl variants
+        // because its hosted terminal swallows everything, but the
+        // Rust port routes terminal-bound keys back to the PTY, so
+        // the agent-shell conflicts surfaced. The Ctrl+Shift remap
+        // is a Rust-port-only adjustment documented in
+        // `docs/HANDOFF.md` (Keyboard chords).
         match key {
-            // Ctrl+P / Ctrl+Shift+P — open the command palette. Both
-            // chords share an opener so the user can use the one their
-            // muscle memory prefers; mirrors C#'s `OpenCommandPaletteCommand`
-            // input binding (the C# build wires Ctrl+P + Ctrl+Shift+P
-            // identically). Toggle behaviour: if the palette is already
-            // open, re-pressing the chord closes it — same as a
-            // single-key chord pattern across the rest of the chrome
-            // (sidebar / overview toggles).
-            "p" => {
+            // Ctrl+Shift+P — command palette toggle.
+            "p" if mods.shift => {
                 cx.stop_propagation();
                 if self.command_palette.is_some() {
                     self.close_command_palette(cx);
@@ -4501,29 +4583,28 @@ impl AppShell {
                     self.open_command_palette(window, cx);
                 }
             }
-            // Ctrl+, opens the Settings dialog. Windows convention,
-            // also the VS Code binding. The Rust port adds an
-            // in-app Settings UI (the C# build hand-edits
-            // `settings.json`); see ADR-0018.
-            "," => {
+            // Ctrl+Shift+, opens the Settings dialog.
+            "," if mods.shift => {
                 cx.stop_propagation();
                 self.open_settings_dialog(window, cx);
             }
-            "t" => {
+            // Ctrl+Shift+T — new tab. Plain Ctrl+T stays with the
+            // terminal (readline transpose-char).
+            "t" if mods.shift => {
                 cx.stop_propagation();
                 self.spawn_tab(window, cx);
             }
-            "w" => {
+            // Ctrl+Shift+W — close active tab (or collapse an empty
+            // group). Plain Ctrl+W stays with the terminal —
+            // readline binds it to backward-kill-word.
+            "w" if mods.shift => {
                 cx.stop_propagation();
                 let g = self.focused_group;
                 let group = self.focused_group();
                 if group.tabs.is_empty() {
-                    // Empty focused group — collapse it so the user
-                    // can undo an accidental split right without
-                    // having to spawn a tab first. Mirrors the
-                    // `tab is null` branch of `MainViewModel.CloseTabAsync`.
-                    // No-op when this is the only group; the user has
-                    // to close their last tab to quit.
+                    // Empty focused group — collapse so the user
+                    // can undo an accidental split right. No-op
+                    // when this is the only group.
                     if self.groups.len() > 1 {
                         self.close_focused_group(window, cx);
                     }
@@ -4532,30 +4613,31 @@ impl AppShell {
                     self.close_tab(g, t, window, cx);
                 }
             }
-            // Ctrl+\ — split the focused group to the right. Matches
-            // the C# binding (`SplitRightCommand`). Backslash is a
-            // single-key chord on US/most layouts, so we hit it here
-            // alongside the shifted variant in case of layouts that
-            // treat the bare key as a different glyph.
-            "\\" => {
+            // Ctrl+Shift+\ — split the focused group to the right.
+            // On US layouts gpui's Windows adapter folds Shift+\
+            // into "|" with shift consumed; accept both shapes.
+            "\\" if mods.shift => {
                 cx.stop_propagation();
                 self.split_right(window, cx);
             }
-            // Ctrl+B — toggle sidebar visibility. Matches VS Code +
-            // most editors with a project tree, so the muscle memory
-            // carries over.
-            "b" if !mods.shift => {
+            "|" => {
+                cx.stop_propagation();
+                self.split_right(window, cx);
+            }
+            // Ctrl+Shift+B — toggle sidebar visibility.
+            "b" if mods.shift => {
                 cx.stop_propagation();
                 self.toggle_sidebar(cx);
             }
-            // Ctrl+Shift+O — toggle the Overview panel. Mirrors the
-            // C# build's `Ctrl+Shift+O` input binding (see
-            // `MainViewModel.Palette` and `MainWindow.InputBindings`).
+            // Ctrl+Shift+O — toggle the Overview panel.
             "o" if mods.shift => {
                 cx.stop_propagation();
                 let next = !self.show_overview;
                 self.set_show_overview(next, cx);
             }
+            // Ctrl+Tab / Ctrl+Shift+Tab — cycle tabs forwards /
+            // backwards. Shift is intrinsic to the prev-tab chord
+            // so these stay on plain Ctrl; no shell binds Ctrl+Tab.
             "tab" if !mods.shift => {
                 cx.stop_propagation();
                 self.next_tab(window, cx);
@@ -4564,11 +4646,12 @@ impl AppShell {
                 cx.stop_propagation();
                 self.prev_tab(window, cx);
             }
-            d if !mods.shift && d.len() == 1 => {
-                if let Some(n) = d.chars().next().and_then(|c| c.to_digit(10))
-                    && (1..=9).contains(&n)
-                {
-                    let idx = (n as usize) - 1;
+            // Ctrl+Shift+1..9 — focus tab N. Plain Ctrl+1..9 stays
+            // with the terminal. gpui's Windows adapter folds
+            // Shift+digit into !@#$%^&*( and clears `mods.shift`;
+            // `keystroke_digit_index` accepts both shapes.
+            d if d.len() == 1 => {
+                if let Some(idx) = keystroke_digit_index(d, mods.shift) {
                     let group_idx = self.focused_group;
                     if idx < self.groups[group_idx].tabs.len() {
                         cx.stop_propagation();
@@ -4579,6 +4662,49 @@ impl AppShell {
             _ => {}
         }
     }
+}
+
+/// Resolve a 1-based digit-tab keystroke into a 0-based tab index.
+///
+/// Accepts both shapes the gpui keyboard adapters surface for
+/// Ctrl+Shift+digit:
+///
+/// - Bare digit `"1".."9"` with `shift_set == true` — non-US layouts
+///   and most non-Windows platforms.
+/// - US-layout shifted glyph `"!@#$%^&*("` with `shift_set == false`,
+///   because gpui's Windows adapter folds the shifted character into
+///   the key string and clears the shift modifier (see
+///   `gpui::platform::windows::keyboard::get_keystroke_key`).
+///
+/// Returns `None` for "0" / ")" (Ctrl+Shift+0 is unbound, matching
+/// the legacy C# build) and for any non-digit key.
+fn keystroke_digit_index(key: &str, shift_set: bool) -> Option<usize> {
+    if shift_set
+        && let Some(c) = key.chars().next()
+        && let Some(n) = c.to_digit(10)
+        && (1..=9).contains(&n)
+    {
+        return Some((n as usize) - 1);
+    }
+    let n: u32 = match key {
+        "!" => 1,
+        "@" => 2,
+        "#" => 3,
+        "$" => 4,
+        "%" => 5,
+        "^" => 6,
+        "&" => 7,
+        "*" => 8,
+        "(" => 9,
+        _ => return None,
+    };
+    if shift_set {
+        // The adapter cleared shift for the US shifted-glyph form.
+        // If shift is still set, the keystroke is exotic (AltGr,
+        // dead key) — refuse to bind to avoid surprises.
+        return None;
+    }
+    Some((n as usize) - 1)
 }
 
 impl Focusable for AppShell {
@@ -5267,7 +5393,7 @@ struct GroupRenderData {
 
 // ─── Command palette ────────────────────────────────────────────────
 //
-// Ctrl+P / Ctrl+Shift+P open the palette modal. Action assembly +
+// Ctrl+Shift+P opens the palette modal. Action assembly +
 // dispatch live here so we have direct access to every AppShell
 // method we route to (spawn_tab_in, apply_settings, toggle_sidebar,
 // sidebar updates). The state struct and the render function live in
@@ -5284,7 +5410,7 @@ impl AppShell {
         self.command_palette.as_mut()
     }
 
-    /// Open the palette. Idempotent — re-pressing Ctrl+P while the
+    /// Open the palette. Idempotent — re-pressing Ctrl+Shift+P while the
     /// palette is open closes it (the chord toggles, mirroring the
     /// sidebar / overview chords). Builds the action list from the
     /// current sidebar / settings snapshot the same way C#
@@ -5423,7 +5549,7 @@ impl AppShell {
                 }
                 BuiltInCommand::OpenSettings => {
                     // Open the in-app Settings dialog — same entry
-                    // point Ctrl+, takes (see `on_key_down`). The
+                    // point Ctrl+Shift+, takes (see `on_key_down`). The
                     // earlier behaviour shelled out to whatever app
                     // owns `.json` so the user could hand-edit
                     // `settings.json`; the Rust port has a proper
@@ -5470,7 +5596,7 @@ impl AppShell {
         // row. The chord still feeds the fuzzy scorer because the
         // renderer's hint path is independent of search input — the
         // search target is `PaletteAction::display`, and a user
-        // typing the chord (e.g. "Ctrl+B") still finds Toggle sidebar
+        // typing the chord (e.g. "Ctrl+Shift+B") still finds Toggle sidebar
         // via the title fragment.
         for cmd in [
             BuiltInCommand::NewSession,
@@ -6285,5 +6411,73 @@ mod tests {
         // route a tab to the wrong project.
         assert!(!path_eq_ci("/repos/Foo", "/repos/foo"));
         assert!(path_eq_ci("/repos/foo", "/repos/foo"));
+    }
+
+    // ─── keystroke_digit_index ─────────────────────────────────────
+    //
+    // Covers both shapes the gpui keyboard adapters produce for
+    // Ctrl+Shift+digit: bare-digit + shift, and the US-layout
+    // shifted-glyph form with shift consumed by the adapter.
+
+    #[test]
+    fn keystroke_digit_bare_digit_with_shift_resolves() {
+        for d in '1'..='9' {
+            let key = d.to_string();
+            let idx = keystroke_digit_index(&key, true);
+            assert_eq!(
+                idx,
+                Some((d.to_digit(10).unwrap() as usize) - 1),
+                "digit {d}",
+            );
+        }
+    }
+
+    #[test]
+    fn keystroke_digit_shifted_glyph_resolves_on_us_layout() {
+        // gpui's Windows adapter folds Shift+1..9 into !@#$%^&*( and
+        // clears `mods.shift`.
+        let cases = [
+            ("!", 0),
+            ("@", 1),
+            ("#", 2),
+            ("$", 3),
+            ("%", 4),
+            ("^", 5),
+            ("&", 6),
+            ("*", 7),
+            ("(", 8),
+        ];
+        for (glyph, expected) in cases {
+            assert_eq!(
+                keystroke_digit_index(glyph, false),
+                Some(expected),
+                "glyph {glyph}",
+            );
+        }
+    }
+
+    #[test]
+    fn keystroke_digit_zero_is_unbound() {
+        // Ctrl+Shift+0 / Ctrl+) intentionally unbound — mirrors the
+        // legacy C# build's "no Ctrl+0" convention.
+        assert_eq!(keystroke_digit_index("0", true), None);
+        assert_eq!(keystroke_digit_index(")", false), None);
+    }
+
+    #[test]
+    fn keystroke_digit_plain_digit_without_shift_is_unbound() {
+        // Plain Ctrl+1..9 must not match — the universal Ctrl+Shift
+        // remap explicitly leaves them to the terminal.
+        for d in '1'..='9' {
+            let key = d.to_string();
+            assert_eq!(keystroke_digit_index(&key, false), None, "digit {d}");
+        }
+    }
+
+    #[test]
+    fn keystroke_digit_non_digit_keys_return_none() {
+        assert_eq!(keystroke_digit_index("a", true), None);
+        assert_eq!(keystroke_digit_index("a", false), None);
+        assert_eq!(keystroke_digit_index("", true), None);
     }
 }

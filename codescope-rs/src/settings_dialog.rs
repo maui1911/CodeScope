@@ -232,7 +232,7 @@ fn format_f32(value: f32) -> String {
 
 impl AppShell {
     /// Open the Settings dialog. Idempotent on an already-open
-    /// dialog. Triggered by Ctrl+, (handled in `on_key_down`).
+    /// dialog. Triggered by Ctrl+Shift+, (handled in `on_key_down`).
     pub fn open_settings_dialog(
         &mut self,
         window: &mut Window,

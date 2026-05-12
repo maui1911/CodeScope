@@ -12,6 +12,7 @@
 //!    initial terminal tab and owns everything from there.
 
 mod app;
+mod assets;
 mod command_palette;
 mod confirm_dialog;
 mod new_project_dialog;
@@ -156,7 +157,13 @@ fn main() -> Result<()> {
     let window_bounds = saved_window.map(window_state_to_bounds);
     let paths = Arc::new(paths);
 
-    let app = gpui::Application::new();
+    // `with_assets` registers our static SVG icon set so
+    // `gpui::svg().path("icons/foo.svg")` resolves through
+    // `crate::assets::AppAssets` to bytes embedded via
+    // `include_bytes!`. Without an explicit `AssetSource`, gpui's
+    // `SvgRenderer` silently no-ops every `svg()` element (the
+    // default `()` source returns `None`). See `crate::assets`.
+    let app = gpui::Application::new().with_assets(crate::assets::AppAssets);
 
     app.run(move |cx| {
         // `window.json` save lives inside `AppShell::new` (observes

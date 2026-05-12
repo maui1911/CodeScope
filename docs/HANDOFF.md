@@ -19,6 +19,35 @@ Tests: `codescope-core` (417) + `codescope-rs` bin (75) +
 **Uncommitted work:** none on `main`.
 **Open issues:** none on GitHub.
 
+### Keyboard chords (Rust port)
+
+The Rust port routes plain Ctrl+letter keystrokes to the terminal so
+coding agents inside the PTY can use them (Ctrl+W = backward-kill-word,
+Ctrl+P = previous history, Ctrl+T = transpose, Ctrl+B = backward-char,
+Ctrl+1..9 = history selection in some agent CLIs). Every app-level
+chord therefore lives on **Ctrl+Shift** so it can't conflict.
+
+| Action               | Chord                |
+|----------------------|----------------------|
+| New tab              | Ctrl+Shift+T         |
+| Close tab            | Ctrl+Shift+W         |
+| Next / prev tab      | Ctrl+Tab / Ctrl+Shift+Tab |
+| Focus tab N          | Ctrl+Shift+1..9      |
+| Toggle sidebar       | Ctrl+Shift+B         |
+| Settings             | Ctrl+Shift+,         |
+| Command palette      | Ctrl+Shift+P         |
+| Overview             | Ctrl+Shift+O         |
+| Split right          | Ctrl+Shift+\         |
+| Focus group L/R      | Alt+Left / Alt+Right |
+| Focus group N        | Alt+1..9             |
+
+Implemented in `codescope-rs/src/app.rs::on_key_down` and mirrored by
+the terminal whitelist `codescope-rs/terminal/src/view.rs::is_app_level_shortcut`.
+gpui's Windows keyboard adapter folds shifted digits into `!@#$%^&*(`
+and clears `mods.shift`, so `keystroke_digit_index` (and the matching
+match arm in the terminal whitelist) accept both shapes — see the
+unit tests in both files.
+
 ### Cursor — what's next
 
 Feature-parity sweep done. The Rust port matches C# functionally;
