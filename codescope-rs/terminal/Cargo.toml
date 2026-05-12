@@ -9,7 +9,7 @@ description = "Terminal emulator component for CodeScope-rs."
 alacritty_terminal = "0.25"
 anyhow = "1"
 codescope-core = { path = "../core" }
-flume = { version = "0.11", default-features = false }
+flume = { version = "0.11", default-features = false, features = ["async"] }
 gpui = "0.2.2"
 linkify = "0.10"
 open = "5"
