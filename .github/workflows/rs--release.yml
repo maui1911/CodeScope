@@ -126,10 +126,19 @@ jobs:
         # artifacts at the workspace root, so each upload `path:` carries its
         # final workspace-relative location (e.g. `codescope-rs/target/...`)
         # — keeps the artifact ZIPs round-trip-correct.
+        #
+        # Write the plan manifest into the working directory (codescope-rs/),
+        # NOT into `target/distrib/`. Bash creates the redirect target as an
+        # empty file BEFORE `dist` runs; `dist` calls `load_manifests` over
+        # its `dist_dir` (= `target/distrib/`) and tries to parse every
+        # `*dist-manifest.json` file it finds there. An empty file makes
+        # axoasset bail with `failed to parse JSON / EOF while parsing a
+        # value at line 1 column 0`. Matches the upstream cargo-dist 0.31
+        # template, which also keeps `plan-dist-manifest.json` at the
+        # workspace root for the same reason.
         working-directory: codescope-rs
         shell: bash
         run: |
-          mkdir -p target/distrib
           if [ -z "${{ github.event.pull_request }}" ]; then
             # `dist host --steps=create` needs the *stripped* tag (see
             # tag-flag rationale on the job outputs above).
@@ -137,15 +146,15 @@ jobs:
           else
             DIST_SUBCOMMAND="plan"
           fi
-          dist $DIST_SUBCOMMAND --output-format=json > target/distrib/plan-dist-manifest.json
+          dist $DIST_SUBCOMMAND --output-format=json > plan-dist-manifest.json
           echo "dist ran successfully"
-          cat target/distrib/plan-dist-manifest.json
-          echo "manifest=$(jq -c "." target/distrib/plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
+          cat plan-dist-manifest.json
+          echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
       - name: "Upload dist-manifest.json"
         uses: actions/upload-artifact@v6
         with:
           name: artifacts-plan-dist-manifest
-          path: codescope-rs/target/distrib/plan-dist-manifest.json
+          path: codescope-rs/plan-dist-manifest.json
 
   # Build and packages all the platform-specific things
   build-local-artifacts:
