@@ -69,7 +69,9 @@ struct BadgeState {
 /// On Windows the underlying `ITaskbarList3` proxy is held behind an
 /// `Rc<RefCell<...>>` so the deferred-init `cx.spawn` task can wire
 /// it up *without* going through the AppShell entity (no nested
-/// `this.update` borrow). See `init_handle` / `init_after_construction`.
+/// `this.update` borrow). See [`Self::init_handle`] +
+/// [`TaskbarBadgeInit::run`] (scheduled from
+/// `AppShell::schedule_taskbar_badge_init`).
 pub struct TaskbarBadge {
     last: Option<BadgeState>,
     #[cfg(target_os = "windows")]
