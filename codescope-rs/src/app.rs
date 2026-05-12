@@ -298,6 +298,18 @@ const TOAST_POLL: Duration = Duration::from_millis(250);
 /// freshly-pushed toast can need expiry attention, so polling at
 /// the same rate is plenty.
 const TOAST_POLL_IDLE: Duration = TOAST_LIFETIME_ERR;
+
+/// Telemetry transcript-tail poll cadence while at least one tail
+/// is registered. Matches the C# `ClaudeTelemetryService` 250 ms
+/// flat poll — keeps the idle → busy transition latency under one
+/// tick instead of the previous 2 s adaptive cadence (the user
+/// reported a ~2 s lag before the wait pulse appeared).
+const TELEMETRY_POLL_ACTIVE: Duration = Duration::from_millis(250);
+/// Telemetry poll cadence when no tails are registered. The C#
+/// build disarms its timer entirely here; we keep the task alive
+/// (avoids a wakeup/teardown dance per tab) but throttle to a
+/// 30 s heartbeat so an idle CodeScope doesn't burn cycles.
+const TELEMETRY_POLL_IDLE: Duration = Duration::from_secs(30);
 /// Cap on simultaneously-visible toasts. Mirrors the C# build's
 /// ToastService visible-cap. When the user fires a flurry of
 /// actions (or hits a recurring error) we evict the oldest so the
@@ -439,21 +451,6 @@ impl AgentTail {
             AgentTail::Copilot(t) => t.poll(),
             AgentTail::OpenCode(t) => t.poll(),
             AgentTail::Pi(t) => t.poll(),
-        }
-    }
-
-    /// Cheap probe used by the busy/idle adaptive cadence in
-    /// [`AppShell::start_telemetry_poll`]: returns the latest
-    /// `SessionState` without cloning the surrounding snapshot.
-    /// `SessionState` is `Copy`, so this is `O(1)` per tail. The
-    /// owned-snapshot path goes through [`AgentTail::snapshot`] /
-    /// [`AppShell::telemetry_for`].
-    fn state(&self) -> Option<codescope_core::SessionState> {
-        match self {
-            AgentTail::Claude(t) => t.snapshot.as_ref().map(|s| s.state),
-            AgentTail::Copilot(t) => t.snapshot.as_ref().map(|s| s.state),
-            AgentTail::OpenCode(t) => t.snapshot().map(|s| s.state),
-            AgentTail::Pi(t) => t.snapshot.as_ref().map(|s| s.state),
         }
     }
 
@@ -1300,31 +1297,36 @@ impl AppShell {
 
     /// Spawn the background transcript-tail polling loop.
     ///
-    /// Uses an adaptive interval: 250 ms while any session is busy /
-    /// pending-tool-use; 2 s when all sessions are idle or unknown.
-    /// Mirrors the C# `ClaudeTelemetryService` 250 ms poll (the C#
-    /// build also uses FSWatcher; here we rely on polling only to avoid
-    /// adding the `notify` crate dependency).
+    /// Cadence mirrors the C# [`ClaudeTelemetryService`]:
     ///
-    /// Called from `AppShell::new` after the struct is constructed.
+    /// - **250 ms** while *any* tail is registered, regardless of busy
+    ///   state. The C# build uses a flat 250 ms `Timer` armed only
+    ///   when watches exist (see `RefreshTimerArmed`); we match that
+    ///   so an idle → busy transition surfaces inside the next tick
+    ///   instead of waiting up to the previous 2 s idle cadence
+    ///   (the original "twee seconds before the wait pulse appears"
+    ///   bug — issue: agent thinking-state latency).
+    /// - **30 s** when no tails are registered. The C# build fully
+    ///   disarms the timer here; we keep the task alive (avoids a
+    ///   wakeup/teardown dance on every tab open/close) but throttle
+    ///   it down to a heartbeat.
+    ///
+    /// Polling cost: each tick is a `FileInfo::Length` stat per
+    /// tail; reads only happen when the offset has moved. On Windows
+    /// this is sub-millisecond per file, so 4 tails × 4 Hz is
+    /// negligible. The C# build runs the same rate across four
+    /// agent services (~16 Hz combined) in production.
+    ///
+    /// Called from `AppShell::new` after the struct is constructed;
+    /// the first tick fires after construction is done (avoids the
+    /// borrow-at-construction race that `start_dirty_poll` also
+    /// guards against).
     fn start_telemetry_poll(&self, cx: &mut Context<Self>) {
-        // Adaptive cadence — three rates so we don't burn CPU when
-        // there's nothing to read:
-        //
-        // - 250 ms while any registered tail is in `Busy` /
-        //   `PendingToolUse` (assistant streaming).
-        // - 2 s while at least one tail is registered but every
-        //   snapshot is idle.
-        // - 30 s when there are no tails at all (the "armed-only-
-        //   when-needed" pattern from the C# `RefreshTimerArmed`
-        //   model — we don't fully tear down the task to keep the
-        //   spawn site simple, but we stop hammering the executor).
-        //
-        // The first tick fires after construction is done (avoids the
-        // borrow-at-construction race that `start_dirty_poll` also
-        // guards against).
         cx.spawn(async move |this, cx| {
-            let mut interval = Duration::from_secs(2);
+            // Start at the active cadence — the first registration
+            // typically races construction, so we don't want to
+            // sleep 30 s on cold-start before the first tick.
+            let mut interval = TELEMETRY_POLL_ACTIVE;
             loop {
                 cx.background_executor().timer(interval).await;
                 if this.upgrade().is_none() {
@@ -1340,18 +1342,10 @@ impl AppShell {
                         // Same logic for the taskbar overlay: a tab
                         // that just closed should clear the badge.
                         this.refresh_taskbar_badge();
-                        return Duration::from_secs(30);
+                        return TELEMETRY_POLL_IDLE;
                     }
-                    let mut any_busy = false;
                     for tail in this.telemetry_tails.values_mut() {
                         tail.poll();
-                        if matches!(
-                            tail.state(),
-                            Some(codescope_core::SessionState::Busy)
-                                | Some(codescope_core::SessionState::PendingToolUse)
-                        ) {
-                            any_busy = true;
-                        }
                     }
                     // After every poll, recompute the per-path
                     // active/busy snapshot the sidebar uses to colour
@@ -1359,7 +1353,7 @@ impl AppShell {
                     // to a collapsed project row. Cheap — one map
                     // lookup per tab; the sidebar `set_session_paths`
                     // call short-circuits with no notify when nothing
-                    // changed, so a 250 ms busy cadence doesn't drive
+                    // changed, so a 250 ms cadence doesn't drive
                     // a redraw every tick unless a tab actually
                     // flipped state.
                     this.push_sidebar_session_paths(cx);
@@ -1368,11 +1362,7 @@ impl AppShell {
                     // de-dupes redundant `apply` calls so a quiet
                     // busy stretch doesn't repaint every 250 ms.
                     this.refresh_taskbar_badge();
-                    if any_busy {
-                        Duration::from_millis(250)
-                    } else {
-                        Duration::from_secs(2)
-                    }
+                    TELEMETRY_POLL_ACTIVE
                 });
                 match result {
                     Ok(next) => interval = next,
@@ -5238,16 +5228,14 @@ impl AppShell {
                     self.spawn_tab(window, cx);
                 }
                 BuiltInCommand::OpenSettings => {
-                    let path = self.paths.settings_file();
-                    if let Err(err) = open_in_native_browser(&path) {
-                        eprintln!("warning: failed to open settings.json: {err:#}");
-                        self.push_toast(
-                            ToastKind::Err,
-                            SharedString::from("Couldn't open settings.json"),
-                            Some(format!("{err}").into()),
-                            cx,
-                        );
-                    }
+                    // Open the in-app Settings dialog — same entry
+                    // point Ctrl+, takes (see `on_key_down`). The
+                    // earlier behaviour shelled out to whatever app
+                    // owns `.json` so the user could hand-edit
+                    // `settings.json`; the Rust port has a proper
+                    // dialog now (ADR-0018) and the palette should
+                    // mirror the keyboard shortcut's destination.
+                    self.open_settings_dialog(window, cx);
                 }
                 BuiltInCommand::ReloadTheme => {
                     // Re-resolve the theme from the current settings
@@ -5437,31 +5425,6 @@ impl AppShell {
             .read(cx)
             .active_project()
             .map(|p| p.path.clone())
-    }
-}
-
-/// Open a path with the platform's default handler. Windows routes
-/// through `ShellExecuteW` and is fire-and-forget — `shell_open_url`
-/// doesn't surface failure, so the Windows arm always returns
-/// `Ok(())` even if the shell can't find a handler for the file. The
-/// macOS / Linux arms shell out to `open` / `xdg-open` and propagate
-/// the spawn error so a missing binary surfaces as a toast. Used by
-/// the palette's "Open settings" row to hand `settings.json` off to
-/// the user's preferred editor.
-fn open_in_native_browser(path: &std::path::Path) -> std::io::Result<()> {
-    #[cfg(target_os = "windows")]
-    {
-        let path_str = path.to_string_lossy().into_owned();
-        crate::win32_titlebar::shell_open_url(&path_str);
-        Ok(())
-    }
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open").arg(path).spawn().map(|_| ())
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        std::process::Command::new("xdg-open").arg(path).spawn().map(|_| ())
     }
 }
 
