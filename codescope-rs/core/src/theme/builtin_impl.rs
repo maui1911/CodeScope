@@ -64,7 +64,19 @@ pub fn codescope_default() -> Theme {
                 Rgb::from_hex(0x666666), Rgb::from_hex(0xf14c4c), Rgb::from_hex(0x23d18b), Rgb::from_hex(0xf5f543),
                 Rgb::from_hex(0x3b8eea), Rgb::from_hex(0xd670d6), Rgb::from_hex(0x29b8db), Rgb::from_hex(0xffffff),
             ],
-            Rgb::from_hex(0xcccccc), Rgb::from_hex(0x1e1e1e), Rgb::from_hex(0xffffff),
+            // Foreground / **terminal background** / cursor.
+            //
+            // `#0a0a0c` is the canonical terminal canvas for the
+            // default theme — a near-black with a faint cool tint, so
+            // the canvas reads as dark without going full `#000000`
+            // (which can crush against IPS panel uniformity issues).
+            // Reference points considered:
+            //   * Windows Terminal default `#0c0c0c`,
+            //   * Alacritty default      `#1d1f21`,
+            //   * VS Code Dark+          `#1e1e1e` (too light for us).
+            // The chrome `canvas` field stays `#000000` — only the
+            // *terminal* canvas changed here.
+            Rgb::from_hex(0xcccccc), Rgb::from_hex(0x0a0a0c), Rgb::from_hex(0xffffff),
         ),
     }
 }
@@ -251,6 +263,19 @@ mod tests {
         assert_eq!(t.chrome.ink_muted,    Rgb::from_hex(0xa6a6a6));
         assert_eq!(t.chrome.divider,      Rgb::from_hex(0x222222));
         assert_eq!(t.chrome.accent,       Rgb::from_hex(0x0099ff));
+    }
+
+    #[test]
+    fn default_terminal_canvas_is_near_black() {
+        // Lock the terminal background (`palette.background`) for the
+        // default theme. `#0a0a0c` is intentionally darker than VS
+        // Code Dark+ (`#1e1e1e`) and Alacritty default (`#1d1f21`),
+        // closer to Windows Terminal (`#0c0c0c`) with a faint cool
+        // tint. Any drift away from this value should be deliberate
+        // and considered alongside the chrome canvas (#000000) — the
+        // two reads together set the "depth" of the panel.
+        let t = codescope_default();
+        assert_eq!(t.palette.background, Rgb::from_hex(0x0a0a0c));
     }
 
     #[test]

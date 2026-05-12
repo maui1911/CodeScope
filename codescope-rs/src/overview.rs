@@ -1,27 +1,25 @@
-//! Overview panel — one card per open + recently-closed session
-//! across every project. Toggled on/off via the sidebar footer
-//! "Overview" button or `Ctrl+Shift+O`; while visible, replaces the
-//! workspace area (per-group tab strip + terminal grid) inside the
-//! main row so the sidebar + status bar stay anchored.
+//! Overview panel — one card per currently-open session across every
+//! project. Toggled on/off via the sidebar footer "Overview" button or
+//! `Ctrl+Shift+O`; while visible, replaces the workspace area
+//! (per-group tab strip + terminal grid) inside the main row so the
+//! sidebar + status bar stay anchored.
 //!
 //! Mirrors `src/CodeScope.Ui/Views/OverviewView.xaml` /
-//! `ViewModels/OverviewViewModel.cs` from the C# build, with two
-//! deliberate extensions called out in the brief:
+//! `ViewModels/OverviewViewModel.cs` from the C# build. Like the C#
+//! Overview, this view shows live sessions only — closed history is
+//! filtered out at the core layer ([`codescope_core::build_overview_rows`])
+//! and the reopen flow lives in the sidebar's per-project history
+//! menu, not here.
 //!
-//! * the Rust port surfaces *closed* session rows alongside live ones
-//!   (C# Overview hides them — it shows live tabs only), with a
-//!   "Reopen" action that wires through the existing
-//!   [`crate::app::AppShell::reopen_session`] path,
-//! * each card surfaces telemetry-aware decoration (model name, tokens
-//!   used, last-turn duration, state dot) when the runtime is tailing
-//!   the agent — same data the status-bar cluster already reads from
-//!   [`crate::app::AppShell::telemetry_for`].
+//! Each card surfaces telemetry-aware decoration (model name, tokens
+//! used, last-turn duration, state dot) when the runtime is tailing
+//! the agent — same data the status-bar cluster already reads from
+//! [`crate::app::AppShell::telemetry_for`].
 //!
 //! Row data comes from [`codescope_core::build_overview_rows`] which
-//! flattens the on-disk `ProjectsConfig` and applies the same sort
-//! the C# `Rebuild` pass uses (live first, then closed newest-first).
-//! Live-row decoration is folded in here by joining on `session_id`
-//! against `self.groups`.
+//! flattens the on-disk `ProjectsConfig` and sorts live sessions
+//! newest-first by `last_opened`. Live-row decoration is folded in
+//! here by joining on `session_id` against `self.groups`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -91,18 +89,15 @@ impl AppShell {
         // 56 px tall, divider bottom border. Mirrors C# OverviewView's
         // header: OVERVIEW eyebrow chip + "N sessions across N
         // projects" subtitle + "← Back to workspace" link on the
-        // right.
-        let live_count = rows
-            .iter()
-            .filter(|r| r.lifecycle == OverviewLifecycle::Live)
-            .count();
-        let closed_count = rows.len() - live_count;
+        // right. Closed rows are filtered upstream so `rows.len()`
+        // is the live-session count.
+        let live_count = rows.len();
         let project_count = projects
             .projects
             .iter()
             .filter(|p| p.sessions.iter().any(|s| s.closed_at.is_none()))
             .count();
-        let subtitle = subtitle_line(live_count, closed_count, project_count);
+        let subtitle = subtitle_line(live_count, project_count);
 
         let eyebrow = div()
             .px(px(7.0))
@@ -565,30 +560,20 @@ impl AppShell {
     }
 }
 
-/// "5 live + 2 closed across 3 projects" — drives the header
-/// subtitle. Mirrors C# `OverviewViewModel.SubtitleBody` shape, with
-/// an extra closed-count term because the Rust port renders history
-/// in the same grid.
-fn subtitle_line(live: usize, closed: usize, project_count: usize) -> String {
-    if live == 0 && closed == 0 {
+/// "5 live across 3 projects" — drives the header subtitle. Mirrors
+/// C# `OverviewViewModel.SubtitleBody`. The Rust port used to carry
+/// an extra "N closed" term when Overview surfaced closed history;
+/// that's been removed along with the closed-row branch — the panel
+/// is now active-sessions-only.
+fn subtitle_line(live: usize, project_count: usize) -> String {
+    if live == 0 {
         return "no sessions yet".to_string();
     }
-    let mut parts: Vec<String> = Vec::new();
-    if live > 0 {
-        parts.push(if live == 1 {
-            "1 live".to_string()
-        } else {
-            format!("{live} live")
-        });
-    }
-    if closed > 0 {
-        parts.push(if closed == 1 {
-            "1 closed".to_string()
-        } else {
-            format!("{closed} closed")
-        });
-    }
-    let count_part = parts.join(" + ");
+    let count_part = if live == 1 {
+        "1 live".to_string()
+    } else {
+        format!("{live} live")
+    };
     let project_part = if project_count == 1 {
         "1 project".to_string()
     } else {
@@ -649,15 +634,10 @@ mod tests {
 
     #[test]
     fn subtitle_line_handles_pluralization_and_zero_cases() {
-        assert_eq!(subtitle_line(0, 0, 0), "no sessions yet");
-        assert_eq!(subtitle_line(1, 0, 1), "1 live across 1 project");
-        assert_eq!(subtitle_line(3, 0, 2), "3 live across 2 projects");
-        assert_eq!(subtitle_line(1, 1, 1), "1 live + 1 closed across 1 project");
-        assert_eq!(
-            subtitle_line(2, 5, 3),
-            "2 live + 5 closed across 3 projects"
-        );
-        assert_eq!(subtitle_line(0, 4, 2), "4 closed across 2 projects");
+        assert_eq!(subtitle_line(0, 0), "no sessions yet");
+        assert_eq!(subtitle_line(1, 1), "1 live across 1 project");
+        assert_eq!(subtitle_line(3, 2), "3 live across 2 projects");
+        assert_eq!(subtitle_line(2, 3), "2 live across 3 projects");
     }
 
     #[test]
