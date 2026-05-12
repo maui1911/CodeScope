@@ -2193,6 +2193,19 @@ impl AppShell {
         &self.projects
     }
 
+    /// Snapshot of every currently-open tab's session id, deduped.
+    /// Used by the Overview to filter `ProjectsConfig.sessions` down
+    /// to actually-running rows (persisted `closed_at = None` can drift
+    /// from live state — crashes leave orphans, layout-restored rows
+    /// may never have been re-spawned). Mirrors C#
+    /// `MainViewModel.OpenTabs.Select(t => t.SessionId).ToHashSet()`.
+    pub(crate) fn live_session_ids(&self) -> std::collections::HashSet<String> {
+        self.groups
+            .iter()
+            .flat_map(|g| g.tabs.iter().map(|t| t.session_id.clone()))
+            .collect()
+    }
+
     /// Iterate `(group_idx, tab_idx, session_id, adopted_session_id)`
     /// tuples across every group / tab. The Overview module joins
     /// these against `OverviewRow.session_id` to discover the live
@@ -5939,7 +5952,14 @@ impl AppShell {
                     cx.new(|_| DraggedTab { title, theme })
                 })
                 .child(
+                    // `flex_none` so the 8 px status dot never gets
+                    // squished horizontally when the tab title is long
+                    // enough to push the flex container against the
+                    // close button — without this the dot collapses
+                    // to a flat sliver and the busy/idle colour stops
+                    // reading at a glance.
                     div()
+                        .flex_none()
                         .w(px(8.0))
                         .h(px(8.0))
                         .rounded_full()

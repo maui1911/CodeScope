@@ -35,7 +35,7 @@ pub fn by_name(name: &str) -> Theme {
 pub fn codescope_default() -> Theme {
     Theme {
         name: "codescope-default".into(),
-        display_name: "CodeScope (Framer Blue)".into(),
+        display_name: "CodeScope".into(),
         dark: true,
         chrome: ThemeChrome {
             // Canonical mapping from `DesignTokens.xaml`:

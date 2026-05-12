@@ -25,8 +25,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use codescope_core::{
-    OverviewLifecycle, OverviewRow, SessionState, Theme, build_overview_rows, format_context_pct,
-    format_tokens, model_display_name, now_iso8601,
+    OverviewLifecycle, OverviewRow, SessionState, Theme, build_overview_rows_for_live,
+    format_context_pct, format_tokens, model_display_name, now_iso8601,
 };
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -77,7 +77,13 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let projects = self.projects_snapshot();
-        let rows = build_overview_rows(projects);
+        // Source the live session-id set from the running tab strip so
+        // the Overview reflects what's actually open — persisted
+        // `Session` records with `closed_at = None` can drift from
+        // live state (crashes, layout-restored rows that were never
+        // re-spawned, …). Mirrors C# `MainViewModel.OpenTabs`.
+        let live_ids = self.live_session_ids();
+        let rows = build_overview_rows_for_live(projects, &live_ids);
         let now = now_iso8601();
 
         let canvas = theme::canvas(theme);

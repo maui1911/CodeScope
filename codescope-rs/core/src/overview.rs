@@ -114,6 +114,46 @@ pub fn build_rows(cfg: &ProjectsConfig) -> Vec<OverviewRow> {
     rows
 }
 
+/// Like [`build_rows`], but additionally filters to sessions whose
+/// `id` is in `live_session_ids` — i.e. tabs that are currently open
+/// in the running app, not just any persisted record with
+/// `closed_at = None`. The persistence layer can drift from live
+/// state (crashes leave orphan rows, layout-restored sessions that
+/// were never actually reopened, …); the Overview should reflect the
+/// running tab strip, mirroring C# `MainViewModel.OpenTabs`.
+pub fn build_rows_for_live<S>(cfg: &ProjectsConfig, live_session_ids: &S) -> Vec<OverviewRow>
+where
+    S: LiveSessionLookup + ?Sized,
+{
+    let mut rows: Vec<OverviewRow> = cfg
+        .projects
+        .iter()
+        .flat_map(|p| {
+            p.sessions
+                .iter()
+                .filter(|s| s.closed_at.is_none() && live_session_ids.contains(&s.id))
+                .map(move |s| OverviewRow::from_session(p, s))
+        })
+        .collect();
+    sort_rows(&mut rows);
+    rows
+}
+
+/// Abstraction so the filter helper works with `HashSet<&str>`,
+/// `HashSet<String>`, or `&[String]` without forcing the caller into
+/// one concrete shape.
+pub trait LiveSessionLookup {
+    fn contains(&self, id: &str) -> bool;
+}
+
+impl LiveSessionLookup for std::collections::HashSet<String> {
+    fn contains(&self, id: &str) -> bool { self.contains(id) }
+}
+
+impl LiveSessionLookup for [String] {
+    fn contains(&self, id: &str) -> bool { self.iter().any(|s| s == id) }
+}
+
 /// Sort an Overview row list in display order:
 ///
 /// 1. Live rows first (live before closed),
