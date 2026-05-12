@@ -71,6 +71,51 @@ pub const SIDEBAR_DEFAULT_WIDTH: f32 = 240.0;
 pub const SIDEBAR_MIN_WIDTH: f32 = 160.0;
 pub const SIDEBAR_MAX_WIDTH: f32 = 600.0;
 
+/// Vertical pixel offset of the "New session ▸" row inside the
+/// **project** context menu, measured from the menu's top-left.
+///
+/// Layout: header (`py_2` = 16 px) + 11 px mono line + 10 px sans line +
+/// `my_1` divider gap (≈ 8 px) ≈ 45 px. Used to anchor the
+/// "New session ▸" submenu vertically aligned with its parent row.
+/// Kept as a constant so the layout math stays explicit and the
+/// `submenu_open_position` unit test has a stable input.
+const NEW_SESSION_ROW_OFFSET_PROJECT: f32 = 45.0;
+
+/// Vertical pixel offset of the "New session ▸" row inside the
+/// **worktree** context menu. Same header + divider layout as the
+/// project menu, so the row top lands at the same offset. Kept as a
+/// distinct constant in case the worktree header grows extra rows
+/// (e.g. PR badge) in a future iteration.
+const NEW_SESSION_ROW_OFFSET_WORKTREE: f32 = NEW_SESSION_ROW_OFFSET_PROJECT;
+
+/// Compute where a submenu's top-left should anchor in window coords.
+///
+/// `parent_pos` is the parent menu's anchored top-left (already in
+/// window coords). `parent_width` is the parent menu's `min_w` —
+/// adding it places the submenu *just past* the parent's right edge,
+/// with a 2 px breathing gap. `parent_row_top` is the vertical offset
+/// of the row that owns the submenu, measured from `parent_pos.y`, so
+/// the submenu's top aligns with the row that opened it.
+///
+/// Pure function over its inputs — exercised by the
+/// `submenu_open_position_*` unit tests below.
+fn submenu_open_position(
+    parent_pos: Point<Pixels>,
+    parent_width: Pixels,
+    parent_row_top: Pixels,
+) -> Point<Pixels> {
+    // No gap between parent and submenu — the submenu's left edge sits
+    // flush against the parent's right edge so a mouse moving from
+    // parent row to submenu doesn't pass through an empty corridor
+    // that would briefly drop both `hovering_parent` and
+    // `hovering_submenu` (and close the submenu prematurely). The
+    // visible 1 px border of each menu already provides separation.
+    Point {
+        x: parent_pos.x + parent_width,
+        y: parent_pos.y + parent_row_top,
+    }
+}
+
 /// Open right-click context menu state. `None` when no menu is
 /// showing. The position is in window coordinates so we can hand it
 /// straight to [`anchored`] without recomputing on render.
@@ -103,6 +148,40 @@ enum OpenMenu {
         label: String,
         position: Point<Pixels>,
     },
+}
+
+/// One-of submenu identifier. The parent context menu opens at most one
+/// nested submenu at a time (a "New session ▸" agent picker today;
+/// future submenus add variants). Tracked on
+/// [`Sidebar::open_submenu`] alongside hover state so the render path
+/// knows whether to keep the overlay alive.
+///
+/// Mirrors the WPF `MenuItem` submenu behaviour from `BuildAgentChoices`
+/// in `SidebarView.xaml.cs`; gpui has no native submenu widget so we
+/// model it as a sibling anchored overlay that opens on hover/click of
+/// the parent row and dismisses when both parent + submenu lose hover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmenuKind {
+    /// Project / worktree "New session ▸" picker — rows are
+    /// `agent_registry.get_all()` with the default first. Mirrors C#
+    /// `BuildAgentChoices`.
+    NewSession,
+}
+
+/// Live submenu state. Position is derived from the parent menu's
+/// geometry at render time, not stored here — that way a window
+/// resize between open + render doesn't pin the submenu to a stale
+/// window coord.
+#[derive(Debug, Clone)]
+struct OpenSubmenu {
+    kind: SubmenuKind,
+    /// Whether the cursor is currently inside the submenu itself.
+    /// Combined with `hovering_parent` so leaving the parent row but
+    /// drifting onto the submenu keeps it open.
+    hovering_submenu: bool,
+    /// Whether the cursor is currently inside the parent row that
+    /// owns this submenu.
+    hovering_parent: bool,
 }
 
 /// Per-worktree state for the lazy `gh pr list` lookup. `Pending`
@@ -364,6 +443,11 @@ pub struct Sidebar {
     layout: LayoutState,
     /// Currently-open project context menu, if any.
     menu: Option<OpenMenu>,
+    /// Currently-open nested submenu, if any. Always pairs with an
+    /// open [`Self::menu`]; closing the parent menu also closes this.
+    /// Mirrors WPF's at-most-one-open submenu pairing — the
+    /// MenuItem.IsSubmenuOpen flag on the parent row.
+    open_submenu: Option<OpenSubmenu>,
     /// Currently-open "New worktree from branch…" dialog, if any.
     /// At most one dialog at a time — opening another would race
     /// against an in-flight `git worktree add` call from the first.
@@ -505,6 +589,7 @@ impl Sidebar {
             paths,
             layout,
             menu: None,
+            open_submenu: None,
             dialog: None,
             new_project_dialog: None,
             dirty_state: HashMap::new(),
@@ -1050,6 +1135,7 @@ impl Sidebar {
     /// already going to call `cx.notify()` for a different reason.
     pub(crate) fn close_menu_no_notify(&mut self) {
         self.menu = None;
+        self.open_submenu = None;
     }
 
     pub fn select(&mut self, idx: usize, cx: &mut Context<Self>) {
@@ -1118,6 +1204,7 @@ impl Sidebar {
             return;
         }
         self.menu = Some(OpenMenu::Project { project_idx: idx, position });
+        self.open_submenu = None;
         cx.notify();
     }
 
@@ -1211,6 +1298,7 @@ impl Sidebar {
         }
 
         self.menu = Some(OpenMenu::Worktree { project_idx, worktree_id, position });
+        self.open_submenu = None;
         cx.notify();
     }
 
@@ -1226,13 +1314,69 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         self.menu = Some(OpenMenu::History { session_id, label, position });
+        self.open_submenu = None;
         cx.notify();
     }
 
     fn close_menu(&mut self, cx: &mut Context<Self>) {
-        if self.menu.take().is_some() {
+        let had = self.menu.take().is_some() | self.open_submenu.take().is_some();
+        if had {
             cx.notify();
         }
+    }
+
+    /// Open / replace the active submenu. Closes any previously-open
+    /// submenu — at most one is visible at a time. Mirrors WPF's
+    /// "hover the parent row to expand" behaviour; we model the
+    /// submenu as a sibling overlay since gpui has no native primitive.
+    fn open_submenu(&mut self, kind: SubmenuKind, cx: &mut Context<Self>) {
+        if let Some(sub) = self.open_submenu.as_mut()
+            && sub.kind == kind
+        {
+            sub.hovering_parent = true;
+            return;
+        }
+        self.open_submenu = Some(OpenSubmenu {
+            kind,
+            hovering_submenu: false,
+            hovering_parent: true,
+        });
+        cx.notify();
+    }
+
+    /// Mark whether the parent row that owns the current submenu is
+    /// being hovered. When both `hovering_parent` and `hovering_submenu`
+    /// go false, the submenu closes.
+    fn set_submenu_parent_hover(
+        &mut self,
+        kind: SubmenuKind,
+        hovering: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(sub) = self.open_submenu.as_mut() else { return };
+        if sub.kind != kind || sub.hovering_parent == hovering {
+            return;
+        }
+        sub.hovering_parent = hovering;
+        let should_close = !sub.hovering_parent && !sub.hovering_submenu;
+        if should_close {
+            self.open_submenu = None;
+        }
+        cx.notify();
+    }
+
+    /// Mark whether the submenu overlay itself is being hovered.
+    fn set_submenu_self_hover(&mut self, hovering: bool, cx: &mut Context<Self>) {
+        let Some(sub) = self.open_submenu.as_mut() else { return };
+        if sub.hovering_submenu == hovering {
+            return;
+        }
+        sub.hovering_submenu = hovering;
+        let should_close = !sub.hovering_parent && !sub.hovering_submenu;
+        if should_close {
+            self.open_submenu = None;
+        }
+        cx.notify();
     }
 
     /// Reveal the project's working tree in the OS file browser.
@@ -3108,25 +3252,77 @@ impl Render for Sidebar {
         // none). Snapshot indices + position up-front so the closure-
         // borrow on `self.menu` doesn't outlast the render helper
         // calls below.
+        //
+        // Submenu offsets — the y-position of the "New session ▸" row
+        // inside each parent menu, measured from the parent menu's
+        // top-left. Both menus put the header at the top, then a
+        // divider, so the row lands at roughly the same offset for
+        // both. Kept as constants to make the parity intent explicit
+        // and to give the submenu_open_position helper test a stable
+        // input.
+        const PROJECT_MENU_WIDTH_PX: f32 = 220.0;
+        const WORKTREE_MENU_WIDTH_PX: f32 = 240.0;
+        // Worktree menu has an extra "Open session" row before the
+        // "New session ▸" row; project menu jumps straight to it.
+        let project_row_top = px(NEW_SESSION_ROW_OFFSET_PROJECT);
+        let worktree_row_top = px(NEW_SESSION_ROW_OFFSET_WORKTREE);
         match self.menu.as_ref() {
             Some(OpenMenu::Project { project_idx, position }) => {
+                let project_pos = *position;
                 if let Some(project) = self.projects.projects.get(*project_idx).cloned() {
+                    let project_path = project.path.clone();
+                    let project_name: SharedString = project.name.clone().into();
                     let overlay = self
-                        .render_project_menu(*project_idx, *position, &project, &theme, cx)
+                        .render_project_menu(*project_idx, project_pos, &project, &theme, cx)
                         .into_any_element();
                     root = root.child(overlay);
+                    if let Some(sub) = self.open_submenu.as_ref()
+                        && sub.kind == SubmenuKind::NewSession
+                    {
+                        let submenu_pos = submenu_open_position(
+                            project_pos,
+                            px(PROJECT_MENU_WIDTH_PX),
+                            project_row_top,
+                        );
+                        let body = self.render_new_session_submenu(
+                            &project_path,
+                            project_name,
+                            cx,
+                        );
+                        root = root.child(
+                            deferred(
+                                anchored()
+                                    .position(submenu_pos)
+                                    .anchor(Corner::TopLeft)
+                                    .snap_to_window_with_margin(px(8.0))
+                                    .child(body),
+                            )
+                            .into_any_element(),
+                        );
+                    }
                 }
             }
             Some(OpenMenu::Worktree { project_idx, worktree_id, position }) => {
+                let wt_pos = *position;
                 if let Some(project) = self.projects.projects.get(*project_idx).cloned()
                     && let Some(wt) =
                         project.worktrees.iter().find(|w| &w.id == worktree_id).cloned()
                 {
+                    let branch_label = wt.branch.clone().unwrap_or_else(|| {
+                        std::path::Path::new(&wt.path)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| wt.path.clone())
+                    });
+                    let session_title: SharedString =
+                        format!("{} · {}", project.name, branch_label).into();
+                    let wt_path = wt.path.clone();
                     let overlay = self
                         .render_worktree_menu(
                             *project_idx,
                             worktree_id.clone(),
-                            *position,
+                            wt_pos,
                             &project,
                             &wt,
                             &theme,
@@ -3134,6 +3330,30 @@ impl Render for Sidebar {
                         )
                         .into_any_element();
                     root = root.child(overlay);
+                    if let Some(sub) = self.open_submenu.as_ref()
+                        && sub.kind == SubmenuKind::NewSession
+                    {
+                        let submenu_pos = submenu_open_position(
+                            wt_pos,
+                            px(WORKTREE_MENU_WIDTH_PX),
+                            worktree_row_top,
+                        );
+                        let body = self.render_new_session_submenu(
+                            &wt_path,
+                            session_title,
+                            cx,
+                        );
+                        root = root.child(
+                            deferred(
+                                anchored()
+                                    .position(submenu_pos)
+                                    .anchor(Corner::TopLeft)
+                                    .snap_to_window_with_margin(px(8.0))
+                                    .child(body),
+                            )
+                            .into_any_element(),
+                        );
+                    }
                 }
             }
             Some(OpenMenu::History { session_id, label, position }) => {
@@ -3177,20 +3397,140 @@ impl Sidebar {
     /// (`"{id_prefix}-{agent_id}"`); pick a prefix that's unique
     /// inside its parent menu so multiple invocations on the same
     /// frame don't collide.
-    fn build_new_agent_rows(
+    /// Build the "New session ▸" parent row that opens the agent
+    /// picker submenu. Mirrors the WPF `MenuItem { Header = "New
+    /// session", ... }` with the inline `BuildAgentChoices` submenu —
+    /// gpui has no native submenu primitive so we model it as a sibling
+    /// anchored overlay that opens on hover/click of this row. The
+    /// chevron (`▸`) on the right gives users the visual cue that
+    /// there's a sub-list.
+    ///
+    /// Clicking the parent row directly fires the *default* agent —
+    /// matches WPF's "click the header = trigger the default" muscle
+    /// memory for an opened-via-keyboard menu and the C# code's
+    /// `Tag = "primary"` `Default` entry inside `BuildAgentChoices`.
+    ///
+    /// `parent_menu_position` is where the *parent* menu was anchored
+    /// (window coords). The submenu position is computed from this
+    /// plus the parent menu's width + the row offset so the submenu
+    /// sits to the right of the parent row.
+    fn build_new_session_parent_row(
         &self,
         worktree_path: &str,
         title_prefix: &SharedString,
         id_prefix: &'static str,
         cx: &mut Context<Self>,
-    ) -> Vec<gpui::AnyElement> {
+    ) -> gpui::AnyElement {
         let theme = self.theme.clone();
+        let ink = theme::ink(&theme);
+        let ink_dim = theme::ink_dim(&theme);
+        let ink_ghost = theme::ink_ghost(&theme);
+        let frost = theme::frost_10(&theme);
+
+        // Default agent — the row's primary click target (and the row
+        // the submenu's "Default" entry highlights).
+        let default_id = self.agent_registry.get_default().map(|a| a.id.clone());
+        let default_cmd = default_id.as_deref().and_then(|id| {
+            self.agent_registry.get_by_id(id).map(|p| {
+                let mut argv: Vec<String> =
+                    Vec::with_capacity(1 + p.new_session_args.len());
+                argv.push(p.command.clone());
+                argv.extend(p.new_session_args.iter().cloned());
+                argv.join(" ")
+            })
+        });
+
+        let path = PathBuf::from(worktree_path);
+        let title = title_prefix.clone();
+        let row_id = SharedString::from(format!("{id_prefix}-new-session"));
+
+        let frost_hover = frost;
+        div()
+            .id(row_id)
+            .h(px(28.0))
+            .px_3()
+            .flex()
+            .flex_row()
+            .items_center()
+            .text_size(px(12.5))
+            .text_color(ink_dim)
+            .cursor_pointer()
+            .hover(move |s| s.bg(frost_hover).text_color(ink))
+            .on_hover(cx.listener(|this, hovering, _window, cx| {
+                this.set_submenu_parent_hover(
+                    SubmenuKind::NewSession,
+                    *hovering,
+                    cx,
+                );
+                if *hovering && this.open_submenu.is_none() {
+                    // Open the submenu on hover-enter, mirroring WPF's
+                    // hover-to-expand behaviour. The render path
+                    // computes the anchor position from the parent
+                    // menu's geometry on the next frame.
+                    this.open_submenu(SubmenuKind::NewSession, cx);
+                }
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    // Click on the parent row fires the default agent
+                    // directly — matches WPF's `Tag = "primary"`
+                    // "Default" inside the submenu being the default
+                    // header action.
+                    if let Some(cmd) = default_cmd.clone() {
+                        cx.emit(SidebarEvent::OpenSession {
+                            working_directory: path.clone(),
+                            title: title.clone(),
+                            auto_type: Some(cmd.into()),
+                            force_new: true,
+                        });
+                        this.close_menu(cx);
+                    } else {
+                        // No default agent → fall back to a plain
+                        // shell. Same behaviour as the WPF "Default"
+                        // entry when no project-/global-default is set.
+                        cx.emit(SidebarEvent::OpenSession {
+                            working_directory: path.clone(),
+                            title: title.clone(),
+                            auto_type: None,
+                            force_new: true,
+                        });
+                        this.close_menu(cx);
+                    }
+                }),
+            )
+            .child(div().flex_grow().child("New session"))
+            // Submenu chevron — dimmed to `text_faint` per the design
+            // spec; the parent row's hover state lifts the ink colour
+            // separately so the chevron stays subtle.
+            .child(
+                div()
+                    .ml(px(8.0))
+                    .text_size(px(12.0))
+                    .text_color(ink_ghost)
+                    .child("▸"),
+            )
+            .into_any_element()
+    }
+
+    /// Build the "New session ▸" submenu body. Default agent first
+    /// (highlighted with an accent dot), a divider, then the rest in
+    /// registry order. Mirrors C# `BuildAgentChoices`.
+    fn render_new_session_submenu(
+        &self,
+        worktree_path: &str,
+        title_prefix: SharedString,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = self.theme.clone();
+        let elevated = theme::elevated(&theme);
+        let divider = theme::divider(&theme);
         let ink = theme::ink(&theme);
         let ink_dim = theme::ink_dim(&theme);
         let frost = theme::frost_10(&theme);
         let accent = theme::accent(&theme);
 
-        // Order: default first, then the rest in registration order.
         let default_id = self.agent_registry.get_default().map(|a| a.id.clone());
         let mut profiles: Vec<&AgentProfile> = Vec::new();
         if let Some(def_id) = default_id.as_deref()
@@ -3205,74 +3545,101 @@ impl Sidebar {
             profiles.push(a);
         }
 
-        profiles
-            .into_iter()
-            .map(|profile| {
-                let is_default = Some(profile.id.as_str()) == default_id.as_deref();
-                let label = SharedString::from(format!("New {} session", profile.display_name));
-                let row_id = SharedString::from(format!("{id_prefix}-{}", profile.id));
-                let path = PathBuf::from(worktree_path);
-                let title = SharedString::from(format!(
-                    "{} · {}",
-                    title_prefix.as_ref(),
-                    profile.id,
-                ));
-                // Join argv with spaces — the receiver runs it through
-                // the shell, fine for our built-in profiles (single
-                // tokens like `claude`, `codex`, …). Custom agent argv
-                // containing spaces would need quoting; the C# build
-                // has the same caveat (`string.Join(" ", argv)` in
-                // `AgentCommandJoiner`).
-                let mut argv: Vec<String> =
-                    Vec::with_capacity(1 + profile.new_session_args.len());
-                argv.push(profile.command.clone());
-                argv.extend(profile.new_session_args.iter().cloned());
-                let cmd = argv.join(" ");
+        let mut body = div()
+            .id("submenu-new-session")
+            .flex()
+            .flex_col()
+            .py_1()
+            .min_w(px(200.0))
+            .bg(elevated)
+            .border_1()
+            .border_color(divider)
+            .rounded_md()
+            .shadow_lg()
+            .font(theme::font_sans())
+            // Track cursor enter/leave on the submenu itself so the
+            // dismiss heuristic stays right — leaving the parent row
+            // while still inside the submenu keeps the submenu open.
+            .on_hover(cx.listener(|this, hovering, _window, cx| {
+                this.set_submenu_self_hover(*hovering, cx);
+            }))
+            // Stop click bubbling into the parent menu's `on_mouse_down_out`
+            // (which would close the whole menu). Each row's `on_mouse_down`
+            // already does its own `stop_propagation`; this catches drags
+            // inside the gap between rows.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            );
 
-                let base_color = if is_default { ink } else { ink_dim };
-                let hover_color = ink;
-                let frost_hover = frost;
+        let mut first = true;
+        for profile in profiles {
+            let is_default = Some(profile.id.as_str()) == default_id.as_deref();
+            let label = SharedString::from(format!("New {} session", profile.display_name));
+            let row_id = SharedString::from(format!("submenu-new-{}", profile.id));
+            let path = PathBuf::from(worktree_path);
+            let title = SharedString::from(format!(
+                "{} · {}",
+                title_prefix.as_ref(),
+                profile.id,
+            ));
+            let mut argv: Vec<String> =
+                Vec::with_capacity(1 + profile.new_session_args.len());
+            argv.push(profile.command.clone());
+            argv.extend(profile.new_session_args.iter().cloned());
+            let cmd = argv.join(" ");
+            let frost_hover = frost;
+            let base_color = if is_default { ink } else { ink_dim };
+            let hover_color = ink;
 
-                let mut row = div()
-                    .id(row_id)
-                    .h(px(28.0))
-                    .px_3()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .text_size(px(12.5))
-                    .text_color(base_color)
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(frost_hover).text_color(hover_color))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            cx.emit(SidebarEvent::OpenSession {
-                                working_directory: path.clone(),
-                                title: title.clone(),
-                                auto_type: Some(cmd.clone().into()),
-                                force_new: true,
-                            });
-                            this.close_menu(cx);
-                        }),
-                    )
-                    .child(div().flex_grow().child(label));
-                if is_default {
-                    // Accent dot — subtle marker for the default agent,
-                    // mirrors C# `Tag = "primary"` rendering hint.
-                    row = row.child(
-                        div()
-                            .ml(px(6.0))
-                            .w(px(6.0))
-                            .h(px(6.0))
-                            .rounded_full()
-                            .bg(accent),
-                    );
-                }
-                row.into_any_element()
-            })
-            .collect()
+            let mut row = div()
+                .id(row_id)
+                .h(px(28.0))
+                .px_3()
+                .flex()
+                .flex_row()
+                .items_center()
+                .text_size(px(12.5))
+                .text_color(base_color)
+                .cursor_pointer()
+                .hover(move |s| s.bg(frost_hover).text_color(hover_color))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.emit(SidebarEvent::OpenSession {
+                            working_directory: path.clone(),
+                            title: title.clone(),
+                            auto_type: Some(cmd.clone().into()),
+                            force_new: true,
+                        });
+                        this.close_menu(cx);
+                    }),
+                )
+                .child(div().flex_grow().child(label));
+            if is_default {
+                row = row.child(
+                    div()
+                        .ml(px(6.0))
+                        .w(px(6.0))
+                        .h(px(6.0))
+                        .rounded_full()
+                        .bg(accent),
+                );
+            }
+
+            // Divider after the default agent — same pattern as the
+            // WPF submenu's `Separator` between Default and the
+            // per-agent rows.
+            if first && is_default && self.agent_registry.get_all().len() > 1 {
+                body = body.child(row).child(div().h_px().bg(divider).my_1());
+            } else {
+                body = body.child(row);
+            }
+            first = false;
+        }
+
+        body.into_any_element()
     }
 
     /// The filter text box that lives between the "PROJECTS" header
@@ -3352,6 +3719,17 @@ impl Sidebar {
         let frost = theme::frost_10(theme);
         let danger = theme::danger(theme);
 
+        // Precompute the "New session ▸" parent row before the menu
+        // chain — the `item` closure below holds an immutable borrow
+        // on `cx` (via `cx.listener`), so we can't call a method that
+        // mutably borrows `cx` mid-chain.
+        let new_session_parent_row = self.build_new_session_parent_row(
+            &project.path,
+            &project.name.clone().into(),
+            "proj-menu-new-session",
+            cx,
+        );
+
         let item = |id: &'static str,
                     label: &'static str,
                     danger_row: bool,
@@ -3417,52 +3795,11 @@ impl Sidebar {
                     .child(div().child("project")),
             )
             .child(div().h_px().bg(divider).my_1())
-            // "New session" rows fire `OpenSession` on the project's
-            // primary worktree path. Project name doubles as the tab
-            // title — the user can rename later. Two flavours:
-            //   • Plain "New session" — opens a shell at the project
-            //     root, no auto-typed command.
-            //   • "New Claude session" — opens a shell, then types
-            //     `claude` after the prompt is up. Mirrors the C#
-            //     build's `BuildAgentChoices` flow at the project
-            //     scope; we don't have the full agent picker yet so
-            //     this is the headline shortcut.
-            .child({
-                let project_path = project.path.clone();
-                let project_title: SharedString = project.name.clone().into();
-                item(
-                    "menu-new-session",
-                    "New session",
-                    false,
-                    Box::new(move |this, _window, cx| {
-                        cx.emit(SidebarEvent::OpenSession {
-                            working_directory: PathBuf::from(&project_path),
-                            title: project_title.clone(),
-                            auto_type: None,
-                            force_new: true,
-                        });
-                        this.close_menu(cx);
-                    }),
-                )
-            })
-            .child({
-                let project_path = project.path.clone();
-                let project_title: SharedString = project.name.clone().into();
-                item(
-                    "menu-new-claude",
-                    "New Claude session",
-                    false,
-                    Box::new(move |this, _window, cx| {
-                        cx.emit(SidebarEvent::OpenSession {
-                            working_directory: PathBuf::from(&project_path),
-                            title: project_title.clone(),
-                            auto_type: Some(claude_command().into()),
-                            force_new: true,
-                        });
-                        this.close_menu(cx);
-                    }),
-                )
-            })
+            // "New session ▸" parent row — opens the agent picker
+            // submenu. Mirrors the WPF `BuildAgentChoices` flow at the
+            // project scope. Clicking the parent fires the default
+            // agent on the project's primary worktree path.
+            .child(new_session_parent_row)
             .child(div().h_px().bg(divider).my_1())
             .child(item(
                 "menu-new-worktree",
@@ -3609,15 +3946,18 @@ impl Sidebar {
         ));
         let is_primary = worktree.is_primary;
 
-        // Precompute the multi-agent "New … session" rows up-front so
-        // we don't try to re-borrow `cx` mutably inside the menu_body
+        // Precompute the "New session ▸" parent row up-front so we
+        // don't try to re-borrow `cx` mutably inside the menu_body
         // chain (the `item` closure below captures `cx.listener`,
-        // which holds an immutable borrow). Builds Vec<AnyElement>;
-        // dropped straight into `.children(...)` later.
-        let agent_rows = self.build_new_agent_rows(
+        // which holds an immutable borrow). The chevron-bearing
+        // parent row opens a nested submenu on hover/click — gpui
+        // has no native submenu primitive, so we model that as a
+        // sibling anchored overlay tracked via `Sidebar::open_submenu`
+        // and rendered in the main render path.
+        let new_session_parent_row = self.build_new_session_parent_row(
             &worktree.path,
             &open_session_title,
-            "wt-menu-new-agent",
+            "wt-menu-new-session",
             cx,
         );
 
@@ -3691,6 +4031,21 @@ impl Sidebar {
                     .child(div().truncate().child(project_label)),
             )
             .child(div().h_px().bg(divider).my_1())
+            // "New session ▸" parent row — opens the agent picker
+            // submenu on hover/click. Mirrors the WPF `MenuItem` with
+            // an inline `BuildAgentChoices` submenu; gpui has no
+            // native submenu so we render the nested overlay as a
+            // sibling of this menu via `Sidebar::open_submenu` state.
+            //
+            // Placed *above* "Open session" to match the C#
+            // `BuildWorktreeMenu` order — the spawn / pick-agent flow
+            // is the more common action, so it lands first.
+            //
+            // Title derives from `open_session_title`
+            // (`{project} · {branch}`) plus a per-agent suffix so
+            // multiple worktrees stay distinguishable in the tab strip
+            // when the user has agents running in several of them.
+            .child(new_session_parent_row)
             .child({
                 let path_for_open = open_session_path.clone();
                 let title_for_open = open_session_title.clone();
@@ -3715,20 +4070,6 @@ impl Sidebar {
                     }),
                 )
             })
-            // Multi-agent "New {DisplayName} session" rows — one per
-            // profile in `agent_registry`. The default profile lands
-            // first (matches the C# `BuildAgentChoices` "Default" entry
-            // sitting at the top of the picker) and gets an accent dot.
-            // Mirrors `SidebarView.xaml.cs::BuildAgentChoices` minus
-            // the Shell sentinel and the global-default fallback —
-            // those land when the Settings dialog grows agent-picker
-            // UI.
-            //
-            // Title derives from `open_session_title`
-            // (`{project} · {branch}`) plus a per-agent suffix so
-            // multiple worktrees stay distinguishable in the tab strip
-            // when the user has agents running in several of them.
-            .children(agent_rows)
             // ── Git ─────────────────────────────────────────────
             // Pull / Copy branch / Open remote in browser. The
             // dirty-state aware Rebase + Discard rows from the C#
@@ -3997,14 +4338,29 @@ impl Sidebar {
         let ink_dim = theme::ink_dim(theme);
         let ink_ghost = theme::ink_ghost(theme);
         let frost = theme::frost_10(theme);
+        let danger = theme::danger(theme);
 
         let header_label: SharedString = label.clone().into();
 
+        // Row builder with `primary` + `danger` styling flags. Primary
+        // rows render at full ink + an accent leading dot; danger rows
+        // render in the destructive palette. Mirrors C# `Tag="primary"`
+        // / `Tag="danger"` styling hooks in `ContextMenuStyles.xaml`.
         let item = |id: &'static str,
                     text: &'static str,
+                    primary: bool,
+                    danger_row: bool,
                     on_click: MenuItemAction|
          -> gpui::Stateful<gpui::Div> {
             let frost_hover = frost;
+            let base_color = if danger_row {
+                danger
+            } else if primary {
+                ink
+            } else {
+                ink_dim
+            };
+            let hover_color = if danger_row { danger } else { ink };
             div()
                 .id(id)
                 .h(px(28.0))
@@ -4013,9 +4369,9 @@ impl Sidebar {
                 .flex_row()
                 .items_center()
                 .text_size(px(12.5))
-                .text_color(ink_dim)
+                .text_color(base_color)
                 .cursor_pointer()
-                .hover(move |s| s.bg(frost_hover).text_color(ink))
+                .hover(move |s| s.bg(frost_hover).text_color(hover_color))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, window, cx| {
@@ -4063,6 +4419,8 @@ impl Sidebar {
             .child(item(
                 "hist-menu-reopen",
                 "Reopen session",
+                true,
+                false,
                 Box::new(move |this, _window, cx| {
                     cx.emit(SidebarEvent::ReopenSession {
                         session_id: reopen_session_id.clone(),
@@ -4073,6 +4431,8 @@ impl Sidebar {
             .child(item(
                 "hist-menu-rename",
                 "Rename session…",
+                false,
+                false,
                 Box::new(move |this, _window, cx| {
                     cx.emit(SidebarEvent::OpenRenameDialog {
                         target: RenameRequest::Session {
@@ -4086,7 +4446,9 @@ impl Sidebar {
             .child(div().h_px().bg(divider).my_1())
             .child(item(
                 "hist-menu-remove",
-                "Remove from history…",
+                "Remove from history",
+                false,
+                true,
                 Box::new(move |this, _window, cx| {
                     this.request_remove_session_from_history(
                         remove_session_id.clone(),
@@ -4253,8 +4615,9 @@ async fn commit_worktree_removal(
 
 /// OS-spawn shared by project + worktree "Reveal" rows. Detached so a
 /// slow shell extension can't stall the UI thread, and we ignore exit
-/// status since the user sees the result on their desktop.
-fn reveal_path_in_file_browser(path: &str) {
+/// status since the user sees the result on their desktop. Also called
+/// from the tab right-click menu in `app.rs`.
+pub(crate) fn reveal_path_in_file_browser(path: &str) {
     #[cfg(target_os = "windows")]
     let result = Command::new("explorer.exe").arg(path).spawn();
     #[cfg(target_os = "macos")]
@@ -4329,7 +4692,8 @@ fn open_url_in_browser(url: &str) {
 /// `wt -d <path>` — Windows-only. Logs a friendly warning on other
 /// platforms; the menu row is hidden there but the helper itself stays
 /// safe to call so the call sites don't need their own `cfg!` guards.
-fn open_path_in_windows_terminal(path: &str) {
+/// Also called from the tab right-click menu in `app.rs`.
+pub(crate) fn open_path_in_windows_terminal(path: &str) {
     #[cfg(target_os = "windows")]
     {
         if let Err(err) = Command::new("wt").args(["-d", path]).spawn() {
@@ -4428,17 +4792,6 @@ fn worktree_row_matches(wt: &WorktreeRowData, needle: &str) -> bool {
     leaf.to_ascii_lowercase().contains(needle)
 }
 
-/// The command we auto-type for "New Claude session". Bare `claude`
-/// — relies on the user's PATH to resolve it (npm-global on Windows,
-/// homebrew/npm on macOS, /usr/local/bin or similar on Linux). When
-/// it fails the user just sees a `command not found` in their shell
-/// and can install it from there. Mirrors the C# build's default
-/// agent invocation; the full agent picker (Codex / shell / custom)
-/// lands when the settings story does.
-fn claude_command() -> &'static str {
-    "claude"
-}
-
 /// Platform-appropriate label for the "Reveal in <native file browser>"
 /// menu row. Mirrors the underlying spawn target in
 /// [`Sidebar::reveal_in_explorer`] (`explorer.exe` / `open` /
@@ -4447,7 +4800,7 @@ fn claude_command() -> &'static str {
 /// keep that string on Windows and pick a native equivalent
 /// elsewhere instead of shipping a Windows-centric label on macOS /
 /// Linux.
-fn reveal_in_file_browser_label() -> &'static str {
+pub(crate) fn reveal_in_file_browser_label() -> &'static str {
     if cfg!(target_os = "windows") {
         "Reveal in File Explorer"
     } else if cfg!(target_os = "macos") {
@@ -4501,6 +4854,49 @@ mod tests {
         assert_eq!(history_agent_display_name(""), None);
         assert_eq!(history_agent_display_name("gemini"), None);
         assert_eq!(history_agent_display_name("-"), None);
+    }
+
+    #[test]
+    fn submenu_open_position_offsets_by_parent_width_and_row_top() {
+        // Anchor a 240 px wide parent menu at (100, 200) with the
+        // submenu-owning row at y-offset 45 from the parent top. The
+        // submenu should open flush against the parent's right edge,
+        // vertically aligned with that row.
+        let pos = submenu_open_position(
+            Point { x: px(100.0), y: px(200.0) },
+            px(240.0),
+            px(45.0),
+        );
+        assert_eq!(pos.x, px(340.0));
+        assert_eq!(pos.y, px(245.0));
+    }
+
+    #[test]
+    fn submenu_open_position_zero_row_top_aligns_with_parent_top() {
+        // Edge case — row at the very top of the parent menu (no
+        // header). Submenu top should match parent top.
+        let pos = submenu_open_position(
+            Point { x: px(50.0), y: px(75.0) },
+            px(200.0),
+            px(0.0),
+        );
+        assert_eq!(pos.x, px(250.0));
+        assert_eq!(pos.y, px(75.0));
+    }
+
+    #[test]
+    fn submenu_open_position_origin_anchors_at_parent_right_edge() {
+        // Parent menu at window origin — the submenu's left edge sits
+        // flush against the parent's right edge (parent_width on x)
+        // and the submenu's top aligns with the row top (no header
+        // contributes to y when parent_pos.y == 0).
+        let pos = submenu_open_position(
+            Point { x: px(0.0), y: px(0.0) },
+            px(220.0),
+            px(45.0),
+        );
+        assert_eq!(pos.x, px(220.0));
+        assert_eq!(pos.y, px(45.0));
     }
 
     fn row(branch: Option<&str>, path: &str) -> WorktreeRowData {

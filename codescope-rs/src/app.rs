@@ -52,15 +52,15 @@ use codescope_terminal::{
 use gpui::StatefulInteractiveElement;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, ParentElement, Render, SharedString, Styled, Window, WindowBounds,
-    WindowControlArea, div, px,
+    AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, SharedString, Styled, Window,
+    WindowBounds, WindowControlArea, div, px,
 };
 use parking_lot::Mutex;
 
 use crate::sidebar::{
-    SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, Sidebar, SidebarEvent,
-    ToastSeverity,
+    RenameRequest, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, Sidebar,
+    SidebarEvent, ToastSeverity,
 };
 use crate::theme;
 
@@ -2620,6 +2620,72 @@ impl AppShell {
         self.save_layout();
     }
 
+    /// Peel the named tab out of its current group and into a fresh
+    /// group immediately to the right. Fired from the tab right-click
+    /// menu's "Move to new group" row. No-op when the tab can't be
+    /// resolved (concurrent close / drag) or when it's already the
+    /// sole tab in its group (move would just shuffle empty groups).
+    /// Mirrors the C# `MainViewModel.MoveTabToNewGroup` command.
+    fn move_tab_to_new_group(
+        &mut self,
+        source_group_id: u64,
+        source_tab_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(source_idx) =
+            self.groups.iter().position(|g| g.id == source_group_id)
+        else {
+            self.close_tab_menu(cx);
+            return;
+        };
+        // Refuse the move when the tab is already alone in its group —
+        // the C# build also bails here (no behaviour change, just an
+        // extra empty group).
+        if self.groups[source_idx].tabs.len() <= 1 {
+            self.close_tab_menu(cx);
+            return;
+        }
+        let Some(tab_pos) = self.groups[source_idx]
+            .tabs
+            .iter()
+            .position(|t| t.id == source_tab_id)
+        else {
+            self.close_tab_menu(cx);
+            return;
+        };
+
+        let id = self.next_group_id;
+        self.next_group_id += 1;
+        let insert_at = source_idx + 1;
+        self.groups.insert(
+            insert_at,
+            Group { id, tabs: Vec::new(), active_tab: 0 },
+        );
+        self.group_weights.insert(insert_at, 1.0);
+
+        // Re-resolve the source row's index — the insert above pushed
+        // groups to the right of `source_idx` down by one; `source_idx`
+        // itself stayed put because we inserted *after* it.
+        let tab = self.groups[source_idx].tabs.remove(tab_pos);
+        // Slide the source's active-tab cursor if we removed at or
+        // before it; same logic as `move_tab_to_group`'s cross-group
+        // arm.
+        let g = &mut self.groups[source_idx];
+        if g.active_tab >= g.tabs.len() {
+            g.active_tab = g.tabs.len().saturating_sub(1);
+        } else if g.active_tab > tab_pos {
+            g.active_tab -= 1;
+        }
+
+        self.groups[insert_at].tabs.push(tab);
+        self.groups[insert_at].active_tab = 0;
+        self.focused_group = insert_at;
+        self.close_tab_menu(cx);
+        self.activate_tab(insert_at, 0, window, cx);
+        self.save_layout();
+    }
+
     /// Toggle the sidebar between visible and collapsed. Persists so
     /// the choice survives a restart. When collapsing, the saved
     /// width stays put — re-opening uses the previous width instead
@@ -3200,6 +3266,21 @@ impl AppShell {
         let pivot_pos = group.tabs.iter().position(|t| t.id == tab_id)?;
         let has_others = group.tabs.len() > 1;
         let has_right = pivot_pos + 1 < group.tabs.len();
+        // Snapshot per-tab data needed by the Reveal / Copy / Rename
+        // rows. Looking up by id (not position) keeps these stable
+        // against concurrent tab mutation between menu-open and click.
+        let tab = group.tabs.get(pivot_pos)?;
+        let tab_session_id = tab.session_id.clone();
+        let tab_title = tab.title.clone();
+        let tab_working_dir = tab.working_directory.clone();
+        let tab_working_dir_str = tab_working_dir
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+        // "Move to new group" is meaningful only when there are
+        // siblings worth peeling away from; a single-tab single-group
+        // workspace would just no-op into the same shape it's already
+        // in. Mirrors WPF's `IsEnabled` gating on the equivalent row.
+        let can_move_to_new_group = has_others || self.groups.len() > 1;
 
         let elevated = theme::elevated(theme);
         let divider = theme::divider(theme);
@@ -3262,11 +3343,24 @@ impl AppShell {
             row
         };
 
-        let menu_body = div()
+        let header_title = tab_title.clone();
+        let header_subtitle: SharedString = tab_working_dir
+            .as_ref()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+            .map(SharedString::from)
+            .unwrap_or_else(|| SharedString::from("session"));
+        let reveal_path = tab_working_dir_str.clone();
+        let wt_path = tab_working_dir_str.clone();
+        let copy_path = tab_working_dir_str.clone();
+        let copy_session_id = tab_session_id.clone();
+        let rename_session_id = tab_session_id.clone();
+        let rename_current = tab_title.to_string();
+
+        let mut menu_body = div()
             .flex()
             .flex_col()
             .py_1()
-            .min_w(px(200.0))
+            .min_w(px(220.0))
             .bg(elevated)
             .border_1()
             .border_color(divider)
@@ -3277,9 +3371,109 @@ impl AppShell {
             // the menu root so every row inherits the sans face
             // without each row builder having to repeat the call.
             .font(theme::font_sans())
+            // Contextual header — mirrors `ContextMenuFactory.BuildContextHeader`
+            // in `GroupStripView.OnTabContextMenuOpening`: mono title at
+            // 11 px, sans subtitle at 10 px. Non-interactive.
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(10.0))
+                    .text_color(ink_ghost)
+                    .child(
+                        div()
+                            .text_color(ink)
+                            .font(theme::font_mono())
+                            .text_size(px(11.0))
+                            .truncate()
+                            .child(header_title),
+                    )
+                    .child(div().truncate().child(header_subtitle)),
+            )
+            .child(div().h_px().bg(divider).my_1())
+            // ── Reveal section (mirrors C# `GroupStripView`'s
+            // `PopulateTabContextMenu` Reveal block) ──
+            .child(item(
+                "tab-menu-reveal",
+                crate::sidebar::reveal_in_file_browser_label(),
+                reveal_path.is_some(),
+                false,
+                Box::new(move |this, _window, cx| {
+                    if let Some(p) = reveal_path.clone() {
+                        crate::sidebar::reveal_path_in_file_browser(&p);
+                    }
+                    this.close_tab_menu(cx);
+                }),
+            ));
+        if cfg!(target_os = "windows") {
+            menu_body = menu_body.child(item(
+                "tab-menu-wt",
+                "Open in Windows Terminal",
+                wt_path.is_some(),
+                false,
+                Box::new(move |this, _window, cx| {
+                    if let Some(p) = wt_path.clone() {
+                        crate::sidebar::open_path_in_windows_terminal(&p);
+                    }
+                    this.close_tab_menu(cx);
+                }),
+            ));
+        }
+        let menu_body = menu_body
+            .child(item(
+                "tab-menu-copy-path",
+                "Copy path",
+                copy_path.is_some(),
+                false,
+                Box::new(move |this, _window, cx| {
+                    if let Some(p) = copy_path.clone() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(p));
+                    }
+                    this.close_tab_menu(cx);
+                }),
+            ))
+            .child(item(
+                "tab-menu-copy-session-id",
+                "Copy session id",
+                true,
+                false,
+                Box::new(move |this, _window, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(
+                        copy_session_id.clone(),
+                    ));
+                    this.close_tab_menu(cx);
+                }),
+            ))
+            .child(div().h_px().bg(divider).my_1())
+            // ── Manage section ──
+            .child(item(
+                "tab-menu-rename",
+                "Rename tab…",
+                true,
+                false,
+                Box::new(move |this, window, cx| {
+                    let target = RenameRequest::Session {
+                        session_id: rename_session_id.clone(),
+                    };
+                    let current = rename_current.clone();
+                    this.close_tab_menu(cx);
+                    this.open_rename_dialog(target, current, window, cx);
+                }),
+            ))
+            .child(item(
+                "tab-menu-move-new-group",
+                "Move to new group",
+                can_move_to_new_group,
+                false,
+                Box::new(move |this, window, cx| {
+                    this.move_tab_to_new_group(group_id, tab_id, window, cx);
+                }),
+            ))
+            .child(div().h_px().bg(divider).my_1())
+            // ── Close section ──
             .child(item(
                 "tab-menu-close",
-                "Close",
+                "Close tab",
                 true,
                 false,
                 Box::new(move |this, window, cx| {
@@ -3300,7 +3494,7 @@ impl AppShell {
             ))
             .child(item(
                 "tab-menu-close-others",
-                "Close others",
+                "Close other tabs",
                 has_others,
                 false,
                 Box::new(move |this, window, cx| {
@@ -3309,9 +3503,9 @@ impl AppShell {
             ))
             .child(item(
                 "tab-menu-close-right",
-                "Close all to the right",
+                "Close tabs to the right",
                 has_right,
-                false,
+                true,
                 Box::new(move |this, window, cx| {
                     this.close_tabs_to_right_in_group(group_id, tab_id, window, cx);
                 }),
