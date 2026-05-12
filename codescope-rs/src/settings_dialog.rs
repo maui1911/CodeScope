@@ -192,6 +192,24 @@ fn id_hash(id: &str) -> u64 {
     hasher.finish()
 }
 
+/// Render the font-fallback chain as a one-line read-only hint.
+/// Truncates to the first 3 names + `…` when the chain is longer so
+/// the line never overflows the dialog width regardless of how many
+/// fallbacks the user has configured. The full list is applied at
+/// runtime — this is purely a UI truncation.
+const FALLBACKS_HINT_VISIBLE: usize = 3;
+fn format_fallbacks_hint(fallbacks: &[String]) -> String {
+    if fallbacks.is_empty() {
+        return "fallbacks: (none)".to_string();
+    }
+    if fallbacks.len() <= FALLBACKS_HINT_VISIBLE {
+        return format!("fallbacks: {}", fallbacks.join(", "));
+    }
+    let visible = fallbacks[..FALLBACKS_HINT_VISIBLE].join(", ");
+    let hidden = fallbacks.len() - FALLBACKS_HINT_VISIBLE;
+    format!("fallbacks: {visible}, … (+{hidden} more)")
+}
+
 /// Format an `f32` for the text buffer: trim trailing zeros so `13.0`
 /// renders as `13` (less noisy in the input), `1.25` stays `1.25`.
 fn format_f32(value: f32) -> String {
@@ -385,7 +403,12 @@ impl AppShell {
             div().text_size(px(11.0)).text_color(ink_ghost).child(text)
         };
         let hint = |text: SharedString| {
-            div().text_size(px(11.0)).text_color(ink_ghost).child(text)
+            div()
+                .w_full()
+                .text_size(px(11.0))
+                .text_color(ink_ghost)
+                .truncate()
+                .child(text)
         };
 
         // ─── Theme picker ──────────────────────────────────────────
@@ -518,8 +541,10 @@ impl AppShell {
             SettingsField::Scrollback,
         );
 
-        let fallbacks_hint: SharedString =
-            format!("fallbacks: {}", draft.font.fallbacks.join(", ")).into();
+        // Cap the visible fallback chain so a 10-deep Nerd-Font list
+        // doesn't blow past the dialog width. The full chain is still
+        // applied at runtime — this is purely a display truncation.
+        let fallbacks_hint: SharedString = format_fallbacks_hint(&draft.font.fallbacks).into();
 
         // ─── Cursor shape radios ───────────────────────────────────
         let cursor_radio = |id: &'static str, label: &'static str, value: &'static str| {
@@ -602,9 +627,10 @@ impl AppShell {
         //
         // Two-column scroll-friendly stack: left column = theme +
         // agent pickers; right column = font + cursor + scrollback.
-        // Both share the dialog's 520 px width minus the 20 px gutter
-        // — keeps each column roughly the same width as the
-        // new-project dialog's body.
+        // Both share the dialog's 640 px width minus the 40 px side
+        // padding + 16 px gutter — leaves ~290 px per column which
+        // is enough for the font-family input plus the truncated
+        // fallback hint without wrapping.
 
         let restart_hint = div()
             .text_size(px(10.0))
@@ -725,8 +751,8 @@ impl AppShell {
             .flex()
             .flex_col()
             .gap_3()
-            .w(px(560.0))
-            .max_h(px(640.0))
+            .w(px(640.0))
+            .max_h(px(720.0))
             .bg(elevated)
             .border_1()
             .border_color(divider)
@@ -909,6 +935,28 @@ mod tests {
         // the same process — gpui ties element identity to it across
         // frames.
         assert_eq!(id_hash("codescope-default"), id_hash("codescope-default"));
+    }
+
+    #[test]
+    fn format_fallbacks_hint_truncates_long_chains() {
+        // Empty list reads as "(none)" rather than a dangling colon.
+        assert_eq!(format_fallbacks_hint(&[]), "fallbacks: (none)");
+        // Short chains render in full.
+        let three = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        assert_eq!(format_fallbacks_hint(&three), "fallbacks: A, B, C");
+        // Long chains keep the first three and indicate the rest.
+        let ten: Vec<String> = (0..10).map(|i| format!("F{i}")).collect();
+        let hint = format_fallbacks_hint(&ten);
+        assert!(hint.starts_with("fallbacks: F0, F1, F2"), "{hint}");
+        assert!(hint.contains("(+7 more)"), "{hint}");
+    }
+
+    #[test]
+    fn format_fallbacks_hint_keeps_exactly_three_inline() {
+        // Exactly the visible cap — no "+N more" suffix.
+        let three = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let hint = format_fallbacks_hint(&three);
+        assert!(!hint.contains("more"), "{hint}");
     }
 
     #[test]
