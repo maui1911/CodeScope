@@ -86,20 +86,22 @@ jobs:
       # but also really annoying to build CI around when it needs secrets to work right.)
       - id: plan
         # dist-workspace.toml and Cargo.toml live in codescope-rs/, so all
-        # `dist` invocations run from that subdir. Artifact paths below are
-        # prefixed with `codescope-rs/` because actions/*-artifact resolves
-        # `path:` relative to $GITHUB_WORKSPACE, not the step's working-dir.
+        # `dist` invocations run from that subdir. Subsequent jobs extract
+        # artifacts at the workspace root, so each upload `path:` carries its
+        # final workspace-relative location (e.g. `codescope-rs/target/...`)
+        # — keeps the artifact ZIPs round-trip-correct.
         working-directory: codescope-rs
         run: |
-          dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
+          mkdir -p target/distrib
+          dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > target/distrib/plan-dist-manifest.json
           echo "dist ran successfully"
-          cat plan-dist-manifest.json
-          echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
+          cat target/distrib/plan-dist-manifest.json
+          echo "manifest=$(jq -c "." target/distrib/plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
       - name: "Upload dist-manifest.json"
         uses: actions/upload-artifact@v6
         with:
           name: artifacts-plan-dist-manifest
-          path: codescope-rs/plan-dist-manifest.json
+          path: codescope-rs/target/distrib/plan-dist-manifest.json
 
   # Build and packages all the platform-specific things
   build-local-artifacts:
@@ -146,14 +148,17 @@ jobs:
           fi
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
-      # Get the dist-manifest. Drop into codescope-rs/target/distrib/ so dist
-      # (which runs from codescope-rs/) can find prior artifacts at the path
-      # it expects.
+      # Get the dist-manifest. Extract to the workspace root: upload-artifact
+      # preserves each entry's workspace-relative path inside the artifact, so
+      # the uploads carry `codescope-rs/target/distrib/...` already — pointing
+      # the download at the workspace root restores the original layout (using
+      # `codescope-rs/target/distrib/` here would nest it as
+      # `codescope-rs/target/distrib/codescope-rs/target/distrib/...`).
       - name: Fetch local artifacts
         uses: actions/download-artifact@v7
         with:
           pattern: artifacts-*
-          path: codescope-rs/target/distrib/
+          path: .
           merge-multiple: true
       - name: Install dependencies
         run: |
@@ -209,12 +214,15 @@ jobs:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
       - run: chmod +x ~/.cargo/bin/dist
-      # Get all the local artifacts for the global tasks to use (for e.g. checksums)
+      # Get all the local artifacts for the global tasks to use (for e.g.
+      # checksums). Extract to workspace root — uploaded entries already carry
+      # their `codescope-rs/target/distrib/...` prefix, so this restores the
+      # original layout without doubling the prefix.
       - name: Fetch local artifacts
         uses: actions/download-artifact@v7
         with:
           pattern: artifacts-*
-          path: codescope-rs/target/distrib/
+          path: .
           merge-multiple: true
       - id: cargo-dist
         shell: bash
@@ -263,12 +271,14 @@ jobs:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
       - run: chmod +x ~/.cargo/bin/dist
-      # Fetch artifacts from scratch-storage
+      # Fetch artifacts from scratch-storage. Extract to workspace root so the
+      # `codescope-rs/...` prefixes embedded in each upload land at their
+      # natural path, where `dist host` (running from codescope-rs/) finds them.
       - name: Fetch artifacts
         uses: actions/download-artifact@v7
         with:
           pattern: artifacts-*
-          path: codescope-rs/target/distrib/
+          path: .
           merge-multiple: true
       - id: host
         shell: bash
@@ -293,6 +303,14 @@ jobs:
           merge-multiple: true
       - name: Cleanup
         run: |
+          # Uploaded artifacts preserve their workspace-relative paths, so
+          # everything lands under `artifacts/codescope-rs/...`. Flatten that
+          # back to `artifacts/<basename>` so `gh release create artifacts/*`
+          # sees the release files (it doesn't recurse into directories).
+          if [ -d artifacts/codescope-rs ]; then
+            find artifacts/codescope-rs -type f -exec mv -t artifacts/ {} +
+            rm -rf artifacts/codescope-rs
+          fi
           # Remove the granular manifests
           rm -f artifacts/*-dist-manifest.json
       - name: Create GitHub Release
