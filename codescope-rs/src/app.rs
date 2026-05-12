@@ -668,6 +668,13 @@ pub struct AppShell {
     /// gpui doesn't have a modal-window primitive. See
     /// `rename_dialog.rs` for the full rationale.
     pub(crate) rename_dialog: Option<crate::rename_dialog::RenameDialogState>,
+    /// Multiplatform taskbar / dock badge driver. Mirrors C#
+    /// `TaskbarBadgeService`. Refreshed from the same telemetry-poll
+    /// callback that updates the sidebar dots
+    /// ([`AppShell::push_sidebar_session_paths`]) so the badge tracks
+    /// agent-rollup state with no extra polling cost. Cleared when
+    /// the shell drops.
+    taskbar_badge: crate::taskbar_badge::TaskbarBadge,
 }
 
 impl AppShell {
@@ -1066,6 +1073,7 @@ impl AppShell {
             show_overview: false,
             settings_dialog: None,
             rename_dialog: None,
+            taskbar_badge: crate::taskbar_badge::TaskbarBadge::new(window),
         };
         shell.start_telemetry_poll(cx);
         shell.start_agent_discovery_poll(cx);
@@ -1073,7 +1081,19 @@ impl AppShell {
         shell.rehydrate_or_cold_start(window, cx);
         shell
     }
+}
 
+impl Drop for AppShell {
+    /// Clear the OS taskbar / dock overlay on teardown so a fresh
+    /// launch doesn't inherit a stale red badge from a previous run.
+    /// Mirrors WPF's automatic `TaskbarItemInfo` cleanup when the
+    /// `MainWindow` is destroyed.
+    fn drop(&mut self) {
+        self.taskbar_badge.clear();
+    }
+}
+
+impl AppShell {
     /// Persist the current group layout (weights + focus index) to
     /// `layout.json`. Called after splitter-drag end, split-right, and
     /// group-collapse — anything that mutates either field. Never
@@ -1263,6 +1283,9 @@ impl AppShell {
                         // from a session that just closed. Push
                         // empties so the dots fade back to `rest`.
                         this.push_sidebar_session_paths(cx);
+                        // Same logic for the taskbar overlay: a tab
+                        // that just closed should clear the badge.
+                        this.refresh_taskbar_badge();
                         return Duration::from_secs(30);
                     }
                     let mut any_busy = false;
@@ -1286,6 +1309,11 @@ impl AppShell {
                     // a redraw every tick unless a tab actually
                     // flipped state.
                     this.push_sidebar_session_paths(cx);
+                    // Taskbar / dock overlay refresh runs on the
+                    // same cadence — the badge driver itself
+                    // de-dupes redundant `apply` calls so a quiet
+                    // busy stretch doesn't repaint every 250 ms.
+                    this.refresh_taskbar_badge();
                     if any_busy {
                         Duration::from_millis(250)
                     } else {
@@ -3713,6 +3741,18 @@ impl AppShell {
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.set_session_paths(busy, active, cx);
         });
+    }
+
+    /// Recompute the OS-level taskbar / dock overlay from the
+    /// current agent rollup. Mirrors C#
+    /// `MainViewModel.RecomputeTaskbarBadge` — busy / agent counts
+    /// flow from the same telemetry source the status-bar segment
+    /// already reads. The badge driver no-ops when the state hasn't
+    /// changed, so calling this from a 250 ms busy-poll is cheap.
+    fn refresh_taskbar_badge(&mut self) {
+        let (busy, idle) = self.agent_rollup_counts();
+        let agents = busy + idle;
+        self.taskbar_badge.apply(busy, agents);
     }
 
     /// Walk every tab across every group and count adopted agent

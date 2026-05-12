@@ -20,6 +20,7 @@ mod overview;
 mod rename_dialog;
 mod settings_dialog;
 mod sidebar;
+mod taskbar_badge;
 mod theme;
 #[cfg(target_os = "windows")]
 mod win32_titlebar;
