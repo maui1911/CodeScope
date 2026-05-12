@@ -272,6 +272,71 @@ pub fn built_in_defaults() -> Vec<AgentProfile> {
     ]
 }
 
+/// Build the auto-type command string used to (re)attach a terminal
+/// session to a previously-running agent conversation. Mirrors C#
+/// `SessionManager.CreateAgentSession` resume branch + `JoinResumeByIdArgs`
+/// (see `src/CodeScope.Core/Services/SessionManager.cs`).
+///
+/// Resolution table:
+///
+/// 1. `agent_session_id = Some(id)` AND `resume_by_id_args` non-empty
+///    → `[command, resume_by_id_args[0..n-1]..,
+///        resume_by_id_args[last] + id_suffix]`
+///    where the last token is concat'd with the id without a space
+///    when it ends with `=` (Copilot's `--resume=<id>` shape) and
+///    appended as a separate argv element otherwise (Claude's
+///    `--resume <id>`, OpenCode's `--session <id>`, Pi's
+///    `--session <id>`).
+/// 2. Otherwise (no known id, or the profile has no resume-by-id
+///    flow) → `[command, resume_args...]`. Empty `resume_args` yields
+///    just the bare `command` — matches C# `CreateAgentSession` with
+///    `resume = true` and an empty `ResumeArgs`.
+///
+/// Tokens are joined with single spaces. The result is intended for
+/// `auto_type` in a PowerShell prompt, exactly like the C# build.
+pub fn build_resume_auto_type(
+    profile: &AgentProfile,
+    agent_session_id: Option<&str>,
+) -> Option<String> {
+    if profile.command.is_empty() {
+        return None;
+    }
+
+    let id_for_resume = agent_session_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if let Some(id) = id_for_resume {
+        if !profile.resume_by_id_args.is_empty() {
+            let mut argv: Vec<String> =
+                Vec::with_capacity(1 + profile.resume_by_id_args.len());
+            argv.push(profile.command.clone());
+            let last_idx = profile.resume_by_id_args.len() - 1;
+            for (i, token) in profile.resume_by_id_args.iter().enumerate() {
+                if i == last_idx && token.ends_with('=') {
+                    // Copilot's optional-value flag — `--resume=<id>`
+                    // requires no space between flag and value.
+                    argv.push(format!("{token}{id}"));
+                } else if i == last_idx {
+                    argv.push(token.clone());
+                    argv.push(id.to_string());
+                } else {
+                    argv.push(token.clone());
+                }
+            }
+            return Some(argv.join(" "));
+        }
+        // Fall through to resume_args — the profile has no per-id
+        // resume verb (Codex), so the best we can do is "continue
+        // most recent" or just re-launch.
+    }
+
+    let mut argv: Vec<String> = Vec::with_capacity(1 + profile.resume_args.len());
+    argv.push(profile.command.clone());
+    argv.extend(profile.resume_args.iter().cloned());
+    Some(argv.join(" "))
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -461,5 +526,184 @@ mod tests {
         assert!(json.contains("\"resumeByIdArgs\""));
         assert!(json.contains("\"isDefault\""));
         assert!(json.contains("\"contextWindowTokens\""));
+    }
+
+    // ─── build_resume_auto_type ────────────────────────────────────
+    //
+    // Covers the resume-by-explicit-id flow for every built-in
+    // agent. Each test pairs a "with id" assertion against the
+    // "without id" fallback so a regression in either branch is
+    // caught. Mirrors the C# `SessionManager.CreateAgentSession`
+    // resume branch + `JoinResumeByIdArgs`.
+
+    fn registry_profile(id: &str) -> AgentProfile {
+        AgentRegistry::with_built_ins()
+            .get_by_id(id)
+            .cloned()
+            .expect("built-in profile present")
+    }
+
+    #[test]
+    fn build_resume_auto_type_claude_with_id() {
+        let profile = registry_profile("claude");
+        assert_eq!(
+            build_resume_auto_type(&profile, Some("abc-123")),
+            Some("claude --resume abc-123".into()),
+        );
+    }
+
+    #[test]
+    fn build_resume_auto_type_claude_without_id_yields_bare_command() {
+        // Claude's `resume_args` is empty — the bare `claude` is the
+        // fallback when no specific session id is known.
+        let profile = registry_profile("claude");
+        assert_eq!(
+            build_resume_auto_type(&profile, None),
+            Some("claude".into()),
+        );
+    }
+
+    #[test]
+    fn build_resume_auto_type_codex_ignores_id_when_resume_by_id_args_empty() {
+        // Codex has `resume_args = ["resume"]` but no
+        // `resume_by_id_args` — passing an id must not change the
+        // shape, the helper falls through to `resume_args`.
+        let profile = registry_profile("codex");
+        assert_eq!(
+            build_resume_auto_type(&profile, Some("ignored-id")),
+            Some("codex resume".into()),
+        );
+        assert_eq!(
+            build_resume_auto_type(&profile, None),
+            Some("codex resume".into()),
+        );
+    }
+
+    #[test]
+    fn build_resume_auto_type_copilot_with_id_concats_with_equals() {
+        // Copilot's last `resume_by_id_args` entry is `"--resume="`
+        // (trailing `=`). The helper must concat the id without
+        // emitting an intermediate space.
+        let profile = registry_profile("copilot");
+        assert_eq!(
+            build_resume_auto_type(&profile, Some("abc-123")),
+            Some("copilot --resume=abc-123".into()),
+        );
+    }
+
+    #[test]
+    fn build_resume_auto_type_copilot_without_id_uses_continue() {
+        let profile = registry_profile("copilot");
+        assert_eq!(
+            build_resume_auto_type(&profile, None),
+            Some("copilot --continue".into()),
+        );
+    }
+
+    #[test]
+    fn build_resume_auto_type_opencode_with_id() {
+        // OpenCode resumes by `--session <id>` (space-separated, no
+        // trailing `=` on the flag). The built-in command is
+        // `opencode-cli` on Windows.
+        let profile = registry_profile("opencode");
+        let cmd = profile.command.clone();
+        assert_eq!(
+            build_resume_auto_type(&profile, Some("abc-123")),
+            Some(format!("{cmd} --session abc-123")),
+        );
+    }
+
+    #[test]
+    fn build_resume_auto_type_opencode_without_id_uses_continue() {
+        let profile = registry_profile("opencode");
+        let cmd = profile.command.clone();
+        assert_eq!(
+            build_resume_auto_type(&profile, None),
+            Some(format!("{cmd} --continue")),
+        );
+    }
+
+    #[test]
+    fn build_resume_auto_type_pi_with_id_uses_session_flag() {
+        // The user-visible bug: `pi -c` was resuming "most recent"
+        // instead of `pi --session <id>` — this test pins the
+        // correct shape.
+        let profile = registry_profile("pi");
+        assert_eq!(
+            build_resume_auto_type(&profile, Some("abc-123")),
+            Some("pi --session abc-123".into()),
+        );
+    }
+
+    #[test]
+    fn build_resume_auto_type_pi_without_id_falls_back_to_continue() {
+        let profile = registry_profile("pi");
+        assert_eq!(
+            build_resume_auto_type(&profile, None),
+            Some("pi -c".into()),
+        );
+    }
+
+    #[test]
+    fn build_resume_auto_type_empty_id_treated_as_no_id() {
+        // Defensive: a persisted `agent_session_id = Some("")` (or
+        // whitespace) must not produce `claude --resume ` with a
+        // trailing space — fall back to the no-id path instead.
+        let profile = registry_profile("claude");
+        assert_eq!(
+            build_resume_auto_type(&profile, Some("")),
+            Some("claude".into()),
+        );
+        assert_eq!(
+            build_resume_auto_type(&profile, Some("   ")),
+            Some("claude".into()),
+        );
+    }
+
+    #[test]
+    fn build_resume_auto_type_returns_none_when_command_empty() {
+        // Defensive: a hand-edited `settings.json` with a blank
+        // `command` (or a registry override that forgot to set
+        // one) must not emit a leading-space argv. Returning
+        // `None` lets the caller fall through to a plain shell.
+        let profile = AgentProfile {
+            id: "broken".into(),
+            display_name: "Broken".into(),
+            command: String::new(),
+            resume_args: vec!["--continue".into()],
+            new_session_args: vec![],
+            session_id_flag: None,
+            resume_by_id_args: vec!["--resume".into()],
+            is_default: false,
+            icon: None,
+            context_window_tokens: 0,
+        };
+        assert!(build_resume_auto_type(&profile, Some("abc")).is_none());
+        assert!(build_resume_auto_type(&profile, None).is_none());
+    }
+
+    #[test]
+    fn build_resume_auto_type_multi_token_resume_by_id_args_appends_id_to_last() {
+        // Future-proofing for a hypothetical profile whose
+        // `resume_by_id_args` is e.g. `["--resume", "--id"]` —
+        // tokens are emitted in order and the id rides the last
+        // one (still space-separated because the last token
+        // doesn't end with `=`).
+        let profile = AgentProfile {
+            id: "multi".into(),
+            display_name: "Multi".into(),
+            command: "multi".into(),
+            resume_args: vec!["--continue".into()],
+            new_session_args: vec![],
+            session_id_flag: None,
+            resume_by_id_args: vec!["--resume".into(), "--id".into()],
+            is_default: false,
+            icon: None,
+            context_window_tokens: 0,
+        };
+        assert_eq!(
+            build_resume_auto_type(&profile, Some("xyz")),
+            Some("multi --resume --id xyz".into()),
+        );
     }
 }

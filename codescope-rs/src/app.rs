@@ -1759,6 +1759,14 @@ impl AppShell {
                     auto_type: tab.auto_type.as_ref().map(|s| s.to_string()),
                     group_index: g_idx,
                     active_in_group: t_idx == group.active_tab,
+                    // Persist the session id so the rehydrate path on
+                    // next launch can look up `agent_session_id` and
+                    // resume the *specific* conversation, not just
+                    // "most recent". Matches the C# build's behaviour
+                    // where layout-rehydrate goes through
+                    // `CreateAgentSession(resume: true, agentSessionId:
+                    // stored.AgentSessionId)`.
+                    session_id: Some(tab.session_id.clone()),
                 });
             }
         }
@@ -1796,19 +1804,48 @@ impl AppShell {
             // index after the loop.
             self.focused_group = group_idx;
             let title = SharedString::from(tab.title);
-            let auto = tab.auto_type.map(SharedString::from);
-            // Rehydrate path lets `spawn_tab_in` mint a fresh session
-            // id and append a new row through `SessionManager::open`,
-            // even though the tab is logically "the same" tab the
-            // user closed in the previous launch. This is a known
-            // limitation: `LayoutState::open_tabs` does not yet carry
-            // the persisted `Session.id`, so we can't map back to the
-            // stored row. The follow-up that unifies the rehydrate
-            // path with `SessionManager::live` will tighten this up;
-            // until then, accept the duplicate row as the cost of
-            // landing the lifecycle plumbing without a coordinated
-            // schema change.
-            self.spawn_tab_in(Some(path), Some(title), auto, None, window, cx);
+
+            // Reattach to the persisted session row when the layout
+            // entry carries a `session_id` (post-resume-by-id
+            // builds). We re-resolve `auto_type` from the stored
+            // `Session.agent_id` + `Session.agent_session_id` so the
+            // rehydrated tab runs `claude --resume <id>` / `pi
+            // --session <id>` / `copilot --resume=<id>` instead of
+            // the original spawn command (which was just "claude").
+            // Falls back to the layout's recorded `auto_type` when
+            // the session row can't be found (project removed,
+            // layout.json from a pre-session-id build) so legacy
+            // entries still rehydrate as a fresh agent launch.
+            let stored_session = tab
+                .session_id
+                .as_deref()
+                .and_then(|sid| self.lookup_session_by_id(sid));
+            let auto: Option<SharedString> = match stored_session.as_ref() {
+                Some(stored) => stored
+                    .agent_id
+                    .as_deref()
+                    .and_then(|aid| self.agent_registry.get_by_id(aid))
+                    .and_then(|profile| {
+                        codescope_core::build_resume_auto_type(
+                            profile,
+                            stored.agent_session_id.as_deref(),
+                        )
+                    })
+                    .map(SharedString::from)
+                    .or_else(|| tab.auto_type.clone().map(SharedString::from)),
+                None => tab.auto_type.clone().map(SharedString::from),
+            };
+            // Re-bind to the stored session row when the layout
+            // entry carries an id and the row still exists in
+            // `projects.json`. Otherwise we fall back to a fresh
+            // session id (`spawn_tab_in` mints one via
+            // `allocate_session_id`) — the legacy behaviour for
+            // pre-resume-by-id layouts.
+            let restore_session_id =
+                stored_session.as_ref().map(|s| s.id.clone()).or_else(
+                    || tab.session_id.clone(),
+                );
+            self.spawn_tab_in(Some(path), Some(title), auto, restore_session_id, window, cx);
             spawned_any = true;
             if tab.active_in_group {
                 let new_idx = self.groups[group_idx].tabs.len() - 1;
@@ -2025,6 +2062,22 @@ impl AppShell {
             }
         }
         new_id
+    }
+
+    /// Find a persisted [`codescope_core::Session`] by id in the
+    /// current `self.projects` snapshot. Returns a clone so callers
+    /// can drop the borrow on `self` immediately — the layout
+    /// rehydrate path needs that to call `spawn_tab_in` afterwards.
+    /// `None` when the id no longer exists (project removed,
+    /// hard-remove from history, race with a concurrent sidebar
+    /// write).
+    fn lookup_session_by_id(&self, session_id: &str) -> Option<codescope_core::Session> {
+        for project in self.projects.projects.iter() {
+            if let Some(s) = project.sessions.iter().find(|s| s.id == session_id) {
+                return Some(s.clone());
+            }
+        }
+        None
     }
 
     /// Mark `session_id` as soft-closed and persist. Called from
@@ -2274,27 +2327,26 @@ impl AppShell {
         // in `agent_registry` so non-Claude reopens
         // (Codex / OpenCode / Copilot / Pi, plus any
         // `settings.agents` overrides) come back with the right
-        // command instead of dropping to a plain shell. Resume args
-        // are preferred when present (`claude --resume <id>`,
-        // `pi -c`, `copilot --continue`, …) so the agent reattaches
-        // to the previous conversation; falls back to `new_session_args`
-        // when the profile has no resume verb. Plain shell sessions
-        // (no `agent_id`) come back as plain shells.
+        // command instead of dropping to a plain shell.
+        //
+        // When `Session.agent_session_id` is known we resume the
+        // specific conversation via `resume_by_id_args` (`claude
+        // --resume <id>`, `pi --session <id>`, `opencode --session
+        // <id>`, `copilot --resume=<id>`). Without a stored id we
+        // fall back to `resume_args` (`pi -c`, `copilot --continue`,
+        // bare `claude`). Mirrors C# `SessionManager.CreateAgentSession`
+        // resume branch + `JoinResumeByIdArgs`.
         let auto_type: Option<SharedString> = restored
             .agent_id
             .as_deref()
             .and_then(|id| self.agent_registry.get_by_id(id))
-            .map(|profile| {
-                let resume_args = if profile.resume_args.is_empty() {
-                    profile.new_session_args.as_slice()
-                } else {
-                    profile.resume_args.as_slice()
-                };
-                let mut argv: Vec<&str> = Vec::with_capacity(1 + resume_args.len());
-                argv.push(profile.command.as_str());
-                argv.extend(resume_args.iter().map(|s| s.as_str()));
-                SharedString::from(argv.join(" "))
-            });
+            .and_then(|profile| {
+                codescope_core::build_resume_auto_type(
+                    profile,
+                    restored.agent_session_id.as_deref(),
+                )
+            })
+            .map(SharedString::from);
 
         self.spawn_tab_in(
             Some(working_directory),

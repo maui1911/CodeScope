@@ -84,6 +84,17 @@ pub struct RestoreTab {
     /// tab wins.
     #[serde(default)]
     pub active_in_group: bool,
+    /// Persisted [`crate::projects::Session`] id this tab was bound
+    /// to at save time. `Some` lets the rehydrate path look up the
+    /// stored `agent_session_id` and reattach to the *specific*
+    /// conversation via `resume_by_id_args` instead of the agent's
+    /// "most recent" fallback. `None` for older layout.json files
+    /// (pre-resume-by-id) and for tabs that never made it into the
+    /// session store (no project context at spawn time) — those
+    /// rehydrate as a fresh agent launch, matching the previous
+    /// behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 impl Default for LayoutState {
@@ -163,6 +174,7 @@ mod tests {
                 auto_type: Some("claude".into()),
                 group_index: 0,
                 active_in_group: true,
+                session_id: Some("sess-1".into()),
             }],
             collapsed_projects: vec!["proj-2".into(), "proj-3".into()],
         };
@@ -175,6 +187,7 @@ mod tests {
         assert_eq!(loaded.open_tabs.len(), 1);
         assert_eq!(loaded.open_tabs[0].auto_type.as_deref(), Some("claude"));
         assert!(loaded.open_tabs[0].active_in_group);
+        assert_eq!(loaded.open_tabs[0].session_id.as_deref(), Some("sess-1"));
         assert_eq!(loaded.collapsed_projects, vec!["proj-2", "proj-3"]);
     }
 
@@ -195,6 +208,24 @@ mod tests {
         let loaded = LayoutState::load_from(&path).unwrap();
         assert_eq!(loaded.selected_project_id.as_deref(), Some("proj-x"));
         assert!(loaded.collapsed_projects.is_empty());
+    }
+
+    #[test]
+    fn legacy_restore_tab_without_session_id_loads() {
+        // layout.json files written before resume-by-explicit-id
+        // landed don't carry `session_id` on each tab. They must
+        // still load (with `session_id = None`) so a one-shot
+        // upgrade doesn't drop the user's restored tab strip.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        std::fs::write(
+            &path,
+            r#"{"sidebar_visible":true,"sidebar_width":240,"open_tabs":[{"working_directory":"C:\\repos\\foo","title":"foo","auto_type":"claude","group_index":0,"active_in_group":true}]}"#,
+        )
+        .unwrap();
+        let loaded = LayoutState::load_from(&path).unwrap();
+        assert_eq!(loaded.open_tabs.len(), 1);
+        assert!(loaded.open_tabs[0].session_id.is_none());
     }
 
     #[test]
