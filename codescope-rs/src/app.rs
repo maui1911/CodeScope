@@ -1753,6 +1753,20 @@ impl AppShell {
         for (g_idx, group) in self.groups.iter().enumerate() {
             for (t_idx, tab) in group.tabs.iter().enumerate() {
                 let Some(ref wd) = tab.working_directory else { continue };
+                // Persist `session_id` only when this tab's id actually
+                // resolves to a row in `projects.json` — free-floating
+                // tabs (no project context at spawn time) mint an id
+                // that's never appended via `SessionManager::open`, so
+                // writing it here would (a) be unresolvable on next
+                // launch and (b) trick the rehydrate path into
+                // adopting a non-existent row (`allocate_session_id`
+                // skips the `open` append when `restore_session_id`
+                // is `Some`). Leave it `None` for those tabs so the
+                // rehydrate falls back to the legacy fresh-spawn
+                // path and still produces a working terminal.
+                let persisted_session_id = self
+                    .lookup_session_by_id(&tab.session_id)
+                    .map(|_| tab.session_id.clone());
                 out.push(codescope_core::RestoreTab {
                     working_directory: wd.to_string_lossy().into_owned(),
                     title: tab.title.to_string(),
@@ -1766,7 +1780,7 @@ impl AppShell {
                     // where layout-rehydrate goes through
                     // `CreateAgentSession(resume: true, agentSessionId:
                     // stored.AgentSessionId)`.
-                    session_id: Some(tab.session_id.clone()),
+                    session_id: persisted_session_id,
                 });
             }
         }
@@ -1835,16 +1849,19 @@ impl AppShell {
                     .or_else(|| tab.auto_type.clone().map(SharedString::from)),
                 None => tab.auto_type.clone().map(SharedString::from),
             };
-            // Re-bind to the stored session row when the layout
-            // entry carries an id and the row still exists in
-            // `projects.json`. Otherwise we fall back to a fresh
-            // session id (`spawn_tab_in` mints one via
-            // `allocate_session_id`) — the legacy behaviour for
-            // pre-resume-by-id layouts.
-            let restore_session_id =
-                stored_session.as_ref().map(|s| s.id.clone()).or_else(
-                    || tab.session_id.clone(),
-                );
+            // Re-bind to the stored session row only when the row
+            // actually exists in `projects.json` right now. Passing
+            // `Some(id)` makes `allocate_session_id` skip the
+            // `SessionManager::open` append (it assumes the row is
+            // already on disk), so handing it a ghost id would leave
+            // the tab bound to a session that history / close
+            // bookkeeping can't touch. When the row is gone (project
+            // removed, hard-remove from history, race with a sidebar
+            // write) we fall back to `None` and let
+            // `allocate_session_id` mint a fresh id + append a new
+            // row — matches the pre-resume-by-id rehydrate
+            // behaviour for legacy layout.json files.
+            let restore_session_id = stored_session.as_ref().map(|s| s.id.clone());
             self.spawn_tab_in(Some(path), Some(title), auto, restore_session_id, window, cx);
             spawned_any = true;
             if tab.active_in_group {
