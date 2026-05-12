@@ -2314,10 +2314,18 @@ impl AppShell {
     /// edit fully takes over only after the next Ctrl+Shift+T.
     pub(crate) fn apply_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
         let theme = Arc::new(codescope_core::theme::builtin::by_name(&settings.theme));
+        // Rebuild the AgentRegistry from the new settings so the
+        // sidebar's "New session ▸" default-row reflects the freshly
+        // chosen `default_agent` and any `agents` overrides. Without
+        // this the sidebar keeps its construction-time registry and
+        // the Settings dialog appears to do nothing for agent choice.
+        let agent_registry =
+            codescope_core::AgentRegistry::from_settings(&settings);
         self.settings = Arc::new(settings);
         self.theme = theme.clone();
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.apply_theme(theme, cx);
+            sidebar.apply_agent_registry(agent_registry, cx);
         });
         cx.notify();
     }

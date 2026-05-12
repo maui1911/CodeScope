@@ -1290,6 +1290,21 @@ impl Sidebar {
         cx.notify();
     }
 
+    /// Replace the cached `AgentRegistry`. AppShell calls this from
+    /// `apply_settings` after the user saves a new `default_agent` so
+    /// the worktree menu's "New session ▸" default-row, the project
+    /// menu, and any other registry consumer here render the freshly-
+    /// chosen default instead of the stale one captured at
+    /// construction time.
+    pub fn apply_agent_registry(
+        &mut self,
+        agent_registry: AgentRegistry,
+        cx: &mut Context<Self>,
+    ) {
+        self.agent_registry = agent_registry;
+        cx.notify();
+    }
+
     /// Open the project context menu at `position` (window coords)
     /// for the project at `idx`. No-op if the index is out of range.
     fn open_project_menu(
