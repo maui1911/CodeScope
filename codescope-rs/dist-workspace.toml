@@ -81,9 +81,12 @@ source-tarball = false
 # trigger (we only want tag pushes to spin up the release pipeline).
 # We also ship a custom WiX template at `codescope-rs/wix/main.wxs`
 # (per-user install to `%LOCALAPPDATA%\Programs\codescope-rs\`,
-# per-user Start Menu shortcut, `ALLUSERS=""` / `MSIINSTALLPERUSER=1`
-# for no-UAC installs and upgrades). `allow-dirty` tells cargo-dist
-# not to fight the manual edits on either path on every `dist plan`
+# per-user Start Menu shortcut, `InstallScope="perUser"` plus
+# `MSIINSTALLPERUSER=1` for no-UAC installs and upgrades — we do
+# *not* set `ALLUSERS` explicitly because WiX 3.14 rejects
+# `Property@Value=""` and the perUser InstallScope already handles
+# the ALLUSERS bookkeeping). `allow-dirty` tells cargo-dist not to
+# fight the manual edits on either path on every `dist plan`
 # invocation.
 allow-dirty = ["ci", "msi"]
 # Don't fan out a PR-validation build matrix — the task brief says
