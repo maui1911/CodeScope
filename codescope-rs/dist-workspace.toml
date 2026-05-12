@@ -1,0 +1,61 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist' (cargo-dist / axodotdev).
+#
+# Scope notes for the CodeScope Rust port:
+#
+# - We deliberately ship Windows-only artifacts in this iteration. The
+#   gpui 0.2.x stack technically supports macOS and Linux (target-gated
+#   deps in its Cargo.toml), but the Rust port hasn't been compiled or
+#   tested on those platforms yet, the Windows dev box used for
+#   day-to-day work has no cross-toolchain installed (cc / clang / zig
+#   missing — ring's build.rs fails on first run), and the visual chrome
+#   relies on a Win32-only custom titlebar plus an ITaskbarList3 badge.
+#   Until somebody validates a real macOS / Linux build end-to-end, the
+#   pipeline only emits Windows binaries and an MSI installer — same
+#   scope as the C# build's `release.yml`. See `docs/HANDOFF.md`
+#   "Cross-platform status" section for the path forward.
+# - The MSI installer is built via WiX (cargo-dist's `msi` installer).
+#   On a stock GitHub-hosted `windows-latest` runner cargo-dist
+#   downloads the WiX toolset itself; no manual install required.
+# - `install-path = "CARGO_HOME"` is the cargo-dist default for CLI
+#   tools, but CodeScope is a GUI app users launch from the Start menu,
+#   so we leave that field at its default and let the MSI installer put
+#   the binary under `%ProgramFiles%\CodeScope\` like a normal Win32
+#   desktop app.
+# - `install-updater = false` for now — Velopack handles the
+#   self-update path in-process (see `codescope-rs/core/src/update_check.rs`
+#   and the velopack integration on the AppShell). The axoupdater
+#   shipped by cargo-dist would compete with Velopack for the same
+#   responsibility.
+[dist]
+# Preferred dist version in CI. Bumped together with the workflow.
+cargo-dist-version = "0.31.0"
+# CI backend.
+ci = "github"
+# Installers to generate per target platform.
+installers = ["msi"]
+# Target platforms. Windows-only intentionally — see scope note above.
+targets = ["x86_64-pc-windows-msvc"]
+# Where to host releases.
+hosting = "github"
+# Don't bundle axoupdater; Velopack handles self-update.
+install-updater = false
+# Only run releases from explicit `v*` tag pushes — never on plain
+# branch commits, and the existing C# `release.yml` already covers the
+# product-level release-on-tag flow. We use a Rust-specific tag prefix
+# so the two pipelines don't clash on the same repo.
+tag-namespace = "rs-"
+# Don't ship a generic source tarball — the project is public on GitHub
+# and the repo itself serves as the source archive.
+source-tarball = false
+# We hand-edit the generated workflow to drop the `pull_request:`
+# trigger (we only want tag pushes to spin up the release pipeline).
+# `allow-dirty` tells cargo-dist not to fight the manual edit on every
+# `dist plan` invocation.
+allow-dirty = ["ci"]
+# Don't fan out a PR-validation build matrix — the task brief says
+# "only trigger on tag pushes". This empties cargo-dist's PR mode so
+# the workflow's pull_request gate (when present) is a no-op.
+pr-run-mode = "skip"
