@@ -410,6 +410,59 @@ impl SessionManager {
         Err(anyhow!("session '{session_id}' not found"))
     }
 
+    /// Stamp `agent_session_id` on the session whose CodeScope id is
+    /// `session_id`. Strict variant: errors when the session can't be
+    /// found in any project.
+    ///
+    /// This is the discovery-callback entry point used by the Rust app
+    /// shell once an agent (Claude / Pi / OpenCode / Copilot) reports
+    /// its own session UUID via a transcript / state file. Mirrors C#
+    /// `SessionStore.UpdateAgentSessionIdAsync` but with the
+    /// non-optional `&str` signature `MainViewModel.ApplyAdoption`
+    /// actually uses at the callsite — see PR #178 for the resume-by-id
+    /// machinery that consumes the persisted value.
+    ///
+    /// Idempotent: a no-op when the persisted value already matches
+    /// `agent_session_id`, so callers can hit this on every discovery
+    /// tick without producing redundant writes. Returns `Ok(true)` when
+    /// the value actually changed (callers should persist),
+    /// `Ok(false)` for a no-op (callers can skip the write).
+    ///
+    /// Implemented as a thin wrapper over
+    /// [`Self::update_agent_session_id`] so the session-walk/mutation
+    /// logic only lives in one place.
+    pub fn set_agent_session_id(
+        cfg: &mut ProjectsConfig,
+        session_id: &str,
+        agent_session_id: &str,
+    ) -> Result<bool> {
+        Self::update_agent_session_id(cfg, session_id, Some(agent_session_id))
+    }
+
+    /// Lenient cousin of [`Self::set_agent_session_id`]. Returns
+    /// `false` instead of erroring when the session id isn't found —
+    /// used by the agent-discovery callback path to swallow the
+    /// cold-start race where a freshly-spawned tab's first discovery
+    /// tick fires before [`Self::open`] has written the new row to
+    /// `projects.json`. The next tick (250–350 ms later) will land
+    /// after the row exists and the stamp succeeds normally.
+    ///
+    /// Returns `true` when the value actually changed, `false` for a
+    /// no-op (either the value already matched, or the session id is
+    /// unknown). Mirrors the strict variant's `Result<bool>` contract
+    /// minus the error arm.
+    ///
+    /// Implemented on top of [`Self::set_agent_session_id`] so the
+    /// session-walk/mutation logic is shared — the lenient policy is
+    /// just "treat the strict variant's error as a no-op".
+    pub fn set_agent_session_id_lenient(
+        cfg: &mut ProjectsConfig,
+        session_id: &str,
+        agent_session_id: &str,
+    ) -> bool {
+        Self::set_agent_session_id(cfg, session_id, agent_session_id).unwrap_or(false)
+    }
+
     // ---- queries ---------------------------------------------------
 
     /// All sessions across all projects with `closed_at = None`.
@@ -951,6 +1004,94 @@ mod tests {
             .unwrap();
         assert!(changed);
         assert!(cfg.projects[0].sessions[0].agent_session_id.is_none());
+    }
+
+    #[test]
+    fn set_agent_session_id_stamps_a_fresh_value() {
+        let mut cfg = ProjectsConfig::default();
+        let mut p = make_project("p1");
+        p.sessions.push(make_session("s1", None));
+        cfg.projects.push(p);
+
+        let changed = SessionManager::set_agent_session_id(&mut cfg, "s1", "uuid-abc")
+            .unwrap();
+        assert!(changed);
+        assert_eq!(
+            cfg.projects[0].sessions[0].agent_session_id.as_deref(),
+            Some("uuid-abc"),
+        );
+    }
+
+    #[test]
+    fn set_agent_session_id_is_idempotent_for_same_value() {
+        let mut cfg = ProjectsConfig::default();
+        let mut p = make_project("p1");
+        let mut s = make_session("s1", None);
+        s.agent_session_id = Some("uuid-abc".into());
+        p.sessions.push(s);
+        cfg.projects.push(p);
+
+        let changed = SessionManager::set_agent_session_id(&mut cfg, "s1", "uuid-abc")
+            .unwrap();
+        assert!(!changed);
+        assert_eq!(
+            cfg.projects[0].sessions[0].agent_session_id.as_deref(),
+            Some("uuid-abc"),
+        );
+    }
+
+    #[test]
+    fn set_agent_session_id_errors_on_unknown_session() {
+        let mut cfg = ProjectsConfig::default();
+        cfg.projects.push(make_project("p1"));
+        let err = SessionManager::set_agent_session_id(&mut cfg, "ghost", "uuid-abc")
+            .unwrap_err();
+        assert!(err.to_string().contains("ghost"));
+    }
+
+    #[test]
+    fn set_agent_session_id_lenient_swallows_unknown_session() {
+        let mut cfg = ProjectsConfig::default();
+        let mut p = make_project("p1");
+        p.sessions.push(make_session("s1", None));
+        cfg.projects.push(p);
+
+        // Unknown session — no error, no mutation. Mirrors the
+        // cold-start race the discovery callback path swallows.
+        let changed = SessionManager::set_agent_session_id_lenient(
+            &mut cfg, "ghost", "uuid-abc",
+        );
+        assert!(!changed);
+        assert!(cfg.projects[0].sessions[0].agent_session_id.is_none());
+
+        // Known session still works.
+        let changed = SessionManager::set_agent_session_id_lenient(
+            &mut cfg, "s1", "uuid-abc",
+        );
+        assert!(changed);
+        assert_eq!(
+            cfg.projects[0].sessions[0].agent_session_id.as_deref(),
+            Some("uuid-abc"),
+        );
+    }
+
+    #[test]
+    fn set_agent_session_id_round_trips_through_save_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.json");
+
+        let mut cfg = ProjectsConfig::default();
+        let mut p = make_project("p1");
+        p.sessions.push(make_session("s1", None));
+        cfg.projects.push(p);
+
+        SessionManager::set_agent_session_id(&mut cfg, "s1", "uuid-abc").unwrap();
+        cfg.save_to(&path).unwrap();
+
+        let loaded = SessionManager::load_from_with_sweep(&path, fixed_now()).unwrap();
+        let stamped = &loaded.projects[0].sessions[0];
+        assert_eq!(stamped.id, "s1");
+        assert_eq!(stamped.agent_session_id.as_deref(), Some("uuid-abc"));
     }
 
     // ---- queries ----------------------------------------------
