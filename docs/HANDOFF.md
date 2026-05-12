@@ -96,6 +96,8 @@ chord therefore lives on **Ctrl+Shift** so it can't conflict.
 | Command palette      | Ctrl+Shift+P         |
 | Overview             | Ctrl+Shift+O         |
 | Split right          | Ctrl+Shift+\         |
+| Open remote          | Ctrl+Shift+G         |
+| Open PR              | Ctrl+Shift+R         |
 | Focus group L/R      | Alt+Left / Alt+Right |
 | Focus group N        | Alt+1..9             |
 
