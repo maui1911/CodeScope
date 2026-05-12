@@ -1,3 +1,12 @@
+// Tell the Windows linker to mark this exe as a GUI binary so a
+// double-click (or the per-user MSI Start Menu shortcut) doesn't pop
+// a leftover console window. Without this attribute the default
+// `console` subsystem applies: Windows spawns a conhost.exe child,
+// stdout goes there, and **closing that console window kills the app
+// too** — exactly the regression the user just reported. Cargo
+// builds for non-Windows targets ignore this attribute.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! `cargo run --bin codescope-rs` — launches the gpui app shell.
 //!
 //! Boot sequence:

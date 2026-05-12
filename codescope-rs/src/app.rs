@@ -1881,7 +1881,14 @@ impl AppShell {
     fn rehydrate_or_cold_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let saved: Vec<codescope_core::RestoreTab> = self.layout.open_tabs.clone();
         if saved.is_empty() {
-            self.spawn_tab(window, cx);
+            // Cold launch — leave the window empty. The user opens
+            // sessions explicitly via the sidebar (double-click on a
+            // worktree row), Ctrl+Shift+T, or the "+ new tab" button.
+            // The previous behaviour auto-spawned a default-shell tab
+            // pinned to the first project, which surprised users who
+            // had multiple projects and didn't expect one of them to
+            // be selected on every fresh boot. Mirrors C#'s empty
+            // workspace state ("CodeScope — add a project to begin.").
             return;
         }
         let group_count = self.groups.len();
@@ -2879,10 +2886,15 @@ impl AppShell {
         let was_focused_group = self.focused_group == group_idx;
         group.tabs.remove(tab_idx);
         if group.tabs.is_empty() {
-            // Empty group — collapse if there are siblings, otherwise
-            // quit.
+            // Empty group — collapse if there are siblings. When this
+            // is the last surviving group we keep it as an empty
+            // workspace so the user can open a new session from the
+            // sidebar (double-click a worktree, Ctrl+Shift+T, "+ new
+            // tab") without losing the whole window. The app only
+            // exits when the user closes the window itself (caption X
+            // / Alt+F4 / Cmd+Q / etc.).
             if self.groups.len() == 1 {
-                cx.quit();
+                cx.notify();
                 return;
             }
             self.groups.remove(group_idx);
