@@ -233,13 +233,15 @@ impl AppShell {
         let divider = theme::divider(theme);
         let ink = theme::ink(theme);
         let ink_dim = theme::ink_dim(theme);
-        let ink_ghost = theme::ink_ghost(theme);
         let ink_muted = theme::ink_muted(theme);
         let frost = theme::frost_10(theme);
         let danger = theme::danger(theme);
         let accent = theme::accent(theme);
         let canvas = theme::canvas(theme);
         let text_faint = theme::text_faint();
+        // `ink_ghost` is intentionally not bound — the C# spec reserves
+        // a footer hint slot in that colour but the Rust port doesn't
+        // render hints yet. Add it back if/when we wire that row in.
 
         let focus_handle = state.focus_handle.clone();
         let kind = state.spec.kind;
@@ -353,10 +355,6 @@ impl AppShell {
             .pt_2()
             .child(cancel_btn)
             .child(primary_btn);
-
-        let _ = ink_ghost; // reserved for future hint-text slot; keeps the import shape
-                          // identical to the other dialog files so a future
-                          // hint row drops in without rewiring.
 
         let card = div()
             .flex()
