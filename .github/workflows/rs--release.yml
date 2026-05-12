@@ -356,14 +356,16 @@ jobs:
           merge-multiple: true
       - name: Cleanup
         run: |
-          # Uploaded artifacts preserve their workspace-relative paths, so
-          # everything lands under `artifacts/codescope-rs/...`. Flatten that
-          # back to `artifacts/<basename>` so `gh release create artifacts/*`
-          # sees the release files (it doesn't recurse into directories).
-          if [ -d artifacts/codescope-rs ]; then
-            find artifacts/codescope-rs -type f -exec mv -t artifacts/ {} +
-            rm -rf artifacts/codescope-rs
-          fi
+          # Uploaded artifacts preserve their workspace-relative paths.
+          # build-local-artifacts emits codescope-rs-relative paths (e.g.
+          # `target/distrib/foo.msi`) so they land under `artifacts/target/`;
+          # the plan upload preserves the `codescope-rs/` prefix and lands
+          # under `artifacts/codescope-rs/`. Flatten every regular file in
+          # `artifacts/` down to `artifacts/<basename>` so
+          # `gh release create artifacts/*` (which doesn't recurse into
+          # directories) sees the release files.
+          find artifacts -mindepth 2 -type f -exec mv -t artifacts/ {} +
+          find artifacts -mindepth 1 -type d -empty -delete
           # Remove the granular manifests
           rm -f artifacts/*-dist-manifest.json
       - name: Create GitHub Release
