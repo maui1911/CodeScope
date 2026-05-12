@@ -112,16 +112,23 @@ fn git_path(relative: &str) -> Option<PathBuf> {
 }
 
 fn git_describe() -> Option<String> {
-    // `--match v*` restricts to product-version tags (`v0.2.5`,
-    // `v0.3.0-rc1`). The Rust-side release pipeline cuts its own
-    // `rs-vX.Y.Z` tags in the same repo (`rs--release.yml`,
-    // ADR-0019); without the filter `git describe` would pick the
-    // most recent reachable tag of either flavour and stamp the
-    // running Rust build with `rs-v…`, which `update_check::evaluate`
-    // would then try to parse as a semver triple (and fail to a
-    // false `UpToDate` via `is_unknown_fallback`'s catch-all). The
-    // C# `Directory.Build.targets` carries the same filter for the
-    // same reason.
-    let raw = run_git(&["describe", "--tags", "--always", "--dirty", "--match", "v*"])?;
-    Some(strip_v_prefix(&raw))
+    // The Rust port cuts its release tags as `rs-vX.Y.Z`
+    // (`rs--release.yml`, ADR-0019). Match only those — `--match v*`
+    // would catch the C# build's tags instead and stamp this binary
+    // with a version that doesn't correspond to anything the Rust
+    // release pipeline ever shipped. Strip the `rs-v` prefix so the
+    // chrome can render `V0.3.0-rc.1` consistently.
+    let raw = run_git(&["describe", "--tags", "--always", "--dirty", "--match", "rs-v*"])?;
+    Some(strip_rs_v_prefix(&raw))
+}
+
+/// Strip a leading `rs-v` / `rs-V` from a `git describe` output so
+/// the chrome version slug reads `0.3.0-rc.1` instead of
+/// `rs-v0.3.0-rc.1`. Falls through to [`strip_v_prefix`] when the
+/// describe didn't match any `rs-v*` tag (commit-hash-only fallback).
+fn strip_rs_v_prefix(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix("rs-v").or_else(|| s.strip_prefix("rs-V")) {
+        return rest.to_owned();
+    }
+    strip_v_prefix(s)
 }
