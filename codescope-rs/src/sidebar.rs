@@ -3642,13 +3642,13 @@ impl Sidebar {
         // the submenu's "Default" entry highlights). Uses the shared
         // core helper so the parent-row click matches the submenu's
         // "Default" entry, `Sidebar::default_agent_auto_type`, and
-        // `default_agent_auto_type_for` byte-for-byte.
-        let default_id = self.agent_registry.get_default().map(|a| a.id.clone());
-        let default_cmd = default_id.as_deref().and_then(|id| {
-            self.agent_registry
-                .get_by_id(id)
-                .and_then(codescope_core::build_new_session_auto_type)
-        });
+        // `default_agent_auto_type_for` byte-for-byte. Resolves the
+        // profile via `get_default()` directly — no second `get_by_id`
+        // lookup, no intermediate `default_id` clone.
+        let default_cmd = self
+            .agent_registry
+            .get_default()
+            .and_then(codescope_core::build_new_session_auto_type);
 
         let path = PathBuf::from(worktree_path);
         let title = title_prefix.clone();
