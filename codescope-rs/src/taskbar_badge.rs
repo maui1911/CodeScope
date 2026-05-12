@@ -73,9 +73,11 @@ pub struct TaskbarBadge {
 
 impl TaskbarBadge {
     /// Build a new badge attached to `window`. On Windows the
-    /// underlying `ITaskbarList3` COM object is created lazily on
-    /// first `apply` so a fast crash during startup doesn't leak a
-    /// half-initialised taskbar entry.
+    /// underlying `ITaskbarList3` COM object is constructed eagerly
+    /// (`CoInitializeEx` + `CoCreateInstance`) so the first
+    /// telemetry tick after startup doesn't have to pay COM init
+    /// latency. If construction fails (very old Windows / no shell)
+    /// the badge silently no-ops — no fatal-path side effects.
     pub fn new(window: &Window) -> Self {
         Self {
             last: None,
@@ -116,9 +118,10 @@ impl TaskbarBadge {
         }
     }
 
-    /// Force-clear the overlay. Called on shell drop so a fresh
-    /// launch doesn't inherit a stale taskbar dot when the previous
-    /// process died without unwinding.
+    /// Force-clear the overlay. Called from `AppShell::drop` for a
+    /// graceful teardown — best-effort: a hard abort / OS-level
+    /// kill skips destructors, so we rely on Windows itself to
+    /// release the overlay when the owning HWND is destroyed.
     pub fn clear(&mut self) {
         self.last = Some(BadgeState { busy: 0, agents: 0 });
         #[cfg(target_os = "windows")]
@@ -159,6 +162,13 @@ mod windows_impl {
     /// sentinel for `ITaskbarList3::SetOverlayIcon`.
     fn null_hicon() -> HICON {
         HICON(std::ptr::null_mut())
+    }
+
+    /// Convert a Rust string to a NUL-terminated UTF-16 buffer, used
+    /// as the `pszDescription` argument to `SetOverlayIcon`. The
+    /// buffer must outlive the call — caller holds it on the stack.
+    fn to_wide_nul(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
     /// Owns the COM-initialised `ITaskbarList3` pointer and an HWND
@@ -211,9 +221,21 @@ mod windows_impl {
             } else {
                 (0xFF, 0x5A, 0x5A) // Signal.Warn
             };
+            // Screen-reader / hover-tooltip description. Mirrors the
+            // C# `TaskbarItemInfo.Description` strings — "All agents
+            // idle" for the green dot, "<n> agents working" / "1
+            // agent working" for the red disc.
+            let description = if busy == 0 {
+                "All agents idle".to_string()
+            } else if busy == 1 {
+                "1 agent working".to_string()
+            } else {
+                format!("{busy} agents working")
+            };
+            let desc_wide = to_wide_nul(&description);
             if let Some(icon) = build_badge_icon(r, g, b, digit.as_deref()) {
                 unsafe {
-                    let _ = tb.SetOverlayIcon(hwnd, icon, PCWSTR::null());
+                    let _ = tb.SetOverlayIcon(hwnd, icon, PCWSTR(desc_wide.as_ptr()));
                     // SetOverlayIcon copies the icon contents, so we
                     // can free our handle immediately. Skipping this
                     // would leak a kernel object per state change.
@@ -257,14 +279,20 @@ mod windows_impl {
     }
 
     /// Paint a centred filled disc into a BGRA buffer (Windows DIB
-    /// premultiplied BGRA — but since we use opaque alpha = 0xFF and
-    /// full opacity colours, premultiplication is a no-op for the disc
-    /// pixels). Edge pixels get a coarse alpha gradient so the disc
-    /// doesn't look painfully aliased on the taskbar.
+    /// premultiplied BGRA). Adds a 1 px ~40% black contrast ring on
+    /// the outermost pixel band — mirrors the C# build's
+    /// `DrawEllipse(null, new Pen(ring, 1), …)` call, which keeps
+    /// the badge legible on light taskbar themes (white / Aero /
+    /// macOS-light). Without the ring a `#FF5A5A` red disc bleeds
+    /// into the taskbar background on light Win11 themes.
     fn draw_disc(pixels: &mut [u32], size: usize, r: u8, g: u8, b: u8) {
         let cx = (size as f32 - 1.0) / 2.0;
         let cy = (size as f32 - 1.0) / 2.0;
         let radius = (size as f32 / 2.0) - 0.5;
+        // Ring darkens the outermost ~1 px of the disc to ~40% black —
+        // 0x66 = 102/255 ~= 40%, matching the WPF `Color.FromArgb(102,
+        // 0, 0, 0)` in `TaskbarBadgeService.BuildOverlay`.
+        let ring_alpha = 0x66u16;
         for y in 0..size {
             for x in 0..size {
                 let dx = x as f32 - cx;
@@ -284,42 +312,95 @@ mod windows_impl {
                 if alpha == 0 {
                     continue;
                 }
+                // Blend the fill colour over the ring tint for the
+                // outer 1 px so the rim reads as a darker version of
+                // the fill — same look as WPF's stroke-after-fill.
+                let ring_strength = if dist >= radius - 1.0 && dist <= radius {
+                    ((1.0 - (radius - dist).clamp(0.0, 1.0)) * ring_alpha as f32) as u16
+                } else {
+                    0
+                };
+                let blend = |c: u8| -> u8 {
+                    // Linear blend: out = c * (1 - ring_strength/255)
+                    let inv = 255u16 - ring_strength;
+                    ((c as u16 * inv) / 255) as u8
+                };
+                let fr = blend(r);
+                let fg = blend(g);
+                let fb = blend(b);
                 // Premultiply BGRA — `SetDIBits` for 32 bpp icons
                 // expects alpha-premultiplied colour channels.
-                let pr = ((r as u16 * alpha as u16) / 255) as u8;
-                let pg = ((g as u16 * alpha as u16) / 255) as u8;
-                let pb = ((b as u16 * alpha as u16) / 255) as u8;
+                let pr = ((fr as u16 * alpha as u16) / 255) as u8;
+                let pg = ((fg as u16 * alpha as u16) / 255) as u8;
+                let pb = ((fb as u16 * alpha as u16) / 255) as u8;
                 pixels[y * size + x] =
                     (alpha as u32) << 24 | (pr as u32) << 16 | (pg as u32) << 8 | (pb as u32);
             }
         }
     }
 
-    /// Stamp the digit text (e.g. "1".."9" or "9+") in white,
-    /// centred in the 16×16 frame. Uses a tiny 3×5 pixel font;
-    /// glyphs ship inline so we don't depend on any system font
-    /// lookup (which historically has caused regressions when WPF
-    /// "Segoe UI Variable" isn't installed). White-on-red is the
-    /// only legible 16-px combo at taskbar scale anyway.
+    /// Stamp the digit text in white. Uses a tiny 3×5 pixel font for
+    /// digits and renders a smaller superscript-style 3×3 plus sign
+    /// when the input ends in `+` — mirrors the C# build's
+    /// "em-size-10 digit + em-size-6 plus, offset up and right"
+    /// layout from `TaskbarBadgeService.BuildOverlay`. Glyphs ship
+    /// inline so we don't depend on system font lookup (which has
+    /// historically broken when "Segoe UI Variable" wasn't
+    /// installed). White-on-red is the only legible 16-px combo at
+    /// taskbar scale anyway.
     fn draw_digit_text(pixels: &mut [u32], size: usize, text: &str) {
-        // Glyph width = 3 px; 1 px gap between glyphs.
-        let glyph_w = 3usize;
-        let glyph_h = 5usize;
-        let gap = 1usize;
-        let total_w = text.chars().count() * glyph_w + text.chars().count().saturating_sub(1) * gap;
-        let start_x = (size - total_w) / 2;
-        let start_y = (size - glyph_h) / 2;
+        const GLYPH_W: usize = 3;
+        const GLYPH_H: usize = 5;
+        // Detect the "9+" cap form: a single base digit followed by
+        // a superscript plus that sits in the upper-right corner.
+        let (base, has_plus) = if let Some(stripped) = text.strip_suffix('+') {
+            (stripped, true)
+        } else {
+            (text, false)
+        };
 
-        for (i, ch) in text.chars().enumerate() {
+        // Centre the base digit alone, then stamp the small plus on
+        // top of it. The C# build does the same — it shifts the
+        // digit left by 1 px when there's a `+` so the pair reads
+        // visually centred.
+        let base_w = base.chars().count() * GLYPH_W
+            + base.chars().count().saturating_sub(1) * 1;
+        let mut base_x = size.saturating_sub(base_w) / 2;
+        if has_plus && base_x > 0 {
+            base_x -= 1;
+        }
+        let base_y = size.saturating_sub(GLYPH_H) / 2;
+
+        for (i, ch) in base.chars().enumerate() {
             let bitmap = glyph_for(ch);
-            let ox = start_x + i * (glyph_w + gap);
-            for gy in 0..glyph_h {
-                for gx in 0..glyph_w {
-                    if (bitmap[gy] >> (glyph_w - 1 - gx)) & 1 == 1 {
+            let ox = base_x + i * (GLYPH_W + 1);
+            for gy in 0..GLYPH_H {
+                for gx in 0..GLYPH_W {
+                    if (bitmap[gy] >> (GLYPH_W - 1 - gx)) & 1 == 1 {
                         let x = ox + gx;
-                        let y = start_y + gy;
+                        let y = base_y + gy;
                         if x < size && y < size {
                             // Pure opaque white pixel.
+                            pixels[y * size + x] = 0xFFFFFFFF;
+                        }
+                    }
+                }
+            }
+        }
+
+        if has_plus {
+            // 3×3 "+" glyph, top-right-anchored, drawn as a
+            // superscript so it visually distinguishes "9+" from
+            // a plain "9".
+            let plus: [u8; 3] = [0b010, 0b111, 0b010];
+            let px = size.saturating_sub(4); // 1 px right padding
+            let py = 1;
+            for gy in 0..3 {
+                for gx in 0..3 {
+                    if (plus[gy] >> (2 - gx)) & 1 == 1 {
+                        let x = px + gx;
+                        let y = py + gy;
+                        if x < size && y < size {
                             pixels[y * size + x] = 0xFFFFFFFF;
                         }
                     }

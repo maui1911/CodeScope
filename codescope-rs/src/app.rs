@@ -1084,10 +1084,12 @@ impl AppShell {
 }
 
 impl Drop for AppShell {
-    /// Clear the OS taskbar / dock overlay on teardown so a fresh
-    /// launch doesn't inherit a stale red badge from a previous run.
-    /// Mirrors WPF's automatic `TaskbarItemInfo` cleanup when the
-    /// `MainWindow` is destroyed.
+    /// Best-effort clear of the OS taskbar / dock overlay on
+    /// graceful teardown. Only runs on normal unwind — a hard
+    /// abort / OS-level kill skips destructors, but in that case
+    /// Windows itself releases the overlay when the HWND is
+    /// destroyed. Mirrors WPF's automatic `TaskbarItemInfo`
+    /// cleanup when the `MainWindow` is closed.
     fn drop(&mut self) {
         self.taskbar_badge.clear();
     }
