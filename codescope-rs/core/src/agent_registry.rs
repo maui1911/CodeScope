@@ -353,11 +353,17 @@ pub fn build_resume_auto_type(
 /// `Sidebar::render_new_session_submenu`) so they can't drift out of
 /// sync.
 pub fn build_new_session_auto_type(profile: &AgentProfile) -> Option<String> {
-    if profile.command.is_empty() {
+    // Trim before the emptiness check so a whitespace-only `command`
+    // (e.g. `"   "` from a hand-edited `settings.json`) also returns
+    // `None` instead of auto-typing junk like `"   --init"`. Accidental
+    // leading/trailing spaces around the command don't get typed
+    // either — we emit the trimmed token, not the raw field.
+    let command = profile.command.trim();
+    if command.is_empty() {
         return None;
     }
     let mut argv: Vec<String> = Vec::with_capacity(1 + profile.new_session_args.len());
-    argv.push(profile.command.clone());
+    argv.push(command.to_string());
     argv.extend(profile.new_session_args.iter().cloned());
     Some(argv.join(" "))
 }
@@ -813,5 +819,51 @@ mod tests {
             context_window_tokens: 0,
         };
         assert!(build_new_session_auto_type(&profile).is_none());
+    }
+
+    #[test]
+    fn build_new_session_auto_type_treats_whitespace_only_command_as_empty() {
+        // A whitespace-only `command` from a hand-edited
+        // `settings.json` (e.g. `"   "`) is just as broken as a
+        // truly empty one — auto-typing `"    --init"` would emit
+        // junk. The helper trims before the emptiness check.
+        let profile = AgentProfile {
+            id: "broken".into(),
+            display_name: "Broken".into(),
+            command: "   ".into(),
+            resume_args: vec![],
+            new_session_args: vec!["--init".into()],
+            session_id_flag: None,
+            resume_by_id_args: vec![],
+            is_default: false,
+            icon: None,
+            context_window_tokens: 0,
+        };
+        assert!(build_new_session_auto_type(&profile).is_none());
+    }
+
+    #[test]
+    fn build_new_session_auto_type_trims_padded_command() {
+        // Accidental leading/trailing spaces around a real command
+        // (e.g. `" claude "` from a hand-edited `settings.json`) get
+        // trimmed before joining — otherwise the auto-typed line
+        // would be `" claude "` and PowerShell would fail to find
+        // the executable.
+        let profile = AgentProfile {
+            id: "padded".into(),
+            display_name: "Padded".into(),
+            command: " claude ".into(),
+            resume_args: vec![],
+            new_session_args: vec![],
+            session_id_flag: None,
+            resume_by_id_args: vec![],
+            is_default: true,
+            icon: None,
+            context_window_tokens: 0,
+        };
+        assert_eq!(
+            build_new_session_auto_type(&profile),
+            Some("claude".into()),
+        );
     }
 }
