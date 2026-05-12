@@ -24,6 +24,7 @@ mod settings_dialog;
 mod sidebar;
 mod taskbar_badge;
 mod theme;
+mod velopack_bridge;
 #[cfg(target_os = "windows")]
 mod win32_titlebar;
 
@@ -56,6 +57,14 @@ impl Render for Root {
 }
 
 fn main() -> Result<()> {
+    // Velopack install / uninstall / first-run / restarted-after-update
+    // hooks must dispatch before anything else — the Velopack
+    // bootstrap helper may need to exit/restart the process from this
+    // call. Safe no-op on builds that weren't installed via a Velopack
+    // bootstrapper (`cargo run`, cargo-dist MSI, unpacked zip).
+    // Mirrors the equivalent C# call site in `App.OnStartup`.
+    velopack_bridge::run_startup_hooks();
+
     let paths = AppPaths::detect();
     if let Err(err) = paths.ensure_dirs() {
         eprintln!(

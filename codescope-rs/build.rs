@@ -112,6 +112,16 @@ fn git_path(relative: &str) -> Option<PathBuf> {
 }
 
 fn git_describe() -> Option<String> {
-    let raw = run_git(&["describe", "--tags", "--always", "--dirty"])?;
+    // `--match v*` restricts to product-version tags (`v0.2.5`,
+    // `v0.3.0-rc1`). The Rust-side release pipeline cuts its own
+    // `rs-vX.Y.Z` tags in the same repo (`rs--release.yml`,
+    // ADR-0019); without the filter `git describe` would pick the
+    // most recent reachable tag of either flavour and stamp the
+    // running Rust build with `rs-v…`, which `update_check::evaluate`
+    // would then try to parse as a semver triple (and fail to a
+    // false `UpToDate` via `is_unknown_fallback`'s catch-all). The
+    // C# `Directory.Build.targets` carries the same filter for the
+    // same reason.
+    let raw = run_git(&["describe", "--tags", "--always", "--dirty", "--match", "v*"])?;
     Some(strip_v_prefix(&raw))
 }

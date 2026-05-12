@@ -1626,6 +1626,16 @@ impl AppShell {
                     body: _,
                 } = status
                 {
+                    // Probe Velopack-install state once on the
+                    // background executor — the call walks the
+                    // process's exe path to look for a Velopack
+                    // manifest, which is cheap but still IO. Cached
+                    // behind a `OnceLock` inside the bridge so we
+                    // only ever do it once per process lifetime.
+                    let velopack_supported = cx
+                        .background_executor()
+                        .spawn(async { crate::velopack_bridge::is_velopack_install() })
+                        .await;
                     let _ = this.update(cx, |this, cx| {
                         // Suppress duplicate announcements for the
                         // same version this process lifetime, the
@@ -1641,8 +1651,21 @@ impl AppShell {
                         this.last_announced_update = Some(version.clone());
                         let title: SharedString =
                             format!("CodeScope {version} available").into();
-                        let detail: SharedString =
-                            format!("A newer release is published. {url}").into();
+                        // Detail text differs by install path:
+                        //
+                        // * Velopack install → "Downloading update…"
+                        //   so the user knows auto-apply is queued.
+                        //   We also kick off the actual apply below.
+                        // * cargo-dist MSI / `cargo run` / unpacked
+                        //   zip → keep the existing URL hint; the
+                        //   user opens the release page themselves.
+                        let detail: SharedString = if velopack_supported {
+                            "Downloading update in the background. \
+                             Restart CodeScope when prompted to install."
+                                .into()
+                        } else {
+                            format!("A newer release is published. {url}").into()
+                        };
                         this.push_notification(
                             crate::notifications::NotificationKind::Generic,
                             title,
@@ -1651,6 +1674,47 @@ impl AppShell {
                             cx,
                         );
                     });
+                    if velopack_supported {
+                        // Mirror C# `UpdateService.CheckAsync`:
+                        // download in the background, then call
+                        // `ApplyUpdatesAndRestart` — Velopack exits
+                        // the process and the bootstrap helper
+                        // relaunches us on the new version. Errors
+                        // here are best-effort and only logged
+                        // (matches C# `LogWarning(ex, …)`).
+                        cx.background_executor()
+                            .spawn(async {
+                                match crate::velopack_bridge::maybe_apply_now() {
+                                    crate::velopack_bridge::ApplyOutcome::Applied => {
+                                        // Unreachable — apply_updates_and_restart
+                                        // exits the process on success.
+                                    }
+                                    crate::velopack_bridge::ApplyOutcome::UpToDate => {
+                                        // Race between our GitHub poll
+                                        // and Velopack's feed read: the
+                                        // poll saw a newer release but
+                                        // Velopack's view says we're
+                                        // current. Quietly drop it —
+                                        // the next 3-hour tick will
+                                        // re-converge.
+                                    }
+                                    crate::velopack_bridge::ApplyOutcome::Unsupported => {
+                                        // Shouldn't happen — we
+                                        // gated on `is_velopack_install`
+                                        // above. Log if it does so a
+                                        // future regression is visible.
+                                        eprintln!(
+                                            "[velopack] apply: Unsupported despite \
+                                             positive install probe"
+                                        );
+                                    }
+                                    crate::velopack_bridge::ApplyOutcome::Failed(msg) => {
+                                        eprintln!("[velopack] apply failed: {msg}");
+                                    }
+                                }
+                            })
+                            .detach();
+                    }
                 }
                 cx.background_executor()
                     .timer(codescope_core::update_check::POLL_INTERVAL)
