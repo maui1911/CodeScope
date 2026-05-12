@@ -59,8 +59,21 @@ jobs:
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
-      tag: ${{ !github.event.pull_request && github.ref_name || '' }}
-      tag-flag: ${{ !github.event.pull_request && format('--tag={0}', github.ref_name) || '' }}
+      # `tag` is the *original* git tag (e.g. `rs-v0.3.0-rc1`) — used as the
+      # GitHub release tag downstream so the two release pipelines on this
+      # repo (C# `v*` and Rust `rs-v*`) don't collide.
+      # `tag-flag` is the *stripped* tag (e.g. `v0.3.0-rc1`) passed to every
+      # `dist` invocation via `--tag=`. cargo-dist 0.31's `tag-namespace`
+      # config only controls the workflow filename and the trigger glob; it
+      # does NOT strip the namespace before the underlying `axotag` parser
+      # sees the value. `axotag` then tries to parse `rs-v0.3.0-rc1` as
+      # `<package-name>-v<version>` (no package called `rs` exists) or as a
+      # bare semver (fails on the `r`). Stripping `rs-` here side-steps the
+      # bug — cargo-dist sees a clean `v0.3.0-rc1` and the GitHub release
+      # below is still tagged `rs-v0.3.0-rc1` because `gh release create`
+      # uses `needs.plan.outputs.tag` (the un-stripped value).
+      tag: ${{ steps.tags.outputs.tag }}
+      tag-flag: ${{ steps.tags.outputs.tag-flag }}
       publishing: ${{ !github.event.pull_request }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -69,6 +82,29 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+      - id: tags
+        # Compute the namespaced + stripped tag values once and reuse them
+        # across every downstream `dist` call. See the comment on the
+        # `tag` / `tag-flag` job outputs above for why both are needed.
+        # On a pull_request event (currently unreachable — the workflow's
+        # `on:` block only lists `push.tags` — but kept defensive in case
+        # we re-enable PR validation later) we emit empty strings, mirroring
+        # cargo-dist's original generator behaviour.
+        shell: bash
+        run: |
+          if [ -z "${{ github.event.pull_request }}" ]; then
+            FULL_TAG="${{ github.ref_name }}"
+            # Strip the `rs-` namespace prefix (matches `tag-namespace` in
+            # `codescope-rs/dist-workspace.toml`). `${var#prefix}` is a
+            # POSIX shell parameter expansion that removes the shortest
+            # leading match — exactly what we want.
+            STRIPPED_TAG="${FULL_TAG#rs-}"
+            echo "tag=${FULL_TAG}" >> "$GITHUB_OUTPUT"
+            echo "tag-flag=--tag=${STRIPPED_TAG}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "tag-flag=" >> "$GITHUB_OUTPUT"
+          fi
       - name: Install dist
         # we specify bash to get pipefail; it guards against the `curl` command
         # failing. otherwise `sh` won't catch that `curl` returned non-0
@@ -91,9 +127,17 @@ jobs:
         # final workspace-relative location (e.g. `codescope-rs/target/...`)
         # — keeps the artifact ZIPs round-trip-correct.
         working-directory: codescope-rs
+        shell: bash
         run: |
           mkdir -p target/distrib
-          dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > target/distrib/plan-dist-manifest.json
+          if [ -z "${{ github.event.pull_request }}" ]; then
+            # `dist host --steps=create` needs the *stripped* tag (see
+            # tag-flag rationale on the job outputs above).
+            DIST_SUBCOMMAND="host --steps=create ${{ steps.tags.outputs.tag-flag }}"
+          else
+            DIST_SUBCOMMAND="plan"
+          fi
+          dist $DIST_SUBCOMMAND --output-format=json > target/distrib/plan-dist-manifest.json
           echo "dist ran successfully"
           cat target/distrib/plan-dist-manifest.json
           echo "manifest=$(jq -c "." target/distrib/plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
