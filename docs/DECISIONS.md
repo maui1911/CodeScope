@@ -407,3 +407,61 @@ idiom mirrors the in-app modals (`new_project_dialog.rs`,
 - No new schema fields — anything not yet representable in `Settings`
   (e.g. per-theme overrides for an external theme bundle) stays out of
   reach of the dialog until the underlying struct grows the capability.
+
+---
+
+## ADR-0019 — Rust port uses cargo-dist + Velopack-rs for its own release pipeline
+
+**Date:** 2026-05-12
+**Status:** Accepted (PR #154)
+
+The Rust port (`codescope-rs/`) now ships through a separate
+`rs--release.yml` workflow built on [cargo-dist][cargo-dist] +
+[velopack-rs][vrs], running alongside the existing C# `release.yml`.
+Both pipelines target the same GitHub repository and the same product
+brand — the split is purely build-system.
+
+[cargo-dist]: https://opensource.axo.dev/cargo-dist/
+[vrs]: https://crates.io/crates/velopack
+
+**Why deviate from the single-pipeline default?**
+
+- **Different toolchains**: the C# `release.yml` shells out to `vpk`
+  (the .NET CLI) which orchestrates MSBuild, Velopack's
+  `dotnet publish` wrapper, and the Velopack uploader in one pass.
+  Trying to run cargo-dist *inside* that workflow would mean pulling
+  Rust + cargo-dist + MSI tooling into the .NET pipeline just to ship
+  an artifact that's independent of the C# build.
+- **Independent release cadence**: the Rust port is still pre-feature-
+  parity in places (cross-platform, code signing, full Velopack
+  channels). A combined pipeline would force both ports to rev tags
+  together, which doesn't make sense yet.
+- **Tag-namespace separation** (`rs-` prefix vs. `v` prefix). Both
+  pipelines run `git describe --tags --match v*` so the C# build's
+  informational version (and the Rust build's `CODESCOPE_VERSION_DISPLAY`)
+  only ever see product-version tags, never the Rust-pipeline-internal
+  `rs-vX.Y.Z` tags. Without that `--match`, `git describe` would pick
+  whichever tag is closest in commit-distance regardless of prefix —
+  exactly the failure mode Copilot caught on PR #162. See
+  `Directory.Build.targets` and `codescope-rs/build.rs`.
+
+**Consequences:**
+
+- Two release-pipeline files live in `.github/workflows/`. The C#
+  `release.yml` is unchanged; the Rust file is `rs--release.yml`.
+- Two parallel release flows for the user:
+  - `git tag v0.2.6 && git push --tags` → C# release (existing).
+  - `git tag rs-v0.0.2 && git push --tags` → Rust release (new).
+- The Rust pipeline currently ships **Windows-only** artifacts
+  (`x86_64-pc-windows-msvc`). See `docs/HANDOFF.md` "Cross-platform
+  status" for the path forward to macOS / Linux.
+- `velopack` crate replaces a hand-rolled apply path. The
+  `codescope_core::update_check` module (which polls the GitHub
+  releases endpoint and emits an `UpdateStatus::Available`) keeps
+  its existing role; the bin-side `velopack_bridge.rs` consumes that
+  signal and either auto-applies (Velopack-install path) or surfaces
+  the URL (cargo-dist MSI / `cargo run` path).
+- `dist-workspace.toml` carries `allow-dirty = ["ci"]` so the
+  hand-edited "tag-push only" trigger in `rs--release.yml` survives
+  future `dist generate` runs.
+

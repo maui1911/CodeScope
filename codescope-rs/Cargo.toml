@@ -8,7 +8,26 @@ version = "0.0.1"
 edition = "2024"
 publish = false
 description = "CodeScope (Rust port): gpui shell that orchestrates parallel AI coding agent CLI sessions with Git worktree isolation."
+repository = "https://github.com/maui1911/CodeScope"
+# `license-file` points at the repo-root `LICENSE` (Functional Source
+# License v1.1, ALv2 future). There is no SPDX identifier for FSL so
+# we link the file directly — cargo-dist + the MSI builder both pick
+# this up. Caught by Copilot on PR #162.
+license-file = "../LICENSE"
+authors = ["maui1911"]
 build = "build.rs"
+
+# cargo-dist needs an opt-in when the package is `publish = false` —
+# otherwise `dist generate` reports "no distable binaries". See
+# dist-workspace.toml for the pipeline scope notes.
+[package.metadata.dist]
+dist = true
+
+[package.metadata.wix]
+upgrade-guid = "A1FAA411-B556-490B-8C50-0FFDBE4EE0FD"
+path-guid = "3326208D-A1EE-453F-ACB6-EDBEE0D923C5"
+license = false
+eula = false
 
 [[bin]]
 name = "codescope-rs"
@@ -28,6 +47,20 @@ anyhow = "1"
 parking_lot = "0.12"
 uuid = { version = "1", features = ["v4"] }
 raw-window-handle = "0.6"
+# Velopack-rs apply path — mirrors the C# build's
+# `src/CodeScope.App/Updates/UpdateService.cs` Velopack integration.
+# At runtime we instantiate an `UpdateManager` against the same GitHub
+# releases endpoint the C# `vpk upload github` flow publishes to. If
+# the constructor returns `Err` we know this binary wasn't installed
+# via a Velopack bootstrapper (e.g. running from `cargo run`, or
+# installed via the cargo-dist MSI which doesn't embed a Velopack
+# manifest), and we fall back to the GitHub-polling notification path
+# in `codescope-core::update_check`. Velopack-rs is currently
+# Windows-first; we still pull it in on every target because the
+# crate compiles fine on non-Windows hosts (the platform-specific
+# pieces no-op there). Targeting Windows-only via cfg gates would
+# just add scaffolding for a code path no one currently runs.
+velopack = "0.0.1589-ga2c5a97"
 # `futures-channel::oneshot` for the themed ConfirmDialog's Future<bool>
 # API. gpui already pulls this in transitively for `window.prompt`'s
 # return type; we depend on it explicitly so the confirm dialog reads
@@ -69,3 +102,8 @@ opt-level = 1
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
