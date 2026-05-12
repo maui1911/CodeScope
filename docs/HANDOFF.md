@@ -21,24 +21,30 @@ Tests: `codescope-core` (418) + `codescope-rs` bin (100) +
 
 ### Cross-platform status (Rust port)
 
-The Rust port currently ships Windows-only artifacts. The state of
-each tier-1 target as of session 39:
+The Rust port builds natively on the GH Actions matrix
+(`windows-2022`, `macos-14`, `macos-15-intel`, `ubuntu-22.04`) as of
+the multiplatform-release-pipeline PR. Cross-compiling from the
+Windows dev box is still impractical (`ring`'s build.rs hard-fails
+without `cc` / `clang` / `zig`), but that's no longer the only path —
+the release pipeline runs the right toolchain on each platform.
 
-| Target                          | Compiles on Windows-host check? | Why |
-|---------------------------------|---------------------------------|-----|
-| `x86_64-pc-windows-msvc`        | ✅ (workspace clean, 543 tests) | Day-to-day dev target. |
-| `x86_64-apple-darwin`           | ❓ untested                     | `ring` (TLS for ureq) needs `cc`; the Windows dev box has no Apple SDK / cross-toolchain. gpui 0.2.x *declares* macOS deps (`cocoa`, `objc2-app-kit`, `metal`) so a native macOS runner should at least get past dep-resolution. |
-| `aarch64-apple-darwin`          | ❓ untested                     | Same as above. |
-| `x86_64-unknown-linux-gnu`      | ❓ untested                     | `ring` + gpui's wayland/x11 deps need a real cc + system packages (xkbcommon, fontconfig, libxcb). Likely buildable on a stock ubuntu-22.04 runner with `apt install` for the system libs; nobody has tried yet. |
+| Target                          | Build on native runner? | Notes |
+|---------------------------------|-------------------------|-------|
+| `x86_64-pc-windows-msvc`        | ✅                      | Day-to-day dev target. Workspace clean, 543 tests passing on Windows host. Ships MSI + zip. |
+| `aarch64-apple-darwin`          | ✅ via `macos-14`       | Native Apple Silicon runner. Ships `.tar.xz`. `taskbar_badge.rs` macOS branch is a no-op stub. |
+| `x86_64-apple-darwin`           | ✅ via `macos-15-intel` | Native Intel macOS runner. Same artifact shape as ARM. |
+| `x86_64-unknown-linux-gnu`      | ✅ via `ubuntu-22.04`   | apt installs `libwayland-dev`, `libxkbcommon-dev`/`-x11-dev`, `libfontconfig1-dev`, `libfreetype6-dev`, `libxcb*-dev`, `libssl-dev`, `pkg-config` for gpui's Linux backend. |
 
-Cross-compilation from the Windows dev box is **not** the path forward
-— `ring`'s build.rs hard-fails without `cc` / `clang` / `zig`. The
-realistic move is a native CI matrix on the GitHub Actions side, but
-that's deferred until a real user asks for a non-Windows build.
+`codescope-rs/dist-workspace.toml` now lists all four targets and
+declares the Linux apt deps under `[dist.dependencies.apt]`; cargo-dist
+expands that into the matrix's `packages_install` step in
+`.github/workflows/rs--release.yml`.
 
-Until then `codescope-rs/dist-workspace.toml` ships `targets =
-["x86_64-pc-windows-msvc"]` only, matching the C# build's scope. See
-the file's leading comment for the rationale.
+Code signing remains a follow-up on every platform — unsigned MSIs
+trigger Windows SmartScreen, unsigned `.app`/`.dmg` payloads trigger
+macOS Gatekeeper, and Linux has no equivalent gate. Document the
+per-OS friction in the README install section when first user-facing
+builds ship.
 
 ### Rust release pipeline (cargo-dist + Velopack)
 

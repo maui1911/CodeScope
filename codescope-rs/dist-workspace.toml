@@ -5,20 +5,27 @@ members = ["cargo:."]
 #
 # Scope notes for the CodeScope Rust port:
 #
-# - We deliberately ship Windows-only artifacts in this iteration. The
-#   gpui 0.2.x stack technically supports macOS and Linux (target-gated
-#   deps in its Cargo.toml), but the Rust port hasn't been compiled or
-#   tested on those platforms yet, the Windows dev box used for
-#   day-to-day work has no cross-toolchain installed (cc / clang / zig
-#   missing — ring's build.rs fails on first run), and the visual chrome
-#   relies on a Win32-only custom titlebar plus an ITaskbarList3 badge.
-#   Until somebody validates a real macOS / Linux build end-to-end, the
-#   pipeline only emits Windows binaries and an MSI installer — same
-#   scope as the C# build's `release.yml`. See `docs/HANDOFF.md`
-#   "Cross-platform status" section for the path forward.
-# - The MSI installer is built via WiX (cargo-dist's `msi` installer).
-#   On a stock GitHub-hosted `windows-latest` runner cargo-dist
-#   downloads the WiX toolset itself; no manual install required.
+# - The pipeline runs natively on GitHub-hosted runners for each
+#   target — `windows-2022` (MSVC), `macos-14` (Apple Silicon),
+#   `macos-15-intel` (Intel x86_64), and `ubuntu-22.04` (glibc).
+#   cargo-dist 0.31 picks these runner labels itself from the target
+#   triple. Cross-compiling from the Windows dev box is *not*
+#   supported (ring's build.rs needs `cc` / `clang` / `zig` that
+#   aren't installed), but that's irrelevant on the native matrix.
+#   The visual chrome's Win32-only bits (custom titlebar,
+#   ITaskbarList3 badge) are `#[cfg(windows)]` gated with no-op
+#   stubs on macOS / Linux so the same crate compiles on every
+#   target.
+# - The MSI installer (Windows only) is built via WiX (cargo-dist's
+#   `msi` installer). On a stock GitHub-hosted `windows-latest`
+#   runner cargo-dist downloads the WiX toolset itself; no manual
+#   install required. macOS ships a `.tar.xz` of the binary +
+#   resources (cargo-dist's default for that platform); Linux ships
+#   a `.tar.xz` archive.
+# - Linux runtime deps (gpui needs wayland + x11 + xkbcommon +
+#   fontconfig + freetype) are installed in the GH Actions Linux
+#   job via apt before `dist build` runs. See
+#   `.github/workflows/rs--release.yml`.
 # - `install-path = "CARGO_HOME"` is the cargo-dist default for CLI
 #   tools, but CodeScope is a GUI app users launch from the Start menu,
 #   so we leave that field at its default and let the MSI installer
@@ -39,10 +46,19 @@ members = ["cargo:."]
 cargo-dist-version = "0.31.0"
 # CI backend.
 ci = "github"
-# Installers to generate per target platform.
+# Installers to generate per target platform. `msi` only applies on
+# Windows targets; cargo-dist silently skips it for macOS / Linux and
+# emits the default per-platform archive (`.tar.xz` on Linux / macOS,
+# `.zip` on Windows) alongside the installer.
 installers = ["msi"]
-# Target platforms. Windows-only intentionally — see scope note above.
-targets = ["x86_64-pc-windows-msvc"]
+# Target platforms. Native runners on the GH Actions matrix build each
+# triple — see the workflow for the runner / OS mapping.
+targets = [
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+]
 # Where to host releases.
 hosting = "github"
 # Don't bundle axoupdater; Velopack handles self-update.
@@ -64,3 +80,23 @@ allow-dirty = ["ci"]
 # "only trigger on tag pushes". This empties cargo-dist's PR mode so
 # the workflow's pull_request gate (when present) is a no-op.
 pr-run-mode = "skip"
+
+# System packages required at build time for the Linux target.
+# gpui's Linux backend links against wayland-client, xkbcommon, X11,
+# fontconfig, and freetype; the matching `-dev` packages plus pkg-config
+# are needed for the build to succeed on a stock `ubuntu-22.04` runner.
+# cargo-dist injects this as the `packages_install` shell step in the
+# generated workflow, gated to the Linux job via the matrix entry's
+# `packages_install` field.
+[dist.dependencies.apt]
+libwayland-dev = "*"
+libxkbcommon-dev = "*"
+libxkbcommon-x11-dev = "*"
+libfontconfig1-dev = "*"
+libfreetype6-dev = "*"
+libxcb1-dev = "*"
+libxcb-render0-dev = "*"
+libxcb-shape0-dev = "*"
+libxcb-xfixes0-dev = "*"
+libssl-dev = "*"
+pkg-config = "*"
