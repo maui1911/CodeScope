@@ -5399,14 +5399,18 @@ impl Render for AppShell {
                     .text_color(theme::ink(&theme))
                     .child("CodeScope"),
             )
+            // Flex filler so the version slug pushes to the right edge
+            // of the sidebar column (mirrors `Grid.Column="3"` in
+            // `MainWindow.xaml`'s brand grid).
+            .child(div().flex_grow())
             .child(
                 // Version slug — `Fig.Font.Mono` @ `FontSize="10"` in
-                // `MainWindow.xaml` (Text.Faint foreground; the closest
-                // themable analogue here is `ink_ghost`).
+                // `MainWindow.xaml`, right-aligned (`Grid.Column="3"`),
+                // `Text.Faint` foreground.
                 div()
                     .font(theme::font_mono())
                     .text_size(px(10.0))
-                    .text_color(theme::ink_ghost(&theme))
+                    .text_color(theme::text_faint())
                     .truncate()
                     .child(VERSION_DISPLAY),
             )
