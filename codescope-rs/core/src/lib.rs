@@ -43,7 +43,10 @@ pub mod update_check;
 pub mod window_state;
 
 pub use agent::{AgentId, agent_id_from_auto_type};
-pub use agent_registry::{AgentProfile, AgentRegistry, build_resume_auto_type, built_in_defaults};
+pub use agent_registry::{
+    AgentProfile, AgentRegistry, build_new_session_auto_type, build_resume_auto_type,
+    built_in_defaults,
+};
 pub use claude_discovery::{AdoptionCandidate, POLL_INTERVAL_MS as CLAUDE_DISCOVERY_POLL_MS};
 pub use claude_telemetry::{
     SessionState, TelemetrySnapshot, TranscriptTail, context_window_for_model, encode_cwd,

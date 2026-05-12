@@ -1351,19 +1351,20 @@ impl Sidebar {
     }
 
     /// Build the auto-type command string for the registry's default
-    /// agent (e.g. `"claude"`, `"codex --resume"`). Used by the
+    /// agent (e.g. `"claude"` with the built-in Claude profile, or
+    /// `"my-cli --init fresh"` for a custom profile whose
+    /// `new_session_args` is `["--init", "fresh"]`). Used by the
     /// double-click handler on a worktree row so opening a tab from
     /// the sidebar lands in the user's configured default agent
     /// instead of a plain shell. Mirrors AppShell::default_agent_auto_type
     /// but reads from the sidebar's own cached registry — the two are
-    /// kept in lockstep via `apply_agent_registry`.
+    /// kept in lockstep via `apply_agent_registry`. The argv→string
+    /// joining lives in `codescope_core::build_new_session_auto_type`
+    /// so this path can't drift from `default_agent_auto_type_for` /
+    /// `render_new_session_submenu`.
     fn default_agent_auto_type(&self) -> Option<SharedString> {
         let profile = self.agent_registry.get_default()?;
-        let mut argv: Vec<String> =
-            Vec::with_capacity(1 + profile.new_session_args.len());
-        argv.push(profile.command.clone());
-        argv.extend(profile.new_session_args.iter().cloned());
-        Some(SharedString::from(argv.join(" ")))
+        codescope_core::build_new_session_auto_type(profile).map(SharedString::from)
     }
 
     /// Open the project context menu at `position` (window coords)
@@ -3638,17 +3639,16 @@ impl Sidebar {
         let frost = theme::frost_10(&theme);
 
         // Default agent — the row's primary click target (and the row
-        // the submenu's "Default" entry highlights).
-        let default_id = self.agent_registry.get_default().map(|a| a.id.clone());
-        let default_cmd = default_id.as_deref().and_then(|id| {
-            self.agent_registry.get_by_id(id).map(|p| {
-                let mut argv: Vec<String> =
-                    Vec::with_capacity(1 + p.new_session_args.len());
-                argv.push(p.command.clone());
-                argv.extend(p.new_session_args.iter().cloned());
-                argv.join(" ")
-            })
-        });
+        // the submenu's "Default" entry highlights). Uses the shared
+        // core helper so the parent-row click matches the submenu's
+        // "Default" entry, `Sidebar::default_agent_auto_type`, and
+        // `default_agent_auto_type_for` byte-for-byte. Resolves the
+        // profile via `get_default()` directly — no second `get_by_id`
+        // lookup, no intermediate `default_id` clone.
+        let default_cmd = self
+            .agent_registry
+            .get_default()
+            .and_then(codescope_core::build_new_session_auto_type);
 
         let path = PathBuf::from(worktree_path);
         let title = title_prefix.clone();
@@ -3793,11 +3793,15 @@ impl Sidebar {
                 title_prefix.as_ref(),
                 profile.id,
             ));
-            let mut argv: Vec<String> =
-                Vec::with_capacity(1 + profile.new_session_args.len());
-            argv.push(profile.command.clone());
-            argv.extend(profile.new_session_args.iter().cloned());
-            let cmd = argv.join(" ");
+            // Shared helper keeps the new-session command shape in
+            // sync with the double-click handler and Ctrl+Shift+T.
+            // Preserves the `Option` semantics: a profile with an
+            // empty `command` flows through as `auto_type: None` so
+            // the session manager falls back to a plain shell prompt
+            // (matching the parent-row's no-default-agent path) —
+            // emitting `Some("")` would auto-type a `-Command "& {  }"`
+            // scriptblock on Windows pwsh, which is *not* "no command".
+            let cmd = codescope_core::build_new_session_auto_type(profile);
             let frost_hover = frost;
             let base_color = if is_default { ink } else { ink_dim };
             let hover_color = ink;
@@ -3820,7 +3824,7 @@ impl Sidebar {
                         cx.emit(SidebarEvent::OpenSession {
                             working_directory: path.clone(),
                             title: title.clone(),
-                            auto_type: Some(cmd.clone().into()),
+                            auto_type: cmd.clone().map(SharedString::from),
                             force_new: true,
                         });
                         this.close_menu(cx);

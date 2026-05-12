@@ -337,6 +337,37 @@ pub fn build_resume_auto_type(
     Some(argv.join(" "))
 }
 
+/// Build the auto-type command string used to launch a brand-new
+/// session for `profile`. Mirrors C#
+/// `SessionManager.CreateAgentSession` with `resume = false`:
+/// `[command, new_session_args...]` joined by single spaces.
+///
+/// Returns `None` when `profile.command` is empty — defensive against
+/// a hand-edited `settings.json` so callers can fall back to a plain
+/// shell instead of emitting a leading-space argv.
+///
+/// Shared helper called from every new-session entry point (the
+/// sidebar's double-click handler, `AppShell::default_agent_auto_type`,
+/// the worktree menu's `New session ▸` parent row in
+/// `Sidebar::build_new_session_parent_row`, and the per-agent rows in
+/// `Sidebar::render_new_session_submenu`) so they can't drift out of
+/// sync.
+pub fn build_new_session_auto_type(profile: &AgentProfile) -> Option<String> {
+    // Trim before the emptiness check so a whitespace-only `command`
+    // (e.g. `"   "` from a hand-edited `settings.json`) also returns
+    // `None` instead of auto-typing junk like `"   --init"`. Accidental
+    // leading/trailing spaces around the command don't get typed
+    // either — we emit the trimmed token, not the raw field.
+    let command = profile.command.trim();
+    if command.is_empty() {
+        return None;
+    }
+    let mut argv: Vec<String> = Vec::with_capacity(1 + profile.new_session_args.len());
+    argv.push(command.to_string());
+    argv.extend(profile.new_session_args.iter().cloned());
+    Some(argv.join(" "))
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -704,6 +735,135 @@ mod tests {
         assert_eq!(
             build_resume_auto_type(&profile, Some("xyz")),
             Some("multi --resume --id xyz".into()),
+        );
+    }
+
+    // ─── build_new_session_auto_type ───────────────────────────────
+    //
+    // Pins the contract every new-session entry point (sidebar
+    // double-click, Ctrl+Shift+T, per-agent submenu rows) relies on:
+    // `<command> [<new_session_args>...]` joined by single spaces,
+    // with `None` only when `command` is empty. All five built-in
+    // profiles ship empty `new_session_args` today, so the bare-
+    // command shape covers each one — the custom-profile test below
+    // pins the multi-arg joining shape for user-defined profiles.
+
+    #[test]
+    fn build_new_session_auto_type_claude_yields_bare_command() {
+        let profile = registry_profile("claude");
+        assert_eq!(
+            build_new_session_auto_type(&profile),
+            Some("claude".into()),
+        );
+    }
+
+    #[test]
+    fn build_new_session_auto_type_codex_yields_bare_command() {
+        // Codex's `new_session_args` is empty — the bare `codex` is
+        // the expected new-session launch (`resume_args = ["resume"]`
+        // is the resume shape, not the new-session shape).
+        let profile = registry_profile("codex");
+        assert_eq!(
+            build_new_session_auto_type(&profile),
+            Some("codex".into()),
+        );
+    }
+
+    #[test]
+    fn build_new_session_auto_type_copilot_yields_bare_command() {
+        let profile = registry_profile("copilot");
+        assert_eq!(
+            build_new_session_auto_type(&profile),
+            Some("copilot".into()),
+        );
+    }
+
+    #[test]
+    fn build_new_session_auto_type_joins_custom_new_session_args() {
+        // A user-defined profile with new-session args must serialise
+        // as `<command> <arg1> <arg2>...` so the terminal gets a
+        // single ready-to-run line.
+        let profile = AgentProfile {
+            id: "custom".into(),
+            display_name: "Custom".into(),
+            command: "my-cli".into(),
+            resume_args: vec![],
+            new_session_args: vec!["--init".into(), "fresh".into()],
+            session_id_flag: None,
+            resume_by_id_args: vec![],
+            is_default: true,
+            icon: None,
+            context_window_tokens: 0,
+        };
+        assert_eq!(
+            build_new_session_auto_type(&profile),
+            Some("my-cli --init fresh".into()),
+        );
+    }
+
+    #[test]
+    fn build_new_session_auto_type_returns_none_when_command_empty() {
+        // Defensive: a hand-edited `settings.json` with a blank
+        // `command` must not emit a leading-space argv. Returning
+        // `None` lets the caller fall through to a plain shell.
+        let profile = AgentProfile {
+            id: "broken".into(),
+            display_name: "Broken".into(),
+            command: String::new(),
+            resume_args: vec![],
+            new_session_args: vec!["--init".into()],
+            session_id_flag: None,
+            resume_by_id_args: vec![],
+            is_default: false,
+            icon: None,
+            context_window_tokens: 0,
+        };
+        assert!(build_new_session_auto_type(&profile).is_none());
+    }
+
+    #[test]
+    fn build_new_session_auto_type_treats_whitespace_only_command_as_empty() {
+        // A whitespace-only `command` from a hand-edited
+        // `settings.json` (e.g. `"   "`) is just as broken as a
+        // truly empty one — auto-typing `"    --init"` would emit
+        // junk. The helper trims before the emptiness check.
+        let profile = AgentProfile {
+            id: "broken".into(),
+            display_name: "Broken".into(),
+            command: "   ".into(),
+            resume_args: vec![],
+            new_session_args: vec!["--init".into()],
+            session_id_flag: None,
+            resume_by_id_args: vec![],
+            is_default: false,
+            icon: None,
+            context_window_tokens: 0,
+        };
+        assert!(build_new_session_auto_type(&profile).is_none());
+    }
+
+    #[test]
+    fn build_new_session_auto_type_trims_padded_command() {
+        // Accidental leading/trailing spaces around a real command
+        // (e.g. `" claude "` from a hand-edited `settings.json`) get
+        // trimmed before joining — otherwise the auto-typed line
+        // would be `" claude "` and PowerShell would fail to find
+        // the executable.
+        let profile = AgentProfile {
+            id: "padded".into(),
+            display_name: "Padded".into(),
+            command: " claude ".into(),
+            resume_args: vec![],
+            new_session_args: vec![],
+            session_id_flag: None,
+            resume_by_id_args: vec![],
+            is_default: true,
+            icon: None,
+            context_window_tokens: 0,
+        };
+        assert_eq!(
+            build_new_session_auto_type(&profile),
+            Some("claude".into()),
         );
     }
 }
