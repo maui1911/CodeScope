@@ -123,31 +123,27 @@ impl SessionDescriptor {
     }
 }
 
-/// Wrap `value` in double quotes so pwsh's command-line parser keeps
-/// it as a single token. Mirrors C# `SessionManager.Quote` — always
-/// quote (rather than only-when-whitespace), since pwsh strips the
-/// outer quotes when parsing `-WorkingDirectory` / `-Command` args, so
-/// the extra quotes are harmless but missing quotes break paths /
-/// commands that *do* contain whitespace. Values already starting
-/// with `"` are returned unchanged to avoid double-wrapping.
-fn quote_for_pwsh(value: &str) -> String {
-    if value.starts_with('"') {
-        return value.to_string();
-    }
-    format!("\"{value}\"")
-}
-
 /// Build the pwsh argv that boots an agent CLI inside an interactive
 /// shell. Mirrors the C# `SessionManager.CreateAgentSession`
-/// `ShellArgs` layout: `-NoExit -NoLogo -WorkingDirectory <quoted-wd>
+/// `ShellArgs` layout: `-NoExit -NoLogo -WorkingDirectory <wd>
 /// -Command "& { <agent_command> }"`.
 ///
 /// The agent call is wrapped in a pwsh scriptblock with `&` so
 /// `-NoExit` keeps the shell alive after the agent exits (a fresh
-/// `PS C:\>` prompt appears once the agent process detaches). The
-/// outer double quotes around the scriptblock are necessary because
-/// ConPTY's command-line splitter would otherwise treat `&` / `{` as
-/// separate tokens and never feed the block to `-Command`.
+/// `PS C:\>` prompt appears once the agent process detaches).
+///
+/// **Quoting policy:** we DO NOT pre-quote individual argv elements
+/// here. The PTY layer (alacritty's Windows tty with
+/// `escape_args = true`) joins `Vec<String>` into a Windows command
+/// line via the standard `CreateProcess` lpCommandLine convention,
+/// which already wraps whitespace-containing tokens in double quotes.
+/// Pre-quoting here would produce `""C:\path""` after PTY re-escapes —
+/// pwsh then reads the leading `""` as an empty drive name and
+/// `Set-Location` blows up with `A drive with the name '"C' does not
+/// exist.` (user report on PR #184 boot). The C# build uses
+/// `Process.Start` with a fully-formed `Arguments` string, so its
+/// `Quote` helper is authoritative there; here the PTY does the
+/// equivalent for us, so we hand it the raw value.
 ///
 /// Replacing the previous post-spawn auto-type write fixes the UX
 /// regression where users briefly saw a `PS C:\> claude` line echoed
@@ -157,9 +153,9 @@ pub fn build_agent_shell_args(agent_command: &str, working_directory: &str) -> V
         "-NoExit".into(),
         "-NoLogo".into(),
         "-WorkingDirectory".into(),
-        quote_for_pwsh(working_directory),
+        working_directory.to_string(),
         "-Command".into(),
-        quote_for_pwsh(&format!("& {{ {agent_command} }}")),
+        format!("& {{ {agent_command} }}"),
     ]
 }
 
@@ -787,11 +783,9 @@ mod tests {
     #[test]
     fn build_agent_shell_args_emits_command_block() {
         // Happy path: a plain agent command + plain working
-        // directory. The resulting argv should match the C#
-        // `CreateAgentSession` shape — `-NoExit -NoLogo
-        // -WorkingDirectory <quoted-wd> -Command "& { <cmd> }"` —
-        // so pwsh runs the agent inside an interactive shell that
-        // survives the agent's exit.
+        // directory. argv values are raw (no pre-quoting); the PTY
+        // layer's `escape_args=true` adds the Windows command-line
+        // quoting at spawn time. Pre-quoting here would double-wrap.
         let args = build_agent_shell_args("claude", "C:\\repo");
         assert_eq!(
             args,
@@ -799,20 +793,19 @@ mod tests {
                 "-NoExit".to_string(),
                 "-NoLogo".to_string(),
                 "-WorkingDirectory".to_string(),
-                "\"C:\\repo\"".to_string(),
+                "C:\\repo".to_string(),
                 "-Command".to_string(),
-                "\"& { claude }\"".to_string(),
+                "& { claude }".to_string(),
             ]
         );
     }
 
     #[test]
-    fn build_agent_shell_args_quotes_working_directory_with_spaces() {
-        // Path with spaces must come back wrapped in double quotes
-        // so pwsh's `-WorkingDirectory` parser treats it as one
-        // token. Mirrors C# `Quote` always-quote behaviour.
+    fn build_agent_shell_args_passes_working_directory_with_spaces_raw() {
+        // Path with spaces is handed raw — the PTY layer wraps it
+        // when composing the `CreateProcess` command line.
         let args = build_agent_shell_args("claude", "C:\\Program Files\\repo");
-        assert!(args.contains(&"\"C:\\Program Files\\repo\"".to_string()));
+        assert!(args.contains(&"C:\\Program Files\\repo".to_string()));
     }
 
     #[test]
@@ -821,7 +814,7 @@ mod tests {
         // scriptblock verbatim — pwsh parses the block, not us.
         let args = build_agent_shell_args("claude --resume abc-123", "C:\\repo");
         let cmd_arg = args.last().expect("non-empty argv");
-        assert_eq!(cmd_arg, "\"& { claude --resume abc-123 }\"");
+        assert_eq!(cmd_arg, "& { claude --resume abc-123 }");
     }
 
     #[test]
@@ -831,7 +824,7 @@ mod tests {
         // that takes a quoted prompt (`pi --say 'hi there'`) works.
         let args = build_agent_shell_args("pi --say 'hi there'", "C:\\repo");
         let cmd_arg = args.last().expect("non-empty argv");
-        assert_eq!(cmd_arg, "\"& { pi --say 'hi there' }\"");
+        assert_eq!(cmd_arg, "& { pi --say 'hi there' }");
     }
 
     #[test]
@@ -842,7 +835,7 @@ mod tests {
         // The helper must therefore pass them through unchanged.
         let args = build_agent_shell_args("claude --foo a&b | tee log.txt", "C:\\repo");
         let cmd_arg = args.last().expect("non-empty argv");
-        assert_eq!(cmd_arg, "\"& { claude --foo a&b | tee log.txt }\"");
+        assert_eq!(cmd_arg, "& { claude --foo a&b | tee log.txt }");
     }
 
     #[test]
