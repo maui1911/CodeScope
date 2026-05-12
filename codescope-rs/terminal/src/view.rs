@@ -743,7 +743,12 @@ fn to_mouse_button(button: MouseButton) -> Option<mouse::MouseButton> {
 /// Kept conservative — we only opt out of bindings nothing in a
 /// shell prompt would meaningfully use, so power-users running vim
 /// or readline still get every key they need.
-fn is_app_level_shortcut(key: &str, mods: &gpui::Modifiers) -> bool {
+///
+/// Mirrors the AppShell `on_key_down` chord set so a chord typed
+/// while the terminal has focus bubbles up to the shell instead of
+/// being eaten + forwarded to the PTY (the "Ctrl+Shift+O / Ctrl+
+/// Shift+P don't open palettes when the terminal is focused" bug).
+pub(crate) fn is_app_level_shortcut(key: &str, mods: &gpui::Modifiers) -> bool {
     let app_mod = mods.control || mods.platform;
     if !app_mod || mods.alt {
         return false;
@@ -752,7 +757,9 @@ fn is_app_level_shortcut(key: &str, mods: &gpui::Modifiers) -> bool {
     if key == "tab" {
         return true;
     }
-    // Ctrl+1 .. Ctrl+9 (direct tab select).
+    // Ctrl+1 .. Ctrl+9 (direct tab select). Plain Ctrl only —
+    // Ctrl+Shift+digit is not bound at the shell, so let the
+    // terminal keep it for its own use.
     if !mods.shift
         && key.len() == 1
         && key
@@ -773,6 +780,30 @@ fn is_app_level_shortcut(key: &str, mods: &gpui::Modifiers) -> bool {
     // Ctrl+\ / Ctrl+| (split right). C# binds `OemPipe` (Ctrl+|);
     // on US layouts that's Shift+\, so we accept both shapes.
     if key == "\\" {
+        return true;
+    }
+    // Ctrl+P / Ctrl+Shift+P — command palette open / toggle.
+    // Both shapes share an opener in AppShell, so both bubble.
+    if key == "p" {
+        return true;
+    }
+    // Ctrl+Shift+O — toggle the Overview panel. Plain Ctrl+O is
+    // not bound at the shell (and is a common shell shortcut for
+    // "open" in readline-flavoured tools), so we *only* bubble
+    // the shifted form.
+    if key == "o" && mods.shift {
+        return true;
+    }
+    // Ctrl+B — toggle sidebar. Plain Ctrl+B only; Ctrl+Shift+B
+    // is unbound and stays with the terminal (readline maps it
+    // to backward-char in some configs).
+    if key == "b" && !mods.shift {
+        return true;
+    }
+    // Ctrl+, — open Settings. Windows / VS Code convention,
+    // unbound in any shell so it's safe to swallow regardless
+    // of the shift state.
+    if key == "," {
         return true;
     }
     false
@@ -994,6 +1025,36 @@ mod tests {
         let plain = Modifiers::default();
         assert!(!is_app_level_shortcut("t", &plain));
         assert!(!is_app_level_shortcut("a", &plain));
+    }
+
+    #[test]
+    fn ctrl_p_and_ctrl_shift_p_bubble_for_palette() {
+        // AppShell binds both shapes to the command palette
+        // open/toggle action — both must escape the terminal.
+        assert!(is_app_level_shortcut("p", &ctrl()));
+        assert!(is_app_level_shortcut("p", &ctrl_shift()));
+    }
+
+    #[test]
+    fn ctrl_shift_o_bubbles_for_overview() {
+        // Only the shifted form is bound (plain Ctrl+O is a
+        // common shell shortcut and stays with the terminal).
+        assert!(is_app_level_shortcut("o", &ctrl_shift()));
+        assert!(!is_app_level_shortcut("o", &ctrl()));
+    }
+
+    #[test]
+    fn ctrl_b_bubbles_for_sidebar() {
+        // Plain Ctrl+B only; Ctrl+Shift+B stays with the terminal.
+        assert!(is_app_level_shortcut("b", &ctrl()));
+        assert!(!is_app_level_shortcut("b", &ctrl_shift()));
+    }
+
+    #[test]
+    fn ctrl_comma_bubbles_for_settings() {
+        // Windows / VS Code convention — Settings dialog opener.
+        assert!(is_app_level_shortcut(",", &ctrl()));
+        assert!(is_app_level_shortcut(",", &ctrl_shift()));
     }
 }
 
