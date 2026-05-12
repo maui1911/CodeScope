@@ -2533,15 +2533,25 @@ impl AppShell {
         });
 
         // Resolve the shell + argv. When `auto_type` is set and we
-        // have a working directory to land in, boot the agent through
+        // have a working directory to land in *and* the default pwsh
+        // shell is in play, boot the agent through
         // `pwsh -NoExit -Command "& { <agent> }"` so the CLI starts
         // immediately without a visible `PS C:\> claude` echoed line
         // — the regression this branch fixes. Mirrors C#
         // `SessionManager.CreateAgentSession`'s `ShellArgs` layout.
         //
+        // The agent-via-`-Command` path is *Windows + pwsh* specific.
+        // `CODESCOPE_SHELL` (dev override) and non-Windows targets fall
+        // through to the auto-type fallback below, which writes the
+        // agent command into the spawned shell after a short settle
+        // delay — slightly slopier but preserves agent-launch behaviour
+        // for any shell. `agent_launched_via_args` tracks which path we
+        // took so the fallback only fires when needed.
+        //
         // Plain shell tabs (`auto_type = None`) and agent tabs with no
         // working directory (no project context, nothing for the agent
         // to operate against) keep the previous bare-shell shape.
+        let mut agent_launched_via_args = false;
         let shell = std::env::var("CODESCOPE_SHELL")
             .ok()
             .map(|program| Shell::new(program, Vec::new()))
@@ -2554,6 +2564,7 @@ impl AppShell {
                                 cmd.as_ref(),
                                 &wd.to_string_lossy(),
                             );
+                            agent_launched_via_args = true;
                             Some(Shell::new(program, args))
                         }
                         _ => Some(Shell::new(program, Vec::new())),
@@ -2618,24 +2629,29 @@ impl AppShell {
             self.allocate_session_id(working_directory_for_tab.as_deref(), restore_session_id);
         let group_idx = self.focused_group;
         let group = &mut self.groups[group_idx];
+        // Capture the entity so the fallback `auto_type` job below can
+        // write to it without re-borrowing `self.groups` after the
+        // await point.
+        let terminal_for_autotype = terminal.clone();
         let agent_id = codescope_core::agent_id_from_auto_type(
             auto_type.as_ref().map(|s| s.as_ref()),
         );
         // `auto_type` is kept on the Tab as metadata (agent
         // detection via `agent_id_from_auto_type` + layout persistence
-        // so a restart can rebuild the command) but no longer drives a
-        // post-spawn pty write — the agent is already booted via
-        // `pwsh -Command "& { ... }"` above, mirroring C#
-        // `SessionManager.CreateAgentSession`. Removing the auto-typed
-        // write also kills the visible `PS C:\> claude` echo regression
-        // (the line briefly flashed before pwsh started its REPL).
+        // so a restart can rebuild the command). On the Windows + pwsh
+        // happy path it doesn't drive a post-spawn pty write any more
+        // because the agent is already booted via
+        // `pwsh -Command "& { ... }"`, mirroring C#
+        // `SessionManager.CreateAgentSession`. On the
+        // `CODESCOPE_SHELL` override path and non-Windows targets the
+        // post-spawn auto-type below is still the launch mechanism.
         group.tabs.push(Tab {
             id,
             session_id,
             title,
             terminal,
             working_directory: working_directory_for_tab,
-            auto_type,
+            auto_type: auto_type.clone(),
             spawned_at: SystemTime::now(),
             adopted_session_id: None,
             fired_session_ids: std::collections::HashSet::new(),
@@ -2643,6 +2659,27 @@ impl AppShell {
         });
         let new_idx = group.tabs.len() - 1;
         self.activate_tab(group_idx, new_idx, window, cx);
+
+        // Fallback: auto-type the agent command into the shell when we
+        // *couldn't* build the agent into the shell argv up-front
+        // (CODESCOPE_SHELL override / non-Windows targets). Without
+        // this the agent would never launch on those paths. Skipped on
+        // the Windows + pwsh happy path so the user no longer sees a
+        // `PS C:\> claude` echoed line — the regression this branch
+        // fixes.
+        if !agent_launched_via_args
+            && let Some(cmd) = auto_type
+        {
+            cx.spawn(async move |_, cx| {
+                cx.background_executor().timer(Duration::from_millis(250)).await;
+                let _ = terminal_for_autotype.update(cx, |term, _cx| {
+                    let mut bytes = cmd.as_bytes().to_vec();
+                    bytes.push(b'\r');
+                    term.write_input(bytes);
+                });
+            })
+            .detach();
+        }
     }
 
     /// Close the tab at `(group_idx, tab_idx)`. When the group's last

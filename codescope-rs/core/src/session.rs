@@ -123,11 +123,13 @@ impl SessionDescriptor {
     }
 }
 
-/// Wrap `value` in double quotes if it contains whitespace (or is
-/// empty) so pwsh's command-line parser keeps it as a single token.
-/// Mirrors C# `SessionManager.Quote` — always-safe to quote since pwsh
-/// strips the outer quotes when parsing `-WorkingDirectory` / `-Command`
-/// args. Values already starting with `"` are returned unchanged.
+/// Wrap `value` in double quotes so pwsh's command-line parser keeps
+/// it as a single token. Mirrors C# `SessionManager.Quote` — always
+/// quote (rather than only-when-whitespace), since pwsh strips the
+/// outer quotes when parsing `-WorkingDirectory` / `-Command` args, so
+/// the extra quotes are harmless but missing quotes break paths /
+/// commands that *do* contain whitespace. Values already starting
+/// with `"` are returned unchanged to avoid double-wrapping.
 fn quote_for_pwsh(value: &str) -> String {
     if value.starts_with('"') {
         return value.to_string();
