@@ -9,47 +9,88 @@
 >
 > **The Rust port (`codescope-rs/`) is a 1:1 functional port of the C# CodeScope build (`src/CodeScope.App/`, `src/CodeScope.Core/`, `src/CodeScope.AgentCli/`).** Before implementing any feature on the Rust side, **read the equivalent C# code first** and mirror its behavior, button labels, dialogs, data shapes, and persistence layout. Functional parity is the goal — we are not redesigning. If a `HANDOFF.md` entry, README line, or "next entry point" disagrees with what the C# code actually does, the C# code wins; update the doc. Genuine platform-forced deviations (gpui vs WPF idiom) get a one-line comment and an entry in `docs/DECISIONS.md`. "Cleaner" or "more elegant" is not a reason on its own. (Reinforced in session 33 after PR #56 invented a non-existent UX.)
 
-**Last updated:** 2026-05-11 (sidebar agent-state dots — parity with C#)
-
-### Sidebar agent-state dots (this session)
-
-`feat/rs/sidebar-agent-state-dots` ports the C# `WorktreeViewModel.DotState`
-/ `HasBusyChild` semantics into `codescope-rs/src/sidebar.rs` so the
-6 px worktree dot tracks adopted agent activity (busy → red + pulsing
-halo, idle → green, rest → dim grey) instead of clean/dirty git
-state — dirty information already lives in the right-aligned `chg`
-slug. Collapsed projects now show a small `Signal.Warn` propagation
-dot next to the row when any child worktree's session is busy
-(C# `ProjectViewModel.HasBusyChild`). Worktree rows render the
-2 px accent rail on the left edge when at least one live session is
-pinned to that path (C# `HasActiveSession`). The pulsing halo runs
-via `gpui::AnimationExt::with_animation` on a 1.4 s repeat — opacity-
-only (no scale transform on `div` yet) but visually reads as the
-spec'd red bloom. Plumbing: `Sidebar::set_session_paths(busy,
-active, cx)` is pushed from `AppShell::start_telemetry_poll` after
-every tail poll; cheap diff guards a notify so the 250 ms busy
-cadence doesn't redraw on every tick. Path comparison uses a new
-`codescope_core::path_canon::paths_match` (4 unit tests added).
-
-**Sidebar filter input — deferred.** The Rust sidebar has no filter
-text-box equivalent to the C# `SidebarView` filter. Skipped for this
-PR per its scope; pick this up next.
-
-### Older entry
-
-**Last updated:** 2026-05-10 (session 37 — status bar wired + sidebar parity sweep)
-**Branch:** `main` (PRs #98–#101 merged; #102 + #103 in flight pending review)
-**Head:** main, in sync with origin
+**Last updated:** 2026-05-12 (session 38 — feature-parity sweep (#135–#150))
+**Branch:** `main`
+**Head:** `6346668` (themed ConfirmDialog + destructive-site migration, #150)
 **Release:** `v0.2.5` shipped in session 36 — no new release this run
 **Build status:** ✅ C# untouched. Rust workspace builds clean.
-Tests: `codescope-core` (121 — claude_discovery added 19,
-git status_label added 8, status-bar formatters added 14) +
-`codescope-terminal` mouse-encoder (9) + sidebar-bin tests (29) —
-**159 total**, all passing.
-**Uncommitted work:** none on `main`. Open branches: `feat/sidebar-rebase-onto-default` (#102), `feat/sidebar-project-collapse` (#103).
+Tests: `codescope-core` (417) + `codescope-rs` bin (75) +
+`codescope-terminal` (19) + 1 doctest — **512 total**, all passing.
+**Uncommitted work:** none on `main`.
 **Open issues:** none on GitHub.
 
+### Cursor — what's next
+
+Feature-parity sweep done. The Rust port matches C# functionally;
+remaining items are platform-blocked (gpui 0.2.x) or also-deferred in
+C# (session-exit toasts, Gitea CI rollup). Next session can focus on
+polish or new product features — see "Next — suggested entry points"
+near the end of this file.
+
+### Session 38 — feature-parity sweep (PRs #135–#150)
+
+Long autonomous sweep that closed almost every remaining gap between
+the Rust port and the C# build. Sixteen PRs landed (one withdrawn /
+folded), each with the standard Copilot review + address-loop where
+needed. Wave summary, by area:
+
+- **#135 — AgentRegistry + default_agent setting** ported into
+  `codescope_core`. The Rust side now resolves the same agent ids
+  as C# (`shell` / `claude` / `copilot` / `opencode` / `pi` / `codex`)
+  and persists a user-chosen default.
+- **#136 — Sidebar agent-state dots.** Green / red / dim semantics
+  plus the 1.4 s halo pulse on busy adopted sessions; project rows
+  show propagation dots when any child is busy.
+- **#137 — Status-bar parity sweep.** Closed the remaining gaps
+  against C# `StatusBarView` (segment ordering, signal colours,
+  separator interspersing).
+- **#139 — History rows show agent type.** Live + closed history
+  entries label the agent (Claude Code / Copilot CLI / OpenCode /
+  Pi / Codex / shell); strikethrough on closed rows dropped to
+  match the C# look.
+- **#140 — Color + font sweep.** Added the missing `surface_elev`
+  token, `text_faint`, and restored every drift hex against
+  `DesignTokens.xaml`. Font chains (`Fig.Font.Mono` / `Fig.Font.Sans`)
+  applied across sidebar / status-bar.
+- **#141 — Settings dialog (Ctrl+,).** Theme / default-agent /
+  font / cursor controls; persists through `codescope_core::Settings`.
+  Rust-side addition vs C# (which hand-edits `settings.json`);
+  documented in `docs/DECISIONS.md` ADR-0018.
+- **#142 — PR integration foundation.** `gh pr list --json` poll
+  per worktree, badge in the row, "Open PR" + "Copy PR URL" menu
+  rows. `ci!` slug renders when CI is failing (parity with C#).
+- **#143 — Overview view (Ctrl+Shift+O).** All-sessions panel
+  mirroring `OverviewView.xaml`.
+- **#144 — Command Palette (Ctrl+P).** Fuzzy search across
+  projects / worktrees / commands.
+- **#145 + #146 — Sidebar parity bundle.** Collapsed projects now
+  persist to `layout.json`; sidebar filter text-box (case-insensitive,
+  branch + folder leaf); folder drop-target on the sidebar root
+  (drop a directory to add it as a project); multi-agent submenu
+  rows on project / worktree contexts.
+- **#147 — Tab drag-reorder + cross-group reparent.** Floating
+  drag chip follows the cursor; reparent across groups with no
+  ConPTY teardown.
+- **#148 — Rename dialog.** Project + session rename with a
+  themed dialog (parity with C# `RenameDialog`).
+- **#150 — Themed ConfirmDialog.** Replaces every native
+  `MessageBox` confirm on destructive paths (Remove project,
+  Remove worktree, Discard changes, Remove from history). Added
+  the missing confirm to "Remove project" while we were there.
+
+**Forced deviations / platform notes:**
+
+- Drag-chip `-1.5°` rotation is deferred — gpui 0.2.x exposes
+  `with_rotation` only on SVG elements, not on `div`. Inline
+  comment in `app.rs` (≈line 380) documents this and the no-rotate
+  fallback. The chip still tracks the cursor and gets the blue
+  outer glow.
+- Settings dialog is a Rust-side addition (C# hand-edits
+  `settings.json`); see ADR-0018 in `docs/DECISIONS.md`.
+
 ### Session 37 — status bar integration + sidebar parity sweep
+
+**Last updated:** 2026-05-10. Rust workspace clean, **159 tests** at the time.
 
 Started with the cursor from session 36 ("wire register / unregister
 into spawn / close, then integrating PR for the bar") and pivoted
@@ -1653,7 +1694,7 @@ cap is now model-aware instead of a baked 1M default.
 | 4 | Live git status, dirty/ahead/behind indicators | ✅ shipped |
 | 5 | `gh` / `tea` PR integration, CI status, Create PR | ✅ shipped (Gitea CI rollup deferred) |
 | 6 | Toasts, command palette, adaptive pollers, 50+ parallel sessions | ✅ shipped (session-exit toasts deferred) |
-| 7 | Design overhaul using `docs/DESIGN.md` | 🔶 in progress |
+| 7 | Design overhaul using `docs/DESIGN.md` | ✅ shipped (drag-chip rotation flourish deferred — gpui 0.2.x limitation) |
 
 ## Repo shape
 
@@ -1705,9 +1746,14 @@ docs/
 
 ## Known rough edges
 
-- **"Remove from history" has no confirm dialog** — the action is destructive (entry cannot be recovered) but currently fires immediately on click. A follow-up should add a small inline confirm or an Undo toast. Low priority until the history feature is user-tested.
-- **Gitea CI rollup is always `None`** — `tea pulls status`/REST integration deferred.
-- **Session-exit toasts deferred** — `SessionManager` starts pwsh with `-NoExit`; detecting agent exit needs `SessionManager` refactor or pty-output parsing.
+- **Drag-chip `-1.5°` rotation deferred (Rust)** — gpui 0.2.x exposes
+  `with_rotation` only on SVG elements, not on `div`. The chip tracks
+  the cursor and gets the blue outer glow but no tilt. Documented
+  inline in `codescope-rs/src/app.rs` (≈line 380). Unblocks when gpui
+  ships `Transform::rotate` on layout elements (or we swap to an SVG
+  composite for the chip).
+- **Gitea CI rollup is always `None`** — `tea pulls status`/REST integration deferred (same status on both C# and Rust sides).
+- **Session-exit toasts deferred** — `SessionManager` starts pwsh with `-NoExit`; detecting agent exit needs `SessionManager` refactor or pty-output parsing. Same gap exists on the Rust port.
 - **Terminal scrollback unbounded** — `Microsoft.Terminal.Wpf` 1.22 doesn't
   expose a public scrollback-line cap. Long-running sessions grow
   `WorkingSet64` without bound. `MemoryWatchdog` (dev-mode only) logs
@@ -1742,23 +1788,21 @@ dotnet publish src/CodeScope.App -c Release -r win-x64 `
 
 ## Next — suggested entry points
 
-**Immediate:**
+The feature-parity sweep is done — the Rust port now matches C#
+functionally. Remaining items are small or platform-blocked:
 
-- **"Remove from history" confirm** — add an inline confirm or Undo toast so
-  the destructive action is recoverable (see rough edges below).
+**Small / polish:**
 
-**Multi-group / chrome polish:**
-
-- **Tab drag-reorder motion spec** — `docs/design/html/CodeScope - Tab Drag.html`.
-- **Tab Drag — floating drag chip adorner** — custom `Adorner` that
-  follows the cursor, renders the tab replica with a −1.5° rotation +
-  blue outer glow. 3 px blue drop-indicator between tabs needs a
-  `DragOver` calc + dynamic `Rectangle` in the strip's ItemsPanel.
+- **Session-exit toasts** (both ports) — `SessionManager` starts pwsh
+  with `-NoExit`; needs pty-output parsing or a `SessionManager`
+  refactor to detect agent exits cleanly.
+- **Drag-chip rotation flourish (Rust)** — cosmetic, blocked on
+  gpui 0.2.x exposing `with_rotation` on layout elements (currently
+  SVG-only). See `codescope-rs/src/app.rs` ≈line 380.
 
 **Deferred / longer-horizon:**
 
-- Session-exit toasts via `SessionManager` refactor.
-- Real Gitea CI rollup (`tea pulls status` / REST).
+- Real Gitea CI rollup (`tea pulls status` / REST) — deferred in C# too.
 - PR review-comments dialog (`gh pr view --comments`).
 - Kanban overview of active sessions.
 - **In-app update notifier** — `UpdateManager.CheckForUpdatesAsync` on
