@@ -1205,6 +1205,40 @@ impl AppShell {
     // Claude telemetry
     // -----------------------------------------------------------------------
 
+    /// Stamp `Session.agent_session_id` for the CodeScope session
+    /// identified by `session_id` (the stable id from `projects.json`,
+    /// **not** the agent-minted UUID) and persist `projects.json` so
+    /// `build_resume_auto_type` (PR #178) can resume the session by id
+    /// after a restart.
+    ///
+    /// Called from the agent-discovery loop the moment any of the four
+    /// agents (Claude, Copilot, OpenCode, Pi) mints a session id we
+    /// can recognise. Mirrors C# `MainViewModel.ApplyAdoption` →
+    /// `SessionStore.UpdateAgentSessionIdAsync` round-trip.
+    ///
+    /// Lenient on missing sessions: a freshly-spawned tab's first
+    /// discovery tick can race [`SessionManager::open`]'s write to
+    /// `projects.json`. We swallow that — the next tick (~350 ms
+    /// later) will land after the row exists and the stamp will
+    /// succeed. Persist failures are logged and otherwise ignored to
+    /// match the rest of the persist callsites in this file
+    /// (`spawn_tab_in`, `close_tab`, etc).
+    fn persist_agent_session_id(&mut self, session_id: &str, agent_session_id: &str) {
+        let changed = codescope_core::SessionManager::set_agent_session_id_lenient(
+            &mut self.projects,
+            session_id,
+            agent_session_id,
+        );
+        if !changed {
+            return;
+        }
+        if let Err(err) = codescope_core::session::save(&self.projects, &self.paths) {
+            eprintln!(
+                "warning: failed to persist agent_session_id for {session_id}: {err:#}"
+            );
+        }
+    }
+
     /// Register a transcript tail for `session_id` under
     /// `working_directory`, dispatching by `agent_id`. Safe to call
     /// multiple times with the same id — the old tail is replaced
@@ -1451,6 +1485,13 @@ impl AppShell {
                         previous_session_id: Option<String>,
                         new_session_id: String,
                         working_directory: String,
+                        /// CodeScope session id (from `projects.json`),
+                        /// the stable handle we stamp
+                        /// `agent_session_id` against. Captured here
+                        /// so the second pass can persist the
+                        /// agent-minted id without re-borrowing the
+                        /// tab.
+                        codescope_session_id: String,
                     }
                     let mut found = Vec::new();
                     let mut any_active = false;
@@ -1564,6 +1605,7 @@ impl AppShell {
                                     previous_session_id: tab.adopted_session_id.clone(),
                                     new_session_id: sid,
                                     working_directory: wd_str,
+                                    codescope_session_id: tab.session_id.clone(),
                                 });
                             }
                         }
@@ -1578,6 +1620,16 @@ impl AppShell {
                             f.agent_id,
                             f.new_session_id.clone(),
                             &f.working_directory,
+                        );
+                        // Persist the agent-minted id back to
+                        // `projects.json` so `build_resume_auto_type`
+                        // (PR #178) can resume the session by id after
+                        // a restart. Lenient on missing sessions —
+                        // see `persist_agent_session_id` for the
+                        // cold-start race rationale.
+                        this.persist_agent_session_id(
+                            &f.codescope_session_id,
+                            &f.new_session_id,
                         );
                         if let Some(group) = this.groups.get_mut(f.group_idx) {
                             if let Some(tab) = group.tabs.get_mut(f.tab_idx) {
