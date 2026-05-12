@@ -2452,15 +2452,23 @@ impl Render for Sidebar {
             // propagation so the chevron doesn't double-fire `select`.
             let chevron_glyph = if collapsed { "\u{25B8}" } else { "\u{25BE}" };
             let id_for_toggle = id.clone();
+            // 24×24 hit target with a 14 px glyph — the C# `SidebarView.xaml`
+            // chevron Path is 10×10 with a much smaller hit-box, which
+            // user testing flagged as fiddly to land on. Bumping the
+            // hit-box to a comfortable 24 px keeps the visual indent
+            // identical (the 6 px right margin still sits between the
+            // chevron column and the project name) but makes the click
+            // target forgiving without enlarging the visible glyph too
+            // far past the C# baseline.
             let chevron = div()
                 .id(("project-chevron", id_hash(&id)))
-                .w(px(14.0))
-                .h(px(14.0))
+                .w(px(24.0))
+                .h(px(24.0))
                 .mr(px(6.0))
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(px(10.0))
+                .text_size(px(14.0))
                 // Chevron stroke — `Text.Secondary` (ink_muted) in C#
                 // `SidebarView.xaml` (`Stroke="{DynamicResource Text.Secondary}"`).
                 .text_color(theme::ink_muted(&theme))
@@ -2684,21 +2692,27 @@ impl Render for Sidebar {
                     .hover(move |s| s.bg(frost_hover).text_color(ink_hover))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |_, _, _, cx| {
-                            // Plain row click — focus an existing
-                            // tab for this worktree if one is open,
-                            // otherwise spawn one. The worktree
-                            // context menu's "New Claude session"
-                            // row (and the project menu's "New
-                            // session" / "New Claude session" rows)
-                            // still pass `force_new: true` to always
-                            // spawn a fresh tab.
-                            cx.emit(SidebarEvent::OpenSession {
-                                working_directory: PathBuf::from(&wt_path_for_event),
-                                title: title_label.clone(),
-                                auto_type: None,
-                                force_new: false,
-                            });
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            // Single-click selects (highlights the owning
+                            // project, mirroring C# `OnTreeSelectionChanged`
+                            // setting `SelectedWorktree` / `SelectedProject`).
+                            // Double-click is the explicit "open session"
+                            // gesture — same semantics as C#
+                            // `OnTreeDoubleClick`: focus an existing tab for
+                            // this worktree, or spawn one if none exists.
+                            // The worktree context menu's "Open session" /
+                            // "New <agent> session" rows remain the keyboard /
+                            // right-click paths.
+                            if is_double_click(event.click_count) {
+                                cx.emit(SidebarEvent::OpenSession {
+                                    working_directory: PathBuf::from(&wt_path_for_event),
+                                    title: title_label.clone(),
+                                    auto_type: None,
+                                    force_new: false,
+                                });
+                            } else {
+                                this.select(project_idx_for_menu, cx);
+                            }
                         }),
                     )
                     .on_mouse_down(
@@ -2905,9 +2919,13 @@ impl Render for Sidebar {
                 // has any closed-session rows. Mirrors C# `SidebarView`'s
                 // chevron Border which is gated on `HasHistory`.
                 // ▸ collapsed, ▾ expanded; click flips
-                // `expanded_worktrees`. Hit-target is a 14×14 box so the
-                // glyph is comfortable to click without the user having
-                // to land on the 8 px arrow itself.
+                // `expanded_worktrees`. The C# Path is 8×8 (`SidebarView.xaml`
+                // history chevron); user testing flagged it as too small
+                // to hit comfortably. Hit-target is a 20×20 box around a
+                // 12 px glyph — keeps the visual delta from the project
+                // chevron (which is bigger again at 14 px / 24×24) so the
+                // hierarchy reads correctly, while staying clickable
+                // without precision targeting.
                 let wt_key = wt_row_id.clone();
                 let has_history = !wt.closed_sessions.is_empty();
                 let history_expanded = self.expanded_worktrees.contains(&wt_key);
@@ -2917,13 +2935,13 @@ impl Render for Sidebar {
                     wt_row.child(
                         div()
                             .id(("worktree-history-chevron", id_hash(&wt_key)))
-                            .w(px(14.0))
-                            .h(px(14.0))
+                            .w(px(20.0))
+                            .h(px(20.0))
                             .ml(px(4.0))
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_size(px(10.0))
+                            .text_size(px(12.0))
                             // History chevron — `Stroke="{DynamicResource Text.Faint}"`
                             // in `SidebarView.xaml`.
                             .text_color(theme::text_faint())
@@ -2985,10 +3003,18 @@ impl Render for Sidebar {
                             .hover(move |s| s.bg(frost_hover).text_color(ink_hover))
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(move |_, _, _, cx| {
-                                    cx.emit(SidebarEvent::ReopenSession {
-                                        session_id: id_for_click.clone(),
-                                    });
+                                cx.listener(move |_, event: &MouseDownEvent, _, cx| {
+                                    // Single-click is select-only (the
+                                    // hover/selection highlight gives feedback
+                                    // that the row was hit). Double-click is
+                                    // the explicit reopen gesture, mirroring
+                                    // C# `OnTreeDoubleClick`'s
+                                    // `ReopenClosedSessionCommand` branch.
+                                    if is_double_click(event.click_count) {
+                                        cx.emit(SidebarEvent::ReopenSession {
+                                            session_id: id_for_click.clone(),
+                                        });
+                                    }
                                 }),
                             )
                             // Right-click opens the closed-history
@@ -4777,6 +4803,19 @@ fn handle_filter_key_down(
 
 /// Does a worktree row match the lowercased filter needle? Matches
 /// the branch (when set) and the folder leaf (always). Caller has
+/// Whether a `MouseDownEvent::click_count` value should be treated
+/// as a double-click for the purposes of opening / reopening a
+/// session from a sidebar row. gpui's `ClickState` bumps this
+/// counter on each press inside the platform's
+/// double-click time + distance threshold (~400 ms on Windows),
+/// so anything `>= 2` is the platform-blessed "double click" gesture.
+/// Mirrors the WPF default `MouseDoubleClick` semantics used by
+/// `SidebarView.OnTreeDoubleClick` in the C# build — single-click
+/// selects, double-click opens.
+fn is_double_click(click_count: usize) -> bool {
+    click_count >= 2
+}
+
 /// already lowercased `needle` and confirmed the project name didn't
 /// match.
 fn worktree_row_matches(wt: &WorktreeRowData, needle: &str) -> bool {
@@ -4934,5 +4973,43 @@ mod tests {
     fn filter_no_match_returns_false() {
         let r = row(Some("main"), "/repos/bar");
         assert!(!worktree_row_matches(&r, "missing"));
+    }
+
+    #[test]
+    fn is_double_click_treats_count_one_as_single() {
+        // First press in a chain — gpui populates `click_count = 1`
+        // for a plain single click. Sidebar rows must treat this as
+        // "select-only" so we don't auto-open sessions on a stray
+        // tap (the bug this commit fixes).
+        assert!(!is_double_click(1));
+    }
+
+    #[test]
+    fn is_double_click_recognises_count_two() {
+        // Two presses inside the platform's double-click window —
+        // gpui's `ClickState` bumps `click_count` to 2. This is the
+        // gesture the sidebar treats as "open / reopen session".
+        assert!(is_double_click(2));
+    }
+
+    #[test]
+    fn is_double_click_accepts_higher_click_counts() {
+        // Triple- and quad-clicks should also fall through the
+        // double-click gate — once the user has clearly committed to
+        // opening the session, holding down for a triple-click should
+        // still open (not silently reselect on the third press). The
+        // emitter side is idempotent for an already-open session, so
+        // this is the safer fallthrough.
+        assert!(is_double_click(3));
+        assert!(is_double_click(4));
+    }
+
+    #[test]
+    fn is_double_click_rejects_zero() {
+        // Defensive guard — gpui shouldn't fire `MouseDownEvent` with
+        // `click_count = 0`, but if a future refactor synthesises one
+        // (e.g. for keyboard-driven `Enter` reuse) it must not be
+        // treated as a double-click.
+        assert!(!is_double_click(0));
     }
 }
