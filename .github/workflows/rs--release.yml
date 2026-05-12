@@ -275,6 +275,146 @@ jobs:
             | sed 's|^.*/codescope-rs/|codescope-rs/|'
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+      # ---------------------------------------------------------------
+      # Velopack packaging — Windows only for now.
+      #
+      # The Rust velopack-rs bridge (`codescope-rs/src/velopack_bridge.rs`)
+      # pins `CHANNEL = "win"` and only the Windows install flow is
+      # exercised in the AppShell today. macOS + Linux velopack packaging
+      # is a documented follow-up; tar.xz archives from cargo-dist still
+      # ship for those platforms via the rest of this matrix entry.
+      #
+      # The steps below produce Velopack's canonical feed asset
+      # `releases.win.json` (what `GithubSource` resolves via
+      # `CoreUtil.GetVeloReleaseIndexName(channel)` → `releases.<channel>.json`,
+      # see velopack/velopack `Sources/GitBase.cs`), the legacy text-format
+      # `RELEASES`-style file, the `Full.nupkg` package (and a `Delta.nupkg`
+      # from the second release onward), and the Velopack setup installer
+      # (`*-Setup.exe`), all under `codescope-rs/target/distrib/velopack/`.
+      # Every file is threaded through the same upload-artifact path used
+      # for the MSI + zip. The steps no-op on macOS/Linux jobs via the
+      # `runner.os` gate.
+      # ---------------------------------------------------------------
+      - name: Setup .NET (for vpk)
+        if: runner.os == 'Windows'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install vpk
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: dotnet tool install -g vpk
+      - name: Stage Velopack publish dir
+        # cargo-dist already built `codescope-rs.exe` under
+        # `target/<triple>/release/`. vpk wants a flat publish dir that
+        # contains the main exe plus any side-by-side files. The Rust
+        # build is statically linked (no runtime DLLs to ship), so just
+        # the .exe is enough — but we also copy any sibling .dll cargo
+        # emits so a future dynamically-linked sidecar gets picked up
+        # automatically.
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: codescope-rs
+        run: |
+          $publish = "target/distrib/velopack/publish"
+          New-Item -ItemType Directory -Force -Path $publish | Out-Null
+          # Pick the matching triple — the matrix only has one Windows
+          # target today (`x86_64-pc-windows-msvc`) but glob just in
+          # case we add aarch64 later.
+          $src = Get-ChildItem -Path "target" -Directory `
+            | Where-Object { $_.Name -like "*windows*" } `
+            | ForEach-Object { Join-Path $_.FullName "release" } `
+            | Where-Object { Test-Path (Join-Path $_ "codescope-rs.exe") } `
+            | Select-Object -First 1
+          if (-not $src) {
+            throw "Could not find a release build of codescope-rs.exe under target/*windows*/release/"
+          }
+          Write-Host "Staging velopack publish from $src"
+          Copy-Item -Path (Join-Path $src "codescope-rs.exe") -Destination $publish -Force
+          # Bring along any side-by-side .dll files cargo emits next to
+          # the exe. Today there are none, but this future-proofs us
+          # against e.g. adding a dynamically-linked sidecar.
+          Get-ChildItem -Path $src -Filter "*.dll" -ErrorAction SilentlyContinue `
+            | Copy-Item -Destination $publish -Force
+          Get-ChildItem $publish
+      - name: Download prior Velopack release (for delta)
+        # Best-effort: pulls the latest GitHub release's velopack assets
+        # into `releases/` so `vpk pack` can compute a Delta.nupkg.
+        # First release just no-ops (no prior to diff against) and
+        # `vpk pack` emits only a Full.nupkg, which is fine. Keep
+        # `continue-on-error` so a missing/private prior release
+        # doesn't abort the whole pipeline.
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        working-directory: codescope-rs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          New-Item -ItemType Directory -Force -Path target/distrib/velopack/releases | Out-Null
+          vpk download github `
+            --repoUrl "https://github.com/${{ github.repository }}" `
+            --token "$env:GH_TOKEN" `
+            --outputDir target/distrib/velopack/releases `
+            --channel win
+      - name: Pack with Velopack
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: codescope-rs
+        env:
+          # `build-local-artifacts` runs with the namespaced tag
+          # (e.g. `rs-v0.3.0-rc.2`) on `GITHUB_REF_NAME`; vpk wants a
+          # bare semver, so strip the `rs-v` prefix to match what
+          # cargo-dist's `--tag=` peels off and what `velopack_bridge.rs`
+          # compares against at runtime.
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          $fullTag = $env:GITHUB_REF_NAME
+          $packVersion = $fullTag -replace '^rs-v',''
+          Write-Host "Packing velopack release with version $packVersion"
+          # Flags mirror the C# `.github/workflows/release.yml` velopack
+          # step (see `vpk pack` block there), with these intentional
+          # divergences:
+          #   * `--packId codescope-rs` (the Rust port has its own
+          #     application identity — the C# build uses `CodeScope`).
+          #     `velopack_bridge.rs` doesn't pin a packId at runtime;
+          #     vpk's GithubSource matches on channel + repo, so the id
+          #     can differ between the two builds without colliding.
+          #   * No `--splashImage` — the Rust port doesn't ship a splash
+          #     asset (only the icon under `codescope-rs/assets/`).
+          vpk pack `
+            --packId codescope-rs `
+            --packVersion $packVersion `
+            --packDir target/distrib/velopack/publish `
+            --mainExe codescope-rs.exe `
+            --packTitle CodeScope `
+            --packAuthors maui1911 `
+            --icon assets/codescope.ico `
+            --channel win `
+            --outputDir target/distrib/velopack/releases
+          Write-Host "Velopack outputs:"
+          Get-ChildItem target/distrib/velopack/releases
+      - name: Collect Velopack upload paths
+        # Append the velopack release files (RELEASES-win, *.nupkg, the
+        # installer setup .exe) to the upload-artifact path list so the
+        # host job picks them up and `gh release create` attaches them
+        # alongside the MSI + zip.
+        if: runner.os == 'Windows'
+        id: velopack-paths
+        shell: bash
+        working-directory: codescope-rs
+        run: |
+          # Emit workspace-relative paths so they round-trip through
+          # upload-artifact the same way the cargo-dist outputs do
+          # (see the matching comment in the Post-build step above).
+          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
+          find target/distrib/velopack/releases -maxdepth 1 -type f \
+            | sed 's|^|codescope-rs/|' \
+            >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "Velopack upload paths:"
+          find target/distrib/velopack/releases -maxdepth 1 -type f \
+            | sed 's|^|codescope-rs/|'
       - name: "Upload artifacts"
         uses: actions/upload-artifact@v6
         with:
@@ -282,6 +422,7 @@ jobs:
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
             codescope-rs/${{ env.BUILD_MANIFEST_NAME }}
+            ${{ steps.velopack-paths.outputs.paths }}
 
   # Build and package all the platform-agnostic(ish) things
   build-global-artifacts:
