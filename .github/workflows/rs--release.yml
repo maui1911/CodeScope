@@ -46,8 +46,12 @@ on:
   # for now nothing in the repo benefits from validating the workflow
   # on every PR so we keep the trigger surface minimal.
   push:
+    # GitHub Actions tag filters are **glob/minimatch**, not regex —
+    # `+` would be matched literally. Use `*` (zero-or-more of any
+    # char) so both `rs-v0.0.2` and `rs-v0.3.0-rc1` match. Copilot
+    # caught the original regex-style pattern in PR #162 review.
     tags:
-      - 'rs-**[0-9]+.[0-9]+.[0-9]+*'
+      - 'rs-v[0-9]*.[0-9]*.[0-9]*'
 
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do

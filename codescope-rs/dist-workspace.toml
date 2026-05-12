@@ -21,9 +21,14 @@ members = ["cargo:."]
 #   downloads the WiX toolset itself; no manual install required.
 # - `install-path = "CARGO_HOME"` is the cargo-dist default for CLI
 #   tools, but CodeScope is a GUI app users launch from the Start menu,
-#   so we leave that field at its default and let the MSI installer put
-#   the binary under `%ProgramFiles%\CodeScope\` like a normal Win32
-#   desktop app.
+#   so we leave that field at its default and let the MSI installer
+#   put the binary under `%ProgramFiles%\codescope-rs\` (the WiX
+#   template derives the directory name from the Cargo `package.name`).
+#   The C# build installs to `%ProgramFiles%\CodeScope\` instead, so
+#   the two MSIs coexist on the same machine while we work the Rust
+#   port toward feature parity. The directory name can be rebranded
+#   to `CodeScope` once the Rust build is the only build shipping —
+#   that's a `[package.metadata.wix]` edit, not a rename.
 # - `install-updater = false` for now — Velopack handles the
 #   self-update path in-process (see `codescope-rs/core/src/update_check.rs`
 #   and the velopack integration on the AppShell). The axoupdater

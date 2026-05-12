@@ -436,10 +436,14 @@ brand — the split is purely build-system.
   parity in places (cross-platform, code signing, full Velopack
   channels). A combined pipeline would force both ports to rev tags
   together, which doesn't make sense yet.
-- **Tag-namespace separation** (`rs-` prefix vs. `v` prefix) keeps
-  the C# build's `git describe` flow untouched — `Directory.Build.targets`
-  filters on `v[0-9]+`, and the Rust-side `build.rs` does the same
-  with `git describe --tags`. The two namespaces never collide.
+- **Tag-namespace separation** (`rs-` prefix vs. `v` prefix). Both
+  pipelines run `git describe --tags --match v*` so the C# build's
+  informational version (and the Rust build's `CODESCOPE_VERSION_DISPLAY`)
+  only ever see product-version tags, never the Rust-pipeline-internal
+  `rs-vX.Y.Z` tags. Without that `--match`, `git describe` would pick
+  whichever tag is closest in commit-distance regardless of prefix —
+  exactly the failure mode Copilot caught on PR #162. See
+  `Directory.Build.targets` and `codescope-rs/build.rs`.
 
 **Consequences:**
 

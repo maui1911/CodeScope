@@ -20,14 +20,19 @@
 //!    Velopack bootstrapper (e.g. `cargo run`, a cargo-dist MSI install,
 //!    or a manually-unpacked binary) this is a fast no-op — Velopack
 //!    detects "no `Update.exe` sibling" and returns immediately.
-//! 2. **`maybe_apply_now`** is called when the user clicks "Apply
-//!    update" from a notification. It tries to construct an
-//!    `UpdateManager` against the same GitHub releases endpoint the
-//!    C# `vpk upload github` flow publishes to; if construction fails
-//!    (binary isn't Velopack-installed) we report `Unsupported` and
-//!    the caller falls back to just opening the release page in a
-//!    browser — same behaviour as today's notification entry that
-//!    surfaces `html_url`.
+//! 2. **`maybe_apply_now`** is called *automatically* on the
+//!    background executor as soon as the GitHub-release poll
+//!    reports a newer version, **gated on `is_velopack_install()`
+//!    returning `true`**. It tries to construct an `UpdateManager`
+//!    against the same GitHub releases endpoint the C# `vpk upload
+//!    github` flow publishes to; on success, Velopack downloads the
+//!    delta and `apply_updates_and_restart` exits the process so the
+//!    bootstrap helper can relaunch us on the new version. If
+//!    construction fails (binary isn't Velopack-installed) we report
+//!    `Unsupported` — but the gate above means we should never
+//!    actually reach this path in practice; the caller logs a
+//!    diagnostic if it ever does. Mirrors the C# `UpdateService`'s
+//!    "check + download + apply" auto-flow exactly.
 //!
 //! The GitHub-release polling loop in
 //! `codescope_core::update_check::check_once` continues to run
@@ -65,9 +70,15 @@ const CHANNEL: &str = "win";
 
 /// Result of an attempted Velopack apply.
 ///
-/// `Unsupported` carries the GitHub HTML URL as a fallback so the
-/// caller can fall back to "open the release page in a browser",
-/// which is what the polling notification surfaces today.
+/// The caller usually gates this entire call site on
+/// `is_velopack_install()` returning `true`, so `Unsupported` is
+/// only reachable when the install state changed between the gate
+/// and the call (or we've made a code-mismatch — the caller logs a
+/// diagnostic). The fallback URL ("open the release page") lives on
+/// the `UpdateStatus::Available` value from
+/// `codescope_core::update_check`, not on this enum — keep the
+/// Velopack outcome purely about the apply attempt and let the
+/// caller decide which fallback to surface.
 #[derive(Debug, Clone)]
 pub enum ApplyOutcome {
     /// Velopack staged the update and called `apply_updates_and_restart`,
@@ -79,8 +90,12 @@ pub enum ApplyOutcome {
     /// No update was available (the feed was empty, or the running
     /// version matches the latest).
     UpToDate,
-    /// This binary wasn't installed via Velopack. Caller should
-    /// surface the fallback URL (the GitHub release page) instead.
+    /// This binary wasn't installed via Velopack — caller should
+    /// have gated on `is_velopack_install()` and surfaced the
+    /// GitHub release URL (from
+    /// `codescope_core::update_check::UpdateStatus::Available.url`)
+    /// instead. Indicates a code-path mismatch when actually
+    /// returned.
     Unsupported,
     /// Velopack tried but something failed (network, parse, file IO,
     /// …). Message is a single human-readable line suitable for the
@@ -198,20 +213,53 @@ pub fn channel_override() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serialises every env-mutation test in this module. cargo runs
+    /// `#[test]` functions in parallel by default and the env-mutation
+    /// API (`set_var` / `remove_var`) is unsound across threads, so we
+    /// hold this mutex for the entire body of each env test. Reused
+    /// pattern from `std::env::set_var` rustdoc — same approach the
+    /// stdlib's own internal tests take.
+    ///
+    /// Caught by Copilot on PR #162 (the original tests asserted
+    /// "single-threaded" without enforcing it; cargo's parallel test
+    /// runner would have flaked sooner or later).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Snapshot + restore guard for `CODESCOPE_VELOPACK_CHANNEL`. The
+    /// `Drop` impl puts the env back the way we found it even if the
+    /// test panics — without it a panicking test would leak the
+    /// override into whatever test runs next on the same process.
+    struct EnvGuard {
+        previous: Option<String>,
+    }
+    impl EnvGuard {
+        fn capture() -> Self {
+            Self {
+                previous: std::env::var("CODESCOPE_VELOPACK_CHANNEL").ok(),
+            }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: lock is held by the caller for the lifetime of
+            // this guard (test holds `_lock` until end of scope).
+            unsafe {
+                match &self.previous {
+                    Some(v) => std::env::set_var("CODESCOPE_VELOPACK_CHANNEL", v),
+                    None => std::env::remove_var("CODESCOPE_VELOPACK_CHANNEL"),
+                }
+            }
+        }
+    }
 
     #[test]
     fn channel_override_defaults_to_win() {
-        // Test running with no env override should yield "win".
-        //
-        // SAFETY: cargo runs tests with a clean-enough env that we
-        // assert the default. If a developer sets the override in
-        // their shell this test will fail loudly, which is the
-        // intended signal.
-        // SAFETY: `remove_var` is unsafe in Rust 2024 because env
-        // mutation isn't thread-safe; the test harness is
-        // single-threaded for this module so it's a localised use
-        // that mirrors how `tempfile`-style tests interact with
-        // process env.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::capture();
+        // SAFETY: env mutation serialised via `ENV_LOCK`; `EnvGuard`
+        // restores the previous value on drop.
         unsafe {
             std::env::remove_var("CODESCOPE_VELOPACK_CHANNEL");
         }
@@ -220,15 +268,13 @@ mod tests {
 
     #[test]
     fn channel_override_honours_env_var() {
-        // SAFETY: same caveat as the previous test — single-threaded
-        // module-level test, see std::env::set_var docs.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::capture();
+        // SAFETY: same as above — serialised + restored.
         unsafe {
             std::env::set_var("CODESCOPE_VELOPACK_CHANNEL", "beta");
         }
         assert_eq!(channel_override(), "beta");
-        unsafe {
-            std::env::remove_var("CODESCOPE_VELOPACK_CHANNEL");
-        }
     }
 
     #[test]
