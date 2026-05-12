@@ -4713,8 +4713,9 @@ pub(crate) fn open_path_in_windows_terminal(path: &str) {
 /// "submit" key — filtering is live as the user types.
 ///
 /// Chords with Ctrl / Cmd (= `platform` on gpui) / Alt held are
-/// intentionally *not* consumed. App-level shortcuts (Ctrl+B to
-/// toggle sidebar, Ctrl+T to spawn a tab, …) keep working while
+/// intentionally *not* consumed. App-level shortcuts
+/// (Ctrl+Shift+B to toggle sidebar, Ctrl+Shift+T to spawn a tab,
+/// …) keep working while
 /// the filter has focus — without this gate `stop_propagation()`
 /// would swallow the chord at the filter and the shortcut would
 /// silently turn into a stray `b` / `t` in the filter buffer.
@@ -4752,8 +4753,8 @@ fn handle_filter_key_down(
         _ => {}
     }
     if app_chord {
-        // Let app-level handlers (e.g. Ctrl+B / Ctrl+T in
-        // `AppShell::on_key_down`) see the chord.
+        // Let app-level handlers (e.g. Ctrl+Shift+B / Ctrl+Shift+T
+        // in `AppShell::on_key_down`) see the chord.
         return;
     }
     let Some(key_char) = event.keystroke.key_char.as_deref() else {

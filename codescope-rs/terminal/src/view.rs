@@ -746,21 +746,41 @@ fn to_mouse_button(button: MouseButton) -> Option<mouse::MouseButton> {
 ///
 /// Mirrors the AppShell `on_key_down` chord set so a chord typed
 /// while the terminal has focus bubbles up to the shell instead of
-/// being eaten + forwarded to the PTY (the "Ctrl+Shift+O / Ctrl+
-/// Shift+P don't open palettes when the terminal is focused" bug).
+/// being eaten + forwarded to the PTY.
+///
+/// **All app chords require Ctrl+Shift** so they don't collide with
+/// the wealth of plain-Ctrl bindings coding agents inside the
+/// terminal rely on (Ctrl+W = backward-kill-word, Ctrl+P = previous
+/// history, Ctrl+T = transpose, Ctrl+B = backward-char, Ctrl+1..9
+/// often mapped to history selection, …). Plain Ctrl+letter falls
+/// through to the PTY untouched.
+///
+/// The only chords still on plain Ctrl are Ctrl+Tab / Ctrl+Shift+Tab
+/// (no shell binds Ctrl+Tab — shift is intrinsic to "prev" tab).
 pub(crate) fn is_app_level_shortcut(key: &str, mods: &gpui::Modifiers) -> bool {
     let app_mod = mods.control || mods.platform;
     if !app_mod || mods.alt {
         return false;
     }
-    // Ctrl+Tab / Ctrl+Shift+Tab (tab cycling).
+    // Ctrl+Tab / Ctrl+Shift+Tab — tab cycling. Shells don't bind
+    // Ctrl+Tab; let both shapes bubble.
     if key == "tab" {
         return true;
     }
-    // Ctrl+1 .. Ctrl+9 (direct tab select). Plain Ctrl only —
-    // Ctrl+Shift+digit is not bound at the shell, so let the
-    // terminal keep it for its own use.
-    if !mods.shift
+    // Ctrl+Shift+1..9 — focus tab N. Plain Ctrl+1..9 stays with
+    // the terminal so the agent inside can use them.
+    //
+    // gpui's Windows keyboard adapter folds Shift+digit into the
+    // shifted glyph (Shift+1 ⇒ "!", Shift+2 ⇒ "@", …) and clears
+    // `mods.shift`. Accept both shapes:
+    //
+    //   - "1".."9" with shift still set (some non-US layouts).
+    //   - The US-layout shifted glyphs "!@#$%^&*(" with shift
+    //     cleared (the common Windows case).
+    //
+    // "0" / ")" is intentionally not matched — Ctrl+Shift+0 is
+    // unbound to mirror the AppShell handler.
+    if mods.shift
         && key.len() == 1
         && key
             .chars()
@@ -769,41 +789,41 @@ pub(crate) fn is_app_level_shortcut(key: &str, mods: &gpui::Modifiers) -> bool {
     {
         return true;
     }
-    // Ctrl+T (new tab), Ctrl+W (close tab) — both shifted and
-    // unshifted bubble. C# `MainWindow.InputBindings` binds plain
-    // Ctrl+T / Ctrl+W to NewSession / CloseTab, so for parity we
-    // hand the chord to the app shell. Shift variants stay as
-    // long-standing alternates so muscle memory keeps working.
-    if key == "t" || key == "w" {
+    if matches!(key, "!" | "@" | "#" | "$" | "%" | "^" | "&" | "*" | "(") {
         return true;
     }
-    // Ctrl+\ / Ctrl+| (split right). C# binds `OemPipe` (Ctrl+|);
-    // on US layouts that's Shift+\, so we accept both shapes.
-    if key == "\\" {
+    // Ctrl+Shift+T (new tab) / Ctrl+Shift+W (close tab). Plain
+    // Ctrl+T / Ctrl+W stay with the terminal — agents rely on
+    // them (transpose / backward-kill-word in readline).
+    if (key == "t" || key == "w") && mods.shift {
         return true;
     }
-    // Ctrl+P / Ctrl+Shift+P — command palette open / toggle.
-    // Both shapes share an opener in AppShell, so both bubble.
-    if key == "p" {
+    // Ctrl+Shift+\ (split right). On US layouts the gpui Windows
+    // adapter folds Shift+\ into "|" and clears `mods.shift`, so
+    // we accept both shapes.
+    if key == "\\" && mods.shift {
         return true;
     }
-    // Ctrl+Shift+O — toggle the Overview panel. Plain Ctrl+O is
-    // not bound at the shell (and is a common shell shortcut for
-    // "open" in readline-flavoured tools), so we *only* bubble
-    // the shifted form.
+    if key == "|" {
+        return true;
+    }
+    // Ctrl+Shift+P — command palette. Plain Ctrl+P stays with the
+    // terminal so readline previous-history keeps working.
+    if key == "p" && mods.shift {
+        return true;
+    }
+    // Ctrl+Shift+O — overview pane.
     if key == "o" && mods.shift {
         return true;
     }
-    // Ctrl+B — toggle sidebar. Plain Ctrl+B only; Ctrl+Shift+B
-    // is unbound and stays with the terminal (readline maps it
-    // to backward-char in some configs).
-    if key == "b" && !mods.shift {
+    // Ctrl+Shift+B — toggle sidebar. Plain Ctrl+B stays with the
+    // terminal (readline backward-char).
+    if key == "b" && mods.shift {
         return true;
     }
-    // Ctrl+, — open Settings. Windows / VS Code convention,
-    // unbound in any shell so it's safe to swallow regardless
-    // of the shift state.
-    if key == "," {
+    // Ctrl+Shift+, — open Settings. Plain Ctrl+, stays with the
+    // terminal in case the agent / shell has bound it.
+    if key == "," && mods.shift {
         return true;
     }
     false
@@ -967,41 +987,70 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_t_bubbles_to_app_shell() {
-        // C# `MainWindow.InputBindings` binds Ctrl+T → NewSession.
-        // Mirror that on the Rust side.
-        assert!(is_app_level_shortcut("t", &ctrl()));
+    fn ctrl_shift_t_bubbles_to_app_shell() {
+        // Ctrl+Shift+T is the universal new-tab chord. Plain Ctrl+T
+        // stays with the terminal (readline transpose-char).
         assert!(is_app_level_shortcut("t", &ctrl_shift()));
+        assert!(!is_app_level_shortcut("t", &ctrl()));
     }
 
     #[test]
-    fn ctrl_w_bubbles_to_app_shell() {
-        assert!(is_app_level_shortcut("w", &ctrl()));
+    fn ctrl_shift_w_bubbles_to_app_shell() {
+        // Ctrl+Shift+W closes the tab. Plain Ctrl+W stays with the
+        // terminal — readline binds it to backward-kill-word, and
+        // taking it away would break every coding agent CLI.
         assert!(is_app_level_shortcut("w", &ctrl_shift()));
+        assert!(!is_app_level_shortcut("w", &ctrl()));
     }
 
     #[test]
     fn ctrl_tab_and_shift_tab_bubble() {
+        // Ctrl+Tab / Ctrl+Shift+Tab are the only chords still on
+        // plain Ctrl — no shell binds Ctrl+Tab.
         assert!(is_app_level_shortcut("tab", &ctrl()));
         assert!(is_app_level_shortcut("tab", &ctrl_shift()));
     }
 
     #[test]
-    fn ctrl_digit_bubbles_only_for_one_through_nine() {
+    fn ctrl_shift_digit_bubbles_only_for_one_through_nine() {
+        // Bare-digit shape (non-US layouts and most non-Windows
+        // platforms): "1".."9" with shift still set.
         for d in '1'..='9' {
             let key = d.to_string();
-            assert!(is_app_level_shortcut(&key, &ctrl()), "digit {d}");
+            assert!(is_app_level_shortcut(&key, &ctrl_shift()), "digit {d}");
         }
-        // Ctrl+0 stays with the shell — C# doesn't bind it either.
-        assert!(!is_app_level_shortcut("0", &ctrl()));
+        // US-layout shifted-glyph shape: gpui's Windows adapter
+        // returns "!@#$%^&*(" with shift cleared.
+        for glyph in ["!", "@", "#", "$", "%", "^", "&", "*", "("] {
+            assert!(is_app_level_shortcut(glyph, &ctrl()), "glyph {glyph}");
+        }
+        // Ctrl+Shift+0 / Ctrl+) intentionally unbound.
+        assert!(!is_app_level_shortcut("0", &ctrl_shift()));
+        assert!(!is_app_level_shortcut(")", &ctrl()));
     }
 
     #[test]
-    fn ctrl_backslash_bubbles_for_split() {
-        // Both bare Ctrl+\ and the shifted Ctrl+| variant land here
-        // with `key == "\\"` on US layouts; Ctrl+| is what C# binds.
-        assert!(is_app_level_shortcut("\\", &ctrl()));
+    fn plain_ctrl_digit_stays_with_terminal() {
+        // Plain Ctrl+1..9 (no shift) is *not* an app chord any more
+        // — agents inside the terminal use Ctrl+digit. This is the
+        // central guarantee of the Ctrl+Shift universal remap.
+        for d in '1'..='9' {
+            let key = d.to_string();
+            assert!(
+                !is_app_level_shortcut(&key, &ctrl()),
+                "plain Ctrl+{d} must stay with the terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_shift_backslash_bubbles_for_split() {
+        // Both bare Ctrl+Shift+\ and the US-layout-folded "|"
+        // shape map to split-right.
         assert!(is_app_level_shortcut("\\", &ctrl_shift()));
+        assert!(is_app_level_shortcut("|", &ctrl()));
+        // Plain Ctrl+\ stays with the terminal.
+        assert!(!is_app_level_shortcut("\\", &ctrl()));
     }
 
     #[test]
@@ -1028,33 +1077,33 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_p_and_ctrl_shift_p_bubble_for_palette() {
-        // AppShell binds both shapes to the command palette
-        // open/toggle action — both must escape the terminal.
-        assert!(is_app_level_shortcut("p", &ctrl()));
+    fn ctrl_shift_p_bubbles_for_palette_only() {
+        // Plain Ctrl+P is readline previous-history, kept with the
+        // terminal. Only Ctrl+Shift+P opens the palette now.
         assert!(is_app_level_shortcut("p", &ctrl_shift()));
+        assert!(!is_app_level_shortcut("p", &ctrl()));
     }
 
     #[test]
     fn ctrl_shift_o_bubbles_for_overview() {
-        // Only the shifted form is bound (plain Ctrl+O is a
-        // common shell shortcut and stays with the terminal).
         assert!(is_app_level_shortcut("o", &ctrl_shift()));
         assert!(!is_app_level_shortcut("o", &ctrl()));
     }
 
     #[test]
-    fn ctrl_b_bubbles_for_sidebar() {
-        // Plain Ctrl+B only; Ctrl+Shift+B stays with the terminal.
-        assert!(is_app_level_shortcut("b", &ctrl()));
-        assert!(!is_app_level_shortcut("b", &ctrl_shift()));
+    fn ctrl_shift_b_bubbles_for_sidebar() {
+        // Ctrl+Shift+B opens the sidebar. Plain Ctrl+B is readline
+        // backward-char and stays with the terminal.
+        assert!(is_app_level_shortcut("b", &ctrl_shift()));
+        assert!(!is_app_level_shortcut("b", &ctrl()));
     }
 
     #[test]
-    fn ctrl_comma_bubbles_for_settings() {
-        // Windows / VS Code convention — Settings dialog opener.
-        assert!(is_app_level_shortcut(",", &ctrl()));
+    fn ctrl_shift_comma_bubbles_for_settings() {
+        // Only the shifted form opens Settings — plain Ctrl+, may
+        // be bound inside the terminal by user tooling.
         assert!(is_app_level_shortcut(",", &ctrl_shift()));
+        assert!(!is_app_level_shortcut(",", &ctrl()));
     }
 }
 

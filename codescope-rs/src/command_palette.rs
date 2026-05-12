@@ -2,7 +2,7 @@
 //! `src/CodeScope.Ui/Dialogs/CommandPaletteDialog.xaml(.cs)` +
 //! `CommandPaletteViewModel.cs` + `MainViewModel.Palette.cs`.
 //!
-//! Ctrl+P / Ctrl+Shift+P open the palette. Fuzzy search runs over a
+//! Ctrl+Shift+P opens the palette. Fuzzy search runs over a
 //! freshly-assembled list of actions covering five kinds:
 //!
 //! - **Projects**  — focus / select the project in the sidebar.
@@ -83,11 +83,11 @@ pub enum BuiltInCommand {
     /// sidebar's `OpenOverview` event the same way the footer button
     /// does. Keymap hint: Ctrl+Shift+O.
     ToggleOverview,
-    /// Show / hide the sidebar. Keymap hint: Ctrl+B.
+    /// Show / hide the sidebar. Keymap hint: Ctrl+Shift+B.
     ToggleSidebar,
     /// Open the "Add project" dialog. Keymap hint: none (the `+` button).
     NewProject,
-    /// Spawn a new shell tab. Keymap hint: Ctrl+T.
+    /// Spawn a new shell tab. Keymap hint: Ctrl+Shift+T.
     NewSession,
     /// Reveal `settings.json` in the platform file browser. Keymap
     /// hint: none — the C# build wires this through a menu item.
@@ -118,10 +118,10 @@ impl BuiltInCommand {
     pub fn hint(self) -> &'static str {
         match self {
             BuiltInCommand::ToggleOverview => "Ctrl+Shift+O",
-            BuiltInCommand::ToggleSidebar => "Ctrl+B",
+            BuiltInCommand::ToggleSidebar => "Ctrl+Shift+B",
             BuiltInCommand::NewProject => "+",
-            BuiltInCommand::NewSession => "Ctrl+T",
-            BuiltInCommand::OpenSettings => "Ctrl+,",
+            BuiltInCommand::NewSession => "Ctrl+Shift+T",
+            BuiltInCommand::OpenSettings => "Ctrl+Shift+,",
             BuiltInCommand::ReloadTheme => "menu",
         }
     }
@@ -496,13 +496,18 @@ fn handle_key_down(
     let key = event.keystroke.key.as_str();
     cx.stop_propagation();
 
-    // Ctrl+P / Ctrl+Shift+P while the palette is focused — the chord
-    // can't bubble to `AppShell::on_key_down` (we `stop_propagation`
-    // above), so we mirror its toggle-close behaviour locally. Without
-    // this, the open chord becomes a one-way trip and the user has to
-    // hit Esc or click the backdrop. Matches the menu / overview /
-    // sidebar single-chord toggle pattern across the rest of the chrome.
-    if key == "p" && event.keystroke.modifiers.control {
+    // Ctrl+Shift+P while the palette is focused — the chord can't
+    // bubble to `AppShell::on_key_down` (we `stop_propagation`
+    // above), so we mirror its toggle-close behaviour locally.
+    // Without this, the open chord becomes a one-way trip and the
+    // user has to hit Esc or click the backdrop. Matches the menu /
+    // overview / sidebar single-chord toggle pattern across the rest
+    // of the chrome.
+    //
+    // The universal Ctrl+Shift remap requires shift here too —
+    // plain Ctrl+P stays with the textbox layer.
+    let mods = &event.keystroke.modifiers;
+    if key == "p" && (mods.control || mods.platform) && mods.shift {
         shell.close_command_palette(cx);
         return;
     }
