@@ -231,12 +231,34 @@ jobs:
         working-directory: codescope-rs
         run: |
           # Parse out what we just built and upload it to scratch storage.
-          # dist emits paths relative to its working-dir (codescope-rs/), but
-          # upload-artifact resolves `path:` from $GITHUB_WORKSPACE — prepend
-          # `codescope-rs/` to every emitted path so the upload step finds them.
+          # `dist print-upload-files-from-manifest` emits ABSOLUTE paths
+          # (e.g. `D:\a\CodeScope\CodeScope\codescope-rs\target\distrib\foo.msi`
+          # on Windows, `/home/runner/.../codescope-rs/target/distrib/foo.tar.xz`
+          # on Linux/macOS), not workspace-relative ones. The previous fix
+          # here was `sed 's|^|codescope-rs/|'`, which glued the prefix onto
+          # already-absolute paths and produced nonsense like
+          # `codescope-rs/D:\a\...`. upload-artifact then silently warned the
+          # bogus paths away (`if-no-files-found: warn`) and the only file
+          # that actually shipped to the release was the dist-manifest.
+          #
+          # Normalize backslashes → forward slashes first (Windows paths),
+          # then strip everything up to and including `codescope-rs/` and
+          # re-prepend it. End result: `codescope-rs/target/distrib/foo.msi`.
+          # After `host` fetches everything into `artifacts/` and flattens,
+          # the basenames land at `artifacts/<basename>` for
+          # `gh release create artifacts/*`.
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
-          dist print-upload-files-from-manifest --manifest dist-manifest.json | sed 's|^|codescope-rs/|' >> "$GITHUB_OUTPUT"
+          dist print-upload-files-from-manifest --manifest dist-manifest.json \
+            | tr '\\' '/' \
+            | sed 's|^.*/codescope-rs/|codescope-rs/|' \
+            >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
+
+          # Echo the rewritten paths for debugging (next runs grep this).
+          echo "Upload paths (post-rewrite):"
+          dist print-upload-files-from-manifest --manifest dist-manifest.json \
+            | tr '\\' '/' \
+            | sed 's|^.*/codescope-rs/|codescope-rs/|'
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
       - name: "Upload artifacts"
@@ -285,12 +307,28 @@ jobs:
           echo "dist ran successfully"
 
           # Parse out what we just built and upload it to scratch storage.
-          # dist runs from codescope-rs/, so emitted upload_files are
-          # codescope-rs-relative — prefix them for upload-artifact which
-          # resolves `path:` from $GITHUB_WORKSPACE.
+          # `upload_files` in the dist manifest holds ABSOLUTE paths
+          # (`/home/runner/.../codescope-rs/target/distrib/foo`); the previous
+          # `sed 's|^|codescope-rs/|'` glued a prefix onto already-absolute
+          # paths and silently broke the upload — see the matching comment
+          # in build-local-artifacts.
+          #
+          # Strip the runner-specific prefix back to `codescope-rs/` so each
+          # upload entry lands at `codescope-rs/target/distrib/<file>`. The
+          # `tr` normalizes `\` → `/` defensively even though this job only
+          # runs on ubuntu — keeps the pipeline identical to the build-local
+          # variant for future-proofing.
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
-          jq --raw-output ".upload_files[]" dist-manifest.json | sed 's|^|codescope-rs/|' >> "$GITHUB_OUTPUT"
+          jq --raw-output ".upload_files[]" dist-manifest.json \
+            | tr '\\' '/' \
+            | sed 's|^.*/codescope-rs/|codescope-rs/|' \
+            >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
+
+          echo "Upload paths (post-rewrite):"
+          jq --raw-output ".upload_files[]" dist-manifest.json \
+            | tr '\\' '/' \
+            | sed 's|^.*/codescope-rs/|codescope-rs/|'
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
       - name: "Upload artifacts"
@@ -357,26 +395,47 @@ jobs:
       - name: Cleanup
         run: |
           # Uploaded artifacts preserve their workspace-relative paths.
-          # build-local-artifacts emits codescope-rs-relative paths (e.g.
-          # `target/distrib/foo.msi`) so they land under `artifacts/target/`;
-          # the plan upload preserves the `codescope-rs/` prefix and lands
-          # under `artifacts/codescope-rs/`. Flatten every regular file in
+          # Every upload step (plan / build-local / build-global) now stores
+          # entries under `codescope-rs/...` (see the matching comments
+          # there), so after merge-multiple they land under
+          # `artifacts/codescope-rs/...`. Flatten every regular file in
           # `artifacts/` down to `artifacts/<basename>` so
           # `gh release create artifacts/*` (which doesn't recurse into
           # directories) sees the release files.
+          echo "Before flatten:"
+          find artifacts -type f | sort
           find artifacts -mindepth 2 -type f -exec mv -t artifacts/ {} +
           find artifacts -mindepth 1 -type d -empty -delete
           # Remove the granular manifests
           rm -f artifacts/*-dist-manifest.json
+          echo "After flatten:"
+          find artifacts -type f | sort
       - name: Create GitHub Release
         env:
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
+          # Re-attach the `rs-` namespace prefix when rewriting download URLs
+          # below. Keep this in sync with `tag-namespace` in
+          # codescope-rs/dist-workspace.toml.
+          TAG_NAMESPACE: "rs-"
         run: |
-          # Write and read notes from a file to avoid quoting breaking things
-          echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
+          # Debug: list everything that will go up as a release asset.
+          echo "Artifacts to upload:"
+          ls -la artifacts/
+
+          # Write and read notes from a file to avoid quoting breaking things.
+          # cargo-dist builds the announcement body using the STRIPPED tag
+          # (e.g. `v0.3.0-rc.1`) because we feed it `--tag=v0.3.0-rc.1` after
+          # peeling the `rs-` namespace prefix (see the `tags` step on the
+          # `plan` job). But the actual GitHub release tag carries the
+          # namespace (`rs-v0.3.0-rc.1`), so every download URL in the body
+          # would 404. Patch the release-asset URLs to include the prefix
+          # before writing the notes file.
+          printf '%s' "$ANNOUNCEMENT_BODY" \
+            | sed "s|/releases/download/v|/releases/download/${TAG_NAMESPACE}v|g" \
+            > "$RUNNER_TEMP/notes.txt"
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
