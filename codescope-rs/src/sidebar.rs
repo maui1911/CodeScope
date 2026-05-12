@@ -1350,6 +1350,22 @@ impl Sidebar {
         cx.notify();
     }
 
+    /// Build the auto-type command string for the registry's default
+    /// agent (e.g. `"claude"`, `"codex --resume"`). Used by the
+    /// double-click handler on a worktree row so opening a tab from
+    /// the sidebar lands in the user's configured default agent
+    /// instead of a plain shell. Mirrors AppShell::default_agent_auto_type
+    /// but reads from the sidebar's own cached registry — the two are
+    /// kept in lockstep via `apply_agent_registry`.
+    fn default_agent_auto_type(&self) -> Option<SharedString> {
+        let profile = self.agent_registry.get_default()?;
+        let mut argv: Vec<String> =
+            Vec::with_capacity(1 + profile.new_session_args.len());
+        argv.push(profile.command.clone());
+        argv.extend(profile.new_session_args.iter().cloned());
+        Some(SharedString::from(argv.join(" ")))
+    }
+
     /// Open the project context menu at `position` (window coords)
     /// for the project at `idx`. No-op if the index is out of range.
     fn open_project_menu(
@@ -2862,10 +2878,20 @@ impl Render for Sidebar {
                             // "New <agent> session" rows remain the keyboard /
                             // right-click paths.
                             if is_double_click(event.click_count) {
+                                // Resolve the default agent so the
+                                // worktree double-click lands the user
+                                // in their configured agent (Claude /
+                                // Codex / …), not a plain shell. The
+                                // sidebar's `agent_registry` is kept in
+                                // lockstep with `Settings.default_agent`
+                                // via `apply_agent_registry` on save —
+                                // so a freshly-saved default takes
+                                // effect on the very next double-click.
+                                let auto_type = this.default_agent_auto_type();
                                 cx.emit(SidebarEvent::OpenSession {
                                     working_directory: PathBuf::from(&wt_path_for_event),
                                     title: title_label.clone(),
-                                    auto_type: None,
+                                    auto_type,
                                     force_new: false,
                                 });
                             } else {
