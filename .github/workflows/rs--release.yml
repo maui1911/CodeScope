@@ -218,7 +218,21 @@ jobs:
           ${{ matrix.packages_install }}
       - name: Build artifacts
         working-directory: codescope-rs
+        shell: bash
         run: |
+          # Pin the version slug to the stripped tag (e.g.
+          # `0.3.0-rc.1`) so the title-bar chrome reads the actual
+          # release version instead of `git describe --always`'s
+          # commit-hash fallback — Actions checkouts are shallow and
+          # often can't see any `rs-v*` tag, even though the workflow
+          # itself was triggered by one. `build.rs` consumes
+          # `CODESCOPE_VERSION` as an override; strip the leading
+          # `rs-v` so the slug renders as `V0.3.0-rc.1` (build.rs adds
+          # the `V` prefix at render time).
+          FULL_TAG="${GITHUB_REF_NAME}"
+          STRIPPED_VERSION="${FULL_TAG#rs-v}"
+          export CODESCOPE_VERSION="${STRIPPED_VERSION}"
+          echo "Building with CODESCOPE_VERSION=${CODESCOPE_VERSION}"
           # Actually do builds and make zips and whatnot
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
