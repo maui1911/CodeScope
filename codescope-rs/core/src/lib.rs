@@ -52,7 +52,11 @@ pub use copilot_discovery::POLL_INTERVAL_MS as COPILOT_DISCOVERY_POLL_MS;
 pub use copilot_telemetry::CopilotTranscriptTail;
 pub use opencode_discovery::POLL_INTERVAL_MS as OPENCODE_DISCOVERY_POLL_MS;
 pub use opencode_telemetry::OpenCodeMessageTail;
-pub use overview::{OverviewLifecycle, OverviewRow, build_rows as build_overview_rows};
+pub use overview::{
+    LiveSessionLookup, OverviewLifecycle, OverviewRow,
+    build_rows as build_overview_rows,
+    build_rows_for_live as build_overview_rows_for_live,
+};
 pub use pi_discovery::POLL_INTERVAL_MS as PI_DISCOVERY_POLL_MS;
 pub use pi_telemetry::PiTranscriptTail;
 pub use layout::{LayoutState, RestoreTab};
