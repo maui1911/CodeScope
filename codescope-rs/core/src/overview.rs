@@ -84,19 +84,94 @@ impl OverviewRow {
     }
 }
 
+/// Default cap on the number of closed-session rows surfaced in the
+/// Overview. Mirrors the "show the last 20 closed sessions" heuristic
+/// the brief calls out — the on-disk `RetentionPolicy` keeps a much
+/// larger window (60 days / 200 entries per project) so the user can
+/// reopen old work, but dumping every retained closed row into a
+/// single grid drowns the panel. Live rows are never capped.
+pub const DEFAULT_MAX_CLOSED_ROWS: usize = 20;
+
+/// Closed-row dedup window. Two closed sessions for the same
+/// `(project_name, agent_id)` whose `closed_at` stamps fall within
+/// this window are treated as the same logical tab restarted and
+/// only the newest row is kept. The 5-minute span was picked to
+/// match the brief — long enough to swallow a quick crash + respawn
+/// loop, short enough that two genuinely separate working sessions
+/// from the same agent on the same project don't get folded into
+/// one row.
+pub const CLOSED_DEDUP_WINDOW_SECS: f64 = 5.0 * 60.0;
+
 /// Build the flat row list from a [`ProjectsConfig`] snapshot,
-/// already sorted via [`sort_rows`]. Mirrors C#
+/// already sorted via [`sort_rows`] and capped at
+/// [`DEFAULT_MAX_CLOSED_ROWS`] closed rows. Mirrors C#
 /// `OverviewViewModel.Rebuild` minus the per-card preview lines (the
 /// Rust port builds those in the gpui layer so it can fold in live
 /// telemetry without re-running this pass).
 pub fn build_rows(cfg: &ProjectsConfig) -> Vec<OverviewRow> {
+    build_rows_capped(cfg, DEFAULT_MAX_CLOSED_ROWS)
+}
+
+/// Build the flat row list with an explicit cap on the number of
+/// closed-session rows. Live rows are never capped; closed rows are
+/// sorted newest-first, deduped by `(project_name, agent_id)` within
+/// a [`CLOSED_DEDUP_WINDOW_SECS`] window (so a quick respawn loop
+/// only surfaces the most recent row), and then truncated to
+/// `max_closed` entries.
+pub fn build_rows_capped(cfg: &ProjectsConfig, max_closed: usize) -> Vec<OverviewRow> {
     let mut rows: Vec<OverviewRow> = cfg
         .projects
         .iter()
         .flat_map(|p| p.sessions.iter().map(move |s| OverviewRow::from_session(p, s)))
         .collect();
     sort_rows(&mut rows);
-    rows
+
+    // Split into live (no cap) + closed (sorted newest-first by
+    // virtue of `sort_rows`). The live partition keeps its sort order
+    // because `sort_rows` already puts live before closed.
+    let split = rows
+        .iter()
+        .position(|r| r.lifecycle == OverviewLifecycle::Closed)
+        .unwrap_or(rows.len());
+    let closed_tail = rows.split_off(split);
+    let mut live = rows;
+
+    // Dedup near-identical closed rows. For each kept row we record
+    // the (project_name, agent_id, closed_at_secs) key. A candidate
+    // row is suppressed when an earlier (newer) row shares the same
+    // (project, agent) and its `closed_at` is within the dedup
+    // window. We keep the newest row of each cluster which falls out
+    // naturally because `closed_tail` is already newest-first.
+    let mut deduped: Vec<OverviewRow> = Vec::with_capacity(closed_tail.len().min(max_closed));
+    let mut kept_keys: Vec<(String, Option<String>, Option<f64>)> = Vec::new();
+    for row in closed_tail {
+        let key_proj = row.project_name.clone();
+        let key_agent = row.agent_id.clone();
+        let row_secs = row.closed_at.as_deref().and_then(parse_iso8601_secs);
+        let is_dup = kept_keys.iter().any(|(p, a, t)| {
+            p == &key_proj
+                && a == &key_agent
+                && match (row_secs, *t) {
+                    (Some(a_secs), Some(b_secs)) => {
+                        (a_secs - b_secs).abs() <= CLOSED_DEDUP_WINDOW_SECS
+                    }
+                    // Without a parseable timestamp on either side we
+                    // can't bound the cluster, so we don't dedup.
+                    _ => false,
+                }
+        });
+        if is_dup {
+            continue;
+        }
+        kept_keys.push((key_proj, key_agent, row_secs));
+        deduped.push(row);
+        if deduped.len() >= max_closed {
+            break;
+        }
+    }
+
+    live.extend(deduped);
+    live
 }
 
 /// Sort an Overview row list in display order:
@@ -293,5 +368,149 @@ mod tests {
             &mk_session("s2", None, Some("2026-05-11T10:00:00Z")),
         );
         assert_eq!(closed.lifecycle, OverviewLifecycle::Closed);
+    }
+
+    #[test]
+    fn build_rows_caps_closed_at_default_limit() {
+        // 25 closed sessions, one project — only the newest 20 survive
+        // and the live row is always retained even though it'd sort
+        // below all the recent closed rows by raw timestamp (live
+        // rows have a separate sort domain).
+        let mut sessions = Vec::new();
+        sessions.push(mk_session("live", Some("2026-01-01T00:00:00Z"), None));
+        for i in 0..25 {
+            // Stagger closed_at stamps an hour apart so the dedup
+            // window can't fold them together, and vary the agent
+            // slightly per row so the (project, agent) dedup key is
+            // unique.
+            let stamp = format!("2026-05-11T{:02}:00:00Z", i);
+            let mut s = mk_session(&format!("c{i}"), None, Some(&stamp));
+            s.agent_id = Some(format!("agent-{i}"));
+            sessions.push(s);
+        }
+        let cfg = ProjectsConfig {
+            version: 1,
+            agents: vec![],
+            projects: vec![mk_project("p1", "alpha", sessions)],
+        };
+
+        let rows = build_rows(&cfg);
+        let live_count = rows
+            .iter()
+            .filter(|r| r.lifecycle == OverviewLifecycle::Live)
+            .count();
+        let closed_count = rows
+            .iter()
+            .filter(|r| r.lifecycle == OverviewLifecycle::Closed)
+            .count();
+        assert_eq!(live_count, 1, "live row must always be retained");
+        assert_eq!(
+            closed_count, DEFAULT_MAX_CLOSED_ROWS,
+            "closed cap honoured"
+        );
+    }
+
+    #[test]
+    fn build_rows_under_cap_returns_everything() {
+        let mut sessions = Vec::new();
+        for i in 0..5 {
+            let stamp = format!("2026-05-11T{:02}:00:00Z", i);
+            let mut s = mk_session(&format!("c{i}"), None, Some(&stamp));
+            s.agent_id = Some(format!("agent-{i}"));
+            sessions.push(s);
+        }
+        let cfg = ProjectsConfig {
+            version: 1,
+            agents: vec![],
+            projects: vec![mk_project("p1", "alpha", sessions)],
+        };
+
+        let rows = build_rows(&cfg);
+        assert_eq!(rows.len(), 5);
+    }
+
+    #[test]
+    fn build_rows_capped_keeps_newest_first_when_over_cap() {
+        // 5 closed rows, cap to 2 — must keep the two newest by
+        // closed_at, in newest-first order.
+        let sessions = vec![
+            {
+                let mut s = mk_session("oldest", None, Some("2026-05-01T00:00:00Z"));
+                s.agent_id = Some("a".into());
+                s
+            },
+            {
+                let mut s = mk_session("mid1", None, Some("2026-05-02T00:00:00Z"));
+                s.agent_id = Some("b".into());
+                s
+            },
+            {
+                let mut s = mk_session("mid2", None, Some("2026-05-03T00:00:00Z"));
+                s.agent_id = Some("c".into());
+                s
+            },
+            {
+                let mut s = mk_session("newer", None, Some("2026-05-04T00:00:00Z"));
+                s.agent_id = Some("d".into());
+                s
+            },
+            {
+                let mut s = mk_session("newest", None, Some("2026-05-05T00:00:00Z"));
+                s.agent_id = Some("e".into());
+                s
+            },
+        ];
+        let cfg = ProjectsConfig {
+            version: 1,
+            agents: vec![],
+            projects: vec![mk_project("p1", "alpha", sessions)],
+        };
+
+        let rows = build_rows_capped(&cfg, 2);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].session_id, "newest");
+        assert_eq!(rows[1].session_id, "newer");
+    }
+
+    #[test]
+    fn build_rows_dedups_near_duplicate_closed_rows() {
+        // Three closed rows for the same (project, agent) clustered
+        // within ~4 minutes of each other plus one fully separate row
+        // an hour later. Dedup must collapse the cluster to the
+        // newest entry; the separated row stays.
+        let sessions = vec![
+            mk_session("crash1", None, Some("2026-05-11T10:00:00Z")),
+            mk_session("crash2", None, Some("2026-05-11T10:02:00Z")),
+            mk_session("crash3", None, Some("2026-05-11T10:04:00Z")),
+            mk_session("separate", None, Some("2026-05-11T11:00:00Z")),
+        ];
+        let cfg = ProjectsConfig {
+            version: 1,
+            agents: vec![],
+            projects: vec![mk_project("p1", "alpha", sessions)],
+        };
+
+        let rows = build_rows(&cfg);
+        assert_eq!(rows.len(), 2, "near-duplicate cluster collapsed to newest");
+        assert_eq!(rows[0].session_id, "separate");
+        assert_eq!(rows[1].session_id, "crash3");
+    }
+
+    #[test]
+    fn build_rows_dedup_does_not_collapse_different_agents() {
+        // Same project + same closed_at, different agents → not a
+        // duplicate, both rows survive.
+        let mut s1 = mk_session("a_row", None, Some("2026-05-11T10:00:00Z"));
+        s1.agent_id = Some("claude".into());
+        let mut s2 = mk_session("b_row", None, Some("2026-05-11T10:00:00Z"));
+        s2.agent_id = Some("codex".into());
+        let cfg = ProjectsConfig {
+            version: 1,
+            agents: vec![],
+            projects: vec![mk_project("p1", "alpha", vec![s1, s2])],
+        };
+
+        let rows = build_rows(&cfg);
+        assert_eq!(rows.len(), 2);
     }
 }

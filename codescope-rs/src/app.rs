@@ -5238,16 +5238,14 @@ impl AppShell {
                     self.spawn_tab(window, cx);
                 }
                 BuiltInCommand::OpenSettings => {
-                    let path = self.paths.settings_file();
-                    if let Err(err) = open_in_native_browser(&path) {
-                        eprintln!("warning: failed to open settings.json: {err:#}");
-                        self.push_toast(
-                            ToastKind::Err,
-                            SharedString::from("Couldn't open settings.json"),
-                            Some(format!("{err}").into()),
-                            cx,
-                        );
-                    }
+                    // Open the in-app Settings dialog — same entry
+                    // point Ctrl+, takes (see `on_key_down`). The
+                    // earlier behaviour shelled out to whatever app
+                    // owns `.json` so the user could hand-edit
+                    // `settings.json`; the Rust port has a proper
+                    // dialog now (ADR-0018) and the palette should
+                    // mirror the keyboard shortcut's destination.
+                    self.open_settings_dialog(window, cx);
                 }
                 BuiltInCommand::ReloadTheme => {
                     // Re-resolve the theme from the current settings
@@ -5437,31 +5435,6 @@ impl AppShell {
             .read(cx)
             .active_project()
             .map(|p| p.path.clone())
-    }
-}
-
-/// Open a path with the platform's default handler. Windows routes
-/// through `ShellExecuteW` and is fire-and-forget — `shell_open_url`
-/// doesn't surface failure, so the Windows arm always returns
-/// `Ok(())` even if the shell can't find a handler for the file. The
-/// macOS / Linux arms shell out to `open` / `xdg-open` and propagate
-/// the spawn error so a missing binary surfaces as a toast. Used by
-/// the palette's "Open settings" row to hand `settings.json` off to
-/// the user's preferred editor.
-fn open_in_native_browser(path: &std::path::Path) -> std::io::Result<()> {
-    #[cfg(target_os = "windows")]
-    {
-        let path_str = path.to_string_lossy().into_owned();
-        crate::win32_titlebar::shell_open_url(&path_str);
-        Ok(())
-    }
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open").arg(path).spawn().map(|_| ())
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        std::process::Command::new("xdg-open").arg(path).spawn().map(|_| ())
     }
 }
 
