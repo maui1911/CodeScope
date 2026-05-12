@@ -244,6 +244,13 @@ const MIN_GROUP_WEIGHT: f32 = 0.15;
 /// Defensive on degenerate inputs: empty slices and non-finite or
 /// non-positive sums both fall back to assigning `1.0` to every
 /// element so the layout still gets a sane sum.
+///
+/// **Ratio preservation is best-effort:** results below
+/// `MIN_GROUP_WEIGHT` are clamped to that floor, which slightly
+/// shifts the ratios in the (rare) case where rescaling would
+/// produce a sub-minimum weight. In practice this only fires after
+/// extreme drag combinations and the user is dragging anyway — the
+/// floor keeps every column visible.
 fn normalise_group_weights(weights: &mut [f32]) {
     let count = weights.len();
     if count == 0 {
@@ -7103,9 +7110,12 @@ mod tests {
         // single weight back to `1.0` (mean of one element) so the
         // single flex item gets the standard `flex-grow: 1` treatment
         // rather than taffy's truncated free-space distribution.
+        // Epsilon-compare — `2.5 * (1.0 / 2.5)` isn't exactly `1.0` in
+        // f32 (scale rounds).
         let mut weights = vec![2.5_f32];
         normalise_group_weights(&mut weights);
-        assert_eq!(weights, vec![1.0]);
+        assert_eq!(weights.len(), 1);
+        assert!((weights[0] - 1.0).abs() < 1e-5);
     }
 
     #[test]
@@ -7115,7 +7125,8 @@ mod tests {
         // workspace stayed blank.
         let mut weights = vec![0.5_f32];
         normalise_group_weights(&mut weights);
-        assert_eq!(weights, vec![1.0]);
+        assert_eq!(weights.len(), 1);
+        assert!((weights[0] - 1.0).abs() < 1e-5);
     }
 
     #[test]
