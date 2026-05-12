@@ -47,6 +47,20 @@ members = ["cargo:."]
 #   and the velopack integration on the AppShell). The axoupdater
 #   shipped by cargo-dist would compete with Velopack for the same
 #   responsibility.
+# - Velopack packaging runs *alongside* cargo-dist in
+#   `.github/workflows/rs--release.yml` for Windows targets only. The
+#   workflow installs `vpk` (the Velopack CLI, a .NET 8 tool — yes, the
+#   Rust SDK still needs the .NET tool for packaging), copies the
+#   cargo-built `codescope-rs.exe` into a publish dir, downloads the
+#   prior GitHub release's `RELEASES-win` + `.nupkg` (best-effort, for
+#   Delta generation), runs `vpk pack --channel win`, and threads the
+#   resulting `RELEASES-win`, `Full.nupkg`, optional `Delta.nupkg`, and
+#   setup installer through the existing upload-artifact path so they
+#   land on the GitHub release alongside the MSI + zip. macOS / Linux
+#   velopack packaging is intentionally deferred — `velopack_bridge.rs`
+#   pins `CHANNEL = "win"` today and the auto-update path is only
+#   exercised on Windows; tar.xz archives from cargo-dist still ship
+#   for those platforms unchanged.
 [dist]
 # Preferred dist version in CI. Bumped together with the workflow.
 cargo-dist-version = "0.31.0"
