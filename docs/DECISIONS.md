@@ -452,9 +452,17 @@ brand — the split is purely build-system.
 - Two parallel release flows for the user:
   - `git tag v0.2.6 && git push --tags` → C# release (existing).
   - `git tag rs-v0.0.2 && git push --tags` → Rust release (new).
-- The Rust pipeline currently ships **Windows-only** artifacts
-  (`x86_64-pc-windows-msvc`). See `docs/HANDOFF.md` "Cross-platform
-  status" for the path forward to macOS / Linux.
+- The Rust pipeline ships **multiplatform** artifacts as of the
+  multiplatform-release-pipeline PR: `x86_64-pc-windows-msvc` (MSI +
+  zip), `aarch64-apple-darwin` + `x86_64-apple-darwin` (`.tar.xz`),
+  and `x86_64-unknown-linux-gnu` (`.tar.xz`). The original
+  cross-compile-from-Windows blocker (ring's build.rs needing
+  `cc` / `clang` / `zig`) is sidestepped by running native builds
+  on the GH Actions matrix (`windows-2022`, `macos-14`,
+  `macos-15-intel`, `ubuntu-22.04`). See `docs/HANDOFF.md`
+  "Cross-platform status" for the runtime test matrix and known
+  per-platform gaps (code signing / SmartScreen / Gatekeeper
+  remain follow-ups).
 - `velopack` crate replaces a hand-rolled apply path. The
   `codescope_core::update_check` module (which polls the GitHub
   releases endpoint and emits an `UpdateStatus::Available`) keeps
