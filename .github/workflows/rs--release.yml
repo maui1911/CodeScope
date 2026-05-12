@@ -318,19 +318,23 @@ jobs:
         run: |
           $publish = "target/distrib/velopack/publish"
           New-Item -ItemType Directory -Force -Path $publish | Out-Null
-          # Pick the matching triple — the matrix only has one Windows
-          # target today (`x86_64-pc-windows-msvc`) but glob just in
-          # case we add aarch64 later.
-          $src = Get-ChildItem -Path "target" -Directory `
-            | Where-Object { $_.Name -like "*windows*" } `
-            | ForEach-Object { Join-Path $_.FullName "release" } `
-            | Where-Object { Test-Path (Join-Path $_ "codescope-rs.exe") } `
+          # cargo-dist 0.31 builds Windows binaries with `--profile dist`,
+          # which lands the exe at `target/<triple>/dist/codescope-rs.exe`
+          # (NOT the default `release/` profile dir). Older cargo-dist
+          # versions used `release/`. Glob both so a future profile
+          # change doesn't break this step.
+          Write-Host "Searching target/ for codescope-rs.exe..."
+          Get-ChildItem -Path "target" -Recurse -Filter "codescope-rs.exe" -ErrorAction SilentlyContinue `
+            | ForEach-Object { Write-Host "  found: $($_.FullName)" }
+          $exe = Get-ChildItem -Path "target" -Recurse -Filter "codescope-rs.exe" -ErrorAction SilentlyContinue `
+            | Where-Object { $_.FullName -like "*windows*" -and ($_.FullName -like "*\dist\*" -or $_.FullName -like "*\release\*") } `
             | Select-Object -First 1
-          if (-not $src) {
-            throw "Could not find a release build of codescope-rs.exe under target/*windows*/release/"
+          if (-not $exe) {
+            throw "Could not find a release build of codescope-rs.exe under target/<windows triple>/<dist|release>/"
           }
+          $src = $exe.DirectoryName
           Write-Host "Staging velopack publish from $src"
-          Copy-Item -Path (Join-Path $src "codescope-rs.exe") -Destination $publish -Force
+          Copy-Item -Path $exe.FullName -Destination $publish -Force
           # Bring along any side-by-side .dll files cargo emits next to
           # the exe. Today there are none, but this future-proofs us
           # against e.g. adding a dynamically-linked sidecar.
