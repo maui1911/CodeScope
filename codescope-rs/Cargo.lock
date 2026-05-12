@@ -964,6 +964,7 @@ dependencies = [
  "codescope-core",
  "codescope-terminal",
  "embed-resource",
+ "futures-channel",
  "gpui",
  "gpui-terminal",
  "parking_lot",
