@@ -284,11 +284,16 @@ jobs:
       # is a documented follow-up; tar.xz archives from cargo-dist still
       # ship for those platforms via the rest of this matrix entry.
       #
-      # The steps below produce a `RELEASES-win` manifest + `Full.nupkg`
-      # (+ `Delta.nupkg` from the second release onward) under
-      # `codescope-rs/target/distrib/velopack/`, then thread those files
-      # through the same upload-artifact path used for the MSI + zip.
-      # They no-op on macOS/Linux jobs via the `runner.os` gate.
+      # The steps below produce Velopack's canonical feed asset
+      # `releases.win.json` (what `GithubSource` resolves via
+      # `CoreUtil.GetVeloReleaseIndexName(channel)` → `releases.<channel>.json`,
+      # see velopack/velopack `Sources/GitBase.cs`), the legacy text-format
+      # `RELEASES`-style file, the `Full.nupkg` package (and a `Delta.nupkg`
+      # from the second release onward), and the Velopack setup installer
+      # (`*-Setup.exe`), all under `codescope-rs/target/distrib/velopack/`.
+      # Every file is threaded through the same upload-artifact path used
+      # for the MSI + zip. The steps no-op on macOS/Linux jobs via the
+      # `runner.os` gate.
       # ---------------------------------------------------------------
       - name: Setup .NET (for vpk)
         if: runner.os == 'Windows'
@@ -369,7 +374,7 @@ jobs:
           Write-Host "Packing velopack release with version $packVersion"
           # Flags mirror the C# `.github/workflows/release.yml` velopack
           # step (see `vpk pack` block there), with these intentional
-          # diverges:
+          # divergences:
           #   * `--packId codescope-rs` (the Rust port has its own
           #     application identity — the C# build uses `CodeScope`).
           #     `velopack_bridge.rs` doesn't pin a packId at runtime;
