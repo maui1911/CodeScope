@@ -85,6 +85,11 @@ jobs:
       # (PRs run on the *source* but secrets are usually on the *target* -- that's *good*
       # but also really annoying to build CI around when it needs secrets to work right.)
       - id: plan
+        # dist-workspace.toml and Cargo.toml live in codescope-rs/, so all
+        # `dist` invocations run from that subdir. Artifact paths below are
+        # prefixed with `codescope-rs/` because actions/*-artifact resolves
+        # `path:` relative to $GITHUB_WORKSPACE, not the step's working-dir.
+        working-directory: codescope-rs
         run: |
           dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
           echo "dist ran successfully"
@@ -94,7 +99,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: artifacts-plan-dist-manifest
-          path: plan-dist-manifest.json
+          path: codescope-rs/plan-dist-manifest.json
 
   # Build and packages all the platform-specific things
   build-local-artifacts:
@@ -120,6 +125,9 @@ jobs:
     container: ${{ matrix.container && matrix.container.image || null }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Path is relative to the step's working-directory (codescope-rs) for
+      # shell use, then re-prefixed below for the upload-artifact `path:`
+      # (which resolves from $GITHUB_WORKSPACE).
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
     steps:
       - name: enable windows longpaths
@@ -138,17 +146,20 @@ jobs:
           fi
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
-      # Get the dist-manifest
+      # Get the dist-manifest. Drop into codescope-rs/target/distrib/ so dist
+      # (which runs from codescope-rs/) can find prior artifacts at the path
+      # it expects.
       - name: Fetch local artifacts
         uses: actions/download-artifact@v7
         with:
           pattern: artifacts-*
-          path: target/distrib/
+          path: codescope-rs/target/distrib/
           merge-multiple: true
       - name: Install dependencies
         run: |
           ${{ matrix.packages_install }}
       - name: Build artifacts
+        working-directory: codescope-rs
         run: |
           # Actually do builds and make zips and whatnot
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
@@ -159,10 +170,14 @@ jobs:
         # to "real" actions without writing to env-vars, and writing to env-vars has
         # inconsistent syntax between shell and powershell.
         shell: bash
+        working-directory: codescope-rs
         run: |
-          # Parse out what we just built and upload it to scratch storage
+          # Parse out what we just built and upload it to scratch storage.
+          # dist emits paths relative to its working-dir (codescope-rs/), but
+          # upload-artifact resolves `path:` from $GITHUB_WORKSPACE — prepend
+          # `codescope-rs/` to every emitted path so the upload step finds them.
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
-          dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
+          dist print-upload-files-from-manifest --manifest dist-manifest.json | sed 's|^|codescope-rs/|' >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
@@ -172,7 +187,7 @@ jobs:
           name: artifacts-build-local-${{ join(matrix.targets, '_') }}
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
-            ${{ env.BUILD_MANIFEST_NAME }}
+            codescope-rs/${{ env.BUILD_MANIFEST_NAME }}
 
   # Build and package all the platform-agnostic(ish) things
   build-global-artifacts:
@@ -199,17 +214,21 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           pattern: artifacts-*
-          path: target/distrib/
+          path: codescope-rs/target/distrib/
           merge-multiple: true
       - id: cargo-dist
         shell: bash
+        working-directory: codescope-rs
         run: |
           dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
           echo "dist ran successfully"
 
-          # Parse out what we just built and upload it to scratch storage
+          # Parse out what we just built and upload it to scratch storage.
+          # dist runs from codescope-rs/, so emitted upload_files are
+          # codescope-rs-relative — prefix them for upload-artifact which
+          # resolves `path:` from $GITHUB_WORKSPACE.
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
-          jq --raw-output ".upload_files[]" dist-manifest.json >> "$GITHUB_OUTPUT"
+          jq --raw-output ".upload_files[]" dist-manifest.json | sed 's|^|codescope-rs/|' >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
@@ -219,7 +238,7 @@ jobs:
           name: artifacts-build-global
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
-            ${{ env.BUILD_MANIFEST_NAME }}
+            codescope-rs/${{ env.BUILD_MANIFEST_NAME }}
   # Determines if we should publish/announce
   host:
     needs:
@@ -249,10 +268,11 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           pattern: artifacts-*
-          path: target/distrib/
+          path: codescope-rs/target/distrib/
           merge-multiple: true
       - id: host
         shell: bash
+        working-directory: codescope-rs
         run: |
           dist host ${{ needs.plan.outputs.tag-flag }} --steps=upload --steps=release --output-format=json > dist-manifest.json
           echo "artifacts uploaded and released successfully"
@@ -263,7 +283,7 @@ jobs:
         with:
           # Overwrite the previous copy
           name: artifacts-dist-manifest
-          path: dist-manifest.json
+          path: codescope-rs/dist-manifest.json
       # Create a GitHub Release while uploading all files to it
       - name: "Download GitHub Artifacts"
         uses: actions/download-artifact@v7
