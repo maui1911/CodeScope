@@ -121,7 +121,7 @@ impl BuiltInCommand {
             BuiltInCommand::ToggleSidebar => "Ctrl+B",
             BuiltInCommand::NewProject => "+",
             BuiltInCommand::NewSession => "Ctrl+T",
-            BuiltInCommand::OpenSettings => "menu",
+            BuiltInCommand::OpenSettings => "Ctrl+,",
             BuiltInCommand::ReloadTheme => "menu",
         }
     }
