@@ -96,6 +96,19 @@ pub enum BuiltInCommand {
     /// the user has hand-edited `settings.json` and wants to see the
     /// change without restarting. Keymap hint: none.
     ReloadTheme,
+    /// Open the active tab's worktree origin remote in the user's
+    /// default browser. Mirrors the sidebar worktree menu's
+    /// "Open remote in browser" row. Hint: Ctrl+Shift+G (G for
+    /// "git remote"). No-ops when the active tab has no working
+    /// directory the sidebar tracks as a worktree, or when the
+    /// underlying repo has no `origin` configured.
+    OpenRemoteInBrowser,
+    /// Open the active tab's worktree pull-request URL in the user's
+    /// default browser. Mirrors the sidebar worktree menu's
+    /// "Open PR in browser" row — same gating: only fires when the
+    /// cached `gh pr list` lookup resolved to an open PR for the
+    /// worktree's *current* branch. Hint: Ctrl+Shift+R (R for "PR").
+    OpenPullRequestInBrowser,
 }
 
 impl BuiltInCommand {
@@ -110,6 +123,8 @@ impl BuiltInCommand {
             BuiltInCommand::NewSession => "New session",
             BuiltInCommand::OpenSettings => "Open settings",
             BuiltInCommand::ReloadTheme => "Reload theme",
+            BuiltInCommand::OpenRemoteInBrowser => "Open remote in browser",
+            BuiltInCommand::OpenPullRequestInBrowser => "Open PR in browser",
         }
     }
 
@@ -123,6 +138,8 @@ impl BuiltInCommand {
             BuiltInCommand::NewSession => "Ctrl+Shift+T",
             BuiltInCommand::OpenSettings => "Ctrl+Shift+,",
             BuiltInCommand::ReloadTheme => "menu",
+            BuiltInCommand::OpenRemoteInBrowser => "Ctrl+Shift+G",
+            BuiltInCommand::OpenPullRequestInBrowser => "Ctrl+Shift+R",
         }
     }
 }
@@ -604,6 +621,28 @@ mod tests {
         assert_eq!(BuiltInCommand::NewProject.title(), "New project");
         assert_eq!(BuiltInCommand::OpenSettings.title(), "Open settings");
         assert_eq!(BuiltInCommand::ReloadTheme.title(), "Reload theme");
+        assert_eq!(
+            BuiltInCommand::OpenRemoteInBrowser.title(),
+            "Open remote in browser"
+        );
+        assert_eq!(
+            BuiltInCommand::OpenPullRequestInBrowser.title(),
+            "Open PR in browser"
+        );
+    }
+
+    #[test]
+    fn open_remote_and_pr_commands_advertise_chords() {
+        // The palette right-hand hint is the only place users see the
+        // chord without opening the docs — assert it stays in lockstep
+        // with the chord wired in `app.rs::on_key_down` /
+        // `terminal/src/view.rs::is_app_level_shortcut`. A drift here
+        // means the palette would lie about the keymap.
+        assert_eq!(BuiltInCommand::OpenRemoteInBrowser.hint(), "Ctrl+Shift+G");
+        assert_eq!(
+            BuiltInCommand::OpenPullRequestInBrowser.hint(),
+            "Ctrl+Shift+R"
+        );
     }
 
     #[test]

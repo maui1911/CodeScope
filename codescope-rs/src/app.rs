@@ -3369,6 +3369,34 @@ impl AppShell {
         let copy_session_id = tab_session_id.clone();
         let rename_session_id = tab_session_id.clone();
         let rename_current = tab_title.to_string();
+        // "Open remote" / "Open PR" gating mirrors the sidebar's
+        // worktree-row menu — same `Sidebar` accessors so the two
+        // surfaces agree row-for-row. We only emit the rows when the
+        // tab's working directory matches a tracked worktree (Open
+        // remote) and the PR cache has a `Resolved { info: Some(_) }`
+        // entry whose branch still matches the live branch (Open PR).
+        // Each path is captured into its own `Option<String>` so the
+        // closure for each row only takes ownership of the path it
+        // needs.
+        let (open_remote_path, open_pr_path) = {
+            let sidebar = self.sidebar.read(cx);
+            match tab_working_dir_str.as_ref() {
+                Some(path) => {
+                    let tracked = sidebar.path_is_tracked_worktree(path);
+                    let has_pr = sidebar.pr_url_for_path(path).is_some();
+                    (
+                        tracked.then(|| path.clone()),
+                        has_pr.then(|| path.clone()),
+                    )
+                }
+                None => (None, None),
+            }
+        };
+        // Snapshot for the divider gate — the row builders below
+        // consume the `Option<String>`s by `.map(|path| …)` and we
+        // need the boolean answer to "should we paint a divider
+        // above the section" regardless of which row is enabled.
+        let has_open_in_browser_rows = open_remote_path.is_some() || open_pr_path.is_some();
 
         let mut menu_body = div()
             .flex()
@@ -3483,6 +3511,52 @@ impl AppShell {
                     this.move_tab_to_new_group(group_id, tab_id, window, cx);
                 }),
             ))
+            // ── Open in browser section ──
+            //
+            // Both rows are gated against `Sidebar` state at menu-build
+            // time so the menu height collapses cleanly when neither
+            // surface applies (e.g. a plain shell tab with no project
+            // context, or a worktree whose PR cache hasn't landed).
+            // We don't render a greyed-out unclickable affordance —
+            // the row disappears entirely instead. Mirrors the C#
+            // tab menu's `HasOriginRemote` / `HasPullRequest` gates
+            // in `GroupStripView.PopulateTabContextMenu`.
+            .children(
+                has_open_in_browser_rows
+                    .then(|| div().h_px().bg(divider).my_1().into_any_element()),
+            )
+            .children(open_remote_path.map(|path| {
+                item(
+                    "tab-menu-open-remote",
+                    "Open remote in browser",
+                    true,
+                    false,
+                    Box::new(move |this, _window, cx| {
+                        let path = path.clone();
+                        this.close_tab_menu(cx);
+                        this.sidebar.update(cx, |sidebar, cx| {
+                            sidebar.open_remote_in_browser_for_path(path, cx);
+                        });
+                    }),
+                )
+                .into_any_element()
+            }))
+            .children(open_pr_path.map(|path| {
+                item(
+                    "tab-menu-open-pr",
+                    "Open PR in browser",
+                    true,
+                    false,
+                    Box::new(move |this, _window, cx| {
+                        let path = path.clone();
+                        this.close_tab_menu(cx);
+                        this.sidebar.update(cx, |sidebar, cx| {
+                            sidebar.open_pr_in_browser_for_path(path, cx);
+                        });
+                    }),
+                )
+                .into_any_element()
+            }))
             .child(div().h_px().bg(divider).my_1())
             // ── Close section ──
             .child(item(
@@ -4577,6 +4651,8 @@ impl AppShell {
         //   Ctrl+Shift+P            command palette (toggle)
         //   Ctrl+Shift+O            overview pane (toggle)
         //   Ctrl+Shift+\            split right
+        //   Ctrl+Shift+G            open active tab's remote in browser
+        //   Ctrl+Shift+R            open active tab's PR in browser
         //   Alt+Left / Alt+Right    cycle focus group
         //   Alt+1..9                focus group N
         //
@@ -4647,6 +4723,22 @@ impl AppShell {
                 cx.stop_propagation();
                 let next = !self.show_overview;
                 self.set_show_overview(next, cx);
+            }
+            // Ctrl+Shift+G — open the active tab's worktree origin
+            // remote in the browser. Plain Ctrl+G is "abort" /
+            // history-cancel in many shells, so we keep it on the
+            // shifted form to stay out of the terminal.
+            "g" if mods.shift => {
+                cx.stop_propagation();
+                self.open_active_tab_remote_in_browser(cx);
+            }
+            // Ctrl+Shift+R — open the active tab's cached PR URL in
+            // the browser. Plain Ctrl+R is readline reverse-history-
+            // search and is heavily used inside coding agents, so
+            // this chord stays on Ctrl+Shift.
+            "r" if mods.shift => {
+                cx.stop_propagation();
+                self.open_active_tab_pr_in_browser(cx);
             }
             // Ctrl+Tab / Ctrl+Shift+Tab — cycle tabs forwards /
             // backwards. Shift is intrinsic to the prev-tab chord
@@ -5584,6 +5676,12 @@ impl AppShell {
                         cx,
                     );
                 }
+                BuiltInCommand::OpenRemoteInBrowser => {
+                    self.open_active_tab_remote_in_browser(cx);
+                }
+                BuiltInCommand::OpenPullRequestInBrowser => {
+                    self.open_active_tab_pr_in_browser(cx);
+                }
             },
         }
     }
@@ -5618,6 +5716,8 @@ impl AppShell {
             BuiltInCommand::NewProject,
             BuiltInCommand::OpenSettings,
             BuiltInCommand::ReloadTheme,
+            BuiltInCommand::OpenRemoteInBrowser,
+            BuiltInCommand::OpenPullRequestInBrowser,
         ] {
             out.push(PaletteAction {
                 kind: PaletteActionKind::Command(cmd),
@@ -5758,6 +5858,50 @@ impl AppShell {
             .read(cx)
             .active_project()
             .map(|p| p.path.clone())
+    }
+
+    /// Active tab's working directory as a `String`. Used by the
+    /// "Open remote / PR in browser" surfaces (tab menu, palette,
+    /// Ctrl+Shift+G / +R) to look the path up in the sidebar's
+    /// `git_status` / `pr_urls` caches. Returns `None` when the
+    /// active tab is a plain shell with no project context.
+    fn active_tab_working_dir(&self) -> Option<String> {
+        let g = self.groups.get(self.focused_group)?;
+        let t = g.tabs.get(g.active_tab)?;
+        t.working_directory
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+    }
+
+    /// Open the active tab's worktree origin remote in the user's
+    /// default browser. Mirrors the sidebar worktree menu's
+    /// "Open remote in browser" row — and shares the same helper, so
+    /// the URL resolution / shell-execute path is exactly one code
+    /// path. No-ops when the active tab has no working directory the
+    /// sidebar tracks as a worktree.
+    fn open_active_tab_remote_in_browser(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.active_tab_working_dir() else {
+            return;
+        };
+        self.sidebar.update(cx, |sidebar, cx| {
+            if !sidebar.path_is_tracked_worktree(&path) {
+                return;
+            }
+            sidebar.open_remote_in_browser_for_path(path, cx);
+        });
+    }
+
+    /// Open the active tab's cached PR URL in the user's default
+    /// browser. Same gating as the sidebar worktree menu's
+    /// "Open PR in browser" row — a missing / stale-branch / no-open-PR
+    /// cache entry no-ops.
+    fn open_active_tab_pr_in_browser(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.active_tab_working_dir() else {
+            return;
+        };
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.open_pr_in_browser_for_path(path, cx);
+        });
     }
 }
 
