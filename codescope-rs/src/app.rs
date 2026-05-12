@@ -509,9 +509,6 @@ pub struct AppShell {
     sidebar_drag: Option<SidebarDrag>,
     /// Open tab right-click menu, if any.
     tab_menu: Option<TabMenu>,
-    /// Status-bar gear right-click menu, if any. Anchored at the
-    /// recorded click position so it floats next to the gear icon.
-    gear_menu: Option<gpui::Point<gpui::Pixels>>,
     /// In-flight tab drag-hover state. `Some` between an `on_drag_move`
     /// over any strip and the matching drop / drag-cancel. Drives the
     /// 3 px blue drop-indicator that previews "drop here" and the
@@ -866,6 +863,14 @@ impl AppShell {
                         cx,
                     );
                 }
+                SidebarEvent::OpenSettings => {
+                    // Opened from the sidebar project context menu's
+                    // "Settings…" row. Same entry point Ctrl+Shift+,
+                    // and the status-bar gear left-click use —
+                    // `open_settings_dialog` is idempotent on an
+                    // already-open dialog.
+                    this.open_settings_dialog(window, cx);
+                }
             }
         })
         .detach();
@@ -1065,7 +1070,6 @@ impl AppShell {
             sidebar_visible,
             sidebar_drag: None,
             tab_menu: None,
-            gear_menu: None,
             tab_drag_hover: None,
             tab_rects: HashMap::new(),
             prev_tab_rects: HashMap::new(),
@@ -3710,107 +3714,6 @@ impl AppShell {
         )
     }
 
-    /// Status-bar gear right-click menu — two-row popover anchored at
-    /// the recorded click position. `BottomLeft` corner because the
-    /// gear lives in the status bar; the menu should float above the
-    /// bar rather than drop below the window edge.
-    fn render_gear_menu(
-        &self,
-        theme: &Arc<Theme>,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
-        let position = *self.gear_menu.as_ref()?;
-
-        let elevated = theme::elevated(theme);
-        let divider = theme::divider(theme);
-        let ink = theme::ink(theme);
-        let ink_dim = theme::ink_dim(theme);
-        let frost = theme::frost_10(theme);
-
-        type Action = Box<dyn Fn(&mut AppShell, &mut Window, &mut Context<AppShell>) + 'static>;
-        let item = |id: &'static str, label: &'static str, on_click: Action|
-         -> gpui::Stateful<gpui::Div> {
-            let frost_hover = frost;
-            div()
-                .id(id)
-                .h(px(28.0))
-                .px_3()
-                .flex()
-                .flex_row()
-                .items_center()
-                .text_size(px(12.5))
-                .text_color(ink_dim)
-                .cursor_pointer()
-                .hover(move |s| s.bg(frost_hover).text_color(ink))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        on_click(this, window, cx);
-                    }),
-                )
-                .child(label)
-        };
-
-        let menu_body = div()
-            .flex()
-            .flex_col()
-            .py_1()
-            .min_w(px(180.0))
-            .bg(elevated)
-            .border_1()
-            .border_color(divider)
-            .rounded_md()
-            .shadow_lg()
-            .font(theme::font_sans())
-            .child(item(
-                "gear-menu-open",
-                "Open Settings…",
-                Box::new(|this, window, cx| {
-                    this.close_gear_menu(cx);
-                    this.open_settings_dialog(window, cx);
-                }),
-            ))
-            .child(item(
-                "gear-menu-reload-theme",
-                "Reload theme",
-                Box::new(|this, _window, cx| {
-                    this.close_gear_menu(cx);
-                    // Re-resolve the theme from the current settings —
-                    // same `BuiltInCommand::ReloadTheme` path the
-                    // command palette dispatches.
-                    let settings_clone = (*this.settings).clone();
-                    this.apply_settings(settings_clone, cx);
-                    this.push_toast(
-                        ToastKind::Ok,
-                        SharedString::from("Theme reloaded"),
-                        None,
-                        cx,
-                    );
-                }),
-            ))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_, _, _, cx| cx.stop_propagation()),
-            )
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_gear_menu(cx)));
-
-        Some(
-            gpui::deferred(
-                gpui::anchored()
-                    .position(gpui::point(position.x, position.y))
-                    // Anchor the menu's *bottom-left* at the click so it
-                    // grows upward from the status bar — the bar lives
-                    // at the bottom of the window, so a TopLeft anchor
-                    // would clip off-screen.
-                    .anchor(gpui::Corner::BottomLeft)
-                    .snap_to_window_with_margin(px(8.0))
-                    .child(menu_body),
-            )
-            .into_any_element(),
-        )
-    }
-
     /// Build the bottom status bar. 32 px tall, two clusters mirroring
     /// the C# `StatusBarView`:
     ///
@@ -4186,11 +4089,13 @@ impl AppShell {
         // ─── Settings gear button ────────────────────────────────
         //
         // Sits just-left of the bell in the status bar's right cluster.
-        // Left-click opens the Settings dialog (same entry point as the
-        // Ctrl+Shift+, chord and the command palette's "Open settings"
-        // row). Right-click opens a tiny menu with "Open Settings…" and
-        // "Reload theme" so power users get a discoverable surface
-        // beyond the keyboard chord.
+        // Left-click opens the Settings dialog directly — same entry
+        // point as the Ctrl+Shift+, chord and the command palette's
+        // "Open settings" row. The gear deliberately has *no*
+        // right-click menu; the discoverable "Settings…" row lives
+        // in the sidebar project context menu instead (see
+        // `Sidebar::render_project_menu`), which is the more natural
+        // home alongside the rest of the project-scoped actions.
         let gear_btn = div()
             .id("status-gear-btn")
             .relative()
@@ -4207,13 +4112,6 @@ impl AppShell {
                 cx.listener(|this, _, window, cx| {
                     cx.stop_propagation();
                     this.open_settings_dialog(window, cx);
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, event: &gpui::MouseDownEvent, _window, cx| {
-                    cx.stop_propagation();
-                    this.open_gear_menu(event.position, cx);
                 }),
             )
             // 12 × 12 gear SVG; `text_color` drives the `currentColor`
@@ -4595,28 +4493,6 @@ impl AppShell {
 
     fn close_tab_menu(&mut self, cx: &mut Context<Self>) {
         if self.tab_menu.take().is_some() {
-            cx.notify();
-        }
-    }
-
-    /// Open the status-bar gear's right-click menu at the recorded
-    /// window-coordinate `position`. Two rows: "Open Settings…" (same
-    /// entry point as left-click) and "Reload theme" (mirrors the
-    /// command palette's `ReloadTheme` action). Kept intentionally
-    /// small — the gear's primary action is left-click; the menu is a
-    /// discoverable affordance for power-user shortcuts, not a full
-    /// settings surface.
-    fn open_gear_menu(
-        &mut self,
-        position: gpui::Point<gpui::Pixels>,
-        cx: &mut Context<Self>,
-    ) {
-        self.gear_menu = Some(position);
-        cx.notify();
-    }
-
-    fn close_gear_menu(&mut self, cx: &mut Context<Self>) {
-        if self.gear_menu.take().is_some() {
             cx.notify();
         }
     }
@@ -5697,7 +5573,6 @@ impl Render for AppShell {
             .child(main_row)
             .child(self.render_status_bar(&theme, cx))
             .children(self.render_tab_menu(&theme, cx))
-            .children(self.render_gear_menu(&theme, cx))
             .children(self.render_toasts(&theme, cx))
             .children(self.render_notifications_popover(&theme, cx))
             .children(self.render_command_palette(window, &theme, cx))
