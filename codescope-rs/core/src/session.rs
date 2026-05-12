@@ -427,49 +427,40 @@ impl SessionManager {
     /// tick without producing redundant writes. Returns `Ok(true)` when
     /// the value actually changed (callers should persist),
     /// `Ok(false)` for a no-op (callers can skip the write).
+    ///
+    /// Implemented as a thin wrapper over
+    /// [`Self::update_agent_session_id`] so the session-walk/mutation
+    /// logic only lives in one place.
     pub fn set_agent_session_id(
         cfg: &mut ProjectsConfig,
         session_id: &str,
         agent_session_id: &str,
     ) -> Result<bool> {
-        for project in cfg.projects.iter_mut() {
-            if let Some(s) = project.sessions.iter_mut().find(|s| s.id == session_id) {
-                if s.agent_session_id.as_deref() == Some(agent_session_id) {
-                    return Ok(false);
-                }
-                s.agent_session_id = Some(agent_session_id.to_string());
-                return Ok(true);
-            }
-        }
-        Err(anyhow!("session '{session_id}' not found"))
+        Self::update_agent_session_id(cfg, session_id, Some(agent_session_id))
     }
 
     /// Lenient cousin of [`Self::set_agent_session_id`]. Returns
-    /// `Ok(false)` instead of erroring when the session id isn't found
-    /// — used by the agent-discovery callback path to swallow the
+    /// `false` instead of erroring when the session id isn't found —
+    /// used by the agent-discovery callback path to swallow the
     /// cold-start race where a freshly-spawned tab's first discovery
     /// tick fires before [`Self::open`] has written the new row to
     /// `projects.json`. The next tick (250–350 ms later) will land
     /// after the row exists and the stamp succeeds normally.
     ///
-    /// Same return contract as the strict variant otherwise:
-    /// `Ok(true)` on actual mutation, `Ok(false)` on no-op (either the
-    /// value already matched, or the session id is unknown).
+    /// Returns `true` when the value actually changed, `false` for a
+    /// no-op (either the value already matched, or the session id is
+    /// unknown). Mirrors the strict variant's `Result<bool>` contract
+    /// minus the error arm.
+    ///
+    /// Implemented on top of [`Self::set_agent_session_id`] so the
+    /// session-walk/mutation logic is shared — the lenient policy is
+    /// just "treat the strict variant's error as a no-op".
     pub fn set_agent_session_id_lenient(
         cfg: &mut ProjectsConfig,
         session_id: &str,
         agent_session_id: &str,
     ) -> bool {
-        for project in cfg.projects.iter_mut() {
-            if let Some(s) = project.sessions.iter_mut().find(|s| s.id == session_id) {
-                if s.agent_session_id.as_deref() == Some(agent_session_id) {
-                    return false;
-                }
-                s.agent_session_id = Some(agent_session_id.to_string());
-                return true;
-            }
-        }
-        false
+        Self::set_agent_session_id(cfg, session_id, agent_session_id).unwrap_or(false)
     }
 
     // ---- queries ---------------------------------------------------

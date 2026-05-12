@@ -1220,11 +1220,33 @@ impl AppShell {
     /// discovery tick can race [`SessionManager::open`]'s write to
     /// `projects.json`. We swallow that — the next tick (~350 ms
     /// later) will land after the row exists and the stamp will
-    /// succeed. Persist failures are logged and otherwise ignored to
-    /// match the rest of the persist callsites in this file
-    /// (`spawn_tab_in`, `close_tab`, etc).
+    /// succeed.
+    ///
+    /// Reload-before-mutate: the sidebar persists `projects.json`
+    /// independently (add / remove project, soft-close session, …), so
+    /// stamping a stale in-memory `self.projects` would clobber any
+    /// changes the sidebar wrote between two AppShell mutations.
+    /// Mirrors the discipline used in `allocate_session_id`,
+    /// `soft_close_session`, `reopen_session`, and `open_rename_dialog`.
+    /// On reload failure we leave `self.projects` untouched and bail
+    /// out without writing — same rule the other persist sites use, so
+    /// a transient I/O hiccup doesn't end with a stale snapshot landing
+    /// on top of newer disk state. Persist failures themselves are
+    /// logged and otherwise ignored to match the rest of the persist
+    /// callsites in this file (`spawn_tab_in`, `close_tab`, etc).
     fn persist_agent_session_id(&mut self, session_id: &str, agent_session_id: &str) {
-        let changed = codescope_core::SessionManager::set_agent_session_id_lenient(
+        match ProjectsConfig::load(&self.paths) {
+            Ok(cfg) => {
+                self.projects = cfg;
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to reload projects.json before persist of agent_session_id for {session_id}: {err:#}"
+                );
+                return;
+            }
+        }
+        let changed = SessionManager::set_agent_session_id_lenient(
             &mut self.projects,
             session_id,
             agent_session_id,
@@ -1482,15 +1504,24 @@ impl AppShell {
                         group_idx: usize,
                         tab_idx: usize,
                         agent_id: codescope_core::AgentId,
-                        previous_session_id: Option<String>,
-                        new_session_id: String,
+                        /// Agent-minted UUID we'd previously adopted
+                        /// for this tab, if any — used to unregister
+                        /// the old telemetry tail on rotation
+                        /// (Claude `/clear`, Pi re-invocation).
+                        previous_agent_session_id: Option<String>,
+                        /// Agent-minted UUID this tick is adopting.
+                        new_agent_session_id: String,
                         working_directory: String,
                         /// CodeScope session id (from `projects.json`),
                         /// the stable handle we stamp
                         /// `agent_session_id` against. Captured here
                         /// so the second pass can persist the
                         /// agent-minted id without re-borrowing the
-                        /// tab.
+                        /// tab. Distinct from
+                        /// `new_agent_session_id` above — that's the
+                        /// UUID the agent CLI minted, this is the
+                        /// CodeScope-allocated id from
+                        /// `projects.json::Session.id`.
                         codescope_session_id: String,
                     }
                     let mut found = Vec::new();
@@ -1602,8 +1633,8 @@ impl AppShell {
                                     group_idx: g_idx,
                                     tab_idx: t_idx,
                                     agent_id,
-                                    previous_session_id: tab.adopted_session_id.clone(),
-                                    new_session_id: sid,
+                                    previous_agent_session_id: tab.adopted_session_id.clone(),
+                                    new_agent_session_id: sid,
                                     working_directory: wd_str,
                                     codescope_session_id: tab.session_id.clone(),
                                 });
@@ -1611,14 +1642,14 @@ impl AppShell {
                         }
                     }
                     for f in found {
-                        if let Some(prev) = f.previous_session_id.as_deref() {
-                            if prev != f.new_session_id {
+                        if let Some(prev) = f.previous_agent_session_id.as_deref() {
+                            if prev != f.new_agent_session_id {
                                 this.unregister_telemetry(prev);
                             }
                         }
                         this.register_telemetry(
                             f.agent_id,
-                            f.new_session_id.clone(),
+                            f.new_agent_session_id.clone(),
                             &f.working_directory,
                         );
                         // Persist the agent-minted id back to
@@ -1629,12 +1660,13 @@ impl AppShell {
                         // cold-start race rationale.
                         this.persist_agent_session_id(
                             &f.codescope_session_id,
-                            &f.new_session_id,
+                            &f.new_agent_session_id,
                         );
                         if let Some(group) = this.groups.get_mut(f.group_idx) {
                             if let Some(tab) = group.tabs.get_mut(f.tab_idx) {
-                                tab.adopted_session_id = Some(f.new_session_id.clone());
-                                tab.fired_session_ids.insert(f.new_session_id);
+                                tab.adopted_session_id =
+                                    Some(f.new_agent_session_id.clone());
+                                tab.fired_session_ids.insert(f.new_agent_session_id);
                             }
                         }
                     }
