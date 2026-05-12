@@ -348,8 +348,10 @@ pub fn build_resume_auto_type(
 ///
 /// Shared helper called from every new-session entry point (the
 /// sidebar's double-click handler, `AppShell::default_agent_auto_type`,
-/// and the per-agent rows in `render_new_session_submenu`) so they
-/// can't drift out of sync.
+/// the worktree menu's `New session ▸` parent row in
+/// `Sidebar::build_new_session_parent_row`, and the per-agent rows in
+/// `Sidebar::render_new_session_submenu`) so they can't drift out of
+/// sync.
 pub fn build_new_session_auto_type(profile: &AgentProfile) -> Option<String> {
     if profile.command.is_empty() {
         return None;
@@ -735,10 +737,10 @@ mod tests {
     // Pins the contract every new-session entry point (sidebar
     // double-click, Ctrl+Shift+T, per-agent submenu rows) relies on:
     // `<command> [<new_session_args>...]` joined by single spaces,
-    // with `None` only when `command` is empty. Built-in profiles
-    // ship empty `new_session_args` for every agent except Codex's
-    // (also empty today), so the bare-command shape covers them all.
-    // The custom-profile test below pins the multi-arg joining shape.
+    // with `None` only when `command` is empty. All five built-in
+    // profiles ship empty `new_session_args` today, so the bare-
+    // command shape covers each one — the custom-profile test below
+    // pins the multi-arg joining shape for user-defined profiles.
 
     #[test]
     fn build_new_session_auto_type_claude_yields_bare_command() {

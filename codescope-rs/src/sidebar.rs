@@ -3639,16 +3639,15 @@ impl Sidebar {
         let frost = theme::frost_10(&theme);
 
         // Default agent — the row's primary click target (and the row
-        // the submenu's "Default" entry highlights).
+        // the submenu's "Default" entry highlights). Uses the shared
+        // core helper so the parent-row click matches the submenu's
+        // "Default" entry, `Sidebar::default_agent_auto_type`, and
+        // `default_agent_auto_type_for` byte-for-byte.
         let default_id = self.agent_registry.get_default().map(|a| a.id.clone());
         let default_cmd = default_id.as_deref().and_then(|id| {
-            self.agent_registry.get_by_id(id).map(|p| {
-                let mut argv: Vec<String> =
-                    Vec::with_capacity(1 + p.new_session_args.len());
-                argv.push(p.command.clone());
-                argv.extend(p.new_session_args.iter().cloned());
-                argv.join(" ")
-            })
+            self.agent_registry
+                .get_by_id(id)
+                .and_then(codescope_core::build_new_session_auto_type)
         });
 
         let path = PathBuf::from(worktree_path);
@@ -3796,14 +3795,13 @@ impl Sidebar {
             ));
             // Shared helper keeps the new-session command shape in
             // sync with the double-click handler and Ctrl+Shift+T.
-            // A profile with an empty `command` falls back to bare
-            // `command` (= empty string) only when the helper returns
-            // `None`; we filter that case to a blank string so the
-            // row still renders — clicking it would auto-type
-            // nothing, matching how the helper returning `None` is
-            // handled elsewhere.
-            let cmd =
-                codescope_core::build_new_session_auto_type(profile).unwrap_or_default();
+            // Preserves the `Option` semantics: a profile with an
+            // empty `command` flows through as `auto_type: None` so
+            // the session manager falls back to a plain shell prompt
+            // (matching the parent-row's no-default-agent path) —
+            // emitting `Some("")` would auto-type a `-Command "& {  }"`
+            // scriptblock on Windows pwsh, which is *not* "no command".
+            let cmd = codescope_core::build_new_session_auto_type(profile);
             let frost_hover = frost;
             let base_color = if is_default { ink } else { ink_dim };
             let hover_color = ink;
@@ -3826,7 +3824,7 @@ impl Sidebar {
                         cx.emit(SidebarEvent::OpenSession {
                             working_directory: path.clone(),
                             title: title.clone(),
-                            auto_type: Some(cmd.clone().into()),
+                            auto_type: cmd.clone().map(SharedString::from),
                             force_new: true,
                         });
                         this.close_menu(cx);

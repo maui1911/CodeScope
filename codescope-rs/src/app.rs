@@ -6962,14 +6962,22 @@ fn push_non_empty_font_candidate(candidates: &mut Vec<String>, family: &str) {
 /// as a free function so it can be unit-tested without a gpui context.
 /// Returns `<command> [<new_session_args>...]` joined by spaces.
 ///
-/// `None` only when `AgentRegistry::from_settings` yields an empty
-/// list — which today can only happen if `settings.agents` was passed
-/// in non-empty but every entry was filtered out somewhere upstream.
-/// `from_settings` re-seeds the built-in profiles when
-/// `settings.agents` is empty, and `get_default()` falls back to the
-/// first profile when no `is_default` flag is set, so a typo'd /
-/// missing `default_agent` still resolves to *some* agent (just not
-/// the user's preferred one).
+/// `None` in two cases:
+///
+/// 1. `AgentRegistry::from_settings` yields an empty list and
+///    `get_default()` returns `None`. Today this only happens if
+///    `settings.agents` was passed in non-empty but every entry was
+///    filtered out somewhere upstream — `from_settings` re-seeds the
+///    built-in profiles when `settings.agents` is empty, and
+///    `get_default()` falls back to the first profile when no
+///    `is_default` flag is set, so a typo'd / missing `default_agent`
+///    still resolves to *some* agent (just not the user's preferred
+///    one).
+/// 2. The resolved profile has an empty `command`. This is a
+///    defensive fallback in `build_new_session_auto_type` — a
+///    hand-edited `settings.json` with a blank `command` would
+///    otherwise emit a leading-space argv. Returning `None` lets the
+///    caller fall back to a plain shell instead of auto-typing junk.
 fn default_agent_auto_type_for(settings: &Settings) -> Option<SharedString> {
     let registry = codescope_core::AgentRegistry::from_settings(settings);
     let profile = registry.get_default()?;
