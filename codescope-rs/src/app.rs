@@ -871,6 +871,15 @@ impl AppShell {
                     // already-open dialog.
                     this.open_settings_dialog(window, cx);
                 }
+                SidebarEvent::WorktreeBranchChanged { path, branch } => {
+                    // `git checkout other` inside a worktree's pty
+                    // flipped the branch; the git-status poller saw
+                    // the new value on this tick. Rewrite the title
+                    // of every tab pinned to this path so the strip
+                    // follows. Mirrors C#
+                    // `MainViewModel.RefreshTabTitlesForWorktree`.
+                    this.rename_tabs_for_path(path, branch, cx);
+                }
             }
         })
         .detach();
@@ -1871,6 +1880,80 @@ impl AppShell {
             }
         }
         None
+    }
+
+    /// Rewrite the title of every tab whose `working_directory` matches
+    /// `path` so its branch segment reflects `new_branch`.
+    ///
+    /// Skips:
+    /// * Tabs whose persisted [`Session`] row has an explicit
+    ///   `display_name` (user-renamed via the Rename dialog — the
+    ///   rename always wins, mirroring the "explicit user intent" rule).
+    /// * Tabs whose title doesn't have the standard `Project · Branch`
+    ///   shape — [`codescope_core::rebuild_title`] returns `None`,
+    ///   which we treat as "leave it alone".
+    /// * Tabs whose rebuilt title equals the current one (no work).
+    ///
+    /// Path matching uses [`codescope_core::path_canon::paths_match`]
+    /// so a `C:\Dev\Repo` tab still matches a `c:/dev/repo` event
+    /// (Windows path-case + slash normalisation).
+    ///
+    /// Fires `cx.notify()` only when at least one title actually
+    /// changed — quiet ticks (poll re-confirmed the same branch)
+    /// don't re-render.
+    ///
+    /// Mirrors C# `MainViewModel.RefreshTabTitlesForWorktree`.
+    fn rename_tabs_for_path(
+        &mut self,
+        path: &std::path::Path,
+        new_branch: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let event_path = path.to_string_lossy().into_owned();
+        // Snapshot per-session display_name lookup so we don't borrow
+        // `self.projects` across the mutable iteration over groups.
+        // Sessions with an explicit display_name set must not be
+        // overwritten — the user renamed them.
+        let renamed_session_ids: HashSet<String> = self
+            .projects
+            .projects
+            .iter()
+            .flat_map(|p| p.sessions.iter())
+            .filter(|s| {
+                s.display_name
+                    .as_deref()
+                    .map(|d| !d.trim().is_empty())
+                    .unwrap_or(false)
+            })
+            .map(|s| s.id.clone())
+            .collect();
+
+        let mut any_changed = false;
+        for group in self.groups.iter_mut() {
+            for tab in group.tabs.iter_mut() {
+                let Some(wd) = tab.working_directory.as_deref() else {
+                    continue;
+                };
+                if !codescope_core::path_canon::paths_match(
+                    &wd.to_string_lossy(),
+                    &event_path,
+                ) {
+                    continue;
+                }
+                if renamed_session_ids.contains(&tab.session_id) {
+                    continue;
+                }
+                if let Some(new_title) =
+                    codescope_core::rebuild_title(tab.title.as_ref(), new_branch)
+                {
+                    tab.title = SharedString::from(new_title);
+                    any_changed = true;
+                }
+            }
+        }
+        if any_changed {
+            cx.notify();
+        }
     }
 
     /// Allocate a session id for a freshly-spawned tab.

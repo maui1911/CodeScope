@@ -297,6 +297,14 @@ pub enum SidebarEvent {
     ///
     /// `ConfirmDialog`: [`crate::confirm_dialog::ConfirmDialog`]
     OpenConfirmDialog { spec: ConfirmSpec, action: ConfirmAction },
+    /// The live branch for a worktree has changed (the user ran
+    /// `git checkout` inside its pty, the `start_git_status_poll`
+    /// loop picked it up). AppShell uses this to rewrite the title
+    /// of every tab pinned to `path` so the strip stays consistent
+    /// with reality. Mirrors C#
+    /// `MainViewModel.RefreshTabTitlesForWorktree` (driven by the
+    /// `SessionStoreChange.WorktreeStatusUpdated` event).
+    WorktreeBranchChanged { path: PathBuf, branch: String },
 }
 
 /// What `SidebarEvent::OpenConfirmDialog` is asking to do after the
@@ -853,6 +861,14 @@ impl Sidebar {
                 if this
                     .update(cx, |this, cx| {
                         let mut changed = false;
+                        // Branches that flipped this tick. Emitted as
+                        // `WorktreeBranchChanged` so AppShell can
+                        // rewrite the title of every tab pinned to
+                        // the worktree path — `git checkout other`
+                        // inside the pty has to be reflected in the
+                        // tab strip, mirroring C#
+                        // `RefreshTabTitlesForWorktree`.
+                        let mut branch_changes: Vec<(String, String)> = Vec::new();
                         // Prune stale paths (removed projects / worktrees).
                         let prev_len = this.git_status.len();
                         this.git_status.retain(|path, _| known.contains(path));
@@ -860,10 +876,34 @@ impl Sidebar {
                             changed = true;
                         }
                         for (path, status) in updates {
-                            let prev = this.git_status.insert(path, status.clone());
+                            let prev_branch = this
+                                .git_status
+                                .get(&path)
+                                .map(|s| s.branch.clone());
+                            let prev = this.git_status.insert(path.clone(), status.clone());
                             if prev.as_ref() != Some(&status) {
                                 changed = true;
                             }
+                            // Emit only when the branch slot itself
+                            // changed — a numstat-only delta (lines
+                            // edited but same HEAD branch) shouldn't
+                            // trigger a tab re-title. Also catches
+                            // first-time observation: prev_branch is
+                            // None until the first tick lands, so a
+                            // tab spawned with a spawn-time branch
+                            // hint gets confirmed/corrected on the
+                            // first poll.
+                            if prev_branch.as_deref() != Some(status.branch.as_str())
+                                && !status.branch.is_empty()
+                            {
+                                branch_changes.push((path, status.branch.clone()));
+                            }
+                        }
+                        for (path, branch) in branch_changes {
+                            cx.emit(SidebarEvent::WorktreeBranchChanged {
+                                path: PathBuf::from(path),
+                                branch,
+                            });
                         }
                         if changed {
                             cx.notify();
