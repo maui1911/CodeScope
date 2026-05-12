@@ -876,27 +876,32 @@ impl Sidebar {
                             changed = true;
                         }
                         for (path, status) in updates {
-                            let prev_branch = this
-                                .git_status
-                                .get(&path)
-                                .map(|s| s.branch.clone());
+                            // Single hash lookup: `insert` returns the
+                            // prior value (if any), which we both
+                            // compare for change-detection and read
+                            // the previous branch from. A pre-`insert`
+                            // `get` would mean two hash lookups per
+                            // worktree per 5 s tick — cheap individually
+                            // but worth avoiding at the typical
+                            // worktree count.
                             let prev = this.git_status.insert(path.clone(), status.clone());
-                            if prev.as_ref() != Some(&status) {
-                                changed = true;
-                            }
                             // Emit only when the branch slot itself
                             // changed — a numstat-only delta (lines
                             // edited but same HEAD branch) shouldn't
                             // trigger a tab re-title. Also catches
-                            // first-time observation: prev_branch is
-                            // None until the first tick lands, so a
-                            // tab spawned with a spawn-time branch
-                            // hint gets confirmed/corrected on the
-                            // first poll.
-                            if prev_branch.as_deref() != Some(status.branch.as_str())
+                            // first-time observation: prev is None
+                            // until the first tick lands, so a tab
+                            // spawned with a spawn-time branch hint
+                            // gets confirmed / corrected on the first
+                            // poll.
+                            let prev_branch = prev.as_ref().map(|s| s.branch.as_str());
+                            if prev_branch != Some(status.branch.as_str())
                                 && !status.branch.is_empty()
                             {
-                                branch_changes.push((path, status.branch.clone()));
+                                branch_changes.push((path.clone(), status.branch.clone()));
+                            }
+                            if prev.as_ref() != Some(&status) {
+                                changed = true;
                             }
                         }
                         for (path, branch) in branch_changes {
