@@ -863,6 +863,14 @@ impl AppShell {
                         cx,
                     );
                 }
+                SidebarEvent::OpenSettings => {
+                    // Opened from the sidebar project context menu's
+                    // "Settings…" row. Same entry point Ctrl+Shift+,
+                    // and the status-bar gear left-click use —
+                    // `open_settings_dialog` is idempotent on an
+                    // already-open dialog.
+                    this.open_settings_dialog(window, cx);
+                }
             }
         })
         .detach();
@@ -2356,6 +2364,21 @@ impl AppShell {
         &self.settings
     }
 
+    /// Resolve the default agent's auto-type command string from
+    /// `Settings.default_agent` via `AgentRegistry::from_settings`.
+    /// Returns `<command> [<new_session_args>...]` joined by spaces.
+    /// `None` only when the resulting registry has zero agents — in
+    /// practice `from_settings` re-seeds the built-ins when
+    /// `settings.agents` is empty and `get_default()` falls back to
+    /// the first profile, so a typo'd / missing `default_agent` still
+    /// resolves to *some* agent (just not the user's preferred one).
+    /// Mirrors the sidebar's "New session ▸" default-row builder
+    /// (see `render_new_session_row`) so Ctrl+Shift+T lands on the
+    /// same agent the worktree menu's primary click would.
+    pub(crate) fn default_agent_auto_type(&self) -> Option<SharedString> {
+        default_agent_auto_type_for(&self.settings)
+    }
+
     /// Open a fresh shell session and append it as a new tab. The new
     /// tab becomes the active one and the terminal grabs focus.
     ///
@@ -2365,8 +2388,23 @@ impl AppShell {
     /// that already know which path to pin the terminal to (sidebar
     /// worktree clicks, post-create-worktree spawns) hand both in
     /// directly.
+    ///
+    /// `auto_type` is resolved from `Settings.default_agent` so the
+    /// new tab boots into the user's preferred agent CLI. Falls back
+    /// to a plain shell when the active project context is missing
+    /// (no folder for the agent to operate in) or when no default
+    /// agent is configured.
     fn spawn_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.spawn_tab_in(None, None, None, None, window, cx);
+        // Only auto-type the default agent when we actually have a
+        // working directory to land the agent in — a plain shell
+        // fallback keeps the empty / no-project state usable.
+        let has_project_context = self.sidebar.read(cx).active_project().is_some();
+        let auto_type = if has_project_context {
+            self.default_agent_auto_type()
+        } else {
+            None
+        };
+        self.spawn_tab_in(None, None, auto_type, None, window, cx);
     }
 
     fn spawn_tab_in(
@@ -4052,6 +4090,45 @@ impl AppShell {
                 .child("CodeScope — add a project to begin.")
         });
 
+        // ─── Settings gear button ────────────────────────────────
+        //
+        // Sits just-left of the bell in the status bar's right cluster.
+        // Left-click opens the Settings dialog directly — same entry
+        // point as the Ctrl+Shift+, chord and the command palette's
+        // "Open settings" row. The gear deliberately has *no*
+        // right-click menu; the discoverable "Settings…" row lives
+        // in the sidebar project context menu instead (see
+        // `Sidebar::render_project_menu`), which is the more natural
+        // home alongside the rest of the project-scoped actions.
+        let gear_btn = div()
+            .id("status-gear-btn")
+            .relative()
+            .w(px(22.0))
+            .h(px(22.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(move |s| s.bg(gpui::Hsla { h: 0.0, s: 0.0, l: 1.0, a: 0.08 }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.open_settings_dialog(window, cx);
+                }),
+            )
+            // 12 × 12 gear SVG; `text_color` drives the `currentColor`
+            // stroke so the tint tracks `text_faint`. Same sizing as
+            // the branch / sync / clock segments in the left cluster.
+            .child(
+                svg()
+                    .path("icons/settings.svg")
+                    .w(px(12.0))
+                    .h(px(12.0))
+                    .text_color(ink_muted),
+            );
+
         // ─── Bell button ─────────────────────────────────────────
         let has_unread = self.notifications.has_unread();
         let bell_btn = div()
@@ -4213,7 +4290,14 @@ impl AppShell {
             if let Some(seg) = workspace_summary {
                 clusters.push(vec![seg.into_any_element()]);
             }
-            clusters.push(vec![bell_btn.into_any_element()]);
+            // Gear + bell share the final cluster — same separator
+            // discipline as the rest of the bar (separators sit between
+            // clusters, not inside them), so the two icons read as a
+            // single "actions" group on the right.
+            clusters.push(vec![
+                gear_btn.into_any_element(),
+                bell_btn.into_any_element(),
+            ]);
             clusters
         };
 
@@ -6579,6 +6663,28 @@ fn push_non_empty_font_candidate(candidates: &mut Vec<String>, family: &str) {
     }
 }
 
+/// Resolve the default agent's auto-type command string from a
+/// `Settings` snapshot. Pulled out of `AppShell::default_agent_auto_type`
+/// as a free function so it can be unit-tested without a gpui context.
+/// Returns `<command> [<new_session_args>...]` joined by spaces.
+///
+/// `None` only when `AgentRegistry::from_settings` yields an empty
+/// list — which today can only happen if `settings.agents` was passed
+/// in non-empty but every entry was filtered out somewhere upstream.
+/// `from_settings` re-seeds the built-in profiles when
+/// `settings.agents` is empty, and `get_default()` falls back to the
+/// first profile when no `is_default` flag is set, so a typo'd /
+/// missing `default_agent` still resolves to *some* agent (just not
+/// the user's preferred one).
+fn default_agent_auto_type_for(settings: &Settings) -> Option<SharedString> {
+    let registry = codescope_core::AgentRegistry::from_settings(settings);
+    let profile = registry.get_default()?;
+    let mut argv: Vec<String> = Vec::with_capacity(1 + profile.new_session_args.len());
+    argv.push(profile.command.clone());
+    argv.extend(profile.new_session_args.iter().cloned());
+    Some(SharedString::from(argv.join(" ")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6707,5 +6813,83 @@ mod tests {
         assert_eq!(keystroke_digit_index("a", true), None);
         assert_eq!(keystroke_digit_index("a", false), None);
         assert_eq!(keystroke_digit_index("", true), None);
+    }
+
+    // ─── default_agent_auto_type_for ───────────────────────────────
+    //
+    // Ctrl+Shift+T / the "+ new tab" button route through this helper
+    // to look up the user's preferred agent CLI from the registry. The
+    // tests below pin the contract `on_key_down` for Ctrl+Shift+T
+    // relies on: a vanilla Settings yields the Claude command; flipping
+    // `default_agent` picks the matching profile; an empty `agents`
+    // override returns `None` so the caller can fall back to a plain
+    // shell.
+
+    #[test]
+    fn default_agent_auto_type_for_default_settings_returns_claude() {
+        // Built-in default — vanilla settings should auto-type `claude`
+        // (no extra args; new-session args are empty in the built-in
+        // Claude profile).
+        let settings = Settings::default();
+        let cmd = default_agent_auto_type_for(&settings).expect("default present");
+        assert_eq!(cmd.as_ref(), "claude");
+    }
+
+    #[test]
+    fn default_agent_auto_type_for_honours_default_agent_setting() {
+        // User changed `settings.default_agent` to Codex — the helper
+        // must follow, otherwise Ctrl+Shift+T would silently keep
+        // spawning Claude after the user reconfigured their default.
+        let settings = Settings {
+            default_agent: "codex".into(),
+            ..Settings::default()
+        };
+        let cmd = default_agent_auto_type_for(&settings).expect("default present");
+        // The built-in Codex profile uses the `codex` command. Asserting
+        // the prefix keeps the test resilient to future new-session-arg
+        // additions on the built-in profile while still catching a
+        // wrong-profile regression.
+        assert!(
+            cmd.as_ref() == "codex" || cmd.as_ref().starts_with("codex "),
+            "expected codex command, got {cmd:?}",
+        );
+    }
+
+    #[test]
+    fn default_agent_auto_type_for_joins_new_session_args() {
+        // A user-defined profile with new-session args should serialise
+        // as `<command> <arg1> <arg2>...` so the terminal gets a single
+        // ready-to-run line.
+        let settings = Settings {
+            agents: vec![codescope_core::AgentProfile {
+                id: "custom".into(),
+                display_name: "Custom".into(),
+                command: "my-cli".into(),
+                resume_args: vec![],
+                new_session_args: vec!["--init".into(), "fresh".into()],
+                session_id_flag: None,
+                resume_by_id_args: vec![],
+                is_default: true,
+                icon: None,
+                context_window_tokens: 0,
+            }],
+            ..Settings::default()
+        };
+        let cmd = default_agent_auto_type_for(&settings).expect("default present");
+        assert_eq!(cmd.as_ref(), "my-cli --init fresh");
+    }
+
+    #[test]
+    fn default_agent_auto_type_for_empty_agents_falls_back_to_built_ins() {
+        // Empty `agents` overrides → `from_settings` re-seeds the
+        // built-in agent set, so `default_agent_auto_type_for` still
+        // returns a Some (Claude). This pins the contract Ctrl+Shift+T
+        // relies on: a fresh / empty profile list never strands the
+        // user without an agent.
+        let settings = Settings {
+            agents: vec![],
+            ..Settings::default()
+        };
+        assert!(default_agent_auto_type_for(&settings).is_some());
     }
 }

@@ -281,6 +281,12 @@ pub enum SidebarEvent {
     /// Mirrors C# `Dialogs.RenameDialog.Prompt(current, title)`
     /// invocation pattern from `SidebarViewModel.Commands.cs`.
     OpenRenameDialog { target: RenameRequest, current_name: String },
+    /// User picked "Settings…" from the sidebar project context
+    /// menu. AppShell opens the in-app Settings dialog — same entry
+    /// point Ctrl+Shift+, and the status-bar gear left-click use.
+    /// No payload: the dialog edits global `settings.json`, not
+    /// per-project state, so the row is identical for every project.
+    OpenSettings,
     /// User asked for a destructive (or otherwise confirm-gated)
     /// sidebar action. AppShell opens its themed [`ConfirmDialog`],
     /// awaits the result, and — on confirm — dispatches the carried
@@ -3972,6 +3978,23 @@ impl Sidebar {
                 "Copy path",
                 false,
                 Box::new(move |this, _window, cx| this.copy_path(idx, cx)),
+            ))
+            .child(div().h_px().bg(divider).my_1())
+            // "Settings…" — opens the in-app Settings dialog. The
+            // status-bar gear left-clicks straight to the same dialog
+            // (no menu), so this row is the discoverable, labelled
+            // entry point that lives alongside the rest of the
+            // project-scoped actions. Edits global `settings.json`,
+            // not per-project state — the row is identical on every
+            // project.
+            .child(item(
+                "menu-open-settings",
+                "Settings…",
+                false,
+                Box::new(move |this, _window, cx| {
+                    cx.emit(SidebarEvent::OpenSettings);
+                    this.close_menu(cx);
+                }),
             ))
             .child(div().h_px().bg(divider).my_1())
             // "Rename project…" — fires a `SidebarEvent::OpenRenameDialog`
