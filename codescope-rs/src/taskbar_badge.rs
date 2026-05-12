@@ -65,19 +65,66 @@ struct BadgeState {
 /// Public façade. Construct once on window creation, stash on
 /// [`crate::app::AppShell`], call `apply` from the telemetry-poll
 /// callback that already runs on every tab status change.
+///
+/// On Windows the underlying `ITaskbarList3` proxy is held behind an
+/// `Rc<RefCell<...>>` so the deferred-init `cx.spawn` task can wire
+/// it up *without* going through the AppShell entity (no nested
+/// `this.update` borrow). See [`Self::init_handle`] +
+/// [`TaskbarBadgeInit::run`] (scheduled from
+/// `AppShell::schedule_taskbar_badge_init`).
 pub struct TaskbarBadge {
     last: Option<BadgeState>,
     #[cfg(target_os = "windows")]
     inner: windows_impl::WindowsBadge,
 }
 
+/// Opaque "init this from a spawn body" handle.
+///
+/// On Windows it carries a shared `Rc` to the lazy COM slot; on
+/// other platforms it's empty. Cloned out of [`TaskbarBadge::init_handle`]
+/// and passed into a foreground-executor task that awaits a short
+/// timer (escaping the AppShell entity's construction borrow) before
+/// calling [`Self::run`]. **Must** be called from outside any
+/// `cx.update(...)` / `cx.new(...)` closure on Windows.
+#[derive(Clone)]
+pub struct TaskbarBadgeInit {
+    #[cfg(target_os = "windows")]
+    inner: windows_impl::WindowsBadgeInit,
+}
+
+impl TaskbarBadgeInit {
+    /// Perform the deferred platform-specific bring-up. On Windows
+    /// this is the `CoInitializeEx` + `CoCreateInstance(TaskbarList)`
+    /// pair that must not run while the AppShell `RefCell` is
+    /// borrowed (the COM proxy bring-up pumps the Win32 message loop
+    /// and re-enters the gpui window proc).
+    pub fn run(self) {
+        #[cfg(target_os = "windows")]
+        {
+            self.inner.run();
+        }
+    }
+}
+
 impl TaskbarBadge {
-    /// Build a new badge attached to `window`. On Windows the
-    /// underlying `ITaskbarList3` COM object is constructed eagerly
-    /// (`CoInitializeEx` + `CoCreateInstance`) so the first
-    /// telemetry tick after startup doesn't have to pay COM init
-    /// latency. If construction fails (very old Windows / no shell)
-    /// the badge silently no-ops — no fatal-path side effects.
+    /// Build a new badge attached to `window`.
+    ///
+    /// **Important:** this is a cheap constructor that only captures
+    /// the HWND. The Windows COM init (`CoInitializeEx` +
+    /// `CoCreateInstance(TaskbarList)`) is deferred — call
+    /// [`Self::init_handle`] right after construction, schedule the
+    /// returned handle on the foreground executor with a short timer,
+    /// then invoke [`TaskbarBadgeInit::run`] from outside any entity
+    /// `cx.update` borrow.
+    ///
+    /// This split exists because the shell-side COM bring-up pumps
+    /// the Win32 message loop on the STA thread, which re-enters the
+    /// gpui window proc. If we did that while the AppShell entity's
+    /// `RefCell` was still borrowed (i.e. inside
+    /// `cx.new(|cx| AppShell::new(...))`), the re-entry would trip
+    /// `RefCell already borrowed` at
+    /// `gpui::async_context::update_entity`. See the dev-handoff for
+    /// the crash from session 38 PR #149.
     pub fn new(window: &Window) -> Self {
         Self {
             last: None,
@@ -86,9 +133,27 @@ impl TaskbarBadge {
         }
     }
 
+    /// Get an init handle to run from a deferred `cx.spawn` body.
+    /// See [`TaskbarBadgeInit`] for the constraints.
+    pub fn init_handle(&self) -> TaskbarBadgeInit {
+        TaskbarBadgeInit {
+            #[cfg(target_os = "windows")]
+            inner: self.inner.init_handle(),
+        }
+    }
+
     /// Apply a new state. No-op when the state is identical to the
-    /// last applied state, so polling-loop callers don't have to
-    /// gate on their own change detection.
+    /// last *successfully* applied state, so polling-loop callers
+    /// don't have to gate on their own change detection.
+    ///
+    /// Safe to call before [`TaskbarBadgeInit::run`] has completed —
+    /// the Windows path silently returns "not applied" when the COM
+    /// proxy slot is still empty, and `last` is **not** cached in
+    /// that case so the next telemetry tick retries painting (per
+    /// Copilot review on PR #153 — without that, the very first
+    /// apply pre-init would cache `last` and the badge would never
+    /// appear until the state changed again, e.g. a tab becoming
+    /// busy).
     pub fn apply(&mut self, busy_count: u32, agent_tab_count: u32) {
         let next = BadgeState {
             busy: busy_count,
@@ -97,25 +162,36 @@ impl TaskbarBadge {
         if self.last == Some(next) {
             return;
         }
-        self.last = Some(next);
 
-        #[cfg(target_os = "windows")]
-        {
-            self.inner.apply(busy_count, agent_tab_count);
+        let applied = {
+            #[cfg(target_os = "windows")]
+            {
+                self.inner.apply(busy_count, agent_tab_count)
+            }
+            #[cfg(target_os = "macos")]
+            {
+                macos_impl::apply(busy_count, agent_tab_count)
+            }
+            #[cfg(target_os = "linux")]
+            {
+                linux_impl::apply(busy_count, agent_tab_count)
+            }
+            // Other platforms: stay quiet — no badge concept. Treat
+            // as "applied" so we don't busy-poll forever.
+            #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+            {
+                let _ = (busy_count, agent_tab_count);
+                true
+            }
+        };
+
+        if applied {
+            self.last = Some(next);
         }
-        #[cfg(target_os = "macos")]
-        {
-            macos_impl::apply(busy_count, agent_tab_count);
-        }
-        #[cfg(target_os = "linux")]
-        {
-            linux_impl::apply(busy_count, agent_tab_count);
-        }
-        // Other platforms: stay quiet — no badge concept.
-        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-        {
-            let _ = (busy_count, agent_tab_count);
-        }
+        // else: leave `self.last` unchanged so the next call with
+        // the same state still hits the platform `apply` and gets a
+        // chance to paint once the deferred init has populated the
+        // COM slot.
     }
 
     /// Force-clear the overlay. Called from `AppShell::drop` for a
@@ -171,26 +247,71 @@ mod windows_impl {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    /// Owns the COM-initialised `ITaskbarList3` pointer and an HWND
-    /// snapshot. Both can be `None` if extraction failed at boot —
-    /// caller silently no-ops in that case.
-    pub(super) struct WindowsBadge {
-        hwnd: Option<HWND>,
-        taskbar: Option<ITaskbarList3>,
+    /// Shared, mutable slot holding the lazily-constructed
+    /// `ITaskbarList3` COM proxy. Wrapped in `Rc<RefCell<...>>` so
+    /// the deferred `cx.spawn` init body can write into it without
+    /// having to go through a `this.update(...)` closure on the
+    /// AppShell entity — that would re-enter the entity's RefCell
+    /// and panic during construction. `ITaskbarList3` is `!Send`,
+    /// matching `Rc`'s thread affinity.
+    pub(super) type SharedTaskbar = std::rc::Rc<std::cell::RefCell<TaskbarSlot>>;
+
+    pub(super) struct TaskbarSlot {
+        pub(super) taskbar: Option<ITaskbarList3>,
+        /// `true` once we've attempted `CoCreateInstance` — used to
+        /// avoid retrying if the shell rejects us (very old Windows /
+        /// WinPE / shell-less containers).
+        pub(super) init_attempted: bool,
     }
 
-    impl WindowsBadge {
-        pub(super) fn new(window: &Window) -> Self {
-            let hwnd = extract_hwnd(window);
-            // COM init is per-thread. The gpui main thread is where we
-            // were constructed; any later `apply` runs on the same
-            // thread because TaskbarBadge is not Send. `COINIT_APARTMENT
-            // THREADED` matches the Windows shell's expectations for
-            // ITaskbarList3 and is a no-op (returns S_FALSE) if COM
-            // was already initialised elsewhere on this thread.
+    /// Owns the lazy COM slot and an HWND snapshot. The HWND can be
+    /// `None` if `raw-window-handle` couldn't extract it; the slot
+    /// can hold `None` if either the deferred init hasn't run yet or
+    /// `CoCreateInstance` failed. `apply` silently no-ops in both
+    /// cases.
+    pub(super) struct WindowsBadge {
+        hwnd: Option<HWND>,
+        slot: SharedTaskbar,
+    }
+
+    /// Init-side handle. Holds a clone of the shared COM slot so the
+    /// foreground-executor task spawned from `AppShell::new` can
+    /// populate it after a short timer (outside the construction
+    /// borrow). See [`super::TaskbarBadgeInit`].
+    #[derive(Clone)]
+    pub(super) struct WindowsBadgeInit {
+        slot: SharedTaskbar,
+    }
+
+    impl WindowsBadgeInit {
+        pub(super) fn run(self) {
+            // Re-check inside the borrow so a second `run` (e.g. if
+            // someone calls it twice) is cheap and idempotent.
+            {
+                let slot = self.slot.borrow();
+                if slot.init_attempted {
+                    return;
+                }
+            }
+            // COM init is per-thread. The gpui main thread is where
+            // we were constructed; any later `apply` runs on the same
+            // thread because TaskbarBadge is not Send.
+            // `COINIT_APARTMENTTHREADED` matches gpui's own
+            // `OleInitialize` call (which initialises STA) and the
+            // Windows shell's expectations for ITaskbarList3, so this
+            // returns S_FALSE (already initialised in compatible
+            // mode) — never RPC_E_CHANGED_MODE.
             unsafe {
                 let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
             }
+            // `CoCreateInstance(TaskbarList)` synchronously pumps the
+            // Win32 message loop while it brings up the shell proxy
+            // (this is the call whose pump-during-construction tripped
+            // the `RefCell already borrowed` panic in session 38).
+            // Running it here, on a foreground-executor task body that
+            // has awaited a timer, guarantees no gpui entity borrow is
+            // currently live, so the re-entrant window-proc dispatch
+            // gets its own fresh `borrow_mut`, executes, and returns.
             let taskbar: Option<ITaskbarList3> = unsafe {
                 CoCreateInstance(&TaskbarList, None, CLSCTX_INPROC_SERVER).ok()
             };
@@ -202,18 +323,70 @@ mod windows_impl {
                     let _ = tb.HrInit();
                 }
             }
-            Self { hwnd, taskbar }
+            let mut slot = self.slot.borrow_mut();
+            slot.taskbar = taskbar;
+            slot.init_attempted = true;
+        }
+    }
+
+    impl WindowsBadge {
+        pub(super) fn new(window: &Window) -> Self {
+            // Capture the HWND eagerly — this is a pure
+            // `raw-window-handle` read with no Windows-shell side
+            // effects. The COM init is deferred to
+            // `WindowsBadgeInit::run` so we don't pump the message
+            // loop (and re-enter gpui's already-borrowed RefCell)
+            // while the AppShell entity is still being constructed.
+            let hwnd = extract_hwnd(window);
+            let slot = std::rc::Rc::new(std::cell::RefCell::new(TaskbarSlot {
+                taskbar: None,
+                init_attempted: false,
+            }));
+            Self { hwnd, slot }
         }
 
-        pub(super) fn apply(&mut self, busy: u32, agents: u32) {
-            let (Some(hwnd), Some(ref tb)) = (self.hwnd, self.taskbar.as_ref()) else {
-                return;
+        pub(super) fn init_handle(&self) -> WindowsBadgeInit {
+            WindowsBadgeInit {
+                slot: self.slot.clone(),
+            }
+        }
+
+        /// Returns `true` if the call actually reached the shell —
+        /// i.e. the HWND was extractable *and* the deferred COM init
+        /// has completed. Caller uses this to decide whether to
+        /// cache the requested state; returning `false` keeps the
+        /// cache un-updated so the next telemetry tick retries
+        /// painting once the COM slot is ready.
+        pub(super) fn apply(&mut self, busy: u32, agents: u32) -> bool {
+            // Do *not* lazy-init from here — `apply` is called from
+            // inside a `this.update(cx, ...)` borrow on the telemetry
+            // poll path, and `CoCreateInstance(TaskbarList)` pumps
+            // the Win32 message loop while building the shell proxy.
+            // The pump would re-enter the gpui window proc and trip
+            // a nested `RefCell` borrow on the AppShell entity. If
+            // the deferred init handle hasn't run yet (very first
+            // telemetry tick before the foreground spawn body fires)
+            // we silently no-op; the next tick will paint the badge.
+            let Some(hwnd) = self.hwnd else {
+                // HWND extraction failed at boot — this is permanent,
+                // so report "applied" to short-circuit the retry
+                // loop. The caller will just stop calling us once
+                // state stabilises.
+                return true;
+            };
+            let slot = self.slot.borrow();
+            let Some(ref tb) = slot.taskbar else {
+                // Deferred init still pending (or `CoCreateInstance`
+                // failed). Report "not applied" so the cache doesn't
+                // get poisoned with a state we never actually
+                // painted.
+                return false;
             };
             if agents == 0 {
                 unsafe {
                     let _ = tb.SetOverlayIcon(hwnd, null_hicon(), PCWSTR::null());
                 }
-                return;
+                return true;
             }
             let digit = super::format_badge_text(busy);
             let (r, g, b) = if busy == 0 {
@@ -242,10 +415,15 @@ mod windows_impl {
                     let _ = DestroyIcon(icon);
                 }
             }
+            true
         }
 
         pub(super) fn clear(&mut self) {
-            let (Some(hwnd), Some(ref tb)) = (self.hwnd, self.taskbar.as_ref()) else {
+            let Some(hwnd) = self.hwnd else {
+                return;
+            };
+            let slot = self.slot.borrow();
+            let Some(ref tb) = slot.taskbar else {
                 return;
             };
             unsafe {
@@ -521,8 +699,12 @@ mod windows_impl {
 // "cleared overlay" path for idle / no agents.
 #[cfg(target_os = "macos")]
 mod macos_impl {
-    pub(super) fn apply(_busy: u32, _agents: u32) {
+    /// Returns `true` once an implementation lands; the current stub
+    /// reports `true` so the de-dup cache in `TaskbarBadge::apply`
+    /// doesn't spin retrying.
+    pub(super) fn apply(_busy: u32, _agents: u32) -> bool {
         // TODO: NSApp.dockTile.setBadgeLabel:
+        true
     }
     pub(super) fn clear() {
         // TODO: setBadgeLabel:nil
@@ -539,8 +721,12 @@ mod macos_impl {
 // the busy digit is shown.
 #[cfg(target_os = "linux")]
 mod linux_impl {
-    pub(super) fn apply(_busy: u32, _agents: u32) {
+    /// Returns `true` once an implementation lands; the current stub
+    /// reports `true` so the de-dup cache in `TaskbarBadge::apply`
+    /// doesn't spin retrying.
+    pub(super) fn apply(_busy: u32, _agents: u32) -> bool {
         // TODO: Unity LauncherEntry DBus signal
+        true
     }
     pub(super) fn clear() {
         // TODO: count-visible = false

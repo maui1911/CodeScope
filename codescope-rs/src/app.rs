@@ -1094,8 +1094,44 @@ impl AppShell {
         shell.start_telemetry_poll(cx);
         shell.start_agent_discovery_poll(cx);
         shell.start_update_check_poll(cx);
+        shell.schedule_taskbar_badge_init(cx);
         shell.rehydrate_or_cold_start(window, cx);
         shell
+    }
+
+    /// Schedule the deferred Windows COM bring-up for the taskbar
+    /// badge.
+    ///
+    /// `TaskbarBadge::new` only captures the HWND — the
+    /// `CoCreateInstance(TaskbarList)` call is deferred to a
+    /// `cx.spawn` foreground task because that call synchronously
+    /// pumps the Win32 message loop while marshalling the shell
+    /// proxy, and pumping while the AppShell entity's `RefCell` was
+    /// still borrowed (i.e. inside `cx.new(|cx| AppShell::new(...))`)
+    /// re-entered the gpui window proc and tripped
+    /// `RefCell already borrowed` (session 38 PR #149 startup crash).
+    ///
+    /// The body crucially does **not** call `this.update(...)` — the
+    /// COM init writes through a cloned `Rc<RefCell<...>>` slot so
+    /// no entity borrow is live while the message pump runs.
+    fn schedule_taskbar_badge_init(&self, cx: &mut Context<Self>) {
+        let init = self.taskbar_badge.init_handle();
+        cx.spawn(async move |this, cx| {
+            // A tiny timer is enough to bounce the work out of the
+            // current effect cycle so the AppShell entity's
+            // construction borrow has dropped before we run. We do
+            // not call `this.upgrade()` strictly — the entity could
+            // already be torn down by then on a fast quit — but a
+            // dropped slot is fine: `init.run()` just writes through
+            // the shared Rc, which the WindowsBadge may or may not
+            // still be observing.
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+            let _ = this;
+            init.run();
+        })
+        .detach();
     }
 }
 
