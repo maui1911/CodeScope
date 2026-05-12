@@ -141,13 +141,17 @@ impl TaskbarBadge {
     }
 
     /// Apply a new state. No-op when the state is identical to the
-    /// last applied state, so polling-loop callers don't have to
-    /// gate on their own change detection.
+    /// last *successfully* applied state, so polling-loop callers
+    /// don't have to gate on their own change detection.
     ///
     /// Safe to call before [`TaskbarBadgeInit::run`] has completed —
-    /// the Windows path silently no-ops when the COM proxy slot is
-    /// still empty, and `last` still updates so the next tick after
-    /// init produces the correct overlay.
+    /// the Windows path silently returns "not applied" when the COM
+    /// proxy slot is still empty, and `last` is **not** cached in
+    /// that case so the next telemetry tick retries painting (per
+    /// Copilot review on PR #153 — without that, the very first
+    /// apply pre-init would cache `last` and the badge would never
+    /// appear until the state changed again, e.g. a tab becoming
+    /// busy).
     pub fn apply(&mut self, busy_count: u32, agent_tab_count: u32) {
         let next = BadgeState {
             busy: busy_count,
@@ -156,25 +160,36 @@ impl TaskbarBadge {
         if self.last == Some(next) {
             return;
         }
-        self.last = Some(next);
 
-        #[cfg(target_os = "windows")]
-        {
-            self.inner.apply(busy_count, agent_tab_count);
+        let applied = {
+            #[cfg(target_os = "windows")]
+            {
+                self.inner.apply(busy_count, agent_tab_count)
+            }
+            #[cfg(target_os = "macos")]
+            {
+                macos_impl::apply(busy_count, agent_tab_count)
+            }
+            #[cfg(target_os = "linux")]
+            {
+                linux_impl::apply(busy_count, agent_tab_count)
+            }
+            // Other platforms: stay quiet — no badge concept. Treat
+            // as "applied" so we don't busy-poll forever.
+            #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+            {
+                let _ = (busy_count, agent_tab_count);
+                true
+            }
+        };
+
+        if applied {
+            self.last = Some(next);
         }
-        #[cfg(target_os = "macos")]
-        {
-            macos_impl::apply(busy_count, agent_tab_count);
-        }
-        #[cfg(target_os = "linux")]
-        {
-            linux_impl::apply(busy_count, agent_tab_count);
-        }
-        // Other platforms: stay quiet — no badge concept.
-        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-        {
-            let _ = (busy_count, agent_tab_count);
-        }
+        // else: leave `self.last` unchanged so the next call with
+        // the same state still hits the platform `apply` and gets a
+        // chance to paint once the deferred init has populated the
+        // COM slot.
     }
 
     /// Force-clear the overlay. Called from `AppShell::drop` for a
@@ -334,7 +349,13 @@ mod windows_impl {
             }
         }
 
-        pub(super) fn apply(&mut self, busy: u32, agents: u32) {
+        /// Returns `true` if the call actually reached the shell —
+        /// i.e. the HWND was extractable *and* the deferred COM init
+        /// has completed. Caller uses this to decide whether to
+        /// cache the requested state; returning `false` keeps the
+        /// cache un-updated so the next telemetry tick retries
+        /// painting once the COM slot is ready.
+        pub(super) fn apply(&mut self, busy: u32, agents: u32) -> bool {
             // Do *not* lazy-init from here — `apply` is called from
             // inside a `this.update(cx, ...)` borrow on the telemetry
             // poll path, and `CoCreateInstance(TaskbarList)` pumps
@@ -345,17 +366,25 @@ mod windows_impl {
             // telemetry tick before the foreground spawn body fires)
             // we silently no-op; the next tick will paint the badge.
             let Some(hwnd) = self.hwnd else {
-                return;
+                // HWND extraction failed at boot — this is permanent,
+                // so report "applied" to short-circuit the retry
+                // loop. The caller will just stop calling us once
+                // state stabilises.
+                return true;
             };
             let slot = self.slot.borrow();
             let Some(ref tb) = slot.taskbar else {
-                return;
+                // Deferred init still pending (or `CoCreateInstance`
+                // failed). Report "not applied" so the cache doesn't
+                // get poisoned with a state we never actually
+                // painted.
+                return false;
             };
             if agents == 0 {
                 unsafe {
                     let _ = tb.SetOverlayIcon(hwnd, null_hicon(), PCWSTR::null());
                 }
-                return;
+                return true;
             }
             let digit = super::format_badge_text(busy);
             let (r, g, b) = if busy == 0 {
@@ -384,6 +413,7 @@ mod windows_impl {
                     let _ = DestroyIcon(icon);
                 }
             }
+            true
         }
 
         pub(super) fn clear(&mut self) {
@@ -667,8 +697,12 @@ mod windows_impl {
 // "cleared overlay" path for idle / no agents.
 #[cfg(target_os = "macos")]
 mod macos_impl {
-    pub(super) fn apply(_busy: u32, _agents: u32) {
+    /// Returns `true` once an implementation lands; the current stub
+    /// reports `true` so the de-dup cache in `TaskbarBadge::apply`
+    /// doesn't spin retrying.
+    pub(super) fn apply(_busy: u32, _agents: u32) -> bool {
         // TODO: NSApp.dockTile.setBadgeLabel:
+        true
     }
     pub(super) fn clear() {
         // TODO: setBadgeLabel:nil
@@ -685,8 +719,12 @@ mod macos_impl {
 // the busy digit is shown.
 #[cfg(target_os = "linux")]
 mod linux_impl {
-    pub(super) fn apply(_busy: u32, _agents: u32) {
+    /// Returns `true` once an implementation lands; the current stub
+    /// reports `true` so the de-dup cache in `TaskbarBadge::apply`
+    /// doesn't spin retrying.
+    pub(super) fn apply(_busy: u32, _agents: u32) -> bool {
         // TODO: Unity LauncherEntry DBus signal
+        true
     }
     pub(super) fn clear() {
         // TODO: count-visible = false
