@@ -28,6 +28,11 @@ anyhow = "1"
 parking_lot = "0.12"
 uuid = { version = "1", features = ["v4"] }
 raw-window-handle = "0.6"
+# `futures-channel::oneshot` for the themed ConfirmDialog's Future<bool>
+# API. gpui already pulls this in transitively for `window.prompt`'s
+# return type; we depend on it explicitly so the confirm dialog reads
+# from the same well-known crate without going through gpui internals.
+futures-channel = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 # Direct Win32 access for the custom titlebar: gpui's

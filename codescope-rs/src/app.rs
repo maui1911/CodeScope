@@ -668,6 +668,13 @@ pub struct AppShell {
     /// gpui doesn't have a modal-window primitive. See
     /// `rename_dialog.rs` for the full rationale.
     pub(crate) rename_dialog: Option<crate::rename_dialog::RenameDialogState>,
+    /// Open Confirm dialog, if any. Themed in-app replacement for the
+    /// OS-native `window.prompt(...)` used by destructive sidebar
+    /// actions (remove project, discard worktree changes, remove
+    /// worktree, force-retry, remove from history). Mirrors C#
+    /// `Dialogs.ConfirmDialog.Confirm` / `Destructive`. See
+    /// `confirm_dialog.rs`.
+    pub(crate) confirm_dialog: Option<crate::confirm_dialog::ConfirmDialogState>,
     /// Multiplatform taskbar / dock badge driver. Mirrors C#
     /// `TaskbarBadgeService`. Refreshed from the same telemetry-poll
     /// callback that updates the sidebar dots
@@ -846,6 +853,14 @@ impl AppShell {
                     this.open_rename_dialog(
                         target.clone(),
                         current_name.clone(),
+                        window,
+                        cx,
+                    );
+                }
+                SidebarEvent::OpenConfirmDialog { spec, action } => {
+                    this.handle_open_confirm_dialog(
+                        spec.clone(),
+                        action.clone(),
                         window,
                         cx,
                     );
@@ -1073,6 +1088,7 @@ impl AppShell {
             show_overview: false,
             settings_dialog: None,
             rename_dialog: None,
+            confirm_dialog: None,
             taskbar_badge: crate::taskbar_badge::TaskbarBadge::new(window),
         };
         shell.start_telemetry_poll(cx);
@@ -1872,6 +1888,99 @@ impl AppShell {
     /// retention sweep, or stale event from a closed sidebar that has
     /// since rebuilt) is logged and swallowed — there's nothing useful
     /// to spawn at that point.
+    /// Open the themed ConfirmDialog and dispatch the carried
+    /// [`crate::sidebar::ConfirmAction`] once the user resolves it.
+    /// Bridges the sidebar's "I want to confirm this destructive
+    /// action" event to the AppShell-owned dialog overlay. On
+    /// confirm, sidebar-scoped actions go through
+    /// [`Sidebar::execute_confirm_action`]; the
+    /// `RemoveSessionFromHistory` variant is handled here because the
+    /// session store lives on AppShell.
+    pub(crate) fn handle_open_confirm_dialog(
+        &mut self,
+        spec: crate::confirm_dialog::ConfirmSpec,
+        action: crate::sidebar::ConfirmAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rx = self.open_confirm_dialog(spec, window, cx);
+        cx.spawn(async move |this, cx| {
+            let confirmed = rx.await.unwrap_or(false);
+            if !confirmed {
+                return;
+            }
+            let _ = this.update(cx, |this, cx| {
+                match action {
+                    crate::sidebar::ConfirmAction::RemoveSessionFromHistory {
+                        session_id,
+                    } => {
+                        this.remove_session_from_history(session_id, cx);
+                    }
+                    other => {
+                        this.sidebar.update(cx, |sidebar, cx| {
+                            sidebar.execute_confirm_action(other, cx);
+                        });
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Drop a closed-session row from history. Reload-then-mutate-
+    /// then-save mirrors the `reopen_session` discipline so a sidebar
+    /// write between two of ours can't clobber the array. Surfaces
+    /// failures as toasts so the user sees the row stay in the
+    /// disclosure instead of silently racing the on-disk file.
+    /// Mirrors C# `RemoveSessionFromHistoryAsync` /
+    /// `SessionStore.RemoveSessionAsync`.
+    pub(crate) fn remove_session_from_history(
+        &mut self,
+        session_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        match ProjectsConfig::load(&self.paths) {
+            Ok(cfg) => {
+                self.projects = cfg;
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to reload projects.json before remove-from-history: {err:#}"
+                );
+                self.push_toast(
+                    ToastKind::Err,
+                    SharedString::from("Remove failed"),
+                    Some(SharedString::from(format!(
+                        "Could not read projects.json: {err:#}"
+                    ))),
+                    cx,
+                );
+                return;
+            }
+        }
+        if let Err(err) = SessionManager::hard_remove(&mut self.projects, &session_id) {
+            self.push_toast(
+                ToastKind::Err,
+                SharedString::from("Remove failed"),
+                Some(SharedString::from(format!("{err:#}"))),
+                cx,
+            );
+            return;
+        }
+        if let Err(err) = codescope_core::session::save(&self.projects, &self.paths) {
+            self.push_toast(
+                ToastKind::Err,
+                SharedString::from("Remove failed"),
+                Some(SharedString::from(format!("Failed to save: {err:#}"))),
+                cx,
+            );
+            return;
+        }
+        // Mirror the updated config into the sidebar so the row
+        // disappears from the history disclosure on this frame.
+        self.mirror_projects_to_sidebar(cx);
+    }
+
     pub(crate) fn reopen_session(
         &mut self,
         session_id: String,
@@ -4874,6 +4983,7 @@ impl Render for AppShell {
             .children(self.render_command_palette(window, &theme, cx))
             .children(self.render_settings_dialog(window, &theme, cx))
             .children(self.render_rename_dialog(window, &theme, cx))
+            .children(self.render_confirm_dialog(window, &theme, cx))
     }
 }
 
