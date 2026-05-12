@@ -6973,10 +6973,7 @@ fn push_non_empty_font_candidate(candidates: &mut Vec<String>, family: &str) {
 fn default_agent_auto_type_for(settings: &Settings) -> Option<SharedString> {
     let registry = codescope_core::AgentRegistry::from_settings(settings);
     let profile = registry.get_default()?;
-    let mut argv: Vec<String> = Vec::with_capacity(1 + profile.new_session_args.len());
-    argv.push(profile.command.clone());
-    argv.extend(profile.new_session_args.iter().cloned());
-    Some(SharedString::from(argv.join(" ")))
+    codescope_core::build_new_session_auto_type(profile).map(SharedString::from)
 }
 
 #[cfg(test)]

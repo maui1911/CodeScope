@@ -337,6 +337,29 @@ pub fn build_resume_auto_type(
     Some(argv.join(" "))
 }
 
+/// Build the auto-type command string used to launch a brand-new
+/// session for `profile`. Mirrors C#
+/// `SessionManager.CreateAgentSession` with `resume = false`:
+/// `[command, new_session_args...]` joined by single spaces.
+///
+/// Returns `None` when `profile.command` is empty — defensive against
+/// a hand-edited `settings.json` so callers can fall back to a plain
+/// shell instead of emitting a leading-space argv.
+///
+/// Shared helper called from every new-session entry point (the
+/// sidebar's double-click handler, `AppShell::default_agent_auto_type`,
+/// and the per-agent rows in `render_new_session_submenu`) so they
+/// can't drift out of sync.
+pub fn build_new_session_auto_type(profile: &AgentProfile) -> Option<String> {
+    if profile.command.is_empty() {
+        return None;
+    }
+    let mut argv: Vec<String> = Vec::with_capacity(1 + profile.new_session_args.len());
+    argv.push(profile.command.clone());
+    argv.extend(profile.new_session_args.iter().cloned());
+    Some(argv.join(" "))
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -705,5 +728,88 @@ mod tests {
             build_resume_auto_type(&profile, Some("xyz")),
             Some("multi --resume --id xyz".into()),
         );
+    }
+
+    // ─── build_new_session_auto_type ───────────────────────────────
+    //
+    // Pins the contract every new-session entry point (sidebar
+    // double-click, Ctrl+Shift+T, per-agent submenu rows) relies on:
+    // `<command> [<new_session_args>...]` joined by single spaces,
+    // with `None` only when `command` is empty. Built-in profiles
+    // ship empty `new_session_args` for every agent except Codex's
+    // (also empty today), so the bare-command shape covers them all.
+    // The custom-profile test below pins the multi-arg joining shape.
+
+    #[test]
+    fn build_new_session_auto_type_claude_yields_bare_command() {
+        let profile = registry_profile("claude");
+        assert_eq!(
+            build_new_session_auto_type(&profile),
+            Some("claude".into()),
+        );
+    }
+
+    #[test]
+    fn build_new_session_auto_type_codex_yields_bare_command() {
+        // Codex's `new_session_args` is empty — the bare `codex` is
+        // the expected new-session launch (`resume_args = ["resume"]`
+        // is the resume shape, not the new-session shape).
+        let profile = registry_profile("codex");
+        assert_eq!(
+            build_new_session_auto_type(&profile),
+            Some("codex".into()),
+        );
+    }
+
+    #[test]
+    fn build_new_session_auto_type_copilot_yields_bare_command() {
+        let profile = registry_profile("copilot");
+        assert_eq!(
+            build_new_session_auto_type(&profile),
+            Some("copilot".into()),
+        );
+    }
+
+    #[test]
+    fn build_new_session_auto_type_joins_custom_new_session_args() {
+        // A user-defined profile with new-session args must serialise
+        // as `<command> <arg1> <arg2>...` so the terminal gets a
+        // single ready-to-run line.
+        let profile = AgentProfile {
+            id: "custom".into(),
+            display_name: "Custom".into(),
+            command: "my-cli".into(),
+            resume_args: vec![],
+            new_session_args: vec!["--init".into(), "fresh".into()],
+            session_id_flag: None,
+            resume_by_id_args: vec![],
+            is_default: true,
+            icon: None,
+            context_window_tokens: 0,
+        };
+        assert_eq!(
+            build_new_session_auto_type(&profile),
+            Some("my-cli --init fresh".into()),
+        );
+    }
+
+    #[test]
+    fn build_new_session_auto_type_returns_none_when_command_empty() {
+        // Defensive: a hand-edited `settings.json` with a blank
+        // `command` must not emit a leading-space argv. Returning
+        // `None` lets the caller fall through to a plain shell.
+        let profile = AgentProfile {
+            id: "broken".into(),
+            display_name: "Broken".into(),
+            command: String::new(),
+            resume_args: vec![],
+            new_session_args: vec!["--init".into()],
+            session_id_flag: None,
+            resume_by_id_args: vec![],
+            is_default: false,
+            icon: None,
+            context_window_tokens: 0,
+        };
+        assert!(build_new_session_auto_type(&profile).is_none());
     }
 }

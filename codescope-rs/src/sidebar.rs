@@ -1351,19 +1351,20 @@ impl Sidebar {
     }
 
     /// Build the auto-type command string for the registry's default
-    /// agent (e.g. `"claude"`, `"codex --resume"`). Used by the
+    /// agent (e.g. `"claude"` with the built-in Claude profile, or
+    /// `"my-cli --init fresh"` for a custom profile whose
+    /// `new_session_args` is `["--init", "fresh"]`). Used by the
     /// double-click handler on a worktree row so opening a tab from
     /// the sidebar lands in the user's configured default agent
     /// instead of a plain shell. Mirrors AppShell::default_agent_auto_type
     /// but reads from the sidebar's own cached registry — the two are
-    /// kept in lockstep via `apply_agent_registry`.
+    /// kept in lockstep via `apply_agent_registry`. The argv→string
+    /// joining lives in `codescope_core::build_new_session_auto_type`
+    /// so this path can't drift from `default_agent_auto_type_for` /
+    /// `render_new_session_submenu`.
     fn default_agent_auto_type(&self) -> Option<SharedString> {
         let profile = self.agent_registry.get_default()?;
-        let mut argv: Vec<String> =
-            Vec::with_capacity(1 + profile.new_session_args.len());
-        argv.push(profile.command.clone());
-        argv.extend(profile.new_session_args.iter().cloned());
-        Some(SharedString::from(argv.join(" ")))
+        codescope_core::build_new_session_auto_type(profile).map(SharedString::from)
     }
 
     /// Open the project context menu at `position` (window coords)
@@ -3793,11 +3794,16 @@ impl Sidebar {
                 title_prefix.as_ref(),
                 profile.id,
             ));
-            let mut argv: Vec<String> =
-                Vec::with_capacity(1 + profile.new_session_args.len());
-            argv.push(profile.command.clone());
-            argv.extend(profile.new_session_args.iter().cloned());
-            let cmd = argv.join(" ");
+            // Shared helper keeps the new-session command shape in
+            // sync with the double-click handler and Ctrl+Shift+T.
+            // A profile with an empty `command` falls back to bare
+            // `command` (= empty string) only when the helper returns
+            // `None`; we filter that case to a blank string so the
+            // row still renders — clicking it would auto-type
+            // nothing, matching how the helper returning `None` is
+            // handled elsewhere.
+            let cmd =
+                codescope_core::build_new_session_auto_type(profile).unwrap_or_default();
             let frost_hover = frost;
             let base_color = if is_default { ink } else { ink_dim };
             let hover_color = ink;
