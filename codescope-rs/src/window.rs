@@ -17,6 +17,7 @@ mod new_project_dialog;
 mod new_worktree_dialog;
 mod notifications;
 mod overview;
+mod rename_dialog;
 mod settings_dialog;
 mod sidebar;
 mod theme;

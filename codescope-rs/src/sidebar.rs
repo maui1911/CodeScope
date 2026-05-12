@@ -92,6 +92,16 @@ enum OpenMenu {
         worktree_id: String,
         position: Point<Pixels>,
     },
+    /// Right-click on a closed-session history row. The menu is tiny
+    /// (Rename… + Reopen) — broken out as a third variant so the
+    /// project/worktree rendering paths stay unchanged.
+    History {
+        session_id: String,
+        /// Display label snapshotted at right-click time so the dialog
+        /// pre-fills with the same text the user just clicked.
+        label: String,
+        position: Point<Pixels>,
+    },
 }
 
 /// Per-worktree state for the lazy `gh pr list` lookup. `Pending`
@@ -184,6 +194,30 @@ pub enum SidebarEvent {
     /// the persisted `worktree_path` + `agent_id`. Mirrors C#
     /// `MainViewModel.ReopenClosedSessionAsync`.
     ReopenSession { session_id: String },
+    /// User picked "Rename project…" / "Rename session…" from a
+    /// context menu. AppShell owns the rename dialog state and the
+    /// rename persistence path; the sidebar fires the request and
+    /// passes the current value so the dialog opens pre-populated.
+    /// Mirrors C# `Dialogs.RenameDialog.Prompt(current, title)`
+    /// invocation pattern from `SidebarViewModel.Commands.cs`.
+    OpenRenameDialog { target: RenameRequest, current_name: String },
+}
+
+/// What `SidebarEvent::OpenRenameDialog` is asking to rename. Held by
+/// the dialog state until submit / cancel. Worktree-as-target is
+/// intentionally absent — the C# build renames the on-disk worktree
+/// directory (`SessionStore.RenameWorktreeAsync`), which is heavier
+/// than a display-name flip and depends on closing every open tab
+/// pinned to that worktree first. We keep parity with the C# UI by
+/// hiding the row entirely on the Rust side until that flow lands.
+/// See `docs/DECISIONS.md` for the deviation note.
+#[derive(Debug, Clone)]
+pub enum RenameRequest {
+    /// Rename a project's display name. Mirrors C# `RenameProjectCommand`.
+    Project { project_id: String },
+    /// Rename a session's display-name override (live or closed).
+    /// Mirrors C# `RenameSessionCommand`.
+    Session { session_id: String },
 }
 
 /// Toast severity emitted by the sidebar. AppShell maps these to its
@@ -1136,6 +1170,21 @@ impl Sidebar {
         }
 
         self.menu = Some(OpenMenu::Worktree { project_idx, worktree_id, position });
+        cx.notify();
+    }
+
+    /// Open the closed-history row context menu. Snapshots the row's
+    /// current display label so the rename dialog opens pre-filled,
+    /// even if the underlying `display_name` resolves through a
+    /// fallback chain (display_name → branch → id) at render time.
+    fn open_history_menu(
+        &mut self,
+        session_id: String,
+        label: String,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.menu = Some(OpenMenu::History { session_id, label, position });
         cx.notify();
     }
 
@@ -2601,6 +2650,23 @@ impl Render for Sidebar {
                                     });
                                 }),
                             )
+                            // Right-click opens the closed-history
+                            // context menu (Reopen + Rename…). Mirrors
+                            // the C# `SessionTabViewModel` template's
+                            // right-click affordance on history rows.
+                            .on_mouse_down(MouseButton::Right, {
+                                let id_for_ctx = session_id.clone();
+                                let label_for_ctx = row.label.to_string();
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.open_history_menu(
+                                        id_for_ctx.clone(),
+                                        label_for_ctx.clone(),
+                                        event.position,
+                                        cx,
+                                    );
+                                })
+                            })
                             // Hollow outline dot — `border_1` + transparent
                             // bg matches the WPF `Stroke=Text.Faint`
                             // ellipse on the closed-row template, marking
@@ -2872,6 +2938,18 @@ impl Render for Sidebar {
                         .into_any_element();
                     root = root.child(overlay);
                 }
+            }
+            Some(OpenMenu::History { session_id, label, position }) => {
+                let overlay = self
+                    .render_history_menu(
+                        session_id.clone(),
+                        label.clone(),
+                        *position,
+                        &theme,
+                        cx,
+                    )
+                    .into_any_element();
+                root = root.child(overlay);
             }
             None => {}
         }
@@ -3244,6 +3322,29 @@ impl Sidebar {
                 Box::new(move |this, _window, cx| this.copy_path(idx, cx)),
             ))
             .child(div().h_px().bg(divider).my_1())
+            // "Rename project…" — fires a `SidebarEvent::OpenRenameDialog`
+            // so AppShell opens the modal. Mirrors C#
+            // `SidebarViewModel.RenameProjectCommand` (currently
+            // unbound on the C# side at the project scope but the
+            // store API exists; the Rust port wires the row).
+            .child({
+                let project_id = project.id.clone();
+                let current_name = project.name.clone();
+                item(
+                    "menu-rename-project",
+                    "Rename project…",
+                    false,
+                    Box::new(move |this, _window, cx| {
+                        cx.emit(SidebarEvent::OpenRenameDialog {
+                            target: RenameRequest::Project {
+                                project_id: project_id.clone(),
+                            },
+                            current_name: current_name.clone(),
+                        });
+                        this.close_menu(cx);
+                    }),
+                )
+            })
             .child(item(
                 "menu-remove",
                 "Remove project",
@@ -3666,6 +3767,124 @@ impl Sidebar {
                     }),
                 ))
             }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_menu(cx)));
+
+        deferred(
+            anchored()
+                .position(point(position.x, position.y))
+                .anchor(Corner::TopLeft)
+                .snap_to_window_with_margin(px(8.0))
+                .child(menu_body),
+        )
+    }
+
+    /// Closed-history row context menu — tiny by design (Reopen +
+    /// Rename…). Triggered by a right-click on a row inside the
+    /// per-worktree history disclosure. Mirrors the C# build's
+    /// `SessionTabViewModel` history template right-click affordance,
+    /// scoped down to the two actions we support today.
+    fn render_history_menu(
+        &self,
+        session_id: String,
+        label: String,
+        position: Point<Pixels>,
+        theme: &Arc<Theme>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let elevated = theme::elevated(theme);
+        let divider = theme::divider(theme);
+        let ink = theme::ink(theme);
+        let ink_dim = theme::ink_dim(theme);
+        let ink_ghost = theme::ink_ghost(theme);
+        let frost = theme::frost_10(theme);
+
+        let header_label: SharedString = label.clone().into();
+
+        let item = |id: &'static str,
+                    text: &'static str,
+                    on_click: MenuItemAction|
+         -> gpui::Stateful<gpui::Div> {
+            let frost_hover = frost;
+            div()
+                .id(id)
+                .h(px(28.0))
+                .px_3()
+                .flex()
+                .flex_row()
+                .items_center()
+                .text_size(px(12.5))
+                .text_color(ink_dim)
+                .cursor_pointer()
+                .hover(move |s| s.bg(frost_hover).text_color(ink))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        on_click(this, window, cx);
+                    }),
+                )
+                .child(text)
+        };
+
+        let reopen_session_id = session_id.clone();
+        let rename_session_id = session_id.clone();
+        let rename_current = label.clone();
+
+        let menu_body = div()
+            .flex()
+            .flex_col()
+            .py_1()
+            .min_w(px(200.0))
+            .bg(elevated)
+            .border_1()
+            .border_color(divider)
+            .rounded_md()
+            .shadow_lg()
+            .font(theme::font_sans())
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(10.0))
+                    .text_color(ink_ghost)
+                    .child(
+                        div()
+                            .text_color(ink)
+                            .font(theme::font_mono())
+                            .text_size(px(11.0))
+                            .truncate()
+                            .child(header_label),
+                    )
+                    .child(div().child("closed session")),
+            )
+            .child(div().h_px().bg(divider).my_1())
+            .child(item(
+                "hist-menu-reopen",
+                "Reopen session",
+                Box::new(move |this, _window, cx| {
+                    cx.emit(SidebarEvent::ReopenSession {
+                        session_id: reopen_session_id.clone(),
+                    });
+                    this.close_menu(cx);
+                }),
+            ))
+            .child(item(
+                "hist-menu-rename",
+                "Rename session…",
+                Box::new(move |this, _window, cx| {
+                    cx.emit(SidebarEvent::OpenRenameDialog {
+                        target: RenameRequest::Session {
+                            session_id: rename_session_id.clone(),
+                        },
+                        current_name: rename_current.clone(),
+                    });
+                    this.close_menu(cx);
+                }),
+            ))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|_, _, _, cx| cx.stop_propagation()),

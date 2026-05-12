@@ -106,6 +106,32 @@ impl Project {
     }
 }
 
+/// Rename a project's display name. Mirrors C# `SessionStore.RenameProjectAsync`
+/// — trims whitespace, rejects an empty result, and no-ops when the trimmed
+/// value matches the current name. Returns `Ok(true)` when the name actually
+/// changed (callers should persist), `Ok(false)` for a no-op, and `Err` when
+/// the id is unknown or the trimmed input is empty.
+pub fn rename_project(
+    cfg: &mut ProjectsConfig,
+    project_id: &str,
+    new_name: &str,
+) -> Result<bool> {
+    let trimmed = new_name.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("project name cannot be empty");
+    }
+    let project = cfg
+        .projects
+        .iter_mut()
+        .find(|p| p.id == project_id)
+        .ok_or_else(|| anyhow::anyhow!("project '{project_id}' not found"))?;
+    if project.name == trimmed {
+        return Ok(false);
+    }
+    project.name = trimmed.to_string();
+    Ok(true)
+}
+
 /// One git worktree under a [`Project`]. Every project carries an
 /// explicit primary row (`is_primary: true`) pointing at
 /// `Project::path` plus zero or more additional worktrees with
@@ -710,5 +736,52 @@ mod tests {
         assert_eq!(reloaded.agents[0]["id"], "claude");
         assert_eq!(reloaded.agents[1]["id"], "codex");
         assert_eq!(reloaded.projects.len(), 1);
+    }
+
+    #[test]
+    fn rename_project_updates_name_and_reports_change() {
+        let mut cfg = ProjectsConfig::default();
+        let project = Project::new("C:\\repos\\foo".into());
+        let id = project.id.clone();
+        cfg.projects.push(project);
+
+        let changed = rename_project(&mut cfg, &id, "  Renamed  ").unwrap();
+        assert!(changed);
+        assert_eq!(cfg.projects[0].name, "Renamed");
+    }
+
+    #[test]
+    fn rename_project_is_noop_when_name_unchanged() {
+        let mut cfg = ProjectsConfig::default();
+        let mut project = Project::new("C:\\repos\\foo".into());
+        project.name = "Stable".into();
+        let id = project.id.clone();
+        cfg.projects.push(project);
+
+        let changed = rename_project(&mut cfg, &id, "Stable").unwrap();
+        assert!(!changed);
+        // Trim still applies to the comparison.
+        let changed = rename_project(&mut cfg, &id, "  Stable  ").unwrap();
+        assert!(!changed);
+    }
+
+    #[test]
+    fn rename_project_rejects_empty_or_whitespace_name() {
+        let mut cfg = ProjectsConfig::default();
+        let project = Project::new("C:\\repos\\foo".into());
+        let id = project.id.clone();
+        cfg.projects.push(project);
+
+        assert!(rename_project(&mut cfg, &id, "").is_err());
+        assert!(rename_project(&mut cfg, &id, "   ").is_err());
+    }
+
+    #[test]
+    fn rename_project_errors_on_unknown_id() {
+        let mut cfg = ProjectsConfig::default();
+        cfg.projects.push(Project::new("C:\\repos\\foo".into()));
+
+        let err = rename_project(&mut cfg, "ghost", "New").unwrap_err();
+        assert!(err.to_string().contains("ghost"));
     }
 }
