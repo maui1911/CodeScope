@@ -53,6 +53,14 @@ pub struct RenameDialogState {
     /// model on this primitive yet, so the user has to manually clear
     /// before typing. This is a follow-up rather than a parity gap.
     pub name: String,
+    /// Snapshot of the pre-fill value, kept around so submit can short-
+    /// circuit on `trimmed == original.trim()`. Session renames in
+    /// particular need this: `SessionManager::rename` unconditionally
+    /// sets `display_name`, so pressing Enter on a closed-history row
+    /// whose label was *derived* (from `branch` or `id`) would otherwise
+    /// stamp that derived value as an explicit override — invisible to
+    /// the user, but it stops branch / id fallbacks from re-deriving.
+    pub original: String,
     /// Inline validation error, rendered above the footer. Cleared on
     /// any user edit.
     pub error: Option<String>,
@@ -68,6 +76,7 @@ impl RenameDialogState {
             focus_handle,
             target,
             title,
+            original: current.clone(),
             name: current,
             error: None,
         }
@@ -145,6 +154,20 @@ impl AppShell {
             return;
         }
         let target = state.target.clone();
+        let original_trimmed = state.original.trim().to_string();
+        // Universal no-op when the trimmed buffer matches the trimmed
+        // pre-fill — applies to both project and session paths so a
+        // closed-history row pre-filled from a derived label doesn't
+        // get its derivation stamped as an explicit `display_name`
+        // override on a no-op Enter. The project path's helper
+        // already guards against this internally, but mirroring the
+        // check up-front keeps the two branches aligned and skips an
+        // unnecessary disk write either way.
+        if trimmed == original_trimmed {
+            self.rename_dialog = None;
+            cx.notify();
+            return;
+        }
 
         match target {
             RenameRequest::Project { project_id } => {

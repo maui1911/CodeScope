@@ -743,6 +743,12 @@ impl AppShell {
                     // / `soft_close_session` use. A sidebar add/remove
                     // between two AppShell mutations would otherwise
                     // make the rename target invisible at submit time.
+                    //
+                    // Bail on load failure rather than mutating a stale
+                    // snapshot and persisting it on top of newer disk
+                    // state (same rule `reopen_session` uses). Surface
+                    // the error so the user sees the row stay
+                    // un-renamed instead of silently racing the file.
                     match ProjectsConfig::load(&this.paths) {
                         Ok(cfg) => {
                             this.projects = cfg;
@@ -751,6 +757,15 @@ impl AppShell {
                             eprintln!(
                                 "warning: failed to reload projects.json before rename: {err:#}"
                             );
+                            this.push_toast(
+                                ToastKind::Err,
+                                SharedString::from("Rename failed"),
+                                Some(SharedString::from(format!(
+                                    "Could not read projects.json: {err:#}"
+                                ))),
+                                cx,
+                            );
+                            return;
                         }
                     }
                     this.open_rename_dialog(
