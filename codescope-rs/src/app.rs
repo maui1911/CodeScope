@@ -2366,8 +2366,12 @@ impl AppShell {
 
     /// Resolve the default agent's auto-type command string from
     /// `Settings.default_agent` via `AgentRegistry::from_settings`.
-    /// Returns `<command> [<new_session_args>...]` joined by spaces,
-    /// or `None` when no default agent is configured / matches.
+    /// Returns `<command> [<new_session_args>...]` joined by spaces.
+    /// `None` only when the resulting registry has zero agents — in
+    /// practice `from_settings` re-seeds the built-ins when
+    /// `settings.agents` is empty and `get_default()` falls back to
+    /// the first profile, so a typo'd / missing `default_agent` still
+    /// resolves to *some* agent (just not the user's preferred one).
     /// Mirrors the sidebar's "New session ▸" default-row builder
     /// (see `render_new_session_row`) so Ctrl+Shift+T lands on the
     /// same agent the worktree menu's primary click would.
@@ -6662,9 +6666,16 @@ fn push_non_empty_font_candidate(candidates: &mut Vec<String>, family: &str) {
 /// Resolve the default agent's auto-type command string from a
 /// `Settings` snapshot. Pulled out of `AppShell::default_agent_auto_type`
 /// as a free function so it can be unit-tested without a gpui context.
-/// Returns `<command> [<new_session_args>...]` joined by spaces, or
-/// `None` when the registry has no default profile (e.g. an empty
-/// settings override that explicitly clears the built-ins).
+/// Returns `<command> [<new_session_args>...]` joined by spaces.
+///
+/// `None` only when `AgentRegistry::from_settings` yields an empty
+/// list — which today can only happen if `settings.agents` was passed
+/// in non-empty but every entry was filtered out somewhere upstream.
+/// `from_settings` re-seeds the built-in profiles when
+/// `settings.agents` is empty, and `get_default()` falls back to the
+/// first profile when no `is_default` flag is set, so a typo'd /
+/// missing `default_agent` still resolves to *some* agent (just not
+/// the user's preferred one).
 fn default_agent_auto_type_for(settings: &Settings) -> Option<SharedString> {
     let registry = codescope_core::AgentRegistry::from_settings(settings);
     let profile = registry.get_default()?;
