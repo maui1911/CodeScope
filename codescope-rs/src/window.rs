@@ -13,6 +13,7 @@
 
 mod app;
 mod command_palette;
+mod confirm_dialog;
 mod new_project_dialog;
 mod new_worktree_dialog;
 mod notifications;

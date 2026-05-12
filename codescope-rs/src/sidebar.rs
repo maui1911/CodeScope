@@ -42,6 +42,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, anchored, deferred, div, point, px,
 };
 
+use crate::confirm_dialog::ConfirmSpec;
 use crate::new_project_dialog::NewProjectDialogState;
 use crate::new_worktree_dialog::NewWorktreeDialogState;
 use crate::theme;
@@ -201,6 +202,46 @@ pub enum SidebarEvent {
     /// Mirrors C# `Dialogs.RenameDialog.Prompt(current, title)`
     /// invocation pattern from `SidebarViewModel.Commands.cs`.
     OpenRenameDialog { target: RenameRequest, current_name: String },
+    /// User asked for a destructive (or otherwise confirm-gated)
+    /// sidebar action. AppShell opens its themed [`ConfirmDialog`],
+    /// awaits the result, and — on confirm — dispatches the carried
+    /// [`ConfirmAction`] back to the sidebar via
+    /// [`Sidebar::execute_confirm_action`]. Replaces the previous
+    /// `window.prompt(...)` OS-native modals so destructive sidebar
+    /// flows share visual chrome with the rest of the app's modals.
+    ///
+    /// `ConfirmDialog`: [`crate::confirm_dialog::ConfirmDialog`]
+    OpenConfirmDialog { spec: ConfirmSpec, action: ConfirmAction },
+}
+
+/// What `SidebarEvent::OpenConfirmDialog` is asking to do after the
+/// user confirms. Keeps the dialog-host (AppShell) decoupled from the
+/// per-action sidebar mutation paths — AppShell only needs to fire
+/// the matching [`Sidebar::execute_confirm_action`] dispatch when the
+/// dialog's receiver resolves to `true`. Each variant carries the
+/// stable identifiers (project id, worktree id, session id) it needs
+/// so a `projects.json` reorder between emit-and-confirm doesn't pin
+/// the wrong row.
+#[derive(Debug, Clone)]
+pub enum ConfirmAction {
+    /// Drop a project from the sidebar list. Mirrors C#
+    /// `SidebarViewModel.RemoveProjectCommand`.
+    RemoveProject { project_id: String },
+    /// `git reset --hard HEAD` + `git clean -fd` in the named
+    /// worktree's directory. Mirrors C# `DiscardChangesCommand`.
+    DiscardWorktreeChanges { project_id: String, worktree_id: String },
+    /// `git worktree remove` (force=false), with a follow-up
+    /// force-retry confirm if the first attempt fails. Mirrors C#
+    /// `RemoveWorktreeCommand`.
+    RemoveWorktree { project_id: String, worktree_id: String },
+    /// `git worktree remove --force`. Fired by the
+    /// `RemoveWorktreeForce` retry confirm after the non-force
+    /// attempt rejects. Mirrors the C# retry path in
+    /// `RemoveWorktreeCommand`.
+    RemoveWorktreeForce { project_id: String, worktree_id: String },
+    /// Forget a closed (history) session. Mirrors C#
+    /// `RemoveSessionFromHistoryCommand`.
+    RemoveSessionFromHistory { session_id: String },
 }
 
 /// What `SidebarEvent::OpenRenameDialog` is asking to rename. Held by
@@ -1575,50 +1616,72 @@ impl Sidebar {
         })
     }
 
-    /// Confirm-then-run `git reset --hard HEAD` + `git clean -fd`
-    /// for a worktree. Destructive — uses a `Critical`-level prompt
-    /// so the user has to actively confirm. Mirrors C#'s
-    /// `DiscardChangesCommand`.
-    fn discard_worktree_changes(
+    /// Open the themed confirm dialog for "Discard all changes" in a
+    /// worktree. The actual `git reset --hard HEAD` / `git clean -fd`
+    /// kicks off in [`Self::perform_discard_worktree_changes`] once
+    /// AppShell resolves the dialog to `true`. Mirrors C#
+    /// `DiscardChangesCommand` (which composes a destructive
+    /// `ConfirmDialog.Destructive(...)`).
+    fn request_discard_worktree_changes(
         &mut self,
         project_idx: usize,
         worktree_id: &str,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(path) = self.worktree_path(project_idx, worktree_id) else {
             self.close_menu(cx);
             return;
         };
-        // Friendly label for the prompt — shared with the rest of
-        // the worktree-action surface so wording stays consistent
-        // (`Remove worktree '<label>'?` and `Discard all changes
-        // in '<label>'?` line up).
         let label = self
             .worktree_display_label(project_idx, worktree_id)
             .unwrap_or_else(|| "this worktree".into());
+        let Some(project) = self.projects.projects.get(project_idx) else {
+            self.close_menu(cx);
+            return;
+        };
+        let project_id = project.id.clone();
         self.close_menu(cx);
-        let prompt_msg = format!("Discard all changes in '{label}'?");
-        let detail = format!(
-            "Path: {path}\n\nThis runs `git reset --hard HEAD` followed \
-             by `git clean -fd`. Untracked files and modifications to \
-             tracked files will be lost — there's no undo."
-        );
-        let rx = window.prompt(
-            gpui::PromptLevel::Critical,
-            &prompt_msg,
-            Some(&detail),
-            &["Discard", "Cancel"],
-            cx,
-        );
+
+        let spec = ConfirmSpec::destructive(
+            format!("Discard ALL local changes in '{label}'?"),
+            "This runs `git reset --hard HEAD` followed by `git clean -fd`. \
+             Untracked files and modifications to tracked files will be \
+             lost — there's no undo.",
+        )
+        .with_detail(SharedString::from(format!("Path: {path}")))
+        .with_confirm_label("Discard");
+        cx.emit(SidebarEvent::OpenConfirmDialog {
+            spec,
+            action: ConfirmAction::DiscardWorktreeChanges {
+                project_id,
+                worktree_id: worktree_id.to_string(),
+            },
+        });
+    }
+
+    /// Perform the discard now that the user has confirmed. Looks up
+    /// the worktree by stable id so a reorder between request and
+    /// confirm can't pin the wrong row.
+    fn perform_discard_worktree_changes(
+        &mut self,
+        project_id: &str,
+        worktree_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project_idx) =
+            self.projects.projects.iter().position(|p| p.id == project_id)
+        else {
+            return;
+        };
+        let Some(path) = self.worktree_path(project_idx, worktree_id) else {
+            return;
+        };
+        let label = self
+            .worktree_display_label(project_idx, worktree_id)
+            .unwrap_or_else(|| "this worktree".into());
         let path = std::path::PathBuf::from(path);
-        let label_for_toast = label.clone();
+        let label_for_toast = label;
         cx.spawn(async move |this, cx| {
-            // 0 = first button ("Discard"). Anything else = cancel.
-            match rx.await {
-                Ok(0) => {}
-                _ => return,
-            }
             let result = cx
                 .background_spawn(
                     async move { codescope_core::git::discard_all_changes(&path) },
@@ -1640,20 +1703,15 @@ impl Sidebar {
         .detach();
     }
 
-    /// Drop a non-primary worktree from this project. Calls
-    /// `git worktree remove` (force=false first; on failure prompts
-    /// the user before retrying with `--force`), then rewrites
-    /// `projects.json` so the row disappears from the sidebar.
-    /// Mirrors `SidebarViewModel.RemoveWorktreeAsync` minus the
-    /// session-close pre-step (the Rust port doesn't yet track which
-    /// tabs are pinned to which worktree, so the user is responsible
-    /// for closing them — the force-prompt covers the file-locked
-    /// case).
-    fn remove_worktree(
+    /// Open the themed "Delete worktree" confirm dialog. The actual
+    /// `git worktree remove` runs from
+    /// [`Self::perform_remove_worktree_initial`] once AppShell
+    /// resolves the dialog. Mirrors C# `RemoveWorktreeAsync` (which
+    /// fronts the action with a destructive `ConfirmDialog`).
+    fn request_remove_worktree(
         &mut self,
         project_idx: usize,
         worktree_id: &str,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(ctx) = self.worktree_remove_context(project_idx, worktree_id) else {
@@ -1662,27 +1720,67 @@ impl Sidebar {
         };
         self.close_menu(cx);
 
-        let confirm_msg = format!("Delete worktree '{}'?", ctx.display_label);
-        let confirm_detail = format!(
-            "Path: {}\n\nOpen sessions stay running but lose their working directory. \
+        let spec = ConfirmSpec::destructive(
+            format!("Delete worktree '{}'?", ctx.display_label),
+            "Open sessions stay running but lose their working directory. \
              Unpushed commits stay on the branch.",
-            ctx.worktree_path
-        );
-        let rx = window.prompt(
-            gpui::PromptLevel::Warning,
-            &confirm_msg,
-            Some(&confirm_detail),
-            &["Delete", "Cancel"],
-            cx,
-        );
-        cx.spawn_in(window, async move |this, cx| {
-            // 0 = first button ("Delete"). Anything else = cancel /
-            // dialog dismissed.
-            match rx.await {
-                Ok(0) => {}
-                _ => return,
-            }
+        )
+        .with_detail(SharedString::from(format!("Path: {}", ctx.worktree_path)))
+        .with_confirm_label("Delete");
+        cx.emit(SidebarEvent::OpenConfirmDialog {
+            spec,
+            action: ConfirmAction::RemoveWorktree {
+                project_id: ctx.project_id.clone(),
+                worktree_id: ctx.worktree_id.clone(),
+            },
+        });
+    }
+
+    /// First-attempt `git worktree remove` (force=false). On failure,
+    /// fires a follow-up [`SidebarEvent::OpenConfirmDialog`] with
+    /// [`ConfirmAction::RemoveWorktreeForce`] so the user can opt in
+    /// to `--force`. On success, rewrites `projects.json`. Mirrors
+    /// the first half of `SidebarViewModel.RemoveWorktreeAsync`.
+    fn perform_remove_worktree_initial(
+        &mut self,
+        project_id: &str,
+        worktree_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project_idx) =
+            self.projects.projects.iter().position(|p| p.id == project_id)
+        else {
+            return;
+        };
+        let Some(ctx) = self.worktree_remove_context(project_idx, worktree_id) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
             run_remove_worktree_flow(this, ctx, cx).await;
+        })
+        .detach();
+    }
+
+    /// Force-remove path. Called after the user confirms the retry
+    /// dialog that `run_remove_worktree_flow` raises on the first
+    /// attempt's failure. Mirrors the retry-with-force branch in
+    /// `SidebarViewModel.RemoveWorktreeAsync`.
+    fn perform_remove_worktree_force(
+        &mut self,
+        project_id: &str,
+        worktree_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project_idx) =
+            self.projects.projects.iter().position(|p| p.id == project_id)
+        else {
+            return;
+        };
+        let Some(ctx) = self.worktree_remove_context(project_idx, worktree_id) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            run_remove_worktree_force_flow(this, ctx, cx).await;
         })
         .detach();
     }
@@ -1736,11 +1834,110 @@ impl Sidebar {
         .detach();
     }
 
+    /// Open the themed confirm dialog for "Remove session from
+    /// history". On confirm the AppShell-side handler dispatches
+    /// [`ConfirmAction::RemoveSessionFromHistory`] back to itself
+    /// (since session removal goes through the AppShell-owned
+    /// `SessionManager::hard_remove`). Mirrors C#
+    /// `RemoveSessionFromHistoryCommand`.
+    fn request_remove_session_from_history(
+        &mut self,
+        session_id: String,
+        label: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_menu(cx);
+        let spec = ConfirmSpec::destructive(
+            format!("Remove session '{label}' from history?"),
+            "The closed-session row is forgotten. Its agent transcript on \
+             disk (if any) is left untouched.",
+        )
+        .with_confirm_label("Remove");
+        cx.emit(SidebarEvent::OpenConfirmDialog {
+            spec,
+            action: ConfirmAction::RemoveSessionFromHistory { session_id },
+        });
+    }
+
+    /// Dispatch a confirmed [`ConfirmAction`] to the matching sidebar
+    /// mutation path. Called by AppShell when the themed
+    /// [`crate::confirm_dialog::ConfirmDialog`] resolves to `true`.
+    /// Variants that need AppShell state (the session-history one)
+    /// are handled on the AppShell side and never reach this match.
+    pub fn execute_confirm_action(
+        &mut self,
+        action: ConfirmAction,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            ConfirmAction::RemoveProject { project_id } => {
+                self.remove_project_by_id(&project_id, cx);
+            }
+            ConfirmAction::DiscardWorktreeChanges { project_id, worktree_id } => {
+                self.perform_discard_worktree_changes(&project_id, &worktree_id, cx);
+            }
+            ConfirmAction::RemoveWorktree { project_id, worktree_id } => {
+                self.perform_remove_worktree_initial(&project_id, &worktree_id, cx);
+            }
+            ConfirmAction::RemoveWorktreeForce { project_id, worktree_id } => {
+                self.perform_remove_worktree_force(&project_id, &worktree_id, cx);
+            }
+            ConfirmAction::RemoveSessionFromHistory { .. } => {
+                // Handled by AppShell — the session store lives there.
+                // Hitting this branch would mean a routing bug; the
+                // log line keeps the failure visible without crashing.
+                eprintln!(
+                    "warning: RemoveSessionFromHistory routed to Sidebar; AppShell should handle this action"
+                );
+            }
+        }
+    }
+
+    /// Open the themed confirm dialog for "Remove project". On confirm
+    /// the AppShell-side handler dispatches
+    /// [`ConfirmAction::RemoveProject`] back to
+    /// [`Self::execute_confirm_action`], which calls
+    /// [`Self::remove_project_by_id`]. We snapshot the project's id
+    /// (not the index) so a `projects.json` reorder between
+    /// emit-and-confirm can't pin the wrong row.
+    fn request_remove_project(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let Some(project) = self.projects.projects.get(idx) else {
+            self.close_menu(cx);
+            return;
+        };
+        let project_id = project.id.clone();
+        let project_name = project.name.clone();
+        let project_path = project.path.clone();
+        self.close_menu(cx);
+        let spec = ConfirmSpec::destructive(
+            format!("Remove project '{project_name}' from CodeScope?"),
+            "The folder on disk stays untouched; only this app's record is removed.",
+        )
+        .with_detail(SharedString::from(project_path))
+        .with_confirm_label("Remove");
+        cx.emit(SidebarEvent::OpenConfirmDialog {
+            spec,
+            action: ConfirmAction::RemoveProject { project_id },
+        });
+    }
+
     /// Drop a project from the sidebar list and persist `projects.json`.
     /// Does **not** touch anything on disk — the working tree stays
     /// where it is; the user just removes it from CodeScope's view.
     /// Save-then-commit ordering matches `add_project` so a write
     /// failure leaves both disk and UI in their previous state.
+    ///
+    /// Stable-id variant of [`Self::remove_project`] — resolves the
+    /// row by `project_id` so the action survives a reorder between
+    /// dialog-open and dialog-confirm.
+    fn remove_project_by_id(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        let Some(idx) = self.projects.projects.iter().position(|p| p.id == project_id)
+        else {
+            return;
+        };
+        self.remove_project(idx, cx);
+    }
+
     fn remove_project(&mut self, idx: usize, cx: &mut Context<Self>) {
         if idx >= self.projects.projects.len() {
             return;
@@ -3349,7 +3546,7 @@ impl Sidebar {
                 "menu-remove",
                 "Remove project",
                 true,
-                Box::new(move |this, _window, cx| this.remove_project(idx, cx)),
+                Box::new(move |this, _window, cx| this.request_remove_project(idx, cx)),
             ))
             // Click on the menu itself shouldn't bubble out and trigger
             // the dismiss handler we install below.
@@ -3705,11 +3902,10 @@ impl Sidebar {
                             "wt-menu-discard",
                             "Discard changes…",
                             true,
-                            Box::new(move |this, window, cx| {
-                                this.discard_worktree_changes(
+                            Box::new(move |this, _window, cx| {
+                                this.request_discard_worktree_changes(
                                     project_idx,
                                     &id_for_discard,
-                                    window,
                                     cx,
                                 );
                             }),
@@ -3762,8 +3958,8 @@ impl Sidebar {
                     "wt-menu-remove",
                     "Remove worktree…",
                     true,
-                    Box::new(move |this, window, cx| {
-                        this.remove_worktree(project_idx, &id_for_remove, window, cx);
+                    Box::new(move |this, _window, cx| {
+                        this.request_remove_worktree(project_idx, &id_for_remove, cx);
                     }),
                 ))
             }))
@@ -3833,6 +4029,8 @@ impl Sidebar {
         let reopen_session_id = session_id.clone();
         let rename_session_id = session_id.clone();
         let rename_current = label.clone();
+        let remove_session_id = session_id.clone();
+        let remove_label = label.clone();
 
         let menu_body = div()
             .flex()
@@ -3885,6 +4083,18 @@ impl Sidebar {
                     this.close_menu(cx);
                 }),
             ))
+            .child(div().h_px().bg(divider).my_1())
+            .child(item(
+                "hist-menu-remove",
+                "Remove from history…",
+                Box::new(move |this, _window, cx| {
+                    this.request_remove_session_from_history(
+                        remove_session_id.clone(),
+                        remove_label.clone(),
+                        cx,
+                    );
+                }),
+            ))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|_, _, _, cx| cx.stop_propagation()),
@@ -3915,14 +4125,17 @@ struct WorktreeRemoveContext {
     display_label: String,
 }
 
-/// Run the post-confirm `git worktree remove` flow. Lives outside the
-/// `Sidebar` impl because `cx.spawn_in` hands us an `AsyncApp` and a
-/// `WeakEntity<Sidebar>`, not a `&mut Sidebar` — wrapping the whole
-/// thing in a free async function keeps the borrow shape obvious.
+/// Run the post-confirm initial `git worktree remove` (force=false).
+/// On success, rewrites `projects.json`. On failure, fires a follow-
+/// up [`SidebarEvent::OpenConfirmDialog`] with
+/// [`ConfirmAction::RemoveWorktreeForce`] so the user can opt in
+/// to `--force`. Lives outside the `Sidebar` impl because the
+/// `cx.spawn` task gets a `WeakEntity<Sidebar>`, not `&mut Sidebar`
+/// — keeping the borrow shape explicit.
 async fn run_remove_worktree_flow(
     this: gpui::WeakEntity<Sidebar>,
     ctx: WorktreeRemoveContext,
-    cx: &mut gpui::AsyncWindowContext,
+    cx: &mut gpui::AsyncApp,
 ) {
     use codescope_core::git;
 
@@ -3938,56 +4151,78 @@ async fn run_remove_worktree_flow(
             .await
     };
 
-    let needs_force = match first_attempt {
-        Ok(()) => false,
+    match first_attempt {
+        Ok(()) => {
+            commit_worktree_removal(this, &ctx, cx).await;
+        }
         Err(err) => {
-            // Retry-with-force prompt. Same wording shape as the C#
-            // dialog: show the underlying git error so the user sees
-            // *why* the normal remove failed before deciding to force.
-            let prompt_msg = "Couldn't remove worktree — force?".to_string();
+            // Raise the themed force-retry confirm. Same wording
+            // shape as the C# dialog: show the underlying git error
+            // so the user sees *why* the normal remove failed before
+            // deciding to force.
+            let project_id = ctx.project_id.clone();
+            let worktree_id = ctx.worktree_id.clone();
             let detail = format!(
                 "{}\n\nForce remove will discard uncommitted changes and untracked files in the worktree.",
                 err
             );
-            let receiver = match this.update_in(cx, |_this, window, cx| {
-                window.prompt(
-                    gpui::PromptLevel::Warning,
-                    &prompt_msg,
-                    Some(&detail),
-                    &["Force remove", "Cancel"],
-                    cx,
+            let _ = this.update(cx, |_, cx| {
+                let spec = crate::confirm_dialog::ConfirmSpec::destructive(
+                    "Couldn't remove worktree — force?",
+                    "",
                 )
-            }) {
-                Ok(rx) => rx,
-                Err(_) => return,
-            };
-            match receiver.await {
-                Ok(0) => true,
-                _ => return,
-            }
-        }
-    };
-
-    if needs_force {
-        let repo = repo.clone();
-        let wt_path = wt_path.clone();
-        let forced = cx
-            .background_spawn(async move { git::remove_worktree(&repo, &wt_path, true) })
-            .await;
-        if let Err(err) = forced {
-            eprintln!(
-                "warning: force-remove of worktree '{}' failed: {err:#}",
-                ctx.display_label
-            );
-            return;
+                .with_detail(SharedString::from(detail))
+                .with_confirm_label("Force remove");
+                cx.emit(SidebarEvent::OpenConfirmDialog {
+                    spec,
+                    action: ConfirmAction::RemoveWorktreeForce {
+                        project_id,
+                        worktree_id,
+                    },
+                });
+            });
         }
     }
+}
 
-    // Git is happy; rewrite `projects.json` to drop the row. Match by
-    // (project id, worktree id) so a concurrent edit that reordered
-    // the list still hits the right row. If the project / worktree is
-    // already gone (e.g. another window beat us to it), the rewrite
-    // is a no-op and we still return success.
+/// Run `git worktree remove --force`, fired after the user confirms
+/// the retry dialog. Same finish-up as the non-force path.
+async fn run_remove_worktree_force_flow(
+    this: gpui::WeakEntity<Sidebar>,
+    ctx: WorktreeRemoveContext,
+    cx: &mut gpui::AsyncApp,
+) {
+    use codescope_core::git;
+
+    let repo = std::path::PathBuf::from(&ctx.project_path);
+    let wt_path = std::path::PathBuf::from(&ctx.worktree_path);
+
+    let forced = {
+        let repo = repo.clone();
+        let wt_path = wt_path.clone();
+        cx.background_spawn(async move { git::remove_worktree(&repo, &wt_path, true) })
+            .await
+    };
+    if let Err(err) = forced {
+        eprintln!(
+            "warning: force-remove of worktree '{}' failed: {err:#}",
+            ctx.display_label
+        );
+        return;
+    }
+    commit_worktree_removal(this, &ctx, cx).await;
+}
+
+/// Rewrite `projects.json` to drop the just-removed worktree. Shared
+/// by the non-force and force flows. Matches by (project id,
+/// worktree id) so a concurrent edit that reordered the list still
+/// hits the right row. If the project / worktree is already gone
+/// (e.g. another window beat us to it), the rewrite is a no-op.
+async fn commit_worktree_removal(
+    this: gpui::WeakEntity<Sidebar>,
+    ctx: &WorktreeRemoveContext,
+    cx: &mut gpui::AsyncApp,
+) {
     let _ = this.update(cx, |this, cx| {
         let mut next = this.projects.clone();
         let Some(project) = next.projects.iter_mut().find(|p| p.id == ctx.project_id) else {
