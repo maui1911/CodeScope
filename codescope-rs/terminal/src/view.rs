@@ -789,7 +789,13 @@ pub(crate) fn is_app_level_shortcut(key: &str, mods: &gpui::Modifiers) -> bool {
     {
         return true;
     }
-    if matches!(key, "!" | "@" | "#" | "$" | "%" | "^" | "&" | "*" | "(") {
+    // The shifted-glyph form only counts as an app chord when shift
+    // has already been consumed by the platform adapter — same rule
+    // as `AppShell::keystroke_digit_index`. If a layout produces the
+    // glyph *with* shift still set, the shell would refuse to bind
+    // it; bubbling here would then drop the keystroke entirely. Keep
+    // the whitelist and the shell handler in lockstep.
+    if !mods.shift && matches!(key, "!" | "@" | "#" | "$" | "%" | "^" | "&" | "*" | "(") {
         return true;
     }
     // Ctrl+Shift+T (new tab) / Ctrl+Shift+W (close tab). Plain
@@ -1027,6 +1033,16 @@ mod tests {
         // Ctrl+Shift+0 / Ctrl+) intentionally unbound.
         assert!(!is_app_level_shortcut("0", &ctrl_shift()));
         assert!(!is_app_level_shortcut(")", &ctrl()));
+        // Glyph form with shift still set: layouts that don't fold
+        // the shifted character must not bubble (the shell would
+        // reject the same shape — see `keystroke_digit_index` in
+        // `app.rs`). Without this guard the keystroke is lost.
+        for glyph in ["!", "@", "#", "$", "%", "^", "&", "*", "("] {
+            assert!(
+                !is_app_level_shortcut(glyph, &ctrl_shift()),
+                "glyph {glyph} with shift still set must not bubble"
+            );
+        }
     }
 
     #[test]
