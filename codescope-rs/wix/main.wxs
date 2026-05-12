@@ -107,7 +107,16 @@
               of LocalAppData.
             -->
             <Directory Id='LocalAppDataFolder'>
-                <Directory Id='ProgramsFolder' Name='Programs'>
+                <!--
+                  `LocalAppDataProgramsFolder` is our id for the
+                  `%LOCALAPPDATA%\Programs` subdir. We deliberately do
+                  *not* name it `ProgramsFolder` to avoid confusion with
+                  the WiX `ProgramMenuFolder` (per-user Start Menu) and
+                  the Windows shell's "Programs" concept — both are
+                  authored a few lines below and live in a different
+                  directory tree entirely.
+                -->
+                <Directory Id='LocalAppDataProgramsFolder' Name='Programs'>
                     <Directory Id='APPLICATIONFOLDER' Name='codescope-rs'>
                         <Directory Id='Bin' Name='bin'>
                             <!--
@@ -116,9 +125,14 @@
                               HKCU registry KeyPath (not a file) and every
                               per-user directory in the tree needs a
                               RemoveFolder so uninstall leaves no trace.
-                              We pin both `RemoveFolder` cleanups for the
-                              non-leaf dirs to this component since it's
-                              the one that always runs.
+                              The `RemoveFolder` cleanups for `Bin`,
+                              `APPLICATIONFOLDER`, and
+                              `LocalAppDataProgramsFolder` are authored
+                              under the `binary0` component below — that
+                              component is always installed (the PATH
+                              component is optional via the Environment
+                              sub-feature), so it's the right anchor for
+                              directory cleanup.
                             -->
                             <Component Id='Path' Guid='3326208D-A1EE-453F-ACB6-EDBEE0D923C5'>
                                 <!--
@@ -166,7 +180,7 @@
                                               Directory='APPLICATIONFOLDER'
                                               On='uninstall'/>
                                 <RemoveFolder Id='RemoveProgramsDir'
-                                              Directory='ProgramsFolder'
+                                              Directory='LocalAppDataProgramsFolder'
                                               On='uninstall'/>
                             </Component>
                         </Directory>
