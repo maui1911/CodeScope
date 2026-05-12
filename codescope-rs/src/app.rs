@@ -509,6 +509,9 @@ pub struct AppShell {
     sidebar_drag: Option<SidebarDrag>,
     /// Open tab right-click menu, if any.
     tab_menu: Option<TabMenu>,
+    /// Status-bar gear right-click menu, if any. Anchored at the
+    /// recorded click position so it floats next to the gear icon.
+    gear_menu: Option<gpui::Point<gpui::Pixels>>,
     /// In-flight tab drag-hover state. `Some` between an `on_drag_move`
     /// over any strip and the matching drop / drag-cancel. Drives the
     /// 3 px blue drop-indicator that previews "drop here" and the
@@ -1062,6 +1065,7 @@ impl AppShell {
             sidebar_visible,
             sidebar_drag: None,
             tab_menu: None,
+            gear_menu: None,
             tab_drag_hover: None,
             tab_rects: HashMap::new(),
             prev_tab_rects: HashMap::new(),
@@ -2292,6 +2296,17 @@ impl AppShell {
         &self.settings
     }
 
+    /// Resolve the default agent's auto-type command string from
+    /// `Settings.default_agent` via `AgentRegistry::from_settings`.
+    /// Returns `<command> [<new_session_args>...]` joined by spaces,
+    /// or `None` when no default agent is configured / matches.
+    /// Mirrors the sidebar's "New session ▸" default-row builder
+    /// (see `render_new_session_row`) so Ctrl+Shift+T lands on the
+    /// same agent the worktree menu's primary click would.
+    pub(crate) fn default_agent_auto_type(&self) -> Option<SharedString> {
+        default_agent_auto_type_for(&self.settings)
+    }
+
     /// Open a fresh shell session and append it as a new tab. The new
     /// tab becomes the active one and the terminal grabs focus.
     ///
@@ -2301,8 +2316,23 @@ impl AppShell {
     /// that already know which path to pin the terminal to (sidebar
     /// worktree clicks, post-create-worktree spawns) hand both in
     /// directly.
+    ///
+    /// `auto_type` is resolved from `Settings.default_agent` so the
+    /// new tab boots into the user's preferred agent CLI. Falls back
+    /// to a plain shell when the active project context is missing
+    /// (no folder for the agent to operate in) or when no default
+    /// agent is configured.
     fn spawn_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.spawn_tab_in(None, None, None, None, window, cx);
+        // Only auto-type the default agent when we actually have a
+        // working directory to land the agent in — a plain shell
+        // fallback keeps the empty / no-project state usable.
+        let has_project_context = self.sidebar.read(cx).active_project().is_some();
+        let auto_type = if has_project_context {
+            self.default_agent_auto_type()
+        } else {
+            None
+        };
+        self.spawn_tab_in(None, None, auto_type, None, window, cx);
     }
 
     fn spawn_tab_in(
@@ -3616,6 +3646,107 @@ impl AppShell {
         )
     }
 
+    /// Status-bar gear right-click menu — two-row popover anchored at
+    /// the recorded click position. `BottomLeft` corner because the
+    /// gear lives in the status bar; the menu should float above the
+    /// bar rather than drop below the window edge.
+    fn render_gear_menu(
+        &self,
+        theme: &Arc<Theme>,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let position = *self.gear_menu.as_ref()?;
+
+        let elevated = theme::elevated(theme);
+        let divider = theme::divider(theme);
+        let ink = theme::ink(theme);
+        let ink_dim = theme::ink_dim(theme);
+        let frost = theme::frost_10(theme);
+
+        type Action = Box<dyn Fn(&mut AppShell, &mut Window, &mut Context<AppShell>) + 'static>;
+        let item = |id: &'static str, label: &'static str, on_click: Action|
+         -> gpui::Stateful<gpui::Div> {
+            let frost_hover = frost;
+            div()
+                .id(id)
+                .h(px(28.0))
+                .px_3()
+                .flex()
+                .flex_row()
+                .items_center()
+                .text_size(px(12.5))
+                .text_color(ink_dim)
+                .cursor_pointer()
+                .hover(move |s| s.bg(frost_hover).text_color(ink))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        on_click(this, window, cx);
+                    }),
+                )
+                .child(label)
+        };
+
+        let menu_body = div()
+            .flex()
+            .flex_col()
+            .py_1()
+            .min_w(px(180.0))
+            .bg(elevated)
+            .border_1()
+            .border_color(divider)
+            .rounded_md()
+            .shadow_lg()
+            .font(theme::font_sans())
+            .child(item(
+                "gear-menu-open",
+                "Open Settings…",
+                Box::new(|this, window, cx| {
+                    this.close_gear_menu(cx);
+                    this.open_settings_dialog(window, cx);
+                }),
+            ))
+            .child(item(
+                "gear-menu-reload-theme",
+                "Reload theme",
+                Box::new(|this, _window, cx| {
+                    this.close_gear_menu(cx);
+                    // Re-resolve the theme from the current settings —
+                    // same `BuiltInCommand::ReloadTheme` path the
+                    // command palette dispatches.
+                    let settings_clone = (*this.settings).clone();
+                    this.apply_settings(settings_clone, cx);
+                    this.push_toast(
+                        ToastKind::Ok,
+                        SharedString::from("Theme reloaded"),
+                        None,
+                        cx,
+                    );
+                }),
+            ))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_gear_menu(cx)));
+
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position(gpui::point(position.x, position.y))
+                    // Anchor the menu's *bottom-left* at the click so it
+                    // grows upward from the status bar — the bar lives
+                    // at the bottom of the window, so a TopLeft anchor
+                    // would clip off-screen.
+                    .anchor(gpui::Corner::BottomLeft)
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(menu_body),
+            )
+            .into_any_element(),
+        )
+    }
+
     /// Build the bottom status bar. 32 px tall, two clusters mirroring
     /// the C# `StatusBarView`:
     ///
@@ -3988,6 +4119,50 @@ impl AppShell {
                 .child("CodeScope — add a project to begin.")
         });
 
+        // ─── Settings gear button ────────────────────────────────
+        //
+        // Sits just-left of the bell in the status bar's right cluster.
+        // Left-click opens the Settings dialog (same entry point as the
+        // Ctrl+Shift+, chord and the command palette's "Open settings"
+        // row). Right-click opens a tiny menu with "Open Settings…" and
+        // "Reload theme" so power users get a discoverable surface
+        // beyond the keyboard chord.
+        let gear_btn = div()
+            .id("status-gear-btn")
+            .relative()
+            .w(px(22.0))
+            .h(px(22.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(move |s| s.bg(gpui::Hsla { h: 0.0, s: 0.0, l: 1.0, a: 0.08 }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.open_settings_dialog(window, cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &gpui::MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                    this.open_gear_menu(event.position, cx);
+                }),
+            )
+            // 12 × 12 gear SVG; `text_color` drives the `currentColor`
+            // stroke so the tint tracks `text_faint`. Same sizing as
+            // the branch / sync / clock segments in the left cluster.
+            .child(
+                svg()
+                    .path("icons/settings.svg")
+                    .w(px(12.0))
+                    .h(px(12.0))
+                    .text_color(ink_muted),
+            );
+
         // ─── Bell button ─────────────────────────────────────────
         let has_unread = self.notifications.has_unread();
         let bell_btn = div()
@@ -4149,7 +4324,14 @@ impl AppShell {
             if let Some(seg) = workspace_summary {
                 clusters.push(vec![seg.into_any_element()]);
             }
-            clusters.push(vec![bell_btn.into_any_element()]);
+            // Gear + bell share the final cluster — same separator
+            // discipline as the rest of the bar (separators sit between
+            // clusters, not inside them), so the two icons read as a
+            // single "actions" group on the right.
+            clusters.push(vec![
+                gear_btn.into_any_element(),
+                bell_btn.into_any_element(),
+            ]);
             clusters
         };
 
@@ -4349,6 +4531,28 @@ impl AppShell {
 
     fn close_tab_menu(&mut self, cx: &mut Context<Self>) {
         if self.tab_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Open the status-bar gear's right-click menu at the recorded
+    /// window-coordinate `position`. Two rows: "Open Settings…" (same
+    /// entry point as left-click) and "Reload theme" (mirrors the
+    /// command palette's `ReloadTheme` action). Kept intentionally
+    /// small — the gear's primary action is left-click; the menu is a
+    /// discoverable affordance for power-user shortcuts, not a full
+    /// settings surface.
+    fn open_gear_menu(
+        &mut self,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.gear_menu = Some(position);
+        cx.notify();
+    }
+
+    fn close_gear_menu(&mut self, cx: &mut Context<Self>) {
+        if self.gear_menu.take().is_some() {
             cx.notify();
         }
     }
@@ -5429,6 +5633,7 @@ impl Render for AppShell {
             .child(main_row)
             .child(self.render_status_bar(&theme, cx))
             .children(self.render_tab_menu(&theme, cx))
+            .children(self.render_gear_menu(&theme, cx))
             .children(self.render_toasts(&theme, cx))
             .children(self.render_notifications_popover(&theme, cx))
             .children(self.render_command_palette(window, &theme, cx))
@@ -6515,6 +6720,21 @@ fn push_non_empty_font_candidate(candidates: &mut Vec<String>, family: &str) {
     }
 }
 
+/// Resolve the default agent's auto-type command string from a
+/// `Settings` snapshot. Pulled out of `AppShell::default_agent_auto_type`
+/// as a free function so it can be unit-tested without a gpui context.
+/// Returns `<command> [<new_session_args>...]` joined by spaces, or
+/// `None` when the registry has no default profile (e.g. an empty
+/// settings override that explicitly clears the built-ins).
+fn default_agent_auto_type_for(settings: &Settings) -> Option<SharedString> {
+    let registry = codescope_core::AgentRegistry::from_settings(settings);
+    let profile = registry.get_default()?;
+    let mut argv: Vec<String> = Vec::with_capacity(1 + profile.new_session_args.len());
+    argv.push(profile.command.clone());
+    argv.extend(profile.new_session_args.iter().cloned());
+    Some(SharedString::from(argv.join(" ")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6643,5 +6863,83 @@ mod tests {
         assert_eq!(keystroke_digit_index("a", true), None);
         assert_eq!(keystroke_digit_index("a", false), None);
         assert_eq!(keystroke_digit_index("", true), None);
+    }
+
+    // ─── default_agent_auto_type_for ───────────────────────────────
+    //
+    // Ctrl+Shift+T / the "+ new tab" button route through this helper
+    // to look up the user's preferred agent CLI from the registry. The
+    // tests below pin the contract `on_key_down` for Ctrl+Shift+T
+    // relies on: a vanilla Settings yields the Claude command; flipping
+    // `default_agent` picks the matching profile; an empty `agents`
+    // override returns `None` so the caller can fall back to a plain
+    // shell.
+
+    #[test]
+    fn default_agent_auto_type_for_default_settings_returns_claude() {
+        // Built-in default — vanilla settings should auto-type `claude`
+        // (no extra args; new-session args are empty in the built-in
+        // Claude profile).
+        let settings = Settings::default();
+        let cmd = default_agent_auto_type_for(&settings).expect("default present");
+        assert_eq!(cmd.as_ref(), "claude");
+    }
+
+    #[test]
+    fn default_agent_auto_type_for_honours_default_agent_setting() {
+        // User changed `settings.default_agent` to Codex — the helper
+        // must follow, otherwise Ctrl+Shift+T would silently keep
+        // spawning Claude after the user reconfigured their default.
+        let settings = Settings {
+            default_agent: "codex".into(),
+            ..Settings::default()
+        };
+        let cmd = default_agent_auto_type_for(&settings).expect("default present");
+        // The built-in Codex profile uses the `codex` command. Asserting
+        // the prefix keeps the test resilient to future new-session-arg
+        // additions on the built-in profile while still catching a
+        // wrong-profile regression.
+        assert!(
+            cmd.as_ref() == "codex" || cmd.as_ref().starts_with("codex "),
+            "expected codex command, got {cmd:?}",
+        );
+    }
+
+    #[test]
+    fn default_agent_auto_type_for_joins_new_session_args() {
+        // A user-defined profile with new-session args should serialise
+        // as `<command> <arg1> <arg2>...` so the terminal gets a single
+        // ready-to-run line.
+        let settings = Settings {
+            agents: vec![codescope_core::AgentProfile {
+                id: "custom".into(),
+                display_name: "Custom".into(),
+                command: "my-cli".into(),
+                resume_args: vec![],
+                new_session_args: vec!["--init".into(), "fresh".into()],
+                session_id_flag: None,
+                resume_by_id_args: vec![],
+                is_default: true,
+                icon: None,
+                context_window_tokens: 0,
+            }],
+            ..Settings::default()
+        };
+        let cmd = default_agent_auto_type_for(&settings).expect("default present");
+        assert_eq!(cmd.as_ref(), "my-cli --init fresh");
+    }
+
+    #[test]
+    fn default_agent_auto_type_for_empty_agents_falls_back_to_built_ins() {
+        // Empty `agents` overrides → `from_settings` re-seeds the
+        // built-in agent set, so `default_agent_auto_type_for` still
+        // returns a Some (Claude). This pins the contract Ctrl+Shift+T
+        // relies on: a fresh / empty profile list never strands the
+        // user without an agent.
+        let settings = Settings {
+            agents: vec![],
+            ..Settings::default()
+        };
+        assert!(default_agent_auto_type_for(&settings).is_some());
     }
 }

@@ -39,6 +39,7 @@ const ICONS: &[(&str, &[u8])] = &[
     icon!("icons/clock.svg"),
     icon!("icons/bell.svg"),
     icon!("icons/worktree.svg"),
+    icon!("icons/settings.svg"),
 ];
 
 impl AssetSource for AppAssets {
