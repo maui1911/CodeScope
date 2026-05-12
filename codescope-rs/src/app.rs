@@ -2512,17 +2512,6 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let shell = std::env::var("CODESCOPE_SHELL")
-            .ok()
-            .map(|program| Shell::new(program, Vec::new()))
-            .or_else(|| {
-                if cfg!(windows) {
-                    Some(Shell::new("pwsh.exe".into(), Vec::new()))
-                } else {
-                    None
-                }
-            });
-
         let mut env = HashMap::new();
         env.insert("TERM".into(), "xterm-256color".into());
         env.insert("COLORTERM".into(), "truecolor".into());
@@ -2542,6 +2531,37 @@ impl AppShell {
                 .as_ref()
                 .map(|(path, _)| std::path::PathBuf::from(path))
         });
+
+        // Resolve the shell + argv. When `auto_type` is set and we
+        // have a working directory to land in, boot the agent through
+        // `pwsh -NoExit -Command "& { <agent> }"` so the CLI starts
+        // immediately without a visible `PS C:\> claude` echoed line
+        // — the regression this branch fixes. Mirrors C#
+        // `SessionManager.CreateAgentSession`'s `ShellArgs` layout.
+        //
+        // Plain shell tabs (`auto_type = None`) and agent tabs with no
+        // working directory (no project context, nothing for the agent
+        // to operate against) keep the previous bare-shell shape.
+        let shell = std::env::var("CODESCOPE_SHELL")
+            .ok()
+            .map(|program| Shell::new(program, Vec::new()))
+            .or_else(|| {
+                if cfg!(windows) {
+                    let program = "pwsh.exe".to_string();
+                    match (auto_type.as_ref(), working_directory.as_ref()) {
+                        (Some(cmd), Some(wd)) => {
+                            let args = codescope_core::build_agent_shell_args(
+                                cmd.as_ref(),
+                                &wd.to_string_lossy(),
+                            );
+                            Some(Shell::new(program, args))
+                        }
+                        _ => Some(Shell::new(program, Vec::new())),
+                    }
+                } else {
+                    None
+                }
+            });
 
         // Build the terminal palette + cursor preset from the active
         // theme + settings. Cloned per spawn so each tab carries its
@@ -2598,19 +2618,24 @@ impl AppShell {
             self.allocate_session_id(working_directory_for_tab.as_deref(), restore_session_id);
         let group_idx = self.focused_group;
         let group = &mut self.groups[group_idx];
-        // Capture the entity so an `auto_type` job can write to it
-        // without re-borrowing `self.groups` after the await point.
-        let terminal_for_autotype = terminal.clone();
         let agent_id = codescope_core::agent_id_from_auto_type(
             auto_type.as_ref().map(|s| s.as_ref()),
         );
+        // `auto_type` is kept on the Tab as metadata (agent
+        // detection via `agent_id_from_auto_type` + layout persistence
+        // so a restart can rebuild the command) but no longer drives a
+        // post-spawn pty write — the agent is already booted via
+        // `pwsh -Command "& { ... }"` above, mirroring C#
+        // `SessionManager.CreateAgentSession`. Removing the auto-typed
+        // write also kills the visible `PS C:\> claude` echo regression
+        // (the line briefly flashed before pwsh started its REPL).
         group.tabs.push(Tab {
             id,
             session_id,
             title,
             terminal,
             working_directory: working_directory_for_tab,
-            auto_type: auto_type.clone(),
+            auto_type,
             spawned_at: SystemTime::now(),
             adopted_session_id: None,
             fired_session_ids: std::collections::HashSet::new(),
@@ -2618,22 +2643,6 @@ impl AppShell {
         });
         let new_idx = group.tabs.len() - 1;
         self.activate_tab(group_idx, new_idx, window, cx);
-
-        // Auto-type the requested command after a short settling
-        // delay so the shell has had time to print its prompt.
-        // Without the delay, the bytes can land before pwsh starts
-        // its REPL and get echoed into the banner instead of run.
-        if let Some(cmd) = auto_type {
-            cx.spawn(async move |_, cx| {
-                cx.background_executor().timer(Duration::from_millis(250)).await;
-                let _ = terminal_for_autotype.update(cx, |term, _cx| {
-                    let mut bytes = cmd.as_bytes().to_vec();
-                    bytes.push(b'\r');
-                    term.write_input(bytes);
-                });
-            })
-            .detach();
-        }
     }
 
     /// Close the tab at `(group_idx, tab_idx)`. When the group's last

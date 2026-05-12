@@ -88,6 +88,17 @@ pub struct SessionDescriptor {
     pub shell: String,
     pub shell_args: Vec<String>,
     pub title: String,
+    /// Joined argv string for the agent CLI to run inside the shell
+    /// (e.g. `"claude --resume abc-123"` or `"pi --new"`). `None` for
+    /// plain shell tabs. Mirrors C#
+    /// `SessionManager.CreateAgentSession`'s implicit decision: the
+    /// agent-launch path sets it, the shell-launch path doesn't.
+    ///
+    /// When `Some`, the UI layer is expected to build `shell_args` via
+    /// [`build_agent_shell_args`] so the agent is invoked through
+    /// `pwsh -NoExit -Command "& { <agent> }"` and no echoed
+    /// `PS C:\> claude` line appears in the terminal.
+    pub agent_command: Option<String>,
 }
 
 impl SessionDescriptor {
@@ -107,8 +118,47 @@ impl SessionDescriptor {
             shell,
             shell_args,
             title,
+            agent_command: None,
         }
     }
+}
+
+/// Wrap `value` in double quotes if it contains whitespace (or is
+/// empty) so pwsh's command-line parser keeps it as a single token.
+/// Mirrors C# `SessionManager.Quote` — always-safe to quote since pwsh
+/// strips the outer quotes when parsing `-WorkingDirectory` / `-Command`
+/// args. Values already starting with `"` are returned unchanged.
+fn quote_for_pwsh(value: &str) -> String {
+    if value.starts_with('"') {
+        return value.to_string();
+    }
+    format!("\"{value}\"")
+}
+
+/// Build the pwsh argv that boots an agent CLI inside an interactive
+/// shell. Mirrors the C# `SessionManager.CreateAgentSession`
+/// `ShellArgs` layout: `-NoExit -NoLogo -WorkingDirectory <quoted-wd>
+/// -Command "& { <agent_command> }"`.
+///
+/// The agent call is wrapped in a pwsh scriptblock with `&` so
+/// `-NoExit` keeps the shell alive after the agent exits (a fresh
+/// `PS C:\>` prompt appears once the agent process detaches). The
+/// outer double quotes around the scriptblock are necessary because
+/// ConPTY's command-line splitter would otherwise treat `&` / `{` as
+/// separate tokens and never feed the block to `-Command`.
+///
+/// Replacing the previous post-spawn auto-type write fixes the UX
+/// regression where users briefly saw a `PS C:\> claude` line echoed
+/// into the freshly-spawned shell before the agent started.
+pub fn build_agent_shell_args(agent_command: &str, working_directory: &str) -> Vec<String> {
+    vec![
+        "-NoExit".into(),
+        "-NoLogo".into(),
+        "-WorkingDirectory".into(),
+        quote_for_pwsh(working_directory),
+        "-Command".into(),
+        quote_for_pwsh(&format!("& {{ {agent_command} }}")),
+    ]
 }
 
 /// Format a closed-session timestamp as a short relative string —
@@ -675,6 +725,81 @@ mod tests {
         cfg.projects.push(make_project("p1"));
         let err = SessionManager::reopen(&mut cfg, "ghost", fixed_now()).unwrap_err();
         assert!(err.to_string().contains("ghost"));
+    }
+
+    // ---- build_agent_shell_args -------------------------------
+
+    #[test]
+    fn build_agent_shell_args_emits_command_block() {
+        // Happy path: a plain agent command + plain working
+        // directory. The resulting argv should match the C#
+        // `CreateAgentSession` shape — `-NoExit -NoLogo
+        // -WorkingDirectory <quoted-wd> -Command "& { <cmd> }"` —
+        // so pwsh runs the agent inside an interactive shell that
+        // survives the agent's exit.
+        let args = build_agent_shell_args("claude", "C:\\repo");
+        assert_eq!(
+            args,
+            vec![
+                "-NoExit".to_string(),
+                "-NoLogo".to_string(),
+                "-WorkingDirectory".to_string(),
+                "\"C:\\repo\"".to_string(),
+                "-Command".to_string(),
+                "\"& { claude }\"".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_agent_shell_args_quotes_working_directory_with_spaces() {
+        // Path with spaces must come back wrapped in double quotes
+        // so pwsh's `-WorkingDirectory` parser treats it as one
+        // token. Mirrors C# `Quote` always-quote behaviour.
+        let args = build_agent_shell_args("claude", "C:\\Program Files\\repo");
+        assert!(args.contains(&"\"C:\\Program Files\\repo\"".to_string()));
+    }
+
+    #[test]
+    fn build_agent_shell_args_preserves_agent_command_with_spaces() {
+        // Multi-token agent command must end up inside the
+        // scriptblock verbatim — pwsh parses the block, not us.
+        let args = build_agent_shell_args("claude --resume abc-123", "C:\\repo");
+        let cmd_arg = args.last().expect("non-empty argv");
+        assert_eq!(cmd_arg, "\"& { claude --resume abc-123 }\"");
+    }
+
+    #[test]
+    fn build_agent_shell_args_preserves_single_quotes_in_agent_command() {
+        // Single quotes are pwsh's string delimiter — they must
+        // round-trip through the scriptblock untouched so a CLI
+        // that takes a quoted prompt (`pi --say 'hi there'`) works.
+        let args = build_agent_shell_args("pi --say 'hi there'", "C:\\repo");
+        let cmd_arg = args.last().expect("non-empty argv");
+        assert_eq!(cmd_arg, "\"& { pi --say 'hi there' }\"");
+    }
+
+    #[test]
+    fn build_agent_shell_args_preserves_pwsh_significant_chars() {
+        // `&` and `|` are pwsh-significant outside a scriptblock,
+        // but the `& { ... }` wrapping means pwsh parses them as
+        // part of the block, not as top-level command separators.
+        // The helper must therefore pass them through unchanged.
+        let args = build_agent_shell_args("claude --foo a&b | tee log.txt", "C:\\repo");
+        let cmd_arg = args.last().expect("non-empty argv");
+        assert_eq!(cmd_arg, "\"& { claude --foo a&b | tee log.txt }\"");
+    }
+
+    #[test]
+    fn build_agent_shell_args_argv_has_exactly_six_elements() {
+        // Shape lock: the C# layout is six tokens. Catches a future
+        // accidental split (e.g. quoting the wd as two args).
+        let args = build_agent_shell_args("claude", "C:\\repo");
+        assert_eq!(args.len(), 6);
+        assert_eq!(args[0], "-NoExit");
+        assert_eq!(args[1], "-NoLogo");
+        assert_eq!(args[2], "-WorkingDirectory");
+        assert_eq!(args[4], "-Command");
     }
 
     #[test]
