@@ -1889,6 +1889,14 @@ impl AppShell {
             // had multiple projects and didn't expect one of them to
             // be selected on every fresh boot. Mirrors C#'s empty
             // workspace state ("CodeScope — add a project to begin.").
+            //
+            // Focus the AppShell root so app-level chords (Ctrl+Shift+T
+            // to open a new tab, Ctrl+Shift+P for the palette, etc.)
+            // fire from a fresh boot — without explicit focus there's
+            // no focused element at all and the key handler never
+            // triggers (Copilot caught this on PR #184).
+            self.focus_handle.focus(window);
+            cx.notify();
             return;
         }
         let group_count = self.groups.len();
@@ -2894,6 +2902,12 @@ impl AppShell {
             // exits when the user closes the window itself (caption X
             // / Alt+F4 / Cmd+Q / etc.).
             if self.groups.len() == 1 {
+                // Without a focused terminal the AppShell-level
+                // key handler is the only thing listening; route
+                // focus back to the shell root so Ctrl+Shift+T (and
+                // every other app chord) still fires from the empty
+                // state. Copilot caught this on PR #184.
+                self.focus_handle.focus(window);
                 cx.notify();
                 return;
             }
