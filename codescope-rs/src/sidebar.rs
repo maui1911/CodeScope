@@ -1043,6 +1043,98 @@ impl Sidebar {
         self.git_status.get(path)
     }
 
+    /// Resolve the cached "open PR URL" for the worktree rooted at
+    /// `path`. Returns `Some(url)` only when the cached `gh pr list`
+    /// lookup landed on a `Resolved { info: Some(_) }` whose branch
+    /// still matches the live branch (live `git_status` first, with
+    /// the persisted worktree branch as a fallback). Mirrors the same
+    /// gate the sidebar's "Open PR in browser" row uses — so a
+    /// branch-switch-since-fetch hides the row rather than opening a
+    /// stale URL.
+    ///
+    /// Returns `None` for paths we don't track, paths with no PR
+    /// cache entry yet (poller hasn't landed), `Pending` entries, and
+    /// `Resolved` entries with `info: None` (gh said "no open PR for
+    /// this branch") or a mismatched cached branch.
+    pub(crate) fn pr_url_for_path(&self, path: &str) -> Option<String> {
+        let live = self
+            .git_status
+            .get(path)
+            .map(|s| s.branch.clone())
+            .or_else(|| {
+                self.projects
+                    .projects
+                    .iter()
+                    .flat_map(|p| p.worktrees.iter())
+                    .find(|wt| wt.path == path)
+                    .and_then(|wt| wt.branch.clone())
+            })?;
+        match self.pr_urls.get(path)? {
+            PrLookup::Resolved { branch, info: Some(info) } if *branch == live => {
+                Some(info.url.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `path` matches a tracked worktree (primary or
+    /// secondary) on any project. Used by the tab right-click menu
+    /// to decide whether the "Open remote in browser" row makes
+    /// sense — tabs spawned in a plain shell with no project context
+    /// hide the row entirely. The actual "is there a git remote"
+    /// check still runs lazily inside `spawn_open_remote_in_browser`
+    /// (no `origin` → log + no-op), same gating the sidebar row
+    /// uses.
+    pub(crate) fn path_is_tracked_worktree(&self, path: &str) -> bool {
+        self.projects
+            .projects
+            .iter()
+            .flat_map(|p| p.worktrees.iter())
+            .any(|wt| wt.path == path)
+    }
+
+    /// Open the remote (`origin`) for the worktree rooted at `path`
+    /// in the user's default browser. Looks up which project owns the
+    /// path and dispatches to the same async helper the sidebar
+    /// worktree-menu row uses. No-ops + logs when the path doesn't
+    /// match a tracked worktree, when `origin` isn't set, or when
+    /// the URL shape isn't recognised. Used by the tab right-click
+    /// menu and the command palette.
+    pub(crate) fn open_remote_in_browser_for_path(
+        &mut self,
+        path: String,
+        cx: &mut Context<Self>,
+    ) {
+        let project_path = self
+            .projects
+            .projects
+            .iter()
+            .find(|p| p.worktrees.iter().any(|wt| wt.path == path))
+            .map(|p| std::path::PathBuf::from(&p.path));
+        let Some(project_path) = project_path else {
+            return;
+        };
+        cx.spawn(async move |_, cx| {
+            spawn_open_remote_in_browser(project_path, cx).await;
+        })
+        .detach();
+    }
+
+    /// Open the cached PR URL for the worktree rooted at `path` in
+    /// the user's default browser. No-ops when [`Self::pr_url_for_path`]
+    /// returns `None` (no cache entry, mismatched branch, or no open
+    /// PR). Used by the tab right-click menu and the command palette
+    /// — mirrors the gating the sidebar worktree menu uses.
+    pub(crate) fn open_pr_in_browser_for_path(
+        &mut self,
+        path: String,
+        _cx: &mut Context<Self>,
+    ) {
+        if let Some(url) = self.pr_url_for_path(&path) {
+            open_url_in_browser(&url);
+        }
+    }
+
     /// Read-only handle to the in-memory project list. Exposed so the
     /// dialog module can read project metadata without re-borrowing
     /// every private field individually.

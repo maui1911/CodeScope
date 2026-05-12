@@ -832,6 +832,17 @@ pub(crate) fn is_app_level_shortcut(key: &str, mods: &gpui::Modifiers) -> bool {
     if key == "," && mods.shift {
         return true;
     }
+    // Ctrl+Shift+G — open active tab's worktree remote in browser.
+    // Plain Ctrl+G stays with the terminal (readline abort).
+    if key == "g" && mods.shift {
+        return true;
+    }
+    // Ctrl+Shift+R — open active tab's PR in browser. Plain Ctrl+R
+    // is readline reverse-history-search and stays with the
+    // terminal.
+    if key == "r" && mods.shift {
+        return true;
+    }
     false
 }
 
@@ -1120,6 +1131,25 @@ mod tests {
         // be bound inside the terminal by user tooling.
         assert!(is_app_level_shortcut(",", &ctrl_shift()));
         assert!(!is_app_level_shortcut(",", &ctrl()));
+    }
+
+    #[test]
+    fn ctrl_shift_g_bubbles_for_open_remote() {
+        // Ctrl+Shift+G opens the active tab's worktree remote in the
+        // browser. Plain Ctrl+G is readline abort and stays with the
+        // terminal so coding agents inside the PTY keep working.
+        assert!(is_app_level_shortcut("g", &ctrl_shift()));
+        assert!(!is_app_level_shortcut("g", &ctrl()));
+    }
+
+    #[test]
+    fn ctrl_shift_r_bubbles_for_open_pr() {
+        // Ctrl+Shift+R opens the active tab's PR URL in the browser.
+        // Plain Ctrl+R is readline reverse-history-search and is
+        // heavily used inside agent CLIs — must stay with the
+        // terminal.
+        assert!(is_app_level_shortcut("r", &ctrl_shift()));
+        assert!(!is_app_level_shortcut("r", &ctrl()));
     }
 }
 
