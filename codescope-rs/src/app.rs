@@ -563,7 +563,7 @@ pub struct AppShell {
     /// they converge through the shared file. This split mirrors
     /// the C# build where `SessionStore` is the orchestrator and
     /// `SidebarViewModel.StoreSync` projects from it.
-    projects: ProjectsConfig,
+    pub(crate) projects: ProjectsConfig,
     /// Registry of agent profiles built from `settings.agents`
     /// overrides (or the shipped built-in defaults when none are
     /// configured). Mirrors C# `AgentRegistry` — owned at the shell
@@ -593,6 +593,13 @@ pub struct AppShell {
     /// fields mirror exactly what's in [`codescope_core::Settings`];
     /// no schema additions.
     pub(crate) settings_dialog: Option<crate::settings_dialog::SettingsDialogState>,
+    /// Open Rename dialog, if any. Surfaces a single text-input modal
+    /// for renaming a project or a session (live or closed). Mirrors
+    /// the C# build's `Dialogs.RenameDialog.Prompt` — the Rust port
+    /// owns it on AppShell instead of opening a modal `Window` because
+    /// gpui doesn't have a modal-window primitive. See
+    /// `rename_dialog.rs` for the full rationale.
+    pub(crate) rename_dialog: Option<crate::rename_dialog::RenameDialogState>,
 }
 
 impl AppShell {
@@ -728,6 +735,45 @@ impl AppShell {
                 }
                 SidebarEvent::ReopenSession { session_id } => {
                     this.reopen_session(session_id.clone(), window, cx);
+                }
+                SidebarEvent::OpenRenameDialog { target, current_name } => {
+                    // Reload `projects.json` before opening so the
+                    // dialog operates on the freshest snapshot — same
+                    // reload-then-mutate discipline `allocate_session_id`
+                    // / `soft_close_session` use. A sidebar add/remove
+                    // between two AppShell mutations would otherwise
+                    // make the rename target invisible at submit time.
+                    //
+                    // Bail on load failure rather than mutating a stale
+                    // snapshot and persisting it on top of newer disk
+                    // state (same rule `reopen_session` uses). Surface
+                    // the error so the user sees the row stay
+                    // un-renamed instead of silently racing the file.
+                    match ProjectsConfig::load(&this.paths) {
+                        Ok(cfg) => {
+                            this.projects = cfg;
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "warning: failed to reload projects.json before rename: {err:#}"
+                            );
+                            this.push_toast(
+                                ToastKind::Err,
+                                SharedString::from("Rename failed"),
+                                Some(SharedString::from(format!(
+                                    "Could not read projects.json: {err:#}"
+                                ))),
+                                cx,
+                            );
+                            return;
+                        }
+                    }
+                    this.open_rename_dialog(
+                        target.clone(),
+                        current_name.clone(),
+                        window,
+                        cx,
+                    );
                 }
             }
         })
@@ -948,6 +994,7 @@ impl AppShell {
             command_palette: None,
             show_overview: false,
             settings_dialog: None,
+            rename_dialog: None,
         };
         shell.start_telemetry_poll(cx);
         shell.start_agent_discovery_poll(cx);
@@ -1973,6 +2020,19 @@ impl AppShell {
     /// Settings dialog to write `settings.json`.
     pub(crate) fn paths_ref(&self) -> &Arc<AppPaths> {
         &self.paths
+    }
+
+    /// Push the AppShell-side `ProjectsConfig` mirror over to the
+    /// sidebar's copy so the rendered list reflects the latest mutation
+    /// on this frame. Same pattern `reopen_session` uses — extracted
+    /// here so the Rename dialog (and any future AppShell-side mutator)
+    /// doesn't duplicate the clone / `update` / `notify` triple.
+    pub(crate) fn mirror_projects_to_sidebar(&mut self, cx: &mut Context<Self>) {
+        let projects_for_sidebar = self.projects.clone();
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.replace_projects(projects_for_sidebar);
+            cx.notify();
+        });
     }
 
     /// Read-only borrow of the current `Settings`. Used by the
@@ -4644,6 +4704,7 @@ impl Render for AppShell {
             .children(self.render_notifications_popover(&theme, cx))
             .children(self.render_command_palette(window, &theme, cx))
             .children(self.render_settings_dialog(window, &theme, cx))
+            .children(self.render_rename_dialog(window, &theme, cx))
     }
 }
 
