@@ -23,6 +23,7 @@
 use gpui::Window;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -135,17 +136,60 @@ pub fn close(window: &Window) {
 /// as an opaque wide string and routes it through the registered
 /// protocol handler without going through a shell — same model
 /// `start` would use under the hood, minus the cmd.exe parsing.
+///
+/// **Threaded dispatch.** ShellExecuteW is synchronous and — for
+/// `http(s)://` URLs that resolve to an already-running browser —
+/// resolves the handler via DDE / out-of-proc COM. That path pumps
+/// messages on the calling thread while it waits, which would
+/// re-enter gpui's `WndProc` and trip `RefCell already borrowed`
+/// because we're calling from inside an `on_mouse_down` listener
+/// (the App is already borrowed by the dispatch chain that ran us).
+/// Symptom: clicking "Open PR in browser" / "Open remote in browser"
+/// from a sidebar context menu crashes the app — same root cause as
+/// the titlebar `SendMessageW` bug `start_drag` documents in detail.
+///
+/// Mitigation: spawn a one-shot detached OS thread that calls
+/// `CoInitializeEx(APARTMENTTHREADED)` + `ShellExecuteW`. The UI
+/// thread returns immediately, the dispatch chain unwinds, and the
+/// inner message pump (if any) runs in a thread with no gpui state
+/// to borrow. Empty URLs short-circuit so a stale-cache slip-through
+/// doesn't fire ShellExecuteW with an empty argument.
 pub fn shell_open_url(url: &str) {
-    let url_wide = HSTRING::from(url);
-    let verb_wide = HSTRING::from("open");
-    unsafe {
-        let _ = ShellExecuteW(
-            None,
-            &verb_wide,
-            &url_wide,
-            None,
-            None,
-            SW_SHOWNORMAL,
-        );
+    // Defensive: ShellExecuteW with an empty lpFile is documented as
+    // erroring out, but it's still a synchronous call that can pump
+    // messages before returning. Hide the round-trip entirely when we
+    // have nothing to open — callers up the stack should already be
+    // gating on this but a misgated row should fail silent, not hard.
+    if url.is_empty() {
+        return;
     }
+    let url_owned = url.to_owned();
+    std::thread::Builder::new()
+        .name("shell-open-url".into())
+        .spawn(move || {
+            // SAFETY: this thread is single-purpose and exits after
+            // the ShellExecuteW call. CoInitializeEx is required for
+            // some shell protocol handlers (notably the browser DDE
+            // path) to resolve; we pair it with CoUninitialize so the
+            // apartment is torn down cleanly. Failure of either call
+            // is non-fatal — `ShellExecuteW` still attempts the open
+            // and Windows will fall back to the registry handler.
+            unsafe {
+                let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+                let url_wide = HSTRING::from(url_owned.as_str());
+                let verb_wide = HSTRING::from("open");
+                let _ = ShellExecuteW(
+                    None,
+                    &verb_wide,
+                    &url_wide,
+                    None,
+                    None,
+                    SW_SHOWNORMAL,
+                );
+                if hr.is_ok() {
+                    CoUninitialize();
+                }
+            }
+        })
+        .ok();
 }
