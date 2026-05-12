@@ -26,16 +26,22 @@ members = ["cargo:."]
 #   fontconfig + freetype) are installed in the GH Actions Linux
 #   job via apt before `dist build` runs. See
 #   `.github/workflows/rs--release.yml`.
-# - `install-path = "CARGO_HOME"` is the cargo-dist default for CLI
-#   tools, but CodeScope is a GUI app users launch from the Start menu,
-#   so we leave that field at its default and let the MSI installer
-#   put the binary under `%ProgramFiles%\codescope-rs\` (the WiX
-#   template derives the directory name from the Cargo `package.name`).
-#   The C# build installs to `%ProgramFiles%\CodeScope\` instead, so
-#   the two MSIs coexist on the same machine while we work the Rust
-#   port toward feature parity. The directory name can be rebranded
-#   to `CodeScope` once the Rust build is the only build shipping —
-#   that's a `[package.metadata.wix]` edit, not a rename.
+# - The MSI installs **per-user** to
+#   `%LOCALAPPDATA%\Programs\codescope-rs\bin\` and lays a Start Menu
+#   shortcut under the user's `%APPDATA%\Microsoft\Windows\Start
+#   Menu\Programs\` tree. No admin / UAC prompt at install or upgrade
+#   time. This matches VS Code Stable, Zed, Discord, Slack, and GitHub
+#   Desktop's modern default, and it deliberately diverges from the
+#   C# CodeScope build (still `%ProgramFiles%\CodeScope\`, per-machine)
+#   so Velopack-style auto-updates can rewrite the install dir without
+#   needing to escalate every time. The C# and Rust MSIs now live in
+#   different scopes entirely, so they coexist cleanly on the same
+#   machine while we work the Rust port toward feature parity.
+#
+#   The directory chain + `InstallScope="perUser"` + `MSIINSTALLPERUSER=1`
+#   are authored in `codescope-rs/wix/main.wxs` (a hand-edited
+#   cargo-wix template). `allow-dirty = ["msi"]` below tells cargo-dist
+#   to leave the template alone — see the comment near it.
 # - `install-updater = false` for now — Velopack handles the
 #   self-update path in-process (see `codescope-rs/core/src/update_check.rs`
 #   and the velopack integration on the AppShell). The axoupdater
@@ -73,9 +79,13 @@ tag-namespace = "rs-"
 source-tarball = false
 # We hand-edit the generated workflow to drop the `pull_request:`
 # trigger (we only want tag pushes to spin up the release pipeline).
-# `allow-dirty` tells cargo-dist not to fight the manual edit on every
-# `dist plan` invocation.
-allow-dirty = ["ci"]
+# We also ship a custom WiX template at `codescope-rs/wix/main.wxs`
+# (per-user install to `%LOCALAPPDATA%\Programs\codescope-rs\`,
+# per-user Start Menu shortcut, `ALLUSERS=""` / `MSIINSTALLPERUSER=1`
+# for no-UAC installs and upgrades). `allow-dirty` tells cargo-dist
+# not to fight the manual edits on either path on every `dist plan`
+# invocation.
+allow-dirty = ["ci", "msi"]
 # Don't fan out a PR-validation build matrix — the task brief says
 # "only trigger on tag pushes". This empties cargo-dist's PR mode so
 # the workflow's pull_request gate (when present) is a no-op.
