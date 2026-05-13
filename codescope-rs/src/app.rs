@@ -2627,6 +2627,21 @@ impl AppShell {
         &self.groups[self.focused_group]
     }
 
+    /// Public entry-point for the "New project…" flow. The actual
+    /// dialog lives on [`crate::sidebar::Sidebar`]; this helper hides
+    /// the entity-update plumbing so call sites that don't carry the
+    /// sidebar reference (command palette, empty-state CTA, etc.)
+    /// stay terse. Mirrors `MainViewModel.OpenNewProjectDialog`.
+    pub(crate) fn open_new_project_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.open_new_project_dialog(window, cx);
+        });
+    }
+
     /// Toggle / set the Overview panel visibility. When flipped on the
     /// work area (group strip + terminal grid) is replaced by the
     /// full-pane Overview; the sidebar + status bar stay anchored.
@@ -6138,6 +6153,16 @@ impl Render for AppShell {
             .child(tab_strip_inline)
             .child(caption_controls);
 
+        // `projects_empty` here is independent of the
+        // `render_status_bar` local of the same name — recomputed so
+        // the work-area swap stays self-contained.
+        let projects_empty = self
+            .sidebar
+            .read(cx)
+            .projects()
+            .projects
+            .is_empty();
+
         // Work area swap: when the Overview panel is up, hide the
         // group strip + terminal grid entirely and render the
         // Overview in their place. The sidebar + status bar stay
@@ -6146,6 +6171,15 @@ impl Render for AppShell {
         // `IsOverviewVisible` DataTrigger swap in `MainWindow.xaml`.
         let work_area: gpui::AnyElement = if self.show_overview {
             self.render_overview(&theme, cx).into_any_element()
+        } else if projects_empty {
+            // First-run hero takes over the work area whenever no
+            // projects are registered. Mirrors the C# `Sidebar.IsEmpty`
+            // DataTrigger that collapses `WorkspaceLayer` in
+            // `MainWindow.xaml` and shows `EmptyStateView` instead.
+            // Overview still wins over empty-state above so the user
+            // can dismiss the hero by flipping into Overview (then
+            // back) — same precedence the C# build uses.
+            crate::empty_state::render(&theme, cx)
         } else {
             div()
                 .flex_grow()
@@ -6469,9 +6503,7 @@ impl AppShell {
                     self.toggle_sidebar(cx);
                 }
                 BuiltInCommand::NewProject => {
-                    self.sidebar.update(cx, |sidebar, cx| {
-                        sidebar.open_new_project_dialog(window, cx);
-                    });
+                    self.open_new_project_dialog(window, cx);
                 }
                 BuiltInCommand::NewSession => {
                     self.spawn_tab(window, cx);
