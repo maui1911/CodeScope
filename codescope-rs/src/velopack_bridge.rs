@@ -64,9 +64,44 @@ use std::env;
 /// `releases.<channel>.json` asset from each tagged release.
 const REPO_URL: &str = "https://github.com/maui1911/CodeScope";
 
-/// Velopack channel name. Single-channel for now (`win`); multi-channel
-/// (`beta`, `alpha`) is on the follow-up list.
-const CHANNEL: &str = "win";
+/// Default Velopack channel name for the *current* build target.
+///
+/// We use one channel per platform/arch so each build only ever pulls
+/// updates compatible with its own runtime — a macOS arm64 client
+/// asking for `releases.win.json` would (correctly) be told there's
+/// nothing applicable, but the round-trip is wasted and the result
+/// confusing in logs. Per-platform channels also match the asset
+/// layout `vpk pack --channel <name>` produces in the release
+/// pipeline (`rs--release.yml`):
+///
+/// - `x86_64-pc-windows-msvc`      → `win`
+/// - `aarch64-apple-darwin`        → `osx-arm64`
+/// - `x86_64-apple-darwin`         → `osx-x64`
+/// - `x86_64-unknown-linux-gnu`    → `linux-x64`
+///
+/// The Windows variant keeps the historical `win` slug (not
+/// `win-x64`) so already-installed v0.3 builds keep finding the same
+/// `releases.win.json` after this change. Any future Windows arm64
+/// build would add `win-arm64` without disturbing the existing one.
+///
+/// Anything outside this matrix falls back to `win` — harmless on a
+/// build that hasn't been Velopack-installed (the apply gate
+/// short-circuits before the channel is even consulted) and a safe
+/// "no asset for this triple" failure path on a hypothetical
+/// future target until the pipeline catches up.
+pub(crate) const fn default_channel() -> &'static str {
+    if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        "win"
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "osx-arm64"
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        "osx-x64"
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "linux-x64"
+    } else {
+        "win"
+    }
+}
 
 /// Result of an attempted Velopack apply.
 ///
@@ -135,8 +170,13 @@ pub fn maybe_apply_now() -> ApplyOutcome {
     // Velopack-rs preserves the C# field names verbatim (`#[allow(non_snake_case)]`
     // on `UpdateOptions`) — that's why this looks PascalCase. Mirrors
     // C# `new UpdateOptions { ExplicitChannel = Channel }`.
+    //
+    // `channel_override()` returns `default_channel()` (per-platform)
+    // unless `CODESCOPE_VELOPACK_CHANNEL` is set — QA can flip a
+    // build's update feed without rebuilding by exporting the env
+    // var.
     let options = velopack::UpdateOptions {
-        ExplicitChannel: Some(CHANNEL.to_string()),
+        ExplicitChannel: Some(channel_override()),
         ..Default::default()
     };
     // `GithubSource` directly mirrors C#
@@ -202,12 +242,19 @@ pub fn is_velopack_install() -> bool {
     })
 }
 
-/// Allow overriding the Velopack channel via env var for QA testing.
-/// Currently unused but reserved — keeps the surface ready for
-/// multi-channel without forcing another module rebuild later.
-#[allow(dead_code)]
+/// Resolve the Velopack channel name for this run.
+///
+/// Defaults to [`default_channel`] (per-platform/-arch). The
+/// `CODESCOPE_VELOPACK_CHANNEL` env var overrides — handy for QA
+/// pointing a Windows build at a beta feed, or a macOS build at a
+/// `nightly` channel, without recompiling. Empty / whitespace
+/// values are ignored so a stale shell export doesn't shadow the
+/// default with a feed that doesn't exist.
 pub fn channel_override() -> String {
-    env::var("CODESCOPE_VELOPACK_CHANNEL").unwrap_or_else(|_| CHANNEL.to_string())
+    match env::var("CODESCOPE_VELOPACK_CHANNEL") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => default_channel().to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -255,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn channel_override_defaults_to_win() {
+    fn channel_override_defaults_to_platform_channel() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = EnvGuard::capture();
         // SAFETY: env mutation serialised via `ENV_LOCK`; `EnvGuard`
@@ -263,7 +310,43 @@ mod tests {
         unsafe {
             std::env::remove_var("CODESCOPE_VELOPACK_CHANNEL");
         }
-        assert_eq!(channel_override(), "win");
+        // Default tracks the build target's channel name — see
+        // `default_channel` for the full mapping.
+        assert_eq!(channel_override(), default_channel());
+    }
+
+    #[test]
+    fn channel_override_ignores_blank_env_var() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::capture();
+        // SAFETY: serialised + restored.
+        unsafe {
+            std::env::set_var("CODESCOPE_VELOPACK_CHANNEL", "   ");
+        }
+        // Blank value should fall back to the platform default
+        // rather than shadowing the feed with an empty channel name.
+        assert_eq!(channel_override(), default_channel());
+    }
+
+    #[test]
+    fn default_channel_matches_current_target() {
+        // Lock the platform → channel mapping. Adding a new target
+        // belongs alongside an explicit case here so a future
+        // regression (typo / wrong arch) trips the test.
+        let expected = if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+            "win"
+        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            "osx-arm64"
+        } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+            "osx-x64"
+        } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            "linux-x64"
+        } else {
+            // Documented fallback — see `default_channel` for the
+            // reasoning behind picking `win` here.
+            "win"
+        };
+        assert_eq!(default_channel(), expected);
     }
 
     #[test]
