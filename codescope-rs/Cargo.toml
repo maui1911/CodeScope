@@ -4,7 +4,7 @@ exclude = ["vendor/gpui-terminal"]
 
 [package]
 name = "codescope-rs"
-version = "0.3.0-rc.4"
+version = "0.3.0-rc.5"
 edition = "2024"
 publish = false
 description = "CodeScope (Rust port): gpui shell that orchestrates parallel AI coding agent CLI sessions with Git worktree isolation."
