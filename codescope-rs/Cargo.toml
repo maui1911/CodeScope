@@ -66,6 +66,14 @@ velopack = "0.0.1589-ga2c5a97"
 # return type; we depend on it explicitly so the confirm dialog reads
 # from the same well-known crate without going through gpui internals.
 futures-channel = "0.3"
+# Cross-platform OS notification for the agent "turn complete" toast.
+# Mirrors C# `WindowsIdleToastNotifier` / `IIdleToastNotifier`; the
+# Rust port uses notify-rust so the same code path lights up
+# WinRT toast on Windows, FreeDesktop dbus on Linux, and
+# NSUserNotification on macOS. Click activation isn't supported on
+# Windows by this crate — the in-app bell handles tab routing already,
+# so the OS toast is intentionally show-only for v1.
+notify-rust = "4"
 
 [target.'cfg(windows)'.dependencies]
 # Direct Win32 access for the custom titlebar: gpui's

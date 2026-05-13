@@ -646,6 +646,23 @@ pub struct AppShell {
     /// after each telemetry tick to match `telemetry_tails`, so a
     /// rotated/closed session doesn't leak.
     last_session_state: HashMap<String, codescope_core::SessionState>,
+    /// Cross-platform OS-toast notifier for the "turn complete"
+    /// signal. Port of C# `WindowsIdleToastNotifier`. Owns its own
+    /// 2 s per-session de-dupe so the FS-watcher and poll-fallback
+    /// re-fires don't stack two toasts. Actual `Notification::show()`
+    /// runs on the background executor in [`Self::apply_activity_notifications`]
+    /// so the gpui main loop stays snappy.
+    idle_notifier: crate::idle_notifier::IdleNotifier,
+    /// `Window::is_window_active()` value captured at the most recent
+    /// render. The telemetry poll task can't query gpui's `Window`
+    /// directly (it runs without a `&Window` borrow), so we cache the
+    /// flag here every frame and read it from
+    /// [`Self::apply_activity_notifications`] as the gate for OS
+    /// toasts. Up to one frame stale; on a 250 ms telemetry cadence
+    /// that's well below the threshold the user would notice.
+    /// Defaults to `true` so a transition fired during start-up (rare)
+    /// is treated as "user can see the app".
+    window_active_cached: bool,
     /// Live telemetry tails, keyed by adopted-agent session id.
     /// Entries are registered via `register_telemetry` (per-agent
     /// dispatch) and polled by the background task spawned in
@@ -1168,6 +1185,8 @@ impl AppShell {
             text_blink_phase: true,
             notifications: crate::notifications::Notifications::new(),
             last_session_state: HashMap::new(),
+            idle_notifier: crate::idle_notifier::IdleNotifier::new(),
+            window_active_cached: true,
             telemetry_tails: HashMap::new(),
             bell_bounds: None,
             last_announced_update: None,
@@ -4975,6 +4994,13 @@ impl AppShell {
             detail: SharedString,
             session_title: SharedString,
         }
+        // (session_id, tab_title, detail) — fired on the background
+        // executor below as OS toasts. Separate from `pending` because
+        // the OS toast intentionally does *not* honour the
+        // focused-tab suppression (the gate is "is the user looking
+        // at the app", not "which tab is in front"), matching the C#
+        // build's split.
+        let mut pending_toasts: Vec<(String, String, String)> = Vec::new();
         let mut pending: Vec<Pending> = Vec::new();
         // Only records *changed* (sid, state) pairs so the steady-state
         // tick — every tab same as last time — stays allocation-free.
@@ -4999,6 +5025,38 @@ impl AppShell {
                 // (can't write to it inside this loop without giving up
                 // the immutable `&self.groups` borrow).
                 state_updates.push((sid.to_string(), snap.state));
+
+                // OS-level "turn complete" toast: fires on
+                // `(Busy | PendingToolUse) → Idle` regardless of which
+                // tab is currently focused. The gate is "user is not
+                // looking at the app window" — there's no point
+                // pinging the OS if the user is already staring at
+                // CodeScope. Matches the C# `IdleNotifier` placement
+                // *before* the SelectedTab suppression check.
+                if !self.window_active_cached
+                    && matches!(
+                        (prev, snap.state),
+                        (
+                            codescope_core::SessionState::Busy
+                                | codescope_core::SessionState::PendingToolUse,
+                            codescope_core::SessionState::Idle
+                        )
+                    )
+                {
+                    let detail = match snap.last_turn_duration {
+                        Some(d) => format!(
+                            "Turn complete · {}",
+                            codescope_core::TranscriptTail::format_duration(d)
+                        ),
+                        None => "Turn complete.".to_string(),
+                    };
+                    pending_toasts.push((
+                        sid.to_string(),
+                        tab.title.to_string(),
+                        detail,
+                    ));
+                }
+
                 let is_focused = focused_tab_key
                     .map(|(g, t)| g == group.id && t == tab.id)
                     .unwrap_or(false);
@@ -5016,6 +5074,23 @@ impl AppShell {
                     });
                 }
             }
+        }
+
+        // De-dupe + spawn the OS-toast show() calls on the background
+        // executor. notify-rust's `show()` can block for tens of ms on
+        // Windows (COM marshalling) and macOS (NSUserNotification
+        // round-trip) — keep it off the gpui main loop. Errors are
+        // swallowed inside `fire_os_notification` since the toast is
+        // a best-effort surface.
+        for (sid, title, detail) in pending_toasts {
+            if !self.idle_notifier.should_fire(&sid) {
+                continue;
+            }
+            cx.background_executor()
+                .spawn(async move {
+                    crate::idle_notifier::fire_os_notification(&title, &detail);
+                })
+                .detach();
         }
 
         for (sid, state) in state_updates {
@@ -5558,6 +5633,11 @@ impl Render for AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        // Snapshot the OS-level "is the user looking at us" flag so
+        // the background telemetry poll task can read it without a
+        // `&Window` borrow. Updated every frame — at the 250 ms
+        // telemetry cadence, one frame of staleness is invisible.
+        self.window_active_cached = window.is_window_active();
         let theme = self.theme.clone();
         // Tab-drag rect cache: swap the just-built map into
         // `prev_tab_rects` so the in-flight render can still answer
