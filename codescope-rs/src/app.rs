@@ -2627,12 +2627,6 @@ impl AppShell {
         &self.groups[self.focused_group]
     }
 
-    /// Toggle / set the Overview panel visibility. When flipped on the
-    /// work area (group strip + terminal grid) is replaced by the
-    /// full-pane Overview; the sidebar + status bar stay anchored.
-    /// Mirrors the `IsOverviewVisible` setter on the C#
-    /// `MainViewModel`. `cx.notify()` triggers a re-render so the
-    /// flip is visible on the next frame.
     /// Public entry-point for the "New project…" flow. The actual
     /// dialog lives on [`crate::sidebar::Sidebar`]; this helper hides
     /// the entity-update plumbing so call sites that don't carry the
@@ -2648,6 +2642,12 @@ impl AppShell {
         });
     }
 
+    /// Toggle / set the Overview panel visibility. When flipped on the
+    /// work area (group strip + terminal grid) is replaced by the
+    /// full-pane Overview; the sidebar + status bar stay anchored.
+    /// Mirrors the `IsOverviewVisible` setter on the C#
+    /// `MainViewModel`. `cx.notify()` triggers a re-render so the
+    /// flip is visible on the next frame.
     pub(crate) fn set_show_overview(&mut self, value: bool, cx: &mut Context<Self>) {
         if self.show_overview == value {
             return;

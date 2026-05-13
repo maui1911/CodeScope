@@ -68,8 +68,8 @@ pub fn render(theme: &Arc<Theme>, cx: &mut Context<AppShell>) -> AnyElement {
         .child("NO PROJECTS");
 
     // Wordmark: "Add a project" in ink + "." in accent. gpui composes
-    // colours per-child element rather than via per-run runs, so we
-    // build the wordmark as a flex row of two text spans.
+    // colours per-child element rather than via per-run text styling,
+    // so we build the wordmark as a flex row of two text spans.
     let wordmark = div()
         .flex()
         .flex_row()
