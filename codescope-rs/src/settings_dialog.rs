@@ -943,6 +943,14 @@ fn handle_key_down(
             }
             return;
         }
+        "space" => {
+            if let Some(state) = shell.settings_dialog.as_mut() {
+                state.insert_char(' ');
+                shell.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
         _ => {}
     }
 

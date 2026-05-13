@@ -1119,6 +1119,17 @@ fn handle_key_down(
             }
             return;
         }
+        "space" => {
+            let changed = sidebar
+                .new_project_dialog_mut()
+                .map(|s| s.insert_char(' '))
+                .unwrap_or(false);
+            if changed {
+                sidebar.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
         _ => {}
     }
 

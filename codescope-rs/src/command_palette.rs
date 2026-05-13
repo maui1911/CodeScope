@@ -662,6 +662,14 @@ fn handle_key_down(
             }
             return;
         }
+        "space" => {
+            if let Some(state) = shell.command_palette_mut() {
+                state.insert_char(' ');
+                shell.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
         _ => {}
     }
 

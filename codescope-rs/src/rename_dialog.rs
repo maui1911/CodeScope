@@ -536,6 +536,15 @@ fn handle_key_down(
             }
             return;
         }
+        "space" => {
+            if let Some(state) = shell.rename_dialog.as_mut() {
+                state.name.insert_char(' ');
+                state.error = None;
+                shell.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
         _ => {}
     }
 
