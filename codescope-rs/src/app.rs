@@ -1089,6 +1089,15 @@ impl AppShell {
         if sanitized_weights.is_empty() {
             sanitized_weights.push(1.0);
         }
+        // Renormalise on load too. layout.json round-trips the raw
+        // post-drag weights (a single drag against a peer can leave a
+        // survivor at 0.5), and taffy treats `flex_grow = 0.5` as
+        // "claim half of free space" even on a lone item — the rest of
+        // the work area stays blank. close/split/move already call
+        // this on mutation; the load path was the missing site, so a
+        // fresh boot showed the half-width regression even before the
+        // user touched anything.
+        normalise_group_weights(&mut sanitized_weights);
         let group_count = sanitized_weights.len();
         let groups: Vec<Group> = (0..group_count)
             .map(|idx| Group {
