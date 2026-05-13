@@ -23,7 +23,8 @@ use std::sync::Arc;
 use codescope_core::{AgentRegistry, Settings, Theme, theme::builtin};
 use gpui::{
     Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, SharedString, Styled, Window, anchored, deferred, div, point, px,
+    MouseDownEvent, ParentElement, SharedString, Styled, Window, anchored, deferred, div, point,
+    px,
 };
 
 use crate::app::AppShell;
@@ -154,6 +155,19 @@ impl SettingsDialogState {
     pub fn move_caret_end(&mut self) -> bool {
         self.focused_field_mut().move_end();
         true
+    }
+
+    /// Mutable accessor for one of the four text-input fields. Used
+    /// by the mouse-down hit-test path so a click on an unfocused
+    /// field shifts focus AND drops the caret at the click position
+    /// in one step.
+    pub fn field_mut_by(&mut self, field: SettingsField) -> &mut TextField {
+        match field {
+            SettingsField::FontFamily => &mut self.font_family_field,
+            SettingsField::FontSize => &mut self.font_size_field,
+            SettingsField::LineHeight => &mut self.line_height_field,
+            SettingsField::Scrollback => &mut self.scrollback_field,
+        }
     }
 
     fn cycle_field(&mut self, forward: bool) {
@@ -524,9 +538,18 @@ impl AppShell {
                 .items_center()
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();
                         this.settings_focus_field(this_field, cx);
+                        if let Some(state) = this.settings_dialog.as_mut() {
+                            let idx = state
+                                .field_mut_by(this_field)
+                                .index_for_window_point(event.position);
+                            if let Some(idx) = idx {
+                                state.field_mut_by(this_field).set_caret(idx);
+                                cx.notify();
+                            }
+                        }
                     }),
                 )
                 .child(render_input_content(

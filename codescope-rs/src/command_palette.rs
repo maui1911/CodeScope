@@ -31,7 +31,8 @@ use std::sync::Arc;
 
 use codescope_core::Theme;
 use gpui::{
-    Context, FocusHandle, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    Context, FocusHandle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement,
     SharedString, StatefulInteractiveElement, Styled, Window, anchored, deferred, div, point, px,
 };
 
@@ -362,6 +363,20 @@ pub(crate) fn render_palette(
         .font(theme::font_sans())
         .flex()
         .items_center()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                if let Some(state) = this.command_palette_mut()
+                    && let Some(idx) =
+                        state.query.index_for_window_point(event.position)
+                {
+                    state.query.set_caret(idx);
+                    this.wake_text_blink(cx);
+                    cx.notify();
+                }
+            }),
+        )
         .child(render_input_content(
             &state.query,
             SharedString::from("Type to filter…"),

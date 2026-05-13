@@ -21,8 +21,8 @@ use std::sync::Arc;
 use codescope_core::{Project, Theme, git::BranchInfo, projects::Worktree};
 use gpui::{
     Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, anchored, deferred,
-    div, point, px,
+    MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window,
+    anchored, deferred, div, point, px,
 };
 
 use crate::sidebar::Sidebar;
@@ -235,6 +235,17 @@ impl NewWorktreeDialogState {
     }
     pub fn move_caret_end(&mut self) -> bool {
         self.with_focused_field(|f| f.move_end())
+    }
+
+    /// Mutable accessor for one of the editable fields by name.
+    /// Used by the mouse-down hit-test path so a click can shift
+    /// focus AND drop the caret at the click position in one step.
+    pub fn field_mut_by(&mut self, field: DialogField) -> &mut TextField {
+        match field {
+            DialogField::Branch => &mut self.branch,
+            DialogField::Folder => &mut self.folder,
+            DialogField::BasePopupSearch => &mut self.base_query,
+        }
     }
 
     /// Filtered branch list for the base-branch popup. `(HEAD)` is
@@ -648,9 +659,18 @@ impl Sidebar {
                 .cursor_pointer()
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();
                         this.focus_dialog_field(this_field, cx);
+                        if let Some(state) = this.dialog_mut() {
+                            let idx = state
+                                .field_mut_by(this_field)
+                                .index_for_window_point(event.position);
+                            if let Some(idx) = idx {
+                                state.field_mut_by(this_field).set_caret(idx);
+                                cx.notify();
+                            }
+                        }
                     }),
                 )
                 .child(render_input_content(
@@ -979,7 +999,6 @@ impl Sidebar {
         // Search row at the top — the type-to-filter input. Same
         // caret discipline as the BRANCH / FOLDER inputs.
         let mut search_style = focused_caret_style(theme, self.text_blink_phase);
-        search_style.caret_height = 14.0;
         search_style.show_caret = self.text_blink_phase
             && state.focused_field == DialogField::BasePopupSearch;
         let search = div()

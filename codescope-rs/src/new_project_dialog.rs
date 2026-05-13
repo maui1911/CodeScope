@@ -25,8 +25,8 @@ use std::sync::Arc;
 use codescope_core::Theme;
 use gpui::{
     AppContext, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, PathPromptOptions, SharedString, Styled, Window, anchored, deferred, div,
-    point, px,
+    MouseDownEvent, ParentElement, PathPromptOptions, SharedString, Styled, Window, anchored,
+    deferred, div, point, px,
 };
 
 use crate::sidebar::Sidebar;
@@ -130,6 +130,20 @@ impl NewProjectDialogState {
                 }
                 !name.is_empty() && !contains_invalid_filename_chars(name)
             }
+        }
+    }
+
+    /// Mutable accessor for a specific clone-mode field by name.
+    /// Used by the mouse-down hit-test path so a click on a non-
+    /// focused field can both shift focus AND drop the caret at the
+    /// click position in one step. The existing-mode path field is
+    /// read-only — typed characters skip it via `focused_field_mut`,
+    /// but it's still reachable here for completeness.
+    pub fn field_mut_by(&mut self, field: DialogField) -> &mut TextField {
+        match field {
+            DialogField::Url => &mut self.url,
+            DialogField::Parent => &mut self.parent,
+            DialogField::Name => &mut self.name,
         }
     }
 
@@ -760,9 +774,18 @@ impl Sidebar {
                 .items_center()
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();
                         this.focus_new_project_field(this_field, cx);
+                        if let Some(state) = this.new_project_dialog_mut() {
+                            let idx = state
+                                .field_mut_by(this_field)
+                                .index_for_window_point(event.position);
+                            if let Some(idx) = idx {
+                                state.field_mut_by(this_field).set_caret(idx);
+                                cx.notify();
+                            }
+                        }
                     }),
                 )
                 .child(render_input_content(

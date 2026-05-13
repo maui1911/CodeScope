@@ -29,7 +29,8 @@ use std::sync::Arc;
 use codescope_core::{SessionManager, Theme};
 use gpui::{
     Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, SharedString, Styled, Window, anchored, deferred, div, point, px,
+    MouseDownEvent, ParentElement, SharedString, Styled, Window, anchored, deferred, div, point,
+    px,
 };
 
 use crate::app::AppShell;
@@ -295,6 +296,20 @@ impl AppShell {
             .text_size(px(13.0))
             .flex()
             .items_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    if let Some(state) = this.rename_dialog.as_mut()
+                        && let Some(idx) =
+                            state.name.index_for_window_point(event.position)
+                    {
+                        state.name.set_caret(idx);
+                        this.wake_text_blink(cx);
+                        cx.notify();
+                    }
+                }),
+            )
             .child(render_input_content(
                 &state.name,
                 SharedString::from("(empty)"),
