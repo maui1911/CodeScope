@@ -17,7 +17,7 @@ pub const DEFAULT_NAME: &str = "codescope-default";
 /// Every theme bundled with the binary. Used by the settings loader
 /// to resolve `theme: "<name>"` and by the (future) theme picker.
 pub fn all() -> Vec<Theme> {
-    vec![codescope_default(), vs_code_dark(), one_dark(), solarized_dark(), tokyo_night()]
+    vec![codescope_default(), vs_code_dark(), one_dark(), solarized_dark(), tokyo_night(), light()]
 }
 
 /// Look up a theme by `name`. Returns `codescope-default` if the name
@@ -185,6 +185,60 @@ pub fn tokyo_night() -> Theme {
                 Rgb::from_hex(0x7aa2f7), Rgb::from_hex(0xbb9af7), Rgb::from_hex(0x7dcfff), Rgb::from_hex(0xc0caf5),
             ],
             Rgb::from_hex(0xc0caf5), Rgb::from_hex(0x1a1b26), Rgb::from_hex(0xc0caf5),
+        ),
+    }
+}
+
+pub fn light() -> Theme {
+    // The only light theme we ship. Modeled on GitHub Light /
+    // VS Code Light+ — readable under bright ambient light, with
+    // dark slate text on a near-white canvas and a vivid (but not
+    // garish) blue accent.
+    //
+    // Note: the frosted-glass overlays (`frost_10`, `frost_20`,
+    // `ink_dim`, `ink_ghost` in `codescope-rs/src/theme.rs`) all derive from
+    // `chrome.ink` with an alpha. On a light theme `ink` is dark, so
+    // those overlays naturally turn into subtle dark washes over the
+    // light canvas — no extra plumbing needed.
+    Theme {
+        name: "light".into(),
+        display_name: "Light".into(),
+        dark: false,
+        chrome: ThemeChrome {
+            // GitHub Light tokens:
+            //   canvas        = canvas.default    = #FFFFFF
+            //   elevated      = canvas.subtle     = #F6F8FA
+            //   surface_elev  = neutral.muted     = #EAEEF2  (one tier
+            //                   above `elevated`; mirrors the role of
+            //                   `Surface.Color.Elev` in the dark themes
+            //                   — sidebar row hover / selection fill).
+            //   ink           = fg.default        = #1F2328
+            //   ink_muted     = fg.muted          = #57606A
+            //   divider       = border.default    = #D0D7DE
+            //   accent        = accent.fg         = #0969DA
+            canvas:       Rgb::from_hex(0xffffff),
+            elevated:     Rgb::from_hex(0xf6f8fa),
+            surface_elev: Rgb::from_hex(0xeaeef2),
+            ink:          Rgb::from_hex(0x1f2328),
+            ink_muted:    Rgb::from_hex(0x57606a),
+            divider:      Rgb::from_hex(0xd0d7de),
+            accent:       Rgb::from_hex(0x0969da),
+        },
+        palette: build_palette(
+            // VS Code Light+ ANSI palette — same 16 colours the VS Code
+            // integrated terminal renders against a white canvas. Bold
+            // primaries that hold their saturation on `#FFFFFF` without
+            // turning into pastel mud.
+            [
+                Rgb::from_hex(0x000000), Rgb::from_hex(0xcd3131), Rgb::from_hex(0x107c10), Rgb::from_hex(0x949800),
+                Rgb::from_hex(0x0451a5), Rgb::from_hex(0xbc05bc), Rgb::from_hex(0x0598bc), Rgb::from_hex(0x555555),
+                Rgb::from_hex(0x666666), Rgb::from_hex(0xcd3131), Rgb::from_hex(0x14ce14), Rgb::from_hex(0xb5ba00),
+                Rgb::from_hex(0x0451a5), Rgb::from_hex(0xbc05bc), Rgb::from_hex(0x0598bc), Rgb::from_hex(0xa5a5a5),
+            ],
+            // Foreground / terminal background / cursor. Cursor is a
+            // saturated blue (VS Code Light cursor token `#005FB8`) so
+            // it stays visible against the white canvas.
+            Rgb::from_hex(0x3b3b3b), Rgb::from_hex(0xffffff), Rgb::from_hex(0x005fb8),
         ),
     }
 }
