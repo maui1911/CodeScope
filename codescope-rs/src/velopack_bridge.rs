@@ -52,9 +52,18 @@
 //!
 //! ## Channel
 //!
-//! Single-channel (`win`), matching the C# `Velopack.UpdateOptions
-//! { ExplicitChannel = Channel }`. Multi-channel beta / alpha rings
-//! are a documented follow-up.
+//! One channel per build target — `win` / `osx-arm64` / `osx-x64` /
+//! `linux-x64`. See [`default_channel`] for the wrapper used by the
+//! apply call site and [`channel_for`] for the pure table-driven
+//! helper the tests pin. Picked at process start via
+//! [`std::env::consts::OS`] + [`std::env::consts::ARCH`], so an
+//! x86_64 build and an arm64 build of the same release pull from
+//! independent feeds.
+//!
+//! Multi-channel *rings* (beta / alpha) layered on top of those
+//! platform channels are still a documented follow-up — when added
+//! they'll prefix the platform slug (e.g. `beta-osx-arm64`) or be
+//! supplied via the `CODESCOPE_VELOPACK_CHANNEL` env override.
 
 use std::env;
 
@@ -64,43 +73,54 @@ use std::env;
 /// `releases.<channel>.json` asset from each tagged release.
 const REPO_URL: &str = "https://github.com/maui1911/CodeScope";
 
-/// Default Velopack channel name for the *current* build target.
+/// Map an `(os, arch)` pair to a Velopack channel slug.
 ///
-/// We use one channel per platform/arch so each build only ever pulls
-/// updates compatible with its own runtime — a macOS arm64 client
-/// asking for `releases.win.json` would (correctly) be told there's
-/// nothing applicable, but the round-trip is wasted and the result
-/// confusing in logs. Per-platform channels also match the asset
-/// layout `vpk pack --channel <name>` produces in the release
-/// pipeline (`rs--release.yml`):
+/// Pure table-driven helper so the platform → channel mapping is
+/// exhaustively unit-testable on any host — a Linux CI run can still
+/// verify the Windows and macOS branches via this fn instead of
+/// re-running the same `cfg!` chain only the current target sees.
 ///
-/// - `x86_64-pc-windows-msvc`      → `win`
-/// - `aarch64-apple-darwin`        → `osx-arm64`
-/// - `x86_64-apple-darwin`         → `osx-x64`
-/// - `x86_64-unknown-linux-gnu`    → `linux-x64`
+/// Keep in lockstep with `rs--release.yml`'s `Compute velopack
+/// params` step; a mismatch means the client polls a feed the
+/// pipeline never published.
+///
+/// Inputs match the values [`std::env::consts::OS`] and
+/// [`std::env::consts::ARCH`] return at compile time (e.g.
+/// `("windows", "x86_64")`).
+///
+/// - `("windows", "x86_64")`  → `win`
+/// - `("macos",   "aarch64")` → `osx-arm64`
+/// - `("macos",   "x86_64")`  → `osx-x64`
+/// - `("linux",   "x86_64")`  → `linux-x64`
+/// - anything else            → `win` *(documented fallback — see below)*
 ///
 /// The Windows variant keeps the historical `win` slug (not
 /// `win-x64`) so already-installed v0.3 builds keep finding the same
 /// `releases.win.json` after this change. Any future Windows arm64
 /// build would add `win-arm64` without disturbing the existing one.
 ///
-/// Anything outside this matrix falls back to `win` — harmless on a
-/// build that hasn't been Velopack-installed (the apply gate
-/// short-circuits before the channel is even consulted) and a safe
-/// "no asset for this triple" failure path on a hypothetical
-/// future target until the pipeline catches up.
-pub(crate) const fn default_channel() -> &'static str {
-    if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-        "win"
-    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        "osx-arm64"
-    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        "osx-x64"
-    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        "linux-x64"
-    } else {
-        "win"
+/// The fallback to `win` is harmless on a build that hasn't been
+/// Velopack-installed (the apply gate short-circuits before the
+/// channel is even consulted) and is a safe "no asset for this
+/// triple" failure path on a hypothetical future target until the
+/// pipeline catches up.
+pub(crate) fn channel_for(os: &str, arch: &str) -> &'static str {
+    match (os, arch) {
+        ("windows", "x86_64") => "win",
+        ("macos", "aarch64") => "osx-arm64",
+        ("macos", "x86_64") => "osx-x64",
+        ("linux", "x86_64") => "linux-x64",
+        _ => "win",
     }
+}
+
+/// Default Velopack channel name for the *current* build target.
+///
+/// Thin wrapper over [`channel_for`] that feeds it the host's
+/// `OS` + `ARCH` constants — see the helper for the mapping table
+/// and the fallback rule.
+pub(crate) fn default_channel() -> &'static str {
+    channel_for(std::env::consts::OS, std::env::consts::ARCH)
 }
 
 /// Result of an attempted Velopack apply.
@@ -329,24 +349,46 @@ mod tests {
     }
 
     #[test]
-    fn default_channel_matches_current_target() {
-        // Lock the platform → channel mapping. Adding a new target
-        // belongs alongside an explicit case here so a future
-        // regression (typo / wrong arch) trips the test.
-        let expected = if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-            "win"
-        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-            "osx-arm64"
-        } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-            "osx-x64"
-        } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-            "linux-x64"
-        } else {
-            // Documented fallback — see `default_channel` for the
-            // reasoning behind picking `win` here.
-            "win"
-        };
-        assert_eq!(default_channel(), expected);
+    fn channel_for_supported_triples_returns_expected_slugs() {
+        // Table-driven: every supported (os, arch) tuple gets an
+        // explicit case so a typo / wrong arch / accidentally-swapped
+        // channel name fails the test on *any* host, not just the
+        // one whose `cfg!` branch happened to fire.
+        let cases: &[(&str, &str, &str)] = &[
+            ("windows", "x86_64", "win"),
+            ("macos", "aarch64", "osx-arm64"),
+            ("macos", "x86_64", "osx-x64"),
+            ("linux", "x86_64", "linux-x64"),
+        ];
+        for (os, arch, expected) in cases {
+            assert_eq!(
+                channel_for(os, arch),
+                *expected,
+                "channel_for({os:?}, {arch:?}) mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn channel_for_unknown_target_falls_back_to_win() {
+        // Documented fallback contract — keep this case so an
+        // accidental refactor doesn't drop the safety net.
+        assert_eq!(channel_for("freebsd", "x86_64"), "win");
+        assert_eq!(channel_for("windows", "aarch64"), "win");
+        assert_eq!(channel_for("linux", "aarch64"), "win");
+        assert_eq!(channel_for("", ""), "win");
+    }
+
+    #[test]
+    fn default_channel_delegates_to_channel_for() {
+        // Smoke check that the thin wrapper actually feeds the
+        // host's OS/ARCH through `channel_for` — guards against the
+        // wrapper getting accidentally inlined with hardcoded values
+        // during a future refactor.
+        assert_eq!(
+            default_channel(),
+            channel_for(std::env::consts::OS, std::env::consts::ARCH)
+        );
     }
 
     #[test]
