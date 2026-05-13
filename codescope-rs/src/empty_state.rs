@@ -45,19 +45,31 @@ pub fn render(theme: &Arc<Theme>, cx: &mut Context<AppShell>) -> AnyElement {
     let ink = theme::ink(theme);
     let ink_dim = theme::ink_dim(theme);
     let ink_muted = theme::ink_muted(theme);
-    let ink_ghost = theme::ink_ghost(theme);
     let canvas = theme::canvas(theme);
     let accent = theme::accent(theme);
     let divider = theme::divider(theme);
     let frost_10 = theme::frost_10(theme);
-    // Soft accent wash for the behind-CTA glow. We can't do a true
-    // radial gradient in gpui, so we approximate with a translucent
-    // accent-tinted rounded box. ~20% alpha reads as a glow without
-    // competing with the wordmark for visual weight.
-    let accent_glow = gpui::Hsla { a: 0.18, ..accent };
     let accent_hover = gpui::Hsla {
         l: (accent.l + 0.08).min(1.0),
         ..accent
+    };
+    // Soft accent glow around the primary CTA. Same two-layer
+    // pattern the model pill in the status bar uses: a tight
+    // spread for the inner halo, a wide blur for the soft outer
+    // wash. Reads as a proper "lit button" without the dark
+    // pill-shaped blob the previous absolutely-positioned div
+    // produced behind the wordmark.
+    let cta_glow_inner = gpui::BoxShadow {
+        color: gpui::hsla(accent.h, accent.s, accent.l, 0.30),
+        offset: gpui::point(px(0.0), px(0.0)),
+        blur_radius: px(0.0),
+        spread_radius: px(2.0),
+    };
+    let cta_glow_outer = gpui::BoxShadow {
+        color: gpui::hsla(accent.h, accent.s, accent.l, 0.45),
+        offset: gpui::point(px(0.0), px(0.0)),
+        blur_radius: px(40.0),
+        spread_radius: px(0.0),
     };
 
     // ─── Hero stack content ───────────────────────────────────────
@@ -77,6 +89,7 @@ pub fn render(theme: &Arc<Theme>, cx: &mut Context<AppShell>) -> AnyElement {
         .font(theme::font_sans())
         .text_size(px(64.0))
         .line_height(px(64.0))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
         .child(div().text_color(ink).child("Add a project"))
         .child(div().text_color(accent).child("."));
 
@@ -104,7 +117,9 @@ pub fn render(theme: &Arc<Theme>, cx: &mut Context<AppShell>) -> AnyElement {
         .text_color(gpui::black())
         .font(theme::font_sans())
         .text_size(px(14.0))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
         .cursor_pointer()
+        .shadow(vec![cta_glow_inner, cta_glow_outer])
         .hover(move |s| s.bg(accent_hover))
         .child("Add your first project")
         .on_mouse_down(
@@ -114,28 +129,41 @@ pub fn render(theme: &Arc<Theme>, cx: &mut Context<AppShell>) -> AnyElement {
             }),
         );
 
-    // Disabled "Clone from Git URL" ghost button. Matches the C# build —
-    // the affordance is documented but the actual clone flow isn't
-    // wired yet on either platform. We keep it disabled-looking so
-    // users see the planned shape without thinking it's broken.
-    let clone_ghost = div()
+    // Clone-from-Git-URL ghost button. The C# build kept this
+    // disabled (the WPF clone flow never landed); the Rust New
+    // Project dialog already implements the full
+    // `git clone <url> <parent>/<name>` path, so we wire the empty-
+    // state secondary CTA directly to it — opens the dialog already
+    // switched to the Clone tab. Documented deviation per
+    // `docs/DECISIONS.md`.
+    let clone_cta = div()
+        .id("empty-state-clone")
         .h(px(44.0))
         .px(px(14.0))
         .flex()
         .flex_row()
         .items_center()
         .rounded(px(6.0))
-        .text_color(ink_ghost)
+        .text_color(ink_dim)
         .font(theme::font_sans())
         .text_size(px(14.0))
-        .child("Clone from Git URL");
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .cursor_pointer()
+        .hover(move |s| s.bg(frost_10).text_color(ink))
+        .child("Clone from Git URL")
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                this.open_new_project_dialog_clone(window, cx);
+            }),
+        );
 
     let cta_row = div()
         .flex()
         .flex_row()
         .gap(px(10.0))
         .child(primary_cta)
-        .child(clone_ghost);
+        .child(clone_cta);
 
     // ─── Quick-row tiles ──────────────────────────────────────────
     //
@@ -215,33 +243,13 @@ pub fn render(theme: &Arc<Theme>, cx: &mut Context<AppShell>) -> AnyElement {
         .child(div().h(px(32.0)))
         .child(quick_row);
 
-    // Behind-CTA accent glow — a soft tinted box, absolutely
-    // positioned so it doesn't take part in the flex flow but still
-    // tracks the hero stack via the parent's `flex justify_center`.
-    // The hero stack sits inside a `relative` container so the
-    // absolute child anchors against its bounds.
-    let glow = div()
-        .absolute()
-        .w(px(480.0))
-        .h(px(180.0))
-        .rounded(px(90.0))
-        .bg(accent_glow);
-
     div()
         .flex_grow()
         .flex()
         .items_center()
         .justify_center()
         .bg(canvas)
-        .child(
-            div()
-                .relative()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(glow)
-                .child(inner),
-        )
+        .child(inner)
         .into_any_element()
 }
 

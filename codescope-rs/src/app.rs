@@ -2642,6 +2642,26 @@ impl AppShell {
         });
     }
 
+    /// Same as [`Self::open_new_project_dialog`] but lands the user
+    /// directly on the "Clone from URL" tab. The Rust port's New
+    /// Project dialog already implements the full clone flow
+    /// (`git clone <url> <parent>/<name>` then register), so the
+    /// empty-state secondary CTA can reuse it instead of being
+    /// disabled the way the C# build's was.
+    pub(crate) fn open_new_project_dialog_clone(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.open_new_project_dialog(window, cx);
+            sidebar.set_new_project_mode(
+                crate::new_project_dialog::DialogMode::Clone,
+                cx,
+            );
+        });
+    }
+
     /// Toggle / set the Overview panel visibility. When flipped on the
     /// work area (group strip + terminal grid) is replaced by the
     /// full-pane Overview; the sidebar + status bar stay anchored.
