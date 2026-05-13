@@ -9,19 +9,49 @@
 >
 > **The Rust port (`codescope-rs/`) is a 1:1 functional port of the C# CodeScope build (`src/CodeScope.App/`, `src/CodeScope.Core/`, `src/CodeScope.AgentCli/`).** Before implementing any feature on the Rust side, **read the equivalent C# code first** and mirror its behavior, button labels, dialogs, data shapes, and persistence layout. Functional parity is the goal — we are not redesigning. If a `HANDOFF.md` entry, README line, or "next entry point" disagrees with what the C# code actually does, the C# code wins; update the doc. Genuine platform-forced deviations (gpui vs WPF idiom) get a one-line comment and an entry in `docs/DECISIONS.md`. "Cleaner" or "more elegant" is not a reason on its own. (Reinforced in session 33 after PR #56 invented a non-existent UX.)
 
-**Last updated:** 2026-05-13 (session 40 — Rust screenshot paste MVP)
+**Last updated:** 2026-05-14 (session 41 — bell hookup, cross-platform Velopack, empty-state hero)
 **Branch:** `main`
-**Head:** `442e03c` (fix(rs): suppress transient conhost windows on git/gh spawns, #193)
-**Release:** `v0.2.5` shipped in session 36 — no new release this run
+**Head:** `122b2f4` (chore(rs): bump version to 0.3.0-rc.5, #203)
+**Release:** `rs-v0.3.0-rc.5` shipped this session — first release with per-platform Velopack feeds (Win + macOS arm64/x64 + Linux x64)
 **Build status:** ✅ C# untouched. Rust workspace builds clean.
-Tests: `codescope-core` (462) + `codescope-rs` bin (117) +
-`codescope-terminal` (28) + doctests (1 core + 0 terminal) — **608 total**, all passing
-when `TMP` / `TEMP` point outside the repo (used `../codescope-rs-test-tmp`; repo-local
-`target/tmp` makes `git_status_non_repo_returns_none` invalid because temp dirs are inside the worktree).
-**Uncommitted work:** Rust screenshot paste MVP in progress:
-`codescope-rs/core/src/attachments.rs`, `core/src/lib.rs`, `core/src/git.rs`,
-`terminal/src/view.rs`, `src/app.rs`, plus this handoff update.
+Tests: `codescope-core` (463) + `codescope-rs` bin (135) +
+`codescope-terminal` (28) + doctests (1 core + 0 terminal) — **627 total**, all passing.
+**Uncommitted work:** none — every change this session shipped through PRs #195–#203.
 **Open issues:** none checked this run.
+
+### Session 41 — bell wiring, cross-platform Velopack, empty-state hero, titlebar fixes
+
+Closed several Rust-port gaps that had been left half-built. Nine PRs landed (#195–#203):
+
+**Notifications (in-app bell + OS toast).**
+- **#195 — Screenshot paste polish.** Addressed Copilot review on session 40's screenshot-paste MVP (PR opened that run, merged this run). Three fixes: image-save failure now falls through to legacy `\x16` / text-paste path instead of swallowing Ctrl+V; `GIT_EXCLUDE_PATTERN` unanchored so attachments saved from worktree subdirs still match; `ensure_git_exclude` resolves `--show-toplevel` first so the exclude file always lands at the worktree root.
+- **#196 — Bell-notification wiring.** The bell button + popover + ring buffer + `push_notification` API shipped earlier but nothing called it for session activity. Ported C# `MainViewModel.PushActivityNotification`: every telemetry poll tick diffs each tab's `SessionState` against a new `last_session_state` map and fires `SessionWaiting` on `* → PendingToolUse` / `SessionReady` on `(Busy | PendingToolUse) → Idle`. Suppresses notifications for the focused-group's active tab. Pure `classify_activity_transition` helper with 8 unit tests pinning the firing matrix.
+- **#197 — Cross-platform OS toast.** Ported `IIdleToastNotifier` / `WindowsIdleToastNotifier` via the `notify-rust` crate — WinRT toast on Windows, FreeDesktop dbus on Linux, NSUserNotification on macOS. Gate is `Window::is_window_active` (cached from `Render::render` each frame, since the bg telemetry task has no `&Window` borrow), not the C# build's stricter minimised-only check — gpui has no cross-platform `is_minimized()` getter and the broader gate matches user intent. 2 s per-session dedupe matches C# `WindowsIdleToastNotifier.DedupeWindow`. `Notification::show()` punts to `cx.background_executor()` so the blocking COM / NSUserNotification call doesn't stall the gpui main loop. Click-activation is intentionally show-only (notify-rust doesn't support it on Windows; the in-app bell already handles tab routing).
+
+**First-run empty state.**
+- **#198 — Port `EmptyStateView`.** Replaced the work-area's blank canvas (when `Sidebar.IsEmpty == true`) with the C# build's hero: `NO PROJECTS` eyebrow, 64 px `Add a project.` wordmark with accent dot, tagline, primary CTA + ghost, three-tile quick-row (drop / palette / overview). Wired CTAs to the existing `open_new_project_dialog` / `open_command_palette` / `set_show_overview(true)` entry points.
+- **#200 — Empty-state polish + Clone CTA.** After seeing the live render: dropped the opaque dark-blue pill behind the wordmark (read as a solid blob, not a glow), replaced with a two-layer `BoxShadow` on the primary CTA (tight inner halo + 40 px outer wash) — same pattern the status-bar model pill uses. Wired the previously-disabled "Clone from Git URL" ghost — the Rust New Project dialog already implements the full `git clone <url> <parent>/<name>` flow via `DialogMode::Clone`, so keeping the C# build's disabled ghost would be strictly worse UX. New `AppShell::open_new_project_dialog_clone` opens the dialog already on the Clone tab. ADR-0020 documents the deviation.
+
+**Windows titlebar UX.**
+- **#199 — Restore-under-cursor on maximized titlebar drag.** Default Windows behaviour: drag a maximized title bar and the OS auto-restores the window under the cursor. `DefWindowProc`'s `WM_NCLBUTTONDOWN(HTCAPTION)` handles this hand-off but only when delivered *synchronously*. The custom-titlebar path has to `PostMessage` (the existing re-entrance guard documented on `start_drag` — `SendMessage` reaches our `WndProc` while the App is already borrowed → `RefCell already borrowed` panic), so the modal move loop entered a maximized window that never restored. Fix: when `IsZoomed(hwnd)`, patch `WINDOWPLACEMENT.rcNormalPosition` so the restored window lands under the cursor (preserving horizontal ratio, the way native Windows does it), then post `SC_RESTORE` ahead of `NCLBUTTONDOWN`. `title_offset` DPI-scaled via `GetDpiForWindow(hwnd) / 96` since the manifest is PerMonitorV2 (a hardcoded 15 px landed ~7.5 logical px at 200 % display, putting the cursor above the chrome border).
+
+**Cross-platform auto-update.**
+- **#201 — Per-platform Velopack channel.** The bridge previously hardcoded `CHANNEL = "win"`. New `channel_for(os: &str, arch: &str) -> &'static str` pure helper maps `(windows, x86_64) → win`, `(macos, aarch64) → osx-arm64`, `(macos, x86_64) → osx-x64`, `(linux, x86_64) → linux-x64`, with `win` as the documented fallback. `default_channel()` is a thin wrapper feeding it `std::env::consts::{OS, ARCH}`. Table-driven tests cover every supported triple on every host (the previous regression test was tautological — just re-ran the same `cfg!` chain only the current target saw).
+- **#202 — Multi-platform `vpk pack` jobs in `rs--release.yml`.** Velopack steps were gated `if: runner.os == 'Windows'` — generalised under bash so every matrix entry packs. New `Compute velopack params` step derives channel + `mainExe` + `packId` + `bundleId` from `matrix.targets[0]`. `packId` is per-platform (`codescope-rs` for Windows to preserve installed-base contract; `codescope-rs-osx-arm64` / `-osx-x64` / `-linux-x64` elsewhere) so `.nupkg` filenames stay unique when all four matrix entries' outputs flatten into one GitHub release — `velopack_bridge::GithubSource` matches on channel + repo, not packId, so the heterogeneous ids are safe. Skips `--icon` on mac/linux pending a PNG asset.
+- **#203 — Bump to `0.3.0-rc.5`** + tag → first release that publishes four Velopack feeds in one go (`releases.win.json` + `*-win-Setup.exe`, `releases.osx-arm64.json` + `.app.zip`, `releases.osx-x64.json` + `.app.zip`, `releases.linux-x64.json` + `.AppImage`, each with matching nupkgs). Release workflow run green.
+
+**Patient-iteration follow-ups** (acknowledged + user-approved, not blocking):
+- PNG icon for mac/linux Velopack bundles (currently falls back to generic Velopack icon).
+- Code signing on Windows (Authenticode) + macOS (notarytool / Apple Developer). Unsigned builds → SmartScreen on Win, Gatekeeper prompt on first launch on Mac. Velopack apply path still works on Mac once the prompt is dismissed.
+- Multi-channel rings (beta / alpha) layered over the platform slugs. Plan is to prefix the platform slug (e.g. `beta-osx-arm64`) or use the `CODESCOPE_VELOPACK_CHANNEL` env override.
+
+Validation commands:
+
+```bash
+cargo build --manifest-path codescope-rs/Cargo.toml
+cargo test --manifest-path codescope-rs/Cargo.toml --workspace
+# 627 tests pass: 463 core + 135 bin (incl. 6 idle_notifier + 8 classify_activity_transition + 8 velopack channel) + 28 terminal + 1 doctest
+```
 
 ### Session 40 — Rust screenshot paste MVP
 
@@ -75,46 +105,63 @@ macOS Gatekeeper, and Linux has no equivalent gate. Document the
 per-OS friction in the README install section when first user-facing
 builds ship.
 
-### Rust release pipeline (cargo-dist + Velopack)
+### Rust release pipeline (cargo-dist + Velopack, cross-platform)
 
-PR #154 introduced a separate Rust release pipeline that runs alongside
-the C# `release.yml`:
+The Rust release pipeline runs alongside the C# `release.yml`:
 
 - **`codescope-rs/dist-workspace.toml`** — cargo-dist 0.31.0 config.
-  Windows-only target, MSI installer, GitHub hosting, `rs-` tag
-  namespace so the two pipelines never fight over the same tag shape.
+  Four targets (Win x64 / macOS arm64 / macOS x64 / Linux x64), MSI
+  + tar.xz, GitHub hosting, `rs-` tag namespace so the two pipelines
+  never fight over the same tag shape.
 - **`.github/workflows/rs--release.yml`** — auto-generated by
-  `dist generate`, with the trigger pattern hand-edited. Triggers
-  only on tags matching the glob `rs-v[0-9]*.[0-9]*.[0-9]*` (GitHub
-  Actions tag filters are minimatch globs, not regex — the original
-  `[0-9]+` pattern cargo-dist emits would never match because `+`
-  is matched literally). PR run mode is `skip` so day-to-day PRs
-  don't spin up the matrix.
+  `dist generate`, with the trigger pattern hand-edited and the
+  Velopack pack steps hand-added. Triggers only on tags matching
+  the glob `rs-v[0-9]*.[0-9]*.[0-9]*` (GitHub Actions tag filters are
+  minimatch globs, not regex — the original `[0-9]+` pattern
+  cargo-dist emits would never match because `+` is matched literally).
+  PR run mode is `skip` so day-to-day PRs don't spin up the matrix.
+  Velopack packing runs on every matrix entry now (session 41 / PR
+  #202); the `Compute velopack params` step derives channel +
+  `mainExe` + `packId` + `bundleId` per triple and short-circuits
+  unrecognised ones via `supported=false`.
 - **`codescope-rs/src/velopack_bridge.rs`** — Velopack-rs apply path,
-  mirrors `src/CodeScope.App/Updates/UpdateService.cs`. On detection of
-  a newer release, if the binary was installed via a Velopack
+  mirrors `src/CodeScope.App/Updates/UpdateService.cs`. Per-platform
+  channel (`channel_for(os, arch)`) added in session 41 / PR #201 so
+  `(macos, aarch64) → osx-arm64` etc.; Windows keeps the historical
+  `win` slug to preserve installed-base compatibility. On detection
+  of a newer release, if the binary was installed via a Velopack
   bootstrapper, we call `UpdateManager::check_for_updates →
   download_updates → apply_updates_and_restart` exactly like the C#
   build does. On non-Velopack installs (cargo-dist MSI, `cargo run`,
   unpacked zip) we fall back to surfacing the GitHub release URL in
-  the existing notification, same as before.
+  the existing notification, same as before. `CODESCOPE_VELOPACK_CHANNEL`
+  env var still overrides for QA.
 - **`codescope-rs/src/window.rs::main`** — calls
   `velopack_bridge::run_startup_hooks()` as the first line so
   installer / uninstaller / first-run / restarted-after-update hooks
   dispatch correctly. No-op on builds that weren't Velopack-installed.
 
-Releases follow this workflow: `gh release create rs-v0.3.0-rc1` →
-cargo-dist builds + uploads the MSI + zip + sha256 to a fresh GitHub
-release tagged `rs-v0.3.0-rc1`. The user then runs `vpk upload github`
-separately (same flow as the C# `release.yml`) if they want a
-Velopack-style delta / RELEASES feed for auto-update. The two are
-independent — a stable user can install the cargo-dist MSI and still
-get the "update available" notification (just no auto-apply).
+Releases follow this workflow: `git tag rs-v0.3.0-rc.5 && git push
+--tags` → the workflow builds + packs all four platforms + uploads
+Velopack feeds (`releases.<channel>.json`) + nupkgs + the
+per-platform installer/bundle (Setup.exe / .app.zip / .AppImage) +
+the cargo-dist MSI / tar.xz / sha256s, all attached to a single
+GitHub release tagged `rs-v0.3.0-rc.5`. `vpk upload github` is no
+longer a separate step — `vpk pack` runs inline.
 
-**Code signing**: out of scope for this PR. Unsigned MSIs trigger
-Windows SmartScreen warnings until certs are acquired. Same situation
-as the C# build today; documented in
-`codescope-rs/dist-workspace.toml`.
+**Code signing**: deliberately deferred. Unsigned MSIs trigger
+Windows SmartScreen, unsigned `.app` bundles trigger macOS
+Gatekeeper on first launch. The Velopack apply path still works on
+all three OSes once the user dismisses the prompt — same as the C#
+build today. Apple Developer ID + Authenticode certs are the
+follow-up.
+
+**Per-platform packIds** (session 41 / PR #202): `codescope-rs`
+(Windows), `codescope-rs-osx-arm64`, `codescope-rs-osx-x64`,
+`codescope-rs-linux-x64`. `velopack_bridge::GithubSource` matches on
+channel + repo, not packId, so heterogeneous ids across platforms
+are safe; this just keeps `.nupkg` basenames unique when all
+matrix entries' outputs flatten into one release.
 
 ### Keyboard chords (Rust port)
 
@@ -149,11 +196,27 @@ unit tests in both files.
 
 ### Cursor — what's next
 
-Feature-parity sweep done. The Rust port matches C# functionally;
-remaining items are platform-blocked (gpui 0.2.x) or also-deferred in
-C# (session-exit toasts, Gitea CI rollup). Next session can focus on
-polish or new product features — see "Next — suggested entry points"
-near the end of this file.
+The Rust port matches C# functionally and now has its own working
+cross-platform auto-update pipeline. Concrete next-up candidates,
+roughly in priority order:
+
+1. **Validate the multi-platform Velopack flow end-to-end.** Install
+   the `rs-v0.3.0-rc.5` Setup.exe / `.app.zip` / `.AppImage` on a
+   fresh box per OS, cut `rs-v0.3.0-rc.6` with any small change, and
+   verify each platform's installed client auto-applies the delta.
+   This is the first release where the mac/linux halves actually fire.
+2. **PNG icon for mac/linux Velopack bundles.** Repo only has
+   `codescope.ico` today; vpk skips `--icon` on mac/linux. Add a
+   PNG (or icns + png) and pass `--icon` in `rs--release.yml`.
+3. **Code signing.** Authenticode (Win) + Apple Developer / notarytool
+   (mac). Removes SmartScreen / Gatekeeper friction. Velopack
+   supports both via `vpk pack --signAppIdentity` etc.
+4. **Multi-channel rings (beta / alpha).** Layer over the platform
+   slugs — plan is `beta-osx-arm64` etc., or use the existing
+   `CODESCOPE_VELOPACK_CHANNEL` env override.
+
+Anything not on this list is polish / new product features — see
+"Next — suggested entry points" near the end of this file.
 
 ### Session 38 — feature-parity sweep (PRs #135–#150)
 
