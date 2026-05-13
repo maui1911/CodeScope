@@ -22,13 +22,15 @@
 
 use gpui::Window;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    HTCAPTION, IsZoomed, PostMessageW, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE,
-    SW_SHOWNORMAL, WM_NCLBUTTONDOWN, WM_SYSCOMMAND,
+    GetCursorPos, GetWindowPlacement, GetWindowRect, HTCAPTION, IsZoomed, PostMessageW,
+    SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SW_SHOWNORMAL, SetWindowPlacement,
+    WINDOWPLACEMENT, WM_NCLBUTTONDOWN, WM_SYSCOMMAND,
 };
 use windows::core::HSTRING;
 
@@ -70,12 +72,110 @@ pub fn start_drag(window: &Window) {
         // Releasing capture is fine to call synchronously — it's a
         // simple state flip with no nested message pumping.
         let _ = ReleaseCapture();
+
+        // Maximized → restore-then-drag dance.
+        //
+        // Default Windows behaviour: drag the title bar of a
+        // maximized window and the OS auto-restores it under the
+        // cursor so you can keep dragging. That hand-off lives in
+        // `DefWindowProc`'s `WM_NCLBUTTONDOWN(HTCAPTION)` handler and
+        // only fires when the message is delivered SYNCHRONOUSLY via
+        // `SendMessage`. We have to `PostMessage` (see the doc on
+        // this fn for the re-entrance reason), so the modal move
+        // loop starts on a maximized window that never restores —
+        // the user sees their cursor "stuck" and no drag happens.
+        //
+        // Fix: when we detect the window is maximized, repoint the
+        // restore rect under the cursor (preserving horizontal ratio)
+        // and post `SC_RESTORE` before the `NCLBUTTONDOWN`. Both posts
+        // are queued ahead of the modal loop entry, so by the time
+        // the loop starts, the window is the right size and the
+        // cursor is on the title bar.
+        if IsZoomed(hwnd).as_bool() {
+            reposition_for_restore_under_cursor(hwnd);
+            let _ = PostMessageW(
+                Some(hwnd),
+                WM_SYSCOMMAND,
+                WPARAM(SC_RESTORE as usize),
+                LPARAM(0),
+            );
+        }
+
         let _ = PostMessageW(
             Some(hwnd),
             WM_NCLBUTTONDOWN,
             WPARAM(HTCAPTION as usize),
             LPARAM(0),
         );
+    }
+}
+
+/// Helper for `start_drag`: when the user grabs the title bar of a
+/// maximized window, update `WINDOWPLACEMENT.rcNormalPosition` so the
+/// restored window lands under the cursor instead of at its
+/// previously-saved windowed position. Preserves the cursor's
+/// horizontal ratio across the maximize → restore transition the
+/// way native Windows does, so a drag from the right edge of a
+/// maximized window keeps the cursor near the right edge of the
+/// restored window (not at the centre and not off the title bar).
+///
+/// SAFETY: caller holds the HWND for the lifetime of this call.
+/// All Win32 calls take pointers to locals we own. Errors are
+/// best-effort — a failure leaves the placement struct untouched and
+/// the subsequent `SC_RESTORE` falls back to the OS's saved
+/// rcNormalPosition, which is the previous (slightly worse) behaviour
+/// but still leaves the window draggable.
+unsafe fn reposition_for_restore_under_cursor(hwnd: HWND) {
+    unsafe {
+        let mut cursor = POINT::default();
+        if GetCursorPos(&mut cursor).is_err() {
+            return;
+        }
+
+        let mut current = RECT::default();
+        if GetWindowRect(hwnd, &mut current).is_err() {
+            return;
+        }
+        let maximized_width = (current.right - current.left).max(1);
+        let cursor_ratio_x =
+            ((cursor.x - current.left) as f64 / maximized_width as f64).clamp(0.0, 1.0);
+
+        let mut placement = WINDOWPLACEMENT {
+            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+            ..Default::default()
+        };
+        if GetWindowPlacement(hwnd, &mut placement).is_err() {
+            return;
+        }
+
+        let normal = placement.rcNormalPosition;
+        let restored_width = (normal.right - normal.left).max(1);
+        let restored_height = (normal.bottom - normal.top).max(1);
+
+        // Centre the cursor horizontally at the same ratio of the
+        // restored width; place the title bar so the cursor is a
+        // few px into it (matches the native hand-off offset).
+        //
+        // DPI-scale the offset: the app manifest is PerMonitorV2, so
+        // window coordinates are physical pixels at the monitor's DPI.
+        // A hard-coded 15 lands ~7.5 logical px on a 200 % display,
+        // which puts the cursor in/above the chrome border instead of
+        // on the title bar. `GetDpiForWindow` reports 96 at 100 %,
+        // 192 at 200 %, etc.; we scale the 15 px design value by
+        // `dpi/96` so the offset stays roughly 15 logical px on every
+        // monitor. Falls back to 96 (1.0 scale) on the rare 0 return.
+        let dpi = GetDpiForWindow(hwnd);
+        let dpi_scale = if dpi == 0 { 1.0 } else { dpi as f64 / 96.0 };
+        let title_offset = (15.0 * dpi_scale) as i32;
+        let new_left = cursor.x - (cursor_ratio_x * restored_width as f64) as i32;
+        let new_top = cursor.y - title_offset;
+        placement.rcNormalPosition = RECT {
+            left: new_left,
+            top: new_top,
+            right: new_left + restored_width,
+            bottom: new_top + restored_height,
+        };
+        let _ = SetWindowPlacement(hwnd, &placement);
     }
 }
 
