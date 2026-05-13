@@ -473,3 +473,37 @@ brand — the split is purely build-system.
   hand-edited "tag-push only" trigger in `rs--release.yml` survives
   future `dist generate` runs.
 
+---
+
+## ADR-0020 — Rust empty-state "Clone from Git URL" CTA is interactive (forced deviation)
+
+**Date:** 2026-05-13
+**Status:** Accepted
+
+The C# `EmptyStateView` renders the "Clone from Git URL" button as
+`IsEnabled="False"` with a tooltip `"Clone from Git URL (coming soon)"` —
+the WPF clone flow was never wired up there.
+
+The Rust New Project dialog already implements the full
+`git clone <url> <parent>/<name>` flow via `DialogMode::Clone` (see
+`codescope-rs/src/new_project_dialog.rs`). Leaving the empty-state
+ghost disabled in the Rust port would be a strictly worse UX than the
+underlying capability already supports.
+
+**Decision:** the Rust empty-state Clone CTA is interactive. Clicking
+it opens the New Project dialog already switched to the Clone tab via
+`AppShell::open_new_project_dialog_clone`. Same `git clone` flow the
+sidebar's "+ New Project → Clone from URL" tab uses today.
+
+**Consequences:**
+
+- The Rust empty-state hero diverges visually from the C# spec: where
+  C# shows a faded disabled-looking ghost, Rust shows an enabled
+  ghost button with hover state.
+- One additional entry point (`open_new_project_dialog_clone` on
+  `AppShell`) routes through the existing
+  `Sidebar::set_new_project_mode` switch, so the divergence is
+  isolated to one helper — no fork of the dialog state machine.
+- If/when the C# build wires its clone flow, both ports converge
+  on the same affordance.
+
