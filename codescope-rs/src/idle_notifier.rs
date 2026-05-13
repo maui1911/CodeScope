@@ -157,8 +157,10 @@ mod tests {
     fn stale_entries_are_pruned_on_every_call() {
         let mut n = IdleNotifier::new();
         let t0 = Instant::now();
-        // Seed a stale-from-the-future entry; pruning happens before
-        // the contains_key check so it should not block sid-a.
+        // Seed an entry at `t0` and then advance the clock so the
+        // entry is well past the dedupe window. Pruning happens before
+        // the contains_key check, so the next call for *any* session
+        // is enough to evict it.
         n.should_fire_at("sid-stale", t0);
         let t_far = t0 + DEDUPE_WINDOW + Duration::from_secs(60);
         // The stale "sid-stale" entry is now well outside the window;
@@ -169,9 +171,10 @@ mod tests {
 
     #[test]
     fn re_fire_at_exact_window_boundary_is_blocked() {
-        // The check is `< DEDUPE_WINDOW`, so a fire at exactly
-        // `t0 + DEDUPE_WINDOW` is still inside the window and should
-        // be dropped. One nanosecond later it's allowed (covered by
+        // Retain predicate is `<= DEDUPE_WINDOW`, so an entry whose
+        // age equals exactly `DEDUPE_WINDOW` is still kept (matching
+        // the C# build's `kv.Value < cutoff` boundary). One nanosecond
+        // later it's allowed (covered by
         // `second_fire_after_window_returns_true_again`).
         let mut n = IdleNotifier::new();
         let t0 = Instant::now();
