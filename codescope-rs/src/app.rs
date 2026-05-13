@@ -640,6 +640,12 @@ pub struct AppShell {
     /// `notifications.toggle()` and the render calls
     /// `render_notifications_popover` alongside `render_toasts`.
     pub(crate) notifications: crate::notifications::Notifications,
+    /// Per-session previous activity state, keyed by adopted-agent
+    /// session id. Drives the bell-notification fire on transition.
+    /// Mirrors C# `MainViewModel._lastActivity`. Entries are reaped
+    /// after each telemetry tick to match `telemetry_tails`, so a
+    /// rotated/closed session doesn't leak.
+    last_session_state: HashMap<String, codescope_core::SessionState>,
     /// Live telemetry tails, keyed by adopted-agent session id.
     /// Entries are registered via `register_telemetry` (per-agent
     /// dispatch) and polled by the background task spawned in
@@ -1161,6 +1167,7 @@ impl AppShell {
             last_titlebar_press_at: None,
             text_blink_phase: true,
             notifications: crate::notifications::Notifications::new(),
+            last_session_state: HashMap::new(),
             telemetry_tails: HashMap::new(),
             bell_bounds: None,
             last_announced_update: None,
@@ -1554,6 +1561,11 @@ impl AppShell {
                     // de-dupes redundant `apply` calls so a quiet
                     // busy stretch doesn't repaint every 250 ms.
                     this.refresh_taskbar_badge();
+                    // Fire bell-notification entries on activity
+                    // transitions. Mirrors C#
+                    // `MainViewModel.ApplyTelemetry` calling
+                    // `PushActivityNotification` per snapshot.
+                    this.apply_activity_notifications(cx);
                     TELEMETRY_POLL_ACTIVE
                 });
                 match result {
@@ -4930,6 +4942,96 @@ impl AppShell {
         cx.notify();
     }
 
+    /// Walk every adopted-agent tab, diff its current telemetry state
+    /// against the last-observed state, and push a bell-notification
+    /// entry on the same transitions C# `PushActivityNotification`
+    /// covers:
+    ///
+    /// - `* → PendingToolUse` (where previous state ≠ `PendingToolUse`)
+    ///   → `SessionWaiting` "Needs attention" / "Agent paused on a tool
+    ///   prompt."
+    /// - `(Busy | PendingToolUse) → Idle` → `SessionReady` "Ready" /
+    ///   "Turn complete[ · <turn-duration>]".
+    ///
+    /// Suppresses the notification when the tab is the one the user is
+    /// currently looking at (focused group's active tab) — bell noise
+    /// for the front tab adds nothing the user can't already see.
+    ///
+    /// Driven from `start_telemetry_poll` after every tail poll so the
+    /// 250 ms cadence already in place doubles as the activity-watch
+    /// cadence — no separate timer needed.
+    fn apply_activity_notifications(&mut self, cx: &mut Context<Self>) {
+        // Identify the currently-focused tab so we can skip its
+        // notifications. `(group_id, tab_id)` keeps the comparison
+        // stable across tab moves / index shifts.
+        let focused_tab_key: Option<(u64, u64)> = self
+            .groups
+            .get(self.focused_group)
+            .and_then(|g| g.tabs.get(g.active_tab).map(|t| (g.id, t.id)));
+
+        struct Pending {
+            kind: crate::notifications::NotificationKind,
+            title: SharedString,
+            detail: SharedString,
+            session_title: SharedString,
+        }
+        let mut pending: Vec<Pending> = Vec::new();
+        // Only records *changed* (sid, state) pairs so the steady-state
+        // tick — every tab same as last time — stays allocation-free.
+        // The String clone of the session id only happens on a real
+        // transition, not on the 4× per second no-op poll.
+        let mut state_updates: Vec<(String, codescope_core::SessionState)> = Vec::new();
+
+        for group in &self.groups {
+            for tab in &group.tabs {
+                let Some(sid) = tab.adopted_session_id.as_deref() else { continue };
+                let Some(snap) = self.telemetry_for(sid) else { continue };
+                let prev = self
+                    .last_session_state
+                    .get(sid)
+                    .copied()
+                    .unwrap_or(codescope_core::SessionState::Unknown);
+                if prev == snap.state {
+                    continue;
+                }
+                // State changed since last tick — record the update so
+                // the second pass can mutate `last_session_state`
+                // (can't write to it inside this loop without giving up
+                // the immutable `&self.groups` borrow).
+                state_updates.push((sid.to_string(), snap.state));
+                let is_focused = focused_tab_key
+                    .map(|(g, t)| g == group.id && t == tab.id)
+                    .unwrap_or(false);
+                if is_focused {
+                    continue;
+                }
+                if let Some((kind, title, detail)) =
+                    classify_activity_transition(prev, &snap)
+                {
+                    pending.push(Pending {
+                        kind,
+                        title: title.into(),
+                        detail: detail.into(),
+                        session_title: tab.title.clone(),
+                    });
+                }
+            }
+        }
+
+        for (sid, state) in state_updates {
+            self.last_session_state.insert(sid, state);
+        }
+        // Reap entries whose tail no longer exists (session closed or
+        // rotated). Keeps the map bounded and resets first-observation
+        // semantics for a re-adopted session.
+        self.last_session_state
+            .retain(|sid, _| self.telemetry_tails.contains_key(sid));
+
+        for p in pending {
+            self.push_notification(p.kind, p.title, p.detail, Some(p.session_title), cx);
+        }
+    }
+
     /// Push a persistent notification entry.  Unlike toasts these
     /// accumulate in the ring buffer until the user clears them or the
     /// ring reaches its cap (50).  Returns the id of the new entry.
@@ -7184,6 +7286,45 @@ fn default_agent_auto_type_for(settings: &Settings) -> Option<SharedString> {
     codescope_core::build_new_session_auto_type(profile).map(SharedString::from)
 }
 
+/// Pure transition classifier for the bell notification — extracted so
+/// the small state machine can be unit-tested without an `AppShell`.
+///
+/// Returns `Some((kind, title, detail))` when the `prev → snap.state`
+/// transition warrants a bell entry, `None` otherwise. The set of
+/// firing transitions mirrors C#
+/// `MainViewModel.PushActivityNotification`.
+fn classify_activity_transition(
+    prev: codescope_core::SessionState,
+    snap: &codescope_core::TelemetrySnapshot,
+) -> Option<(crate::notifications::NotificationKind, &'static str, String)> {
+    use codescope_core::SessionState::*;
+    if prev == snap.state {
+        return None;
+    }
+    match (prev, snap.state) {
+        (p, PendingToolUse) if p != PendingToolUse => Some((
+            crate::notifications::NotificationKind::SessionWaiting,
+            "Needs attention",
+            "Agent paused on a tool prompt.".to_string(),
+        )),
+        (Busy | PendingToolUse, Idle) => {
+            let detail = match snap.last_turn_duration {
+                Some(d) => format!(
+                    "Turn complete · {}",
+                    codescope_core::TranscriptTail::format_duration(d)
+                ),
+                None => "Turn complete.".to_string(),
+            };
+            Some((
+                crate::notifications::NotificationKind::SessionReady,
+                "Ready",
+                detail,
+            ))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7460,5 +7601,112 @@ mod tests {
             ..Settings::default()
         };
         assert!(default_agent_auto_type_for(&settings).is_some());
+    }
+
+    // ─── classify_activity_transition ──────────────────────────────
+    //
+    // Locks the C# `PushActivityNotification` state machine: which
+    // transitions fire which `NotificationKind`, with the correct
+    // detail string (including turn-duration formatting).
+
+    fn snap_with_state(state: codescope_core::SessionState) -> codescope_core::TelemetrySnapshot {
+        codescope_core::TelemetrySnapshot {
+            model: None,
+            tokens_used: 0,
+            context_pct: None,
+            turn_count: 0,
+            last_turn_duration: None,
+            state,
+        }
+    }
+
+    #[test]
+    fn classify_activity_transition_returns_none_when_state_unchanged() {
+        let snap = snap_with_state(codescope_core::SessionState::Busy);
+        assert!(classify_activity_transition(codescope_core::SessionState::Busy, &snap).is_none());
+    }
+
+    #[test]
+    fn classify_activity_transition_fires_waiting_on_entry_to_pending_tool_use() {
+        let snap = snap_with_state(codescope_core::SessionState::PendingToolUse);
+        for prev in [
+            codescope_core::SessionState::Unknown,
+            codescope_core::SessionState::Idle,
+            codescope_core::SessionState::Busy,
+        ] {
+            let out = classify_activity_transition(prev, &snap);
+            let (kind, title, detail) = out.expect("should fire SessionWaiting");
+            assert_eq!(kind, crate::notifications::NotificationKind::SessionWaiting);
+            assert_eq!(title, "Needs attention");
+            assert_eq!(detail, "Agent paused on a tool prompt.");
+        }
+    }
+
+    #[test]
+    fn classify_activity_transition_does_not_re_fire_pending_to_pending() {
+        let snap = snap_with_state(codescope_core::SessionState::PendingToolUse);
+        // Same state ⇒ None (state-unchanged guard covers it).
+        assert!(
+            classify_activity_transition(codescope_core::SessionState::PendingToolUse, &snap)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn classify_activity_transition_fires_ready_on_busy_to_idle() {
+        let snap = snap_with_state(codescope_core::SessionState::Idle);
+        let (kind, title, detail) =
+            classify_activity_transition(codescope_core::SessionState::Busy, &snap)
+                .expect("should fire SessionReady");
+        assert_eq!(kind, crate::notifications::NotificationKind::SessionReady);
+        assert_eq!(title, "Ready");
+        assert_eq!(detail, "Turn complete.");
+    }
+
+    #[test]
+    fn classify_activity_transition_fires_ready_on_pending_to_idle() {
+        let snap = snap_with_state(codescope_core::SessionState::Idle);
+        let out = classify_activity_transition(
+            codescope_core::SessionState::PendingToolUse,
+            &snap,
+        );
+        let (kind, _, _) = out.expect("should fire SessionReady");
+        assert_eq!(kind, crate::notifications::NotificationKind::SessionReady);
+    }
+
+    #[test]
+    fn classify_activity_transition_appends_turn_duration_when_available() {
+        let mut snap = snap_with_state(codescope_core::SessionState::Idle);
+        snap.last_turn_duration = Some(std::time::Duration::from_secs(75));
+        let (_, _, detail) =
+            classify_activity_transition(codescope_core::SessionState::Busy, &snap).unwrap();
+        // 75 s → "1m 15s" per `TranscriptTail::format_duration`.
+        assert_eq!(detail, "Turn complete · 1m 15s");
+    }
+
+    #[test]
+    fn classify_activity_transition_unknown_to_idle_or_busy_is_silent() {
+        // First observation in Idle / Busy must NOT fire — only
+        // PendingToolUse on first observation is loud (matches C#).
+        for st in [
+            codescope_core::SessionState::Idle,
+            codescope_core::SessionState::Busy,
+        ] {
+            let snap = snap_with_state(st);
+            assert!(
+                classify_activity_transition(codescope_core::SessionState::Unknown, &snap)
+                    .is_none(),
+                "Unknown → {:?} should be silent",
+                st
+            );
+        }
+    }
+
+    #[test]
+    fn classify_activity_transition_idle_to_busy_is_silent() {
+        let snap = snap_with_state(codescope_core::SessionState::Busy);
+        assert!(
+            classify_activity_transition(codescope_core::SessionState::Idle, &snap).is_none()
+        );
     }
 }
