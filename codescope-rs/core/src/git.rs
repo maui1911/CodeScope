@@ -763,7 +763,6 @@ some-future-field foo bar\n";
     // so these run on every local invocation.
 
     use std::path::Path;
-    use std::process::Command;
     use tempfile::TempDir;
 
     /// Initialise a fresh repo *inside a per-test tempdir* and produce
