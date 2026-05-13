@@ -192,31 +192,48 @@ impl NewWorktreeDialogState {
     }
 
     /// Apply `op` (insert / delete / move) to whichever input is in
-    /// focus. Returns `true` when the underlying buffer was touched
-    /// so the caller can `wake_text_blink` + notify.
-    fn with_focused_field<F: FnOnce(&mut TextField)>(&mut self, op: F) -> bool {
+    /// focus. Returns whatever `op` reports — `true` when the
+    /// underlying buffer was touched, `false` on a no-op (e.g.
+    /// backspace at caret 0). Side effects (recompute_folder,
+    /// folder_overridden, base_selected_idx reset, error clearing)
+    /// only fire when `op` actually changed something so a no-op
+    /// keystroke doesn't trigger a redraw.
+    fn with_focused_field<F: FnOnce(&mut TextField) -> bool>(
+        &mut self,
+        op: F,
+    ) -> bool {
         match self.focused_field {
             DialogField::Branch => {
-                op(&mut self.branch);
-                self.recompute_folder();
-                true
+                let changed = op(&mut self.branch);
+                if changed {
+                    self.recompute_folder();
+                }
+                changed
             }
             DialogField::Folder => {
-                self.folder_overridden = true;
-                op(&mut self.folder);
-                self.error = None;
-                true
+                let changed = op(&mut self.folder);
+                if changed {
+                    self.folder_overridden = true;
+                    self.error = None;
+                }
+                changed
             }
             DialogField::BasePopupSearch => {
-                op(&mut self.base_query);
-                self.base_selected_idx = 0;
-                true
+                let changed = op(&mut self.base_query);
+                if changed {
+                    self.base_selected_idx = 0;
+                }
+                changed
             }
         }
     }
 
     pub fn insert_char(&mut self, ch: char) -> bool {
-        self.with_focused_field(|f| f.insert_char(ch))
+        // insert_char on a TextField always changes the buffer.
+        self.with_focused_field(|f| {
+            f.insert_char(ch);
+            true
+        })
     }
     pub fn backspace(&mut self) -> bool {
         self.with_focused_field(|f| f.backspace())

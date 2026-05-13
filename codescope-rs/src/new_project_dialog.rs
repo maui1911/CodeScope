@@ -200,19 +200,27 @@ impl NewProjectDialogState {
             return false;
         }
         let field = self.focused_field;
-        match field {
+        let changed = match field {
             DialogField::Url => {
-                self.url.backspace();
-                self.maybe_redrive_name();
+                let c = self.url.backspace();
+                if c {
+                    self.maybe_redrive_name();
+                }
+                c
             }
             DialogField::Parent => self.parent.backspace(),
             DialogField::Name => {
-                self.name_auto = false;
-                self.name.backspace();
+                let c = self.name.backspace();
+                if c {
+                    self.name_auto = false;
+                }
+                c
             }
+        };
+        if changed {
+            self.error = None;
         }
-        self.error = None;
-        true
+        changed
     }
 
     pub fn delete_forward(&mut self) -> bool {
@@ -220,43 +228,47 @@ impl NewProjectDialogState {
             return false;
         }
         let field = self.focused_field;
-        match field {
+        let changed = match field {
             DialogField::Url => {
-                self.url.delete_forward();
-                self.maybe_redrive_name();
+                let c = self.url.delete_forward();
+                if c {
+                    self.maybe_redrive_name();
+                }
+                c
             }
             DialogField::Parent => self.parent.delete_forward(),
             DialogField::Name => {
-                self.name_auto = false;
-                self.name.delete_forward();
+                let c = self.name.delete_forward();
+                if c {
+                    self.name_auto = false;
+                }
+                c
             }
+        };
+        if changed {
+            self.error = None;
         }
-        self.error = None;
-        true
+        changed
     }
 
     pub fn move_caret_left(&mut self) -> bool {
         let Some(field) = self.focused_field_mut() else { return false };
-        field.move_left();
-        true
+        field.move_left()
     }
 
     pub fn move_caret_right(&mut self) -> bool {
         let Some(field) = self.focused_field_mut() else { return false };
-        field.move_right();
-        true
+        field.move_right()
     }
 
     pub fn move_caret_home(&mut self) -> bool {
         let Some(field) = self.focused_field_mut() else { return false };
-        field.move_home();
-        true
+        field.move_home()
     }
 
     pub fn move_caret_end(&mut self) -> bool {
         let Some(field) = self.focused_field_mut() else { return false };
-        field.move_end();
-        true
+        field.move_end()
     }
 
     fn maybe_redrive_name(&mut self) {

@@ -266,9 +266,7 @@ impl CommandPaletteState {
     }
 
     pub fn backspace(&mut self) -> bool {
-        let before = self.query.text().len();
-        self.query.backspace();
-        let changed = self.query.text().len() != before;
+        let changed = self.query.backspace();
         if changed {
             self.refresh_filter();
         }
@@ -276,29 +274,27 @@ impl CommandPaletteState {
     }
 
     pub fn delete_forward(&mut self) -> bool {
-        let before = self.query.text().len();
-        self.query.delete_forward();
-        let changed = self.query.text().len() != before;
+        let changed = self.query.delete_forward();
         if changed {
             self.refresh_filter();
         }
         changed
     }
 
-    pub fn move_caret_left(&mut self) {
-        self.query.move_left();
+    pub fn move_caret_left(&mut self) -> bool {
+        self.query.move_left()
     }
 
-    pub fn move_caret_right(&mut self) {
-        self.query.move_right();
+    pub fn move_caret_right(&mut self) -> bool {
+        self.query.move_right()
     }
 
-    pub fn move_caret_home(&mut self) {
-        self.query.move_home();
+    pub fn move_caret_home(&mut self) -> bool {
+        self.query.move_home()
     }
 
-    pub fn move_caret_end(&mut self) {
-        self.query.move_end();
+    pub fn move_caret_end(&mut self) -> bool {
+        self.query.move_end()
     }
 }
 
@@ -623,32 +619,44 @@ fn handle_key_down(
             return;
         }
         "left" => {
-            if let Some(state) = shell.command_palette_mut() {
-                state.move_caret_left();
+            let changed = shell
+                .command_palette_mut()
+                .map(|s| s.move_caret_left())
+                .unwrap_or(false);
+            if changed {
                 shell.wake_text_blink(cx);
                 cx.notify();
             }
             return;
         }
         "right" => {
-            if let Some(state) = shell.command_palette_mut() {
-                state.move_caret_right();
+            let changed = shell
+                .command_palette_mut()
+                .map(|s| s.move_caret_right())
+                .unwrap_or(false);
+            if changed {
                 shell.wake_text_blink(cx);
                 cx.notify();
             }
             return;
         }
         "home" => {
-            if let Some(state) = shell.command_palette_mut() {
-                state.move_caret_home();
+            let changed = shell
+                .command_palette_mut()
+                .map(|s| s.move_caret_home())
+                .unwrap_or(false);
+            if changed {
                 shell.wake_text_blink(cx);
                 cx.notify();
             }
             return;
         }
         "end" => {
-            if let Some(state) = shell.command_palette_mut() {
-                state.move_caret_end();
+            let changed = shell
+                .command_palette_mut()
+                .map(|s| s.move_caret_end())
+                .unwrap_or(false);
+            if changed {
                 shell.wake_text_blink(cx);
                 cx.notify();
             }

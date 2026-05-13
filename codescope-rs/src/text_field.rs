@@ -135,56 +135,78 @@ impl TextField {
         self.caret = self.text.len();
     }
 
+    /// Insert `ch` at the caret. Always changes the buffer (a char
+    /// always lengthens it), so this returns `()` rather than a
+    /// "changed" flag — callers should treat every insert as a
+    /// redraw trigger.
     pub fn insert_char(&mut self, ch: char) {
         let caret = self.clamped_caret();
         self.text.insert(caret, ch);
         self.caret = caret + ch.len_utf8();
     }
 
-    /// Delete the char to the left of the caret (Backspace).
-    pub fn backspace(&mut self) {
+    /// Delete the char to the left of the caret (Backspace). Returns
+    /// `true` when the buffer actually shrank — `false` on a no-op
+    /// (caret at start). The return drives whether the caller should
+    /// wake the blink + notify; redrawing on a no-op would burn a
+    /// frame for nothing.
+    pub fn backspace(&mut self) -> bool {
         let caret = self.clamped_caret();
         if caret == 0 {
-            return;
+            return false;
         }
         let prev = prev_char_boundary(&self.text, caret);
         self.text.replace_range(prev..caret, "");
         self.caret = prev;
+        true
     }
 
-    /// Delete the char to the right of the caret (Delete).
-    pub fn delete_forward(&mut self) {
+    /// Delete the char to the right of the caret (Delete). Returns
+    /// `true` when the buffer actually shrank.
+    pub fn delete_forward(&mut self) -> bool {
         let caret = self.clamped_caret();
         if caret >= self.text.len() {
-            return;
+            return false;
         }
         let next = next_char_boundary(&self.text, caret);
         self.text.replace_range(caret..next, "");
         self.caret = caret;
+        true
     }
 
-    pub fn move_left(&mut self) {
+    /// Returns `true` when the caret actually moved.
+    pub fn move_left(&mut self) -> bool {
         let caret = self.clamped_caret();
         if caret == 0 {
-            return;
+            return false;
         }
         self.caret = prev_char_boundary(&self.text, caret);
+        true
     }
 
-    pub fn move_right(&mut self) {
+    pub fn move_right(&mut self) -> bool {
         let caret = self.clamped_caret();
         if caret >= self.text.len() {
-            return;
+            return false;
         }
         self.caret = next_char_boundary(&self.text, caret);
+        true
     }
 
-    pub fn move_home(&mut self) {
+    pub fn move_home(&mut self) -> bool {
+        if self.caret == 0 {
+            return false;
+        }
         self.caret = 0;
+        true
     }
 
-    pub fn move_end(&mut self) {
+    pub fn move_end(&mut self) -> bool {
+        if self.caret == self.text.len() {
+            return false;
+        }
         self.caret = self.text.len();
+        true
     }
 
     /// Set the caret to a specific byte offset, snapping to the

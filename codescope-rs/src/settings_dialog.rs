@@ -119,6 +119,10 @@ impl SettingsDialogState {
         }
     }
 
+    /// Insert + edit + caret-move helpers. The caret-movement /
+    /// delete helpers forward the changed flag from `TextField` so a
+    /// no-op (backspace at caret 0, move_left at caret 0, …) returns
+    /// `false` and the caller skips the redraw.
     pub fn insert_char(&mut self, ch: char) -> bool {
         self.focused_field_mut().insert_char(ch);
         self.error = None;
@@ -126,35 +130,35 @@ impl SettingsDialogState {
     }
 
     pub fn backspace(&mut self) -> bool {
-        self.focused_field_mut().backspace();
-        self.error = None;
-        true
+        let changed = self.focused_field_mut().backspace();
+        if changed {
+            self.error = None;
+        }
+        changed
     }
 
     pub fn delete_forward(&mut self) -> bool {
-        self.focused_field_mut().delete_forward();
-        self.error = None;
-        true
+        let changed = self.focused_field_mut().delete_forward();
+        if changed {
+            self.error = None;
+        }
+        changed
     }
 
     pub fn move_caret_left(&mut self) -> bool {
-        self.focused_field_mut().move_left();
-        true
+        self.focused_field_mut().move_left()
     }
 
     pub fn move_caret_right(&mut self) -> bool {
-        self.focused_field_mut().move_right();
-        true
+        self.focused_field_mut().move_right()
     }
 
     pub fn move_caret_home(&mut self) -> bool {
-        self.focused_field_mut().move_home();
-        true
+        self.focused_field_mut().move_home()
     }
 
     pub fn move_caret_end(&mut self) -> bool {
-        self.focused_field_mut().move_end();
-        true
+        self.focused_field_mut().move_end()
     }
 
     /// Mutable accessor for one of the four text-input fields. Used

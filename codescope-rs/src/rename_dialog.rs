@@ -457,50 +457,80 @@ fn handle_key_down(
             return;
         }
         "backspace" => {
-            if let Some(state) = shell.rename_dialog.as_mut() {
-                state.name.backspace();
-                state.error = None;
+            let changed = if let Some(state) = shell.rename_dialog.as_mut() {
+                let c = state.name.backspace();
+                if c {
+                    state.error = None;
+                }
+                c
+            } else {
+                false
+            };
+            if changed {
                 shell.wake_text_blink(cx);
                 cx.notify();
             }
             return;
         }
         "delete" => {
-            if let Some(state) = shell.rename_dialog.as_mut() {
-                state.name.delete_forward();
-                state.error = None;
+            let changed = if let Some(state) = shell.rename_dialog.as_mut() {
+                let c = state.name.delete_forward();
+                if c {
+                    state.error = None;
+                }
+                c
+            } else {
+                false
+            };
+            if changed {
                 shell.wake_text_blink(cx);
                 cx.notify();
             }
             return;
         }
         "left" => {
-            if let Some(state) = shell.rename_dialog.as_mut() {
-                state.name.move_left();
+            let changed = shell
+                .rename_dialog
+                .as_mut()
+                .map(|s| s.name.move_left())
+                .unwrap_or(false);
+            if changed {
                 shell.wake_text_blink(cx);
                 cx.notify();
             }
             return;
         }
         "right" => {
-            if let Some(state) = shell.rename_dialog.as_mut() {
-                state.name.move_right();
+            let changed = shell
+                .rename_dialog
+                .as_mut()
+                .map(|s| s.name.move_right())
+                .unwrap_or(false);
+            if changed {
                 shell.wake_text_blink(cx);
                 cx.notify();
             }
             return;
         }
         "home" => {
-            if let Some(state) = shell.rename_dialog.as_mut() {
-                state.name.move_home();
+            let changed = shell
+                .rename_dialog
+                .as_mut()
+                .map(|s| s.name.move_home())
+                .unwrap_or(false);
+            if changed {
                 shell.wake_text_blink(cx);
                 cx.notify();
             }
             return;
         }
         "end" => {
-            if let Some(state) = shell.rename_dialog.as_mut() {
-                state.name.move_end();
+            let changed = shell
+                .rename_dialog
+                .as_mut()
+                .map(|s| s.name.move_end())
+                .unwrap_or(false);
+            if changed {
                 shell.wake_text_blink(cx);
                 cx.notify();
             }

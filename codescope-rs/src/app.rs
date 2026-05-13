@@ -88,7 +88,7 @@ const SETTINGS_POLL: Duration = Duration::from_millis(1000);
 /// blink in `terminal/src/view.rs`). The phase is shared across every
 /// input on screen so they all flip in lockstep — half a second of
 /// drift between two adjacent fields would feel unsynced.
-const TEXT_BLINK_PERIOD: Duration = Duration::from_millis(530);
+pub(crate) const TEXT_BLINK_PERIOD: Duration = Duration::from_millis(530);
 
 struct PendingWindowSave {
     state: WindowState,
@@ -1463,13 +1463,26 @@ impl AppShell {
     /// the first tick fires after construction is done (avoids the
     /// borrow-at-construction race that `start_dirty_poll` also
     /// guards against).
+    /// `true` when any AppShell-owned text input is currently on
+    /// screen (rename dialog, settings dialog, or command palette).
+    /// The blink timer uses this to gate `cx.notify()` so an idle
+    /// app — no dialog up — doesn't redraw twice a second just to
+    /// re-paint nothing.
+    fn any_text_input_visible(&self) -> bool {
+        self.rename_dialog.is_some()
+            || self.settings_dialog.is_some()
+            || self.command_palette.is_some()
+    }
+
     /// Drive the global dialog-input caret blink. Flips
-    /// `text_blink_phase` every [`TEXT_BLINK_PERIOD`] and notifies so
-    /// any open dialog repaints. Cheap — one boolean flip + one
-    /// notify ~ twice a second, no work while no input is on screen
-    /// (the dialog renders simply skip the caret render when nothing
-    /// is open). Matches the WPF TextBox default and the terminal
-    /// view's own blink cadence so adjacent inputs flip in lockstep.
+    /// `text_blink_phase` every [`TEXT_BLINK_PERIOD`], but only emits
+    /// a `cx.notify()` while at least one text-input surface
+    /// ([`any_text_input_visible`]) is on screen — an idle app
+    /// otherwise pays a repaint twice a second for nothing. The
+    /// phase itself keeps ticking either way so opening a dialog
+    /// finds the caret already in its conventional rhythm. Matches
+    /// the WPF TextBox default and the terminal view's own blink
+    /// cadence so adjacent inputs flip in lockstep.
     fn start_text_blink(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             loop {
@@ -1479,7 +1492,9 @@ impl AppShell {
                 }
                 let _ = this.update(cx, |this, cx| {
                     this.text_blink_phase = !this.text_blink_phase;
-                    cx.notify();
+                    if this.any_text_input_visible() {
+                        cx.notify();
+                    }
                 });
             }
         })
