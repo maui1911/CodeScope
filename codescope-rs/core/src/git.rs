@@ -20,9 +20,11 @@
 //! sentence is worse UX than a slightly long line.
 
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 use anyhow::{Context, Result, anyhow};
+
+use crate::process::no_window_command;
 
 /// One row from `git for-each-ref refs/heads refs/remotes`. Surfaced
 /// to the "New worktree" dialog so the user can pick a base branch.
@@ -248,7 +250,7 @@ pub fn rebase_onto(repo: &Path, base_ref: &str) -> Result<String> {
 /// Exit-code conventions: `git config --get` returns 1 specifically
 /// for "key not found"; anything else is a real error.
 pub fn remote_origin_url(repo: &Path) -> Result<Option<String>> {
-    let output = Command::new("git")
+    let output = no_window_command("git")
         .args(["config", "--get", "remote.origin.url"])
         .current_dir(repo)
         .stdin(Stdio::null())
@@ -517,7 +519,7 @@ pub(crate) fn parse_numstat(stdout: &str) -> (u32, u32) {
 /// returns `false` for `has_upstream` so the UI hides the segment
 /// rather than showing stale / wrong data.
 fn ahead_behind(repo: &Path) -> (u32, u32, bool) {
-    let output = Command::new("git")
+    let output = no_window_command("git")
         .args(["rev-list", "--left-right", "--count", "HEAD...@{u}"])
         .current_dir(repo)
         .stdin(Stdio::null())
@@ -558,7 +560,7 @@ pub(crate) fn parse_ahead_behind(line: &str) -> (u32, u32) {
 /// Run `git <args...>` in `cwd`. Returns the captured `Output` on
 /// success; bubbles up stderr (trimmed) on non-zero exit.
 fn run_git(cwd: &Path, args: &[&str]) -> Result<Output> {
-    let output = Command::new("git")
+    let output = no_window_command("git")
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -777,7 +779,7 @@ some-future-field foo bar\n";
     /// path, and the absolute worktrees-root path (already created so
     /// `git worktree add` doesn't have to).
     fn init_repo() -> Option<(TempDir, std::path::PathBuf, std::path::PathBuf)> {
-        if Command::new("git").arg("--version").output().is_err() {
+        if no_window_command("git").arg("--version").output().is_err() {
             eprintln!("skipping: `git` not on PATH");
             return None;
         }
@@ -795,7 +797,7 @@ some-future-field foo bar\n";
     }
 
     fn run(repo: &Path, args: &[&str]) {
-        let output = Command::new("git")
+        let output = no_window_command("git")
             .args(args)
             .current_dir(repo)
             .output()
@@ -828,7 +830,7 @@ some-future-field foo bar\n";
         // After the rebase `feat/x` should descend from the new main
         // tip — confirm by checking `git log main..feat/x` lists the
         // single feat commit.
-        let output = Command::new("git")
+        let output = no_window_command("git")
             .args(["log", "--oneline", "main..feat/x"])
             .current_dir(&repo)
             .output()

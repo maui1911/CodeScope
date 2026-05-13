@@ -14,7 +14,9 @@
 //! warm the cache on first interaction.
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+
+use crate::process::no_window_command;
 
 #[cfg(test)]
 use serde::Deserialize;
@@ -87,7 +89,7 @@ pub fn fetch_for_branch(working_dir: &Path, branch: &str) -> Option<PullRequestI
     if branch.is_empty() || branch.starts_with('-') {
         return None;
     }
-    let output = Command::new("gh")
+    let output = no_window_command("gh")
         .args([
             "pr",
             "list",

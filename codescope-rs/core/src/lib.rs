@@ -32,6 +32,7 @@ pub mod paths;
 pub mod pi_discovery;
 pub mod pi_telemetry;
 pub mod pr;
+pub mod process;
 pub mod projects;
 pub mod session;
 pub mod settings;
