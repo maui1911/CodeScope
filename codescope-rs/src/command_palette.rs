@@ -31,10 +31,12 @@ use std::sync::Arc;
 
 use codescope_core::Theme;
 use gpui::{
-    Context, FocusHandle, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    Context, FocusHandle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement,
     SharedString, StatefulInteractiveElement, Styled, Window, anchored, deferred, div, point, px,
 };
 
+use crate::text_field::{TextField, focused_caret_style, render_input_content};
 use crate::theme;
 
 /// Kind of action shown in the palette. Drives the group label on the
@@ -205,7 +207,7 @@ pub struct CommandPaletteState {
     /// mid-session (matches C# behaviour: state captured at open).
     pub all_actions: Vec<PaletteAction>,
     /// Current search input.
-    pub query: String,
+    pub query: TextField,
     /// Indices into `all_actions` after filtering by `query`, sorted
     /// by descending score. Updated on every typed character.
     pub filtered: Vec<usize>,
@@ -224,7 +226,7 @@ impl CommandPaletteState {
         Self {
             focus_handle,
             all_actions: actions,
-            query: String::new(),
+            query: TextField::new(),
             filtered,
             selected: 0,
         }
@@ -233,7 +235,7 @@ impl CommandPaletteState {
     /// Re-score against the current query and refresh `filtered`.
     /// Mirrors C# `OnQueryChanged`.
     pub fn refresh_filter(&mut self) {
-        let needle = self.query.as_str();
+        let needle = self.query.text();
         let displays: Vec<String> = self.all_actions.iter().map(|a| a.display()).collect();
         self.filtered = codescope_core::command_palette::rank(&displays, needle);
         self.selected = 0;
@@ -255,18 +257,44 @@ impl CommandPaletteState {
         self.selected = next as usize;
     }
 
-    pub fn append_char(&mut self, ch: char) {
+    pub fn insert_char(&mut self, ch: char) {
         if ch.is_control() {
             return;
         }
-        self.query.push(ch);
+        self.query.insert_char(ch);
         self.refresh_filter();
     }
 
-    pub fn pop_char(&mut self) {
-        if self.query.pop().is_some() {
+    pub fn backspace(&mut self) -> bool {
+        let changed = self.query.backspace();
+        if changed {
             self.refresh_filter();
         }
+        changed
+    }
+
+    pub fn delete_forward(&mut self) -> bool {
+        let changed = self.query.delete_forward();
+        if changed {
+            self.refresh_filter();
+        }
+        changed
+    }
+
+    pub fn move_caret_left(&mut self) -> bool {
+        self.query.move_left()
+    }
+
+    pub fn move_caret_right(&mut self) -> bool {
+        self.query.move_right()
+    }
+
+    pub fn move_caret_home(&mut self) -> bool {
+        self.query.move_home()
+    }
+
+    pub fn move_caret_end(&mut self) -> bool {
+        self.query.move_end()
     }
 }
 
@@ -282,6 +310,7 @@ pub(crate) fn render_palette(
     state: &CommandPaletteState,
     window: &mut Window,
     theme: &Arc<Theme>,
+    blink_phase: bool,
     cx: &mut Context<crate::app::AppShell>,
 ) -> gpui::AnyElement {
     let viewport = window.viewport_size();
@@ -312,13 +341,11 @@ pub(crate) fn render_palette(
                 .child("COMMAND PALETTE"),
         );
 
-    let query_display: SharedString = if state.query.is_empty() {
-        "Type to filter…".into()
-    } else {
-        state.query.clone().into()
-    };
-    let query_color: Hsla = if state.query.is_empty() { ink_ghost } else { ink };
-
+    // Query box always has focus while the palette is open, so the
+    // caret is always painted (modulated by the blink phase). Same
+    // pattern the dialog inputs use — split at the caret, no gap.
+    let mut query_style = focused_caret_style(theme, blink_phase);
+    query_style.show_caret = blink_phase;
     let query_box = div()
         .id("palette-query")
         .mx_4()
@@ -329,11 +356,28 @@ pub(crate) fn render_palette(
         .border_color(divider)
         .rounded(px(6.0))
         .text_size(px(13.5))
-        .text_color(query_color)
         .font(theme::font_sans())
         .flex()
         .items_center()
-        .child(query_display);
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                if let Some(state) = this.command_palette_mut()
+                    && let Some(idx) =
+                        state.query.index_for_window_point(event.position)
+                {
+                    state.query.set_caret(idx);
+                    this.wake_text_blink(cx);
+                    cx.notify();
+                }
+            }),
+        )
+        .child(render_input_content(
+            &state.query,
+            SharedString::from("Type to filter…"),
+            query_style,
+        ));
 
     // Result rows. Iterate the filtered indices so the order matches
     // the ranker exactly.
@@ -553,8 +597,67 @@ fn handle_key_down(
             return;
         }
         "backspace" => {
-            if let Some(state) = shell.command_palette_mut() {
-                state.pop_char();
+            let touched = shell
+                .command_palette_mut()
+                .map(|s| s.backspace())
+                .unwrap_or(false);
+            if touched {
+                shell.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "delete" => {
+            let touched = shell
+                .command_palette_mut()
+                .map(|s| s.delete_forward())
+                .unwrap_or(false);
+            if touched {
+                shell.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "left" => {
+            let changed = shell
+                .command_palette_mut()
+                .map(|s| s.move_caret_left())
+                .unwrap_or(false);
+            if changed {
+                shell.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "right" => {
+            let changed = shell
+                .command_palette_mut()
+                .map(|s| s.move_caret_right())
+                .unwrap_or(false);
+            if changed {
+                shell.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "home" => {
+            let changed = shell
+                .command_palette_mut()
+                .map(|s| s.move_caret_home())
+                .unwrap_or(false);
+            if changed {
+                shell.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "end" => {
+            let changed = shell
+                .command_palette_mut()
+                .map(|s| s.move_caret_end())
+                .unwrap_or(false);
+            if changed {
+                shell.wake_text_blink(cx);
                 cx.notify();
             }
             return;
@@ -568,17 +671,18 @@ fn handle_key_down(
     if key_char.is_empty() {
         return;
     }
+    let mut changed = false;
     if let Some(state) = shell.command_palette_mut() {
-        let mut changed = false;
         for ch in key_char.chars() {
             if !ch.is_control() {
-                state.append_char(ch);
+                state.insert_char(ch);
                 changed = true;
             }
         }
-        if changed {
-            cx.notify();
-        }
+    }
+    if changed {
+        shell.wake_text_blink(cx);
+        cx.notify();
     }
 }
 

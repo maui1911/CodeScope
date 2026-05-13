@@ -29,11 +29,13 @@ use std::sync::Arc;
 use codescope_core::{SessionManager, Theme};
 use gpui::{
     Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, SharedString, Styled, Window, anchored, deferred, div, point, px,
+    MouseDownEvent, ParentElement, SharedString, Styled, Window, anchored, deferred, div, point,
+    px,
 };
 
 use crate::app::AppShell;
 use crate::sidebar::RenameRequest;
+use crate::text_field::{TextField, render_input_content, focused_caret_style};
 use crate::theme;
 
 /// Live state of the rename dialog. Holds the target identity, the
@@ -48,11 +50,11 @@ pub struct RenameDialogState {
     /// the caller supplies the title verbatim ("Rename project",
     /// "Rename session") so the dialog stays a dumb input primitive.
     pub title: SharedString,
-    /// Editable buffer. Pre-filled with the current name and selected
-    /// on open in the C# build; the Rust port doesn't have a selection
-    /// model on this primitive yet, so the user has to manually clear
-    /// before typing. This is a follow-up rather than a parity gap.
-    pub name: String,
+    /// Editable buffer. Pre-filled with the current name; caret parks
+    /// at the end so the next keystroke appends. WPF's "select-all on
+    /// open" idiom is not implemented yet — the user has to manually
+    /// clear before typing.
+    pub name: TextField,
     /// Snapshot of the pre-fill value, kept around so submit can short-
     /// circuit on `trimmed == original.trim()`. Session renames in
     /// particular need this: `SessionManager::rename` unconditionally
@@ -77,7 +79,7 @@ impl RenameDialogState {
             target,
             title,
             original: current.clone(),
-            name: current,
+            name: TextField::with_text(current),
             error: None,
         }
     }
@@ -91,17 +93,7 @@ impl RenameDialogState {
     /// in returning `bool` rather than `Result` so the render path
     /// stays branch-free.
     pub fn is_valid(&self) -> bool {
-        !self.name.trim().is_empty()
-    }
-
-    fn append_char(&mut self, ch: char) {
-        self.name.push(ch);
-        self.error = None;
-    }
-
-    fn pop_char(&mut self) {
-        self.name.pop();
-        self.error = None;
+        !self.name.text().trim().is_empty()
     }
 }
 
@@ -145,7 +137,7 @@ impl AppShell {
     /// validation failures keep the dialog open with an inline error.
     pub fn submit_rename_dialog(&mut self, cx: &mut Context<Self>) {
         let Some(state) = self.rename_dialog.as_ref() else { return };
-        let trimmed = state.name.trim().to_string();
+        let trimmed = state.name.text().trim().to_string();
         if trimmed.is_empty() {
             if let Some(state) = self.rename_dialog.as_mut() {
                 state.error = Some("Name cannot be empty".into());
@@ -262,7 +254,7 @@ impl AppShell {
         let title = state.title.clone();
         let valid = state.is_valid();
         let error_msg: Option<SharedString> = state.error.clone().map(Into::into);
-        let value: SharedString = state.name.clone().into();
+        let blink_phase = self.text_blink_phase;
 
         // Header — eyebrow ("RENAME") + title.
         let header = div()
@@ -290,13 +282,9 @@ impl AppShell {
             .text_color(ink_ghost)
             .child("NEW NAME");
 
-        // Single-line text input. Always focused (only one field).
-        let placeholder_visible = value.is_empty();
-        let display: SharedString = if placeholder_visible {
-            SharedString::from("(empty)")
-        } else {
-            value.clone()
-        };
+        // Single-line text input. Always focused (only one field), so
+        // the caret is always painted — blink phase still flips it on
+        // and off via the global timer.
         let textbox = div()
             .id("rename-input")
             .px_3()
@@ -308,23 +296,25 @@ impl AppShell {
             .text_size(px(13.0))
             .flex()
             .items_center()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        div()
-                            .flex_grow()
-                            .text_color(if placeholder_visible { ink_ghost } else { ink })
-                            .truncate()
-                            .child(display),
-                    )
-                    // Always-on caret — there's only one input, so we
-                    // don't need a focus indicator to know where it lands.
-                    .child(div().w(px(1.5)).h(px(16.0)).bg(accent)),
-            );
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    if let Some(state) = this.rename_dialog.as_mut()
+                        && let Some(idx) =
+                            state.name.index_for_window_point(event.position)
+                    {
+                        state.name.set_caret(idx);
+                        this.wake_text_blink(cx);
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(render_input_content(
+                &state.name,
+                SharedString::from("(empty)"),
+                focused_caret_style(theme, blink_phase),
+            ));
 
         let body = div()
             .px_5()
@@ -467,8 +457,81 @@ fn handle_key_down(
             return;
         }
         "backspace" => {
-            if let Some(state) = shell.rename_dialog.as_mut() {
-                state.pop_char();
+            let changed = if let Some(state) = shell.rename_dialog.as_mut() {
+                let c = state.name.backspace();
+                if c {
+                    state.error = None;
+                }
+                c
+            } else {
+                false
+            };
+            if changed {
+                shell.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "delete" => {
+            let changed = if let Some(state) = shell.rename_dialog.as_mut() {
+                let c = state.name.delete_forward();
+                if c {
+                    state.error = None;
+                }
+                c
+            } else {
+                false
+            };
+            if changed {
+                shell.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "left" => {
+            let changed = shell
+                .rename_dialog
+                .as_mut()
+                .map(|s| s.name.move_left())
+                .unwrap_or(false);
+            if changed {
+                shell.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "right" => {
+            let changed = shell
+                .rename_dialog
+                .as_mut()
+                .map(|s| s.name.move_right())
+                .unwrap_or(false);
+            if changed {
+                shell.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "home" => {
+            let changed = shell
+                .rename_dialog
+                .as_mut()
+                .map(|s| s.name.move_home())
+                .unwrap_or(false);
+            if changed {
+                shell.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "end" => {
+            let changed = shell
+                .rename_dialog
+                .as_mut()
+                .map(|s| s.name.move_end())
+                .unwrap_or(false);
+            if changed {
+                shell.wake_text_blink(cx);
                 cx.notify();
             }
             return;
@@ -484,11 +547,13 @@ fn handle_key_down(
         let mut changed = false;
         for ch in key_char.chars() {
             if !ch.is_control() {
-                state.append_char(ch);
+                state.name.insert_char(ch);
+                state.error = None;
                 changed = true;
             }
         }
         if changed {
+            shell.wake_text_blink(cx);
             cx.notify();
         }
     }

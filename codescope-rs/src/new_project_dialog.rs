@@ -25,11 +25,12 @@ use std::sync::Arc;
 use codescope_core::Theme;
 use gpui::{
     AppContext, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, PathPromptOptions, SharedString, Styled, Window, anchored, deferred, div,
-    point, px,
+    MouseDownEvent, ParentElement, PathPromptOptions, SharedString, Styled, Window, anchored,
+    deferred, div, point, px,
 };
 
 use crate::sidebar::Sidebar;
+use crate::text_field::{TextField, focused_caret_style, render_input_content};
 use crate::theme;
 
 /// Two ways to add a project. Mirrors the segmented control at the
@@ -67,10 +68,12 @@ pub struct NewProjectDialogState {
     /// Absolute path picked via the platform folder dialog when in
     /// [`DialogMode::Existing`]. Empty until the user clicks Browse.
     pub existing_path: String,
-    /// Clone-mode fields — all three are user-editable.
-    pub url: String,
-    pub parent: String,
-    pub name: String,
+    /// Clone-mode fields — all three are user-editable. Each is a
+    /// [`TextField`] so the caret can be moved with the arrow keys /
+    /// Home / End and characters inserted mid-string.
+    pub url: TextField,
+    pub parent: TextField,
+    pub name: TextField,
     /// `true` while the user has not customised the auto-derived
     /// folder name. Once they edit it, BRANCH→NAME re-derive stops.
     /// Mirrors the C# `NameBox.Tag == NameBox.Text` heuristic.
@@ -91,9 +94,9 @@ impl NewProjectDialogState {
             focused_field: DialogField::Url,
             focus_handle,
             existing_path: String::new(),
-            url: String::new(),
-            parent: default_clone_parent,
-            name: String::new(),
+            url: TextField::new(),
+            parent: TextField::with_text(default_clone_parent),
+            name: TextField::new(),
             name_auto: true,
             busy: false,
             busy_text: None,
@@ -117,11 +120,11 @@ impl NewProjectDialogState {
                 !p.is_empty() && Path::new(p).is_dir()
             }
             DialogMode::Clone => {
-                if !is_valid_git_url(&self.url) {
+                if !is_valid_git_url(self.url.text()) {
                     return false;
                 }
-                let parent = self.parent.trim();
-                let name = self.name.trim();
+                let parent = self.parent.text().trim();
+                let name = self.name.text().trim();
                 if parent.is_empty() || !Path::new(parent).is_dir() {
                     return false;
                 }
@@ -130,56 +133,147 @@ impl NewProjectDialogState {
         }
     }
 
-    fn append_char(&mut self, ch: char) {
+    /// Mutable accessor for a specific clone-mode field by name.
+    /// Used by the mouse-down hit-test path so a click on a non-
+    /// focused field can both shift focus AND drop the caret at the
+    /// click position in one step. The existing-mode path field is
+    /// read-only — typed characters skip it via `focused_field_mut`,
+    /// but it's still reachable here for completeness.
+    pub fn field_mut_by(&mut self, field: DialogField) -> &mut TextField {
+        match field {
+            DialogField::Url => &mut self.url,
+            DialogField::Parent => &mut self.parent,
+            DialogField::Name => &mut self.name,
+        }
+    }
+
+    /// Mutable accessor for the currently-focused clone-mode field.
+    /// Returns `None` when the dialog is busy, in existing-mode (no
+    /// typeable field), or the focus enum doesn't map to a real input.
+    /// Inserting / deleting through this returns the same field so the
+    /// caller can apply post-edit hooks (`maybe_redrive_name`).
+    fn focused_field_mut(&mut self) -> Option<&mut TextField> {
         if self.busy {
-            return;
+            return None;
         }
         if self.mode == DialogMode::Existing {
             // The existing-path field is read-only — typed characters
             // outside Browse are dropped. Mirrors the WPF
             // `IsReadOnly="True"` on the path TextBox.
-            return;
+            return None;
         }
-        match self.focused_field {
-            DialogField::Url => {
-                self.url.push(ch);
-                self.maybe_redrive_name();
-            }
-            DialogField::Parent => self.parent.push(ch),
-            DialogField::Name => {
-                self.name_auto = false;
-                self.name.push(ch);
-            }
-        }
-        self.error = None;
+        Some(match self.focused_field {
+            DialogField::Url => &mut self.url,
+            DialogField::Parent => &mut self.parent,
+            DialogField::Name => &mut self.name,
+        })
     }
 
-    fn pop_char(&mut self) {
-        if self.busy {
-            return;
+    /// Insert a typed character at the focused field's caret. Honours
+    /// the same auto-derive + read-only rules the legacy `append_char`
+    /// used to. Returns `true` when a buffer was actually touched (so
+    /// the caller can `wake_text_blink` + notify).
+    pub fn insert_char(&mut self, ch: char) -> bool {
+        if self.focused_field_mut().is_none() {
+            return false;
         }
-        if self.mode == DialogMode::Existing {
-            return;
-        }
-        match self.focused_field {
+        let field = self.focused_field;
+        match field {
             DialogField::Url => {
-                self.url.pop();
+                self.url.insert_char(ch);
                 self.maybe_redrive_name();
             }
             DialogField::Parent => {
-                self.parent.pop();
+                self.parent.insert_char(ch);
             }
             DialogField::Name => {
                 self.name_auto = false;
-                self.name.pop();
+                self.name.insert_char(ch);
             }
         }
         self.error = None;
+        true
+    }
+
+    pub fn backspace(&mut self) -> bool {
+        if self.focused_field_mut().is_none() {
+            return false;
+        }
+        let field = self.focused_field;
+        let changed = match field {
+            DialogField::Url => {
+                let c = self.url.backspace();
+                if c {
+                    self.maybe_redrive_name();
+                }
+                c
+            }
+            DialogField::Parent => self.parent.backspace(),
+            DialogField::Name => {
+                let c = self.name.backspace();
+                if c {
+                    self.name_auto = false;
+                }
+                c
+            }
+        };
+        if changed {
+            self.error = None;
+        }
+        changed
+    }
+
+    pub fn delete_forward(&mut self) -> bool {
+        if self.focused_field_mut().is_none() {
+            return false;
+        }
+        let field = self.focused_field;
+        let changed = match field {
+            DialogField::Url => {
+                let c = self.url.delete_forward();
+                if c {
+                    self.maybe_redrive_name();
+                }
+                c
+            }
+            DialogField::Parent => self.parent.delete_forward(),
+            DialogField::Name => {
+                let c = self.name.delete_forward();
+                if c {
+                    self.name_auto = false;
+                }
+                c
+            }
+        };
+        if changed {
+            self.error = None;
+        }
+        changed
+    }
+
+    pub fn move_caret_left(&mut self) -> bool {
+        let Some(field) = self.focused_field_mut() else { return false };
+        field.move_left()
+    }
+
+    pub fn move_caret_right(&mut self) -> bool {
+        let Some(field) = self.focused_field_mut() else { return false };
+        field.move_right()
+    }
+
+    pub fn move_caret_home(&mut self) -> bool {
+        let Some(field) = self.focused_field_mut() else { return false };
+        field.move_home()
+    }
+
+    pub fn move_caret_end(&mut self) -> bool {
+        let Some(field) = self.focused_field_mut() else { return false };
+        field.move_end()
     }
 
     fn maybe_redrive_name(&mut self) {
         if self.name_auto {
-            self.name = derive_repo_name(&self.url);
+            self.name.set_text(derive_repo_name(self.url.text()));
         }
     }
 }
@@ -402,7 +496,7 @@ impl Sidebar {
                 let path_str = path.to_string_lossy().into_owned();
                 let _ = this.update(cx, |this, cx| {
                     if let Some(state) = this.new_project_dialog_mut() {
-                        state.parent = path_str;
+                        state.parent.set_text(path_str);
                         state.error = None;
                         cx.notify();
                     }
@@ -445,9 +539,9 @@ impl Sidebar {
                 self.add_project(path, cx);
             }
             DialogMode::Clone => {
-                let url = state.url.trim().to_string();
-                let parent = state.parent.trim().to_string();
-                let name = state.name.trim().to_string();
+                let url = state.url.text().trim().to_string();
+                let parent = state.parent.text().trim().to_string();
+                let name = state.name.text().trim().to_string();
                 let target = Path::new(&parent).join(&name);
                 let target_str = target.to_string_lossy().into_owned();
                 if self
@@ -663,33 +757,21 @@ impl Sidebar {
         };
 
         // Plain text input (no Browse button) used for URL / Name.
+        // Renders the buffer split at the caret with the caret bar
+        // painted inline (no gap) — only when the field is focused
+        // *and* the global blink phase is on.
+        let blink_phase = self.text_blink_phase;
         let textbox = |id: &'static str,
-                       value: &str,
+                       field: &TextField,
                        placeholder: &'static str,
                        this_field: DialogField|
          -> gpui::Stateful<gpui::Div> {
-            let placeholder_visible = value.is_empty();
-            let display: SharedString = if placeholder_visible {
-                SharedString::from(placeholder)
-            } else {
-                value.to_string().into()
-            };
             let is_focused = state.focused_field == this_field && mode == DialogMode::Clone;
-            let mut inner = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_1()
-                .child(
-                    div()
-                        .flex_grow()
-                        .text_color(if placeholder_visible { ink_ghost } else { ink })
-                        .truncate()
-                        .child(display),
-                );
-            if is_focused {
-                inner = inner.child(div().w(px(1.5)).h(px(16.0)).bg(accent));
-            }
+            let mut style = focused_caret_style(theme, blink_phase);
+            // Suppress the caret entirely on unfocused fields; only
+            // the field receiving keystrokes should advertise itself
+            // with a caret bar.
+            style.show_caret = is_focused && blink_phase;
             div()
                 .id(id)
                 .px_3()
@@ -704,12 +786,25 @@ impl Sidebar {
                 .items_center()
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();
                         this.focus_new_project_field(this_field, cx);
+                        if let Some(state) = this.new_project_dialog_mut() {
+                            let idx = state
+                                .field_mut_by(this_field)
+                                .index_for_window_point(event.position);
+                            if let Some(idx) = idx {
+                                state.field_mut_by(this_field).set_caret(idx);
+                                cx.notify();
+                            }
+                        }
                     }),
                 )
-                .child(inner)
+                .child(render_input_content(
+                    field,
+                    SharedString::from(placeholder),
+                    style,
+                ))
         };
 
         // Body — mode-dependent.
@@ -736,7 +831,7 @@ impl Sidebar {
                 let url_field = textbox("np-url", &state.url, "https://…", DialogField::Url);
                 let parent_chrome = path_chrome(
                     "np-parent",
-                    &state.parent,
+                    state.parent.text(),
                     Box::new(cx.listener(|this, _, window, cx| {
                         cx.stop_propagation();
                         this.pick_clone_parent_folder(window, cx);
@@ -783,15 +878,15 @@ impl Sidebar {
                     format!("add project · {path}").into()
                 }
                 DialogMode::Clone => {
-                    let url = if state.url.trim().is_empty() {
+                    let url = if state.url.text().trim().is_empty() {
                         "…".to_string()
                     } else {
-                        state.url.trim().to_string()
+                        state.url.text().trim().to_string()
                     };
-                    let name = if state.name.trim().is_empty() {
+                    let name = if state.name.text().trim().is_empty() {
                         "…".to_string()
                     } else {
-                        state.name.trim().to_string()
+                        state.name.text().trim().to_string()
                     };
                     format!("git clone · {url} → {name}").into()
                 }
@@ -959,8 +1054,67 @@ fn handle_key_down(
             return;
         }
         "backspace" => {
-            if let Some(state) = sidebar.new_project_dialog_mut() {
-                state.pop_char();
+            let touched = sidebar
+                .new_project_dialog_mut()
+                .map(|s| s.backspace())
+                .unwrap_or(false);
+            if touched {
+                sidebar.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "delete" => {
+            let touched = sidebar
+                .new_project_dialog_mut()
+                .map(|s| s.delete_forward())
+                .unwrap_or(false);
+            if touched {
+                sidebar.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "left" => {
+            let touched = sidebar
+                .new_project_dialog_mut()
+                .map(|s| s.move_caret_left())
+                .unwrap_or(false);
+            if touched {
+                sidebar.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "right" => {
+            let touched = sidebar
+                .new_project_dialog_mut()
+                .map(|s| s.move_caret_right())
+                .unwrap_or(false);
+            if touched {
+                sidebar.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "home" => {
+            let touched = sidebar
+                .new_project_dialog_mut()
+                .map(|s| s.move_caret_home())
+                .unwrap_or(false);
+            if touched {
+                sidebar.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "end" => {
+            let touched = sidebar
+                .new_project_dialog_mut()
+                .map(|s| s.move_caret_end())
+                .unwrap_or(false);
+            if touched {
+                sidebar.wake_text_blink(cx);
                 cx.notify();
             }
             return;
@@ -974,17 +1128,17 @@ fn handle_key_down(
     if key_char.is_empty() {
         return;
     }
+    let mut changed = false;
     if let Some(state) = sidebar.new_project_dialog_mut() {
-        let mut changed = false;
         for ch in key_char.chars() {
-            if !ch.is_control() {
-                state.append_char(ch);
+            if !ch.is_control() && state.insert_char(ch) {
                 changed = true;
             }
         }
-        if changed {
-            cx.notify();
-        }
+    }
+    if changed {
+        sidebar.wake_text_blink(cx);
+        cx.notify();
     }
 }
 

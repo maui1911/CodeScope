@@ -558,6 +558,12 @@ pub struct Sidebar {
     /// when the user has clicked into the search box. Without it, the
     /// sidebar would swallow every keystroke globally.
     filter_focus: FocusHandle,
+    /// Global blink phase for the sidebar-owned dialog input carets.
+    /// Flipped on a 530 ms cadence by [`Self::start_text_blink`].
+    /// Mirrors `AppShell::text_blink_phase`; the two ticks are
+    /// independent timers but on the same 530 ms grid so adjacent
+    /// inputs across the two entities flip in step.
+    pub(crate) text_blink_phase: bool,
 }
 
 impl Sidebar {
@@ -617,6 +623,54 @@ impl Sidebar {
             agent_registry,
             filter: String::new(),
             filter_focus,
+            text_blink_phase: true,
+        }
+    }
+
+    /// `true` when a sidebar-owned text input is on screen — the
+    /// "Add project" or "New worktree from branch" dialog. The
+    /// blink timer uses this to skip `cx.notify()` on idle ticks so
+    /// the sidebar doesn't redraw twice a second when nothing's
+    /// open.
+    fn any_text_input_visible(&self) -> bool {
+        self.dialog.is_some() || self.new_project_dialog.is_some()
+    }
+
+    /// Drive the caret blink for the sidebar-owned dialogs
+    /// ("Add project", "New worktree from branch"; rename + settings
+    /// + command palette live on AppShell with their own timer).
+    /// Shares the [`crate::app::TEXT_BLINK_PERIOD`] cadence so paired
+    /// inputs across the two entities flip in lockstep — two timers
+    /// on the same ms-grid drift by at most one tick across a
+    /// session, imperceptible to the eye. Notify is gated on
+    /// [`any_text_input_visible`] so an idle sidebar doesn't repaint
+    /// for nothing.
+    pub fn start_text_blink(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(crate::app::TEXT_BLINK_PERIOD)
+                    .await;
+                if this.upgrade().is_none() {
+                    break;
+                }
+                let _ = this.update(cx, |this, cx| {
+                    this.text_blink_phase = !this.text_blink_phase;
+                    if this.any_text_input_visible() {
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Reset the caret to "visible" right now — called from every
+    /// dialog key handler that mutates an input buffer.
+    pub fn wake_text_blink(&mut self, cx: &mut Context<Self>) {
+        if !self.text_blink_phase {
+            self.text_blink_phase = true;
+            cx.notify();
         }
     }
 
