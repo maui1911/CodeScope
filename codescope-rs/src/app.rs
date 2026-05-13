@@ -4976,6 +4976,10 @@ impl AppShell {
             session_title: SharedString,
         }
         let mut pending: Vec<Pending> = Vec::new();
+        // Only records *changed* (sid, state) pairs so the steady-state
+        // tick — every tab same as last time — stays allocation-free.
+        // The String clone of the session id only happens on a real
+        // transition, not on the 4× per second no-op poll.
         let mut state_updates: Vec<(String, codescope_core::SessionState)> = Vec::new();
 
         for group in &self.groups {
@@ -4987,10 +4991,14 @@ impl AppShell {
                     .get(sid)
                     .copied()
                     .unwrap_or(codescope_core::SessionState::Unknown);
-                state_updates.push((sid.to_string(), snap.state));
                 if prev == snap.state {
                     continue;
                 }
+                // State changed since last tick — record the update so
+                // the second pass can mutate `last_session_state`
+                // (can't write to it inside this loop without giving up
+                // the immutable `&self.groups` borrow).
+                state_updates.push((sid.to_string(), snap.state));
                 let is_focused = focused_tab_key
                     .map(|(g, t)| g == group.id && t == tab.id)
                     .unwrap_or(false);
