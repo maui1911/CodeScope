@@ -20,7 +20,11 @@ use crate::process::no_window_command;
 use crate::time::unix_secs_to_civil;
 
 const ATTACHMENT_DIR: &str = ".codescope/attachments";
-const GIT_EXCLUDE_PATTERN: &str = "/.codescope/attachments/";
+// Unanchored on purpose: the tab's working directory can be a
+// subdirectory of the worktree, so attachments live at
+// `<working_dir>/.codescope/attachments/`, not at the worktree root.
+// A leading `/` would only match at the root and miss those.
+const GIT_EXCLUDE_PATTERN: &str = ".codescope/attachments/";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedAttachment {
@@ -129,9 +133,36 @@ fn slash_path(path: &Path) -> String {
 }
 
 fn ensure_git_exclude(root: &Path) -> Result<()> {
+    // Resolve the worktree root first so subsequent git invocations
+    // produce paths relative to a stable base. `git rev-parse --git-path`
+    // returns paths relative to its current working directory, so calling
+    // it from a subdirectory of a worktree would otherwise give us a
+    // relative path that only resolves correctly via filesystem `..`
+    // traversal — fragile, and on some hosts would silently create a
+    // stray `.git/info/exclude` under the subdirectory.
+    let top_level_output = no_window_command("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()?;
+
+    if !top_level_output.status.success() {
+        return Ok(());
+    }
+
+    let top_level_str = String::from_utf8_lossy(&top_level_output.stdout)
+        .trim()
+        .to_string();
+    if top_level_str.is_empty() {
+        return Ok(());
+    }
+    let top_level = PathBuf::from(top_level_str);
+
     let output = no_window_command("git")
         .args(["rev-parse", "--git-path", "info/exclude"])
-        .current_dir(root)
+        .current_dir(&top_level)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -151,7 +182,7 @@ fn ensure_git_exclude(root: &Path) -> Result<()> {
         if path.is_absolute() {
             path
         } else {
-            root.join(path)
+            top_level.join(path)
         }
     };
 
@@ -223,6 +254,49 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let err = save_attachment_bytes_at(dir.path(), "png", b"", UNIX_EPOCH).unwrap_err();
         assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn writes_git_exclude_at_worktree_root_when_saving_from_subdir() {
+        if no_window_command("git").arg("--version").output().is_err() {
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let init = no_window_command("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+
+        let subdir = dir.path().join("nested").join("workdir");
+        fs::create_dir_all(&subdir).unwrap();
+
+        save_attachment_bytes_at(&subdir, "png", b"sub", UNIX_EPOCH).unwrap();
+
+        // The exclude file must live at the worktree root, not under the
+        // subdirectory we saved from.
+        let root_exclude = dir.path().join(".git/info/exclude");
+        assert!(root_exclude.exists(), "exclude file should be at worktree root");
+        assert!(
+            !subdir.join(".git").exists(),
+            "must not have created a stray .git under the subdirectory"
+        );
+
+        let exclude = fs::read_to_string(&root_exclude).unwrap();
+        // Pattern must be unanchored so it matches attachments saved from
+        // any subdirectory of the worktree.
+        assert!(
+            exclude
+                .lines()
+                .any(|line| line.trim() == GIT_EXCLUDE_PATTERN),
+            "exclude file should contain the unanchored attachments pattern"
+        );
+        assert!(
+            !GIT_EXCLUDE_PATTERN.starts_with('/'),
+            "pattern must not be anchored to the worktree root"
+        );
     }
 
     #[test]

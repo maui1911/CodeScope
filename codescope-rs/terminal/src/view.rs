@@ -577,12 +577,15 @@ impl TerminalView {
                         Ok(path) => {
                             self.paste(&path);
                             self.show_cursor_now();
+                            return;
                         }
                         Err(err) => {
+                            // Image save failed — fall through to the
+                            // legacy text / \x16 paste path so the key
+                            // press is never silently swallowed.
                             eprintln!("failed to save clipboard image attachment: {err:#}");
                         }
                     }
-                    return;
                 }
 
                 if always_paste || smart_ctrl_v {
