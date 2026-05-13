@@ -83,6 +83,12 @@ const WINDOW_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 /// gap. Using mtime polling instead of a real fswatch keeps us off
 /// the `notify` crate dependency for a single-file watch.
 const SETTINGS_POLL: Duration = Duration::from_millis(1000);
+/// Period of the dialog-input caret blink. 530 ms is the conventional
+/// rate the C# WPF TextBox uses (and matches the terminal pane's own
+/// blink in `terminal/src/view.rs`). The phase is shared across every
+/// input on screen so they all flip in lockstep — half a second of
+/// drift between two adjacent fields would feel unsynced.
+const TEXT_BLINK_PERIOD: Duration = Duration::from_millis(530);
 
 struct PendingWindowSave {
     state: WindowState,
@@ -619,6 +625,15 @@ pub struct AppShell {
     /// double-clicks are 100 ms+ apart. Anything under 10 ms is
     /// treated as the synthetic echo and ignored.
     last_titlebar_press_at: Option<std::time::Instant>,
+    /// Global blink phase for dialog input fields (rename, new-project,
+    /// new-worktree, settings, command palette). `true` paints the
+    /// caret bar; `false` hides it. Flipped on a 530 ms cadence by the
+    /// task spawned from `AppShell::new`. Any keystroke that mutates
+    /// an input also resets this to `true` via
+    /// [`AppShell::wake_text_blink`] so the caret is visible the
+    /// instant the user types — mirrors the C# WPF
+    /// `TextBoxBase.CaretBlinkTime` reset on edit.
+    pub(crate) text_blink_phase: bool,
     /// Persistent notification ring buffer + popover visibility state.
     /// Mirrors `INotificationService` / `NotificationService` from the
     /// C# build.  The bell button (landing in the integrating PR) calls
@@ -780,6 +795,11 @@ impl AppShell {
                 // and the data changes much less frequently than the
                 // working tree.
                 sidebar.start_pr_poll(cx);
+                // Dialog-input caret blink (Add project, New worktree).
+                // Independent timer; same 530 ms cadence as AppShell's
+                // so paired inputs across the two entities still feel
+                // synced.
+                sidebar.start_text_blink(cx);
                 sidebar
             })
         };
@@ -1139,6 +1159,7 @@ impl AppShell {
             theme,
             sidebar,
             last_titlebar_press_at: None,
+            text_blink_phase: true,
             notifications: crate::notifications::Notifications::new(),
             telemetry_tails: HashMap::new(),
             bell_bounds: None,
@@ -1156,6 +1177,7 @@ impl AppShell {
         shell.start_agent_discovery_poll(cx);
         shell.start_update_check_poll(cx);
         shell.schedule_taskbar_badge_init(cx);
+        shell.start_text_blink(cx);
         shell.rehydrate_or_cold_start(window, cx);
         shell
     }
@@ -1441,6 +1463,41 @@ impl AppShell {
     /// the first tick fires after construction is done (avoids the
     /// borrow-at-construction race that `start_dirty_poll` also
     /// guards against).
+    /// Drive the global dialog-input caret blink. Flips
+    /// `text_blink_phase` every [`TEXT_BLINK_PERIOD`] and notifies so
+    /// any open dialog repaints. Cheap — one boolean flip + one
+    /// notify ~ twice a second, no work while no input is on screen
+    /// (the dialog renders simply skip the caret render when nothing
+    /// is open). Matches the WPF TextBox default and the terminal
+    /// view's own blink cadence so adjacent inputs flip in lockstep.
+    fn start_text_blink(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(TEXT_BLINK_PERIOD).await;
+                if this.upgrade().is_none() {
+                    break;
+                }
+                let _ = this.update(cx, |this, cx| {
+                    this.text_blink_phase = !this.text_blink_phase;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Reset the caret to "visible" right now. Called by every dialog
+    /// key handler on any keystroke that mutates the buffer so the
+    /// caret doesn't disappear in the middle of a fast type burst —
+    /// mirrors WPF `TextBoxBase` which resets the blink timer on
+    /// every edit.
+    pub(crate) fn wake_text_blink(&mut self, cx: &mut Context<Self>) {
+        if !self.text_blink_phase {
+            self.text_blink_phase = true;
+            cx.notify();
+        }
+    }
+
     fn start_telemetry_poll(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             // Start at the active cadence — the first registration
@@ -6006,7 +6063,13 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let state = self.command_palette.as_ref()?;
-        Some(crate::command_palette::render_palette(state, window, theme, cx))
+        Some(crate::command_palette::render_palette(
+            state,
+            window,
+            theme,
+            self.text_blink_phase,
+            cx,
+        ))
     }
 }
 

@@ -27,6 +27,7 @@ use gpui::{
 };
 
 use crate::app::AppShell;
+use crate::text_field::{TextField, focused_caret_style, render_input_content};
 use crate::theme;
 
 /// Which text-input field currently receives typed keystrokes. The
@@ -52,9 +53,15 @@ pub struct SettingsDialogState {
     /// the struct directly so the user can type freely (incl. invalid
     /// intermediate states like "" or "1.").
     pub draft: Settings,
-    pub font_size_text: String,
-    pub line_height_text: String,
-    pub scrollback_text: String,
+    /// Editable text buffer for the font family. Mirrors
+    /// `draft.font.family` and is flushed back to it at Save time —
+    /// keeping a [`TextField`] separately lets the caret track an
+    /// internal position even though `Settings.font.family` is a plain
+    /// `String` shared with core.
+    pub font_family_field: TextField,
+    pub font_size_field: TextField,
+    pub line_height_field: TextField,
+    pub scrollback_field: TextField,
     /// Snapshot of the on-disk settings + theme captured at the moment
     /// the dialog opened. The dialog mutates [`AppShell::theme`]
     /// directly for live preview as the user clicks through the theme
@@ -73,9 +80,10 @@ impl SettingsDialogState {
         Self {
             focus_handle,
             focused_field: SettingsField::FontFamily,
-            font_size_text: format_f32(settings.font.size),
-            line_height_text: format_f32(settings.font.line_height_multiplier),
-            scrollback_text: settings.scrollback.to_string(),
+            font_family_field: TextField::with_text(settings.font.family.clone()),
+            font_size_field: TextField::with_text(format_f32(settings.font.size)),
+            line_height_field: TextField::with_text(format_f32(settings.font.line_height_multiplier)),
+            scrollback_field: TextField::with_text(settings.scrollback.to_string()),
             draft: settings.clone(),
             original_settings: settings.clone(),
             error: None,
@@ -90,42 +98,62 @@ impl SettingsDialogState {
     /// validation rules.
     pub fn commit_text_buffers(&mut self) -> Result<(), String> {
         let (size, line, scrollback) = parse_numeric_fields(
-            &self.font_size_text,
-            &self.line_height_text,
-            &self.scrollback_text,
+            self.font_size_field.text(),
+            self.line_height_field.text(),
+            self.scrollback_field.text(),
         )?;
+        self.draft.font.family = self.font_family_field.text().to_string();
         self.draft.font.size = size;
         self.draft.font.line_height_multiplier = line;
         self.draft.scrollback = scrollback;
         Ok(())
     }
 
-    fn append_char(&mut self, ch: char) {
+    fn focused_field_mut(&mut self) -> &mut TextField {
         match self.focused_field {
-            SettingsField::FontFamily => self.draft.font.family.push(ch),
-            SettingsField::FontSize => self.font_size_text.push(ch),
-            SettingsField::LineHeight => self.line_height_text.push(ch),
-            SettingsField::Scrollback => self.scrollback_text.push(ch),
+            SettingsField::FontFamily => &mut self.font_family_field,
+            SettingsField::FontSize => &mut self.font_size_field,
+            SettingsField::LineHeight => &mut self.line_height_field,
+            SettingsField::Scrollback => &mut self.scrollback_field,
         }
-        self.error = None;
     }
 
-    fn pop_char(&mut self) {
-        match self.focused_field {
-            SettingsField::FontFamily => {
-                self.draft.font.family.pop();
-            }
-            SettingsField::FontSize => {
-                self.font_size_text.pop();
-            }
-            SettingsField::LineHeight => {
-                self.line_height_text.pop();
-            }
-            SettingsField::Scrollback => {
-                self.scrollback_text.pop();
-            }
-        }
+    pub fn insert_char(&mut self, ch: char) -> bool {
+        self.focused_field_mut().insert_char(ch);
         self.error = None;
+        true
+    }
+
+    pub fn backspace(&mut self) -> bool {
+        self.focused_field_mut().backspace();
+        self.error = None;
+        true
+    }
+
+    pub fn delete_forward(&mut self) -> bool {
+        self.focused_field_mut().delete_forward();
+        self.error = None;
+        true
+    }
+
+    pub fn move_caret_left(&mut self) -> bool {
+        self.focused_field_mut().move_left();
+        true
+    }
+
+    pub fn move_caret_right(&mut self) -> bool {
+        self.focused_field_mut().move_right();
+        true
+    }
+
+    pub fn move_caret_home(&mut self) -> bool {
+        self.focused_field_mut().move_home();
+        true
+    }
+
+    pub fn move_caret_end(&mut self) -> bool {
+        self.focused_field_mut().move_end();
+        true
     }
 
     fn cycle_field(&mut self, forward: bool) {
@@ -374,9 +402,7 @@ impl AppShell {
         let draft = state.draft.clone();
         let focused_field = state.focused_field;
         let error_msg: Option<SharedString> = state.error.clone().map(Into::into);
-        let font_size_text: SharedString = state.font_size_text.clone().into();
-        let line_height_text: SharedString = state.line_height_text.clone().into();
-        let scrollback_text: SharedString = state.scrollback_text.clone().into();
+        let blink_phase = self.text_blink_phase;
 
         // Header — eyebrow + title + subtitle.
         let header = div()
@@ -477,27 +503,13 @@ impl AppShell {
 
         // ─── Text-input builder (single-line) ──────────────────────
         let textbox = |id: &'static str,
-                       value: SharedString,
+                       field: &TextField,
                        placeholder: &'static str,
                        this_field: SettingsField|
          -> gpui::Stateful<gpui::Div> {
-            let placeholder_visible = value.is_empty();
-            let display: SharedString = if placeholder_visible {
-                SharedString::from(placeholder)
-            } else {
-                value
-            };
             let is_focused = focused_field == this_field;
-            let mut inner = div().flex().flex_row().items_center().gap_1().child(
-                div()
-                    .flex_grow()
-                    .text_color(if placeholder_visible { ink_ghost } else { ink })
-                    .truncate()
-                    .child(display),
-            );
-            if is_focused {
-                inner = inner.child(div().w(px(1.5)).h(px(16.0)).bg(accent));
-            }
+            let mut style = focused_caret_style(theme, blink_phase);
+            style.show_caret = is_focused && blink_phase;
             div()
                 .id(id)
                 .px_3()
@@ -517,26 +529,34 @@ impl AppShell {
                         this.settings_focus_field(this_field, cx);
                     }),
                 )
-                .child(inner)
+                .child(render_input_content(
+                    field,
+                    SharedString::from(placeholder),
+                    style,
+                ))
         };
 
         let font_family_input = textbox(
             "settings-font-family",
-            draft.font.family.clone().into(),
+            &state.font_family_field,
             "FiraCode Nerd Font",
             SettingsField::FontFamily,
         );
-        let font_size_input =
-            textbox("settings-font-size", font_size_text, "13", SettingsField::FontSize);
+        let font_size_input = textbox(
+            "settings-font-size",
+            &state.font_size_field,
+            "13",
+            SettingsField::FontSize,
+        );
         let line_height_input = textbox(
             "settings-line-height",
-            line_height_text,
+            &state.line_height_field,
             "1.0",
             SettingsField::LineHeight,
         );
         let scrollback_input = textbox(
             "settings-scrollback",
-            scrollback_text,
+            &state.scrollback_field,
             "10000",
             SettingsField::Scrollback,
         );
@@ -825,8 +845,73 @@ fn handle_key_down(
             return;
         }
         "backspace" => {
-            if let Some(state) = shell.settings_dialog.as_mut() {
-                state.pop_char();
+            let touched = shell
+                .settings_dialog
+                .as_mut()
+                .map(|s| s.backspace())
+                .unwrap_or(false);
+            if touched {
+                shell.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "delete" => {
+            let touched = shell
+                .settings_dialog
+                .as_mut()
+                .map(|s| s.delete_forward())
+                .unwrap_or(false);
+            if touched {
+                shell.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "left" => {
+            let touched = shell
+                .settings_dialog
+                .as_mut()
+                .map(|s| s.move_caret_left())
+                .unwrap_or(false);
+            if touched {
+                shell.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "right" => {
+            let touched = shell
+                .settings_dialog
+                .as_mut()
+                .map(|s| s.move_caret_right())
+                .unwrap_or(false);
+            if touched {
+                shell.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "home" => {
+            let touched = shell
+                .settings_dialog
+                .as_mut()
+                .map(|s| s.move_caret_home())
+                .unwrap_or(false);
+            if touched {
+                shell.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "end" => {
+            let touched = shell
+                .settings_dialog
+                .as_mut()
+                .map(|s| s.move_caret_end())
+                .unwrap_or(false);
+            if touched {
+                shell.wake_text_blink(cx);
                 cx.notify();
             }
             return;
@@ -838,17 +923,17 @@ fn handle_key_down(
     if key_char.is_empty() {
         return;
     }
+    let mut changed = false;
     if let Some(state) = shell.settings_dialog.as_mut() {
-        let mut changed = false;
         for ch in key_char.chars() {
-            if !ch.is_control() {
-                state.append_char(ch);
+            if !ch.is_control() && state.insert_char(ch) {
                 changed = true;
             }
         }
-        if changed {
-            cx.notify();
-        }
+    }
+    if changed {
+        shell.wake_text_blink(cx);
+        cx.notify();
     }
 }
 

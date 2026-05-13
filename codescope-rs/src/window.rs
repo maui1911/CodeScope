@@ -32,6 +32,7 @@ mod rename_dialog;
 mod settings_dialog;
 mod sidebar;
 mod taskbar_badge;
+mod text_field;
 mod theme;
 mod velopack_bridge;
 #[cfg(target_os = "windows")]

@@ -26,6 +26,7 @@ use gpui::{
 };
 
 use crate::sidebar::Sidebar;
+use crate::text_field::{TextField, focused_caret_style, render_input_content};
 use crate::theme;
 
 /// The set of characters Windows refuses inside a filename. The C#
@@ -94,8 +95,8 @@ pub struct NewWorktreeDialogState {
     pub project_name: String,
     pub project_path: String,
     pub worktree_root: String,
-    pub branch: String,
-    pub folder: String,
+    pub branch: TextField,
+    pub folder: TextField,
     pub error: Option<String>,
     pub focus_handle: FocusHandle,
     /// Mirrors C#'s `SpawnSession` — defaults to `true` so confirming
@@ -134,7 +135,7 @@ pub struct NewWorktreeDialogState {
     /// Dropdown popover open?
     pub base_popup_open: bool,
     /// Filter text typed into the popup search.
-    pub base_query: String,
+    pub base_query: TextField,
     /// Currently-highlighted row in the popup (post-filter index).
     /// `0` always points at `(HEAD)` since we pin it on top.
     pub base_selected_idx: usize,
@@ -154,8 +155,8 @@ impl NewWorktreeDialogState {
             project_name: project.name.clone(),
             project_path: project.path.clone(),
             worktree_root,
-            branch: String::new(),
-            folder: String::new(),
+            branch: TextField::new(),
+            folder: TextField::new(),
             error: None,
             focus_handle,
             spawn_session: true,
@@ -165,7 +166,7 @@ impl NewWorktreeDialogState {
             branch_load_error: None,
             base_branch,
             base_popup_open: false,
-            base_query: String::new(),
+            base_query: TextField::new(),
             base_selected_idx: 0,
         }
     }
@@ -177,55 +178,63 @@ impl NewWorktreeDialogState {
     /// an enabled Create button and then watch git fail on the
     /// resulting nonsense path.
     pub fn is_valid(&self) -> bool {
-        self.branch.trim().len() >= 2 && !self.folder.trim().is_empty()
+        self.branch.text().trim().len() >= 2 && !self.folder.text().trim().is_empty()
     }
 
     fn recompute_folder(&mut self) {
         if !self.folder_overridden {
-            self.folder = derived_folder(&self.worktree_root, &self.branch);
+            self.folder
+                .set_text(derived_folder(&self.worktree_root, self.branch.text()));
         }
         // A typing change always invalidates a stale error message —
         // the user is correcting the input.
         self.error = None;
     }
 
-    fn append_char(&mut self, ch: char) {
+    /// Apply `op` (insert / delete / move) to whichever input is in
+    /// focus. Returns `true` when the underlying buffer was touched
+    /// so the caller can `wake_text_blink` + notify.
+    fn with_focused_field<F: FnOnce(&mut TextField)>(&mut self, op: F) -> bool {
         match self.focused_field {
             DialogField::Branch => {
-                self.branch.push(ch);
+                op(&mut self.branch);
                 self.recompute_folder();
+                true
             }
             DialogField::Folder => {
-                // First keystroke flips the override flag so the auto-
-                // derive doesn't fight the user's edit on the next
-                // BRANCH change.
                 self.folder_overridden = true;
-                self.folder.push(ch);
+                op(&mut self.folder);
                 self.error = None;
+                true
             }
             DialogField::BasePopupSearch => {
-                self.base_query.push(ch);
+                op(&mut self.base_query);
                 self.base_selected_idx = 0;
+                true
             }
         }
     }
 
-    fn pop_char(&mut self) {
-        match self.focused_field {
-            DialogField::Branch => {
-                self.branch.pop();
-                self.recompute_folder();
-            }
-            DialogField::Folder => {
-                self.folder_overridden = true;
-                self.folder.pop();
-                self.error = None;
-            }
-            DialogField::BasePopupSearch => {
-                self.base_query.pop();
-                self.base_selected_idx = 0;
-            }
-        }
+    pub fn insert_char(&mut self, ch: char) -> bool {
+        self.with_focused_field(|f| f.insert_char(ch))
+    }
+    pub fn backspace(&mut self) -> bool {
+        self.with_focused_field(|f| f.backspace())
+    }
+    pub fn delete_forward(&mut self) -> bool {
+        self.with_focused_field(|f| f.delete_forward())
+    }
+    pub fn move_caret_left(&mut self) -> bool {
+        self.with_focused_field(|f| f.move_left())
+    }
+    pub fn move_caret_right(&mut self) -> bool {
+        self.with_focused_field(|f| f.move_right())
+    }
+    pub fn move_caret_home(&mut self) -> bool {
+        self.with_focused_field(|f| f.move_home())
+    }
+    pub fn move_caret_end(&mut self) -> bool {
+        self.with_focused_field(|f| f.move_end())
     }
 
     /// Filtered branch list for the base-branch popup. `(HEAD)` is
@@ -234,7 +243,7 @@ impl NewWorktreeDialogState {
     /// each group the original alphabetic sort from `list_branches`
     /// is preserved.
     pub fn filtered_branches(&self) -> Vec<&BranchInfo> {
-        filter_branches(&self.branches, &self.base_query)
+        filter_branches(&self.branches, self.base_query.text())
     }
 }
 
@@ -341,7 +350,7 @@ impl Sidebar {
         if let Some(state) = self.dialog_mut() {
             state.focused_field = field;
             state.base_popup_open = false;
-            state.base_query.clear();
+            state.base_query.set_text("");
             state.base_selected_idx = 0;
             cx.notify();
         }
@@ -364,7 +373,7 @@ impl Sidebar {
             state.base_popup_open = !state.base_popup_open;
             if state.base_popup_open {
                 state.focused_field = DialogField::BasePopupSearch;
-                state.base_query.clear();
+                state.base_query.set_text("");
                 state.base_selected_idx = 0;
             } else if state.focused_field == DialogField::BasePopupSearch {
                 // Closing without picking returns focus to BRANCH —
@@ -388,7 +397,7 @@ impl Sidebar {
             state.base_branch = name;
             state.base_popup_open = false;
             state.focused_field = DialogField::Branch;
-            state.base_query.clear();
+            state.base_query.set_text("");
             state.base_selected_idx = 0;
             cx.notify();
         }
@@ -451,12 +460,12 @@ impl Sidebar {
             return;
         }
         let idx = state.project_idx;
-        let branch = state.branch.trim().to_string();
+        let branch = state.branch.text().trim().to_string();
         // Trim the folder too — the field is user-editable now, so a
         // stray leading/trailing space would otherwise sneak into
         // both the on-disk path and the persisted `Worktree.path`,
         // causing a confusing mismatch later.
-        let folder = state.folder.trim().to_string();
+        let folder = state.folder.text().trim().to_string();
         let project_path = state.project_path.clone();
         let base_branch = state.base_branch.clone();
         let spawn_session = state.spawn_session;
@@ -561,12 +570,12 @@ impl Sidebar {
         let footer_branch: SharedString = if state.branch.is_empty() {
             SharedString::from("…")
         } else {
-            state.branch.clone().into()
+            state.branch.text().to_string().into()
         };
         let footer_leaf: SharedString = if state.folder.is_empty() {
             SharedString::from("…")
         } else {
-            folder_leaf(&state.folder).to_string().into()
+            folder_leaf(state.folder.text()).to_string().into()
         };
         let footer_base: SharedString = state
             .base_branch
@@ -613,37 +622,20 @@ impl Sidebar {
             );
 
         // Reusable textbox builder — lays out a single-line input as a
-        // div styled like a WPF TextBox. The thin accent caret is
-        // only painted when this field has focus, which gives the
-        // user visual feedback as they click between BRANCH and
-        // FOLDER.
+        // div styled like a WPF TextBox. The caret is painted inline
+        // at the field's caret position via `render_input_content` and
+        // only shown when this field has focus *and* the global blink
+        // phase is on. The branch / folder split-point is rendered with
+        // no gap between the text and the caret bar.
+        let blink_phase = self.text_blink_phase;
         let textbox = |id: &'static str,
-                       value: &str,
+                       field: &TextField,
                        placeholder: &'static str,
                        this_field: DialogField|
          -> gpui::Stateful<gpui::Div> {
-            let placeholder_visible = value.is_empty();
-            let display: SharedString = if placeholder_visible {
-                SharedString::from(placeholder)
-            } else {
-                value.to_string().into()
-            };
             let is_focused = focused == this_field && !base_popup_open;
-            let mut inner = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_1()
-                .child(
-                    div()
-                        .flex_grow()
-                        .text_color(if placeholder_visible { ink_ghost } else { ink })
-                        .truncate()
-                        .child(display),
-                );
-            if is_focused {
-                inner = inner.child(div().w(px(1.5)).h(px(16.0)).bg(accent));
-            }
+            let mut style = focused_caret_style(theme, blink_phase);
+            style.show_caret = is_focused && blink_phase;
             div()
                 .id(id)
                 .px_3()
@@ -661,7 +653,11 @@ impl Sidebar {
                         this.focus_dialog_field(this_field, cx);
                     }),
                 )
-                .child(inner)
+                .child(render_input_content(
+                    field,
+                    SharedString::from(placeholder),
+                    style,
+                ))
         };
 
         let branch_block = div()
@@ -975,19 +971,17 @@ impl Sidebar {
         let ink_ghost = theme::ink_ghost(theme);
         let ink_muted = theme::ink_muted(theme);
         let frost = theme::frost_10(theme);
-        let accent = theme::accent(theme);
         let canvas = theme::canvas(theme);
 
         let filtered = state.filtered_branches();
         let selected_idx = state.base_selected_idx;
-        let q_display: SharedString = if state.base_query.is_empty() {
-            SharedString::from("")
-        } else {
-            state.base_query.clone().into()
-        };
-        let placeholder_visible = state.base_query.is_empty();
 
-        // Search row at the top — the type-to-filter input.
+        // Search row at the top — the type-to-filter input. Same
+        // caret discipline as the BRANCH / FOLDER inputs.
+        let mut search_style = focused_caret_style(theme, self.text_blink_phase);
+        search_style.caret_height = 14.0;
+        search_style.show_caret = self.text_blink_phase
+            && state.focused_field == DialogField::BasePopupSearch;
         let search = div()
             .flex()
             .flex_row()
@@ -999,18 +993,11 @@ impl Sidebar {
             .border_color(divider)
             .bg(canvas)
             .text_size(px(12.0))
-            .child(
-                div()
-                    .flex_grow()
-                    .text_color(if placeholder_visible { ink_ghost } else { ink })
-                    .truncate()
-                    .child(if placeholder_visible {
-                        SharedString::from("Filter branches…")
-                    } else {
-                        q_display
-                    }),
-            )
-            .child(div().w(px(1.5)).h(px(14.0)).bg(accent));
+            .child(render_input_content(
+                &state.base_query,
+                SharedString::from("Filter branches…"),
+                search_style,
+            ));
 
         // Build rows. `(HEAD)` is always at index 0 in the visible
         // list; locals start after, remotes after that. The selected
@@ -1410,8 +1397,55 @@ fn handle_key_down(
             return;
         }
         "backspace" => {
-            if let Some(state) = sidebar.dialog_mut() {
-                state.pop_char();
+            let touched =
+                sidebar.dialog_mut().map(|s| s.backspace()).unwrap_or(false);
+            if touched {
+                sidebar.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "delete" => {
+            let touched =
+                sidebar.dialog_mut().map(|s| s.delete_forward()).unwrap_or(false);
+            if touched {
+                sidebar.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "left" => {
+            let touched =
+                sidebar.dialog_mut().map(|s| s.move_caret_left()).unwrap_or(false);
+            if touched {
+                sidebar.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "right" => {
+            let touched =
+                sidebar.dialog_mut().map(|s| s.move_caret_right()).unwrap_or(false);
+            if touched {
+                sidebar.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "home" => {
+            let touched =
+                sidebar.dialog_mut().map(|s| s.move_caret_home()).unwrap_or(false);
+            if touched {
+                sidebar.wake_text_blink(cx);
+                cx.notify();
+            }
+            return;
+        }
+        "end" => {
+            let touched =
+                sidebar.dialog_mut().map(|s| s.move_caret_end()).unwrap_or(false);
+            if touched {
+                sidebar.wake_text_blink(cx);
                 cx.notify();
             }
             return;
@@ -1428,17 +1462,17 @@ fn handle_key_down(
     if key_char.is_empty() {
         return;
     }
+    let mut changed = false;
     if let Some(state) = sidebar.dialog_mut() {
-        let mut changed = false;
         for ch in key_char.chars() {
-            if !ch.is_control() {
-                state.append_char(ch);
+            if !ch.is_control() && state.insert_char(ch) {
                 changed = true;
             }
         }
-        if changed {
-            cx.notify();
-        }
+    }
+    if changed {
+        sidebar.wake_text_blink(cx);
+        cx.notify();
     }
 }
 

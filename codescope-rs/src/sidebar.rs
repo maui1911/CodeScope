@@ -558,6 +558,12 @@ pub struct Sidebar {
     /// when the user has clicked into the search box. Without it, the
     /// sidebar would swallow every keystroke globally.
     filter_focus: FocusHandle,
+    /// Global blink phase for the sidebar-owned dialog input carets.
+    /// Flipped on a 530 ms cadence by [`Self::start_text_blink`].
+    /// Mirrors `AppShell::text_blink_phase`; the two ticks are
+    /// independent timers but on the same 530 ms grid so adjacent
+    /// inputs across the two entities flip in step.
+    pub(crate) text_blink_phase: bool,
 }
 
 impl Sidebar {
@@ -617,6 +623,42 @@ impl Sidebar {
             agent_registry,
             filter: String::new(),
             filter_focus,
+            text_blink_phase: true,
+        }
+    }
+
+    /// Drive the caret blink for the sidebar-owned dialogs
+    /// ("Add project", "New worktree from branch", "Rename" lives on
+    /// AppShell with its own timer). Flips
+    /// [`Self::text_blink_phase`] every 530 ms — same cadence as
+    /// `AppShell::start_text_blink` so adjacent inputs flip together.
+    /// Two timers running on the same ms-grid drift by at most one
+    /// tick across a session — imperceptible to the eye.
+    pub fn start_text_blink(&self, cx: &mut Context<Self>) {
+        use std::time::Duration;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(530))
+                    .await;
+                if this.upgrade().is_none() {
+                    break;
+                }
+                let _ = this.update(cx, |this, cx| {
+                    this.text_blink_phase = !this.text_blink_phase;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Reset the caret to "visible" right now — called from every
+    /// dialog key handler that mutates an input buffer.
+    pub fn wake_text_blink(&mut self, cx: &mut Context<Self>) {
+        if !self.text_blink_phase {
+            self.text_blink_phase = true;
+            cx.notify();
         }
     }
 
