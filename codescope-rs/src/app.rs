@@ -2898,7 +2898,15 @@ impl AppShell {
             }
         };
 
-        let terminal = cx.new(|cx| TerminalView::new_full(backend, palette, font, cx));
+        let terminal = cx.new(|cx| {
+            TerminalView::new_full_with_working_directory(
+                backend,
+                palette,
+                font,
+                working_directory_for_tab.clone(),
+                cx,
+            )
+        });
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         let title: SharedString = title_override

@@ -17,6 +17,7 @@
 //! * The canvas measure phase reports its laid-out bounds back so the
 //!   grid resize logic and mouse-coordinate translation can use them.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -28,10 +29,11 @@ use crate::input::keystroke_to_bytes;
 use crate::mouse::{self, MouseEventKind};
 use crate::paint::paint_snapshot;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, FocusHandle, Focusable, Font, FontFallbacks,
-    FontFeatures, FontStyle, FontWeight, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
-    Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled, TextRun, Window, canvas, div, px,
+    App, Bounds, ClipboardEntry, ClipboardItem, Context, FocusHandle, Focusable, Font, FontFallbacks,
+    FontFeatures, FontStyle, FontWeight, Image, ImageFormat, InteractiveElement, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled, TextRun, Window, canvas,
+    div, px,
 };
 
 /// User-overridable font + size knobs. The defaults target oh-my-posh
@@ -101,6 +103,10 @@ pub struct TerminalView {
     snapshot: TerminalSnapshot,
     palette: ColorPalette,
     font: FontConfig,
+    /// Directory the PTY was spawned in. Screenshot paste stores
+    /// clipboard images under this root and inserts a relative path
+    /// into the prompt.
+    working_directory: Option<PathBuf>,
     focus_handle: FocusHandle,
     /// Last grid size we sent to the Backend, so we don't trigger a
     /// resize on every render.
@@ -157,6 +163,19 @@ impl TerminalView {
         backend: Backend,
         palette: ColorPalette,
         font: FontConfig,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_full_with_working_directory(backend, palette, font, None, cx)
+    }
+
+    /// Full constructor with the tab's resolved working directory.
+    /// The app shell uses this so image paste can save screenshots in
+    /// the active project / worktree instead of a global temp folder.
+    pub fn new_full_with_working_directory(
+        backend: Backend,
+        palette: ColorPalette,
+        font: FontConfig,
+        working_directory: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
@@ -235,6 +254,7 @@ impl TerminalView {
             snapshot,
             palette,
             font,
+            working_directory,
             focus_handle,
             last_size: Arc::new(Mutex::new((0, 0))),
             pending_size,
@@ -542,14 +562,42 @@ impl TerminalView {
                 .backend
                 .mode()
                 .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
-        if always_paste || smart_ctrl_v {
-            if let Some(item) = cx.read_from_clipboard()
-                && let Some(text) = item.text()
-            {
-                self.paste(&text);
-                self.show_cursor_now();
+        let any_clipboard_paste_chord = key == "v"
+            && !mods.alt
+            && ((mods.control && !mods.platform) || (mods.platform && !mods.control));
+        if any_clipboard_paste_chord {
+            if let Some(item) = cx.read_from_clipboard() {
+                // Image paste is CodeScope-specific: terminal PTYs can
+                // only receive text, so store the clipboard image in
+                // the tab's worktree and paste the relative path. Do
+                // this even for plain Ctrl+V when bracketed paste is
+                // off; otherwise the shell would only receive ^V.
+                if let Some(image) = clipboard_image(&item) {
+                    match self.save_clipboard_image(image) {
+                        Ok(path) => {
+                            self.paste(&path);
+                            self.show_cursor_now();
+                            return;
+                        }
+                        Err(err) => {
+                            // Image save failed — fall through to the
+                            // legacy text / \x16 paste path so the key
+                            // press is never silently swallowed.
+                            eprintln!("failed to save clipboard image attachment: {err:#}");
+                        }
+                    }
+                }
+
+                if always_paste || smart_ctrl_v {
+                    if let Some(text) = item.text() {
+                        self.paste(&text);
+                        self.show_cursor_now();
+                    }
+                    return;
+                }
+            } else if always_paste || smart_ctrl_v {
+                return;
             }
-            return;
         }
 
         // PageUp/PageDown without modifiers scroll the view's history
@@ -629,6 +677,15 @@ impl TerminalView {
         // gpui reports +y for wheel-up, alacritty's Scroll::Delta
         // is +n for "scroll up into history" — same direction.
         self.backend.scroll(lines);
+    }
+
+    fn save_clipboard_image(&self, image: &Image) -> anyhow::Result<String> {
+        let saved = codescope_core::save_attachment_bytes(
+            self.working_directory.as_deref(),
+            image_extension(image.format()),
+            image.bytes(),
+        )?;
+        Ok(saved.paste_path)
     }
 
     /// Write clipboard text into the PTY. Honours bracketed-paste mode
@@ -723,6 +780,25 @@ struct PendingResize {
     cols: u16,
     rows: u16,
     set_at: Instant,
+}
+
+fn clipboard_image(item: &ClipboardItem) -> Option<&Image> {
+    item.entries().iter().find_map(|entry| match entry {
+        ClipboardEntry::Image(image) => Some(image),
+        ClipboardEntry::String(_) => None,
+    })
+}
+
+fn image_extension(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Png => "png",
+        ImageFormat::Jpeg => "jpg",
+        ImageFormat::Webp => "webp",
+        ImageFormat::Gif => "gif",
+        ImageFormat::Svg => "svg",
+        ImageFormat::Bmp => "bmp",
+        ImageFormat::Tiff => "tiff",
+    }
 }
 
 /// Map gpui's `MouseButton` enum to the wire-encoded button this
@@ -977,8 +1053,8 @@ impl Render for TerminalView {
 
 #[cfg(test)]
 mod tests {
-    use super::is_app_level_shortcut;
-    use gpui::Modifiers;
+    use super::{clipboard_image, image_extension, is_app_level_shortcut};
+    use gpui::{ClipboardItem, Image, ImageFormat, Modifiers};
 
     fn ctrl() -> Modifiers {
         Modifiers {
@@ -1001,6 +1077,22 @@ mod tests {
             alt: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn clipboard_image_detects_image_entries() {
+        let image = Image::from_bytes(ImageFormat::Png, b"png".to_vec());
+        let item = ClipboardItem::new_image(&image);
+
+        assert_eq!(clipboard_image(&item).map(Image::bytes), Some(b"png".as_slice()));
+        assert!(clipboard_image(&ClipboardItem::new_string("text".to_string())).is_none());
+    }
+
+    #[test]
+    fn image_extension_maps_agent_friendly_extensions() {
+        assert_eq!(image_extension(ImageFormat::Png), "png");
+        assert_eq!(image_extension(ImageFormat::Jpeg), "jpg");
+        assert_eq!(image_extension(ImageFormat::Webp), "webp");
     }
 
     #[test]

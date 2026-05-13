@@ -9,15 +9,44 @@
 >
 > **The Rust port (`codescope-rs/`) is a 1:1 functional port of the C# CodeScope build (`src/CodeScope.App/`, `src/CodeScope.Core/`, `src/CodeScope.AgentCli/`).** Before implementing any feature on the Rust side, **read the equivalent C# code first** and mirror its behavior, button labels, dialogs, data shapes, and persistence layout. Functional parity is the goal — we are not redesigning. If a `HANDOFF.md` entry, README line, or "next entry point" disagrees with what the C# code actually does, the C# code wins; update the doc. Genuine platform-forced deviations (gpui vs WPF idiom) get a one-line comment and an entry in `docs/DECISIONS.md`. "Cleaner" or "more elegant" is not a reason on its own. (Reinforced in session 33 after PR #56 invented a non-existent UX.)
 
-**Last updated:** 2026-05-12 (session 39 — Rust release pipeline + Velopack apply path)
+**Last updated:** 2026-05-13 (session 40 — Rust screenshot paste MVP)
 **Branch:** `main`
-**Head:** `6346668` (themed ConfirmDialog + destructive-site migration, #150)
+**Head:** `442e03c` (fix(rs): suppress transient conhost windows on git/gh spawns, #193)
 **Release:** `v0.2.5` shipped in session 36 — no new release this run
 **Build status:** ✅ C# untouched. Rust workspace builds clean.
-Tests: `codescope-core` (418) + `codescope-rs` bin (100) +
-`codescope-terminal` (24) + 1 doctest — **543 total**, all passing.
-**Uncommitted work:** none on `main`.
-**Open issues:** none on GitHub.
+Tests: `codescope-core` (462) + `codescope-rs` bin (117) +
+`codescope-terminal` (28) + doctests (1 core + 0 terminal) — **608 total**, all passing
+when `TMP` / `TEMP` point outside the repo (used `../codescope-rs-test-tmp`; repo-local
+`target/tmp` makes `git_status_non_repo_returns_none` invalid because temp dirs are inside the worktree).
+**Uncommitted work:** Rust screenshot paste MVP in progress:
+`codescope-rs/core/src/attachments.rs`, `core/src/lib.rs`, `core/src/git.rs`,
+`terminal/src/view.rs`, `src/app.rs`, plus this handoff update.
+**Open issues:** none checked this run.
+
+### Session 40 — Rust screenshot paste MVP
+
+Pulled `main` first (`f63107e..442e03c`, PR #193) per user request, then implemented the minimal
+Rust-only screenshot paste flow:
+
+- `codescope-rs/core/src/attachments.rs` stores image bytes under
+  `<tab-working-directory>/.codescope/attachments/screenshot-YYYYMMDD-HHMMSS-xxxxxx.<ext>` and returns a
+  slash-normalized relative prompt path like `.codescope/attachments/screenshot-...png`.
+- Best-effort appends `/.codescope/attachments/` to the repo-local `.git/info/exclude` using
+  `git rev-parse --git-path info/exclude`; failure to find/write git exclude does not fail paste.
+- `codescope-rs/terminal/src/view.rs` now treats clipboard images specially on paste chords. Plain
+  `Ctrl+V` saves the image + pastes only the relative path, even when bracketed paste is off; text paste keeps
+  the old semantics (`Ctrl+Shift+V` always, plain `Ctrl+V` only with bracketed paste).
+- `codescope-rs/src/app.rs` passes each tab's resolved working directory into `TerminalView` so attachments land
+  in the active project/worktree instead of a global temp folder.
+
+Validation commands:
+
+```bash
+cargo test --manifest-path codescope-rs/Cargo.toml -p codescope-core attachments
+cargo test --manifest-path codescope-rs/Cargo.toml -p codescope-terminal
+cargo build --manifest-path codescope-rs/Cargo.toml --bin codescope-rs
+TMP=$(pwd)/../codescope-rs-test-tmp TEMP=$(pwd)/../codescope-rs-test-tmp cargo test --manifest-path codescope-rs/Cargo.toml --workspace
+```
 
 ### Cross-platform status (Rust port)
 

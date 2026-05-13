@@ -15,6 +15,7 @@
 
 pub mod agent;
 pub mod agent_registry;
+pub mod attachments;
 pub mod claude_discovery;
 pub mod claude_telemetry;
 pub mod command_palette;
@@ -48,6 +49,7 @@ pub use agent_registry::{
     AgentProfile, AgentRegistry, build_new_session_auto_type, build_resume_auto_type,
     built_in_defaults,
 };
+pub use attachments::{SavedAttachment, save_attachment_bytes};
 pub use claude_discovery::{AdoptionCandidate, POLL_INTERVAL_MS as CLAUDE_DISCOVERY_POLL_MS};
 pub use claude_telemetry::{
     SessionState, TelemetrySnapshot, TranscriptTail, context_window_for_model, encode_cwd,
