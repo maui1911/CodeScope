@@ -976,14 +976,35 @@ impl AppShell {
         // Persist live window geometry. The observer fires for every
         // resize / move tick; we just stash the latest state and let
         // the background debounce task hit disk once the dust settles.
+        //
+        // Also force a re-render on every bounds change. gpui's
+        // `Window::bounds_changed` calls `self.refresh()` itself, but
+        // `refresh()` early-exits when `not_drawing()` is false (gpui-
+        // 0.2.2 `window.rs:1367`) — i.e. if the bounds change is
+        // delivered while a paint is in flight, the dirty flag gets
+        // dropped. On Windows under release-build timing, `WM_SIZE`
+        // for the maximize ↔ restore transition tends to arrive
+        // mid-frame, so no follow-up frame is scheduled and the
+        // entity tree keeps the pre-transition layout bounds for the
+        // terminal panes — even though `viewport_size` itself is up
+        // to date. Symptom: terminals stay at the pre-maximize size
+        // until something else (tab swap, output, focus change)
+        // marks the tree dirty. `cx.notify()` on the AppShell entity
+        // queues a re-render outside the active draw, which cascades
+        // through `render_group` → tab content → `TerminalView`'s
+        // canvas prepaint, picking up the new bounds and triggering
+        // `maybe_resize`. Harmless when `Window::refresh()` already
+        // did its job — the entity dirty marker collapses with the
+        // window's own dirty flag for the same frame.
         cx.observe_window_bounds(window, {
             let pending = pending_window_save.clone();
-            move |_, window, _| {
+            move |_, window, cx| {
                 let state = window_state_from_window(window);
                 *pending.lock() = Some(PendingWindowSave {
                     state,
                     set_at: Instant::now(),
                 });
+                cx.notify();
             }
         })
         .detach();
