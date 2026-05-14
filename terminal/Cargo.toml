@@ -7,20 +7,20 @@ description = "Terminal emulator component for CodeScope-rs."
 
 [dependencies]
 alacritty_terminal = "0.25"
-anyhow = "1"
+anyhow.workspace = true
 codescope-core = { path = "../core" }
 flume = { version = "0.11", default-features = false, features = ["async"] }
-gpui = "0.2.2"
+gpui.workspace = true
 linkify = "0.10"
 open = "5"
-parking_lot = "0.12"
+parking_lot.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # Win32 job objects power `process_group` — every PTY child is
 # assigned to a process-wide job flagged `KILL_ON_JOB_CLOSE`, so
 # orphaned Claude/Codex/pwsh processes can't outlive CodeScope (even
 # on a hard crash). Mirrors `src/CodeScope.Core/Interop/ProcessTreeKiller.cs`.
-windows = { version = "0.61", features = [
+windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_JobObjects",
     "Win32_System_Threading",

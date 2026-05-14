@@ -2,6 +2,16 @@
 members = ["core", "terminal"]
 exclude = ["vendor/gpui-terminal"]
 
+# Workspace dependencies — versions are pinned once here so the three
+# crates can never drift. Each member declares `dep.workspace = true`
+# and can add its own `features = [...]` on top of the base set.
+[workspace.dependencies]
+anyhow = "1"
+gpui = "0.2.2"
+parking_lot = "0.12"
+uuid = { version = "1", features = ["v4"] }
+windows = "0.61"
+
 [package]
 name = "codescope-rs"
 version = "0.3.0-rc.8"
@@ -38,14 +48,12 @@ name = "ptytest"
 path = "examples/ptytest.rs"
 
 [dependencies]
-gpui = "0.2.2"
-gpui-terminal = { path = "vendor/gpui-terminal" }
+gpui.workspace = true
 codescope-terminal = { path = "terminal" }
 codescope-core = { path = "core" }
-portable-pty = "0.9"
-anyhow = "1"
-parking_lot = "0.12"
-uuid = { version = "1", features = ["v4"] }
+anyhow.workspace = true
+parking_lot.workspace = true
+uuid.workspace = true
 raw-window-handle = "0.6"
 # Velopack-rs apply path — mirrors the C# build's
 # `src/CodeScope.App/Updates/UpdateService.cs` Velopack integration.
@@ -84,7 +92,7 @@ notify-rust = "4"
 # windows in practice. So we send `WM_SYSCOMMAND` / `WM_NCLBUTTONDOWN`
 # ourselves from `on_mouse_down` listeners — same pattern Chrome,
 # VS Code, and Windows Terminal use for their custom title bars.
-windows = { version = "0.61", features = [
+windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_UI_HiDpi",
     "Win32_UI_WindowsAndMessaging",
@@ -96,6 +104,12 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
 ] }
 winreg = "0.55"
+
+[dev-dependencies]
+# Only the `ptytest` example uses portable-pty for PTY diagnostics
+# against alacritty_terminal's tty layer; the binary itself doesn't
+# link it. Kept as a dev-dependency so release builds shed it.
+portable-pty = "0.9"
 
 [target.'cfg(windows)'.build-dependencies]
 # Embed `assets/codescope.ico` as the Windows resource icon for the
