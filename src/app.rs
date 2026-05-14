@@ -961,29 +961,12 @@ impl AppShell {
         .detach();
         let pending_window_save: Arc<Mutex<Option<PendingWindowSave>>> = Arc::new(Mutex::new(None));
 
-        // Persist live window geometry. The observer fires for every
-        // resize / move tick; we just stash the latest state and let
-        // the background debounce task hit disk once the dust settles.
-        //
-        // Also force a re-render on every bounds change. gpui's
-        // `Window::bounds_changed` calls `self.refresh()` itself, but
-        // `refresh()` early-exits when `not_drawing()` is false (gpui-
-        // 0.2.2 `window.rs:1367`) — i.e. if the bounds change is
-        // delivered while a paint is in flight, the dirty flag gets
-        // dropped. On Windows under release-build timing, `WM_SIZE`
-        // for the maximize ↔ restore transition tends to arrive
-        // mid-frame, so no follow-up frame is scheduled and the
-        // entity tree keeps the pre-transition layout bounds for the
-        // terminal panes — even though `viewport_size` itself is up
-        // to date. Symptom: terminals stay at the pre-maximize size
-        // until something else (tab swap, output, focus change)
-        // marks the tree dirty. `cx.notify()` on the AppShell entity
-        // queues a re-render outside the active draw, which cascades
-        // through `render_group` → tab content → `TerminalView`'s
-        // canvas prepaint, picking up the new bounds and triggering
-        // `maybe_resize`. Harmless when `Window::refresh()` already
-        // did its job — the entity dirty marker collapses with the
-        // window's own dirty flag for the same frame.
+        // Persist live window geometry, and force a re-render so the
+        // terminal panes pick up the new viewport bounds (see the
+        // closure body for the gpui race that makes the second job
+        // non-trivial). The observer fires for every resize / move
+        // tick; we just stash the latest state and let the background
+        // debounce task hit disk once the dust settles.
         cx.observe_window_bounds(window, {
             let pending = pending_window_save.clone();
             move |_, window, cx| {
@@ -992,7 +975,35 @@ impl AppShell {
                     state,
                     set_at: Instant::now(),
                 });
+                // Force a re-render so the entity tree picks up the
+                // new viewport bounds (otherwise the terminal panes
+                // keep their pre-transition layout until something
+                // else marks the tree dirty — e.g. tab swap, output,
+                // focus change).
+                //
+                // `cx.notify()` alone is not enough. The observer
+                // can fire mid-frame (gpui calls it from inside
+                // `Window::bounds_changed`, which is dispatched off
+                // an OS resize tick that can land while `draw_phase
+                // != None`). When that happens, `WindowInvalidator::
+                // invalidate_view` (gpui-0.2.2 `window.rs:116`) adds
+                // the entity to `dirty_views` but skips the
+                // `dirty = true` set — the window's dirty flag never
+                // flips, so no next frame is scheduled. Same race
+                // gpui's own `Window::refresh()` has, which is why
+                // it didn't backstop us either.
+                //
+                // `window.on_next_frame` queues a callback that runs
+                // at the start of the next `on_request_frame` tick,
+                // where `draw_phase == None` is guaranteed. The
+                // `app.notify` there reliably flips `dirty = true`
+                // and the resize cascades through `render_group` →
+                // `TerminalView` canvas prepaint → `maybe_resize` →
+                // `Backend::resize`. `cx.notify()` stays as the
+                // fast path for the (common) outside-of-draw case.
                 cx.notify();
+                let entity = cx.entity_id();
+                window.on_next_frame(move |_, app| app.notify(entity));
             }
         })
         .detach();
