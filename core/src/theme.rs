@@ -17,13 +17,9 @@
 
 use serde::{Deserialize, Serialize};
 
-mod builtin_impl;
-
-pub mod builtin {
-    //! Built-in themes shipped with the binary. Names are stable
-    //! identifiers that `settings.json` references.
-    pub use super::builtin_impl::*;
-}
+/// Built-in themes shipped with the binary. Names are stable
+/// identifiers that `settings.json` references.
+pub mod builtin;
 
 /// 8-bit-per-channel colour, serde-friendly. We deliberately don't
 /// pull `gpui::Hsla` into core — the UI crate converts at the edge.
