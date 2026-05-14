@@ -751,6 +751,18 @@ pub struct AppShell {
     /// agent-rollup state with no extra polling cost. Cleared when
     /// the shell drops.
     taskbar_badge: crate::taskbar_badge::TaskbarBadge,
+    /// Set to `true` while [`AppShell::rehydrate_or_cold_start`] is
+    /// walking live sessions and calling [`AppShell::spawn_tab_in`] for
+    /// each one. All `save_layout` calls (direct and indirect, via
+    /// `activate_tab`'s focused-group hook) short-circuit while this is
+    /// set; the rehydrate driver does a single `save_layout` at the
+    /// end. Without this, N live sessions produced N read-modify-write
+    /// cycles on `layout.json` per cold start AND each intermediate
+    /// write persisted a *partial* `session_placements` snapshot — a
+    /// crash mid-rehydrate would leave already-spawned placements but
+    /// drop the rest (they would still come back via `projects.json`,
+    /// but in group 0 instead of their saved group).
+    suppress_layout_save: bool,
 }
 
 impl AppShell {
@@ -1194,6 +1206,7 @@ impl AppShell {
             rename_dialog: None,
             confirm_dialog: None,
             taskbar_badge: crate::taskbar_badge::TaskbarBadge::new(window),
+            suppress_layout_save: false,
         };
         shell.start_telemetry_poll(cx);
         shell.start_agent_discovery_poll(cx);
@@ -1269,6 +1282,16 @@ impl AppShell {
     /// last reload, so we re-read on every save to avoid the
     /// last-writer-wins data loss the reviewer flagged in #73.
     fn save_layout(&mut self) {
+        // Short-circuit while rehydrate is walking live sessions.
+        // Otherwise the N spawn_tab_in calls become N read-modify-write
+        // cycles on layout.json *and* each intermediate write persists
+        // a partial session_placements list (only the tabs spawned so
+        // far). The rehydrate driver flushes once at the end via
+        // `flush_layout_after_rehydrate`. Outside rehydrate this is
+        // always false so user-driven mutations save normally.
+        if self.suppress_layout_save {
+            return;
+        }
         let mut on_disk = match LayoutState::load(self.paths.as_ref()) {
             Ok(state) => state,
             Err(err) => {
@@ -2039,7 +2062,6 @@ impl AppShell {
             agent_session_id: Option<String>,
             project_name: String,
             branch: Option<String>,
-            display_name: Option<String>,
         }
         let entries: Vec<RehydrateEntry> = self
             .projects
@@ -2064,7 +2086,6 @@ impl AppShell {
                         agent_session_id: s.agent_session_id.clone(),
                         project_name: project_name.clone(),
                         branch,
-                        display_name: s.display_name.clone(),
                     })
                 })
             })
@@ -2095,6 +2116,14 @@ impl AppShell {
         let mut active_by_group: Vec<Option<usize>> = vec![None; group_count];
         let mut spawned_any = false;
 
+        // Suppress per-spawn `save_layout` writes while the loop runs;
+        // we flush a single complete snapshot at the end. Without this,
+        // each `spawn_tab_in` would read+write `layout.json` (and a
+        // crash mid-loop would persist a partial `session_placements`
+        // list — sessions not yet spawned would still rehydrate via
+        // `projects.json` on the next boot, just demoted to group 0).
+        self.suppress_layout_save = true;
+
         for entry in entries {
             let path = std::path::PathBuf::from(&entry.worktree_path);
             if !path.exists() {
@@ -2123,10 +2152,11 @@ impl AppShell {
             // the agent profile. Falls back to the agent's "most recent"
             // resume args when the persisted `agent_session_id` is
             // missing, and to `None` for plain shells.
-            let auto: Option<SharedString> = entry
+            let agent_profile = entry
                 .agent_id
                 .as_deref()
-                .and_then(|aid| self.agent_registry.get_by_id(aid))
+                .and_then(|aid| self.agent_registry.get_by_id(aid));
+            let auto: Option<SharedString> = agent_profile
                 .and_then(|profile| {
                     codescope_core::build_resume_auto_type(
                         profile,
@@ -2135,18 +2165,31 @@ impl AppShell {
                 })
                 .map(SharedString::from);
 
-            // Title mirrors C# `MainViewModel.HydrateFromLoaded`:
-            // `{project} · {branch}` when we have a branch, else the
-            // user-set display name, else the project name. Display
-            // name wins last because the C# tab title binding pulls
-            // from descriptor.Title (project · branch); rename lives
-            // in a separate SessionTabViewModel projection.
+            // Title mirrors C# `MainViewModel.HydrateFromLoaded`
+            // (`src/CodeScope.Ui/ViewModels/MainViewModel.cs:1126-1133`):
+            // when the worktree has a branch we override the
+            // descriptor title with `{project} · {branch}`, otherwise
+            // we fall back to the descriptor's own title — which
+            // `CreateAgentSession` builds as `{agent.DisplayName} ·
+            // {folderName}` and `CreateShellSession` builds as just
+            // `Path.GetFileName(workingDirectory)`. `displayNameOverride`
+            // is explicitly `null` at hydrate time in C#, so the
+            // user-set `Session.DisplayName` does NOT participate in
+            // the tab title here — it only flows into the sidebar
+            // row title (a separate projection). Mirroring that
+            // exactly avoids the asymmetry where a renamed session
+            // with a branch would lose its rename on restart while
+            // the same rename without a branch would survive.
+            let folder_name = std::path::Path::new(&entry.worktree_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| entry.worktree_path.clone());
             let title: SharedString = if let Some(branch) = entry.branch.as_deref() {
                 SharedString::from(format!("{} · {}", entry.project_name, branch))
-            } else if let Some(name) = entry.display_name.as_deref() {
-                SharedString::from(name.to_string())
+            } else if let Some(profile) = agent_profile {
+                SharedString::from(format!("{} · {}", profile.display_name, folder_name))
             } else {
-                SharedString::from(entry.project_name.clone())
+                SharedString::from(folder_name)
             };
 
             self.spawn_tab_in(
@@ -2163,6 +2206,12 @@ impl AppShell {
                 active_by_group[group_idx] = Some(new_idx);
             }
         }
+
+        // Re-enable layout persistence so the final flush below
+        // actually hits disk. Even on the all-paths-missing branch we
+        // need to clear this — otherwise a later user action would
+        // silently no-op every save_layout.
+        self.suppress_layout_save = false;
 
         if !spawned_any {
             // Every live session's worktree was missing — leave the
@@ -2192,6 +2241,11 @@ impl AppShell {
             let active = self.groups[focused].active_tab;
             self.activate_tab(focused, active, window, cx);
         }
+
+        // Single flush of the complete `session_placements` snapshot.
+        // All the per-spawn saves above were suppressed; this is the
+        // one disk write that captures the final rehydrated layout.
+        self.save_layout();
     }
 
     // -----------------------------------------------------------------------
