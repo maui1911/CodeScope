@@ -1,6 +1,6 @@
 """Render the CodeScope brand (rounded blue square + top-right cutout) to a
-multi-size .ico. Mirrors the XAML mark in MainWindow.xaml (14x14 at 4px radius
-with a 4px cutout at 3,3 from the top-right)."""
+multi-size .ico. The design is a 14x14 mark at 4px radius with a 4px cutout at
+(3,3) from the top-right."""
 from PIL import Image, ImageDraw
 
 ACCENT = (0, 153, 255, 255)   # #0099FF
