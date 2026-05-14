@@ -19,7 +19,7 @@
 //!
 //! Scoring lives in [`codescope_core::command_palette::score`] / `rank`
 //! so it's testable without a window. See
-//! `codescope-rs/core/src/command_palette.rs` for the algorithm spec.
+//! `core/src/command_palette.rs` for the algorithm spec.
 //!
 //! The palette state lives on `AppShell` rather than its own entity
 //! because every action it dispatches already lives on `AppShell`

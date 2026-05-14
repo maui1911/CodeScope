@@ -1,6 +1,6 @@
 //! Pure-data helpers for the Overview panel.
 //!
-//! The Rust Overview view (see `codescope-rs/src/overview.rs`) is an
+//! The Overview view (see `src/overview.rs`) is an
 //! "active sessions" dashboard — one row per currently open session
 //! across every project. The on-screen sort + filter belong on the
 //! gpui side, but the row-building + sort key derivation are pure-data

@@ -3,7 +3,7 @@ members = ["cargo:."]
 
 # Config for 'dist' (cargo-dist / axodotdev).
 #
-# Scope notes for the CodeScope Rust port:
+# Scope notes for CodeScope:
 #
 # - The pipeline runs natively on GitHub-hosted runners for each
 #   target — `windows-2022` (MSVC), `macos-14` (Apple Silicon),
@@ -25,49 +25,43 @@ members = ["cargo:."]
 # - Linux runtime deps (gpui needs wayland + x11 + xkbcommon +
 #   fontconfig + freetype) are installed in the GH Actions Linux
 #   job via apt before `dist build` runs. See
-#   `.github/workflows/rs--release.yml`.
+#   `.github/workflows/release.yml`.
 # - The MSI installs **per-user** to
 #   `%LOCALAPPDATA%\Programs\codescope-rs\bin\` and lays a Start Menu
 #   shortcut under the user's `%APPDATA%\Microsoft\Windows\Start
 #   Menu\Programs\` tree. No admin / UAC prompt at install or upgrade
 #   time. This matches VS Code Stable, Zed, Discord, Slack, and GitHub
-#   Desktop's modern default, and it deliberately diverges from the
-#   C# CodeScope build (still `%ProgramFiles%\CodeScope\`, per-machine)
-#   so Velopack-style auto-updates can rewrite the install dir without
-#   needing to escalate every time. The C# and Rust MSIs now live in
-#   different scopes entirely, so they coexist cleanly on the same
-#   machine while we work the Rust port toward feature parity.
+#   Desktop's modern default. The install dir name `codescope-rs/`
+#   predates the C# build retirement (see ADR-0022); cutover-3 renames
+#   the Velopack pack id to `codescope` but leaves the WiX install dir
+#   as `codescope-rs/` so existing installs aren't moved on disk.
 #
 #   The directory chain + `InstallScope="perUser"` + `MSIINSTALLPERUSER=1`
-#   are authored in `codescope-rs/wix/main.wxs` (a hand-edited
-#   cargo-wix template). `allow-dirty = ["msi"]` below tells cargo-dist
-#   to leave the template alone — see the comment near it.
+#   are authored in `wix/main.wxs` (a hand-edited cargo-wix template).
+#   `allow-dirty = ["msi"]` below tells cargo-dist to leave the
+#   template alone — see the comment near it.
 # - `install-updater = false` for now — Velopack handles the
-#   self-update path in-process (see `codescope-rs/core/src/update_check.rs`
+#   self-update path in-process (see `core/src/update_check.rs`
 #   and the velopack integration on the AppShell). The axoupdater
 #   shipped by cargo-dist would compete with Velopack for the same
 #   responsibility.
 # - Velopack packaging runs *alongside* cargo-dist in
-#   `.github/workflows/rs--release.yml` for Windows targets only. The
-#   workflow installs `vpk` (the Velopack CLI, a .NET 8 tool — yes, the
-#   Rust SDK still needs the .NET tool for packaging), copies the
-#   cargo-built `codescope-rs.exe` into a publish dir, downloads the
-#   prior GitHub release's feed + `.nupkg` (best-effort, for Delta
-#   generation), runs `vpk pack --channel win`, and threads the
-#   resulting assets through the existing upload-artifact path so they
-#   land on the GitHub release alongside the MSI + zip. The assets are:
-#   the canonical feed manifest `releases.win.json` (what Velopack's
-#   `GithubSource` resolves via `CoreUtil.GetVeloReleaseIndexName(channel)`
-#   → `releases.<channel>.json`, mapping to the `releases.<channel>.json`
-#   reference in `codescope-rs/src/velopack_bridge.rs`), the legacy
-#   `RELEASES`-style text manifest, the `Full.nupkg` package (and a
-#   `Delta.nupkg` from the second release onward), plus the
-#   `*-Setup.exe` installer.
-#
-#   macOS / Linux velopack packaging is intentionally deferred —
-#   `velopack_bridge.rs` pins `CHANNEL = "win"` today and the
-#   auto-update path is only exercised on Windows; tar.xz archives
-#   from cargo-dist still ship for those platforms unchanged.
+#   `.github/workflows/release.yml` for every target. The workflow
+#   installs `vpk` (the Velopack CLI, a .NET 8 tool — yes, the Rust
+#   SDK still needs the .NET tool for packaging), copies the
+#   cargo-built binary into a publish dir, downloads the prior GitHub
+#   release's feed + `.nupkg` (best-effort, for Delta generation),
+#   runs `vpk pack --channel <platform>`, and threads the resulting
+#   assets through the existing upload-artifact path so they land on
+#   the GitHub release alongside the cargo-dist outputs. Assets per
+#   channel: the canonical feed manifest `releases.<channel>.json`
+#   (what Velopack's `GithubSource` resolves via
+#   `CoreUtil.GetVeloReleaseIndexName(channel)` — see
+#   `src/velopack_bridge.rs`), the legacy `RELEASES`-style text
+#   manifest, the `Full.nupkg` package (and a `Delta.nupkg` from the
+#   second release onward), plus the per-platform installer / bundle
+#   (`*-Setup.exe` on Windows, `*.app.zip` on macOS, `*.AppImage` on
+#   Linux).
 [dist]
 # Preferred dist version in CI. Bumped together with the workflow.
 cargo-dist-version = "0.31.0"
@@ -90,25 +84,19 @@ targets = [
 hosting = "github"
 # Don't bundle axoupdater; Velopack handles self-update.
 install-updater = false
-# Only run releases from explicit `v*` tag pushes — never on plain
-# branch commits, and the existing C# `release.yml` already covers the
-# product-level release-on-tag flow. We use a Rust-specific tag prefix
-# so the two pipelines don't clash on the same repo.
-tag-namespace = "rs-"
 # Don't ship a generic source tarball — the project is public on GitHub
 # and the repo itself serves as the source archive.
 source-tarball = false
 # We hand-edit the generated workflow to drop the `pull_request:`
 # trigger (we only want tag pushes to spin up the release pipeline).
-# We also ship a custom WiX template at `codescope-rs/wix/main.wxs`
-# (per-user install to `%LOCALAPPDATA%\Programs\codescope-rs\`,
-# per-user Start Menu shortcut, `InstallScope="perUser"` plus
-# `MSIINSTALLPERUSER=1` for no-UAC installs and upgrades — we do
-# *not* set `ALLUSERS` explicitly because WiX 3.14 rejects
-# `Property@Value=""` and the perUser InstallScope already handles
-# the ALLUSERS bookkeeping). `allow-dirty` tells cargo-dist not to
-# fight the manual edits on either path on every `dist plan`
-# invocation.
+# We also ship a custom WiX template at `wix/main.wxs` (per-user
+# install to `%LOCALAPPDATA%\Programs\codescope-rs\`, per-user Start
+# Menu shortcut, `InstallScope="perUser"` plus `MSIINSTALLPERUSER=1`
+# for no-UAC installs and upgrades — we do *not* set `ALLUSERS`
+# explicitly because WiX 3.14 rejects `Property@Value=""` and the
+# perUser InstallScope already handles the ALLUSERS bookkeeping).
+# `allow-dirty` tells cargo-dist not to fight the manual edits on
+# either path on every `dist plan` invocation.
 allow-dirty = ["ci", "msi"]
 # Don't fan out a PR-validation build matrix — the task brief says
 # "only trigger on tag pushes". This empties cargo-dist's PR mode so

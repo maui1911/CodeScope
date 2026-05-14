@@ -1,29 +1,22 @@
-//! GitHub release polling — Velopack parity for the Rust port.
+//! GitHub release polling — Velopack-adjacent update notifier.
 //!
-//! The C# build (`src/CodeScope.App/Updates/UpdateService.cs`) wires
-//! Velopack against `https://github.com/maui1911/CodeScope`'s `win`
-//! channel. It checks once at startup and every 3 hours thereafter,
-//! downloads any newer release in the background, and surfaces a toast
-//! + restart-confirmation dialog when the staged update is ready.
-//!
-//! The Rust port doesn't bundle Velopack (no automatic downloader, no
-//! restart-and-apply hook). What we *can* mirror is the visible signal:
-//! poll the same release endpoint on the same cadence, compare against
+//! Velopack handles the actual download / apply path in
+//! `src/velopack_bridge.rs`. This module is the visible signal: poll
+//! the GitHub release list every 3 hours, compare each entry against
 //! the version baked in by `build.rs`, and push a notification entry
-//! when a newer release exists. The user then upgrades manually — same
-//! end-to-end shape as Velopack's "Later" path, where the staged
-//! update applies on the next clean exit.
+//! when a newer release exists. The user then either lets Velopack
+//! stage + apply the update on next exit or upgrades manually.
 //!
 //! # Endpoint
 //!
 //! `https://api.github.com/repos/maui1911/CodeScope/releases?per_page=30`.
 //! We poll the *list* endpoint, not `/releases/latest`. GitHub's
-//! `/latest` only returns the most recent non-prerelease — and every
-//! Rust port release is currently tagged `rs-v0.3.0-rc.N` and marked
-//! `prerelease: true` on GitHub, so `/latest` would only ever surface
-//! the C# build's `v0.2.6` stable tag (already older than any Rust
-//! port build). The list endpoint includes prereleases; we filter
-//! client-side to the `rs-` tag namespace so the C# build's `v0.X.Y`
+//! `/latest` only returns the most recent non-prerelease, and every
+//! `0.3.0-rc.N` release is marked `prerelease: true`, so `/latest`
+//! would either return nothing (no final release published yet) or
+//! the legacy C# `v0.2.6` stable tag we want to *exclude*. The list
+//! endpoint includes prereleases; we filter client-side on a version
+//! floor (see [`MIN_PUBLISHED_TRIPLE`]) so the C# build's `v0.X.Y`
 //! tags don't pollute our comparison. Unauthenticated requests get
 //! 60/h per source IP — far above our once-every-3-hours cadence
 //! even with multiple processes on the same network.
@@ -35,17 +28,17 @@
 //! outranks any rc, and within rcs the numeric rc index decides
 //! (`rc.4 < rc.5`). Mirrors the relevant slice of semver 2.0 §11
 //! without pulling the full identifier-comparison table in — the only
-//! prerelease shape the Rust port ships is `rc.N`, anything else
-//! parses as "no recognised prerelease" and is treated as a final
-//! release on the published side (defensive: an unrecognised tag
-//! would have to lose to no-prerelease to be considered older).
+//! prerelease shape we ship is `rc.N`, anything else parses as "no
+//! recognised prerelease" and is treated as a final release on the
+//! published side (defensive: an unrecognised tag would have to lose
+//! to no-prerelease to be considered older).
 //!
-//! Both sides go through [`strip_tag_prefixes`] which peels `rs-` and
-//! `v`/`V`. The current-version slug from `build.rs` can also carry
-//! `git describe` noise (`-N-gXXXX`, `-dirty`); the parser extracts
-//! the `rc.N` segment if present and ignores the rest, so a developer
-//! build three commits past `0.3.0-rc.5-dirty` still parses as
-//! `0.3.0-rc.5` for "is the published release newer?" purposes.
+//! Both sides go through [`strip_v_prefix`] which peels `v`/`V`. The
+//! current-version slug from `build.rs` can also carry `git describe`
+//! noise (`-N-gXXXX`, `-dirty`); the parser extracts the `rc.N`
+//! segment if present and ignores the rest, so a developer build
+//! three commits past `0.3.0-rc.5-dirty` still parses as `0.3.0-rc.5`
+//! for "is the published release newer?" purposes.
 //!
 //! # Notification surface
 //!
@@ -78,9 +71,10 @@
 //! * **Ambiguous-but-recoverable** — running version is the
 //!   `0.0-unknown` `build.rs` fallback, `Version::parse` can't make
 //!   sense of the current slug, or the polled list contains no
-//!   `rs-v*` candidate. Collapses to `UpdateStatus::UpToDate` because
-//!   turning ambiguity into a notification storm is worse than the
-//!   missed update — the next interval re-evaluates from scratch.
+//!   candidate at or above [`MIN_PUBLISHED_TRIPLE`]. Collapses to
+//!   `UpdateStatus::UpToDate` because turning ambiguity into a
+//!   notification storm is worse than the missed update — the next
+//!   interval re-evaluates from scratch.
 //!
 //! In both cases we never panic, never propagate a `Result`, and never
 //! re-toast the same version twice in a single process lifetime (the
@@ -96,20 +90,20 @@ use crate::AppPaths;
 
 /// Public GitHub releases list endpoint we poll. Bumped from
 /// `/releases/latest` to the paged list (see module docs) so we see
-/// prerelease tags too — the Rust port currently ships only rc.N
-/// tags, all of which are marked `prerelease: true` on GitHub.
-/// `per_page=30` is more than enough headroom for the rc cadence
-/// plus the surrounding C# stable releases we filter out client-side.
+/// prerelease tags too — the current cadence ships only rc.N tags,
+/// all of which are marked `prerelease: true` on GitHub. `per_page=30`
+/// is more than enough headroom for the rc cadence plus the
+/// historical C# `v0.2.X` releases we filter out client-side.
 pub const RELEASES_LIST_URL: &str =
     "https://api.github.com/repos/maui1911/CodeScope/releases?per_page=30";
 
-/// Tag-namespace prefix for the Rust port's releases. Both halves of
-/// the comparison live in the same GitHub repo as the C# build
-/// (`v0.X.Y` tags), so we filter the release list to entries whose
-/// `tag_name` starts with `rs-` — anything else belongs to the C#
-/// pipeline and would compare false-newer against a clean `0.3.0-rc.X`
-/// running build.
-pub const RUST_TAG_PREFIX: &str = "rs-";
+/// Minimum published triple we consider a candidate for the running
+/// build. Anything below this is a legacy release (the C# `v0.1` /
+/// `v0.2.X` line, retired on 2026-05-14 — see ADR-0022 and
+/// `docs/MIGRATION-csharp-to-rust.md`) and would compare false-newer
+/// against a clean `0.3.0-rc.X` running build. Compared on triple only
+/// so `v0.3.0-rc.N` (triple `(0, 3, 0)`) passes the floor.
+pub const MIN_PUBLISHED_TRIPLE: (u64, u64, u64) = (0, 3, 0);
 
 /// Initial delay before the first poll fires — keeps the network call
 /// off the startup-critical path. Mirrors the 10 s delay in
@@ -140,8 +134,8 @@ fn user_agent(current_version: &str) -> String {
 /// future addition to break the parse.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReleaseInfo {
-    /// Git tag of the published release, e.g. `rs-v0.3.0-rc.5` for
-    /// the Rust port or `v0.2.6` for the legacy C# build.
+    /// Git tag of the published release, e.g. `v0.3.0-rc.5` for a
+    /// current release or `v0.2.6` for the retired C# `v0.2.X` line.
     pub tag_name: String,
     /// HTML URL the user clicks to view the release notes / download.
     pub html_url: String,
@@ -191,12 +185,13 @@ pub fn should_poll(paths: &AppPaths) -> bool {
 }
 
 /// Run one poll cycle synchronously: fetch the GitHub release list,
-/// pick the highest `rs-v*` tag, compare against `current_version`.
+/// pick the highest tag at or above [`MIN_PUBLISHED_TRIPLE`], compare
+/// against `current_version`.
 ///
 /// Outcomes follow the "Failure semantics" table at the top of this
 /// module: hard failures (network, HTTP, JSON parse) return
 /// `UpdateStatus::Unknown`; ambiguity cases (unparseable current
-/// version, no `rs-v*` candidate in the list) return
+/// version, no in-floor candidate in the list) return
 /// `UpdateStatus::UpToDate` to avoid a notification storm.
 ///
 /// Designed to be called from `cx.background_spawn` — blocking work
@@ -219,11 +214,11 @@ pub fn check_once(current_version: &str) -> UpdateStatus {
 /// filter + version-comparison logic without touching the network.
 ///
 /// The body is parsed as a JSON *array* of `ReleaseInfo` entries.
-/// We filter to `tag_name` starting with [`RUST_TAG_PREFIX`] (so the
-/// C# build's `v0.X.Y` tags don't enter the comparison), parse each
-/// remaining tag as a [`Version`], take the maximum, and compare
-/// against the running build. Mirrors the way `pr::parse_pr_url_json`
-/// is split from `pr::detect_pr_url`.
+/// Each tag parses as a [`Version`]; we keep only those at or above
+/// [`MIN_PUBLISHED_TRIPLE`] (so the retired C# `v0.2.X` tags drop
+/// out), take the maximum, and compare against the running build.
+/// Mirrors the way `pr::parse_pr_url_json` is split from
+/// `pr::detect_pr_url`.
 pub fn evaluate(json_body: &str, current_version: &str) -> UpdateStatus {
     let releases: Vec<ReleaseInfo> = match serde_json::from_str(json_body) {
         Ok(r) => r,
@@ -246,18 +241,19 @@ pub fn evaluate(json_body: &str, current_version: &str) -> UpdateStatus {
         return UpdateStatus::UpToDate;
     };
 
-    // Find the highest published `rs-v*` release. We can't rely on
-    // the GitHub list being ordered by version (it's ordered by
-    // `created_at` which is wall-clock; a back-published older tag
-    // would jump ahead). Walk every candidate, compare, keep the
-    // running max — at ~5 rc tags this is trivial.
+    // Find the highest published release at or above the floor. We
+    // can't rely on the GitHub list being ordered by version (it's
+    // ordered by `created_at` which is wall-clock; a back-published
+    // older tag would jump ahead). Walk every candidate, compare,
+    // keep the running max — at ~5 rc tags this is trivial.
     let mut best: Option<(Version, &ReleaseInfo)> = None;
     for release in releases.iter() {
         let tag = release.tag_name.trim();
-        if !tag.starts_with(RUST_TAG_PREFIX) {
+        let Some(parsed) = Version::parse(tag) else { continue };
+        if (parsed.major, parsed.minor, parsed.patch) < MIN_PUBLISHED_TRIPLE {
+            // Legacy C# `v0.2.X` (and earlier) — out of update flow.
             continue;
         }
-        let Some(parsed) = Version::parse(tag) else { continue };
         best = match best {
             None => Some((parsed, release)),
             Some((cur, _)) if parsed > cur => Some((parsed, release)),
@@ -265,9 +261,9 @@ pub fn evaluate(json_body: &str, current_version: &str) -> UpdateStatus {
         };
     }
     let Some((latest, release)) = best else {
-        // No `rs-v*` tags in the window we polled — treat as
-        // up-to-date until one shows up (instead of looping the
-        // notification on every tick).
+        // No tags at or above the floor in the window we polled —
+        // treat as up-to-date until one shows up (instead of looping
+        // the notification on every tick).
         return UpdateStatus::UpToDate;
     };
 
@@ -324,24 +320,18 @@ fn fetch_release_list_json(url: &str, current_version: &str) -> Result<String, S
     String::from_utf8(buf).map_err(|e| format!("response not utf-8: {e}"))
 }
 
-/// Strip a leading `v` or `V` from a version string. Mirrors
-/// `build.rs::strip_v_prefix` so the same rule applies on both sides
-/// of the comparison.
+/// Strip a leading `v` or `V` and trim whitespace from a version
+/// string. Mirrors `build.rs::strip_v_prefix` so the same rule
+/// applies on both sides of the comparison. Tags from GitHub arrive
+/// as `v0.3.0-rc.5`; the embedded current-version slug (from
+/// `build.rs`) already had the `v` stripped, but a manual config
+/// might reintroduce it.
 fn strip_v_prefix(s: &str) -> &str {
-    s.strip_prefix('v')
-        .or_else(|| s.strip_prefix('V'))
-        .unwrap_or(s)
-}
-
-/// Strip the Rust-port tag namespace prefix (`rs-`) *and* any
-/// `v`/`V` prefix. Tags from GitHub come in as `rs-v0.3.0-rc.5`; the
-/// embedded current-version slug (from `build.rs`) already had
-/// `rs-v` stripped, but a fresh dev clone or a manual config might
-/// reintroduce it. Same helper on both sides keeps comparison sane.
-fn strip_tag_prefixes(s: &str) -> &str {
     let trimmed = s.trim();
-    let without_rs = trimmed.strip_prefix(RUST_TAG_PREFIX).unwrap_or(trimmed);
-    strip_v_prefix(without_rs)
+    trimmed
+        .strip_prefix('v')
+        .or_else(|| trimmed.strip_prefix('V'))
+        .unwrap_or(trimmed)
 }
 
 /// Recognise the `build.rs` last-resort fallback (`0.0-unknown`).
@@ -349,7 +339,7 @@ fn strip_tag_prefixes(s: &str) -> &str {
 /// treating it as a real version would compare false-newer against
 /// every published tag.
 fn is_unknown_fallback(s: &str) -> bool {
-    let s = strip_tag_prefixes(s);
+    let s = strip_v_prefix(s);
     s == "0.0-unknown" || s.ends_with("-unknown")
 }
 
@@ -386,7 +376,7 @@ impl Version {
     /// Returns `None` for shapes we can't make sense of — caller
     /// treats those as "ambiguous, don't notify".
     fn parse(s: &str) -> Option<Self> {
-        let stripped = strip_tag_prefixes(s);
+        let stripped = strip_v_prefix(s);
         // Split into `triple` and optional `tail` at the first `-`.
         let (triple, tail) = match stripped.find('-') {
             Some(idx) => (&stripped[..idx], Some(&stripped[idx + 1..])),
@@ -475,27 +465,25 @@ fn parse_rc_segment(tail: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
-    // ── strip_tag_prefixes ──────────────────────────────────────────────
+    // ── strip_v_prefix ──────────────────────────────────────────────────
 
     #[test]
-    fn strip_tag_prefixes_handles_rust_namespace() {
-        // Real GitHub tag shape for the Rust port.
-        assert_eq!(strip_tag_prefixes("rs-v0.3.0-rc.5"), "0.3.0-rc.5");
-        assert_eq!(strip_tag_prefixes("rs-V0.3.0"), "0.3.0");
+    fn strip_v_prefix_handles_real_tag_shape() {
+        assert_eq!(strip_v_prefix("v0.3.0-rc.5"), "0.3.0-rc.5");
+        assert_eq!(strip_v_prefix("V0.3.0"), "0.3.0");
+        assert_eq!(strip_v_prefix("v0.2.6"), "0.2.6");
+        assert_eq!(strip_v_prefix("V0.2.6-dirty"), "0.2.6-dirty");
     }
 
     #[test]
-    fn strip_tag_prefixes_handles_plain_v_prefix() {
-        // C# build's tag shape — keeps working even though we filter
-        // these out in `evaluate` by tag prefix.
-        assert_eq!(strip_tag_prefixes("v0.2.6"), "0.2.6");
-        assert_eq!(strip_tag_prefixes("V0.2.6-dirty"), "0.2.6-dirty");
-    }
-
-    #[test]
-    fn strip_tag_prefixes_preserves_internal_v() {
+    fn strip_v_prefix_preserves_internal_v() {
         // Don't accidentally double-strip a `v` later in the string.
-        assert_eq!(strip_tag_prefixes("0.3.0-rc.5-v-suffix"), "0.3.0-rc.5-v-suffix");
+        assert_eq!(strip_v_prefix("0.3.0-rc.5-v-suffix"), "0.3.0-rc.5-v-suffix");
+    }
+
+    #[test]
+    fn strip_v_prefix_trims_whitespace() {
+        assert_eq!(strip_v_prefix("  v0.3.0-rc.5  "), "0.3.0-rc.5");
     }
 
     // ── Version::parse ──────────────────────────────────────────────────
@@ -542,7 +530,7 @@ mod tests {
     #[test]
     fn parse_strips_full_github_tag() {
         // End-to-end: real published tag flows through.
-        let v = Version::parse("rs-v0.3.0-rc.5").unwrap();
+        let v = Version::parse("v0.3.0-rc.5").unwrap();
         assert_eq!((v.major, v.minor, v.patch, v.rc), (0, 3, 0, Some(5)));
     }
 
@@ -551,8 +539,8 @@ mod tests {
         // We don't ship beta/alpha today; the parser refuses to
         // guess so the caller treats them as final releases on the
         // *published* side (defensive: would otherwise rank a
-        // future "rs-v0.3.0-beta.1" as newer than a `0.3.0-rc.5`
-        // dev build).
+        // future "v0.3.0-beta.1" as newer than a `0.3.0-rc.5` dev
+        // build).
         let v = Version::parse("0.3.0-beta.1").unwrap();
         assert_eq!(v.rc, None);
         let v = Version::parse("0.3.0-alpha").unwrap();
@@ -632,12 +620,12 @@ mod tests {
     #[test]
     fn evaluate_available_when_higher_rc_published() {
         // The exact scenario from PR #205's diagnostic chase: running
-        // rc.4, list contains rc.5 (newest), rc.4, rc.3, plus C#
-        // `v0.2.6` we must filter out.
+        // rc.4, list contains rc.5 (newest), rc.4, rc.3, plus legacy
+        // `v0.2.6` we must filter out via the floor.
         let json = release_list(&[
-            release_obj("rs-v0.3.0-rc.5", "https://example.invalid/rc5", Some("rc5 notes")),
-            release_obj("rs-v0.3.0-rc.4", "https://example.invalid/rc4", None),
-            release_obj("rs-v0.3.0-rc.3", "https://example.invalid/rc3", None),
+            release_obj("v0.3.0-rc.5", "https://example.invalid/rc5", Some("rc5 notes")),
+            release_obj("v0.3.0-rc.4", "https://example.invalid/rc4", None),
+            release_obj("v0.3.0-rc.3", "https://example.invalid/rc3", None),
             release_obj("v0.2.6",          "https://example.invalid/csharp", None),
         ]);
         match evaluate(&json, "0.3.0-rc.4") {
@@ -655,8 +643,8 @@ mod tests {
         // `0.3.0` (final) outranks `0.3.0-rc.5` (running), so a stable
         // release after the rc cadence ends still notifies.
         let json = release_list(&[
-            release_obj("rs-v0.3.0", "https://example.invalid/final", None),
-            release_obj("rs-v0.3.0-rc.5", "https://example.invalid/rc5", None),
+            release_obj("v0.3.0", "https://example.invalid/final", None),
+            release_obj("v0.3.0-rc.5", "https://example.invalid/rc5", None),
         ]);
         match evaluate(&json, "0.3.0-rc.5") {
             UpdateStatus::Available { version, .. } => assert_eq!(version, "0.3.0"),
@@ -667,8 +655,8 @@ mod tests {
     #[test]
     fn evaluate_uptodate_when_running_latest_rc() {
         let json = release_list(&[
-            release_obj("rs-v0.3.0-rc.5", "https://example.invalid", None),
-            release_obj("rs-v0.3.0-rc.4", "https://example.invalid", None),
+            release_obj("v0.3.0-rc.5", "https://example.invalid", None),
+            release_obj("v0.3.0-rc.4", "https://example.invalid", None),
         ]);
         assert_eq!(
             evaluate(&json, "0.3.0-rc.5"),
@@ -679,7 +667,7 @@ mod tests {
     #[test]
     fn evaluate_uptodate_when_running_dirty_at_same_rc() {
         let json = release_list(&[
-            release_obj("rs-v0.3.0-rc.5", "https://example.invalid", None),
+            release_obj("v0.3.0-rc.5", "https://example.invalid", None),
         ]);
         // Dev build three commits past rc.5 + dirty — same rc rank.
         assert_eq!(
@@ -693,7 +681,7 @@ mod tests {
         // Developer on rc.6 (unreleased) shouldn't get pinged about
         // the already-published rc.5.
         let json = release_list(&[
-            release_obj("rs-v0.3.0-rc.5", "https://example.invalid", None),
+            release_obj("v0.3.0-rc.5", "https://example.invalid", None),
         ]);
         assert_eq!(
             evaluate(&json, "0.3.0-rc.6"),
@@ -702,15 +690,31 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_uptodate_when_only_csharp_tags_in_list() {
-        // GitHub returned only `v0.X.Y` tags (the C# build); we
-        // filter them out and end up with no candidate. Treat as
-        // UpToDate rather than spamming Unknown forever.
+    fn evaluate_uptodate_when_only_below_floor_tags_in_list() {
+        // GitHub returned only legacy `v0.2.X` (C#) tags — all below
+        // MIN_PUBLISHED_TRIPLE. We filter them out and end up with no
+        // candidate. Treat as UpToDate rather than spamming Unknown
+        // forever.
         let json = release_list(&[
             release_obj("v0.2.6", "https://example.invalid", None),
             release_obj("v0.2.5", "https://example.invalid", None),
+            release_obj("v0.1.0", "https://example.invalid", None),
         ]);
         assert_eq!(evaluate(&json, "0.3.0-rc.4"), UpdateStatus::UpToDate);
+    }
+
+    #[test]
+    fn evaluate_floor_lets_rc_pass() {
+        // `v0.3.0-rc.5` has triple `(0, 3, 0)` which equals the
+        // floor; it must pass the filter.
+        let json = release_list(&[
+            release_obj("v0.3.0-rc.5", "https://example.invalid/rc5", None),
+            release_obj("v0.2.6",      "https://example.invalid/legacy", None),
+        ]);
+        match evaluate(&json, "0.3.0-rc.4") {
+            UpdateStatus::Available { version, .. } => assert_eq!(version, "0.3.0-rc.5"),
+            other => panic!("expected Available rc.5, got {other:?}"),
+        }
     }
 
     #[test]
@@ -718,7 +722,7 @@ mod tests {
         // The build.rs `0.0-unknown` fallback gets short-circuited
         // so it doesn't compare false-newer than every published tag.
         let json = release_list(&[
-            release_obj("rs-v0.3.0-rc.5", "https://example.invalid", None),
+            release_obj("v0.3.0-rc.5", "https://example.invalid", None),
         ]);
         assert_eq!(evaluate(&json, "0.0-unknown"), UpdateStatus::UpToDate);
     }
@@ -730,9 +734,9 @@ mod tests {
         // walk every candidate and keep the highest version, not
         // trust list order. This test scrambles the order to prove it.
         let json = release_list(&[
-            release_obj("rs-v0.3.0-rc.3", "https://example.invalid/rc3", None),
-            release_obj("rs-v0.3.0-rc.5", "https://example.invalid/rc5", None),
-            release_obj("rs-v0.3.0-rc.4", "https://example.invalid/rc4", None),
+            release_obj("v0.3.0-rc.3", "https://example.invalid/rc3", None),
+            release_obj("v0.3.0-rc.5", "https://example.invalid/rc5", None),
+            release_obj("v0.3.0-rc.4", "https://example.invalid/rc4", None),
         ]);
         match evaluate(&json, "0.3.0-rc.2") {
             UpdateStatus::Available { version, url, .. } => {
@@ -757,7 +761,7 @@ mod tests {
     #[test]
     fn evaluate_handles_null_body() {
         let json = release_list(&[
-            release_obj("rs-v0.3.0-rc.5", "https://example.invalid", None),
+            release_obj("v0.3.0-rc.5", "https://example.invalid", None),
         ]);
         match evaluate(&json, "0.3.0-rc.4") {
             UpdateStatus::Available { body, .. } => assert_eq!(body, ""),

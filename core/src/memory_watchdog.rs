@@ -22,9 +22,9 @@
 //! ### Output
 //!
 //! Mirrors C#'s `ILogger` output but emits via `eprintln!`, which is
-//! the convention everywhere else in `codescope-rs/src` (see
-//! `crash_log`'s last-resort surface, the various `eprintln!` warnings
-//! in `app.rs` and `sidebar.rs`). Each line is prefixed
+//! the convention everywhere else in `src/` (see `crash_log`'s
+//! last-resort surface, the various `eprintln!` warnings in `app.rs`
+//! and `sidebar.rs`). Each line is prefixed
 //! `MemoryWatchdog:` so it's filterable from terminal output.
 //!
 //! Each line includes:
@@ -90,10 +90,9 @@ fn run_loop() {
         if let Some(ws) = sample_working_set_bytes() {
             let line = format_line(SystemTime::now(), ws, last);
             // Bump to the stderr stream regardless of severity — the
-            // existing logging convention in `codescope-rs/src` is
-            // `eprintln!`, and we have no `tracing` subscriber wired
-            // up. The `MemoryWatchdog:` prefix makes filtering
-            // straightforward.
+            // existing logging convention in `src/` is `eprintln!`,
+            // and we have no `tracing` subscriber wired up. The
+            // `MemoryWatchdog:` prefix makes filtering straightforward.
             eprintln!("{line}");
             last = Some(ws);
         }

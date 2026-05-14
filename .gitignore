@@ -1,7 +1,18 @@
-# Rust build output
-/target/
-/codescope-rs/target/
-/codescope-rs/vendor/gpui-terminal/target/
+# Rust build output (matches `target/` at any depth — root workspace,
+# `vendor/gpui-terminal/`, `terminal/`, etc.)
+target/
+Cargo.lock.bak
+
+# Stale per-member locks from before the workspace conversion — the
+# workspace root Cargo.lock is the only one we track.
+terminal/Cargo.lock
+
+# vendor/gpui-terminal was cloned with its upstream history; we track
+# the source files via the workspace, not as a submodule. The original
+# `.git` directory was renamed to `.git-upstream-snapshot` so git on the
+# outer repo sees regular files instead of an embedded repository.
+vendor/gpui-terminal/.git/
+vendor/gpui-terminal/.git-upstream-snapshot/
 
 # Release / install artefacts
 artifacts/

@@ -196,7 +196,7 @@ pub fn light() -> Theme {
     // garish) blue accent.
     //
     // Note: the frosted-glass overlays (`frost_10`, `frost_20`,
-    // `ink_dim`, `ink_ghost` in `codescope-rs/src/theme.rs`) all derive from
+    // `ink_dim`, `ink_ghost` in `src/theme.rs`) all derive from
     // `chrome.ink` with an alpha. On a light theme `ink` is dark, so
     // those overlays naturally turn into subtle dark washes over the
     // light canvas — no extra plumbing needed.

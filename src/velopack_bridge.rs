@@ -200,18 +200,15 @@ pub fn maybe_apply_now() -> ApplyOutcome {
         ..Default::default()
     };
     // `GithubSource` argv: `(repoUrl, accessToken, prerelease)`. We
-    // pass `prerelease: true` so the source includes the Rust port's
-    // `rs-v0.3.0-rc.N` tags — every Rust port release published to
-    // date is marked `prerelease: true` on GitHub (cargo-dist /
-    // `rs--release.yml` flags them via
-    // `announcement_is_prerelease`). The C# build's mirror call
-    // (`UpdateService.cs`) uses `prerelease: false`; the difference
-    // is deliberate, not a copy-paste error. Until a stable Rust port
-    // tag ships (≥ `rs-v0.3.0` without an rc suffix) `false` would
-    // make every poll return `NoUpdateAvailable` and the auto-apply
-    // path would never see rc.N → rc.N+1 deltas. A future ring-
-    // channel system (documented at the top of this file) can pin
-    // stable rings back to `false` once they exist.
+    // pass `prerelease: true` so the source includes the
+    // `v0.3.0-rc.N` tags — every release published to date is marked
+    // `prerelease: true` on GitHub (cargo-dist / `release.yml` flags
+    // them via `announcement_is_prerelease`). Until a stable tag
+    // ships (≥ `v0.3.0` without an rc suffix) `false` would make
+    // every poll return `NoUpdateAvailable` and the auto-apply path
+    // would never see rc.N → rc.N+1 deltas. A future ring-channel
+    // system (documented at the top of this file) can pin stable
+    // rings back to `false` once they exist.
     //
     // No token → public-API rate limit (60 req/hr per IP); same as
     // C# build's behaviour.

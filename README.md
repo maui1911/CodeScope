@@ -70,23 +70,23 @@ Only needed if you want to contribute or hack on CodeScope itself.
 
 ```pwsh
 # Prerequisites: stable Rust toolchain (1.85+, edition 2024), git
-cargo build --manifest-path codescope-rs/Cargo.toml
-cargo run --manifest-path codescope-rs/Cargo.toml --bin codescope-rs
+cargo build --workspace
+cargo run --bin codescope-rs
 ```
 
 Run the tests:
 
 ```pwsh
-cargo test --manifest-path codescope-rs/Cargo.toml --workspace
+cargo test --workspace
 ```
 
 Build a release binary:
 
 ```pwsh
-cargo build --manifest-path codescope-rs/Cargo.toml --release
+cargo build --workspace --release
 ```
 
-For installer / Velopack packaging see `.github/workflows/rs--release.yml`.
+For installer / Velopack packaging see `.github/workflows/release.yml`.
 
 ## Keyboard shortcuts
 
@@ -108,28 +108,29 @@ For installer / Velopack packaging see `.github/workflows/rs--release.yml`.
 ## Repository layout
 
 ```
-codescope-rs/
-  src/               GPUI application shell — AppShell, MainViewModel, dialogs, views
-  core/              Pure logic — services, models, no UI references
-  terminal/          GPUI-native ConPTY/PTY terminal view (codescope-terminal crate)
-  examples/          Standalone GPUI demos
-  assets/            Icons, fonts, packaged resources
-  wix/               Windows installer chrome
-  scripts/           Release / packaging helpers
-  vendor/            Vendored upstream crates (see ADR-0017-style notes)
+src/             GPUI application shell — AppShell, MainViewModel, dialogs, views
+core/            Pure logic — services, models, no UI references
+terminal/        GPUI-native ConPTY/PTY terminal view (codescope-terminal crate)
+examples/        Standalone GPUI demos
+assets/          Icons, fonts, packaged resources
+wix/             Windows installer chrome
+scripts/         Release / packaging helpers
+vendor/          Vendored upstream crates
 docs/
-  DESIGN.md          Design tokens
-  DECISIONS.md       ADRs
-  HANDOFF.md         Rolling cursor between working sessions
-  MIGRATION-csharp-to-rust.md   Historical note on the 2026-05-14 cutover
-  screenshots/       README imagery
+  DESIGN.md      Design tokens
+  DECISIONS.md   ADRs
+  HANDOFF.md     Rolling cursor between working sessions
+  MIGRATION-csharp-to-rust.md  Historical note on the 2026-05-14 cutover
+  screenshots/   README imagery
+Cargo.toml       Workspace root + the `codescope-rs` binary crate
 ```
 
 > Historical note: through `v0.2.6` the canonical tree was a .NET 10 / WPF
-> build at `src/CodeScope.{App,Core,Ui}/`. That tree is preserved at tag
-> `legacy/v0.2.6-final`; see [docs/MIGRATION-csharp-to-rust.md](docs/MIGRATION-csharp-to-rust.md)
-> for the why and how of the cutover. Cutover-3 flattens `codescope-rs/*`
-> to repo root.
+> build at `src/CodeScope.{App,Core,Ui}/`, and the Rust port lived under
+> `codescope-rs/`. The C# tree is preserved at tag `legacy/v0.2.6-final`;
+> the Rust port was flattened to repo root in cutover-3. See
+> [docs/MIGRATION-csharp-to-rust.md](docs/MIGRATION-csharp-to-rust.md)
+> for the why and how of the cutover.
 
 ## Status
 
