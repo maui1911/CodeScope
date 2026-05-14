@@ -8,8 +8,8 @@ description = "Shared models for CodeScope: settings, themes, env-aware paths. U
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-anyhow = "1"
-uuid = { version = "1", features = ["v4"] }
+anyhow.workspace = true
+uuid.workspace = true
 # `ureq` powers the GitHub release poll in `update_check`. Picked over
 # `reqwest` because it's blocking (so it composes cleanly with
 # `cx.background_spawn` from app.rs), has no tokio runtime requirement,
@@ -23,7 +23,7 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 # `K32GetProcessMemoryInfo` for the dev-only memory watchdog. Mirrors
 # the version pinned by the binary crate's `Cargo.toml` so we're not
 # pulling two copies of `windows` into the workspace.
-windows = { version = "0.61", features = [
+windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",

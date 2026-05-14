@@ -2,8 +2,8 @@
 //! `~/.copilot/session-state/<session-id>/events.jsonl`.
 //!
 //! Mirrors `CopilotTelemetryService` / `CopilotTranscriptParser` from
-//! the C# build (`src/CodeScope.Core/Services/`). Data shapes match
-//! [`crate::claude_telemetry`] so the status bar can render Copilot
+//! the C# build (`legacy:CodeScope.Core/Services/`). Data shapes match
+//! [`crate::agents::claude::telemetry`] so the status bar can render Copilot
 //! sessions through the same code paths.
 //!
 //! # Polling strategy
@@ -48,7 +48,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::claude_telemetry::{FileTail, SessionState, TelemetrySnapshot, context_window_for_model};
+use crate::telemetry::{FileTail, SessionState, TelemetrySnapshot, context_window_for_model};
 
 // ---------------------------------------------------------------------------
 // JSONL parser
@@ -139,7 +139,7 @@ fn parse_line(line: &str) -> Option<Entry> {
 ///
 /// Mirrors `CopilotTelemetryService.TryRead` from the C# build, with
 /// the same `last_pos` retry semantics as
-/// [`crate::claude_telemetry::process_new_lines`]: read failures bail
+/// [`crate::agents::claude::telemetry::process_new_lines`]: read failures bail
 /// without advancing the cursor, so the next poll re-reads from the
 /// same offset rather than permanently skipping bytes.
 pub fn process_new_lines(
@@ -220,12 +220,11 @@ pub fn process_new_lines(
                 }
                 changed = true;
             }
-            Some("assistant.turn_start") => {
-                if state != SessionState::Busy {
+            Some("assistant.turn_start")
+                if state != SessionState::Busy => {
                     state = SessionState::Busy;
                     changed = true;
                 }
-            }
             Some("assistant.message") => {
                 if entry.has_tool_requests {
                     state = SessionState::PendingToolUse;
@@ -235,24 +234,21 @@ pub fn process_new_lines(
 
                 if entry.output_tokens > 0 {
                     turn_count += 1;
-                    if let Some(ts) = entry.timestamp_secs {
-                        if let Some(user_ts) = *last_user_ts {
-                            if ts > user_ts {
+                    if let Some(ts) = entry.timestamp_secs
+                        && let Some(user_ts) = *last_user_ts
+                            && ts > user_ts {
                                 let secs = ts - user_ts;
                                 if secs >= 0.0 {
                                     last_turn_duration = Some(Duration::from_secs_f64(secs));
                                 }
                             }
-                        }
-                    }
                 }
             }
-            Some("tool.execution_start") => {
-                if state == SessionState::PendingToolUse {
+            Some("tool.execution_start")
+                if state == SessionState::PendingToolUse => {
                     // Tool now executing — still pending more tools or composing.
                     changed = true;
                 }
-            }
             Some("tool.execution_complete") => {
                 state = SessionState::Busy;
                 changed = true;
@@ -278,7 +274,7 @@ pub fn process_new_lines(
             .unwrap_or(file_len)
             .max(file_len);
         tail.last_pos = advanced_to;
-        tail.last_mtime = meta.modified().ok();
+        tail.last_mtime = crate::telemetry::modified_or_none(&meta);
     }
 
     if changed {
@@ -355,7 +351,7 @@ impl CopilotTranscriptTail {
 
     /// Suggested poll interval for the next wake-up. 250 ms while the
     /// session is Busy / PendingToolUse, 2 s while Idle / Unknown.
-    /// Mirrors the cadence used by [`crate::claude_telemetry::TranscriptTail`].
+    /// Mirrors the cadence used by [`crate::agents::claude::telemetry::ClaudeTranscriptTail`].
     pub fn poll_interval(&self) -> Duration {
         match self.snapshot.as_ref().map(|s| s.state) {
             Some(SessionState::Busy) | Some(SessionState::PendingToolUse) => {
@@ -675,7 +671,7 @@ mod tests {
 
     /// Read errors must leave `last_pos` unchanged so the next poll
     /// retries from the same offset rather than skipping bytes.
-    /// Mirrors the parity guarantee in `claude_telemetry::process_new_lines`.
+    /// Mirrors the parity guarantee in `agents::claude::telemetry::process_new_lines`.
     #[test]
     fn parser_skips_malformed_lines_without_advancing_past_them() {
         let tmp = tempfile::tempdir().unwrap();

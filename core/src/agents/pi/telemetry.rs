@@ -2,8 +2,8 @@
 //! from `~/.pi/agent/sessions/**/<timestamp>_<session-id>.jsonl`.
 //!
 //! Mirrors `PiTelemetryService` / `PiTranscriptParser` from the C#
-//! build (`src/CodeScope.Core/Services/`). Data shapes match
-//! [`crate::claude_telemetry`] so the status bar can render Pi
+//! build (`legacy:CodeScope.Core/Services/`). Data shapes match
+//! [`crate::agents::claude::telemetry`] so the status bar can render Pi
 //! sessions through the same code paths.
 //!
 //! # Discovery model
@@ -52,7 +52,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::claude_telemetry::{FileTail, SessionState, TelemetrySnapshot, context_window_for_model};
+use crate::telemetry::{FileTail, SessionState, TelemetrySnapshot, context_window_for_model};
 
 // ---------------------------------------------------------------------------
 // JSONL parser
@@ -188,10 +188,7 @@ pub fn extract_session_id_from_file_name(file_name: &str) -> Option<String> {
     // but exposing the function publicly means a non-JSONL sidecar
     // ending in `_<uuid>.<ext>` could otherwise yield a false positive.
     // Validating the suffix here keeps the public contract honest.
-    let stem = match strip_jsonl_extension(trimmed) {
-        Some(s) => s,
-        None => return None,
-    };
+    let stem = strip_jsonl_extension(trimmed)?;
     let underscore = stem.rfind('_')?;
     if underscore == stem.len() - 1 {
         return None;
@@ -278,11 +275,10 @@ fn locate_recursive(dir: &Path, suffix: &str) -> Option<PathBuf> {
             Err(_) => continue,
         };
         if file_type.is_file() {
-            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                if name.ends_with(suffix) {
+            if let Some(name) = path.file_name().and_then(|s| s.to_str())
+                && name.ends_with(suffix) {
                     return Some(path);
                 }
-            }
         } else if file_type.is_dir() {
             subdirs.push(path);
         }
@@ -306,7 +302,7 @@ fn locate_recursive(dir: &Path, suffix: &str) -> Option<PathBuf> {
 ///
 /// Mirrors `PiTelemetryService.TryRead` from the C# build, with the
 /// same `last_pos` retry semantics as
-/// [`crate::claude_telemetry::process_new_lines`]: read failures bail
+/// [`crate::agents::claude::telemetry::process_new_lines`]: read failures bail
 /// without advancing the cursor, so the next poll re-reads from the
 /// same offset rather than permanently skipping bytes.
 pub fn process_new_lines(
@@ -375,12 +371,11 @@ pub fn process_new_lines(
         // model_change: latch the model + cap as they arrive. Mirrors
         // C# `PiTelemetryService.TryRead` shortcut for this event type.
         if entry.event_type.as_deref() == Some("model_change") {
-            if let Some(m) = entry.model.as_deref() {
-                if !m.is_empty() {
+            if let Some(m) = entry.model.as_deref()
+                && !m.is_empty() {
                     model = Some(m.to_owned());
                     changed = true;
                 }
-            }
             continue;
         }
 
@@ -394,11 +389,10 @@ pub fn process_new_lines(
                 // Only fresh user turns anchor `last_user_ts` —
                 // toolResult is mid-turn, resetting would cut the
                 // measured turn duration short.
-                if entry.role.as_deref() == Some("user") {
-                    if let Some(ts) = entry.timestamp_secs {
+                if entry.role.as_deref() == Some("user")
+                    && let Some(ts) = entry.timestamp_secs {
                         *last_user_ts = Some(ts);
                     }
-                }
                 changed = true;
                 continue;
             }
@@ -417,11 +411,10 @@ pub fn process_new_lines(
             continue;
         }
 
-        if let Some(ref m) = entry.model {
-            if Some(m.as_str()) != model.as_deref() {
+        if let Some(ref m) = entry.model
+            && Some(m.as_str()) != model.as_deref() {
                 model = Some(m.clone());
             }
-        }
 
         // Overwrite, not accumulate — Pi's `input` already covers the
         // full prior conversation, mirroring Claude semantics.
@@ -431,14 +424,13 @@ pub fn process_new_lines(
             + entry.output_tokens;
         turn_count += 1;
 
-        if let (Some(user_ts), Some(asst_ts)) = (*last_user_ts, entry.timestamp_secs) {
-            if asst_ts > user_ts {
+        if let (Some(user_ts), Some(asst_ts)) = (*last_user_ts, entry.timestamp_secs)
+            && asst_ts > user_ts {
                 let secs = asst_ts - user_ts;
                 if secs >= 0.0 {
                     last_turn_duration = Some(Duration::from_secs_f64(secs));
                 }
             }
-        }
     }
 
     if clean_eof {
@@ -452,7 +444,7 @@ pub fn process_new_lines(
             .unwrap_or(file_len)
             .max(file_len);
         tail.last_pos = advanced_to;
-        tail.last_mtime = meta.modified().ok();
+        tail.last_mtime = crate::telemetry::modified_or_none(&meta);
     }
 
     if changed {
@@ -949,7 +941,7 @@ mod tests {
 
     /// Read partial / malformed lines must NOT advance the cursor
     /// past the unread bytes — mirrors the parity guarantee in
-    /// `claude_telemetry::process_new_lines`. JSON parse errors on a
+    /// `agents::claude::telemetry::process_new_lines`. JSON parse errors on a
     /// fully-read line are skipped (line-by-line basis); IO errors
     /// during the read leave `last_pos` unchanged.
     #[test]
@@ -977,7 +969,7 @@ mod tests {
 
     /// `last_pos` advances to the reader's actual stream position,
     /// not the pre-read `metadata.len()`. Mirrors the parity guarantee
-    /// in `copilot_telemetry::process_new_lines`.
+    /// in `agents::copilot::telemetry::process_new_lines`.
     #[test]
     fn cursor_advances_past_pre_read_file_len_when_log_grew_during_read() {
         let tmp = tempfile::tempdir().unwrap();

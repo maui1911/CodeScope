@@ -1,6 +1,6 @@
 //! Process-tree cleanup via Win32 job objects.
 //!
-//! Windows-only mirror of `src/CodeScope.Core/Interop/ProcessTreeKiller.cs`.
+//! Windows-only mirror of `legacy:CodeScope.Core/Interop/ProcessTreeKiller.cs`.
 //! A process-wide job object is created lazily on first
 //! [`adopt_handle`] call and held in a [`OnceLock`] for the rest of the
 //! process lifetime. Every PTY child handed to [`adopt_handle`] is

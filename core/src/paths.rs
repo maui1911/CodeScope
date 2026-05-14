@@ -146,3 +146,93 @@ pub fn rooted_for_tests(dev_mode: bool, root: &Path) -> AppPaths {
         state_dir,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // We can't safely toggle CODESCOPE_DEV via std::env in unit tests
+    // (process-wide mutation under parallel `cargo test`) so we cover
+    // the dev-mode contract by asserting the suffix on a rooted helper
+    // and the path-builder accessors against a known layout.
+
+    #[test]
+    fn dev_mode_uses_dev_suffix() {
+        let dir = TempDir::new().unwrap();
+        let paths = rooted_for_tests(true, dir.path());
+        assert_eq!(paths.app_folder, "CodeScope.Dev");
+        assert!(paths.config_dir.ends_with("CodeScope.Dev"));
+        assert!(paths.state_dir.ends_with("CodeScope.Dev"));
+    }
+
+    #[test]
+    fn prod_mode_uses_plain_folder() {
+        let dir = TempDir::new().unwrap();
+        let paths = rooted_for_tests(false, dir.path());
+        assert_eq!(paths.app_folder, "CodeScope");
+        assert!(paths.config_dir.ends_with("CodeScope"));
+        assert!(paths.state_dir.ends_with("CodeScope"));
+    }
+
+    #[test]
+    fn config_files_live_in_config_dir() {
+        let dir = TempDir::new().unwrap();
+        let paths = rooted_for_tests(false, dir.path());
+        assert_eq!(paths.settings_file(), paths.config_dir.join("settings.json"));
+        assert_eq!(paths.projects_file(), paths.config_dir.join("projects.json"));
+    }
+
+    #[test]
+    fn state_files_live_in_state_dir() {
+        let dir = TempDir::new().unwrap();
+        let paths = rooted_for_tests(false, dir.path());
+        assert_eq!(paths.layout_file(), paths.state_dir.join("layout.json"));
+        assert_eq!(paths.window_file(), paths.state_dir.join("window.json"));
+    }
+
+    #[test]
+    fn single_instance_mutex_has_dev_suffix_in_dev_mode() {
+        let dir = TempDir::new().unwrap();
+        let prod = rooted_for_tests(false, dir.path());
+        let dev = rooted_for_tests(true, dir.path());
+        assert_eq!(prod.single_instance_mutex(), "Global\\CodeScope.SingleInstance");
+        assert_eq!(dev.single_instance_mutex(), "Global\\CodeScope.SingleInstance.Dev");
+    }
+
+    #[test]
+    fn ensure_dirs_creates_both_layers() {
+        let dir = TempDir::new().unwrap();
+        let paths = rooted_for_tests(false, dir.path());
+        assert!(!paths.config_dir.exists());
+        assert!(!paths.state_dir.exists());
+
+        paths.ensure_dirs().expect("ensure_dirs succeeds on a fresh temp dir");
+
+        assert!(paths.config_dir.is_dir());
+        assert!(paths.state_dir.is_dir());
+    }
+
+    #[test]
+    fn ensure_dirs_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let paths = rooted_for_tests(false, dir.path());
+        paths.ensure_dirs().unwrap();
+        // Second call must not error even though the directories
+        // already exist.
+        paths.ensure_dirs().expect("ensure_dirs is idempotent");
+    }
+
+    #[test]
+    fn detect_observes_current_dev_env_var() {
+        // detect() reads CODESCOPE_DEV. We deliberately do *not* mutate
+        // the process env here — that would race with other tests under
+        // parallel `cargo test`. Instead, just check the contract:
+        // detect() must produce app_folder == "CodeScope" when dev_mode
+        // is false, and "CodeScope.Dev" when dev_mode is true,
+        // regardless of which mode the test runner happens to be in.
+        let paths = AppPaths::detect();
+        let expected_folder = if paths.dev_mode { "CodeScope.Dev" } else { "CodeScope" };
+        assert_eq!(paths.app_folder, expected_folder);
+    }
+}

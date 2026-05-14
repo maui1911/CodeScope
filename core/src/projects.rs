@@ -1,5 +1,5 @@
 //! Project / Worktree / Session models — Rust port of
-//! `src/CodeScope.Core/Models/{Project,Session,Worktree,ProjectsConfig}.cs`.
+//! `legacy:CodeScope.Core/Models/{Project,Session,Worktree,ProjectsConfig}.cs`.
 //!
 //! Field names match the C# build's JSON 1:1 so a `projects.json`
 //! written by the v0.x C# binary can be read by this build (and vice

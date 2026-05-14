@@ -1,5 +1,5 @@
 //! Themed confirm dialog — Rust port of
-//! `src/CodeScope.Ui/Dialogs/ConfirmDialog.xaml(.cs)`.
+//! `legacy:CodeScope.Ui/Dialogs/ConfirmDialog.xaml(.cs)`.
 //!
 //! Single in-app modal primitive for confirm / destructive prompts.
 //! Replaces the OS-native `window.prompt(...)` calls that were
@@ -235,7 +235,7 @@ impl AppShell {
         let ink_dim = theme::ink_dim(theme);
         let ink_muted = theme::ink_muted(theme);
         let frost = theme::frost_10(theme);
-        let danger = theme::danger(theme);
+        let danger = theme::danger();
         let accent = theme::accent(theme);
         let canvas = theme::canvas(theme);
         let text_faint = theme::text_faint();

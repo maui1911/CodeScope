@@ -1,7 +1,7 @@
 //! Cross-platform OS notification for the "turn complete" toast.
 //!
 //! Port of the C# `WindowsIdleToastNotifier` / `IIdleToastNotifier`
-//! pair (`src/CodeScope.App/Notifications/`, `src/CodeScope.Ui/Services/`).
+//! pair (`legacy:CodeScope.App/Notifications/`, `legacy:CodeScope.Ui/Services/`).
 //! The Rust port uses [`notify_rust`] so the same code path lights up
 //! a WinRT toast on Windows, a FreeDesktop dbus notification on Linux,
 //! and an `NSUserNotification` on macOS — no per-platform fork required.

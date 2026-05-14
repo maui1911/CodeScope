@@ -57,13 +57,18 @@ to `layout.json`; the project / worktree / session tree persists to
 - `git` — shells out to `git` via `std::process::Command`. Async-aware
   through the GPUI background executor; results returned as
   `Result<T, …>` for non-exceptional failures.
-- `session_manager` — owns the lifecycle of running terminal sessions.
-  Spawns the shell in a directory, hands the pty to
-  `codescope-terminal`, and tears the process tree down on tab close
-  (Win32 job object on Windows; `setpgid` + `killpg` on Unix).
-- `claude_telemetry`, `claude_discovery`, `notifications`,
-  `update_check`, `layout`, `paths`, `settings`, `window_state`,
-  `attachments` — one module per concern, all UI-free.
+- `session` — owns the lifecycle of running terminal sessions
+  (`SessionManager` open / soft_close / reopen / hard_remove / rename
+  + the retention sweep). Mirrors C# `SessionStore` / `SessionManager`.
+- `agents::{claude,copilot,opencode,pi}::{discovery,telemetry}` —
+  per-vendor agent adoption discovery + transcript-tail telemetry,
+  all built on the vendor-neutral primitives in `telemetry`
+  (`SessionState`, `TelemetrySnapshot`, `FileTail`,
+  `context_window_for_model`, `format_tokens`, `format_context_pct`).
+- `update_check`, `layout`, `paths`, `settings`, `window_state`,
+  `attachments`, `crash_log`, `memory_watchdog`, `process`, `theme`,
+  `time` — one module per concern, all UI-free. The GPUI shell crate
+  (`src/`) re-exports nothing back into core.
 
 `src/` (repo root) hosts the GPUI shell (`app.rs` → `AppShell`,
 `view.rs`, `sidebar.rs`, dialogs, status bar). Render-state mutations

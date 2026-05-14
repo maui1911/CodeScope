@@ -291,7 +291,7 @@ fn build_extended(ansi: &[Rgb; 16]) -> Vec<Rgb> {
 mod tests {
     //! Lock the canonical chrome hex values shipped by the default
     //! theme. These come straight from
-    //! `src/CodeScope.App/Styles/DesignTokens.xaml`:
+    //! `legacy:CodeScope.App/Styles/DesignTokens.xaml`:
     //!
     //! * `Fig.Color.Canvas`     = `#FF000000`
     //! * `Fig.Color.NearBlack`  = `#FF090909` (the `Surface.Panel` brush)

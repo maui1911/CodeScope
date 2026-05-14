@@ -27,7 +27,7 @@
 //! the matching pane below. Groups mirror the C# build's
 //! `EditorGroupViewModel` flat list — no recursive split tree.
 //!
-//! Visuals follow `src/CodeScope.App/Styles/DesignTokens.xaml`:
+//! Visuals follow `legacy:CodeScope.App/Styles/DesignTokens.xaml`:
 //! pure-black canvas, pure-white ink, single Framer Blue accent,
 //! frosted-glass surfaces. See [`crate::theme`] for the tokens.
 //!
@@ -196,7 +196,7 @@ struct SplitterDrag {
 /// wrong project / worktree).
 fn path_eq_ci(a: &str, b: &str) -> bool {
     fn norm(s: &str) -> &str {
-        s.trim_end_matches(|c| c == '\\' || c == '/')
+        s.trim_end_matches(['\\', '/'])
     }
     let a = norm(a);
     let b = norm(b);
@@ -317,7 +317,6 @@ struct Toast {
 pub(crate) enum ToastKind {
     Ok,
     Err,
-    #[allow(dead_code)]
     Info,
 }
 
@@ -385,13 +384,6 @@ struct SidebarDrag {
 struct TabDragData {
     source_group_id: u64,
     source_tab_id: u64,
-    /// Snapshotted at drag start. Currently unused — the preview
-    /// view captures its own copy in the `on_drag` constructor —
-    /// but keeping it on the payload means future drop targets
-    /// (e.g. status-bar history rows) can label the dropped tab
-    /// without going back through `self.groups`.
-    #[allow(dead_code)]
-    title: SharedString,
 }
 
 /// Live drop-cursor state: which group's strip is currently being
@@ -477,7 +469,7 @@ impl Render for DraggedTab {
 /// into one heterogeneous map so the discovery / poll plumbing stays
 /// agent-agnostic.
 enum AgentTail {
-    Claude(codescope_core::TranscriptTail),
+    Claude(codescope_core::ClaudeTranscriptTail),
     Copilot(codescope_core::CopilotTranscriptTail),
     OpenCode(codescope_core::OpenCodeMessageTail),
     Pi(codescope_core::PiTranscriptTail),
@@ -497,7 +489,7 @@ impl AgentTail {
         match self {
             AgentTail::Claude(t) => t.snapshot.clone(),
             AgentTail::Copilot(t) => t.snapshot.clone(),
-            AgentTail::OpenCode(t) => t.snapshot().cloned(),
+            AgentTail::OpenCode(t) => t.snapshot.clone(),
             AgentTail::Pi(t) => t.snapshot.clone(),
         }
     }
@@ -695,7 +687,7 @@ pub struct AppShell {
     /// writes (project / worktree mutations also persist to
     /// `projects.json`) are not clobbered, then applies the change
     /// via [`SessionManager`] and writes back via
-    /// [`session::save`]. The Sidebar still owns its own
+    /// [`ProjectsConfig::save`]. The Sidebar still owns its own
     /// `ProjectsConfig` clone for project / worktree rendering —
     /// they converge through the shared file. This split mirrors
     /// the C# build where `SessionStore` is the orchestrator and
@@ -704,12 +696,8 @@ pub struct AppShell {
     /// Registry of agent profiles built from `settings.agents`
     /// overrides (or the shipped built-in defaults when none are
     /// configured). Mirrors C# `AgentRegistry` — owned at the shell
-    /// level so the future new-session menu can list agents, pick the
+    /// level so the new-session menu can list agents, pick the
     /// user's preferred default, and look up by id on session restore.
-    /// Not yet consumed by any view; held here so the registry is live
-    /// from cold-start and the sidebar integration in a follow-up PR
-    /// only has to wire the consumer side.
-    #[allow(dead_code)]
     agent_registry: codescope_core::AgentRegistry,
     /// Open command palette state, if any. `Some` between
     /// Ctrl+Shift+P press and Enter / Esc. Holds the action list,
@@ -729,21 +717,21 @@ pub struct AppShell {
     /// build's hand-edit-the-file workflow. See ADR-0018. Visible
     /// fields mirror exactly what's in [`codescope_core::Settings`];
     /// no schema additions.
-    pub(crate) settings_dialog: Option<crate::settings_dialog::SettingsDialogState>,
+    pub(crate) settings_dialog: Option<crate::dialogs::settings::SettingsDialogState>,
     /// Open Rename dialog, if any. Surfaces a single text-input modal
     /// for renaming a project or a session (live or closed). Mirrors
     /// the C# build's `Dialogs.RenameDialog.Prompt` — the Rust port
     /// owns it on AppShell instead of opening a modal `Window` because
     /// gpui doesn't have a modal-window primitive. See
-    /// `rename_dialog.rs` for the full rationale.
-    pub(crate) rename_dialog: Option<crate::rename_dialog::RenameDialogState>,
+    /// `src/dialogs/rename.rs` for the full rationale.
+    pub(crate) rename_dialog: Option<crate::dialogs::rename::RenameDialogState>,
     /// Open Confirm dialog, if any. Themed in-app replacement for the
     /// OS-native `window.prompt(...)` used by destructive sidebar
     /// actions (remove project, discard worktree changes, remove
     /// worktree, force-retry, remove from history). Mirrors C#
     /// `Dialogs.ConfirmDialog.Confirm` / `Destructive`. See
-    /// `confirm_dialog.rs`.
-    pub(crate) confirm_dialog: Option<crate::confirm_dialog::ConfirmDialogState>,
+    /// `src/dialogs/confirm.rs`.
+    pub(crate) confirm_dialog: Option<crate::dialogs::confirm::ConfirmDialogState>,
     /// Multiplatform taskbar / dock badge driver. Mirrors C#
     /// `TaskbarBadgeService`. Refreshed from the same telemetry-poll
     /// callback that updates the sidebar dots
@@ -1374,7 +1362,7 @@ impl AppShell {
         if !changed {
             return;
         }
-        if let Err(err) = codescope_core::session::save(&self.projects, &self.paths) {
+        if let Err(err) = self.projects.save(&self.paths) {
             eprintln!(
                 "warning: failed to persist agent_session_id for {session_id}: {err:#}"
             );
@@ -1403,14 +1391,14 @@ impl AppShell {
                     );
                     return;
                 };
-                AgentTail::Claude(codescope_core::TranscriptTail::for_session(
+                AgentTail::Claude(codescope_core::ClaudeTranscriptTail::for_session(
                     &root,
                     working_directory,
                     &session_id,
                 ))
             }
             codescope_core::AgentId::Copilot => {
-                let Some(root) = codescope_core::copilot_telemetry::default_session_state_root()
+                let Some(root) = codescope_core::agents::copilot::telemetry::default_session_state_root()
                 else {
                     eprintln!(
                         "[telemetry] no USERPROFILE / HOME — skipping copilot registration for {session_id}"
@@ -1423,14 +1411,14 @@ impl AppShell {
                 ))
             }
             codescope_core::AgentId::OpenCode => {
-                let Some(root) = codescope_core::opencode_telemetry::default_data_root() else {
+                let Some(root) = codescope_core::agents::opencode::telemetry::default_data_root() else {
                     eprintln!(
                         "[telemetry] no USERPROFILE / HOME — skipping opencode registration for {session_id}"
                     );
                     return;
                 };
-                AgentTail::OpenCode(codescope_core::OpenCodeMessageTail::new(
-                    root,
+                AgentTail::OpenCode(codescope_core::OpenCodeMessageTail::for_session(
+                    &root,
                     session_id.clone(),
                 ))
             }
@@ -1446,7 +1434,7 @@ impl AppShell {
                 return;
             }
             codescope_core::AgentId::Pi => {
-                let Some(root) = codescope_core::pi_telemetry::default_sessions_root() else {
+                let Some(root) = codescope_core::agents::pi::telemetry::default_sessions_root() else {
                     eprintln!(
                         "[telemetry] no USERPROFILE / HOME — skipping pi registration for {session_id}"
                     );
@@ -1730,7 +1718,7 @@ impl AppShell {
                                     let Some(root) = Self::claude_projects_root() else {
                                         continue;
                                     };
-                                    codescope_core::claude_discovery::scan(
+                                    codescope_core::agents::claude::discovery::scan(
                                         &root, &wd_str, tab.spawned_at,
                                     )
                                     .into_iter()
@@ -1739,11 +1727,11 @@ impl AppShell {
                                 }
                                 codescope_core::AgentId::Pi => {
                                     let Some(root) =
-                                        codescope_core::pi_telemetry::default_sessions_root()
+                                        codescope_core::agents::pi::telemetry::default_sessions_root()
                                     else {
                                         continue;
                                     };
-                                    codescope_core::pi_discovery::scan(
+                                    codescope_core::agents::pi::discovery::scan(
                                         &root, &wd_str, tab.spawned_at,
                                     )
                                     .into_iter()
@@ -1752,11 +1740,11 @@ impl AppShell {
                                 }
                                 codescope_core::AgentId::OpenCode => {
                                     let Some(root) =
-                                        codescope_core::opencode_telemetry::default_data_root()
+                                        codescope_core::agents::opencode::telemetry::default_data_root()
                                     else {
                                         continue;
                                     };
-                                    codescope_core::opencode_discovery::scan(
+                                    codescope_core::agents::opencode::discovery::scan(
                                         &root, &wd_str, tab.spawned_at,
                                     )
                                     .into_iter()
@@ -1765,11 +1753,11 @@ impl AppShell {
                                 }
                                 codescope_core::AgentId::Copilot => {
                                     let Some(root) =
-                                        codescope_core::copilot_telemetry::default_session_state_root()
+                                        codescope_core::agents::copilot::telemetry::default_session_state_root()
                                     else {
                                         continue;
                                     };
-                                    codescope_core::copilot_discovery::scan(
+                                    codescope_core::agents::copilot::discovery::scan(
                                         &root, &wd_str, tab.spawned_at,
                                     )
                                     .into_iter()
@@ -1817,11 +1805,10 @@ impl AppShell {
                         }
                     }
                     for f in found {
-                        if let Some(prev) = f.previous_agent_session_id.as_deref() {
-                            if prev != f.new_agent_session_id {
+                        if let Some(prev) = f.previous_agent_session_id.as_deref()
+                            && prev != f.new_agent_session_id {
                                 this.unregister_telemetry(prev);
                             }
-                        }
                         this.register_telemetry(
                             f.agent_id,
                             f.new_agent_session_id.clone(),
@@ -1837,13 +1824,12 @@ impl AppShell {
                             &f.codescope_session_id,
                             &f.new_agent_session_id,
                         );
-                        if let Some(group) = this.groups.get_mut(f.group_idx) {
-                            if let Some(tab) = group.tabs.get_mut(f.tab_idx) {
+                        if let Some(group) = this.groups.get_mut(f.group_idx)
+                            && let Some(tab) = group.tabs.get_mut(f.tab_idx) {
                                 tab.adopted_session_id =
                                     Some(f.new_agent_session_id.clone());
                                 tab.fired_session_ids.insert(f.new_agent_session_id);
                             }
-                        }
                     }
                     if any_active { active } else { idle }
                 });
@@ -2192,7 +2178,7 @@ impl AppShell {
                 .map(SharedString::from);
 
             // Title mirrors C# `MainViewModel.HydrateFromLoaded`
-            // (`src/CodeScope.Ui/ViewModels/MainViewModel.cs:1126-1133`):
+            // (`legacy:CodeScope.Ui/ViewModels/MainViewModel.cs:1126-1133`):
             // when the worktree has a branch we override the
             // descriptor title with `{project} · {branch}`, otherwise
             // we fall back to the descriptor's own title — which
@@ -2449,7 +2435,7 @@ impl AppShell {
         };
         match SessionManager::open(&mut self.projects, &project_id, session, &now_iso8601()) {
             Ok(_) => {
-                if let Err(err) = codescope_core::session::save(&self.projects, &self.paths) {
+                if let Err(err) = self.projects.save(&self.paths) {
                     eprintln!("warning: failed to persist session open: {err:#}");
                 }
             }
@@ -2494,7 +2480,7 @@ impl AppShell {
         }
         match SessionManager::soft_close(&mut self.projects, session_id, &now_iso8601()) {
             Ok(_pruned) => {
-                if let Err(err) = codescope_core::session::save(&self.projects, &self.paths) {
+                if let Err(err) = self.projects.save(&self.paths) {
                     eprintln!("warning: failed to persist session soft-close: {err:#}");
                 }
             }
@@ -2529,7 +2515,7 @@ impl AppShell {
     /// session store lives on AppShell.
     pub(crate) fn handle_open_confirm_dialog(
         &mut self,
-        spec: crate::confirm_dialog::ConfirmSpec,
+        spec: crate::dialogs::confirm::ConfirmSpec,
         action: crate::sidebar::ConfirmAction,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2598,7 +2584,7 @@ impl AppShell {
             );
             return;
         }
-        if let Err(err) = codescope_core::session::save(&self.projects, &self.paths) {
+        if let Err(err) = self.projects.save(&self.paths) {
             self.push_toast(
                 ToastKind::Err,
                 SharedString::from("Remove failed"),
@@ -2659,7 +2645,7 @@ impl AppShell {
                 return;
             }
         };
-        if let Err(err) = codescope_core::session::save(&self.projects, &self.paths) {
+        if let Err(err) = self.projects.save(&self.paths) {
             eprintln!("warning: failed to persist session reopen: {err:#}");
         }
         // Mirror the updated config into the sidebar so the closed
@@ -2787,7 +2773,7 @@ impl AppShell {
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.open_new_project_dialog(window, cx);
             sidebar.set_new_project_mode(
-                crate::new_project_dialog::DialogMode::Clone,
+                crate::dialogs::new_project::DialogMode::Clone,
                 cx,
             );
         });
@@ -2812,15 +2798,6 @@ impl AppShell {
             sidebar.set_overview_visible(value, cx);
         });
         cx.notify();
-    }
-
-    /// Read accessor for the overview visibility flag. Used by
-    /// `render` to swap the work area for the Overview panel and by
-    /// the sidebar (via property forwarding in a future PR) to flip
-    /// its footer button into the "active" look.
-    #[allow(dead_code)]
-    pub(crate) fn show_overview(&self) -> bool {
-        self.show_overview
     }
 
     /// Read-only borrow of the session catalog. Exposed to the
@@ -3063,7 +3040,7 @@ impl AppShell {
         // already-running terminals.
         let palette = ColorPalette::from_theme_palette(&self.theme.palette);
         let cursor_preset = CursorStylePreset {
-            shape: cursor_shape_from_str(&self.settings.cursor.shape),
+            shape: cursor_shape_from_setting(self.settings.cursor.shape),
             blinking: self.settings.cursor.blinking,
         };
         let font = build_font_config(&self.settings);
@@ -3096,7 +3073,7 @@ impl AppShell {
         };
 
         let terminal = cx.new(|cx| {
-            TerminalView::new_full_with_working_directory(
+            TerminalView::new(
                 backend,
                 palette,
                 font,
@@ -3624,7 +3601,7 @@ impl AppShell {
         let ink = theme::ink(theme);
         let ink_dim = theme::ink_dim(theme);
         let ink_ghost = theme::ink_ghost(theme);
-        let danger = theme::danger(theme);
+        let danger = theme::danger();
         let accent_clean = theme::status_clean(theme);
 
         let stack = div()
@@ -4088,7 +4065,7 @@ impl AppShell {
         let ink_dim = theme::ink_dim(theme);
         let ink_ghost = theme::ink_ghost(theme);
         let frost = theme::frost_10(theme);
-        let danger = theme::danger(theme);
+        let danger = theme::danger();
 
         type Action = Box<dyn Fn(&mut AppShell, &mut Window, &mut Context<AppShell>) + 'static>;
         let item = |id: &'static str,
@@ -4660,7 +4637,7 @@ impl AppShell {
                             .h(px(12.0))
                             .text_color(ink_dim),
                     )
-                    .child(codescope_core::TranscriptTail::format_duration(d))
+                    .child(codescope_core::ClaudeTranscriptTail::format_duration(d))
             });
 
         let agent_summary_visible = agent_busy + agent_idle > 0;
@@ -5040,15 +5017,14 @@ impl AppShell {
                 // subset whose telemetry state is `Busy` or
                 // `PendingToolUse`.
                 active.insert(canon.clone());
-                if let Some(snap) = self.telemetry_for(sid) {
-                    if matches!(
+                if let Some(snap) = self.telemetry_for(sid)
+                    && matches!(
                         snap.state,
                         codescope_core::SessionState::Busy
                             | codescope_core::SessionState::PendingToolUse
                     ) {
                         busy.insert(canon);
                     }
-                }
             }
         }
         self.sidebar.update(cx, |sidebar, cx| {
@@ -5220,7 +5196,7 @@ impl AppShell {
                     let detail = match snap.last_turn_duration {
                         Some(d) => format!(
                             "Turn complete · {}",
-                            codescope_core::TranscriptTail::format_duration(d)
+                            codescope_core::ClaudeTranscriptTail::format_duration(d)
                         ),
                         None => "Turn complete.".to_string(),
                     };
@@ -5285,9 +5261,8 @@ impl AppShell {
     /// accumulate in the ring buffer until the user clears them or the
     /// ring reaches its cap (50).  Returns the id of the new entry.
     ///
-    /// The bell button (integrating PR) wires this up for session events;
+    /// The bell button wires this up for session events;
     /// callers can also call it directly for generic system events.
-    #[allow(dead_code)]
     pub(crate) fn push_notification(
         &mut self,
         kind: crate::notifications::NotificationKind,
@@ -5904,7 +5879,7 @@ impl Render for AppShell {
         let ink = theme::ink(&theme);
         let ink_dim = theme::ink_dim(&theme);
         let frost_hover = theme::frost_10(&theme);
-        let close_hover_bg = theme::danger(&theme);
+        let close_hover_bg = theme::danger();
         let caption_base = move |id: &'static str, area: WindowControlArea, glyph: &'static str| {
             div()
                 .id(id)
@@ -7024,13 +6999,12 @@ impl AppShell {
             // `GroupStripView` keeps the dot tied to `Status` rather
             // than `IsSelected`.
             let status_dot = if tmeta.busy { signal_warn } else { signal_ok };
-            // Drag payload — stable ids + the title so the drag
-            // preview can render without holding a borrow on
-            // `self.groups`.
+            // Drag payload — stable ids only. The preview view
+            // captures its own copy of the title in the on_drag
+            // closure, so the payload doesn't need to carry it.
             let drag_payload = TabDragData {
                 source_group_id: group_id,
                 source_tab_id: tab_id,
-                title: title.clone(),
             };
             let title_for_drag = title.clone();
             let theme_for_preview = theme_for_drag.clone();
@@ -7468,14 +7442,16 @@ fn window_state_from_window(window: &Window) -> WindowState {
 
 // ─── Settings → terminal-config helpers ─────────────────────────────
 
-fn cursor_shape_from_str(s: &str) -> codescope_terminal::CursorShape {
-    use codescope_terminal::CursorShape;
-    match s {
-        "block" => CursorShape::Block,
-        "underline" | "underscore" => CursorShape::Underline,
-        "hollow-block" | "hollow_block" => CursorShape::HollowBlock,
-        // "beam", anything else → beam (Windows-Terminal default).
-        _ => CursorShape::Beam,
+fn cursor_shape_from_setting(
+    shape: codescope_core::CursorShape,
+) -> codescope_terminal::CursorShape {
+    use codescope_core::CursorShape as Setting;
+    use codescope_terminal::CursorShape as Renderer;
+    match shape {
+        Setting::Block => Renderer::Block,
+        Setting::Beam => Renderer::Beam,
+        Setting::Underline => Renderer::Underline,
+        Setting::HollowBlock => Renderer::HollowBlock,
     }
 }
 
@@ -7582,7 +7558,7 @@ fn classify_activity_transition(
             let detail = match snap.last_turn_duration {
                 Some(d) => format!(
                     "Turn complete · {}",
-                    codescope_core::TranscriptTail::format_duration(d)
+                    codescope_core::ClaudeTranscriptTail::format_duration(d)
                 ),
                 None => "Turn complete.".to_string(),
             };
@@ -7951,7 +7927,7 @@ mod tests {
         snap.last_turn_duration = Some(std::time::Duration::from_secs(75));
         let (_, _, detail) =
             classify_activity_transition(codescope_core::SessionState::Busy, &snap).unwrap();
-        // 75 s → "1m 15s" per `TranscriptTail::format_duration`.
+        // 75 s → "1m 15s" per `ClaudeTranscriptTail::format_duration`.
         assert_eq!(detail, "Turn complete · 1m 15s");
     }
 

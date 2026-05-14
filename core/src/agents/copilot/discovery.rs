@@ -4,7 +4,7 @@
 //!
 //! Mirrors `CopilotSessionDiscovery` from the C# build but uses
 //! polling only (no `notify` crate dep). Same `scan_*` shape as
-//! [`crate::claude_discovery`]: pure logic, the caller drives the
+//! [`crate::agents::claude::discovery`]: pure logic, the caller drives the
 //! cadence.
 //!
 //! # Semantics
@@ -76,7 +76,7 @@ pub fn scan(
         }
         let Ok(meta) = entry.metadata() else { continue };
         let created = meta.created().ok();
-        let modified = meta.modified().ok();
+        let modified = crate::telemetry::modified_or_none(&meta);
         let eligible = matches!(created, Some(t) if t >= since)
             || matches!(modified, Some(t) if t >= since);
         if !eligible {

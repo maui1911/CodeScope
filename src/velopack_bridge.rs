@@ -1,5 +1,5 @@
 //! Velopack-rs apply path — Rust port mirror of the C# build's
-//! `src/CodeScope.App/Updates/UpdateService.cs`.
+//! `legacy:CodeScope.App/Updates/UpdateService.cs`.
 //!
 //! ## Why this lives in the binary, not in `codescope-core`
 //!

@@ -1,14 +1,10 @@
 //! Session lifecycle layer — Rust port of
-//! `src/CodeScope.Core/Services/{SessionManager,SessionStore (session
-//! mutators),SessionRetentionPolicy,SessionDescriptor}.cs`.
-//!
-//! **Foundation-only PR.** This module introduces the data shape and
+//! `legacy:CodeScope.Core/Services/{SessionManager,SessionStore (session
+//! mutators),SessionRetentionPolicy,SessionDescriptor}.cs`. Provides
 //! the in-memory session-lifecycle primitives (open / soft-close /
-//! reopen / hard-remove / rename / retention sweep) so a follow-up PR
-//! can plumb the existing ad-hoc `Tab` layer through it without also
-//! having to invent the data layer at the same time. Nothing in this
-//! file is wired into the runtime yet — every public symbol is
-//! intentionally `#[allow(dead_code)]` until a future PR consumes it.
+//! reopen / hard-remove / rename / retention sweep) consumed by the
+//! shell's tab layer in `src/app.rs` and the rename dialog in
+//! `src/dialogs/rename.rs`.
 //!
 //! ## Where sessions live on disk
 //!
@@ -50,7 +46,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 
 use crate::paths::AppPaths;
 use crate::projects::{ProjectsConfig, Session};
@@ -187,14 +183,14 @@ pub fn format_closed_at_relative(closed_at_iso: Option<&str>, now_iso: &str) -> 
         return format!("{}d ago", (delta / 86_400.0) as i64);
     }
     // Older than a week — fall back to "MMM d" of the closed_at date.
-    let (_y, m, d, _hh, _mm, _ss) = crate::time::unix_secs_to_civil(closed_secs as i64);
-    let month = match m {
+    let dt = crate::time::unix_secs_to_civil(closed_secs as i64);
+    let month = match dt.month {
         1 => "Jan", 2 => "Feb", 3 => "Mar", 4 => "Apr",
         5 => "May", 6 => "Jun", 7 => "Jul", 8 => "Aug",
         9 => "Sep", 10 => "Oct", 11 => "Nov", 12 => "Dec",
         _ => "",
     };
-    format!("{month} {d}")
+    format!("{month} {day}", day = dt.day)
 }
 
 /// In-memory orchestration over the persisted `Session` rows in a
@@ -237,8 +233,7 @@ impl SessionManager {
     /// `if (prunedSessionIds.Count > 0) { await SaveSnapshotAsync(); }`
     /// finally-block.
     pub fn load_with_sweep(paths: &AppPaths, now_iso: &str) -> Result<ProjectsConfig> {
-        let mut cfg = ProjectsConfig::load(paths)?;
-        Self::apply_retention(&mut cfg, now_iso, None);
+        let (cfg, _pruned) = Self::load_and_sweep(ProjectsConfig::load(paths)?, now_iso);
         Ok(cfg)
     }
 
@@ -256,12 +251,11 @@ impl SessionManager {
         paths: &AppPaths,
         now_iso: &str,
     ) -> Result<(ProjectsConfig, Option<anyhow::Error>)> {
-        let mut cfg = ProjectsConfig::load(paths)?;
-        let pruned = Self::apply_retention(&mut cfg, now_iso, None);
+        let (cfg, pruned) = Self::load_and_sweep(ProjectsConfig::load(paths)?, now_iso);
         if pruned.is_empty() {
             return Ok((cfg, None));
         }
-        let save_err = save(&cfg, paths).err();
+        let save_err = cfg.save(paths).err();
         Ok((cfg, save_err))
     }
 
@@ -269,9 +263,20 @@ impl SessionManager {
     /// path. Used by tests to avoid hitting the user's real
     /// `%APPDATA%`.
     pub fn load_from_with_sweep(path: &Path, now_iso: &str) -> Result<ProjectsConfig> {
-        let mut cfg = ProjectsConfig::load_from(path)?;
-        Self::apply_retention(&mut cfg, now_iso, None);
+        let (cfg, _pruned) = Self::load_and_sweep(ProjectsConfig::load_from(path)?, now_iso);
         Ok(cfg)
+    }
+
+    /// Shared body of the three load entry points: apply the retention
+    /// sweep to an already-loaded config and return (config, pruned
+    /// session ids). Pulled out so each public variant only carries
+    /// the bit that differs (path source, persistence policy).
+    fn load_and_sweep(
+        mut cfg: ProjectsConfig,
+        now_iso: &str,
+    ) -> (ProjectsConfig, Vec<String>) {
+        let pruned = Self::apply_retention(&mut cfg, now_iso, None);
+        (cfg, pruned)
     }
 
     // ---- session lifecycle -----------------------------------------
@@ -406,57 +411,27 @@ impl SessionManager {
         Err(anyhow!("session '{session_id}' not found"))
     }
 
-    /// Stamp `agent_session_id` on the session whose CodeScope id is
-    /// `session_id`. Strict variant: errors when the session can't be
-    /// found in any project.
+    /// Lenient discovery-callback entry point: stamp `agent_session_id`
+    /// on the session whose CodeScope id is `session_id`, returning
+    /// `false` instead of erroring when the session id isn't found.
     ///
-    /// This is the discovery-callback entry point used by the Rust app
-    /// shell once an agent (Claude / Pi / OpenCode / Copilot) reports
-    /// its own session UUID via a transcript / state file. Mirrors C#
-    /// `SessionStore.UpdateAgentSessionIdAsync` but with the
-    /// non-optional `&str` signature `MainViewModel.ApplyAdoption`
-    /// actually uses at the callsite — see PR #178 for the resume-by-id
-    /// machinery that consumes the persisted value.
+    /// Swallows the cold-start race where a freshly-spawned tab's first
+    /// discovery tick fires before [`Self::open`] has written the new
+    /// row to `projects.json`. The next tick (250–350 ms later) lands
+    /// after the row exists and the stamp succeeds normally. Mirrors C#
+    /// `SessionStore.UpdateAgentSessionIdAsync`; see PR #178 for the
+    /// resume-by-id machinery that consumes the persisted value.
     ///
-    /// Idempotent: a no-op when the persisted value already matches
-    /// `agent_session_id`, so callers can hit this on every discovery
-    /// tick without producing redundant writes. Returns `Ok(true)` when
-    /// the value actually changed (callers should persist),
-    /// `Ok(false)` for a no-op (callers can skip the write).
-    ///
-    /// Implemented as a thin wrapper over
-    /// [`Self::update_agent_session_id`] so the session-walk/mutation
-    /// logic only lives in one place.
-    pub fn set_agent_session_id(
-        cfg: &mut ProjectsConfig,
-        session_id: &str,
-        agent_session_id: &str,
-    ) -> Result<bool> {
-        Self::update_agent_session_id(cfg, session_id, Some(agent_session_id))
-    }
-
-    /// Lenient cousin of [`Self::set_agent_session_id`]. Returns
-    /// `false` instead of erroring when the session id isn't found —
-    /// used by the agent-discovery callback path to swallow the
-    /// cold-start race where a freshly-spawned tab's first discovery
-    /// tick fires before [`Self::open`] has written the new row to
-    /// `projects.json`. The next tick (250–350 ms later) will land
-    /// after the row exists and the stamp succeeds normally.
-    ///
-    /// Returns `true` when the value actually changed, `false` for a
-    /// no-op (either the value already matched, or the session id is
-    /// unknown). Mirrors the strict variant's `Result<bool>` contract
-    /// minus the error arm.
-    ///
-    /// Implemented on top of [`Self::set_agent_session_id`] so the
-    /// session-walk/mutation logic is shared — the lenient policy is
-    /// just "treat the strict variant's error as a no-op".
+    /// Idempotent: returns `true` only when the value actually changed,
+    /// `false` for a no-op (either the value already matched, or the
+    /// session id is unknown).
     pub fn set_agent_session_id_lenient(
         cfg: &mut ProjectsConfig,
         session_id: &str,
         agent_session_id: &str,
     ) -> bool {
-        Self::set_agent_session_id(cfg, session_id, agent_session_id).unwrap_or(false)
+        Self::update_agent_session_id(cfg, session_id, Some(agent_session_id))
+            .unwrap_or(false)
     }
 
     // ---- queries ---------------------------------------------------
@@ -516,11 +491,10 @@ impl SessionManager {
 
         let mut pruned = Vec::new();
         for project in cfg.projects.iter_mut() {
-            if let Some(filter) = project_filter {
-                if project.id != filter {
+            if let Some(filter) = project_filter
+                && project.id != filter {
                     continue;
                 }
-            }
 
             let mut keep: Vec<Session> = Vec::with_capacity(project.sessions.len());
             // Bucket by worktree_id (None collapses to a single
@@ -577,18 +551,10 @@ impl SessionManager {
     }
 }
 
-// Timestamp helpers live in [`crate::time`] so [`crate::claude_telemetry`]
+// Timestamp helpers live in [`crate::time`] so [`crate::agents::claude::telemetry`]
 // can share them — both call sites need the same narrow ISO-8601
 // subset and were on the verge of drifting before consolidation
 // (Copilot review on PR #114). [`now_iso8601`] is re-exported above.
-
-/// Convenience: persist `cfg` via the standard
-/// [`ProjectsConfig::save`] path. Wrapped here so future call sites
-/// can switch to a session-only file (or anything else) without the
-/// integration sites changing.
-pub fn save(cfg: &ProjectsConfig, paths: &AppPaths) -> Result<()> {
-    cfg.save(paths).context("save projects.json")
-}
 
 #[cfg(test)]
 mod tests {
@@ -1006,7 +972,7 @@ mod tests {
         p.sessions.push(make_session("s1", None));
         cfg.projects.push(p);
 
-        let changed = SessionManager::set_agent_session_id(&mut cfg, "s1", "uuid-abc")
+        let changed = SessionManager::update_agent_session_id(&mut cfg, "s1", Some("uuid-abc"))
             .unwrap();
         assert!(changed);
         assert_eq!(
@@ -1024,7 +990,7 @@ mod tests {
         p.sessions.push(s);
         cfg.projects.push(p);
 
-        let changed = SessionManager::set_agent_session_id(&mut cfg, "s1", "uuid-abc")
+        let changed = SessionManager::update_agent_session_id(&mut cfg, "s1", Some("uuid-abc"))
             .unwrap();
         assert!(!changed);
         assert_eq!(
@@ -1037,7 +1003,7 @@ mod tests {
     fn set_agent_session_id_errors_on_unknown_session() {
         let mut cfg = ProjectsConfig::default();
         cfg.projects.push(make_project("p1"));
-        let err = SessionManager::set_agent_session_id(&mut cfg, "ghost", "uuid-abc")
+        let err = SessionManager::update_agent_session_id(&mut cfg, "ghost", Some("uuid-abc"))
             .unwrap_err();
         assert!(err.to_string().contains("ghost"));
     }
@@ -1078,7 +1044,7 @@ mod tests {
         p.sessions.push(make_session("s1", None));
         cfg.projects.push(p);
 
-        SessionManager::set_agent_session_id(&mut cfg, "s1", "uuid-abc").unwrap();
+        SessionManager::update_agent_session_id(&mut cfg, "s1", Some("uuid-abc")).unwrap();
         cfg.save_to(&path).unwrap();
 
         let loaded = SessionManager::load_from_with_sweep(&path, fixed_now()).unwrap();
@@ -1535,7 +1501,7 @@ mod tests {
         let mut cfg = ProjectsConfig::load(&paths).unwrap();
         let session = make_session("s1", Some("primary"));
         SessionManager::open(&mut cfg, "p1", session, fixed_now()).unwrap();
-        save(&cfg, &paths).unwrap();
+        cfg.save(&paths).unwrap();
 
         // 3. Reload and verify the row persisted with last_opened set.
         let reloaded = ProjectsConfig::load(&paths).unwrap();
@@ -1549,7 +1515,7 @@ mod tests {
         let mut cfg = ProjectsConfig::load(&paths).unwrap();
         let pruned = SessionManager::soft_close(&mut cfg, "s1", fixed_now()).unwrap();
         assert!(pruned.is_empty());
-        save(&cfg, &paths).unwrap();
+        cfg.save(&paths).unwrap();
 
         // 5. Reload — row still present, now with closed_at.
         let reloaded = ProjectsConfig::load(&paths).unwrap();
@@ -1588,7 +1554,7 @@ mod tests {
             fixed_now(),
         )
         .unwrap();
-        save(&prod_cfg, &prod).unwrap();
+        prod_cfg.save(&prod).unwrap();
 
         let mut dev_cfg = SessionManager::load_with_sweep(&dev, fixed_now()).unwrap();
         SessionManager::open(
@@ -1598,7 +1564,7 @@ mod tests {
             fixed_now(),
         )
         .unwrap();
-        save(&dev_cfg, &dev).unwrap();
+        dev_cfg.save(&dev).unwrap();
 
         // Each side reads back only its own session.
         let prod_back = ProjectsConfig::load(&prod).unwrap();
@@ -1629,7 +1595,7 @@ mod tests {
             fixed_now(),
         )
         .unwrap();
-        save(&cfg, &paths).unwrap();
+        cfg.save(&paths).unwrap();
 
         // Sidebar (out-of-band) appends a second project to disk
         // — simulating an `add_project` write between AppShell ticks.
@@ -1641,7 +1607,7 @@ mod tests {
         // first (mirrors `AppShell::soft_close_session`).
         let mut cfg = ProjectsConfig::load(&paths).unwrap();
         SessionManager::soft_close(&mut cfg, "s1", fixed_now()).unwrap();
-        save(&cfg, &paths).unwrap();
+        cfg.save(&paths).unwrap();
 
         // Final state: both projects present, s1 closed.
         let final_cfg = ProjectsConfig::load(&paths).unwrap();

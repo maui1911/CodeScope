@@ -42,9 +42,9 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, anchored, deferred, div, point, px,
 };
 
-use crate::confirm_dialog::ConfirmSpec;
-use crate::new_project_dialog::NewProjectDialogState;
-use crate::new_worktree_dialog::NewWorktreeDialogState;
+use crate::dialogs::confirm::ConfirmSpec;
+use crate::dialogs::new_project::NewProjectDialogState;
+use crate::dialogs::new_worktree::NewWorktreeDialogState;
 use crate::theme;
 
 /// How often the dirty-state poller wakes up. 5 s is well under
@@ -295,7 +295,7 @@ pub enum SidebarEvent {
     /// `window.prompt(...)` OS-native modals so destructive sidebar
     /// flows share visual chrome with the rest of the app's modals.
     ///
-    /// `ConfirmDialog`: [`crate::confirm_dialog::ConfirmDialog`]
+    /// `ConfirmDialog`: [`crate::dialogs::confirm::ConfirmDialog`]
     OpenConfirmDialog { spec: ConfirmSpec, action: ConfirmAction },
     /// The live branch for a worktree has changed (the user ran
     /// `git checkout` inside its pty, the `start_git_status_poll`
@@ -907,7 +907,12 @@ impl Sidebar {
                         paths
                             .into_iter()
                             .filter_map(|p| {
-                                codescope_core::git::git_status(&p).map(|s| (p, s))
+                                // Fail-soft: I/O errors and "not a worktree" both
+                                // skip the entry; the next poll tick will retry.
+                                codescope_core::git::git_status(std::path::Path::new(&p))
+                                    .ok()
+                                    .flatten()
+                                    .map(|s| (p, s))
                             })
                             .collect()
                     })
@@ -2234,7 +2239,7 @@ impl Sidebar {
 
     /// Dispatch a confirmed [`ConfirmAction`] to the matching sidebar
     /// mutation path. Called by AppShell when the themed
-    /// [`crate::confirm_dialog::ConfirmDialog`] resolves to `true`.
+    /// [`crate::dialogs::confirm::ConfirmDialog`] resolves to `true`.
     /// Variants that need AppShell state (the session-history one)
     /// are handled on the AppShell side and never reach this match.
     pub fn execute_confirm_action(
@@ -3335,7 +3340,7 @@ impl Render for Sidebar {
 
         // ── Footer: Overview + New Project, stacked, separated from
         //    the tree by a 1 px divider. Mirrors the bottom block in
-        //    `src/CodeScope.Ui/Views/SidebarView.xaml`:
+        //    `legacy:CodeScope.Ui/Views/SidebarView.xaml`:
         //
         //    <Border BorderThickness="0,1,0,0" Padding="8">
         //      <StackPanel>
@@ -3487,7 +3492,7 @@ impl Render for Sidebar {
             .border_color(theme::divider(&theme))
             // Mirror the C# build's `Fig.Font.Sans` default for the
             // sidebar — TextElement.FontFamily on `SidebarView` (see
-            // `src/CodeScope.Ui/Views/SidebarView.xaml`). Branch labels
+            // `legacy:CodeScope.Ui/Views/SidebarView.xaml`). Branch labels
             // and status slugs override this with `theme::font_mono()`
             // on their own `div`, matching the per-element
             // `Fig.Font.Mono` overrides on those XAML nodes.
@@ -3986,7 +3991,7 @@ impl Sidebar {
         let ink_dim = theme::ink_dim(theme);
         let ink_ghost = theme::ink_ghost(theme);
         let frost = theme::frost_10(theme);
-        let danger = theme::danger(theme);
+        let danger = theme::danger();
 
         // Precompute the "New session ▸" parent row before the menu
         // chain — the `item` closure below holds an immutable borrow
@@ -4253,7 +4258,7 @@ impl Sidebar {
         let ink_dim = theme::ink_dim(theme);
         let ink_ghost = theme::ink_ghost(theme);
         let frost = theme::frost_10(theme);
-        let danger = theme::danger(theme);
+        let danger = theme::danger();
 
         let item = |id: &'static str,
                     label: &'static str,
@@ -4624,7 +4629,7 @@ impl Sidebar {
         let ink_dim = theme::ink_dim(theme);
         let ink_ghost = theme::ink_ghost(theme);
         let frost = theme::frost_10(theme);
-        let danger = theme::danger(theme);
+        let danger = theme::danger();
 
         let header_label: SharedString = label.clone().into();
 
@@ -4815,7 +4820,7 @@ async fn run_remove_worktree_flow(
                 err
             );
             let _ = this.update(cx, |_, cx| {
-                let spec = crate::confirm_dialog::ConfirmSpec::destructive(
+                let spec = crate::dialogs::confirm::ConfirmSpec::destructive(
                     "Couldn't remove worktree — force?",
                     "",
                 )

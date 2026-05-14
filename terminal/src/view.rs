@@ -143,35 +143,14 @@ pub struct TerminalView {
 impl TerminalView {
     /// Wrap a [`Backend`] in a gpui Entity. Spawns an async drain task
     /// that re-snapshots and notifies on every backend event.
-    pub fn new(backend: Backend, cx: &mut Context<Self>) -> Self {
-        Self::new_full(backend, ColorPalette::default(), FontConfig::default(), cx)
-    }
-
-    pub fn new_with_font(
-        backend: Backend,
-        font: FontConfig,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        Self::new_full(backend, ColorPalette::default(), font, cx)
-    }
-
-    /// Full constructor — the binary uses this so the View's render
-    /// palette matches whatever theme the [`Backend`] was spawned
-    /// with. Callers that don't care about themes can keep using
-    /// [`Self::new`] / [`Self::new_with_font`].
-    pub fn new_full(
-        backend: Backend,
-        palette: ColorPalette,
-        font: FontConfig,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        Self::new_full_with_working_directory(backend, palette, font, None, cx)
-    }
-
-    /// Full constructor with the tab's resolved working directory.
-    /// The app shell uses this so image paste can save screenshots in
-    /// the active project / worktree instead of a global temp folder.
-    pub fn new_full_with_working_directory(
+    ///
+    /// `palette` should match the palette the backend was spawned
+    /// with so renderer cell colours line up; `font` carries the
+    /// family + size + ligatures choice. `working_directory` is used
+    /// by image paste to save screenshots into the active project /
+    /// worktree instead of a global temp folder; pass `None` to fall
+    /// back to the temp folder.
+    pub fn new(
         backend: Backend,
         palette: ColorPalette,
         font: FontConfig,
@@ -214,8 +193,8 @@ impl TerminalView {
                         _ => None,
                     }
                 };
-                if let Some(req) = to_apply {
-                    if this
+                if let Some(req) = to_apply
+                    && this
                         .update(cx, |view, cx| {
                             view.apply_resize(req.cols, req.rows, cx);
                         })
@@ -223,7 +202,6 @@ impl TerminalView {
                     {
                         break;
                     }
-                }
             }
         })
         .detach();
@@ -403,21 +381,19 @@ impl TerminalView {
         // never open a link inside them.
         let modifier = event.modifiers.control || event.modifiers.platform;
         let is_left = event.button == MouseButton::Left;
-        if is_left && modifier && !event.modifiers.shift {
-            if let Some((row, col)) = self.visible_rc(event.position) {
-                if let Some(uri) = self.snapshot.hyperlink_at(row, col) {
+        if is_left && modifier && !event.modifiers.shift
+            && let Some((row, col)) = self.visible_rc(event.position)
+                && let Some(uri) = self.snapshot.hyperlink_at(row, col) {
                     let _ = open::that_detached(uri.as_ref());
                     return;
                 }
-            }
-        }
 
         // Try mouse-reporting next. When a TUI like tmux/htop/vim
         // is in mouse mode, the click belongs to it — only fall
         // through to selection when reporting is off (or the user
         // held Shift to bypass).
-        if let Some(button) = to_mouse_button(event.button) {
-            if self.try_report_mouse(
+        if let Some(button) = to_mouse_button(event.button)
+            && self.try_report_mouse(
                 MouseEventKind::Press,
                 Some(button),
                 event.modifiers,
@@ -425,7 +401,6 @@ impl TerminalView {
             ) {
                 return;
             }
-        }
         if !is_left {
             return;
         }
@@ -483,8 +458,8 @@ impl TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
-        if let Some(button) = to_mouse_button(event.button) {
-            if self.try_report_mouse(
+        if let Some(button) = to_mouse_button(event.button)
+            && self.try_report_mouse(
                 MouseEventKind::Release,
                 Some(button),
                 event.modifiers,
@@ -493,7 +468,6 @@ impl TerminalView {
                 self.selecting = false;
                 return;
             }
-        }
         self.selecting = false;
     }
 

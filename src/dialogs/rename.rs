@@ -1,4 +1,4 @@
-//! Rename dialog — Rust port of `src/CodeScope.Ui/Dialogs/RenameDialog.xaml(.cs)`.
+//! Rename dialog — Rust port of `legacy:CodeScope.Ui/Dialogs/RenameDialog.xaml(.cs)`.
 //!
 //! A small single-input modal that prompts for a new name and hands the
 //! trimmed result back to the caller. The C# build uses it for three
@@ -206,10 +206,7 @@ impl AppShell {
                     cx.notify();
                     return;
                 }
-                if let Err(err) = codescope_core::session::save(
-                    &self.projects,
-                    self.paths_ref().as_ref(),
-                ) {
+                if let Err(err) = self.projects.save(self.paths_ref().as_ref()) {
                     if let Some(state) = self.rename_dialog.as_mut() {
                         state.error = Some(format!("Failed to save: {err:#}"));
                     }
@@ -246,7 +243,7 @@ impl AppShell {
         let ink_ghost = theme::ink_ghost(theme);
         let ink_muted = theme::ink_muted(theme);
         let frost = theme::frost_10(theme);
-        let danger = theme::danger(theme);
+        let danger = theme::danger();
         let accent = theme::accent(theme);
         let canvas = theme::canvas(theme);
 

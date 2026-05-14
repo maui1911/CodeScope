@@ -788,8 +788,12 @@ impl TerminalSnapshot {
 
 impl Drop for Backend {
     fn drop(&mut self) {
-        // Ask the event loop to stop; ignore the result because the
-        // receiver may already be gone if the child exited on its own.
+        // Best-effort shutdown from Drop: both the channel and the
+        // event-loop thread may already be torn down (e.g. child
+        // exited on its own, or the loop panicked). We can't surface
+        // anything from this path and we don't want to panic during
+        // unwinding, so the send/join results are intentionally
+        // swallowed.
         let _ = self.sender.send(Msg::Shutdown);
         if let Some(handle) = self.join.take() {
             let _ = handle.join();

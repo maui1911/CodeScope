@@ -13,7 +13,7 @@
 //!
 //! Detection is currently based on the auto-typed launch command
 //! recorded on each [`crate::projects::Session`]'s tab — the same
-//! signal `claude_discovery::is_claude_auto_type` already uses.
+//! signal `crate::agent::agent_id_from_auto_type` already uses.
 //! Anything else (plain `pwsh`, no auto-type, an unknown agent) maps
 //! to `None`, leaving the tab telemetry-less just like a shell tab.
 

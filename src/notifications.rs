@@ -1,7 +1,7 @@
 //! Persistent notification state.
 //!
 //! This is the Rust port of the C# `INotificationService` /
-//! `NotificationService` pair (`src/CodeScope.Core/Services/`).
+//! `NotificationService` pair (`legacy:CodeScope.Core/Services/`).
 //! The popover render lives in `app.rs` as `AppShell::render_notifications_popover`,
 //! mirroring how `render_toasts` and `render_tab_menu` are structured there.
 //!
@@ -36,10 +36,6 @@ fn next_id() -> u64 {
 
 /// Semantic class of a notification — drives the colour of the kind dot
 /// in the popover.  Mirrors the C# `NotificationKind` enum.
-///
-/// Variants that appear unused at compile-time are intentional:
-/// the bell button (integrating PR) is the primary call site.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NotificationKind {
     /// Agent finished a turn after being in Wait/Composing — user can reply.
@@ -196,16 +192,9 @@ impl Notifications {
     }
 
     /// Returns `true` when at least one entry has not been read.
-    /// Used by the bell button (integrating PR) to show the unread dot.
-    #[allow(dead_code)]
+    /// Used by the bell button to show the unread dot.
     pub fn has_unread(&self) -> bool {
         self.entries.iter().any(|e| !e.read)
-    }
-
-    /// Number of unread entries.
-    #[allow(dead_code)]
-    pub fn unread_count(&self) -> usize {
-        self.entries.iter().filter(|e| !e.read).count()
     }
 
     pub fn is_open(&self) -> bool {
@@ -218,8 +207,7 @@ impl Notifications {
         self.is_open = open;
     }
 
-    /// Toggle popover open/closed.  Called by the bell button (integrating PR).
-    #[allow(dead_code)]
+    /// Toggle popover open/closed.  Called by the bell button.
     pub fn toggle(&mut self) {
         self.is_open = !self.is_open;
     }
@@ -242,37 +230,6 @@ impl Notifications {
             self.entries.pop();
         }
         id
-    }
-
-    /// Mark a single entry read by id.
-    #[allow(dead_code)]
-    pub fn mark_read(&mut self, id: u64) {
-        if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
-            e.read = true;
-        }
-    }
-
-    /// Mark all entries for a given session read (e.g. when the user
-    /// focuses that tab).  Mirrors `MarkSessionRead` from the C# build.
-    #[allow(dead_code)]
-    pub fn mark_session_read(&mut self, session_title: &str) {
-        for e in self.entries.iter_mut() {
-            if e.session_title
-                .as_ref()
-                .map(|s| s.as_ref() == session_title)
-                .unwrap_or(false)
-            {
-                e.read = true;
-            }
-        }
-    }
-
-    /// Mark every entry read.
-    #[allow(dead_code)]
-    pub fn mark_all_read(&mut self) {
-        for e in self.entries.iter_mut() {
-            e.read = true;
-        }
     }
 
     /// Remove all entries and close the popover.
@@ -340,32 +297,6 @@ mod tests {
     }
 
     #[test]
-    fn mark_read_by_id() {
-        let (id, mut n) = push_one(NotificationKind::Generic, "t");
-        n.mark_read(id);
-        assert!(!n.has_unread());
-        assert!(n.entries()[0].read);
-    }
-
-    #[test]
-    fn mark_read_unknown_id_is_noop() {
-        let (_, mut n) = push_one(NotificationKind::Generic, "t");
-        n.mark_read(9999);
-        assert!(n.has_unread());
-    }
-
-    #[test]
-    fn mark_all_read_clears_unread_flag() {
-        let mut n = Notifications::new();
-        n.push(NotificationKind::Generic, "a", "d", None);
-        n.push(NotificationKind::SessionReady, "b", "d", None);
-        assert!(n.has_unread());
-        n.mark_all_read();
-        assert!(!n.has_unread());
-        assert!(n.entries().iter().all(|e| e.read));
-    }
-
-    #[test]
     fn clear_all_empties_and_closes() {
         let mut n = Notifications::new();
         n.push(NotificationKind::Generic, "a", "d", None);
@@ -385,7 +316,7 @@ mod tests {
         assert!(n.has_any());
         assert!(n.has_unread());
 
-        n.mark_read(id);
+        n.activate(id);
         assert!(n.has_any()); // entry still present
         assert!(!n.has_unread()); // but now read
     }
@@ -398,35 +329,6 @@ mod tests {
         assert!(n.is_open());
         n.toggle();
         assert!(!n.is_open());
-    }
-
-    #[test]
-    fn mark_session_read_targets_correct_entries() {
-        let mut n = Notifications::new();
-        n.push(
-            NotificationKind::SessionReady,
-            "a",
-            "d",
-            Some("session-A".into()),
-        );
-        n.push(
-            NotificationKind::SessionReady,
-            "b",
-            "d",
-            Some("session-B".into()),
-        );
-        n.mark_session_read("session-A");
-        let entries = n.entries();
-        let a = entries
-            .iter()
-            .find(|e| e.title == SharedString::from("a"))
-            .unwrap();
-        let b = entries
-            .iter()
-            .find(|e| e.title == SharedString::from("b"))
-            .unwrap();
-        assert!(a.read);
-        assert!(!b.read);
     }
 
     #[test]
@@ -460,15 +362,4 @@ mod tests {
         assert!(s[3..5].chars().all(|c| c.is_ascii_digit()));
     }
 
-    #[test]
-    fn unread_count_reflects_mixed_state() {
-        let mut n = Notifications::new();
-        let id1 = n.push(NotificationKind::Generic, "a", "d", None);
-        n.push(NotificationKind::Generic, "b", "d", None);
-        assert_eq!(n.unread_count(), 2);
-        n.mark_read(id1);
-        assert_eq!(n.unread_count(), 1);
-        n.mark_all_read();
-        assert_eq!(n.unread_count(), 0);
-    }
 }

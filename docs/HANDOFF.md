@@ -344,7 +344,7 @@ The Rust release pipeline runs alongside the C# `release.yml`:
   unpacked zip) we fall back to surfacing the GitHub release URL in
   the existing notification, same as before. `CODESCOPE_VELOPACK_CHANNEL`
   env var still overrides for QA.
-- **`codescope-rs/src/window.rs::main`** — calls
+- **`codescope-rs/src/main.rs::main`** — calls
   `velopack_bridge::run_startup_hooks()` as the first line so
   installer / uninstaller / first-run / restarted-after-update hooks
   dispatch correctly. No-op on builds that weren't Velopack-installed.

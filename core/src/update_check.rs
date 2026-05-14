@@ -84,6 +84,7 @@
 use std::cmp::Ordering;
 use std::time::Duration;
 
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
 use crate::AppPaths;
@@ -204,7 +205,7 @@ pub fn check_once(current_version: &str) -> UpdateStatus {
             return UpdateStatus::Unknown;
         }
     };
-    evaluate(&body, current_version)
+    evaluate_release_list_json(&body, current_version)
 }
 
 /// Pure logic: given the JSON body of a `/releases` (list) response
@@ -219,7 +220,7 @@ pub fn check_once(current_version: &str) -> UpdateStatus {
 /// out), take the maximum, and compare against the running build.
 /// Mirrors the way `pr::parse_pr_url_json` is split from
 /// `pr::detect_pr_url`.
-pub fn evaluate(json_body: &str, current_version: &str) -> UpdateStatus {
+pub fn evaluate_release_list_json(json_body: &str, current_version: &str) -> UpdateStatus {
     let releases: Vec<ReleaseInfo> = match serde_json::from_str(json_body) {
         Ok(r) => r,
         Err(err) => {
@@ -291,8 +292,8 @@ const MAX_RESPONSE_BYTES: u64 = 1 << 20;
 ///
 /// Private (not `pub(crate)`) because the only legitimate caller is
 /// `check_once`; tests that need to exercise parse + version logic
-/// go through `evaluate` with a fixture JSON string.
-fn fetch_release_list_json(url: &str, current_version: &str) -> Result<String, String> {
+/// go through `evaluate_release_list_json` with a fixture JSON string.
+fn fetch_release_list_json(url: &str, current_version: &str) -> Result<String> {
     use std::io::Read;
 
     let response = ureq::get(url)
@@ -300,9 +301,9 @@ fn fetch_release_list_json(url: &str, current_version: &str) -> Result<String, S
         .set("Accept", "application/vnd.github+json")
         .timeout(REQUEST_TIMEOUT)
         .call()
-        .map_err(|e| format!("request failed: {e}"))?;
+        .context("request failed")?;
     if response.status() < 200 || response.status() >= 300 {
-        return Err(format!("HTTP {}", response.status()));
+        return Err(anyhow!("HTTP {}", response.status()));
     }
     // Read at most MAX_RESPONSE_BYTES + 1 so we can tell the
     // difference between "exactly the cap" and "exceeded the cap".
@@ -311,13 +312,11 @@ fn fetch_release_list_json(url: &str, current_version: &str) -> Result<String, S
     // and we refuse to deserialise a truncated JSON document.
     let mut buf = Vec::with_capacity(16 * 1024);
     let mut limited = response.into_reader().take(MAX_RESPONSE_BYTES + 1);
-    limited
-        .read_to_end(&mut buf)
-        .map_err(|e| format!("read body failed: {e}"))?;
+    limited.read_to_end(&mut buf).context("read body failed")?;
     if buf.len() as u64 > MAX_RESPONSE_BYTES {
-        return Err(format!("response exceeded {} bytes", MAX_RESPONSE_BYTES));
+        return Err(anyhow!("response exceeded {} bytes", MAX_RESPONSE_BYTES));
     }
-    String::from_utf8(buf).map_err(|e| format!("response not utf-8: {e}"))
+    String::from_utf8(buf).context("response not utf-8")
 }
 
 /// Strip a leading `v` or `V` and trim whitespace from a version
@@ -628,7 +627,7 @@ mod tests {
             release_obj("v0.3.0-rc.3", "https://example.invalid/rc3", None),
             release_obj("v0.2.6",          "https://example.invalid/csharp", None),
         ]);
-        match evaluate(&json, "0.3.0-rc.4") {
+        match evaluate_release_list_json(&json, "0.3.0-rc.4") {
             UpdateStatus::Available { version, url, body } => {
                 assert_eq!(version, "0.3.0-rc.5");
                 assert_eq!(url, "https://example.invalid/rc5");
@@ -646,7 +645,7 @@ mod tests {
             release_obj("v0.3.0", "https://example.invalid/final", None),
             release_obj("v0.3.0-rc.5", "https://example.invalid/rc5", None),
         ]);
-        match evaluate(&json, "0.3.0-rc.5") {
+        match evaluate_release_list_json(&json, "0.3.0-rc.5") {
             UpdateStatus::Available { version, .. } => assert_eq!(version, "0.3.0"),
             other => panic!("expected Available, got {other:?}"),
         }
@@ -659,7 +658,7 @@ mod tests {
             release_obj("v0.3.0-rc.4", "https://example.invalid", None),
         ]);
         assert_eq!(
-            evaluate(&json, "0.3.0-rc.5"),
+            evaluate_release_list_json(&json, "0.3.0-rc.5"),
             UpdateStatus::UpToDate
         );
     }
@@ -671,7 +670,7 @@ mod tests {
         ]);
         // Dev build three commits past rc.5 + dirty — same rc rank.
         assert_eq!(
-            evaluate(&json, "0.3.0-rc.5-3-g1a2b3c4-dirty"),
+            evaluate_release_list_json(&json, "0.3.0-rc.5-3-g1a2b3c4-dirty"),
             UpdateStatus::UpToDate
         );
     }
@@ -684,7 +683,7 @@ mod tests {
             release_obj("v0.3.0-rc.5", "https://example.invalid", None),
         ]);
         assert_eq!(
-            evaluate(&json, "0.3.0-rc.6"),
+            evaluate_release_list_json(&json, "0.3.0-rc.6"),
             UpdateStatus::UpToDate
         );
     }
@@ -700,7 +699,7 @@ mod tests {
             release_obj("v0.2.5", "https://example.invalid", None),
             release_obj("v0.1.0", "https://example.invalid", None),
         ]);
-        assert_eq!(evaluate(&json, "0.3.0-rc.4"), UpdateStatus::UpToDate);
+        assert_eq!(evaluate_release_list_json(&json, "0.3.0-rc.4"), UpdateStatus::UpToDate);
     }
 
     #[test]
@@ -711,7 +710,7 @@ mod tests {
             release_obj("v0.3.0-rc.5", "https://example.invalid/rc5", None),
             release_obj("v0.2.6",      "https://example.invalid/legacy", None),
         ]);
-        match evaluate(&json, "0.3.0-rc.4") {
+        match evaluate_release_list_json(&json, "0.3.0-rc.4") {
             UpdateStatus::Available { version, .. } => assert_eq!(version, "0.3.0-rc.5"),
             other => panic!("expected Available rc.5, got {other:?}"),
         }
@@ -724,7 +723,7 @@ mod tests {
         let json = release_list(&[
             release_obj("v0.3.0-rc.5", "https://example.invalid", None),
         ]);
-        assert_eq!(evaluate(&json, "0.0-unknown"), UpdateStatus::UpToDate);
+        assert_eq!(evaluate_release_list_json(&json, "0.0-unknown"), UpdateStatus::UpToDate);
     }
 
     #[test]
@@ -738,7 +737,7 @@ mod tests {
             release_obj("v0.3.0-rc.5", "https://example.invalid/rc5", None),
             release_obj("v0.3.0-rc.4", "https://example.invalid/rc4", None),
         ]);
-        match evaluate(&json, "0.3.0-rc.2") {
+        match evaluate_release_list_json(&json, "0.3.0-rc.2") {
             UpdateStatus::Available { version, url, .. } => {
                 assert_eq!(version, "0.3.0-rc.5");
                 assert_eq!(url, "https://example.invalid/rc5");
@@ -749,13 +748,13 @@ mod tests {
 
     #[test]
     fn evaluate_unknown_on_malformed_json() {
-        assert_eq!(evaluate("not json", "0.3.0-rc.4"), UpdateStatus::Unknown);
-        assert_eq!(evaluate("", "0.3.0-rc.4"), UpdateStatus::Unknown);
+        assert_eq!(evaluate_release_list_json("not json", "0.3.0-rc.4"), UpdateStatus::Unknown);
+        assert_eq!(evaluate_release_list_json("", "0.3.0-rc.4"), UpdateStatus::Unknown);
     }
 
     #[test]
     fn evaluate_uptodate_on_empty_list() {
-        assert_eq!(evaluate("[]", "0.3.0-rc.4"), UpdateStatus::UpToDate);
+        assert_eq!(evaluate_release_list_json("[]", "0.3.0-rc.4"), UpdateStatus::UpToDate);
     }
 
     #[test]
@@ -763,7 +762,7 @@ mod tests {
         let json = release_list(&[
             release_obj("v0.3.0-rc.5", "https://example.invalid", None),
         ]);
-        match evaluate(&json, "0.3.0-rc.4") {
+        match evaluate_release_list_json(&json, "0.3.0-rc.4") {
             UpdateStatus::Available { body, .. } => assert_eq!(body, ""),
             other => panic!("expected Available, got {other:?}"),
         }
