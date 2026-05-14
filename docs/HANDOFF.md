@@ -7,27 +7,147 @@
 
 > ### Rust is canonical (as of 2026-05-14)
 >
-> The Rust port (`codescope-rs/`) is the only active implementation. The
-> .NET 10 / WPF build was retired on 2026-05-14; the last commit where
-> the C# tree still builds is tagged `legacy/v0.2.6-final`. See
-> [ADR-0022](DECISIONS.md) and [MIGRATION-csharp-to-rust.md](MIGRATION-csharp-to-rust.md).
+> The Rust port is the only implementation in the tree. The .NET 10 /
+> WPF build was retired on 2026-05-14 in three sequential PRs
+> (cutover-1/2/3, session 42); the last commit where the C# tree still
+> builds is tagged `legacy/v0.2.6-final`. The Rust port itself was
+> flattened from `codescope-rs/` to repo root in cutover-3 — all crates
+> (`src/`, `core/`, `terminal/`) live at workspace root now, and the
+> Velopack pack id was renamed `codescope-rs` → `codescope`. See
+> [ADR-0022](DECISIONS.md) and
+> [MIGRATION-csharp-to-rust.md](MIGRATION-csharp-to-rust.md).
 > The "mirror C# 1:1" parity rule (introduced session 33) is retired
 > with it — future deviations from `v0.2.6` behavior are normal product
 > work, not parity violations.
 >
-> Cutover-2 (delete C# source) and cutover-3 (flatten `codescope-rs/`
-> to repo root, rename Velopack pack id to `codescope`, tag namespace
-> to `v*`) are tracked in `docs/superpowers/specs/2026-05-14-csharp-build-retirement-design.md`.
+> Build commands no longer need `--manifest-path`: `cargo build/test
+> --workspace` from repo root just works. Workflow is at
+> `.github/workflows/release.yml` (was `rs--release.yml`) and now
+> triggers on plain `v*` tags.
 
-**Last updated:** 2026-05-14 (session 41 — bell hookup, cross-platform Velopack, empty-state hero)
+**Last updated:** 2026-05-14 (session 42 — C# build retirement, three-PR cutover sequence)
 **Branch:** `main`
-**Head:** `122b2f4` (chore(rs): bump version to 0.3.0-rc.5, #203)
-**Release:** `rs-v0.3.0-rc.5` shipped this session — first release with per-platform Velopack feeds (Win + macOS arm64/x64 + Linux x64)
-**Build status:** ✅ C# untouched. Rust workspace builds clean.
-Tests: `codescope-core` (463) + `codescope-rs` bin (135) +
-`codescope-terminal` (28) + doctests (1 core + 0 terminal) — **627 total**, all passing.
-**Uncommitted work:** none — every change this session shipped through PRs #195–#203.
+**Head:** `eca790c` (chore: flatten Rust tree to repo root + rename pack id (cutover-3), #210)
+**Release:** none cut this session — repo state is post-cutover and ready for the first `v*` tag (next push will be `v0.3.0-rc.7` or `v0.3.0` final, packaged under the new `codescope` Velopack pack id).
+**Build status:** ✅ `cargo build --workspace` clean from repo root.
+Tests: `codescope-core` (470) + `codescope-rs` bin (135) +
+`codescope-terminal` (28) + doctests (1 core + 0 terminal) — **634 total**, all passing.
+**Uncommitted work:** none — every change this session shipped through PRs #208 / #209 / #210.
 **Open issues:** none checked this run.
+
+### Session 42 — C# build retirement (cutover-1/2/3)
+
+Three sequential PRs ship the spec at
+`docs/superpowers/specs/2026-05-14-csharp-build-retirement-design.md`.
+The Rust port (already daily-driver since `rs-v0.3.0-rc.5`) becomes
+the only implementation in the tree, the workspace is flattened to
+repo root, and the Velopack pack id is renamed for a clean auto-update
+break.
+
+**Cutover-1 — declare Rust canonical (PR #208, `d137451`).**
+Docs-only. Adds [ADR-0022](DECISIONS.md) (C# build retired) and
+[MIGRATION-csharp-to-rust.md](MIGRATION-csharp-to-rust.md) (historical
+note: what was kept, what was dropped). Rewrites `CLAUDE.md` non-
+negotiables to the Rust stack and drops the "mirror C# 1:1" workflow
+rule. Updates `README.md` install section to list per-platform
+Velopack assets. Rewrites `ARCHITECTURE.md` from the Rust perspective.
+Stamps `PARITY-AUDIT.md` historical. Tags `legacy/v0.2.6-final` on the
+merge commit — the last revision where `dotnet build` against the C#
+tree still succeeds. Five Copilot review comments addressed inline
+(edition 2024 not 2021, Rust 1.85+ floor, real `AppPaths::projects_
+file()` API, POSIX dev variant, plus a resolved-with-explanation on
+`--workspace` covering the root binary crate).
+
+**Cutover-2 — delete C# source (PR #209, `3a34d11`).**
+212 files / 29,810 deletions: `src/CodeScope.{App,Core,Ui}/`,
+`tests/CodeScope.*Tests/`, `CodeScope.sln`, `Directory.Build.{props,
+targets}`, `.github/workflows/release.yml` (the C# pipeline; the Rust
+one at `rs--release.yml` was unchanged), `tools/release.ps1` (`dotnet
+publish` wrapper), `tools/refresh-vcruntime.ps1` (refreshed DLLs
+under the now-deleted `src/CodeScope.App/native/vcredist/`).
+`.gitignore` slimmed to Rust + cross-platform basics. Copilot couldn't
+review (exceeded its 20k-line limit on PR diffs) — admin-merged with
+explicit authorisation, validated via `cargo build/test --workspace`
++ a grep sweep for stale `src/CodeScope` / `Directory.Build` /
+`CodeScope.sln` / `dotnet (run|build|test|publish)` refs. The
+historical `//! Mirrors src/CodeScope...` provenance comments in
+Rust source were intentionally kept — they resolve at the
+`legacy/v0.2.6-final` tag.
+
+**Cutover-3 — flatten + rename (PR #210, `eca790c`).**
+105 history-preserving `git mv`s + ~10 content edits.
+* Layout: `codescope-rs/{src,core,terminal,examples,assets,wix,
+  scripts,vendor,Cargo.{toml,lock},build.rs,dist-workspace.toml}` →
+  repo root. `.github/workflows/rs--release.yml` →
+  `.github/workflows/release.yml`. The previous root `.gitignore`
+  was rebuilt to use `target/` (any depth) so the per-member dirs
+  are covered without explicit prefixes.
+* Workflow: tag trigger `rs-v*` → `v*`; drop the `rs-`-stripping
+  bash on the `plan` job (cargo-dist consumes `v*` directly now);
+  drop every `working-directory: codescope-rs`; rewrite the
+  `sed 's|^.*/codescope-rs/|codescope-rs/|'` upload-path
+  re-anchors to strip back to plain `target/distrib/`;
+  `packVersion="${GITHUB_REF_NAME#rs-v}"` →
+  `"${GITHUB_REF_NAME#v}"`; **`--packId codescope-rs` →
+  `--packId codescope`** (clean break — strands the auto-update
+  lineage of any existing `codescope-rs`-pack-id install exactly
+  once, user reinstalls from the first post-cutover release).
+* `build.rs`: `git describe --match "rs-v*"` → `--match "v*"`;
+  drop the now-unused `strip_rs_v_prefix` helper.
+* `core/src/update_check.rs`: remove `RUST_TAG_PREFIX` + the
+  tag-prefix filter; add `MIN_PUBLISHED_TRIPLE: (u64, u64, u64) =
+  (0, 3, 0)` floor + post-parse filter on the version triple
+  (keeps legacy `v0.2.X` C# releases out without coupling to a
+  tag-prefix shape; rcs at the floor triple pass). Rename
+  `strip_tag_prefixes` → `strip_v_prefix`. Rewrite module docs
+  (Endpoint, Comparison rule, Failure semantics). Tests: all
+  fixture tags shift `rs-v` → `v`, the C#-filter test becomes a
+  below-floor-filter test, new `evaluate_floor_lets_rc_pass` and
+  `strip_v_prefix_trims_whitespace` tests pin the new behaviour.
+* `src/velopack_bridge.rs`: rewrite the `prerelease: true`
+  rationale comment — no more C# parity table to maintain.
+* `Cargo.toml`: `license-file = "LICENSE"` (was `"../LICENSE"`).
+* `dist-workspace.toml`: drop `tag-namespace = "rs-"`.
+* 4 source-comment files (`memory_watchdog.rs`, `overview.rs`,
+  `command_palette.rs`, `theme/builtin_impl.rs`) — drop the
+  leading `codescope-rs/` from in-source path refs.
+
+PR #210 was split into two commits (renames first, content edits
+second) so the renames are reviewable separately; squash-merge
+collapsed them. Same Copilot-couldn't-review situation as #209,
+admin-merged with explicit authorisation.
+
+**Intentionally kept** (spec only renames the Velopack pack id, not
+every identifier downstream):
+- WiX template `wix/main.wxs` keeps `codescope-rs` install dir,
+  binary name (`%LOCALAPPDATA%\Programs\codescope-rs\bin\`),
+  registry key (`Software\maui1911\codescope-rs`).
+- Cargo binary name `[[bin]] name = "codescope-rs"` and the
+  workflow `mainExe=codescope-rs(.exe)`.
+- macOS bundle id `com.maui1911.codescope-rs`.
+- Historical `//! Mirrors src/CodeScope...` provenance comments
+  in Rust source.
+- All session-history entries in this file describing
+  `codescope-rs/` paths (they describe past state and stay
+  resolvable via the legacy tag / commit history).
+
+**User-side post-merge** (one-off, owed at the next release):
+1. Push the first `v*` tag (e.g. `v0.3.0-rc.7` or `v0.3.0` final);
+   workflow publishes the new `codescope-*-Setup.exe` (and macOS
+   `.app.zip` / Linux `.AppImage`) Velopack bundles.
+2. Uninstall the current `codescope-rs` install (Start Menu →
+   "codescope-rs" → uninstall).
+3. Install the new `codescope-*-Setup.exe`. `%APPDATA%\CodeScope\
+   projects.json` carries across unchanged so all sessions
+   rehydrate as before.
+
+Validation commands (current repo state):
+
+```bash
+cargo build --workspace
+cargo test --workspace
+# 634 tests: 470 core + 135 bin + 28 terminal + 1 doctest
+```
 
 ### Session 41 — bell wiring, cross-platform Velopack, empty-state hero, titlebar fixes
 
