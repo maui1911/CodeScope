@@ -2990,6 +2990,7 @@ impl Render for Sidebar {
                             .bg(dot_color);
                         let container = div()
                             .relative()
+                            .flex_shrink_0()
                             .w(px(14.0))
                             .h(px(14.0))
                             .flex()
