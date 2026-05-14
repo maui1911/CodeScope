@@ -125,11 +125,43 @@ impl Default for FontSettings {
     }
 }
 
+/// Cursor shape enumerated explicitly. Serialises as kebab-case
+/// (`"beam"`, `"block"`, `"underline"`, `"hollow-block"`) — what
+/// hand-edited `settings.json` uses. Deserialisation is tolerant: an
+/// unknown / mis-cased / hand-edited value collapses to the
+/// [`CursorShape::Beam`] default rather than erroring out, matching
+/// the legacy permissive behaviour. The terminal crate's own
+/// `alacritty_terminal::vte::ansi::CursorShape` is the renderer-side
+/// type; this one is the persistence-side type, kept independent so
+/// `settings.json` doesn't depend on alacritty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CursorShape {
+    Block,
+    #[default]
+    Beam,
+    Underline,
+    HollowBlock,
+}
+
+impl<'de> Deserialize<'de> for CursorShape {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // Tolerant parse: any unknown spelling becomes the default,
+        // matching the legacy String-typed setting's behaviour.
+        let s: String = String::deserialize(d).unwrap_or_default();
+        Ok(match s.as_str() {
+            "block" => CursorShape::Block,
+            "underline" | "underscore" => CursorShape::Underline,
+            "hollow-block" | "hollow_block" => CursorShape::HollowBlock,
+            _ => CursorShape::Beam,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CursorSettings {
-    /// `"block"`, `"beam"`, `"underline"`, or `"hollow-block"`.
-    pub shape: String,
+    pub shape: CursorShape,
     /// Whether the default cursor blinks. TUIs override.
     pub blinking: bool,
 }
@@ -139,7 +171,7 @@ impl Default for CursorSettings {
         Self {
             // Beam + blink matches Windows Terminal's default and is
             // what users see when they spawn pwsh anywhere else.
-            shape: "beam".into(),
+            shape: CursorShape::Beam,
             blinking: true,
         }
     }
@@ -309,7 +341,7 @@ mod tests {
         settings.font.size = 15.0;
         settings.font.line_height_multiplier = 1.2;
         settings.scrollback = 25_000;
-        settings.cursor.shape = "underline".into();
+        settings.cursor.shape = CursorShape::Underline;
         settings.cursor.blinking = false;
         settings.default_agent = "codex".into();
         settings.save_to(&path).unwrap();
@@ -320,7 +352,7 @@ mod tests {
         assert_eq!(loaded.font.size, 15.0);
         assert_eq!(loaded.font.line_height_multiplier, 1.2);
         assert_eq!(loaded.scrollback, 25_000);
-        assert_eq!(loaded.cursor.shape, "underline");
+        assert_eq!(loaded.cursor.shape, CursorShape::Underline);
         assert!(!loaded.cursor.blinking);
         assert_eq!(loaded.default_agent, "codex");
     }

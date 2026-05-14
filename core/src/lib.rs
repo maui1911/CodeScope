@@ -64,7 +64,7 @@ pub use layout::{LayoutState, RestoreTab, SessionPlacement};
 pub use paths::AppPaths;
 pub use projects::{Project, ProjectsConfig, Session, Worktree};
 pub use session::{RetentionPolicy, SessionDescriptor, SessionManager, build_agent_shell_args, now_iso8601};
-pub use settings::{CursorSettings, DEFAULT_AGENT_ID, FontSettings, Settings};
+pub use settings::{CursorSettings, CursorShape, DEFAULT_AGENT_ID, FontSettings, Settings};
 pub use tab_drag::{TabRect, compute_drop_index};
 pub use tab_title::{TAB_TITLE_SEPARATOR, rebuild_title};
 pub use theme::{Rgb, Theme, ThemePalette, builtin};

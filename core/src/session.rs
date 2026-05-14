@@ -233,8 +233,7 @@ impl SessionManager {
     /// `if (prunedSessionIds.Count > 0) { await SaveSnapshotAsync(); }`
     /// finally-block.
     pub fn load_with_sweep(paths: &AppPaths, now_iso: &str) -> Result<ProjectsConfig> {
-        let mut cfg = ProjectsConfig::load(paths)?;
-        Self::apply_retention(&mut cfg, now_iso, None);
+        let (cfg, _pruned) = Self::load_and_sweep(ProjectsConfig::load(paths)?, now_iso);
         Ok(cfg)
     }
 
@@ -252,8 +251,7 @@ impl SessionManager {
         paths: &AppPaths,
         now_iso: &str,
     ) -> Result<(ProjectsConfig, Option<anyhow::Error>)> {
-        let mut cfg = ProjectsConfig::load(paths)?;
-        let pruned = Self::apply_retention(&mut cfg, now_iso, None);
+        let (cfg, pruned) = Self::load_and_sweep(ProjectsConfig::load(paths)?, now_iso);
         if pruned.is_empty() {
             return Ok((cfg, None));
         }
@@ -265,9 +263,20 @@ impl SessionManager {
     /// path. Used by tests to avoid hitting the user's real
     /// `%APPDATA%`.
     pub fn load_from_with_sweep(path: &Path, now_iso: &str) -> Result<ProjectsConfig> {
-        let mut cfg = ProjectsConfig::load_from(path)?;
-        Self::apply_retention(&mut cfg, now_iso, None);
+        let (cfg, _pruned) = Self::load_and_sweep(ProjectsConfig::load_from(path)?, now_iso);
         Ok(cfg)
+    }
+
+    /// Shared body of the three load entry points: apply the retention
+    /// sweep to an already-loaded config and return (config, pruned
+    /// session ids). Pulled out so each public variant only carries
+    /// the bit that differs (path source, persistence policy).
+    fn load_and_sweep(
+        mut cfg: ProjectsConfig,
+        now_iso: &str,
+    ) -> (ProjectsConfig, Vec<String>) {
+        let pruned = Self::apply_retention(&mut cfg, now_iso, None);
+        (cfg, pruned)
     }
 
     // ---- session lifecycle -----------------------------------------

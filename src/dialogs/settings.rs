@@ -368,9 +368,13 @@ impl AppShell {
     }
 
     /// Set the draft cursor shape.
-    pub fn settings_set_cursor_shape(&mut self, shape: &'static str, cx: &mut Context<Self>) {
+    pub fn settings_set_cursor_shape(
+        &mut self,
+        shape: codescope_core::CursorShape,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(state) = self.settings_dialog.as_mut() {
-            state.draft.cursor.shape = shape.into();
+            state.draft.cursor.shape = shape;
             state.error = None;
             cx.notify();
         }
@@ -594,8 +598,9 @@ impl AppShell {
         let fallbacks_hint: SharedString = format_fallbacks_hint(&draft.font.fallbacks).into();
 
         // ─── Cursor shape radios ───────────────────────────────────
-        let cursor_radio = |id: &'static str, label: &'static str, value: &'static str| {
-            let active = draft.cursor.shape.eq_ignore_ascii_case(value);
+        use codescope_core::CursorShape;
+        let cursor_radio = |id: &'static str, label: &'static str, value: CursorShape| {
+            let active = draft.cursor.shape == value;
             let bg = if active { accent } else { canvas };
             let fg = if active { canvas } else { ink_muted };
             div()
@@ -625,10 +630,10 @@ impl AppShell {
             .flex()
             .flex_row()
             .gap_1()
-            .child(cursor_radio("settings-cursor-block", "Block", "block"))
-            .child(cursor_radio("settings-cursor-beam", "Beam", "beam"))
-            .child(cursor_radio("settings-cursor-underline", "Underline", "underline"))
-            .child(cursor_radio("settings-cursor-hollow", "Hollow", "hollow-block"));
+            .child(cursor_radio("settings-cursor-block", "Block", CursorShape::Block))
+            .child(cursor_radio("settings-cursor-beam", "Beam", CursorShape::Beam))
+            .child(cursor_radio("settings-cursor-underline", "Underline", CursorShape::Underline))
+            .child(cursor_radio("settings-cursor-hollow", "Hollow", CursorShape::HollowBlock));
 
         // ─── Cursor blink checkbox ─────────────────────────────────
         let blink_on = draft.cursor.blinking;

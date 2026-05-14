@@ -3016,7 +3016,7 @@ impl AppShell {
         // already-running terminals.
         let palette = ColorPalette::from_theme_palette(&self.theme.palette);
         let cursor_preset = CursorStylePreset {
-            shape: cursor_shape_from_str(&self.settings.cursor.shape),
+            shape: cursor_shape_from_setting(self.settings.cursor.shape),
             blinking: self.settings.cursor.blinking,
         };
         let font = build_font_config(&self.settings);
@@ -7419,14 +7419,16 @@ fn window_state_from_window(window: &Window) -> WindowState {
 
 // ─── Settings → terminal-config helpers ─────────────────────────────
 
-fn cursor_shape_from_str(s: &str) -> codescope_terminal::CursorShape {
-    use codescope_terminal::CursorShape;
-    match s {
-        "block" => CursorShape::Block,
-        "underline" | "underscore" => CursorShape::Underline,
-        "hollow-block" | "hollow_block" => CursorShape::HollowBlock,
-        // "beam", anything else → beam (Windows-Terminal default).
-        _ => CursorShape::Beam,
+fn cursor_shape_from_setting(
+    shape: codescope_core::CursorShape,
+) -> codescope_terminal::CursorShape {
+    use codescope_core::CursorShape as Setting;
+    use codescope_terminal::CursorShape as Renderer;
+    match shape {
+        Setting::Block => Renderer::Block,
+        Setting::Beam => Renderer::Beam,
+        Setting::Underline => Renderer::Underline,
+        Setting::HollowBlock => Renderer::HollowBlock,
     }
 }
 
