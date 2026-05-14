@@ -44,7 +44,7 @@
 //!
 //! | C# (`UpdateService.cs`)                         | Rust (`velopack_bridge.rs`)                |
 //! |--------------------------------------------------|--------------------------------------------|
-//! | `new GithubSource(RepoUrl, …)`                   | `sources::GithubSource::new(REPO_URL, None, false)` |
+//! | `new GithubSource(RepoUrl, …, prerelease: false)` | `sources::GithubSource::new(REPO_URL, None, true)` — deliberate divergence, see `maybe_apply_now` |
 //! | `mgr.IsInstalled`                                | `UpdateManager::new()` returning `Ok`       |
 //! | `mgr.CheckForUpdatesAsync()`                     | `mgr.check_for_updates()`                   |
 //! | `mgr.DownloadUpdatesAsync(info)`                 | `mgr.download_updates(&info, None)`         |

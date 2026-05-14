@@ -67,14 +67,25 @@
 //! the `0.0-unknown` git-describe slug compares falsely-newer against
 //! every published tag.
 //!
-//! # Network-failure semantics
+//! # Failure semantics
 //!
-//! Every error path collapses to `UpdateStatus::Unknown`. We log one
-//! `eprintln!` line at the failure site (fetch error, JSON parse
-//! error) and the caller just retries on the next interval. We never
-//! panic, never propagate a `Result`, and never re-toast the same
-//! version twice in a single process lifetime (the caller dedupes by
-//! holding the last-announced version in `AppShell` state).
+//! Two failure modes, two outcomes:
+//!
+//! * **Hard failure** — network error, non-2xx HTTP response, malformed
+//!   JSON, oversized body. Collapses to `UpdateStatus::Unknown`. One
+//!   `eprintln!` line at the failure site; caller retries on the next
+//!   interval.
+//! * **Ambiguous-but-recoverable** — running version is the
+//!   `0.0-unknown` `build.rs` fallback, `Version::parse` can't make
+//!   sense of the current slug, or the polled list contains no
+//!   `rs-v*` candidate. Collapses to `UpdateStatus::UpToDate` because
+//!   turning ambiguity into a notification storm is worse than the
+//!   missed update — the next interval re-evaluates from scratch.
+//!
+//! In both cases we never panic, never propagate a `Result`, and never
+//! re-toast the same version twice in a single process lifetime (the
+//! caller dedupes by holding the last-announced version in `AppShell`
+//! state).
 
 use std::cmp::Ordering;
 use std::time::Duration;
@@ -123,13 +134,14 @@ fn user_agent(current_version: &str) -> String {
     format!("CodeScope/{current_version}")
 }
 
-/// One published release as returned by GitHub's `/releases/latest`
-/// endpoint. We deserialise only the three fields we surface; GitHub
-/// adds new fields regularly and we don't want a future addition to
-/// break the parse.
+/// One entry from GitHub's `/releases` list endpoint (see
+/// [`RELEASES_LIST_URL`]). We deserialise only the three fields we
+/// surface; GitHub adds new fields regularly and we don't want a
+/// future addition to break the parse.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReleaseInfo {
-    /// Git tag of the published release, e.g. `v0.2.5` or `0.2.5`.
+    /// Git tag of the published release, e.g. `rs-v0.3.0-rc.5` for
+    /// the Rust port or `v0.2.6` for the legacy C# build.
     pub tag_name: String,
     /// HTML URL the user clicks to view the release notes / download.
     pub html_url: String,
@@ -180,12 +192,17 @@ pub fn should_poll(paths: &AppPaths) -> bool {
 
 /// Run one poll cycle synchronously: fetch the GitHub release list,
 /// pick the highest `rs-v*` tag, compare against `current_version`.
-/// Returns `UpdateStatus::Unknown` for any failure path.
+///
+/// Outcomes follow the "Failure semantics" table at the top of this
+/// module: hard failures (network, HTTP, JSON parse) return
+/// `UpdateStatus::Unknown`; ambiguity cases (unparseable current
+/// version, no `rs-v*` candidate in the list) return
+/// `UpdateStatus::UpToDate` to avoid a notification storm.
 ///
 /// Designed to be called from `cx.background_spawn` — blocking work
 /// that must not run on the UI thread.
 pub fn check_once(current_version: &str) -> UpdateStatus {
-    let body = match fetch_latest_release_json(RELEASES_LIST_URL, current_version) {
+    let body = match fetch_release_list_json(RELEASES_LIST_URL, current_version) {
         Ok(body) => body,
         Err(err) => {
             eprintln!("[update_check] fetch failed: {err}");
@@ -279,7 +296,7 @@ const MAX_RESPONSE_BYTES: u64 = 1 << 20;
 /// Private (not `pub(crate)`) because the only legitimate caller is
 /// `check_once`; tests that need to exercise parse + version logic
 /// go through `evaluate` with a fixture JSON string.
-fn fetch_latest_release_json(url: &str, current_version: &str) -> Result<String, String> {
+fn fetch_release_list_json(url: &str, current_version: &str) -> Result<String, String> {
     use std::io::Read;
 
     let response = ureq::get(url)
