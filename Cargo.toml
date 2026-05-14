@@ -7,13 +7,13 @@ name = "codescope-rs"
 version = "0.3.0-rc.5"
 edition = "2024"
 publish = false
-description = "CodeScope (Rust port): gpui shell that orchestrates parallel AI coding agent CLI sessions with Git worktree isolation."
+description = "CodeScope: gpui shell that orchestrates parallel AI coding agent CLI sessions with Git worktree isolation."
 repository = "https://github.com/maui1911/CodeScope"
 # `license-file` points at the repo-root `LICENSE` (Functional Source
 # License v1.1, ALv2 future). There is no SPDX identifier for FSL so
 # we link the file directly — cargo-dist + the MSI builder both pick
 # this up. Caught by Copilot on PR #162.
-license-file = "../LICENSE"
+license-file = "LICENSE"
 authors = ["maui1911"]
 build = "build.rs"
 

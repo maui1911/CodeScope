@@ -112,23 +112,11 @@ fn git_path(relative: &str) -> Option<PathBuf> {
 }
 
 fn git_describe() -> Option<String> {
-    // The Rust port cuts its release tags as `rs-vX.Y.Z`
-    // (`rs--release.yml`, ADR-0019). Match only those — `--match v*`
-    // would catch the C# build's tags instead and stamp this binary
-    // with a version that doesn't correspond to anything the Rust
-    // release pipeline ever shipped. Strip the `rs-v` prefix so the
-    // chrome can render `V0.3.0-rc.1` consistently.
-    let raw = run_git(&["describe", "--tags", "--always", "--dirty", "--match", "rs-v*"])?;
-    Some(strip_rs_v_prefix(&raw))
-}
-
-/// Strip a leading `rs-v` / `rs-V` from a `git describe` output so
-/// the chrome version slug reads `0.3.0-rc.1` instead of
-/// `rs-v0.3.0-rc.1`. Falls through to [`strip_v_prefix`] when the
-/// describe didn't match any `rs-v*` tag (commit-hash-only fallback).
-fn strip_rs_v_prefix(s: &str) -> String {
-    if let Some(rest) = s.strip_prefix("rs-v").or_else(|| s.strip_prefix("rs-V")) {
-        return rest.to_owned();
-    }
-    strip_v_prefix(s)
+    // Release tags are `vX.Y.Z` (or `vX.Y.Z-rc.N`). Historical C#
+    // `v0.2.X` tags resolve here too on a checkout of that legacy
+    // history; `update_check`'s runtime floor filters them out of
+    // the live update flow, and stamping the binary with the
+    // historical version is correct for that checkout.
+    let raw = run_git(&["describe", "--tags", "--always", "--dirty", "--match", "v*"])?;
+    Some(strip_v_prefix(&raw))
 }

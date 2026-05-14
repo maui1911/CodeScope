@@ -39,19 +39,19 @@ permissions:
 # If there's a prerelease-style suffix to the version, then the release(s)
 # will be marked as a prerelease.
 on:
-  # Tag-push only. We want the Rust release pipeline off the critical
-  # path for day-to-day PRs — `pr-run-mode = "skip"` in
-  # `codescope-rs/dist-workspace.toml` would still let us add a
-  # `pull_request:` trigger later (the matrix would emit no jobs), but
-  # for now nothing in the repo benefits from validating the workflow
-  # on every PR so we keep the trigger surface minimal.
+  # Tag-push only. We want the release pipeline off the critical path
+  # for day-to-day PRs — `pr-run-mode = "skip"` in
+  # `dist-workspace.toml` would still let us add a `pull_request:`
+  # trigger later (the matrix would emit no jobs), but for now nothing
+  # in the repo benefits from validating the workflow on every PR so
+  # we keep the trigger surface minimal.
   push:
     # GitHub Actions tag filters are **glob/minimatch**, not regex —
     # `+` would be matched literally. Use `*` (zero-or-more of any
-    # char) so both `rs-v0.0.2` and `rs-v0.3.0-rc1` match. Copilot
-    # caught the original regex-style pattern in PR #162 review.
+    # char) so both `v0.0.2` and `v0.3.0-rc1` match. Copilot caught
+    # the original regex-style pattern in PR #162 review.
     tags:
-      - 'rs-v[0-9]*.[0-9]*.[0-9]*'
+      - 'v[0-9]*.[0-9]*.[0-9]*'
 
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
@@ -59,19 +59,13 @@ jobs:
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
-      # `tag` is the *original* git tag (e.g. `rs-v0.3.0-rc1`) — used as the
-      # GitHub release tag downstream so the two release pipelines on this
-      # repo (C# `v*` and Rust `rs-v*`) don't collide.
-      # `tag-flag` is the *stripped* tag (e.g. `v0.3.0-rc1`) passed to every
-      # `dist` invocation via `--tag=`. cargo-dist 0.31's `tag-namespace`
-      # config only controls the workflow filename and the trigger glob; it
-      # does NOT strip the namespace before the underlying `axotag` parser
-      # sees the value. `axotag` then tries to parse `rs-v0.3.0-rc1` as
-      # `<package-name>-v<version>` (no package called `rs` exists) or as a
-      # bare semver (fails on the `r`). Stripping `rs-` here side-steps the
-      # bug — cargo-dist sees a clean `v0.3.0-rc1` and the GitHub release
-      # below is still tagged `rs-v0.3.0-rc1` because `gh release create`
-      # uses `needs.plan.outputs.tag` (the un-stripped value).
+      # `tag` is the git tag (e.g. `v0.3.0-rc1`) used downstream as
+      # the GitHub release tag. `tag-flag` is the same tag wrapped as
+      # `--tag=<value>` for every `dist` invocation. (Pre-cutover-3
+      # the Rust pipeline lived under an `rs-` namespace and these two
+      # outputs differed; with the namespace removed they're now the
+      # same value, but keeping both names lets the downstream jobs
+      # stay byte-identical to the cargo-dist 0.31 template.)
       tag: ${{ steps.tags.outputs.tag }}
       tag-flag: ${{ steps.tags.outputs.tag-flag }}
       publishing: ${{ !github.event.pull_request }}
@@ -83,24 +77,18 @@ jobs:
           persist-credentials: false
           submodules: recursive
       - id: tags
-        # Compute the namespaced + stripped tag values once and reuse them
-        # across every downstream `dist` call. See the comment on the
-        # `tag` / `tag-flag` job outputs above for why both are needed.
-        # On a pull_request event (currently unreachable — the workflow's
-        # `on:` block only lists `push.tags` — but kept defensive in case
-        # we re-enable PR validation later) we emit empty strings, mirroring
+        # Compute the tag value once and reuse it across every
+        # downstream `dist` call. On a pull_request event (currently
+        # unreachable — the workflow's `on:` block only lists
+        # `push.tags` — but kept defensive in case we re-enable PR
+        # validation later) we emit empty strings, mirroring
         # cargo-dist's original generator behaviour.
         shell: bash
         run: |
           if [ -z "${{ github.event.pull_request }}" ]; then
             FULL_TAG="${{ github.ref_name }}"
-            # Strip the `rs-` namespace prefix (matches `tag-namespace` in
-            # `codescope-rs/dist-workspace.toml`). `${var#prefix}` is a
-            # POSIX shell parameter expansion that removes the shortest
-            # leading match — exactly what we want.
-            STRIPPED_TAG="${FULL_TAG#rs-}"
             echo "tag=${FULL_TAG}" >> "$GITHUB_OUTPUT"
-            echo "tag-flag=--tag=${STRIPPED_TAG}" >> "$GITHUB_OUTPUT"
+            echo "tag-flag=--tag=${FULL_TAG}" >> "$GITHUB_OUTPUT"
           else
             echo "tag=" >> "$GITHUB_OUTPUT"
             echo "tag-flag=" >> "$GITHUB_OUTPUT"
@@ -121,27 +109,19 @@ jobs:
       # (PRs run on the *source* but secrets are usually on the *target* -- that's *good*
       # but also really annoying to build CI around when it needs secrets to work right.)
       - id: plan
-        # dist-workspace.toml and Cargo.toml live in codescope-rs/, so all
-        # `dist` invocations run from that subdir. Subsequent jobs extract
-        # artifacts at the workspace root, so each upload `path:` carries its
-        # final workspace-relative location (e.g. `codescope-rs/target/...`)
-        # — keeps the artifact ZIPs round-trip-correct.
-        #
-        # Write the plan manifest into the working directory (codescope-rs/),
-        # NOT into `target/distrib/`. Bash creates the redirect target as an
-        # empty file BEFORE `dist` runs; `dist` calls `load_manifests` over
-        # its `dist_dir` (= `target/distrib/`) and tries to parse every
-        # `*dist-manifest.json` file it finds there. An empty file makes
-        # axoasset bail with `failed to parse JSON / EOF while parsing a
-        # value at line 1 column 0`. Matches the upstream cargo-dist 0.31
-        # template, which also keeps `plan-dist-manifest.json` at the
-        # workspace root for the same reason.
-        working-directory: codescope-rs
+        # Write the plan manifest into the workspace root, NOT into
+        # `target/distrib/`. Bash creates the redirect target as an
+        # empty file BEFORE `dist` runs; `dist` calls `load_manifests`
+        # over its `dist_dir` (= `target/distrib/`) and tries to parse
+        # every `*dist-manifest.json` file it finds there. An empty
+        # file makes axoasset bail with `failed to parse JSON / EOF
+        # while parsing a value at line 1 column 0`. Matches the
+        # upstream cargo-dist 0.31 template, which also keeps
+        # `plan-dist-manifest.json` at the workspace root for the same
+        # reason.
         shell: bash
         run: |
           if [ -z "${{ github.event.pull_request }}" ]; then
-            # `dist host --steps=create` needs the *stripped* tag (see
-            # tag-flag rationale on the job outputs above).
             DIST_SUBCOMMAND="host --steps=create ${{ steps.tags.outputs.tag-flag }}"
           else
             DIST_SUBCOMMAND="plan"
@@ -154,7 +134,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: artifacts-plan-dist-manifest
-          path: codescope-rs/plan-dist-manifest.json
+          path: plan-dist-manifest.json
 
   # Build and packages all the platform-specific things
   build-local-artifacts:
@@ -180,9 +160,9 @@ jobs:
     container: ${{ matrix.container && matrix.container.image || null }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # Path is relative to the step's working-directory (codescope-rs) for
-      # shell use, then re-prefixed below for the upload-artifact `path:`
-      # (which resolves from $GITHUB_WORKSPACE).
+      # Workspace-relative path; both the shell steps below and the
+      # upload-artifact `path:` resolve from `$GITHUB_WORKSPACE`, so
+      # one definition serves both consumers.
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
     steps:
       - name: enable windows longpaths
@@ -203,10 +183,8 @@ jobs:
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest. Extract to the workspace root: upload-artifact
       # preserves each entry's workspace-relative path inside the artifact, so
-      # the uploads carry `codescope-rs/target/distrib/...` already — pointing
-      # the download at the workspace root restores the original layout (using
-      # `codescope-rs/target/distrib/` here would nest it as
-      # `codescope-rs/target/distrib/codescope-rs/target/distrib/...`).
+      # the uploads carry `target/distrib/...` and the download restores them
+      # at the workspace root.
       - name: Fetch local artifacts
         uses: actions/download-artifact@v7
         with:
@@ -217,20 +195,19 @@ jobs:
         run: |
           ${{ matrix.packages_install }}
       - name: Build artifacts
-        working-directory: codescope-rs
         shell: bash
         run: |
-          # Pin the version slug to the stripped tag (e.g.
-          # `0.3.0-rc.1`) so the title-bar chrome reads the actual
-          # release version instead of `git describe --always`'s
-          # commit-hash fallback — Actions checkouts are shallow and
-          # often can't see any `rs-v*` tag, even though the workflow
-          # itself was triggered by one. `build.rs` consumes
-          # `CODESCOPE_VERSION` as an override; strip the leading
-          # `rs-v` so the slug renders as `V0.3.0-rc.1` (build.rs adds
-          # the `V` prefix at render time).
+          # Pin the version slug to the tag (e.g. `0.3.0-rc.1`) so the
+          # title-bar chrome reads the actual release version instead
+          # of `git describe --always`'s commit-hash fallback —
+          # Actions checkouts are shallow and often can't see any
+          # `v*` tag, even though the workflow itself was triggered by
+          # one. `build.rs` consumes `CODESCOPE_VERSION` as an
+          # override; strip the leading `v` so the slug renders as
+          # `V0.3.0-rc.1` (build.rs adds the `V` prefix at render
+          # time).
           FULL_TAG="${GITHUB_REF_NAME}"
-          STRIPPED_VERSION="${FULL_TAG#rs-v}"
+          STRIPPED_VERSION="${FULL_TAG#v}"
           export CODESCOPE_VERSION="${STRIPPED_VERSION}"
           echo "Building with CODESCOPE_VERSION=${CODESCOPE_VERSION}"
           # Actually do builds and make zips and whatnot
@@ -242,29 +219,22 @@ jobs:
         # to "real" actions without writing to env-vars, and writing to env-vars has
         # inconsistent syntax between shell and powershell.
         shell: bash
-        working-directory: codescope-rs
         run: |
           # Parse out what we just built and upload it to scratch storage.
           # `dist print-upload-files-from-manifest` emits ABSOLUTE paths
-          # (e.g. `D:\a\CodeScope\CodeScope\codescope-rs\target\distrib\foo.msi`
-          # on Windows, `/home/runner/.../codescope-rs/target/distrib/foo.tar.xz`
-          # on Linux/macOS), not workspace-relative ones. The previous fix
-          # here was `sed 's|^|codescope-rs/|'`, which glued the prefix onto
-          # already-absolute paths and produced nonsense like
-          # `codescope-rs/D:\a\...`. upload-artifact then silently warned the
-          # bogus paths away (`if-no-files-found: warn`) and the only file
-          # that actually shipped to the release was the dist-manifest.
-          #
-          # Normalize backslashes → forward slashes first (Windows paths),
-          # then strip everything up to and including `codescope-rs/` and
-          # re-prepend it. End result: `codescope-rs/target/distrib/foo.msi`.
-          # After `host` fetches everything into `artifacts/` and flattens,
-          # the basenames land at `artifacts/<basename>` for
+          # (e.g. `D:\a\CodeScope\CodeScope\target\distrib\foo.msi` on
+          # Windows, `/home/runner/.../target/distrib/foo.tar.xz` on
+          # Linux/macOS). Normalize backslashes → forward slashes
+          # first (Windows paths), then strip everything up to and
+          # including the leading runner-specific prefix so we end up
+          # with workspace-relative `target/distrib/foo.msi`.
+          # After `host` fetches everything into `artifacts/` and
+          # flattens, the basenames land at `artifacts/<basename>` for
           # `gh release create artifacts/*`.
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
           dist print-upload-files-from-manifest --manifest dist-manifest.json \
             | tr '\\' '/' \
-            | sed 's|^.*/codescope-rs/|codescope-rs/|' \
+            | sed 's|^.*/target/|target/|' \
             >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
@@ -272,17 +242,17 @@ jobs:
           echo "Upload paths (post-rewrite):"
           dist print-upload-files-from-manifest --manifest dist-manifest.json \
             | tr '\\' '/' \
-            | sed 's|^.*/codescope-rs/|codescope-rs/|'
+            | sed 's|^.*/target/|target/|'
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
       # ---------------------------------------------------------------
       # Velopack packaging — cross-platform.
       #
-      # The Rust velopack-rs bridge (`codescope-rs/src/velopack_bridge.rs`)
-      # now picks its update channel per target triple
-      # (`win` / `osx-arm64` / `osx-x64` / `linux-x64`); the steps below
-      # emit one Velopack feed per channel so each running build only
-      # ever pulls its own platform's assets.
+      # The velopack-rs bridge (`src/velopack_bridge.rs`) picks its
+      # update channel per target triple (`win` / `osx-arm64` /
+      # `osx-x64` / `linux-x64`); the steps below emit one Velopack
+      # feed per channel so each running build only ever pulls its own
+      # platform's assets.
       #
       # Each runner produces Velopack's canonical feed asset
       # `releases.<channel>.json` (what `GithubSource` resolves via
@@ -314,9 +284,9 @@ jobs:
         run: |
           # Channel + binary basename + bundle id (macOS only) per
           # triple. Keep this in lockstep with
-          # `codescope-rs/src/velopack_bridge.rs::default_channel` —
-          # a mismatch means the client polls a feed the pipeline
-          # never published.
+          # `src/velopack_bridge.rs::default_channel` — a mismatch
+          # means the client polls a feed the pipeline never
+          # published.
           case "$TARGET" in
             x86_64-pc-windows-msvc)
               channel=win;       mainExe=codescope-rs.exe; bundleId="" ;;
@@ -356,13 +326,12 @@ jobs:
         # cargo-dist already built the release binary at
         # `target/<triple>/{dist,release}/<mainExe>`. vpk wants a flat
         # publish dir that contains the main binary plus any
-        # side-by-side files. Today the Rust build is statically linked
-        # so just the binary is enough — but we also pick up sibling
+        # side-by-side files. Today the build is statically linked so
+        # just the binary is enough — but we also pick up sibling
         # `.dll`/`.dylib`/`.so` files cargo might emit so a future
         # dynamically-linked sidecar gets bundled automatically.
         if: steps.velopack-params.outputs.supported == 'true'
         shell: bash
-        working-directory: codescope-rs
         env:
           TARGET: ${{ matrix.targets[0] }}
           MAIN_EXE: ${{ steps.velopack-params.outputs.mainExe }}
@@ -406,7 +375,6 @@ jobs:
         if: steps.velopack-params.outputs.supported == 'true'
         continue-on-error: true
         shell: bash
-        working-directory: codescope-rs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CHANNEL: ${{ steps.velopack-params.outputs.channel }}
@@ -420,27 +388,26 @@ jobs:
       - name: Pack with Velopack
         if: steps.velopack-params.outputs.supported == 'true'
         shell: bash
-        working-directory: codescope-rs
         env:
-          # `build-local-artifacts` runs with the namespaced tag
-          # (e.g. `rs-v0.3.0-rc.2`) on `GITHUB_REF_NAME`; vpk wants a
-          # bare semver, so strip the `rs-v` prefix to match what
-          # cargo-dist's `--tag=` peels off and what `velopack_bridge.rs`
-          # compares against at runtime.
+          # `build-local-artifacts` runs with the release tag (e.g.
+          # `v0.3.0-rc.2`) on `GITHUB_REF_NAME`; vpk wants a bare
+          # semver, so strip the `v` prefix to match what cargo-dist's
+          # `--tag=` consumes and what `velopack_bridge.rs` compares
+          # against at runtime.
           GITHUB_REF_NAME: ${{ github.ref_name }}
           CHANNEL: ${{ steps.velopack-params.outputs.channel }}
           MAIN_EXE: ${{ steps.velopack-params.outputs.mainExe }}
           BUNDLE_ID: ${{ steps.velopack-params.outputs.bundleId }}
         run: |
-          packVersion="${GITHUB_REF_NAME#rs-v}"
+          packVersion="${GITHUB_REF_NAME#v}"
           echo "Packing velopack release with version $packVersion (channel $CHANNEL)"
-          # Common flags — packId / title / authors / publish dir match
-          # the existing Windows convention so the GithubSource lookup
-          # (channel + repo) keeps resolving the same pack identity
-          # across platforms.
+          # Pack id renamed `codescope-rs` → `codescope` in cutover-3
+          # (ADR-0022). This strands the auto-update lineage of any
+          # `codescope-rs`-pack-id install exactly once; users
+          # reinstall from the first post-cutover release.
           args=(
             pack
-            --packId codescope-rs
+            --packId codescope
             --packVersion "$packVersion"
             --packDir target/distrib/velopack/publish
             --mainExe "$MAIN_EXE"
@@ -482,26 +449,23 @@ jobs:
         if: steps.velopack-params.outputs.supported == 'true'
         id: velopack-paths
         shell: bash
-        working-directory: codescope-rs
         run: |
           # Emit workspace-relative paths so they round-trip through
           # upload-artifact the same way the cargo-dist outputs do
           # (see the matching comment in the Post-build step above).
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
           find target/distrib/velopack/releases -maxdepth 1 -type f \
-            | sed 's|^|codescope-rs/|' \
             >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
           echo "Velopack upload paths:"
-          find target/distrib/velopack/releases -maxdepth 1 -type f \
-            | sed 's|^|codescope-rs/|'
+          find target/distrib/velopack/releases -maxdepth 1 -type f
       - name: "Upload artifacts"
         uses: actions/upload-artifact@v6
         with:
           name: artifacts-build-local-${{ join(matrix.targets, '_') }}
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
-            codescope-rs/${{ env.BUILD_MANIFEST_NAME }}
+            ${{ env.BUILD_MANIFEST_NAME }}
             ${{ steps.velopack-paths.outputs.paths }}
 
   # Build and package all the platform-agnostic(ish) things
@@ -524,10 +488,10 @@ jobs:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
       - run: chmod +x ~/.cargo/bin/dist
-      # Get all the local artifacts for the global tasks to use (for e.g.
-      # checksums). Extract to workspace root — uploaded entries already carry
-      # their `codescope-rs/target/distrib/...` prefix, so this restores the
-      # original layout without doubling the prefix.
+      # Get all the local artifacts for the global tasks to use (for
+      # e.g. checksums). Extract to workspace root — uploaded entries
+      # already carry their `target/distrib/...` paths, so this
+      # restores the original layout.
       - name: Fetch local artifacts
         uses: actions/download-artifact@v7
         with:
@@ -536,34 +500,29 @@ jobs:
           merge-multiple: true
       - id: cargo-dist
         shell: bash
-        working-directory: codescope-rs
         run: |
           dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
           echo "dist ran successfully"
 
-          # Parse out what we just built and upload it to scratch storage.
-          # `upload_files` in the dist manifest holds ABSOLUTE paths
-          # (`/home/runner/.../codescope-rs/target/distrib/foo`); the previous
-          # `sed 's|^|codescope-rs/|'` glued a prefix onto already-absolute
-          # paths and silently broke the upload — see the matching comment
-          # in build-local-artifacts.
-          #
-          # Strip the runner-specific prefix back to `codescope-rs/` so each
-          # upload entry lands at `codescope-rs/target/distrib/<file>`. The
-          # `tr` normalizes `\` → `/` defensively even though this job only
-          # runs on ubuntu — keeps the pipeline identical to the build-local
-          # variant for future-proofing.
+          # Parse out what we just built and upload it to scratch
+          # storage. `upload_files` in the dist manifest holds
+          # ABSOLUTE paths (`/home/runner/.../target/distrib/foo`).
+          # Strip the runner-specific prefix back to `target/distrib/`
+          # so each upload entry lands at its workspace-relative path.
+          # `tr` normalizes `\` → `/` defensively even though this
+          # job only runs on ubuntu — keeps the pipeline identical
+          # to the build-local variant for future-proofing.
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
           jq --raw-output ".upload_files[]" dist-manifest.json \
             | tr '\\' '/' \
-            | sed 's|^.*/codescope-rs/|codescope-rs/|' \
+            | sed 's|^.*/target/|target/|' \
             >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
           echo "Upload paths (post-rewrite):"
           jq --raw-output ".upload_files[]" dist-manifest.json \
             | tr '\\' '/' \
-            | sed 's|^.*/codescope-rs/|codescope-rs/|'
+            | sed 's|^.*/target/|target/|'
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
       - name: "Upload artifacts"
@@ -572,7 +531,7 @@ jobs:
           name: artifacts-build-global
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
-            codescope-rs/${{ env.BUILD_MANIFEST_NAME }}
+            ${{ env.BUILD_MANIFEST_NAME }}
   # Determines if we should publish/announce
   host:
     needs:
@@ -597,9 +556,9 @@ jobs:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
       - run: chmod +x ~/.cargo/bin/dist
-      # Fetch artifacts from scratch-storage. Extract to workspace root so the
-      # `codescope-rs/...` prefixes embedded in each upload land at their
-      # natural path, where `dist host` (running from codescope-rs/) finds them.
+      # Fetch artifacts from scratch-storage. Extract to workspace
+      # root so the `target/...` paths embedded in each upload land at
+      # their natural location, where `dist host` finds them.
       - name: Fetch artifacts
         uses: actions/download-artifact@v7
         with:
@@ -608,7 +567,6 @@ jobs:
           merge-multiple: true
       - id: host
         shell: bash
-        working-directory: codescope-rs
         run: |
           dist host ${{ needs.plan.outputs.tag-flag }} --steps=upload --steps=release --output-format=json > dist-manifest.json
           echo "artifacts uploaded and released successfully"
@@ -619,7 +577,7 @@ jobs:
         with:
           # Overwrite the previous copy
           name: artifacts-dist-manifest
-          path: codescope-rs/dist-manifest.json
+          path: dist-manifest.json
       # Create a GitHub Release while uploading all files to it
       - name: "Download GitHub Artifacts"
         uses: actions/download-artifact@v7
@@ -630,13 +588,12 @@ jobs:
       - name: Cleanup
         run: |
           # Uploaded artifacts preserve their workspace-relative paths.
-          # Every upload step (plan / build-local / build-global) now stores
-          # entries under `codescope-rs/...` (see the matching comments
-          # there), so after merge-multiple they land under
-          # `artifacts/codescope-rs/...`. Flatten every regular file in
-          # `artifacts/` down to `artifacts/<basename>` so
-          # `gh release create artifacts/*` (which doesn't recurse into
-          # directories) sees the release files.
+          # Every upload step (plan / build-local / build-global)
+          # stores entries under `target/...`, so after merge-multiple
+          # they land under `artifacts/target/...`. Flatten every
+          # regular file in `artifacts/` down to `artifacts/<basename>`
+          # so `gh release create artifacts/*` (which doesn't recurse
+          # into directories) sees the release files.
           echo "Before flatten:"
           find artifacts -type f | sort
           find artifacts -mindepth 2 -type f -exec mv -t artifacts/ {} +
@@ -651,26 +608,13 @@ jobs:
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
-          # Re-attach the `rs-` namespace prefix when rewriting download URLs
-          # below. Keep this in sync with `tag-namespace` in
-          # codescope-rs/dist-workspace.toml.
-          TAG_NAMESPACE: "rs-"
         run: |
           # Debug: list everything that will go up as a release asset.
           echo "Artifacts to upload:"
           ls -la artifacts/
 
           # Write and read notes from a file to avoid quoting breaking things.
-          # cargo-dist builds the announcement body using the STRIPPED tag
-          # (e.g. `v0.3.0-rc.1`) because we feed it `--tag=v0.3.0-rc.1` after
-          # peeling the `rs-` namespace prefix (see the `tags` step on the
-          # `plan` job). But the actual GitHub release tag carries the
-          # namespace (`rs-v0.3.0-rc.1`), so every download URL in the body
-          # would 404. Patch the release-asset URLs to include the prefix
-          # before writing the notes file.
-          printf '%s' "$ANNOUNCEMENT_BODY" \
-            | sed "s|/releases/download/v|/releases/download/${TAG_NAMESPACE}v|g" \
-            > "$RUNNER_TEMP/notes.txt"
+          printf '%s' "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/notes.txt"
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
