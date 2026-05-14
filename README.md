@@ -69,7 +69,7 @@ Grab the latest release from the [**Releases page**](https://github.com/maui1911
 Only needed if you want to contribute or hack on CodeScope itself.
 
 ```pwsh
-# Prerequisites: stable Rust toolchain (1.80+), git
+# Prerequisites: stable Rust toolchain (1.85+, edition 2024), git
 cargo build --manifest-path codescope-rs/Cargo.toml
 cargo run --manifest-path codescope-rs/Cargo.toml --bin codescope-rs
 ```

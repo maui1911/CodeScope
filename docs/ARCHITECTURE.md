@@ -85,9 +85,11 @@ Both paths live in `codescope-terminal`.
 
 ## Config schema
 
-`%APPDATA%\CodeScope\projects.json` (path is `paths::projects_json()`
-on every platform — `%APPDATA%` resolves to platform-appropriate
-directories on macOS / Linux):
+`%APPDATA%\CodeScope\projects.json` on Windows (resolved by
+`AppPaths::projects_file()`; the config root is
+`~/.config/CodeScope/` on Linux and
+`~/Library/Application Support/CodeScope/` on macOS — see
+`codescope-rs/core/src/paths.rs`):
 
 ```json
 {

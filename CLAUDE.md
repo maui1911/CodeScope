@@ -34,7 +34,8 @@ intentional deviations in `docs/DECISIONS.md`.
 
 ## Style
 
-- Idiomatic Rust 2021. Run `cargo fmt` before committing
+- Idiomatic Rust 2024 (workspace pins `edition = "2024"` — needs
+  Rust 1.85+). Run `cargo fmt` before committing
 - `cargo clippy --workspace --all-targets` clean on changed files
 - Prefer `?` over `match`/`unwrap` for error propagation; reserve
   `unwrap` for proven invariants with a one-line `// SAFETY:` style
@@ -52,17 +53,32 @@ need to coexist with the installed app.
 Start the dev build with the `CODESCOPE_DEV` env var set:
 
 ```pwsh
+# Windows (PowerShell)
 $env:CODESCOPE_DEV = "1"
 cargo run --manifest-path codescope-rs/Cargo.toml --bin codescope-rs
 ```
 
-`codescope_core::paths` resolves the env var once at process start
-and redirects:
+```bash
+# macOS / Linux
+CODESCOPE_DEV=1 cargo run --manifest-path codescope-rs/Cargo.toml --bin codescope-rs
+```
+
+`codescope_core::paths::AppPaths::detect()` resolves the env var once
+at process start and redirects (paths come from `AppPaths` accessor
+methods — `projects_file()`, `layout_file()`, `window_file()`,
+`settings_file()`):
 
 - single-instance mutex → `Global\CodeScope.SingleInstance.Dev`
-- `%APPDATA%\CodeScope\` → `%APPDATA%\CodeScope.Dev\` (`projects.json`)
-- `%LOCALAPPDATA%\CodeScope\` → `%LOCALAPPDATA%\CodeScope.Dev\`
+  (Windows only)
+- Windows: `%APPDATA%\CodeScope\` → `%APPDATA%\CodeScope.Dev\`
+  (`projects.json`, `settings.json`);
+  `%LOCALAPPDATA%\CodeScope\` → `%LOCALAPPDATA%\CodeScope.Dev\`
   (`layout.json`, `window.json`, `console.log`, `crash.log`)
+- Linux: `~/.config/CodeScope/` → `~/.config/CodeScope.Dev/` (config);
+  `~/.local/state/CodeScope/` → `~/.local/state/CodeScope.Dev/` (state)
+- macOS: `~/Library/Application Support/CodeScope/` →
+  `~/Library/Application Support/CodeScope.Dev/` (both config and
+  state — Apple's HIG keeps them together)
 - window title → `CodeScope [dev] — …`
 
 The Dev store is independent — projects opened in the dev build are
