@@ -452,7 +452,7 @@ pub fn process_new_lines(
             .unwrap_or(file_len)
             .max(file_len);
         tail.last_pos = advanced_to;
-        tail.last_mtime = meta.modified().ok();
+        tail.last_mtime = crate::telemetry::modified_or_none(&meta);
     }
 
     if changed {

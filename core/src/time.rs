@@ -170,6 +170,21 @@ pub fn unix_secs_to_civil(secs: i64) -> CivilDateTime {
     CivilDateTime { year, month: m, day: d, hour, minute, second }
 }
 
+/// Format a `SystemTime` instant as `YYYY-MM-DDTHH:MM:SS.fffZ`. Used
+/// by the crash logger and the dev-only memory watchdog, both of
+/// which write to plain text files where millisecond precision aids
+/// post-hoc correlation across processes. Falls back to the Unix
+/// epoch when the system clock is set before 1970.
+pub fn iso8601_from_systemtime_with_millis(t: SystemTime) -> String {
+    let dur = t.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let secs = dur.as_secs() as i64;
+    let millis = dur.subsec_millis();
+    let CivilDateTime { year, month, day, hour, minute, second } = unix_secs_to_civil(secs);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z"
+    )
+}
+
 /// Current wall-clock time formatted via [`iso8601_from_unix_secs`].
 /// Production callers use this; tests pass fixed strings.
 pub fn now_iso8601() -> String {

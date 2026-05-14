@@ -334,7 +334,10 @@ pub fn process_message_dir(watch: &mut SessionWatch) -> bool {
     let Some(dir) = watch.message_dir.clone() else {
         return false;
     };
-    let dir_mtime = std::fs::metadata(&dir).ok().and_then(|m| m.modified().ok());
+    let dir_mtime = std::fs::metadata(&dir)
+        .ok()
+        .as_ref()
+        .and_then(crate::telemetry::modified_or_none);
 
     // Quiet-tick short-circuit. Capture dir mtime BEFORE the walk so a
     // file landing between this check and the enumerate is still picked

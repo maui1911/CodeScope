@@ -90,6 +90,18 @@ pub fn context_window_for_model(model_id: &str) -> Option<u64> {
     None
 }
 
+/// Read a file's modification time, treating any stat error as "no
+/// mtime yet". Every telemetry / discovery poller in this crate
+/// reaches for an `Option<SystemTime>` so it can compare against the
+/// cursor it stashed on the previous tick — when the platform fails
+/// to expose mtime (rare; Linux without `statx`, exotic filesystems)
+/// the right behaviour is to skip this tick and retry on the next,
+/// not surface the error to the user. Centralising it here documents
+/// the choice once instead of at eight call sites.
+pub fn modified_or_none(meta: &std::fs::Metadata) -> Option<SystemTime> {
+    meta.modified().ok()
+}
+
 /// Mutable state for a single watched JSONL/log file.
 ///
 /// Cheap `stat`-first reads: callers only open the file when its

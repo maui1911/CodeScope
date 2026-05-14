@@ -328,7 +328,7 @@ pub fn process_new_lines(
     // next poll re-reads from the same offset.
     if clean_eof {
         tail.last_pos = file_len;
-        tail.last_mtime = meta.modified().ok();
+        tail.last_mtime = crate::telemetry::modified_or_none(&meta);
     }
 
     if changed {

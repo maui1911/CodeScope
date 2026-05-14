@@ -76,7 +76,7 @@ pub fn scan(
         }
         let Ok(meta) = entry.metadata() else { continue };
         let created = meta.created().ok();
-        let modified = meta.modified().ok();
+        let modified = crate::telemetry::modified_or_none(&meta);
         let eligible = matches!(created, Some(t) if t >= since)
             || matches!(modified, Some(t) if t >= since);
         if !eligible {

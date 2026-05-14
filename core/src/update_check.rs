@@ -84,6 +84,7 @@
 use std::cmp::Ordering;
 use std::time::Duration;
 
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
 use crate::AppPaths;
@@ -292,7 +293,7 @@ const MAX_RESPONSE_BYTES: u64 = 1 << 20;
 /// Private (not `pub(crate)`) because the only legitimate caller is
 /// `check_once`; tests that need to exercise parse + version logic
 /// go through `evaluate` with a fixture JSON string.
-fn fetch_release_list_json(url: &str, current_version: &str) -> Result<String, String> {
+fn fetch_release_list_json(url: &str, current_version: &str) -> Result<String> {
     use std::io::Read;
 
     let response = ureq::get(url)
@@ -300,9 +301,9 @@ fn fetch_release_list_json(url: &str, current_version: &str) -> Result<String, S
         .set("Accept", "application/vnd.github+json")
         .timeout(REQUEST_TIMEOUT)
         .call()
-        .map_err(|e| format!("request failed: {e}"))?;
+        .context("request failed")?;
     if response.status() < 200 || response.status() >= 300 {
-        return Err(format!("HTTP {}", response.status()));
+        return Err(anyhow!("HTTP {}", response.status()));
     }
     // Read at most MAX_RESPONSE_BYTES + 1 so we can tell the
     // difference between "exactly the cap" and "exceeded the cap".
@@ -311,13 +312,11 @@ fn fetch_release_list_json(url: &str, current_version: &str) -> Result<String, S
     // and we refuse to deserialise a truncated JSON document.
     let mut buf = Vec::with_capacity(16 * 1024);
     let mut limited = response.into_reader().take(MAX_RESPONSE_BYTES + 1);
-    limited
-        .read_to_end(&mut buf)
-        .map_err(|e| format!("read body failed: {e}"))?;
+    limited.read_to_end(&mut buf).context("read body failed")?;
     if buf.len() as u64 > MAX_RESPONSE_BYTES {
-        return Err(format!("response exceeded {} bytes", MAX_RESPONSE_BYTES));
+        return Err(anyhow!("response exceeded {} bytes", MAX_RESPONSE_BYTES));
     }
-    String::from_utf8(buf).map_err(|e| format!("response not utf-8: {e}"))
+    String::from_utf8(buf).context("response not utf-8")
 }
 
 /// Strip a leading `v` or `V` and trim whitespace from a version
