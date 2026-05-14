@@ -16,23 +16,36 @@
 //!
 //! # Endpoint
 //!
-//! `https://api.github.com/repos/maui1911/CodeScope/releases/latest`.
-//! GitHub's REST API returns the most recent **non-prerelease** release
-//! published with `vpk upload github` (which is what `release.yml` uses
-//! per the C# build). Unauthenticated requests get 60/h per source IP
-//! — far above our once-every-3-hours cadence even with multiple
-//! processes on the same network.
+//! `https://api.github.com/repos/maui1911/CodeScope/releases?per_page=30`.
+//! We poll the *list* endpoint, not `/releases/latest`. GitHub's
+//! `/latest` only returns the most recent non-prerelease — and every
+//! Rust port release is currently tagged `rs-v0.3.0-rc.N` and marked
+//! `prerelease: true` on GitHub, so `/latest` would only ever surface
+//! the C# build's `v0.2.6` stable tag (already older than any Rust
+//! port build). The list endpoint includes prereleases; we filter
+//! client-side to the `rs-` tag namespace so the C# build's `v0.X.Y`
+//! tags don't pollute our comparison. Unauthenticated requests get
+//! 60/h per source IP — far above our once-every-3-hours cadence
+//! even with multiple processes on the same network.
 //!
 //! # Comparison rule
 //!
-//! Strict semver-major.minor.patch. A leading `v`/`V` is stripped from
-//! both sides. A `-dirty` (or any other) suffix on the *current*
-//! version is stripped before comparison so a developer build that
-//! describes as `0.2.5-dirty` is treated as `0.2.5` for "is the
-//! published release newer?" purposes. Prerelease suffixes on the
-//! published tag (e.g. `0.3.0-rc1`) are likewise dropped — we use the
-//! GitHub `latest` endpoint precisely so we never see them in
-//! practice, but the parser handles them defensively.
+//! Prerelease-aware semver: `major.minor.patch[-rc.N]`. The triple is
+//! compared numerically; on a tie, a final release (`None` prerelease)
+//! outranks any rc, and within rcs the numeric rc index decides
+//! (`rc.4 < rc.5`). Mirrors the relevant slice of semver 2.0 §11
+//! without pulling the full identifier-comparison table in — the only
+//! prerelease shape the Rust port ships is `rc.N`, anything else
+//! parses as "no recognised prerelease" and is treated as a final
+//! release on the published side (defensive: an unrecognised tag
+//! would have to lose to no-prerelease to be considered older).
+//!
+//! Both sides go through [`strip_tag_prefixes`] which peels `rs-` and
+//! `v`/`V`. The current-version slug from `build.rs` can also carry
+//! `git describe` noise (`-N-gXXXX`, `-dirty`); the parser extracts
+//! the `rc.N` segment if present and ignores the rest, so a developer
+//! build three commits past `0.3.0-rc.5-dirty` still parses as
+//! `0.3.0-rc.5` for "is the published release newer?" purposes.
 //!
 //! # Notification surface
 //!
@@ -70,11 +83,22 @@ use serde::Deserialize;
 
 use crate::AppPaths;
 
-/// Public GitHub release endpoint we poll. Mirrors the `RepoUrl`
-/// constant in C# `UpdateService` (the `/releases/latest` path is
-/// what Velopack hits internally).
-pub const RELEASES_LATEST_URL: &str =
-    "https://api.github.com/repos/maui1911/CodeScope/releases/latest";
+/// Public GitHub releases list endpoint we poll. Bumped from
+/// `/releases/latest` to the paged list (see module docs) so we see
+/// prerelease tags too — the Rust port currently ships only rc.N
+/// tags, all of which are marked `prerelease: true` on GitHub.
+/// `per_page=30` is more than enough headroom for the rc cadence
+/// plus the surrounding C# stable releases we filter out client-side.
+pub const RELEASES_LIST_URL: &str =
+    "https://api.github.com/repos/maui1911/CodeScope/releases?per_page=30";
+
+/// Tag-namespace prefix for the Rust port's releases. Both halves of
+/// the comparison live in the same GitHub repo as the C# build
+/// (`v0.X.Y` tags), so we filter the release list to entries whose
+/// `tag_name` starts with `rs-` — anything else belongs to the C#
+/// pipeline and would compare false-newer against a clean `0.3.0-rc.X`
+/// running build.
+pub const RUST_TAG_PREFIX: &str = "rs-";
 
 /// Initial delay before the first poll fires — keeps the network call
 /// off the startup-critical path. Mirrors the 10 s delay in
@@ -154,14 +178,14 @@ pub fn should_poll(paths: &AppPaths) -> bool {
     !paths.dev_mode
 }
 
-/// Run one poll cycle synchronously: fetch the GitHub `latest`
-/// release, parse the tag, compare against `current_version`. Returns
-/// `UpdateStatus::Unknown` for any failure path.
+/// Run one poll cycle synchronously: fetch the GitHub release list,
+/// pick the highest `rs-v*` tag, compare against `current_version`.
+/// Returns `UpdateStatus::Unknown` for any failure path.
 ///
 /// Designed to be called from `cx.background_spawn` — blocking work
 /// that must not run on the UI thread.
 pub fn check_once(current_version: &str) -> UpdateStatus {
-    let body = match fetch_latest_release_json(RELEASES_LATEST_URL, current_version) {
+    let body = match fetch_latest_release_json(RELEASES_LIST_URL, current_version) {
         Ok(body) => body,
         Err(err) => {
             eprintln!("[update_check] fetch failed: {err}");
@@ -171,45 +195,72 @@ pub fn check_once(current_version: &str) -> UpdateStatus {
     evaluate(&body, current_version)
 }
 
-/// Pure logic: given the JSON body of a `/releases/latest` response
+/// Pure logic: given the JSON body of a `/releases` (list) response
 /// and the currently-running version slug, decide what to surface.
 ///
 /// Split out from `check_once` so unit tests can exercise the full
-/// version-comparison + JSON-shape logic without touching the
-/// network. Mirrors the way `pr::parse_pr_url_json` is split from
-/// `pr::detect_pr_url`.
+/// filter + version-comparison logic without touching the network.
+///
+/// The body is parsed as a JSON *array* of `ReleaseInfo` entries.
+/// We filter to `tag_name` starting with [`RUST_TAG_PREFIX`] (so the
+/// C# build's `v0.X.Y` tags don't enter the comparison), parse each
+/// remaining tag as a [`Version`], take the maximum, and compare
+/// against the running build. Mirrors the way `pr::parse_pr_url_json`
+/// is split from `pr::detect_pr_url`.
 pub fn evaluate(json_body: &str, current_version: &str) -> UpdateStatus {
-    let release: ReleaseInfo = match serde_json::from_str(json_body) {
+    let releases: Vec<ReleaseInfo> = match serde_json::from_str(json_body) {
         Ok(r) => r,
         Err(err) => {
-            eprintln!("[update_check] release parse failed: {err}");
+            eprintln!("[update_check] release list parse failed: {err}");
             return UpdateStatus::Unknown;
         }
     };
-    let latest = strip_v_prefix(release.tag_name.trim());
     // Reject the build.rs `0.0-unknown` fallback explicitly: a dev
-    // build that couldn't resolve git would otherwise normalise to
-    // `0.0`, compare false-newer against every published tag, and
-    // get spammed with notifications on every poll.
+    // build that couldn't resolve git would otherwise parse as
+    // `(0, 0, 0)`, compare false-newer against every published tag,
+    // and get spammed with notifications on every poll.
     if is_unknown_fallback(current_version) {
         return UpdateStatus::UpToDate;
     }
-    let current = normalise_current(current_version);
-    match compare_versions(latest, &current) {
-        Some(Ordering::Greater) => UpdateStatus::Available {
-            version: latest.to_owned(),
-            url: release.html_url,
-            body: release.body.unwrap_or_default(),
-        },
-        Some(Ordering::Equal | Ordering::Less) => UpdateStatus::UpToDate,
-        None => {
-            // Version comparison is ambiguous — e.g. the running
-            // build is `0.0-unknown` (no tag yet) or the published
-            // tag isn't semver-shaped. Pretend up-to-date so we
-            // don't spam notifications about an "unknown" version
-            // delta.
-            UpdateStatus::UpToDate
+    let Some(current) = Version::parse(current_version) else {
+        // Same defensive bail as the `is_unknown_fallback` branch:
+        // if we can't even parse our own version we can't compare
+        // safely, so pretend up-to-date until the next tick.
+        return UpdateStatus::UpToDate;
+    };
+
+    // Find the highest published `rs-v*` release. We can't rely on
+    // the GitHub list being ordered by version (it's ordered by
+    // `created_at` which is wall-clock; a back-published older tag
+    // would jump ahead). Walk every candidate, compare, keep the
+    // running max — at ~5 rc tags this is trivial.
+    let mut best: Option<(Version, &ReleaseInfo)> = None;
+    for release in releases.iter() {
+        let tag = release.tag_name.trim();
+        if !tag.starts_with(RUST_TAG_PREFIX) {
+            continue;
         }
+        let Some(parsed) = Version::parse(tag) else { continue };
+        best = match best {
+            None => Some((parsed, release)),
+            Some((cur, _)) if parsed > cur => Some((parsed, release)),
+            Some(existing) => Some(existing),
+        };
+    }
+    let Some((latest, release)) = best else {
+        // No `rs-v*` tags in the window we polled — treat as
+        // up-to-date until one shows up (instead of looping the
+        // notification on every tick).
+        return UpdateStatus::UpToDate;
+    };
+
+    match latest.cmp(&current) {
+        Ordering::Greater => UpdateStatus::Available {
+            version: latest.to_display_string(),
+            url: release.html_url.clone(),
+            body: release.body.clone().unwrap_or_default(),
+        },
+        Ordering::Equal | Ordering::Less => UpdateStatus::UpToDate,
     }
 }
 
@@ -265,270 +316,434 @@ fn strip_v_prefix(s: &str) -> &str {
         .unwrap_or(s)
 }
 
-/// Reduce the current build slug to a semver-shaped string for
-/// comparison against a published tag.
-///
-/// `CODESCOPE_VERSION_DISPLAY` comes from `git describe --tags
-/// --always --dirty`, which produces shapes like:
-///
-/// * `0.2.5` — exact tag
-/// * `0.2.5-dirty` — exact tag with uncommitted changes
-/// * `0.2.5-3-g1a2b3c4` — 3 commits past the tag
-/// * `0.2.5-3-g1a2b3c4-dirty` — same plus dirty
-/// * `0.0-unknown` — no git info available (build.rs fallback)
-///
-/// We strip the `v` prefix and drop everything from the first `-`
-/// onward, treating "past the tag with uncommitted changes" as the
-/// tagged version itself. Conservative on purpose: a dev who's three
-/// commits ahead of `0.2.5` shouldn't get a "0.2.5 is available"
-/// notification.
+/// Strip the Rust-port tag namespace prefix (`rs-`) *and* any
+/// `v`/`V` prefix. Tags from GitHub come in as `rs-v0.3.0-rc.5`; the
+/// embedded current-version slug (from `build.rs`) already had
+/// `rs-v` stripped, but a fresh dev clone or a manual config might
+/// reintroduce it. Same helper on both sides keeps comparison sane.
+fn strip_tag_prefixes(s: &str) -> &str {
+    let trimmed = s.trim();
+    let without_rs = trimmed.strip_prefix(RUST_TAG_PREFIX).unwrap_or(trimmed);
+    strip_v_prefix(without_rs)
+}
+
 /// Recognise the `build.rs` last-resort fallback (`0.0-unknown`).
 /// A dev build that can't resolve git gets stamped with this slug;
 /// treating it as a real version would compare false-newer against
 /// every published tag.
 fn is_unknown_fallback(s: &str) -> bool {
-    let s = strip_v_prefix(s.trim());
+    let s = strip_tag_prefixes(s);
     s == "0.0-unknown" || s.ends_with("-unknown")
 }
 
-fn normalise_current(s: &str) -> String {
-    let s = strip_v_prefix(s.trim());
-    match s.find('-') {
-        Some(idx) => s[..idx].to_owned(),
-        None => s.to_owned(),
+/// Parsed semver-ish version with prerelease awareness for the only
+/// shape the Rust port actually ships: `major.minor.patch[-rc.N]`.
+///
+/// Anything past the `rc.N` segment (`-dirty`, `-3-gHASH`, …) is
+/// ignored — that's `git describe` noise on the current-version side
+/// and is never emitted by the GitHub tag side. An unrecognised
+/// prerelease shape (`-beta.1`, `-alpha`) parses with `rc = None`,
+/// so it ranks alongside a final release. We don't ship those shapes
+/// today; if we ever do, extend this enum rather than relying on the
+/// fall-through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Version {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    /// `None` means "final release" (no prerelease segment). On a
+    /// triple tie, `None` outranks `Some(_)` because semver 2.0
+    /// gives final releases higher precedence than prereleases on
+    /// the same triple.
+    ///
+    /// Field ordering inside this struct matters: `#[derive(Ord)]`
+    /// produces a lexicographic compare across fields in declaration
+    /// order, and `Option<u64>::None < Some(_)` by default — which
+    /// is the *opposite* of what we want. The Ord impl below flips
+    /// it so the derive order doesn't drive the result.
+    rc: Option<u64>,
+}
+
+impl Version {
+    /// Parse a tag or current-version slug into a [`Version`].
+    /// Returns `None` for shapes we can't make sense of — caller
+    /// treats those as "ambiguous, don't notify".
+    fn parse(s: &str) -> Option<Self> {
+        let stripped = strip_tag_prefixes(s);
+        // Split into `triple` and optional `tail` at the first `-`.
+        let (triple, tail) = match stripped.find('-') {
+            Some(idx) => (&stripped[..idx], Some(&stripped[idx + 1..])),
+            None => (stripped, None),
+        };
+        let (major, minor, patch) = parse_triple(triple)?;
+        let rc = tail.and_then(parse_rc_segment);
+        Some(Self { major, minor, patch, rc })
+    }
+
+    /// Render back to the canonical published form (`X.Y.Z` or
+    /// `X.Y.Z-rc.N`). Used when surfacing `UpdateStatus::Available`
+    /// so the notification shows the same shape as the GitHub tag.
+    fn to_display_string(self) -> String {
+        match self.rc {
+            None => format!("{}.{}.{}", self.major, self.minor, self.patch),
+            Some(n) => format!("{}.{}.{}-rc.{n}", self.major, self.minor, self.patch),
+        }
     }
 }
 
-/// Lexicographic comparison over `(major, minor, patch)` triples.
-/// Both inputs must already have their `v` prefix stripped and
-/// suffixes normalised away. Returns `None` when either side fails
-/// to parse as a semver triple — caller treats this as "ambiguous,
-/// don't notify".
-///
-/// We accept 1-, 2-, or 3-segment versions; missing segments default
-/// to 0 (`1.2` becomes `(1, 2, 0)`). This matches Velopack's
-/// `SemanticVersion.Parse` behaviour for short tags like the early
-/// `0.1` releases.
-fn compare_versions(latest: &str, current: &str) -> Option<Ordering> {
-    let l = parse_triple(latest)?;
-    let c = parse_triple(current)?;
-    Some(l.cmp(&c))
+impl Ord for Version {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Triple first.
+        let triple_cmp = (self.major, self.minor, self.patch)
+            .cmp(&(other.major, other.minor, other.patch));
+        if triple_cmp != Ordering::Equal {
+            return triple_cmp;
+        }
+        // Same triple → final (None) outranks any rc (Some). Default
+        // Option ordering would give Some > None, hence the manual
+        // table.
+        match (self.rc, other.rc) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(a), Some(b)) => a.cmp(&b),
+        }
+    }
+}
+
+impl PartialOrd for Version {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
 }
 
 fn parse_triple(s: &str) -> Option<(u64, u64, u64)> {
     let mut parts = s.split('.');
     let major: u64 = parts.next()?.parse().ok()?;
     let minor: u64 = parts.next().unwrap_or("0").parse().ok()?;
-    let patch_raw = parts.next().unwrap_or("0");
+    let patch: u64 = parts.next().unwrap_or("0").parse().ok()?;
     // A 4th segment (`a.b.c.d`) is rejected — we don't ship 4-part
     // versions and accepting them would mask malformed tags.
     if parts.next().is_some() {
         return None;
     }
-    // Drop any prerelease tail on the patch segment (`0.3.0-rc1` →
-    // `0`) so the published `latest` endpoint's defensive parse
-    // matches `normalise_current` on the dev side.
-    let patch_clean = patch_raw.split('-').next().unwrap_or("0");
-    let patch: u64 = patch_clean.parse().ok()?;
     Some((major, minor, patch))
+}
+
+/// Pull an `rc.N` number out of a post-`-` tail. The tail may be:
+///
+/// * `rc.5` — exact tag with prerelease
+/// * `rc.5-dirty` — same plus dirty
+/// * `rc.5-3-gABC` — 3 commits past `rc.5`
+/// * `rc.5-3-gABC-dirty` — both
+/// * `dirty` / `3-gABC` / `dirty-3-gABC` — describe noise on a
+///   final release (rc = None)
+/// * anything else — no recognised prerelease (rc = None)
+///
+/// We split on `-` and search for the first token of the shape
+/// `rc.<digits>`. Conservative on purpose: an unrecognised
+/// prerelease shape (`beta.1`, `alpha`) falls through to `None` and
+/// the caller treats the version as a final release, which is the
+/// safer default for a comparison ("don't downgrade") than treating
+/// it as some kind of rc.
+fn parse_rc_segment(tail: &str) -> Option<u64> {
+    for token in tail.split('-') {
+        if let Some(num_str) = token.strip_prefix("rc.")
+            && let Ok(n) = num_str.parse::<u64>() {
+                return Some(n);
+            }
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ── strip_v_prefix ──────────────────────────────────────────────────
+    // ── strip_tag_prefixes ──────────────────────────────────────────────
 
     #[test]
-    fn strip_v_prefix_removes_lower_v() {
-        assert_eq!(strip_v_prefix("v0.2.5"), "0.2.5");
+    fn strip_tag_prefixes_handles_rust_namespace() {
+        // Real GitHub tag shape for the Rust port.
+        assert_eq!(strip_tag_prefixes("rs-v0.3.0-rc.5"), "0.3.0-rc.5");
+        assert_eq!(strip_tag_prefixes("rs-V0.3.0"), "0.3.0");
     }
 
     #[test]
-    fn strip_v_prefix_removes_upper_v() {
-        assert_eq!(strip_v_prefix("V0.2.5"), "0.2.5");
+    fn strip_tag_prefixes_handles_plain_v_prefix() {
+        // C# build's tag shape — keeps working even though we filter
+        // these out in `evaluate` by tag prefix.
+        assert_eq!(strip_tag_prefixes("v0.2.6"), "0.2.6");
+        assert_eq!(strip_tag_prefixes("V0.2.6-dirty"), "0.2.6-dirty");
     }
 
     #[test]
-    fn strip_v_prefix_no_prefix_unchanged() {
-        assert_eq!(strip_v_prefix("0.2.5"), "0.2.5");
+    fn strip_tag_prefixes_preserves_internal_v() {
+        // Don't accidentally double-strip a `v` later in the string.
+        assert_eq!(strip_tag_prefixes("0.3.0-rc.5-v-suffix"), "0.3.0-rc.5-v-suffix");
+    }
+
+    // ── Version::parse ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_clean_triple_no_prerelease() {
+        let v = Version::parse("0.3.0").unwrap();
+        assert_eq!(v.major, 0);
+        assert_eq!(v.minor, 3);
+        assert_eq!(v.patch, 0);
+        assert_eq!(v.rc, None);
     }
 
     #[test]
-    fn strip_v_prefix_preserves_internal_v() {
-        assert_eq!(strip_v_prefix("0.2.5-rc1"), "0.2.5-rc1");
-    }
-
-    // ── normalise_current ───────────────────────────────────────────────
-
-    #[test]
-    fn normalise_current_strips_dirty_suffix() {
-        assert_eq!(normalise_current("0.2.5-dirty"), "0.2.5");
+    fn parse_with_rc_prerelease() {
+        let v = Version::parse("0.3.0-rc.5").unwrap();
+        assert_eq!(v.rc, Some(5));
     }
 
     #[test]
-    fn normalise_current_strips_describe_distance() {
-        assert_eq!(normalise_current("0.2.5-3-g1a2b3c4"), "0.2.5");
-        assert_eq!(normalise_current("0.2.5-3-g1a2b3c4-dirty"), "0.2.5");
+    fn parse_strips_describe_noise_around_rc() {
+        // `git describe` for a dev clone three commits past `rc.5`
+        // with uncommitted changes still resolves to rc.5 — we treat
+        // ahead-of-tag-but-dirty as the tag itself for "is published
+        // version newer?" purposes, same as the pre-rc behaviour.
+        assert_eq!(Version::parse("0.3.0-rc.5-dirty").unwrap().rc, Some(5));
+        assert_eq!(Version::parse("0.3.0-rc.5-3-g1a2b3c4").unwrap().rc, Some(5));
+        assert_eq!(
+            Version::parse("0.3.0-rc.5-3-g1a2b3c4-dirty").unwrap().rc,
+            Some(5)
+        );
     }
 
     #[test]
-    fn normalise_current_strips_v_prefix() {
-        assert_eq!(normalise_current("v0.2.5"), "0.2.5");
-        assert_eq!(normalise_current("V0.2.5-dirty"), "0.2.5");
+    fn parse_strips_describe_noise_on_final_release() {
+        // Same noise patterns on a final-release tag — no rc segment
+        // present, so rc stays None.
+        let v = Version::parse("0.3.0-dirty").unwrap();
+        assert_eq!(v.rc, None);
+        let v = Version::parse("0.3.0-3-g1a2b3c4").unwrap();
+        assert_eq!(v.rc, None);
     }
 
     #[test]
-    fn normalise_current_unknown_passes_through() {
-        // The "0.0-unknown" build.rs fallback reduces to "0.0" here.
-        // That string would parse as the triple (0, 0, 0) and
-        // compare false-newer against every published tag, which is
-        // why `evaluate` short-circuits via `is_unknown_fallback`
-        // before this normalisation result is fed to
-        // `compare_versions`.
-        assert_eq!(normalise_current("0.0-unknown"), "0.0");
-    }
-
-    // ── compare_versions ────────────────────────────────────────────────
-
-    #[test]
-    fn compare_patch_increment() {
-        assert_eq!(compare_versions("0.2.6", "0.2.5"), Some(Ordering::Greater));
-        assert_eq!(compare_versions("0.2.5", "0.2.6"), Some(Ordering::Less));
+    fn parse_strips_full_github_tag() {
+        // End-to-end: real published tag flows through.
+        let v = Version::parse("rs-v0.3.0-rc.5").unwrap();
+        assert_eq!((v.major, v.minor, v.patch, v.rc), (0, 3, 0, Some(5)));
     }
 
     #[test]
-    fn compare_minor_increment() {
-        assert_eq!(compare_versions("0.3.0", "0.2.99"), Some(Ordering::Greater));
+    fn parse_unrecognised_prerelease_falls_through_to_none() {
+        // We don't ship beta/alpha today; the parser refuses to
+        // guess so the caller treats them as final releases on the
+        // *published* side (defensive: would otherwise rank a
+        // future "rs-v0.3.0-beta.1" as newer than a `0.3.0-rc.5`
+        // dev build).
+        let v = Version::parse("0.3.0-beta.1").unwrap();
+        assert_eq!(v.rc, None);
+        let v = Version::parse("0.3.0-alpha").unwrap();
+        assert_eq!(v.rc, None);
     }
 
     #[test]
-    fn compare_major_increment() {
-        assert_eq!(compare_versions("1.0.0", "0.99.99"), Some(Ordering::Greater));
+    fn parse_rejects_too_many_segments() {
+        assert!(Version::parse("1.0.0.0").is_none());
     }
 
     #[test]
-    fn compare_equal() {
-        assert_eq!(compare_versions("0.2.5", "0.2.5"), Some(Ordering::Equal));
+    fn parse_rejects_non_numeric() {
+        assert!(Version::parse("abc.def.ghi").is_none());
+        assert!(Version::parse("..").is_none());
     }
 
     #[test]
-    fn compare_short_form_treats_missing_as_zero() {
-        // `0.2` and `0.2.0` are equivalent.
-        assert_eq!(compare_versions("0.2", "0.2.0"), Some(Ordering::Equal));
-        assert_eq!(compare_versions("1", "1.0.0"), Some(Ordering::Equal));
+    fn parse_short_form_treats_missing_as_zero() {
+        assert_eq!(Version::parse("0.2").unwrap().patch, 0);
+        assert_eq!(Version::parse("1").unwrap().minor, 0);
+        assert_eq!(Version::parse("1").unwrap().patch, 0);
+    }
+
+    // ── Version::cmp (prerelease-aware) ─────────────────────────────────
+
+    fn v(s: &str) -> Version { Version::parse(s).expect("parse") }
+
+    #[test]
+    fn cmp_triple_drives_comparison_first() {
+        assert!(v("0.2.6") < v("0.3.0"));
+        assert!(v("0.3.0") > v("0.2.6"));
     }
 
     #[test]
-    fn compare_rejects_too_many_segments() {
-        // Four-part versions are not a shape we ship; treat as
-        // ambiguous so the caller doesn't notify on garbage input.
-        assert_eq!(compare_versions("1.0.0.0", "1.0.0"), None);
+    fn cmp_final_outranks_any_rc_on_same_triple() {
+        // The bug that motivated this PR: `0.3.0-rc.5` must NOT be
+        // equal to `0.3.0`. semver 2.0 §11 — final > any prerelease.
+        assert!(v("0.3.0") > v("0.3.0-rc.5"));
+        assert!(v("0.3.0-rc.5") < v("0.3.0"));
     }
 
     #[test]
-    fn compare_rejects_non_numeric() {
-        assert_eq!(compare_versions("abc.def.ghi", "0.0.0"), None);
-        // Empty component
-        assert_eq!(compare_versions("..", "0.0.0"), None);
+    fn cmp_rc_index_decides_within_same_triple() {
+        // The other bug: rc.4 → rc.5 should produce Greater so the
+        // user actually sees a notification.
+        assert!(v("0.3.0-rc.5") > v("0.3.0-rc.4"));
+        assert!(v("0.3.0-rc.4") < v("0.3.0-rc.5"));
     }
 
     #[test]
-    fn compare_strips_prerelease_tail_from_patch() {
-        // The `latest` endpoint normally returns non-prereleases, but
-        // the parser still handles them defensively.
-        assert_eq!(compare_versions("0.3.0-rc1", "0.3.0"), Some(Ordering::Equal));
+    fn cmp_describe_noise_on_current_doesnt_change_rank() {
+        // A dev build three commits ahead of rc.5 with dirty still
+        // compares equal to a clean rc.5 published tag, so the
+        // notification doesn't spam developers in their working
+        // tree.
+        assert_eq!(
+            v("0.3.0-rc.5"),
+            v("0.3.0-rc.5-3-g1a2b3c4-dirty")
+        );
     }
 
-    // ── evaluate (full pipeline, JSON → UpdateStatus) ───────────────────
+    // ── evaluate (full pipeline, JSON list → UpdateStatus) ──────────────
 
-    fn release_json(tag: &str, url: &str, body: Option<&str>) -> String {
+    fn release_obj(tag: &str, url: &str, body: Option<&str>) -> String {
         let body_field = match body {
             Some(b) => format!("\"{}\"", b.replace('\"', "\\\"")),
             None => "null".to_string(),
         };
-        format!(
-            "{{\"tag_name\":\"{tag}\",\"html_url\":\"{url}\",\"body\":{body_field}}}"
-        )
+        format!("{{\"tag_name\":\"{tag}\",\"html_url\":\"{url}\",\"body\":{body_field}}}")
+    }
+
+    fn release_list(entries: &[String]) -> String {
+        format!("[{}]", entries.join(","))
     }
 
     #[test]
-    fn evaluate_available_when_published_newer() {
-        let json = release_json(
-            "v0.2.6",
-            "https://github.com/maui1911/CodeScope/releases/tag/v0.2.6",
-            Some("Bug fixes"),
-        );
-        let status = evaluate(&json, "0.2.5");
-        match status {
+    fn evaluate_available_when_higher_rc_published() {
+        // The exact scenario from PR #205's diagnostic chase: running
+        // rc.4, list contains rc.5 (newest), rc.4, rc.3, plus C#
+        // `v0.2.6` we must filter out.
+        let json = release_list(&[
+            release_obj("rs-v0.3.0-rc.5", "https://example.invalid/rc5", Some("rc5 notes")),
+            release_obj("rs-v0.3.0-rc.4", "https://example.invalid/rc4", None),
+            release_obj("rs-v0.3.0-rc.3", "https://example.invalid/rc3", None),
+            release_obj("v0.2.6",          "https://example.invalid/csharp", None),
+        ]);
+        match evaluate(&json, "0.3.0-rc.4") {
             UpdateStatus::Available { version, url, body } => {
-                assert_eq!(version, "0.2.6");
-                assert_eq!(
-                    url,
-                    "https://github.com/maui1911/CodeScope/releases/tag/v0.2.6"
-                );
-                assert_eq!(body, "Bug fixes");
+                assert_eq!(version, "0.3.0-rc.5");
+                assert_eq!(url, "https://example.invalid/rc5");
+                assert_eq!(body, "rc5 notes");
             }
             other => panic!("expected Available, got {other:?}"),
         }
     }
 
     #[test]
-    fn evaluate_uptodate_when_running_dirty_at_same_tag() {
-        let json = release_json("v0.2.5", "https://example.invalid", None);
-        // `-dirty` on the local build still maps to 0.2.5.
-        assert_eq!(evaluate(&json, "0.2.5-dirty"), UpdateStatus::UpToDate);
-    }
-
-    #[test]
-    fn evaluate_uptodate_when_running_ahead_of_release() {
-        // Developer building from a future commit shouldn't see a
-        // notification for a release they're already past.
-        let json = release_json("v0.2.5", "https://example.invalid", None);
-        assert_eq!(evaluate(&json, "0.2.6"), UpdateStatus::UpToDate);
-    }
-
-    #[test]
-    fn evaluate_uptodate_when_current_is_unknown_fallback() {
-        // The build.rs `0.0-unknown` fallback. `normalise_current`
-        // would otherwise reduce this to `0.0` (parsing as the triple
-        // `(0, 0, 0)`) and compare false-newer against every published
-        // tag — `is_unknown_fallback` short-circuits before that and
-        // returns UpToDate so we don't spam notifications.
-        let json = release_json("v0.2.5", "https://example.invalid", None);
-        assert_eq!(evaluate(&json, "0.0-unknown"), UpdateStatus::UpToDate);
-    }
-
-    #[test]
-    fn evaluate_unknown_on_malformed_json() {
-        assert_eq!(evaluate("not json", "0.2.5"), UpdateStatus::Unknown);
-        assert_eq!(evaluate("", "0.2.5"), UpdateStatus::Unknown);
-    }
-
-    #[test]
-    fn evaluate_unknown_on_missing_required_fields() {
-        // Missing `tag_name` — serde_json fails the field, returns
-        // Unknown. `body` is optional; everything else isn't.
-        assert_eq!(
-            evaluate("{\"html_url\":\"x\"}", "0.2.5"),
-            UpdateStatus::Unknown
-        );
-    }
-
-    #[test]
-    fn evaluate_handles_null_body() {
-        let json = release_json("v0.2.6", "https://example.invalid", None);
-        match evaluate(&json, "0.2.5") {
-            UpdateStatus::Available { body, .. } => assert_eq!(body, ""),
+    fn evaluate_available_when_final_published_against_rc() {
+        // `0.3.0` (final) outranks `0.3.0-rc.5` (running), so a stable
+        // release after the rc cadence ends still notifies.
+        let json = release_list(&[
+            release_obj("rs-v0.3.0", "https://example.invalid/final", None),
+            release_obj("rs-v0.3.0-rc.5", "https://example.invalid/rc5", None),
+        ]);
+        match evaluate(&json, "0.3.0-rc.5") {
+            UpdateStatus::Available { version, .. } => assert_eq!(version, "0.3.0"),
             other => panic!("expected Available, got {other:?}"),
         }
     }
 
     #[test]
-    fn evaluate_handles_unprefixed_tag() {
-        let json = release_json("0.2.6", "https://example.invalid", Some("notes"));
-        match evaluate(&json, "0.2.5") {
-            UpdateStatus::Available { version, .. } => assert_eq!(version, "0.2.6"),
+    fn evaluate_uptodate_when_running_latest_rc() {
+        let json = release_list(&[
+            release_obj("rs-v0.3.0-rc.5", "https://example.invalid", None),
+            release_obj("rs-v0.3.0-rc.4", "https://example.invalid", None),
+        ]);
+        assert_eq!(
+            evaluate(&json, "0.3.0-rc.5"),
+            UpdateStatus::UpToDate
+        );
+    }
+
+    #[test]
+    fn evaluate_uptodate_when_running_dirty_at_same_rc() {
+        let json = release_list(&[
+            release_obj("rs-v0.3.0-rc.5", "https://example.invalid", None),
+        ]);
+        // Dev build three commits past rc.5 + dirty — same rc rank.
+        assert_eq!(
+            evaluate(&json, "0.3.0-rc.5-3-g1a2b3c4-dirty"),
+            UpdateStatus::UpToDate
+        );
+    }
+
+    #[test]
+    fn evaluate_uptodate_when_running_ahead_of_release() {
+        // Developer on rc.6 (unreleased) shouldn't get pinged about
+        // the already-published rc.5.
+        let json = release_list(&[
+            release_obj("rs-v0.3.0-rc.5", "https://example.invalid", None),
+        ]);
+        assert_eq!(
+            evaluate(&json, "0.3.0-rc.6"),
+            UpdateStatus::UpToDate
+        );
+    }
+
+    #[test]
+    fn evaluate_uptodate_when_only_csharp_tags_in_list() {
+        // GitHub returned only `v0.X.Y` tags (the C# build); we
+        // filter them out and end up with no candidate. Treat as
+        // UpToDate rather than spamming Unknown forever.
+        let json = release_list(&[
+            release_obj("v0.2.6", "https://example.invalid", None),
+            release_obj("v0.2.5", "https://example.invalid", None),
+        ]);
+        assert_eq!(evaluate(&json, "0.3.0-rc.4"), UpdateStatus::UpToDate);
+    }
+
+    #[test]
+    fn evaluate_uptodate_when_current_is_unknown_fallback() {
+        // The build.rs `0.0-unknown` fallback gets short-circuited
+        // so it doesn't compare false-newer than every published tag.
+        let json = release_list(&[
+            release_obj("rs-v0.3.0-rc.5", "https://example.invalid", None),
+        ]);
+        assert_eq!(evaluate(&json, "0.0-unknown"), UpdateStatus::UpToDate);
+    }
+
+    #[test]
+    fn evaluate_picks_highest_not_first_in_list() {
+        // GitHub's `/releases` is ordered by `created_at`, which the
+        // user can manipulate (back-publishing). The evaluator MUST
+        // walk every candidate and keep the highest version, not
+        // trust list order. This test scrambles the order to prove it.
+        let json = release_list(&[
+            release_obj("rs-v0.3.0-rc.3", "https://example.invalid/rc3", None),
+            release_obj("rs-v0.3.0-rc.5", "https://example.invalid/rc5", None),
+            release_obj("rs-v0.3.0-rc.4", "https://example.invalid/rc4", None),
+        ]);
+        match evaluate(&json, "0.3.0-rc.2") {
+            UpdateStatus::Available { version, url, .. } => {
+                assert_eq!(version, "0.3.0-rc.5");
+                assert_eq!(url, "https://example.invalid/rc5");
+            }
+            other => panic!("expected Available rc.5, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluate_unknown_on_malformed_json() {
+        assert_eq!(evaluate("not json", "0.3.0-rc.4"), UpdateStatus::Unknown);
+        assert_eq!(evaluate("", "0.3.0-rc.4"), UpdateStatus::Unknown);
+    }
+
+    #[test]
+    fn evaluate_uptodate_on_empty_list() {
+        assert_eq!(evaluate("[]", "0.3.0-rc.4"), UpdateStatus::UpToDate);
+    }
+
+    #[test]
+    fn evaluate_handles_null_body() {
+        let json = release_list(&[
+            release_obj("rs-v0.3.0-rc.5", "https://example.invalid", None),
+        ]);
+        match evaluate(&json, "0.3.0-rc.4") {
+            UpdateStatus::Available { body, .. } => assert_eq!(body, ""),
             other => panic!("expected Available, got {other:?}"),
         }
     }

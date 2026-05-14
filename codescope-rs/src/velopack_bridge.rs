@@ -199,11 +199,23 @@ pub fn maybe_apply_now() -> ApplyOutcome {
         ExplicitChannel: Some(channel_override()),
         ..Default::default()
     };
-    // `GithubSource` directly mirrors C#
-    // `new GithubSource(RepoUrl, accessToken: null, prerelease: false)`.
+    // `GithubSource` argv: `(repoUrl, accessToken, prerelease)`. We
+    // pass `prerelease: true` so the source includes the Rust port's
+    // `rs-v0.3.0-rc.N` tags — every Rust port release published to
+    // date is marked `prerelease: true` on GitHub (cargo-dist /
+    // `rs--release.yml` flags them via
+    // `announcement_is_prerelease`). The C# build's mirror call
+    // (`UpdateService.cs`) uses `prerelease: false`; the difference
+    // is deliberate, not a copy-paste error. Until a stable Rust port
+    // tag ships (≥ `rs-v0.3.0` without an rc suffix) `false` would
+    // make every poll return `NoUpdateAvailable` and the auto-apply
+    // path would never see rc.N → rc.N+1 deltas. A future ring-
+    // channel system (documented at the top of this file) can pin
+    // stable rings back to `false` once they exist.
+    //
     // No token → public-API rate limit (60 req/hr per IP); same as
     // C# build's behaviour.
-    let source = velopack::sources::GithubSource::new(REPO_URL, None, false);
+    let source = velopack::sources::GithubSource::new(REPO_URL, None, true);
     // Velopack-rs returns Err from `UpdateManager::new` when the
     // binary wasn't installed via a Velopack bootstrapper. That's
     // the documented "not installed" detection path; we treat it
