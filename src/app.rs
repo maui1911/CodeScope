@@ -992,7 +992,35 @@ impl AppShell {
                     state,
                     set_at: Instant::now(),
                 });
+                // Force a re-render so the entity tree picks up the
+                // new viewport bounds (otherwise the terminal panes
+                // keep their pre-transition layout until something
+                // else marks the tree dirty — e.g. tab swap, output,
+                // focus change).
+                //
+                // `cx.notify()` alone is not enough. The observer
+                // can fire mid-frame (gpui calls it from inside
+                // `Window::bounds_changed`, which is dispatched off
+                // an OS resize tick that can land while `draw_phase
+                // != None`). When that happens, `WindowInvalidator::
+                // invalidate_view` (gpui-0.2.2 `window.rs:116`) adds
+                // the entity to `dirty_views` but skips the
+                // `dirty = true` set — the window's dirty flag never
+                // flips, so no next frame is scheduled. Same race
+                // gpui's own `Window::refresh()` has, which is why
+                // it didn't backstop us either.
+                //
+                // `window.on_next_frame` queues a callback that runs
+                // at the start of the next `on_request_frame` tick,
+                // where `draw_phase == None` is guaranteed. The
+                // `app.notify` there reliably flips `dirty = true`
+                // and the resize cascades through `render_group` →
+                // `TerminalView` canvas prepaint → `maybe_resize` →
+                // `Backend::resize`. `cx.notify()` stays as the
+                // fast path for the (common) outside-of-draw case.
                 cx.notify();
+                let entity = cx.entity_id();
+                window.on_next_frame(move |_, app| app.notify(entity));
             }
         })
         .detach();
