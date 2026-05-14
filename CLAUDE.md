@@ -15,7 +15,7 @@ isolation. Ships on Windows, macOS (arm64 + x64), and Linux x64.
 
 ## Technology decisions (non-negotiable)
 
-- Rust (stable toolchain) — workspace at `codescope-rs/Cargo.toml`
+- Rust (stable toolchain) — workspace at repo-root `Cargo.toml`
 - [GPUI](https://www.gpui.rs/) for the application shell — do not
   suggest egui, iced, or web frontends
 - `codescope-terminal` (GPUI-native ConPTY/PTY) for terminal hosting —
@@ -55,12 +55,12 @@ Start the dev build with the `CODESCOPE_DEV` env var set:
 ```pwsh
 # Windows (PowerShell)
 $env:CODESCOPE_DEV = "1"
-cargo run --manifest-path codescope-rs/Cargo.toml --bin codescope-rs
+cargo run --bin codescope-rs
 ```
 
 ```bash
 # macOS / Linux
-CODESCOPE_DEV=1 cargo run --manifest-path codescope-rs/Cargo.toml --bin codescope-rs
+CODESCOPE_DEV=1 cargo run --bin codescope-rs
 ```
 
 `codescope_core::paths::AppPaths::detect()` resolves the env var once

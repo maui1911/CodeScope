@@ -20,7 +20,7 @@
 Dependency direction is strict: `codescope-rs` depends on
 `codescope-core` and `codescope-terminal`; `codescope-core` has zero UI
 references (no GPUI, no windowing, no terminal). The workspace lives
-at `codescope-rs/Cargo.toml`. Cutover-3 flattens this to repo root.
+at repo-root `Cargo.toml`.
 
 ## Runtime shape
 
@@ -47,7 +47,7 @@ to `layout.json`; the project / worktree / session tree persists to
 
 ## Core services
 
-`codescope-core` modules (under `codescope-rs/core/src/`):
+`codescope-core` modules (under `core/src/`):
 
 - `projects` — reads/writes `%APPDATA%\CodeScope\projects.json` via
   `serde_json`. Schema versioned by the `version` field; migrations
@@ -65,7 +65,7 @@ to `layout.json`; the project / worktree / session tree persists to
   `update_check`, `layout`, `paths`, `settings`, `window_state`,
   `attachments` — one module per concern, all UI-free.
 
-`codescope-rs/src/` hosts the GPUI shell (`app.rs` → `AppShell`,
+`src/` (repo root) hosts the GPUI shell (`app.rs` → `AppShell`,
 `view.rs`, `sidebar.rs`, dialogs, status bar). Render-state mutations
 go through `cx.notify()` rather than an MVVM relay-command layer.
 
@@ -89,7 +89,7 @@ Both paths live in `codescope-terminal`.
 `AppPaths::projects_file()`; the config root is
 `~/.config/CodeScope/` on Linux and
 `~/Library/Application Support/CodeScope/` on macOS — see
-`codescope-rs/core/src/paths.rs`):
+`core/src/paths.rs`):
 
 ```json
 {
