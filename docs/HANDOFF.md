@@ -5,9 +5,19 @@
 > **Intent:** cursor + last 1–2 sessions in depth, everything else a one-liner.
 > Old detail lives in `git log` — don't duplicate it here.
 
-> ### House rule for the Rust port
+> ### Rust is canonical (as of 2026-05-14)
 >
-> **The Rust port (`codescope-rs/`) is a 1:1 functional port of the C# CodeScope build (`src/CodeScope.App/`, `src/CodeScope.Core/`, `src/CodeScope.AgentCli/`).** Before implementing any feature on the Rust side, **read the equivalent C# code first** and mirror its behavior, button labels, dialogs, data shapes, and persistence layout. Functional parity is the goal — we are not redesigning. If a `HANDOFF.md` entry, README line, or "next entry point" disagrees with what the C# code actually does, the C# code wins; update the doc. Genuine platform-forced deviations (gpui vs WPF idiom) get a one-line comment and an entry in `docs/DECISIONS.md`. "Cleaner" or "more elegant" is not a reason on its own. (Reinforced in session 33 after PR #56 invented a non-existent UX.)
+> The Rust port (`codescope-rs/`) is the only active implementation. The
+> .NET 10 / WPF build was retired on 2026-05-14; the last commit where
+> the C# tree still builds is tagged `legacy/v0.2.6-final`. See
+> [ADR-0022](DECISIONS.md) and [MIGRATION-csharp-to-rust.md](MIGRATION-csharp-to-rust.md).
+> The "mirror C# 1:1" parity rule (introduced session 33) is retired
+> with it — future deviations from `v0.2.6` behavior are normal product
+> work, not parity violations.
+>
+> Cutover-2 (delete C# source) and cutover-3 (flatten `codescope-rs/`
+> to repo root, rename Velopack pack id to `codescope`, tag namespace
+> to `v*`) are tracked in `docs/superpowers/specs/2026-05-14-csharp-build-retirement-design.md`.
 
 **Last updated:** 2026-05-14 (session 41 — bell hookup, cross-platform Velopack, empty-state hero)
 **Branch:** `main`

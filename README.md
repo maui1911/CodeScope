@@ -1,8 +1,8 @@
 # CodeScope
 
-**A native Windows command center for AI coding agents.**
+**A native command center for AI coding agents.**
 
-CodeScope runs Claude Code, Codex, Copilot, OpenCode, Pi and any other CLI agent as parallel, worktree-isolated sessions inside a single WPF window — with tabbed terminals, split editor groups, a live git overview, and a keyboard-first command palette.
+CodeScope runs Claude Code, Codex, Copilot, OpenCode, Pi and any other CLI agent as parallel, worktree-isolated sessions inside a single window — with tabbed terminals, split editor groups, a live git overview, and a keyboard-first command palette. Ships on Windows, macOS (Apple Silicon + Intel), and Linux x64.
 
 ![CodeScope main window](docs/screenshots/hero.png)
 
@@ -10,11 +10,11 @@ CodeScope runs Claude Code, Codex, Copilot, OpenCode, Pi and any other CLI agent
 
 ## Why
 
-Agents are fast enough that one at a time is now the bottleneck. Running five parallel `claude` sessions from Windows Terminal means juggling five shells, five branches, and five mental stacks. CodeScope gives each agent its own git worktree, its own tab, its own notification status, and surfaces the state of every session at a glance:
+Agents are fast enough that one at a time is now the bottleneck. Running five parallel `claude` sessions from a plain terminal means juggling five shells, five branches, and five mental stacks. CodeScope gives each agent its own git worktree, its own tab, its own notification status, and surfaces the state of every session at a glance:
 
 - **Worktree isolation** — every session starts with `git worktree add -b` under the hood, so agents never step on each other's branches.
-- **Native Windows** — WPF + Wpf.Ui chrome, ConPTY-backed terminals via `EasyWindowsTerminalControl`. No Electron, no WebView2.
-- **Bring your own agent** — anything on `PATH` works: `claude`, `codex`, `opencode`, raw `pwsh`. Zero translation layer.
+- **Native** — Rust + [GPUI](https://www.gpui.rs/) chrome, ConPTY/PTY-backed terminals via the in-tree `codescope-terminal` crate. No Electron, no WebView2.
+- **Bring your own agent** — anything on `PATH` works: `claude`, `codex`, `opencode`, raw `pwsh` / `bash`. Zero translation layer.
 
 ## Features
 
@@ -46,44 +46,47 @@ Snap a worktree into its own workspace with `Ctrl+\`. Two agents, side by side, 
 
 ## Install
 
-Grab the latest release from the [**Releases page**](https://github.com/maui1911/CodeScope/releases/latest):
+Grab the latest release from the [**Releases page**](https://github.com/maui1911/CodeScope/releases/latest). Each release ships a per-platform Velopack feed; pick the asset that matches your machine:
 
-| Asset | What |
+| Asset | Platform |
 |---|---|
-| **`CodeScope-win-Setup.exe`** | One-click installer (recommended). Installs to `%LocalAppData%\CodeScope`, auto-updates via Velopack. |
-| **`CodeScope-win-Portable.zip`** | Standalone zip — extract and run `CodeScope.exe`. No install, no auto-update. |
+| **`codescope-rs-win-Setup.exe`** | Windows 10 22H2+ / Windows 11 (x64) — installs to `%LocalAppData%\codescope-rs`, auto-updates. |
+| **`codescope-rs-osx-arm64.app.zip`** | macOS 13+ on Apple Silicon — unzip and drag to `/Applications`. |
+| **`codescope-rs-osx-x64.app.zip`** | macOS 13+ on Intel — unzip and drag to `/Applications`. |
+| **`codescope-rs-linux-x64.AppImage`** | Linux x64 — `chmod +x` and run. |
+
+> Pack id `codescope-rs` is in effect through the `0.3.0-rc.X` line. It is renamed to `codescope` in cutover-3 of the C# retirement; users on `codescope-rs` will need to uninstall and reinstall once when that release ships. `%APPDATA%\CodeScope\projects.json` carries over unchanged.
 
 ### Requirements
 
-- Windows 10 22H2+ or Windows 11
 - `git` on `PATH`
 - At least one agent CLI on `PATH` (`claude`, `codex`, `copilot`, `opencode`, `pi`, etc.)
 
-> **No .NET SDK needed** — the release is self-contained.
+> **No Rust toolchain needed** — the release is self-contained.
 
 ## Build from source
 
 Only needed if you want to contribute or hack on CodeScope itself.
 
 ```pwsh
-# Prerequisites: .NET 10 SDK (10.0.100+), git
-dotnet restore
-dotnet build
-dotnet run --project src/CodeScope.App
+# Prerequisites: stable Rust toolchain (1.85+, edition 2024), git
+cargo build --manifest-path codescope-rs/Cargo.toml
+cargo run --manifest-path codescope-rs/Cargo.toml --bin codescope-rs
 ```
 
 Run the tests:
 
 ```pwsh
-dotnet test
+cargo test --manifest-path codescope-rs/Cargo.toml --workspace
 ```
 
-Publish a release binary:
+Build a release binary:
 
 ```pwsh
-dotnet publish src/CodeScope.App -c Release -r win-x64 `
-    -p:PublishSingleFile=true -p:PublishReadyToRun=true
+cargo build --manifest-path codescope-rs/Cargo.toml --release
 ```
+
+For installer / Velopack packaging see `.github/workflows/rs--release.yml`.
 
 ## Keyboard shortcuts
 
@@ -105,24 +108,32 @@ dotnet publish src/CodeScope.App -c Release -r win-x64 `
 ## Repository layout
 
 ```
-src/
-  CodeScope.App/     WPF host — App.xaml, MainWindow, DI composition root
-  CodeScope.Core/    Pure logic — services, models, no UI references
-  CodeScope.Ui/      ViewModels, Views, Dialogs, Converters
-tests/
-  CodeScope.Core.Tests/
+codescope-rs/
+  src/               GPUI application shell — AppShell, MainViewModel, dialogs, views
+  core/              Pure logic — services, models, no UI references
+  terminal/          GPUI-native ConPTY/PTY terminal view (codescope-terminal crate)
+  examples/          Standalone GPUI demos
+  assets/            Icons, fonts, packaged resources
+  wix/               Windows installer chrome
+  scripts/           Release / packaging helpers
+  vendor/            Vendored upstream crates (see ADR-0017-style notes)
 docs/
   DESIGN.md          Design tokens
   DECISIONS.md       ADRs
   HANDOFF.md         Rolling cursor between working sessions
+  MIGRATION-csharp-to-rust.md   Historical note on the 2026-05-14 cutover
   screenshots/       README imagery
 ```
 
-The `NoScope.CodeScope.*` CLR namespace pairs with the `CodeScope` binary name.
+> Historical note: through `v0.2.6` the canonical tree was a .NET 10 / WPF
+> build at `src/CodeScope.{App,Core,Ui}/`. That tree is preserved at tag
+> `legacy/v0.2.6-final`; see [docs/MIGRATION-csharp-to-rust.md](docs/MIGRATION-csharp-to-rust.md)
+> for the why and how of the cutover. Cutover-3 flattens `codescope-rs/*`
+> to repo root.
 
 ## Status
 
-Pre-1.0. The core session / worktree / PR workflows are stable and used daily; the design system is in its final pass and the release story (Velopack, auto-update) is the current milestone.
+Pre-1.0. The core session / worktree / PR workflows are stable and used daily; per-platform Velopack feeds ship from `rs-v0.3.0-rc.5` onward, and the C# implementation is being retired in three sequential PRs (see `docs/superpowers/specs/2026-05-14-csharp-build-retirement-design.md`).
 
 See `docs/HANDOFF.md` for the live status cursor and `docs/DECISIONS.md` for the architectural record.
 
