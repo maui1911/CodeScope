@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::claude_telemetry::encode_cwd;
+use crate::agents::claude::telemetry::encode_cwd;
 
 /// Suggested poll interval for adoption watches — 350 ms matches the
 /// C# `ClaudeSessionDiscovery.PollInterval`.

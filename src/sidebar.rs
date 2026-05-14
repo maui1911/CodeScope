@@ -42,9 +42,9 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, anchored, deferred, div, point, px,
 };
 
-use crate::confirm_dialog::ConfirmSpec;
-use crate::new_project_dialog::NewProjectDialogState;
-use crate::new_worktree_dialog::NewWorktreeDialogState;
+use crate::dialogs::confirm::ConfirmSpec;
+use crate::dialogs::new_project::NewProjectDialogState;
+use crate::dialogs::new_worktree::NewWorktreeDialogState;
 use crate::theme;
 
 /// How often the dirty-state poller wakes up. 5 s is well under
@@ -295,7 +295,7 @@ pub enum SidebarEvent {
     /// `window.prompt(...)` OS-native modals so destructive sidebar
     /// flows share visual chrome with the rest of the app's modals.
     ///
-    /// `ConfirmDialog`: [`crate::confirm_dialog::ConfirmDialog`]
+    /// `ConfirmDialog`: [`crate::dialogs::confirm::ConfirmDialog`]
     OpenConfirmDialog { spec: ConfirmSpec, action: ConfirmAction },
     /// The live branch for a worktree has changed (the user ran
     /// `git checkout` inside its pty, the `start_git_status_poll`
@@ -2239,7 +2239,7 @@ impl Sidebar {
 
     /// Dispatch a confirmed [`ConfirmAction`] to the matching sidebar
     /// mutation path. Called by AppShell when the themed
-    /// [`crate::confirm_dialog::ConfirmDialog`] resolves to `true`.
+    /// [`crate::dialogs::confirm::ConfirmDialog`] resolves to `true`.
     /// Variants that need AppShell state (the session-history one)
     /// are handled on the AppShell side and never reach this match.
     pub fn execute_confirm_action(
@@ -4820,7 +4820,7 @@ async fn run_remove_worktree_flow(
                 err
             );
             let _ = this.update(cx, |_, cx| {
-                let spec = crate::confirm_dialog::ConfirmSpec::destructive(
+                let spec = crate::dialogs::confirm::ConfirmSpec::destructive(
                     "Couldn't remove worktree — force?",
                     "",
                 )

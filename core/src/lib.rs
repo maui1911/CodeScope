@@ -15,23 +15,16 @@
 
 pub mod agent;
 pub mod agent_registry;
+pub mod agents;
 pub mod attachments;
-pub mod claude_discovery;
-pub mod claude_telemetry;
 pub mod command_palette;
-pub mod copilot_discovery;
-pub mod copilot_telemetry;
 pub mod crash_log;
 pub mod git;
 pub mod layout;
 pub mod memory_watchdog;
-pub mod opencode_discovery;
-pub mod opencode_telemetry;
 pub mod overview;
 pub mod path_canon;
 pub mod paths;
-pub mod pi_discovery;
-pub mod pi_telemetry;
 pub mod pr;
 pub mod process;
 pub mod projects;
@@ -50,23 +43,23 @@ pub use agent_registry::{
     AgentProfile, AgentRegistry, build_new_session_auto_type, build_resume_auto_type,
     built_in_defaults,
 };
-pub use attachments::{SavedAttachment, save_attachment_bytes};
-pub use claude_discovery::POLL_INTERVAL_MS as CLAUDE_DISCOVERY_POLL_MS;
-pub use claude_telemetry::{
-    SessionState, TelemetrySnapshot, ClaudeTranscriptTail, context_window_for_model, encode_cwd,
+pub use agents::claude::discovery::POLL_INTERVAL_MS as CLAUDE_DISCOVERY_POLL_MS;
+pub use agents::claude::telemetry::{
+    ClaudeTranscriptTail, SessionState, TelemetrySnapshot, context_window_for_model, encode_cwd,
     format_context_pct, format_tokens, model_display_name,
 };
-pub use copilot_discovery::POLL_INTERVAL_MS as COPILOT_DISCOVERY_POLL_MS;
-pub use copilot_telemetry::CopilotTranscriptTail;
-pub use opencode_discovery::POLL_INTERVAL_MS as OPENCODE_DISCOVERY_POLL_MS;
-pub use opencode_telemetry::OpenCodeMessageTail;
+pub use agents::copilot::discovery::POLL_INTERVAL_MS as COPILOT_DISCOVERY_POLL_MS;
+pub use agents::copilot::telemetry::CopilotTranscriptTail;
+pub use agents::opencode::discovery::POLL_INTERVAL_MS as OPENCODE_DISCOVERY_POLL_MS;
+pub use agents::opencode::telemetry::OpenCodeMessageTail;
+pub use agents::pi::discovery::POLL_INTERVAL_MS as PI_DISCOVERY_POLL_MS;
+pub use agents::pi::telemetry::PiTranscriptTail;
+pub use attachments::{SavedAttachment, save_attachment_bytes};
 pub use overview::{
     LiveSessionLookup, OverviewLifecycle, OverviewRow,
     build_rows as build_overview_rows,
     build_rows_for_live as build_overview_rows_for_live,
 };
-pub use pi_discovery::POLL_INTERVAL_MS as PI_DISCOVERY_POLL_MS;
-pub use pi_telemetry::PiTranscriptTail;
 pub use layout::{LayoutState, RestoreTab, SessionPlacement};
 pub use paths::AppPaths;
 pub use projects::{Project, ProjectsConfig, Session, Worktree};

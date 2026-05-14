@@ -143,35 +143,14 @@ pub struct TerminalView {
 impl TerminalView {
     /// Wrap a [`Backend`] in a gpui Entity. Spawns an async drain task
     /// that re-snapshots and notifies on every backend event.
-    pub fn new(backend: Backend, cx: &mut Context<Self>) -> Self {
-        Self::new_full(backend, ColorPalette::default(), FontConfig::default(), cx)
-    }
-
-    pub fn new_with_font(
-        backend: Backend,
-        font: FontConfig,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        Self::new_full(backend, ColorPalette::default(), font, cx)
-    }
-
-    /// Full constructor — the binary uses this so the View's render
-    /// palette matches whatever theme the [`Backend`] was spawned
-    /// with. Callers that don't care about themes can keep using
-    /// [`Self::new`] / [`Self::new_with_font`].
-    pub fn new_full(
-        backend: Backend,
-        palette: ColorPalette,
-        font: FontConfig,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        Self::new_full_with_working_directory(backend, palette, font, None, cx)
-    }
-
-    /// Full constructor with the tab's resolved working directory.
-    /// The app shell uses this so image paste can save screenshots in
-    /// the active project / worktree instead of a global temp folder.
-    pub fn new_full_with_working_directory(
+    ///
+    /// `palette` should match the palette the backend was spawned
+    /// with so renderer cell colours line up; `font` carries the
+    /// family + size + ligatures choice. `working_directory` is used
+    /// by image paste to save screenshots into the active project /
+    /// worktree instead of a global temp folder; pass `None` to fall
+    /// back to the temp folder.
+    pub fn new(
         backend: Backend,
         palette: ColorPalette,
         font: FontConfig,

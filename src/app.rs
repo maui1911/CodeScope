@@ -717,21 +717,21 @@ pub struct AppShell {
     /// build's hand-edit-the-file workflow. See ADR-0018. Visible
     /// fields mirror exactly what's in [`codescope_core::Settings`];
     /// no schema additions.
-    pub(crate) settings_dialog: Option<crate::settings_dialog::SettingsDialogState>,
+    pub(crate) settings_dialog: Option<crate::dialogs::settings::SettingsDialogState>,
     /// Open Rename dialog, if any. Surfaces a single text-input modal
     /// for renaming a project or a session (live or closed). Mirrors
     /// the C# build's `Dialogs.RenameDialog.Prompt` — the Rust port
     /// owns it on AppShell instead of opening a modal `Window` because
     /// gpui doesn't have a modal-window primitive. See
     /// `rename_dialog.rs` for the full rationale.
-    pub(crate) rename_dialog: Option<crate::rename_dialog::RenameDialogState>,
+    pub(crate) rename_dialog: Option<crate::dialogs::rename::RenameDialogState>,
     /// Open Confirm dialog, if any. Themed in-app replacement for the
     /// OS-native `window.prompt(...)` used by destructive sidebar
     /// actions (remove project, discard worktree changes, remove
     /// worktree, force-retry, remove from history). Mirrors C#
     /// `Dialogs.ConfirmDialog.Confirm` / `Destructive`. See
     /// `confirm_dialog.rs`.
-    pub(crate) confirm_dialog: Option<crate::confirm_dialog::ConfirmDialogState>,
+    pub(crate) confirm_dialog: Option<crate::dialogs::confirm::ConfirmDialogState>,
     /// Multiplatform taskbar / dock badge driver. Mirrors C#
     /// `TaskbarBadgeService`. Refreshed from the same telemetry-poll
     /// callback that updates the sidebar dots
@@ -1398,7 +1398,7 @@ impl AppShell {
                 ))
             }
             codescope_core::AgentId::Copilot => {
-                let Some(root) = codescope_core::copilot_telemetry::default_session_state_root()
+                let Some(root) = codescope_core::agents::copilot::telemetry::default_session_state_root()
                 else {
                     eprintln!(
                         "[telemetry] no USERPROFILE / HOME — skipping copilot registration for {session_id}"
@@ -1411,7 +1411,7 @@ impl AppShell {
                 ))
             }
             codescope_core::AgentId::OpenCode => {
-                let Some(root) = codescope_core::opencode_telemetry::default_data_root() else {
+                let Some(root) = codescope_core::agents::opencode::telemetry::default_data_root() else {
                     eprintln!(
                         "[telemetry] no USERPROFILE / HOME — skipping opencode registration for {session_id}"
                     );
@@ -1434,7 +1434,7 @@ impl AppShell {
                 return;
             }
             codescope_core::AgentId::Pi => {
-                let Some(root) = codescope_core::pi_telemetry::default_sessions_root() else {
+                let Some(root) = codescope_core::agents::pi::telemetry::default_sessions_root() else {
                     eprintln!(
                         "[telemetry] no USERPROFILE / HOME — skipping pi registration for {session_id}"
                     );
@@ -1718,7 +1718,7 @@ impl AppShell {
                                     let Some(root) = Self::claude_projects_root() else {
                                         continue;
                                     };
-                                    codescope_core::claude_discovery::scan(
+                                    codescope_core::agents::claude::discovery::scan(
                                         &root, &wd_str, tab.spawned_at,
                                     )
                                     .into_iter()
@@ -1727,11 +1727,11 @@ impl AppShell {
                                 }
                                 codescope_core::AgentId::Pi => {
                                     let Some(root) =
-                                        codescope_core::pi_telemetry::default_sessions_root()
+                                        codescope_core::agents::pi::telemetry::default_sessions_root()
                                     else {
                                         continue;
                                     };
-                                    codescope_core::pi_discovery::scan(
+                                    codescope_core::agents::pi::discovery::scan(
                                         &root, &wd_str, tab.spawned_at,
                                     )
                                     .into_iter()
@@ -1740,11 +1740,11 @@ impl AppShell {
                                 }
                                 codescope_core::AgentId::OpenCode => {
                                     let Some(root) =
-                                        codescope_core::opencode_telemetry::default_data_root()
+                                        codescope_core::agents::opencode::telemetry::default_data_root()
                                     else {
                                         continue;
                                     };
-                                    codescope_core::opencode_discovery::scan(
+                                    codescope_core::agents::opencode::discovery::scan(
                                         &root, &wd_str, tab.spawned_at,
                                     )
                                     .into_iter()
@@ -1753,11 +1753,11 @@ impl AppShell {
                                 }
                                 codescope_core::AgentId::Copilot => {
                                     let Some(root) =
-                                        codescope_core::copilot_telemetry::default_session_state_root()
+                                        codescope_core::agents::copilot::telemetry::default_session_state_root()
                                     else {
                                         continue;
                                     };
-                                    codescope_core::copilot_discovery::scan(
+                                    codescope_core::agents::copilot::discovery::scan(
                                         &root, &wd_str, tab.spawned_at,
                                     )
                                     .into_iter()
@@ -2491,7 +2491,7 @@ impl AppShell {
     /// session store lives on AppShell.
     pub(crate) fn handle_open_confirm_dialog(
         &mut self,
-        spec: crate::confirm_dialog::ConfirmSpec,
+        spec: crate::dialogs::confirm::ConfirmSpec,
         action: crate::sidebar::ConfirmAction,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2749,7 +2749,7 @@ impl AppShell {
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.open_new_project_dialog(window, cx);
             sidebar.set_new_project_mode(
-                crate::new_project_dialog::DialogMode::Clone,
+                crate::dialogs::new_project::DialogMode::Clone,
                 cx,
             );
         });
@@ -3049,7 +3049,7 @@ impl AppShell {
         };
 
         let terminal = cx.new(|cx| {
-            TerminalView::new_full_with_working_directory(
+            TerminalView::new(
                 backend,
                 palette,
                 font,

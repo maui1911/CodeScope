@@ -3,7 +3,7 @@
 //!
 //! Mirrors `PiTelemetryService` / `PiTranscriptParser` from the C#
 //! build (`legacy:CodeScope.Core/Services/`). Data shapes match
-//! [`crate::claude_telemetry`] so the status bar can render Pi
+//! [`crate::agents::claude::telemetry`] so the status bar can render Pi
 //! sessions through the same code paths.
 //!
 //! # Discovery model
@@ -302,7 +302,7 @@ fn locate_recursive(dir: &Path, suffix: &str) -> Option<PathBuf> {
 ///
 /// Mirrors `PiTelemetryService.TryRead` from the C# build, with the
 /// same `last_pos` retry semantics as
-/// [`crate::claude_telemetry::process_new_lines`]: read failures bail
+/// [`crate::agents::claude::telemetry::process_new_lines`]: read failures bail
 /// without advancing the cursor, so the next poll re-reads from the
 /// same offset rather than permanently skipping bytes.
 pub fn process_new_lines(

@@ -3,7 +3,7 @@
 //!
 //! Mirrors `CopilotTelemetryService` / `CopilotTranscriptParser` from
 //! the C# build (`legacy:CodeScope.Core/Services/`). Data shapes match
-//! [`crate::claude_telemetry`] so the status bar can render Copilot
+//! [`crate::agents::claude::telemetry`] so the status bar can render Copilot
 //! sessions through the same code paths.
 //!
 //! # Polling strategy
@@ -139,7 +139,7 @@ fn parse_line(line: &str) -> Option<Entry> {
 ///
 /// Mirrors `CopilotTelemetryService.TryRead` from the C# build, with
 /// the same `last_pos` retry semantics as
-/// [`crate::claude_telemetry::process_new_lines`]: read failures bail
+/// [`crate::agents::claude::telemetry::process_new_lines`]: read failures bail
 /// without advancing the cursor, so the next poll re-reads from the
 /// same offset rather than permanently skipping bytes.
 pub fn process_new_lines(
@@ -351,7 +351,7 @@ impl CopilotTranscriptTail {
 
     /// Suggested poll interval for the next wake-up. 250 ms while the
     /// session is Busy / PendingToolUse, 2 s while Idle / Unknown.
-    /// Mirrors the cadence used by [`crate::claude_telemetry::ClaudeTranscriptTail`].
+    /// Mirrors the cadence used by [`crate::agents::claude::telemetry::ClaudeTranscriptTail`].
     pub fn poll_interval(&self) -> Duration {
         match self.snapshot.as_ref().map(|s| s.state) {
             Some(SessionState::Busy) | Some(SessionState::PendingToolUse) => {

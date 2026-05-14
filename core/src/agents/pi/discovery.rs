@@ -3,7 +3,7 @@
 //!
 //! Mirrors `PiSessionDiscovery` from the C# build but uses polling
 //! only (no `notify` crate dep). Same `scan_*` shape as
-//! [`crate::claude_discovery`]: pure logic, the caller drives the
+//! [`crate::agents::claude::discovery`]: pure logic, the caller drives the
 //! cadence.
 //!
 //! # Semantics
@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::path_canon::canonicalize_path;
-use crate::pi_telemetry;
+use crate::agents::pi::telemetry;
 
 /// Suggested poll interval — 350 ms matches the C#
 /// `PiSessionDiscovery.PollInterval`.
@@ -101,7 +101,7 @@ fn walk(
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        let Some(sid) = pi_telemetry::extract_session_id_from_file_name(name) else {
+        let Some(sid) = telemetry::extract_session_id_from_file_name(name) else {
             continue;
         };
         let Ok(meta) = entry.metadata() else { continue };

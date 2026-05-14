@@ -3,7 +3,7 @@
 //!
 //! Mirrors `OpenCodeTelemetryService` / `OpenCodeMessageParser` from
 //! the C# build (`legacy:CodeScope.Core/Services/`). Data shapes match
-//! [`crate::claude_telemetry`] so the status bar can render OpenCode
+//! [`crate::agents::claude::telemetry`] so the status bar can render OpenCode
 //! sessions through the same code paths.
 //!
 //! # Storage shape — different from Claude / Copilot

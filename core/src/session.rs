@@ -542,7 +542,7 @@ impl SessionManager {
     }
 }
 
-// Timestamp helpers live in [`crate::time`] so [`crate::claude_telemetry`]
+// Timestamp helpers live in [`crate::time`] so [`crate::agents::claude::telemetry`]
 // can share them — both call sites need the same narrow ISO-8601
 // subset and were on the verge of drifting before consolidation
 // (Copilot review on PR #114). [`now_iso8601`] is re-exported above.

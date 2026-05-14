@@ -4,7 +4,7 @@
 //!
 //! Mirrors `OpenCodeSessionDiscovery` from the C# build but uses
 //! polling only (no `notify` crate dep). Same `scan_*` shape as
-//! [`crate::claude_discovery`]: pure logic, the caller drives the
+//! [`crate::agents::claude::discovery`]: pure logic, the caller drives the
 //! cadence.
 //!
 //! # Semantics
@@ -25,7 +25,7 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::opencode_telemetry::parse_content;
+use crate::agents::opencode::telemetry::parse_content;
 use crate::path_canon::canonicalize_path;
 
 /// Suggested poll interval — 400 ms matches the C#

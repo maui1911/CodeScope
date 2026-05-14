@@ -1,5 +1,5 @@
 //! Tiny ISO-8601 helpers shared by [`crate::session`] and
-//! [`crate::claude_telemetry`].
+//! [`crate::agents::claude::telemetry`].
 //!
 //! Both call sites need to (a) parse the narrow ISO-8601 subset our
 //! own writers and Claude's CLI produce, and (b) convert between Unix

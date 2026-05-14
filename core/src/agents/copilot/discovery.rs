@@ -4,7 +4,7 @@
 //!
 //! Mirrors `CopilotSessionDiscovery` from the C# build but uses
 //! polling only (no `notify` crate dep). Same `scan_*` shape as
-//! [`crate::claude_discovery`]: pure logic, the caller drives the
+//! [`crate::agents::claude::discovery`]: pure logic, the caller drives the
 //! cadence.
 //!
 //! # Semantics
