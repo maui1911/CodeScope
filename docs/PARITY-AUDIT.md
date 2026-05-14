@@ -1,4 +1,12 @@
 # CodeScope Rust Port: Parity Audit
+
+> **Closed 2026-05-14.** The Rust port reached daily-driver parity at
+> `rs-v0.3.0-rc.5` (session 41) and the C# build was retired the same
+> day. See [ADR-0022](DECISIONS.md) and
+> [MIGRATION-csharp-to-rust.md](MIGRATION-csharp-to-rust.md). The
+> "mirror C# 1:1" rule that drove this audit is retired with the C#
+> code; gaps listed below are historical context, not active TODOs.
+
 ## Executive Summary
 
 The Rust port has completed 4 major subsystems: window-state & layout persistence, Claude telemetry, sidebar context menus, and the new-worktree dialog. The remaining work breaks into three tiers: missing agent telemetry services (Copilot, OpenCode, Pi) and single-feature dialogs (15 tiny items), cross-cutting system features (crash logging, keyboard shortcuts, notifications) totaling about 6-8 engineer-weeks of medium-difficulty work, and one structural blocker (session-state tracking) that gates everything UI-facing. This memo catalogs 25+ gaps discovered by file-by-file comparison of the C# implementation against current Rust code.
