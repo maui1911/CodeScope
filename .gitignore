@@ -1,32 +1,21 @@
-# Build output
-bin/
-obj/
-out/
-publish/
+# Rust build output
+/target/
+/codescope-rs/target/
+/codescope-rs/vendor/gpui-terminal/target/
+
+# Release / install artefacts
 artifacts/
 releases/
-*.user
-*.suo
-*.pdb
 
-# VS / Rider / VS Code
+# JetBrains / VS Code / VS
 .vs/
 .idea/
 .vscode/
-
-# JetBrains
 *.ReSharper*
-
-# dotnet
-*.nupkg
-*.snupkg
-project.lock.json
-project.assets.json
 
 # Test results
 TestResults/
 coverage.*
-*.trx
 
 # Logs
 *.log
@@ -35,14 +24,6 @@ coverage.*
 Thumbs.db
 Desktop.ini
 .DS_Store
-
-# Local tools cache
-.dotnet/
-.nuget/
-
-# Local config overrides
-appsettings.Development.json
-appsettings.Local.json
 
 # Superpowers visual companion
 .superpowers/
