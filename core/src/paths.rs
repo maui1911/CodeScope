@@ -224,17 +224,15 @@ mod tests {
     }
 
     #[test]
-    fn detect_respects_dev_env_var_shape() {
-        // detect() reads CODESCOPE_DEV. We can't mutate process env
-        // safely under parallel tests, but we can still pin the
-        // observable contract: with the env var unset (the typical
-        // `cargo test` baseline) detect() must select prod-mode.
-        // SAFETY: removed only for the duration of this single
-        // assertion; tests that need the dev variant should use
-        // rooted_for_tests.
-        unsafe { std::env::remove_var("CODESCOPE_DEV"); }
+    fn detect_observes_current_dev_env_var() {
+        // detect() reads CODESCOPE_DEV. We deliberately do *not* mutate
+        // the process env here — that would race with other tests under
+        // parallel `cargo test`. Instead, just check the contract:
+        // detect() must produce app_folder == "CodeScope" when dev_mode
+        // is false, and "CodeScope.Dev" when dev_mode is true,
+        // regardless of which mode the test runner happens to be in.
         let paths = AppPaths::detect();
-        assert!(!paths.dev_mode);
-        assert_eq!(paths.app_folder, "CodeScope");
+        let expected_folder = if paths.dev_mode { "CodeScope.Dev" } else { "CodeScope" };
+        assert_eq!(paths.app_folder, expected_folder);
     }
 }

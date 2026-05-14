@@ -410,10 +410,18 @@ pub fn git_status(repo: &Path) -> Result<Option<GitStatus>> {
     //   * Ok(None)  — git ran, but this path isn't inside a worktree
     //                  (covers "not a repo", "missing dir", and the
     //                  default-status "false" case).
-    //   * Err       — git itself failed to start (binary missing, etc).
+    //   * Err       — git itself failed to start (binary missing).
     //   * Ok(Some)  — happy path, fall through.
     // We can't go through `run_git` because it wraps non-zero exit as
     // `Err`, which would collapse "not a worktree" into the I/O bucket.
+    //
+    // Both "git missing" and "cwd doesn't exist" can surface as
+    // `ErrorKind::NotFound` from `Command::output()` — pre-checking
+    // the directory disambiguates them so we don't misclassify a
+    // missing repo path as a missing git binary.
+    if !repo.is_dir() {
+        return Ok(None);
+    }
     let probe = match no_window_command("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(repo)
@@ -424,8 +432,8 @@ pub fn git_status(repo: &Path) -> Result<Option<GitStatus>> {
     {
         Ok(output) => output,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(anyhow!(err)),
-        // Other spawn errors (e.g. cwd doesn't exist) mean "git can't
-        // even look at this path" — caller treats that the same as
+        // Other spawn errors (PermissionDenied, etc) are also "git
+        // can't look at this path" — caller treats that the same as
         // "not a worktree" and retries on the next poll tick.
         Err(_) => return Ok(None),
     };

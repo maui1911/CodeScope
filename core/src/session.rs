@@ -4,7 +4,7 @@
 //! the in-memory session-lifecycle primitives (open / soft-close /
 //! reopen / hard-remove / rename / retention sweep) consumed by the
 //! shell's tab layer in `src/app.rs` and the rename dialog in
-//! `src/rename_dialog.rs`.
+//! `src/dialogs/rename.rs`.
 //!
 //! ## Where sessions live on disk
 //!

@@ -723,14 +723,14 @@ pub struct AppShell {
     /// the C# build's `Dialogs.RenameDialog.Prompt` — the Rust port
     /// owns it on AppShell instead of opening a modal `Window` because
     /// gpui doesn't have a modal-window primitive. See
-    /// `rename_dialog.rs` for the full rationale.
+    /// `src/dialogs/rename.rs` for the full rationale.
     pub(crate) rename_dialog: Option<crate::dialogs::rename::RenameDialogState>,
     /// Open Confirm dialog, if any. Themed in-app replacement for the
     /// OS-native `window.prompt(...)` used by destructive sidebar
     /// actions (remove project, discard worktree changes, remove
     /// worktree, force-retry, remove from history). Mirrors C#
     /// `Dialogs.ConfirmDialog.Confirm` / `Destructive`. See
-    /// `confirm_dialog.rs`.
+    /// `src/dialogs/confirm.rs`.
     pub(crate) confirm_dialog: Option<crate::dialogs::confirm::ConfirmDialogState>,
     /// Multiplatform taskbar / dock badge driver. Mirrors C#
     /// `TaskbarBadgeService`. Refreshed from the same telemetry-poll
