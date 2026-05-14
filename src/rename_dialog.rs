@@ -206,10 +206,7 @@ impl AppShell {
                     cx.notify();
                     return;
                 }
-                if let Err(err) = codescope_core::session::save(
-                    &self.projects,
-                    self.paths_ref().as_ref(),
-                ) {
+                if let Err(err) = self.projects.save(self.paths_ref().as_ref()) {
                     if let Some(state) = self.rename_dialog.as_mut() {
                         state.error = Some(format!("Failed to save: {err:#}"));
                     }

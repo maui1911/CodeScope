@@ -50,7 +50,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 
 use crate::paths::AppPaths;
 use crate::projects::{ProjectsConfig, Session};
@@ -261,7 +261,7 @@ impl SessionManager {
         if pruned.is_empty() {
             return Ok((cfg, None));
         }
-        let save_err = save(&cfg, paths).err();
+        let save_err = cfg.save(paths).err();
         Ok((cfg, save_err))
     }
 
@@ -406,57 +406,27 @@ impl SessionManager {
         Err(anyhow!("session '{session_id}' not found"))
     }
 
-    /// Stamp `agent_session_id` on the session whose CodeScope id is
-    /// `session_id`. Strict variant: errors when the session can't be
-    /// found in any project.
+    /// Lenient discovery-callback entry point: stamp `agent_session_id`
+    /// on the session whose CodeScope id is `session_id`, returning
+    /// `false` instead of erroring when the session id isn't found.
     ///
-    /// This is the discovery-callback entry point used by the Rust app
-    /// shell once an agent (Claude / Pi / OpenCode / Copilot) reports
-    /// its own session UUID via a transcript / state file. Mirrors C#
-    /// `SessionStore.UpdateAgentSessionIdAsync` but with the
-    /// non-optional `&str` signature `MainViewModel.ApplyAdoption`
-    /// actually uses at the callsite — see PR #178 for the resume-by-id
-    /// machinery that consumes the persisted value.
+    /// Swallows the cold-start race where a freshly-spawned tab's first
+    /// discovery tick fires before [`Self::open`] has written the new
+    /// row to `projects.json`. The next tick (250–350 ms later) lands
+    /// after the row exists and the stamp succeeds normally. Mirrors C#
+    /// `SessionStore.UpdateAgentSessionIdAsync`; see PR #178 for the
+    /// resume-by-id machinery that consumes the persisted value.
     ///
-    /// Idempotent: a no-op when the persisted value already matches
-    /// `agent_session_id`, so callers can hit this on every discovery
-    /// tick without producing redundant writes. Returns `Ok(true)` when
-    /// the value actually changed (callers should persist),
-    /// `Ok(false)` for a no-op (callers can skip the write).
-    ///
-    /// Implemented as a thin wrapper over
-    /// [`Self::update_agent_session_id`] so the session-walk/mutation
-    /// logic only lives in one place.
-    pub fn set_agent_session_id(
-        cfg: &mut ProjectsConfig,
-        session_id: &str,
-        agent_session_id: &str,
-    ) -> Result<bool> {
-        Self::update_agent_session_id(cfg, session_id, Some(agent_session_id))
-    }
-
-    /// Lenient cousin of [`Self::set_agent_session_id`]. Returns
-    /// `false` instead of erroring when the session id isn't found —
-    /// used by the agent-discovery callback path to swallow the
-    /// cold-start race where a freshly-spawned tab's first discovery
-    /// tick fires before [`Self::open`] has written the new row to
-    /// `projects.json`. The next tick (250–350 ms later) will land
-    /// after the row exists and the stamp succeeds normally.
-    ///
-    /// Returns `true` when the value actually changed, `false` for a
-    /// no-op (either the value already matched, or the session id is
-    /// unknown). Mirrors the strict variant's `Result<bool>` contract
-    /// minus the error arm.
-    ///
-    /// Implemented on top of [`Self::set_agent_session_id`] so the
-    /// session-walk/mutation logic is shared — the lenient policy is
-    /// just "treat the strict variant's error as a no-op".
+    /// Idempotent: returns `true` only when the value actually changed,
+    /// `false` for a no-op (either the value already matched, or the
+    /// session id is unknown).
     pub fn set_agent_session_id_lenient(
         cfg: &mut ProjectsConfig,
         session_id: &str,
         agent_session_id: &str,
     ) -> bool {
-        Self::set_agent_session_id(cfg, session_id, agent_session_id).unwrap_or(false)
+        Self::update_agent_session_id(cfg, session_id, Some(agent_session_id))
+            .unwrap_or(false)
     }
 
     // ---- queries ---------------------------------------------------
@@ -581,14 +551,6 @@ impl SessionManager {
 // can share them — both call sites need the same narrow ISO-8601
 // subset and were on the verge of drifting before consolidation
 // (Copilot review on PR #114). [`now_iso8601`] is re-exported above.
-
-/// Convenience: persist `cfg` via the standard
-/// [`ProjectsConfig::save`] path. Wrapped here so future call sites
-/// can switch to a session-only file (or anything else) without the
-/// integration sites changing.
-pub fn save(cfg: &ProjectsConfig, paths: &AppPaths) -> Result<()> {
-    cfg.save(paths).context("save projects.json")
-}
 
 #[cfg(test)]
 mod tests {
@@ -1006,7 +968,7 @@ mod tests {
         p.sessions.push(make_session("s1", None));
         cfg.projects.push(p);
 
-        let changed = SessionManager::set_agent_session_id(&mut cfg, "s1", "uuid-abc")
+        let changed = SessionManager::update_agent_session_id(&mut cfg, "s1", Some("uuid-abc"))
             .unwrap();
         assert!(changed);
         assert_eq!(
@@ -1024,7 +986,7 @@ mod tests {
         p.sessions.push(s);
         cfg.projects.push(p);
 
-        let changed = SessionManager::set_agent_session_id(&mut cfg, "s1", "uuid-abc")
+        let changed = SessionManager::update_agent_session_id(&mut cfg, "s1", Some("uuid-abc"))
             .unwrap();
         assert!(!changed);
         assert_eq!(
@@ -1037,7 +999,7 @@ mod tests {
     fn set_agent_session_id_errors_on_unknown_session() {
         let mut cfg = ProjectsConfig::default();
         cfg.projects.push(make_project("p1"));
-        let err = SessionManager::set_agent_session_id(&mut cfg, "ghost", "uuid-abc")
+        let err = SessionManager::update_agent_session_id(&mut cfg, "ghost", Some("uuid-abc"))
             .unwrap_err();
         assert!(err.to_string().contains("ghost"));
     }
@@ -1078,7 +1040,7 @@ mod tests {
         p.sessions.push(make_session("s1", None));
         cfg.projects.push(p);
 
-        SessionManager::set_agent_session_id(&mut cfg, "s1", "uuid-abc").unwrap();
+        SessionManager::update_agent_session_id(&mut cfg, "s1", Some("uuid-abc")).unwrap();
         cfg.save_to(&path).unwrap();
 
         let loaded = SessionManager::load_from_with_sweep(&path, fixed_now()).unwrap();
@@ -1535,7 +1497,7 @@ mod tests {
         let mut cfg = ProjectsConfig::load(&paths).unwrap();
         let session = make_session("s1", Some("primary"));
         SessionManager::open(&mut cfg, "p1", session, fixed_now()).unwrap();
-        save(&cfg, &paths).unwrap();
+        cfg.save(&paths).unwrap();
 
         // 3. Reload and verify the row persisted with last_opened set.
         let reloaded = ProjectsConfig::load(&paths).unwrap();
@@ -1549,7 +1511,7 @@ mod tests {
         let mut cfg = ProjectsConfig::load(&paths).unwrap();
         let pruned = SessionManager::soft_close(&mut cfg, "s1", fixed_now()).unwrap();
         assert!(pruned.is_empty());
-        save(&cfg, &paths).unwrap();
+        cfg.save(&paths).unwrap();
 
         // 5. Reload — row still present, now with closed_at.
         let reloaded = ProjectsConfig::load(&paths).unwrap();
@@ -1588,7 +1550,7 @@ mod tests {
             fixed_now(),
         )
         .unwrap();
-        save(&prod_cfg, &prod).unwrap();
+        prod_cfg.save(&prod).unwrap();
 
         let mut dev_cfg = SessionManager::load_with_sweep(&dev, fixed_now()).unwrap();
         SessionManager::open(
@@ -1598,7 +1560,7 @@ mod tests {
             fixed_now(),
         )
         .unwrap();
-        save(&dev_cfg, &dev).unwrap();
+        dev_cfg.save(&dev).unwrap();
 
         // Each side reads back only its own session.
         let prod_back = ProjectsConfig::load(&prod).unwrap();
@@ -1629,7 +1591,7 @@ mod tests {
             fixed_now(),
         )
         .unwrap();
-        save(&cfg, &paths).unwrap();
+        cfg.save(&paths).unwrap();
 
         // Sidebar (out-of-band) appends a second project to disk
         // — simulating an `add_project` write between AppShell ticks.
@@ -1641,7 +1603,7 @@ mod tests {
         // first (mirrors `AppShell::soft_close_session`).
         let mut cfg = ProjectsConfig::load(&paths).unwrap();
         SessionManager::soft_close(&mut cfg, "s1", fixed_now()).unwrap();
-        save(&cfg, &paths).unwrap();
+        cfg.save(&paths).unwrap();
 
         // Final state: both projects present, s1 closed.
         let final_cfg = ProjectsConfig::load(&paths).unwrap();

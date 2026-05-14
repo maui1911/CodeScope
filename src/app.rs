@@ -695,7 +695,7 @@ pub struct AppShell {
     /// writes (project / worktree mutations also persist to
     /// `projects.json`) are not clobbered, then applies the change
     /// via [`SessionManager`] and writes back via
-    /// [`session::save`]. The Sidebar still owns its own
+    /// [`ProjectsConfig::save`]. The Sidebar still owns its own
     /// `ProjectsConfig` clone for project / worktree rendering —
     /// they converge through the shared file. This split mirrors
     /// the C# build where `SessionStore` is the orchestrator and
@@ -1374,7 +1374,7 @@ impl AppShell {
         if !changed {
             return;
         }
-        if let Err(err) = codescope_core::session::save(&self.projects, &self.paths) {
+        if let Err(err) = self.projects.save(&self.paths) {
             eprintln!(
                 "warning: failed to persist agent_session_id for {session_id}: {err:#}"
             );
@@ -2423,7 +2423,7 @@ impl AppShell {
         };
         match SessionManager::open(&mut self.projects, &project_id, session, &now_iso8601()) {
             Ok(_) => {
-                if let Err(err) = codescope_core::session::save(&self.projects, &self.paths) {
+                if let Err(err) = self.projects.save(&self.paths) {
                     eprintln!("warning: failed to persist session open: {err:#}");
                 }
             }
@@ -2468,7 +2468,7 @@ impl AppShell {
         }
         match SessionManager::soft_close(&mut self.projects, session_id, &now_iso8601()) {
             Ok(_pruned) => {
-                if let Err(err) = codescope_core::session::save(&self.projects, &self.paths) {
+                if let Err(err) = self.projects.save(&self.paths) {
                     eprintln!("warning: failed to persist session soft-close: {err:#}");
                 }
             }
@@ -2572,7 +2572,7 @@ impl AppShell {
             );
             return;
         }
-        if let Err(err) = codescope_core::session::save(&self.projects, &self.paths) {
+        if let Err(err) = self.projects.save(&self.paths) {
             self.push_toast(
                 ToastKind::Err,
                 SharedString::from("Remove failed"),
@@ -2633,7 +2633,7 @@ impl AppShell {
                 return;
             }
         };
-        if let Err(err) = codescope_core::session::save(&self.projects, &self.paths) {
+        if let Err(err) = self.projects.save(&self.paths) {
             eprintln!("warning: failed to persist session reopen: {err:#}");
         }
         // Mirror the updated config into the sidebar so the closed
