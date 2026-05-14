@@ -235,7 +235,7 @@ impl AppShell {
         let ink_dim = theme::ink_dim(theme);
         let ink_muted = theme::ink_muted(theme);
         let frost = theme::frost_10(theme);
-        let danger = theme::danger(theme);
+        let danger = theme::danger();
         let accent = theme::accent(theme);
         let canvas = theme::canvas(theme);
         let text_faint = theme::text_faint();

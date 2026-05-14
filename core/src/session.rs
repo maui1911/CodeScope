@@ -1,14 +1,10 @@
 //! Session lifecycle layer — Rust port of
 //! `src/CodeScope.Core/Services/{SessionManager,SessionStore (session
-//! mutators),SessionRetentionPolicy,SessionDescriptor}.cs`.
-//!
-//! **Foundation-only PR.** This module introduces the data shape and
+//! mutators),SessionRetentionPolicy,SessionDescriptor}.cs`. Provides
 //! the in-memory session-lifecycle primitives (open / soft-close /
-//! reopen / hard-remove / rename / retention sweep) so a follow-up PR
-//! can plumb the existing ad-hoc `Tab` layer through it without also
-//! having to invent the data layer at the same time. Nothing in this
-//! file is wired into the runtime yet — every public symbol is
-//! intentionally `#[allow(dead_code)]` until a future PR consumes it.
+//! reopen / hard-remove / rename / retention sweep) consumed by the
+//! shell's tab layer in `src/app.rs` and the rename dialog in
+//! `src/rename_dialog.rs`.
 //!
 //! ## Where sessions live on disk
 //!
@@ -187,14 +183,14 @@ pub fn format_closed_at_relative(closed_at_iso: Option<&str>, now_iso: &str) -> 
         return format!("{}d ago", (delta / 86_400.0) as i64);
     }
     // Older than a week — fall back to "MMM d" of the closed_at date.
-    let (_y, m, d, _hh, _mm, _ss) = crate::time::unix_secs_to_civil(closed_secs as i64);
-    let month = match m {
+    let dt = crate::time::unix_secs_to_civil(closed_secs as i64);
+    let month = match dt.month {
         1 => "Jan", 2 => "Feb", 3 => "Mar", 4 => "Apr",
         5 => "May", 6 => "Jun", 7 => "Jul", 8 => "Aug",
         9 => "Sep", 10 => "Oct", 11 => "Nov", 12 => "Dec",
         _ => "",
     };
-    format!("{month} {d}")
+    format!("{month} {day}", day = dt.day)
 }
 
 /// In-memory orchestration over the persisted `Session` rows in a

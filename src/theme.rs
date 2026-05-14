@@ -94,17 +94,6 @@ pub fn ink_ghost(theme: &Theme) -> Hsla { with_alpha(theme.chrome.ink, 0.40) }
 #[allow(dead_code)]
 pub fn status_running() -> Hsla { rgb_to_hsla(Rgb::from_hex(0x22c55e)) }
 
-/// Worktree dirty indicator. Amber, distinct enough from
-/// `status_running` (green) and `danger` (red) that the user can
-/// tell at a glance. Was previously used for the sidebar worktree
-/// dot; the C# build colours that dot by agent activity instead
-/// (`WorktreeViewModel.DotState`), so the sidebar now surfaces dirty
-/// state through the right-aligned `chg` status slug. Kept as a
-/// theme helper for any future caller that wants an amber "dirty"
-/// signal without re-deriving the hex.
-#[allow(dead_code)]
-pub fn status_dirty(_theme: &Theme) -> Hsla { rgb_to_hsla(Rgb::from_hex(0xf5a623)) }
-
 /// Worktree clean indicator. Reuses the accent colour so a fully-
 /// clean worktree visually rhymes with the focus / accent rail
 /// elsewhere in the chrome.
@@ -122,8 +111,9 @@ pub fn text_faint() -> Hsla { rgb_to_hsla(Rgb::from_hex(0x606060)) }
 /// Foreground for destructive context-menu entries ("Remove project",
 /// "Discard changes…"). Mirrors `Ctx.Color.Danger` from the C# build's
 /// `ContextMenuStyles.xaml`. Hard-coded — a danger red that reads
-/// across every theme. Themable later.
-pub fn danger(_theme: &Theme) -> Hsla { rgb_to_hsla(Rgb::from_hex(0xff8a8a)) }
+/// across every theme. Themable later — keep the call sites theme-aware
+/// at that point.
+pub fn danger() -> Hsla { rgb_to_hsla(Rgb::from_hex(0xff8a8a)) }
 
 /// `Signal.Color.Ok` from `DesignTokens.xaml` (#FF4BD87B). Used for
 /// the status-bar session dot when the focused Claude session is

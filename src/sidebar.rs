@@ -907,7 +907,12 @@ impl Sidebar {
                         paths
                             .into_iter()
                             .filter_map(|p| {
-                                codescope_core::git::git_status(&p).map(|s| (p, s))
+                                // Fail-soft: I/O errors and "not a worktree" both
+                                // skip the entry; the next poll tick will retry.
+                                codescope_core::git::git_status(std::path::Path::new(&p))
+                                    .ok()
+                                    .flatten()
+                                    .map(|s| (p, s))
                             })
                             .collect()
                     })
@@ -3986,7 +3991,7 @@ impl Sidebar {
         let ink_dim = theme::ink_dim(theme);
         let ink_ghost = theme::ink_ghost(theme);
         let frost = theme::frost_10(theme);
-        let danger = theme::danger(theme);
+        let danger = theme::danger();
 
         // Precompute the "New session ▸" parent row before the menu
         // chain — the `item` closure below holds an immutable borrow
@@ -4253,7 +4258,7 @@ impl Sidebar {
         let ink_dim = theme::ink_dim(theme);
         let ink_ghost = theme::ink_ghost(theme);
         let frost = theme::frost_10(theme);
-        let danger = theme::danger(theme);
+        let danger = theme::danger();
 
         let item = |id: &'static str,
                     label: &'static str,
@@ -4624,7 +4629,7 @@ impl Sidebar {
         let ink_dim = theme::ink_dim(theme);
         let ink_ghost = theme::ink_ghost(theme);
         let frost = theme::frost_10(theme);
-        let danger = theme::danger(theme);
+        let danger = theme::danger();
 
         let header_label: SharedString = label.clone().into();
 

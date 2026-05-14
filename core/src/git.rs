@@ -403,21 +403,20 @@ pub struct GitStatus {
 /// `rev-list --left-right --count HEAD...@{u}`. Mirrors the
 /// per-tick work the C# `WorktreePoller` does per worktree.
 /// Typical total under 30 ms on local repos.
-pub fn git_status(path: &str) -> Option<GitStatus> {
-    let repo = std::path::Path::new(path);
-
+pub fn git_status(repo: &Path) -> Result<Option<GitStatus>> {
     // ── 0. Early repo probe ────────────────────────────────────────
     // `rev-parse --is-inside-work-tree` exits 0 / prints "true" only
-    // inside an actual worktree. Anything else (path doesn't exist,
-    // not a git repo, git missing) → bail with `None` so callers can
-    // distinguish "no data yet" from "valid repo but quiet".
-    let probe = run_git(repo, &["rev-parse", "--is-inside-work-tree"]).ok()?;
+    // inside an actual worktree. I/O failures (git missing, path not
+    // readable) propagate as `Err`; a successful probe that says "not
+    // a worktree" returns `Ok(None)` so callers can distinguish
+    // "valid repo but quiet" from "couldn't run git".
+    let probe = run_git(repo, &["rev-parse", "--is-inside-work-tree"])?;
     if !probe.status.success() {
-        return None;
+        return Ok(None);
     }
     let probe_stdout = String::from_utf8_lossy(&probe.stdout);
     if probe_stdout.trim() != "true" {
-        return None;
+        return Ok(None);
     }
 
     // ── 1. Current branch ──────────────────────────────────────────
@@ -429,7 +428,7 @@ pub fn git_status(path: &str) -> Option<GitStatus> {
     // ── 3. Ahead / behind upstream ─────────────────────────────────
     let (ahead, behind, has_upstream) = ahead_behind(repo);
 
-    Some(GitStatus { branch, added, removed, has_changes, ahead, behind, has_upstream })
+    Ok(Some(GitStatus { branch, added, removed, has_changes, ahead, behind, has_upstream }))
 }
 
 /// `git symbolic-ref --short HEAD` → short branch name.
@@ -1109,8 +1108,9 @@ some-future-field foo bar\n";
     #[test]
     fn git_status_clean_repo_returns_main_no_changes() {
         let Some((_guard, repo, _wts)) = init_repo() else { return };
-        let path_str = repo.to_string_lossy().to_string();
-        let status = git_status(&path_str).expect("should return Some on a valid repo");
+        let status = git_status(&repo)
+            .expect("git invocation succeeds")
+            .expect("should return Some on a valid repo");
 
         assert_eq!(status.branch, "main", "branch");
         assert_eq!(status.added, 0, "added");
@@ -1127,8 +1127,7 @@ some-future-field foo bar\n";
         let Some((_guard, repo, _wts)) = init_repo() else { return };
         std::fs::write(repo.join("new.txt"), b"hello").expect("write");
 
-        let path_str = repo.to_string_lossy().to_string();
-        let status = git_status(&path_str).expect("Some");
+        let status = git_status(&repo).expect("git invocation").expect("Some");
 
         // numstat sees nothing (untracked), but dirty check fills the flag.
         assert_eq!(status.added, 0);
@@ -1147,8 +1146,7 @@ some-future-field foo bar\n";
         // Overwrite with different content: 1 line added, 1 removed.
         std::fs::write(repo.join("file.txt"), b"line1\nnew_line\n").expect("write");
 
-        let path_str = repo.to_string_lossy().to_string();
-        let status = git_status(&path_str).expect("Some");
+        let status = git_status(&repo).expect("git invocation").expect("Some");
 
         // numstat diffs against HEAD — expect at least some activity.
         assert!(
@@ -1159,10 +1157,10 @@ some-future-field foo bar\n";
     }
 
     #[test]
-    fn git_status_non_repo_returns_none() {
+    fn git_status_non_repo_returns_ok_none() {
         // Create a temp directory that's NOT a git repo. `git_status`
-        // must return `None` so callers can distinguish "no data" from
-        // "valid repo but no signal yet".
+        // must return `Ok(None)` so callers can distinguish "valid
+        // probe, but not a worktree" from "couldn't run git".
         let temp = std::env::temp_dir()
             .join(format!("codescope_git_status_test_{}", std::process::id()));
         std::fs::create_dir_all(&temp).expect("create temp dir");
@@ -1173,29 +1171,23 @@ some-future-field foo bar\n";
             "test precondition: temp dir must not be a git repo"
         );
 
-        let result = git_status(temp.to_str().expect("temp path is utf-8"));
+        let result = git_status(&temp);
 
         // Cleanup before assertion so a failing assert still removes
         // the directory.
         let _ = std::fs::remove_dir_all(&temp);
 
-        assert!(
-            result.is_none(),
-            "non-repo path should return None, got {:?}",
-            result
-        );
+        let inner = result.expect("probe runs successfully on existing non-repo dir");
+        assert!(inner.is_none(), "non-repo path should return None, got {:?}", inner);
     }
 
     #[test]
-    fn git_status_missing_path_returns_none() {
+    fn git_status_missing_path_returns_ok_none() {
         // A path that doesn't exist at all. `rev-parse` exits non-zero
-        // → `git_status` returns None.
-        let result = git_status("C:\\does_not_exist_xyz_codescope_test_42");
-        assert!(
-            result.is_none(),
-            "missing path should return None, got {:?}",
-            result
-        );
+        // → `git_status` returns Ok(None) (the probe ran but failed).
+        let missing = std::path::Path::new("C:\\does_not_exist_xyz_codescope_test_42");
+        let result = git_status(missing).expect("rev-parse should run even on missing path");
+        assert!(result.is_none(), "missing path should return None, got {:?}", result);
     }
 
     // --- worktree_status_label ---

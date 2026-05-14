@@ -38,12 +38,9 @@ use crate::app::AppShell;
 use crate::theme;
 
 /// Display name for one of the five supported agent ids. Mirrors
-/// `OverviewViewModel.ResolveAgentDisplay` — the C# build threads the
-/// `AgentRegistry` through here so user-named agents pick up their
-/// custom labels; the Rust Overview can't read the registry directly
-/// (it lives behind `#[allow(dead_code)]` on `AppShell` until the
-/// new-session menu lands), but the five built-in agent ids are
-/// stable so a small lookup is enough for parity.
+/// `OverviewViewModel.ResolveAgentDisplay`. The five built-in agent
+/// ids are stable so a small lookup is enough for parity with the
+/// C# build's `AgentRegistry`-threaded label resolution.
 fn agent_display(agent_id: Option<&str>) -> SharedString {
     match agent_id {
         Some("claude") => SharedString::new_static("Claude Code"),

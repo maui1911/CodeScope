@@ -590,7 +590,7 @@ impl Sidebar {
         let ink_ghost = theme::ink_ghost(theme);
         let ink_muted = theme::ink_muted(theme);
         let frost = theme::frost_10(theme);
-        let danger = theme::danger(theme);
+        let danger = theme::danger();
         let accent = theme::accent(theme);
         let canvas = theme::canvas(theme);
 
@@ -1146,7 +1146,7 @@ impl Sidebar {
                 .px_3()
                 .py_2()
                 .text_size(px(11.0))
-                .text_color(theme::danger(theme))
+                .text_color(theme::danger())
                 .child(SharedString::from(msg.clone()))
         });
 

@@ -29,8 +29,6 @@
 //! touching the call sites. The Windows path is the must-have for
 //! this PR.
 
-#![allow(dead_code)]
-
 use gpui::Window;
 
 /// Compute the badge text shown over the red disc.

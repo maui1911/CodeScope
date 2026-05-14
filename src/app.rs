@@ -317,7 +317,6 @@ struct Toast {
 pub(crate) enum ToastKind {
     Ok,
     Err,
-    #[allow(dead_code)]
     Info,
 }
 
@@ -385,13 +384,6 @@ struct SidebarDrag {
 struct TabDragData {
     source_group_id: u64,
     source_tab_id: u64,
-    /// Snapshotted at drag start. Currently unused — the preview
-    /// view captures its own copy in the `on_drag` constructor —
-    /// but keeping it on the payload means future drop targets
-    /// (e.g. status-bar history rows) can label the dropped tab
-    /// without going back through `self.groups`.
-    #[allow(dead_code)]
-    title: SharedString,
 }
 
 /// Live drop-cursor state: which group's strip is currently being
@@ -704,12 +696,8 @@ pub struct AppShell {
     /// Registry of agent profiles built from `settings.agents`
     /// overrides (or the shipped built-in defaults when none are
     /// configured). Mirrors C# `AgentRegistry` — owned at the shell
-    /// level so the future new-session menu can list agents, pick the
+    /// level so the new-session menu can list agents, pick the
     /// user's preferred default, and look up by id on session restore.
-    /// Not yet consumed by any view; held here so the registry is live
-    /// from cold-start and the sidebar integration in a follow-up PR
-    /// only has to wire the consumer side.
-    #[allow(dead_code)]
     agent_registry: codescope_core::AgentRegistry,
     /// Open command palette state, if any. `Some` between
     /// Ctrl+Shift+P press and Enter / Esc. Holds the action list,
@@ -2788,15 +2776,6 @@ impl AppShell {
         cx.notify();
     }
 
-    /// Read accessor for the overview visibility flag. Used by
-    /// `render` to swap the work area for the Overview panel and by
-    /// the sidebar (via property forwarding in a future PR) to flip
-    /// its footer button into the "active" look.
-    #[allow(dead_code)]
-    pub(crate) fn show_overview(&self) -> bool {
-        self.show_overview
-    }
-
     /// Read-only borrow of the session catalog. Exposed to the
     /// Overview module so it can flatten the live + closed rows
     /// without taking on a clone of the whole `ProjectsConfig` per
@@ -3598,7 +3577,7 @@ impl AppShell {
         let ink = theme::ink(theme);
         let ink_dim = theme::ink_dim(theme);
         let ink_ghost = theme::ink_ghost(theme);
-        let danger = theme::danger(theme);
+        let danger = theme::danger();
         let accent_clean = theme::status_clean(theme);
 
         let stack = div()
@@ -4062,7 +4041,7 @@ impl AppShell {
         let ink_dim = theme::ink_dim(theme);
         let ink_ghost = theme::ink_ghost(theme);
         let frost = theme::frost_10(theme);
-        let danger = theme::danger(theme);
+        let danger = theme::danger();
 
         type Action = Box<dyn Fn(&mut AppShell, &mut Window, &mut Context<AppShell>) + 'static>;
         let item = |id: &'static str,
@@ -5259,9 +5238,8 @@ impl AppShell {
     /// accumulate in the ring buffer until the user clears them or the
     /// ring reaches its cap (50).  Returns the id of the new entry.
     ///
-    /// The bell button (integrating PR) wires this up for session events;
+    /// The bell button wires this up for session events;
     /// callers can also call it directly for generic system events.
-    #[allow(dead_code)]
     pub(crate) fn push_notification(
         &mut self,
         kind: crate::notifications::NotificationKind,
@@ -5878,7 +5856,7 @@ impl Render for AppShell {
         let ink = theme::ink(&theme);
         let ink_dim = theme::ink_dim(&theme);
         let frost_hover = theme::frost_10(&theme);
-        let close_hover_bg = theme::danger(&theme);
+        let close_hover_bg = theme::danger();
         let caption_base = move |id: &'static str, area: WindowControlArea, glyph: &'static str| {
             div()
                 .id(id)
@@ -6998,13 +6976,12 @@ impl AppShell {
             // `GroupStripView` keeps the dot tied to `Status` rather
             // than `IsSelected`.
             let status_dot = if tmeta.busy { signal_warn } else { signal_ok };
-            // Drag payload — stable ids + the title so the drag
-            // preview can render without holding a borrow on
-            // `self.groups`.
+            // Drag payload — stable ids only. The preview view
+            // captures its own copy of the title in the on_drag
+            // closure, so the payload doesn't need to carry it.
             let drag_payload = TabDragData {
                 source_group_id: group_id,
                 source_tab_id: tab_id,
-                title: title.clone(),
             };
             let title_for_drag = title.clone();
             let theme_for_preview = theme_for_drag.clone();

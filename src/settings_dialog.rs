@@ -414,7 +414,7 @@ impl AppShell {
         let frost = theme::frost_10(theme);
         let accent = theme::accent(theme);
         let canvas = theme::canvas(theme);
-        let danger = theme::danger(theme);
+        let danger = theme::danger();
 
         let focus_handle = state.focus_handle.clone();
         let draft = state.draft.clone();

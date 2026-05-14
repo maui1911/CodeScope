@@ -96,7 +96,8 @@ fn save_attachment_bytes_at(
 fn attachment_filename(bytes: &[u8], extension: &str, now: SystemTime) -> String {
     let duration = now.duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = duration.as_secs() as i64;
-    let (year, month, day, hour, minute, second) = unix_secs_to_civil(secs);
+    let crate::time::CivilDateTime { year, month, day, hour, minute, second } =
+        unix_secs_to_civil(secs);
 
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);

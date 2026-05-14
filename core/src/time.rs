@@ -131,17 +131,31 @@ fn is_leap(year: i64) -> bool {
 /// uses an explicit `+00:00` offset, while we emit the equivalent `Z`
 /// shorthand because both round-trip through [`parse_iso8601_secs`].
 pub fn iso8601_from_unix_secs(secs: i64) -> String {
-    let (y, m, d, hh, mm, ss) = unix_secs_to_civil(secs);
-    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+    let CivilDateTime { year, month, day, hour, minute, second } = unix_secs_to_civil(secs);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Calendar breakdown of a Unix-seconds instant: each field is its own
+/// civil component so call sites don't have to remember a positional
+/// tuple shape. Hours/minutes/seconds are bounded by their natural
+/// ranges; year can be negative for pre-1970 inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CivilDateTime {
+    pub year: i64,
+    pub month: u32,
+    pub day: u32,
+    pub hour: u32,
+    pub minute: u32,
+    pub second: u32,
 }
 
 /// Inverse of [`days_since_epoch`] with hours / minutes / seconds.
-pub fn unix_secs_to_civil(secs: i64) -> (i64, i64, i64, i64, i64, i64) {
+pub fn unix_secs_to_civil(secs: i64) -> CivilDateTime {
     let days = secs.div_euclid(86_400);
     let secs_of_day = secs.rem_euclid(86_400);
-    let hh = secs_of_day / 3_600;
-    let mm = (secs_of_day % 3_600) / 60;
-    let ss = secs_of_day % 60;
+    let hour = (secs_of_day / 3_600) as u32;
+    let minute = ((secs_of_day % 3_600) / 60) as u32;
+    let second = (secs_of_day % 60) as u32;
 
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -150,10 +164,10 @@ pub fn unix_secs_to_civil(secs: i64) -> (i64, i64, i64, i64, i64, i64) {
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d, hh, mm, ss)
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let year = if m <= 2 { y + 1 } else { y };
+    CivilDateTime { year, month: m, day: d, hour, minute, second }
 }
 
 /// Current wall-clock time formatted via [`iso8601_from_unix_secs`].
