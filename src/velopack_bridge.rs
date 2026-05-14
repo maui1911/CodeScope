@@ -20,19 +20,22 @@
 //!    Velopack bootstrapper (e.g. `cargo run`, a cargo-dist MSI install,
 //!    or a manually-unpacked binary) this is a fast no-op — Velopack
 //!    detects "no `Update.exe` sibling" and returns immediately.
-//! 2. **`maybe_apply_now`** is called *automatically* on the
-//!    background executor as soon as the GitHub-release poll
-//!    reports a newer version, **gated on `is_velopack_install()`
-//!    returning `true`**. It tries to construct an `UpdateManager`
-//!    against the same GitHub releases endpoint the C# `vpk upload
-//!    github` flow publishes to; on success, Velopack downloads the
-//!    delta and `apply_updates_and_restart` exits the process so the
-//!    bootstrap helper can relaunch us on the new version. If
-//!    construction fails (binary isn't Velopack-installed) we report
-//!    `Unsupported` — but the gate above means we should never
-//!    actually reach this path in practice; the caller logs a
-//!    diagnostic if it ever does. Mirrors the C# `UpdateService`'s
-//!    "check + download + apply" auto-flow exactly.
+//! 2. **`stage_pending_update` + `apply_staged`** drive the auto-apply
+//!    flow, split across two threads:
+//!    * [`stage_pending_update`] runs on the background executor as
+//!      soon as the GitHub-release poll reports a newer version,
+//!      **gated on `is_velopack_install()` returning `true`**. It
+//!      constructs an `UpdateManager`, calls `check_for_updates`, and
+//!      `download_updates` — heavy IO that must not block the UI.
+//!    * [`apply_staged`] takes the `StagedUpdate` carrier and calls
+//!      `apply_updates_and_restart`. **Must run on the main thread.**
+//!      velopack-rs ends that call with `std::process::exit(0)`
+//!      (velopack-0.0.1589 `manager.rs:560`); calling exit from a
+//!      worker thread while GPUI's message loop is still running on
+//!      main races CRT teardown against active foreground state and
+//!      crashes the process without a recoverable panic. Observed on
+//!      v0.3.0-rc.7: three WER dumps in <60 s when the first
+//!      auto-apply tick fired, no Rust panic captured.
 //!
 //! The GitHub-release polling loop in
 //! `codescope_core::update_check::check_once` continues to run
@@ -44,11 +47,11 @@
 //!
 //! | C# (`UpdateService.cs`)                         | Rust (`velopack_bridge.rs`)                |
 //! |--------------------------------------------------|--------------------------------------------|
-//! | `new GithubSource(RepoUrl, …, prerelease: false)` | `sources::GithubSource::new(REPO_URL, None, true)` — deliberate divergence, see `maybe_apply_now` |
+//! | `new GithubSource(RepoUrl, …, prerelease: false)` | `sources::GithubSource::new(REPO_URL, None, true)` — deliberate divergence, see `stage_pending_update` |
 //! | `mgr.IsInstalled`                                | `UpdateManager::new()` returning `Ok`       |
-//! | `mgr.CheckForUpdatesAsync()`                     | `mgr.check_for_updates()`                   |
-//! | `mgr.DownloadUpdatesAsync(info)`                 | `mgr.download_updates(&info, None)`         |
-//! | `mgr.ApplyUpdatesAndRestart(info)`               | `mgr.apply_updates_and_restart(&info)`      |
+//! | `mgr.CheckForUpdatesAsync()`                     | `mgr.check_for_updates()` (in `stage_pending_update`) |
+//! | `mgr.DownloadUpdatesAsync(info)`                 | `mgr.download_updates(&info, None)` (in `stage_pending_update`) |
+//! | `mgr.ApplyUpdatesAndRestart(info)`               | `mgr.apply_updates_and_restart(&info)` (in `apply_staged`, main thread) |
 //!
 //! ## Channel
 //!
@@ -123,34 +126,48 @@ pub(crate) fn default_channel() -> &'static str {
     channel_for(std::env::consts::OS, std::env::consts::ARCH)
 }
 
-/// Result of an attempted Velopack apply.
+/// Carrier for a fully-downloaded but not-yet-applied update.
 ///
-/// The caller usually gates this entire call site on
-/// `is_velopack_install()` returning `true`, so `Unsupported` is
-/// only reachable when the install state changed between the gate
-/// and the call (or we've made a code-mismatch — the caller logs a
-/// diagnostic). The fallback URL ("open the release page") lives on
-/// the `UpdateStatus::Available` value from
-/// `codescope_core::update_check`, not on this enum — keep the
-/// Velopack outcome purely about the apply attempt and let the
+/// Held across the background → main thread hop between
+/// [`stage_pending_update`] and [`apply_staged`] so the apply call
+/// (which ends in `std::process::exit(0)`) runs on the main thread.
+/// See the "Two-tier strategy" section at the top of this module for
+/// why that thread placement matters.
+///
+/// No public constructor — only [`stage_pending_update`] produces one,
+/// which keeps the "must be paired with a Velopack-checked manager"
+/// invariant in the type system.
+pub struct StagedUpdate {
+    mgr: velopack::UpdateManager,
+    info: velopack::UpdateInfo,
+}
+
+/// Outcome of [`stage_pending_update`].
+///
+/// The caller gates the entire call site on `is_velopack_install()`
+/// returning `true`, so `Unsupported` is only reachable when the
+/// install state changed between the gate and the call (or we've made
+/// a code-mismatch — the caller logs a diagnostic). The fallback URL
+/// ("open the release page") lives on the `UpdateStatus::Available`
+/// value from `codescope_core::update_check`, not on this enum — keep
+/// the Velopack outcome purely about the stage attempt and let the
 /// caller decide which fallback to surface.
-#[derive(Debug, Clone)]
-pub enum ApplyOutcome {
-    /// Velopack staged the update and called `apply_updates_and_restart`,
-    /// which exits the process — we never return from a successful
-    /// apply path. This variant only exists for completeness and is
-    /// returned when the underlying `apply_updates_and_restart` call
-    /// is somehow a no-op (e.g. nothing to apply).
-    Applied,
+pub enum StageOutcome {
+    /// Update downloaded and ready to apply. Pass the carrier to
+    /// [`apply_staged`] on the **main thread** to finish the upgrade.
+    ///
+    /// Boxed because `StagedUpdate` holds a full `UpdateInfo` (asset
+    /// metadata + delta list) — keeping it inline would make every
+    /// `StageOutcome` value carry that payload around. Clippy's
+    /// `large_enum_variant` flagged the same.
+    Ready(Box<StagedUpdate>),
     /// No update was available (the feed was empty, or the running
     /// version matches the latest).
     UpToDate,
     /// This binary wasn't installed via Velopack — caller should
     /// have gated on `is_velopack_install()` and surfaced the
-    /// GitHub release URL (from
-    /// `codescope_core::update_check::UpdateStatus::Available.url`)
-    /// instead. Indicates a code-path mismatch when actually
-    /// returned.
+    /// GitHub release URL instead. Indicates a code-path mismatch
+    /// when actually returned.
     Unsupported,
     /// Velopack tried but something failed (network, parse, file IO,
     /// …). Message is a single human-readable line suitable for the
@@ -176,17 +193,18 @@ pub fn run_startup_hooks() {
     velopack::VelopackApp::build().run();
 }
 
-/// Attempt to download + apply any pending update via Velopack.
+/// Check for and download any pending update via Velopack.
 ///
-/// Designed to be called from a background thread (it blocks on
-/// network IO). Returns `ApplyOutcome` so the caller can decide how
-/// to surface the result; on a successful `Applied` outcome the
-/// process is replaced by the freshly-installed copy and we never
-/// reach the return statement.
+/// Safe to call from a background thread — has no process-affecting
+/// side effects beyond staging the downloaded `.nupkg` under
+/// `<install>/packages/`. The actual upgrade (which ends in
+/// `std::process::exit(0)` inside velopack-rs) is split out as
+/// [`apply_staged`] so it can be invoked from the main thread; see
+/// that function for the failure mode that drove the split.
 ///
-/// Mirrors C# `UpdateService.CheckAsync` — same gating, same
-/// channel, same call sequence.
-pub fn maybe_apply_now() -> ApplyOutcome {
+/// Mirrors the check + download half of C# `UpdateService.CheckAsync`
+/// — same channel, same source configuration.
+pub fn stage_pending_update() -> StageOutcome {
     // Velopack-rs preserves the C# field names verbatim (`#[allow(non_snake_case)]`
     // on `UpdateOptions`) — that's why this looks PascalCase. Mirrors
     // C# `new UpdateOptions { ExplicitChannel = Channel }`.
@@ -220,29 +238,48 @@ pub fn maybe_apply_now() -> ApplyOutcome {
     // open the release URL instead of toasting a scary error.
     let mgr = match velopack::UpdateManager::new(source, Some(options), None) {
         Ok(m) => m,
-        Err(_) => return ApplyOutcome::Unsupported,
+        Err(_) => return StageOutcome::Unsupported,
     };
     let check = match mgr.check_for_updates() {
         Ok(c) => c,
-        Err(e) => return ApplyOutcome::Failed(format!("check failed: {e}")),
+        Err(e) => return StageOutcome::Failed(format!("check failed: {e}")),
     };
     let info = match check {
         velopack::UpdateCheck::UpdateAvailable(i) => i,
         velopack::UpdateCheck::NoUpdateAvailable | velopack::UpdateCheck::RemoteIsEmpty => {
-            return ApplyOutcome::UpToDate;
+            return StageOutcome::UpToDate;
         }
     };
     if let Err(e) = mgr.download_updates(&info, None) {
-        return ApplyOutcome::Failed(format!("download failed: {e}"));
+        return StageOutcome::Failed(format!("download failed: {e}"));
     }
-    // `apply_updates_and_restart` exits the process on success; if
-    // it returns it means there was a soft error and we report
-    // it. The C# build's equivalent is also expected to not return
-    // (the call is documented as "restart the app").
-    match mgr.apply_updates_and_restart(&info) {
-        Ok(_) => ApplyOutcome::Applied,
-        Err(e) => ApplyOutcome::Failed(format!("apply failed: {e}")),
-    }
+    StageOutcome::Ready(Box::new(StagedUpdate { mgr, info }))
+}
+
+/// Apply a staged update and exit the process so the Velopack
+/// bootstrap helper can relaunch us on the new version.
+///
+/// **Must run on the main thread.** velopack-rs's
+/// `apply_updates_and_restart` ends with `std::process::exit(0)`
+/// (`velopack-0.0.1589::manager::apply_updates_and_restart`, line
+/// 560). Calling `exit` from a worker thread while GPUI's main thread
+/// is still running the Windows message loop races CRT teardown
+/// against active foreground state — the process dies with an access
+/// violation (WER dump, no Rust panic, so no `crash.log` either).
+/// Observed locally on v0.3.0-rc.7: three WER dumps in <60 s as the
+/// first auto-apply tick fired on each launch.
+///
+/// The happy path never returns — the call spawns `Update.exe` with
+/// `--waitPid <our pid>`, the bootstrap helper waits for the parent
+/// to exit, then installs the staged `.nupkg` and relaunches.
+/// Returns `Err(message)` only on the documented soft-error path
+/// where `apply_updates_and_restart` returned a `Result::Err` instead
+/// of exiting.
+pub fn apply_staged(staged: Box<StagedUpdate>) -> Result<(), String> {
+    staged
+        .mgr
+        .apply_updates_and_restart(&staged.info)
+        .map_err(|e| format!("apply failed: {e}"))
 }
 
 /// Whether Velopack's apply path is *available* — i.e. this binary
@@ -409,15 +446,6 @@ mod tests {
             std::env::set_var("CODESCOPE_VELOPACK_CHANNEL", "beta");
         }
         assert_eq!(channel_override(), "beta");
-    }
-
-    #[test]
-    fn apply_outcome_is_debug_and_clone() {
-        // Future callers may want to log the outcome by value; make
-        // sure the API stays compatible. This is a compile-only
-        // check (any of these traits going away breaks the build).
-        fn assert_debug_clone<T: std::fmt::Debug + Clone>() {}
-        assert_debug_clone::<ApplyOutcome>();
     }
 
     #[test]
