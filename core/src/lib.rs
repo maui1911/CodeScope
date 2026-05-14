@@ -39,6 +39,7 @@ pub mod session;
 pub mod settings;
 pub mod tab_drag;
 pub mod tab_title;
+pub mod telemetry;
 pub mod theme;
 pub mod time;
 pub mod update_check;
@@ -50,9 +51,9 @@ pub use agent_registry::{
     built_in_defaults,
 };
 pub use attachments::{SavedAttachment, save_attachment_bytes};
-pub use claude_discovery::{AdoptionCandidate, POLL_INTERVAL_MS as CLAUDE_DISCOVERY_POLL_MS};
+pub use claude_discovery::POLL_INTERVAL_MS as CLAUDE_DISCOVERY_POLL_MS;
 pub use claude_telemetry::{
-    SessionState, TelemetrySnapshot, TranscriptTail, context_window_for_model, encode_cwd,
+    SessionState, TelemetrySnapshot, ClaudeTranscriptTail, context_window_for_model, encode_cwd,
     format_context_pct, format_tokens, model_display_name,
 };
 pub use copilot_discovery::POLL_INTERVAL_MS as COPILOT_DISCOVERY_POLL_MS;

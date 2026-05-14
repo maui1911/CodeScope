@@ -48,7 +48,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::claude_telemetry::{FileTail, SessionState, TelemetrySnapshot, context_window_for_model};
+use crate::telemetry::{FileTail, SessionState, TelemetrySnapshot, context_window_for_model};
 
 // ---------------------------------------------------------------------------
 // JSONL parser
@@ -355,7 +355,7 @@ impl CopilotTranscriptTail {
 
     /// Suggested poll interval for the next wake-up. 250 ms while the
     /// session is Busy / PendingToolUse, 2 s while Idle / Unknown.
-    /// Mirrors the cadence used by [`crate::claude_telemetry::TranscriptTail`].
+    /// Mirrors the cadence used by [`crate::claude_telemetry::ClaudeTranscriptTail`].
     pub fn poll_interval(&self) -> Duration {
         match self.snapshot.as_ref().map(|s| s.state) {
             Some(SessionState::Busy) | Some(SessionState::PendingToolUse) => {

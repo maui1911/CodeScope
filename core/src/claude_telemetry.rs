@@ -18,92 +18,11 @@
 
 use std::io::{BufRead as _, BufReader, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use serde_json::Value;
 
-// ---------------------------------------------------------------------------
-// Public data types
-// ---------------------------------------------------------------------------
-
-/// Semantic activity of a Claude session, derived from the transcript tail.
-///
-/// Mirrors `ClaudeActivityState` in the C# build.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SessionState {
-    /// No information yet — no entries parsed, or session never
-    /// produced a user prompt.
-    #[default]
-    Unknown,
-    /// Last assistant turn ended with `stop_reason: end_turn` —
-    /// waiting for next user prompt.
-    Idle,
-    /// Last assistant turn ended with `stop_reason: tool_use` —
-    /// pending tool call (permission prompt in manual mode).
-    PendingToolUse,
-    /// Most recent entry is a user turn — agent is composing its
-    /// response.
-    Busy,
-}
-
-/// Snapshot of live telemetry for a single Claude Code session.
-///
-/// Mirrors `ClaudeSessionTelemetry` in the C# build. `context_pct` is
-/// computed from `tokens_used` and the context window looked up from
-/// the model id; `None` when the model is unrecognised.
-#[derive(Debug, Clone, PartialEq)]
-pub struct TelemetrySnapshot {
-    /// Most recent `message.model` seen on an assistant turn.
-    pub model: Option<String>,
-    /// Most recent assistant turn's total context:
-    /// `input + cache_read + cache_creation + output`.
-    ///
-    /// Overwrites on each assistant turn — **not** a running sum.
-    /// (Summing double-counts: Claude's `input_tokens` already covers
-    /// the full prior conversation in every request.)
-    pub tokens_used: u64,
-    /// `tokens_used / context_window` in `[0.0, 1.0]`. `None` when
-    /// the model id is unrecognised and no cap can be derived.
-    pub context_pct: Option<f32>,
-    /// Number of non-tool-result user messages — each fresh prompt
-    /// increments this by one.
-    pub turn_count: u32,
-    /// Wall-clock duration of the most recent user→assistant pair
-    /// (`assistant.timestamp − user.timestamp`). `None` until the
-    /// first complete round-trip.
-    pub last_turn_duration: Option<Duration>,
-    /// Current activity state of the session.
-    pub state: SessionState,
-}
-
-// ---------------------------------------------------------------------------
-// Model catalog
-// ---------------------------------------------------------------------------
-
-/// Nominal context-window capacity for a Claude model id.
-///
-/// Mirrors `ClaudeModelCatalog` from the C# build. Rules are
-/// deliberately loose — substring matching lets point-release
-/// variants work without a code change. The `1m` marker upgrades
-/// to 1M.
-pub fn context_window_for_model(model_id: &str) -> Option<u64> {
-    let id = model_id.to_lowercase();
-    if id.contains("1m") {
-        return Some(1_000_000);
-    }
-    if id.contains("sonnet") || id.contains("haiku") {
-        return Some(200_000);
-    }
-    // Claude 3.x Opus — 200k; must not catch "claude-opus-4-*".
-    if id.contains("claude-3") {
-        return Some(200_000);
-    }
-    // Opus 4.x and later ship 1M context in Claude Code by default.
-    if id.contains("claude") && id.contains("opus") {
-        return Some(1_000_000);
-    }
-    None
-}
+pub use crate::telemetry::{FileTail, SessionState, TelemetrySnapshot, context_window_for_model};
 
 /// Encode an absolute path to the `~/.claude/projects/<name>` directory
 /// name used by Claude Code.
@@ -117,26 +36,6 @@ pub fn encode_cwd(path: &str) -> String {
             other => other,
         })
         .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Per-file tail state
-// ---------------------------------------------------------------------------
-
-/// Mutable state for a single watched JSONL file.
-///
-/// Cheap `stat`-first reads: we only open the file when its length
-/// has advanced past `last_pos`. Mirrors the `Watch` inner class of
-/// `ClaudeTelemetryService`.
-#[derive(Debug, Default)]
-pub struct FileTail {
-    /// Byte offset of the next read. Reset to 0 when the file shrinks
-    /// (truncated / rewritten).
-    pub last_pos: u64,
-    /// mtime of the last `stat` that produced a read. Unused for
-    /// correctness but handy for debugging; callers can use
-    /// `metadata.len()` instead.
-    pub last_mtime: Option<SystemTime>,
 }
 
 // ---------------------------------------------------------------------------
@@ -462,7 +361,7 @@ pub fn process_new_lines(
 ///
 /// Mirrors the `Watch` inner class of `ClaudeTelemetryService`.
 #[derive(Debug)]
-pub struct TranscriptTail {
+pub struct ClaudeTranscriptTail {
     /// Absolute path to the JSONL file.
     pub path: PathBuf,
     tail: FileTail,
@@ -475,7 +374,7 @@ pub struct TranscriptTail {
     pub snapshot: Option<TelemetrySnapshot>,
 }
 
-impl TranscriptTail {
+impl ClaudeTranscriptTail {
     /// Construct a tail for `path` and immediately do an initial read
     /// so existing transcript content is consumed before the first
     /// poll interval fires.
@@ -970,39 +869,39 @@ mod tests {
     fn format_duration_under_10s_keeps_one_decimal() {
         // Mirrors C# `FormatDuration` "{seconds:0.0}s" branch.
         assert_eq!(
-            TranscriptTail::format_duration(Duration::from_millis(0)),
+            ClaudeTranscriptTail::format_duration(Duration::from_millis(0)),
             "0.0s"
         );
         assert_eq!(
-            TranscriptTail::format_duration(Duration::from_millis(3_100)),
+            ClaudeTranscriptTail::format_duration(Duration::from_millis(3_100)),
             "3.1s"
         );
         assert_eq!(
-            TranscriptTail::format_duration(Duration::from_millis(9_999)),
+            ClaudeTranscriptTail::format_duration(Duration::from_millis(9_999)),
             "10.0s"
         );
     }
 
     #[test]
     fn format_duration_under_minute_uses_integer_seconds() {
-        assert_eq!(TranscriptTail::format_duration(Duration::from_secs(10)), "10s");
-        assert_eq!(TranscriptTail::format_duration(Duration::from_secs(45)), "45s");
-        assert_eq!(TranscriptTail::format_duration(Duration::from_secs(59)), "59s");
+        assert_eq!(ClaudeTranscriptTail::format_duration(Duration::from_secs(10)), "10s");
+        assert_eq!(ClaudeTranscriptTail::format_duration(Duration::from_secs(45)), "45s");
+        assert_eq!(ClaudeTranscriptTail::format_duration(Duration::from_secs(59)), "59s");
     }
 
     #[test]
     fn format_duration_minutes_use_m_s_format() {
         // C# emits `"{m}m {s}s"` — no leading zeros on seconds.
         assert_eq!(
-            TranscriptTail::format_duration(Duration::from_secs(60)),
+            ClaudeTranscriptTail::format_duration(Duration::from_secs(60)),
             "1m 0s"
         );
         assert_eq!(
-            TranscriptTail::format_duration(Duration::from_secs(134)),
+            ClaudeTranscriptTail::format_duration(Duration::from_secs(134)),
             "2m 14s"
         );
         assert_eq!(
-            TranscriptTail::format_duration(Duration::from_secs(3_599)),
+            ClaudeTranscriptTail::format_duration(Duration::from_secs(3_599)),
             "59m 59s"
         );
     }
@@ -1010,15 +909,15 @@ mod tests {
     #[test]
     fn format_duration_hours_use_h_m_format() {
         assert_eq!(
-            TranscriptTail::format_duration(Duration::from_secs(3_600)),
+            ClaudeTranscriptTail::format_duration(Duration::from_secs(3_600)),
             "1h 0m"
         );
         assert_eq!(
-            TranscriptTail::format_duration(Duration::from_secs(3_900)),
+            ClaudeTranscriptTail::format_duration(Duration::from_secs(3_900)),
             "1h 5m"
         );
         assert_eq!(
-            TranscriptTail::format_duration(Duration::from_secs(7_265)),
+            ClaudeTranscriptTail::format_duration(Duration::from_secs(7_265)),
             "2h 1m"
         );
     }

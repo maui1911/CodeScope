@@ -41,7 +41,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
-use crate::claude_telemetry::{SessionState, TelemetrySnapshot, context_window_for_model};
+use crate::telemetry::{SessionState, TelemetrySnapshot, context_window_for_model};
 
 // ---------------------------------------------------------------------------
 // Per-message parser

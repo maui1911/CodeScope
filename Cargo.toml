@@ -31,7 +31,7 @@ eula = false
 
 [[bin]]
 name = "codescope-rs"
-path = "src/window.rs"
+path = "src/main.rs"
 
 [[example]]
 name = "ptytest"

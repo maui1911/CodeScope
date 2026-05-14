@@ -469,7 +469,7 @@ impl Render for DraggedTab {
 /// into one heterogeneous map so the discovery / poll plumbing stays
 /// agent-agnostic.
 enum AgentTail {
-    Claude(codescope_core::TranscriptTail),
+    Claude(codescope_core::ClaudeTranscriptTail),
     Copilot(codescope_core::CopilotTranscriptTail),
     OpenCode(codescope_core::OpenCodeMessageTail),
     Pi(codescope_core::PiTranscriptTail),
@@ -1391,7 +1391,7 @@ impl AppShell {
                     );
                     return;
                 };
-                AgentTail::Claude(codescope_core::TranscriptTail::for_session(
+                AgentTail::Claude(codescope_core::ClaudeTranscriptTail::for_session(
                     &root,
                     working_directory,
                     &session_id,
@@ -4613,7 +4613,7 @@ impl AppShell {
                             .h(px(12.0))
                             .text_color(ink_dim),
                     )
-                    .child(codescope_core::TranscriptTail::format_duration(d))
+                    .child(codescope_core::ClaudeTranscriptTail::format_duration(d))
             });
 
         let agent_summary_visible = agent_busy + agent_idle > 0;
@@ -5173,7 +5173,7 @@ impl AppShell {
                     let detail = match snap.last_turn_duration {
                         Some(d) => format!(
                             "Turn complete · {}",
-                            codescope_core::TranscriptTail::format_duration(d)
+                            codescope_core::ClaudeTranscriptTail::format_duration(d)
                         ),
                         None => "Turn complete.".to_string(),
                     };
@@ -7533,7 +7533,7 @@ fn classify_activity_transition(
             let detail = match snap.last_turn_duration {
                 Some(d) => format!(
                     "Turn complete · {}",
-                    codescope_core::TranscriptTail::format_duration(d)
+                    codescope_core::ClaudeTranscriptTail::format_duration(d)
                 ),
                 None => "Turn complete.".to_string(),
             };
@@ -7902,7 +7902,7 @@ mod tests {
         snap.last_turn_duration = Some(std::time::Duration::from_secs(75));
         let (_, _, detail) =
             classify_activity_transition(codescope_core::SessionState::Busy, &snap).unwrap();
-        // 75 s → "1m 15s" per `TranscriptTail::format_duration`.
+        // 75 s → "1m 15s" per `ClaudeTranscriptTail::format_duration`.
         assert_eq!(detail, "Turn complete · 1m 15s");
     }
 

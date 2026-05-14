@@ -52,7 +52,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::claude_telemetry::{FileTail, SessionState, TelemetrySnapshot, context_window_for_model};
+use crate::telemetry::{FileTail, SessionState, TelemetrySnapshot, context_window_for_model};
 
 // ---------------------------------------------------------------------------
 // JSONL parser
