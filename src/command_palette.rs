@@ -1,5 +1,5 @@
 //! Command palette modal — Rust port of
-//! `src/CodeScope.Ui/Dialogs/CommandPaletteDialog.xaml(.cs)` +
+//! `legacy:CodeScope.Ui/Dialogs/CommandPaletteDialog.xaml(.cs)` +
 //! `CommandPaletteViewModel.cs` + `MainViewModel.Palette.cs`.
 //!
 //! Ctrl+Shift+P opens the palette. Fuzzy search runs over a

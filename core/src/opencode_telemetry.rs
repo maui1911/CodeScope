@@ -2,7 +2,7 @@
 //! `~/.local/share/opencode/project/<slug>/storage/message/<sessionId>/msg_*.json`.
 //!
 //! Mirrors `OpenCodeTelemetryService` / `OpenCodeMessageParser` from
-//! the C# build (`src/CodeScope.Core/Services/`). Data shapes match
+//! the C# build (`legacy:CodeScope.Core/Services/`). Data shapes match
 //! [`crate::claude_telemetry`] so the status bar can render OpenCode
 //! sessions through the same code paths.
 //!
@@ -157,8 +157,8 @@ pub fn parse_content(content: &str) -> Option<MessageEntry> {
     // `toolInvocation.state` is not `"result"` means the agent is mid-call.
     // Conservative: only flag pending if assistant role; user messages can
     // carry tool parts in some shapes but never wait. Mirrors C# logic.
-    if role.as_deref() == Some("assistant") {
-        if let Some(parts) = obj.get("parts").and_then(Value::as_array) {
+    if role.as_deref() == Some("assistant")
+        && let Some(parts) = obj.get("parts").and_then(Value::as_array) {
             for part in parts {
                 let Some(part_obj) = part.as_object() else {
                     continue;
@@ -178,7 +178,6 @@ pub fn parse_content(content: &str) -> Option<MessageEntry> {
                 }
             }
         }
-    }
 
     Some(entry)
 }
@@ -257,8 +256,8 @@ fn locate_recursive(dir: &Path, session_id: &str) -> std::io::Result<Option<Path
         if name == session_id {
             // Verify the parent segment is "message" — same path-segment
             // guard as the C# locate.
-            if let Some(parent) = path.parent() {
-                if parent
+            if let Some(parent) = path.parent()
+                && parent
                     .file_name()
                     .and_then(|s| s.to_str())
                     .map(|n| n.eq_ignore_ascii_case("message"))
@@ -266,7 +265,6 @@ fn locate_recursive(dir: &Path, session_id: &str) -> std::io::Result<Option<Path
                 {
                     return Ok(Some(path));
                 }
-            }
         }
         if let Some(found) = locate_recursive(&path, session_id)? {
             return Ok(Some(found));
@@ -342,11 +340,10 @@ pub fn process_message_dir(watch: &mut SessionWatch) -> bool {
     // Quiet-tick short-circuit. Capture dir mtime BEFORE the walk so a
     // file landing between this check and the enumerate is still picked
     // up on the next tick. Mirrors C# comment verbatim.
-    if let (Some(dm), Some(last)) = (dir_mtime, watch.last_walked_dir_mtime) {
-        if dm <= last && watch.snapshot.is_some() {
+    if let (Some(dm), Some(last)) = (dir_mtime, watch.last_walked_dir_mtime)
+        && dm <= last && watch.snapshot.is_some() {
             return false;
         }
-    }
 
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
@@ -608,13 +605,11 @@ impl OpenCodeMessageTail {
             // OpenCode writes its first message file; a 250 ms recursive
             // walk over the whole data root every tick is wasteful.
             // Mirrors C# Issue #36.
-            if let Some(missed) = self.last_locate_miss_at {
-                if let Ok(elapsed) = SystemTime::now().duration_since(missed) {
-                    if elapsed < LOCATE_NOT_FOUND_TTL {
+            if let Some(missed) = self.last_locate_miss_at
+                && let Ok(elapsed) = SystemTime::now().duration_since(missed)
+                    && elapsed < LOCATE_NOT_FOUND_TTL {
                         return false;
                     }
-                }
-            }
             match try_locate_message_dir(&self.data_root, &self.watch.session_id) {
                 Some(dir) => {
                     self.watch.message_dir = Some(dir);

@@ -19,7 +19,7 @@ parking_lot.workspace = true
 # Win32 job objects power `process_group` — every PTY child is
 # assigned to a process-wide job flagged `KILL_ON_JOB_CLOSE`, so
 # orphaned Claude/Codex/pwsh processes can't outlive CodeScope (even
-# on a hard crash). Mirrors `src/CodeScope.Core/Interop/ProcessTreeKiller.cs`.
+# on a hard crash). Mirrors `legacy:CodeScope.Core/Interop/ProcessTreeKiller.cs`.
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_JobObjects",

@@ -1,6 +1,6 @@
 //! First-run / no-projects empty state.
 //!
-//! Port of `src/CodeScope.Ui/Views/EmptyStateView.xaml` — the
+//! Port of `legacy:CodeScope.Ui/Views/EmptyStateView.xaml` — the
 //! "Add a project." hero that replaces the workspace area whenever
 //! [`crate::sidebar::SidebarView::projects`] is empty. Same gate the
 //! C# build uses (`Sidebar.IsEmpty` DataTrigger in `MainWindow.xaml`).

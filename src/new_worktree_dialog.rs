@@ -1,5 +1,5 @@
 //! "New worktree from branch…" dialog — Rust port of
-//! `src/CodeScope.Ui/Dialogs/NewWorktreeDialog.xaml.cs`.
+//! `legacy:CodeScope.Ui/Dialogs/NewWorktreeDialog.xaml.cs`.
 //!
 //! Trimmed first cut versus the C# build: only the branch-name input
 //! is interactive. The folder path is auto-derived from the sanitised

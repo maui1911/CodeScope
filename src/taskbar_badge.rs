@@ -1,5 +1,5 @@
 //! Multiplatform taskbar / dock badge — mirrors C#
-//! `TaskbarBadgeService.cs` (`src/CodeScope.Ui/Services/TaskbarBadgeService.cs`).
+//! `TaskbarBadgeService.cs` (`legacy:CodeScope.Ui/Services/TaskbarBadgeService.cs`).
 //!
 //! Visual contract (must match the C# `Apply` method):
 //!
@@ -527,6 +527,7 @@ mod windows_impl {
     fn draw_digit_text(pixels: &mut [u32], size: usize, text: &str) {
         const GLYPH_W: usize = 3;
         const GLYPH_H: usize = 5;
+        const GLYPH_SPACING: usize = 1;
         // Detect the "9+" cap form: a single base digit followed by
         // a superscript plus that sits in the upper-right corner.
         let (base, has_plus) = if let Some(stripped) = text.strip_suffix('+') {
@@ -540,7 +541,7 @@ mod windows_impl {
         // digit left by 1 px when there's a `+` so the pair reads
         // visually centred.
         let base_w = base.chars().count() * GLYPH_W
-            + base.chars().count().saturating_sub(1) * 1;
+            + base.chars().count().saturating_sub(1) * GLYPH_SPACING;
         let mut base_x = size.saturating_sub(base_w) / 2;
         if has_plus && base_x > 0 {
             base_x -= 1;
@@ -549,7 +550,7 @@ mod windows_impl {
 
         for (i, ch) in base.chars().enumerate() {
             let bitmap = glyph_for(ch);
-            let ox = base_x + i * (GLYPH_W + 1);
+            let ox = base_x + i * (GLYPH_W + GLYPH_SPACING);
             for gy in 0..GLYPH_H {
                 for gx in 0..GLYPH_W {
                     if (bitmap[gy] >> (GLYPH_W - 1 - gx)) & 1 == 1 {

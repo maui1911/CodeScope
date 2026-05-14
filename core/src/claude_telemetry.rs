@@ -3,7 +3,7 @@
 //!
 //! Mirrors `ClaudeTelemetryService` / `ClaudeTranscriptParser` /
 //! `ClaudeModelCatalog` from the C# build
-//! (`src/CodeScope.Core/Services/`). Data shapes and field names are
+//! (`legacy:CodeScope.Core/Services/`). Data shapes and field names are
 //! intentionally kept 1:1 so the status bar can display the same
 //! information regardless of which runtime processes the transcript.
 //!
@@ -137,8 +137,8 @@ fn parse_line(line: &str) -> Option<Entry> {
 
         // Detect tool-result user messages: content is an array
         // with at least one `{"type":"tool_result",...}` item.
-        if kind == EntryKind::User {
-            if let Some(content) = msg.get("content").and_then(Value::as_array) {
+        if kind == EntryKind::User
+            && let Some(content) = msg.get("content").and_then(Value::as_array) {
                 user_carries_tool_result = content.iter().any(|item| {
                     item.as_object()
                         .and_then(|o| o.get("type"))
@@ -146,7 +146,6 @@ fn parse_line(line: &str) -> Option<Entry> {
                         == Some("tool_result")
                 });
             }
-        }
     }
 
     Some(Entry {
@@ -283,11 +282,10 @@ pub fn process_new_lines(
 
                 if has_usage {
                     // Latch most-recent model; update context window.
-                    if let Some(ref m) = entry.model {
-                        if Some(m.as_str()) != model.as_deref() {
+                    if let Some(ref m) = entry.model
+                        && Some(m.as_str()) != model.as_deref() {
                             model = Some(m.clone());
                         }
-                    }
 
                     // Overwrite, not accumulate — see doc comment on
                     // `TelemetrySnapshot::tokens_used`.
@@ -306,15 +304,14 @@ pub fn process_new_lines(
                     turn_count += 1;
 
                     // Compute turn duration from last fresh user prompt.
-                    if let (Some(user_ts), Some(asst_ts)) = (*last_user_ts, entry.timestamp_secs) {
-                        if asst_ts > user_ts {
+                    if let (Some(user_ts), Some(asst_ts)) = (*last_user_ts, entry.timestamp_secs)
+                        && asst_ts > user_ts {
                             let secs = asst_ts - user_ts;
                             if secs >= 0.0 {
                                 last_turn_duration =
                                     Some(Duration::from_secs_f64(secs));
                             }
                         }
-                    }
                 }
 
                 changed = true;

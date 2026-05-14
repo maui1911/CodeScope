@@ -27,7 +27,7 @@
 //! the matching pane below. Groups mirror the C# build's
 //! `EditorGroupViewModel` flat list — no recursive split tree.
 //!
-//! Visuals follow `src/CodeScope.App/Styles/DesignTokens.xaml`:
+//! Visuals follow `legacy:CodeScope.App/Styles/DesignTokens.xaml`:
 //! pure-black canvas, pure-white ink, single Framer Blue accent,
 //! frosted-glass surfaces. See [`crate::theme`] for the tokens.
 //!
@@ -2154,7 +2154,7 @@ impl AppShell {
                 .map(SharedString::from);
 
             // Title mirrors C# `MainViewModel.HydrateFromLoaded`
-            // (`src/CodeScope.Ui/ViewModels/MainViewModel.cs:1126-1133`):
+            // (`legacy:CodeScope.Ui/ViewModels/MainViewModel.cs:1126-1133`):
             // when the worktree has a branch we override the
             // descriptor title with `{project} · {branch}`, otherwise
             // we fall back to the descriptor's own title — which

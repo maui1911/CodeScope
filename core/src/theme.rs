@@ -6,7 +6,7 @@
 //! (serde) and the gpui paint code (the `app` crate maps `Rgb` →
 //! `gpui::Hsla`).
 //!
-//! Terms borrowed from `src/CodeScope.App/Styles/DesignTokens.xaml`:
+//! Terms borrowed from `legacy:CodeScope.App/Styles/DesignTokens.xaml`:
 //!
 //! * `canvas` / `ink` — pure surface + foreground.
 //! * `accent` — the single decorated colour. Framer Blue in our default;

@@ -1,4 +1,4 @@
-//! Rename dialog — Rust port of `src/CodeScope.Ui/Dialogs/RenameDialog.xaml(.cs)`.
+//! Rename dialog — Rust port of `legacy:CodeScope.Ui/Dialogs/RenameDialog.xaml(.cs)`.
 //!
 //! A small single-input modal that prompts for a new name and hands the
 //! trimmed result back to the caller. The C# build uses it for three

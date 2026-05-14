@@ -1,5 +1,5 @@
 //! "Add project" dialog — Rust port of
-//! `src/CodeScope.Ui/Dialogs/NewProjectDialog.xaml(.cs)`.
+//! `legacy:CodeScope.Ui/Dialogs/NewProjectDialog.xaml(.cs)`.
 //!
 //! Mirrors the C# UX 1:1: a segmented mode toggle between
 //! "Existing folder" (the default) and "Clone from URL", an inline

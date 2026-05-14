@@ -4,7 +4,7 @@
 //! (per-group tab strip + terminal grid) inside the main row so the
 //! sidebar + status bar stay anchored.
 //!
-//! Mirrors `src/CodeScope.Ui/Views/OverviewView.xaml` /
+//! Mirrors `legacy:CodeScope.Ui/Views/OverviewView.xaml` /
 //! `ViewModels/OverviewViewModel.cs` from the C# build. Like the C#
 //! Overview, this view shows live sessions only — closed history is
 //! filtered out at the core layer ([`codescope_core::build_overview_rows`])

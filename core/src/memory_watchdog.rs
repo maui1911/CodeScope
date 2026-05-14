@@ -1,6 +1,6 @@
 //! Dev-mode-only memory watchdog.
 //!
-//! Mirrors `src/CodeScope.App/Diagnostics/MemoryWatchdog.cs` in the C#
+//! Mirrors `legacy:CodeScope.App/Diagnostics/MemoryWatchdog.cs` in the C#
 //! build. Periodically samples the process working-set and surfaces
 //! growth between ticks so per-session terminal scrollback retention
 //! regressions (and similar "creep" leaks) don't go unnoticed during

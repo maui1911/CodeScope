@@ -1,5 +1,5 @@
 //! Themed confirm dialog — Rust port of
-//! `src/CodeScope.Ui/Dialogs/ConfirmDialog.xaml(.cs)`.
+//! `legacy:CodeScope.Ui/Dialogs/ConfirmDialog.xaml(.cs)`.
 //!
 //! Single in-app modal primitive for confirm / destructive prompts.
 //! Replaces the OS-native `window.prompt(...)` calls that were

@@ -2,7 +2,7 @@
 //! `~/.copilot/session-state/<session-id>/events.jsonl`.
 //!
 //! Mirrors `CopilotTelemetryService` / `CopilotTranscriptParser` from
-//! the C# build (`src/CodeScope.Core/Services/`). Data shapes match
+//! the C# build (`legacy:CodeScope.Core/Services/`). Data shapes match
 //! [`crate::claude_telemetry`] so the status bar can render Copilot
 //! sessions through the same code paths.
 //!
@@ -220,12 +220,11 @@ pub fn process_new_lines(
                 }
                 changed = true;
             }
-            Some("assistant.turn_start") => {
-                if state != SessionState::Busy {
+            Some("assistant.turn_start")
+                if state != SessionState::Busy => {
                     state = SessionState::Busy;
                     changed = true;
                 }
-            }
             Some("assistant.message") => {
                 if entry.has_tool_requests {
                     state = SessionState::PendingToolUse;
@@ -235,24 +234,21 @@ pub fn process_new_lines(
 
                 if entry.output_tokens > 0 {
                     turn_count += 1;
-                    if let Some(ts) = entry.timestamp_secs {
-                        if let Some(user_ts) = *last_user_ts {
-                            if ts > user_ts {
+                    if let Some(ts) = entry.timestamp_secs
+                        && let Some(user_ts) = *last_user_ts
+                            && ts > user_ts {
                                 let secs = ts - user_ts;
                                 if secs >= 0.0 {
                                     last_turn_duration = Some(Duration::from_secs_f64(secs));
                                 }
                             }
-                        }
-                    }
                 }
             }
-            Some("tool.execution_start") => {
-                if state == SessionState::PendingToolUse {
+            Some("tool.execution_start")
+                if state == SessionState::PendingToolUse => {
                     // Tool now executing — still pending more tools or composing.
                     changed = true;
                 }
-            }
             Some("tool.execution_complete") => {
                 state = SessionState::Busy;
                 changed = true;

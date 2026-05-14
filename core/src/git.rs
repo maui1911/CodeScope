@@ -132,7 +132,7 @@ pub fn list_branches(repo: &Path) -> Result<Vec<BranchInfo>> {
     let mut all = Vec::new();
     all.extend(for_each_ref(repo, false, "refs/heads")?);
     all.extend(for_each_ref(repo, true, "refs/remotes")?);
-    all.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    all.sort_by_key(|a| a.name.to_lowercase());
     Ok(all)
 }
 

@@ -1,7 +1,7 @@
 //! Command palette fuzzy matcher — pure scoring logic, no UI.
 //!
 //! 1:1 port of `CommandPaletteViewModel.Score` from the C# build
-//! (`src/CodeScope.Ui/ViewModels/CommandPaletteViewModel.cs`). The
+//! (`legacy:CodeScope.Ui/ViewModels/CommandPaletteViewModel.cs`). The
 //! ranker is kept in `core` so the C# unit tests have a direct
 //! mirror in `cargo test` without spinning up gpui.
 //!

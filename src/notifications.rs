@@ -1,7 +1,7 @@
 //! Persistent notification state.
 //!
 //! This is the Rust port of the C# `INotificationService` /
-//! `NotificationService` pair (`src/CodeScope.Core/Services/`).
+//! `NotificationService` pair (`legacy:CodeScope.Core/Services/`).
 //! The popover render lives in `app.rs` as `AppShell::render_notifications_popover`,
 //! mirroring how `render_toasts` and `render_tab_menu` are structured there.
 //!

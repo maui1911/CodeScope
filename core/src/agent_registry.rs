@@ -1,7 +1,7 @@
 //! Agent profile registry — Rust port of C# `AgentRegistry` + `AgentProfile`.
 //!
-//! Mirrors `src/CodeScope.Core/Services/AgentRegistry.cs` and
-//! `src/CodeScope.Core/Models/AgentProfile.cs`. The C# build exposes
+//! Mirrors `legacy:CodeScope.Core/Services/AgentRegistry.cs` and
+//! `legacy:CodeScope.Core/Models/AgentProfile.cs`. The C# build exposes
 //! these via DI so views/view-models can list available agents, pick
 //! the user-flagged default for "new tab", and look up by id when
 //! restoring sessions. This port keeps the same shape so the eventual
@@ -275,7 +275,7 @@ pub fn built_in_defaults() -> Vec<AgentProfile> {
 /// Build the auto-type command string used to (re)attach a terminal
 /// session to a previously-running agent conversation. Mirrors C#
 /// `SessionManager.CreateAgentSession` resume branch + `JoinResumeByIdArgs`
-/// (see `src/CodeScope.Core/Services/SessionManager.cs`).
+/// (see `legacy:CodeScope.Core/Services/SessionManager.cs`).
 ///
 /// Resolution table:
 ///
@@ -306,8 +306,8 @@ pub fn build_resume_auto_type(
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    if let Some(id) = id_for_resume {
-        if !profile.resume_by_id_args.is_empty() {
+    if let Some(id) = id_for_resume
+        && !profile.resume_by_id_args.is_empty() {
             let mut argv: Vec<String> =
                 Vec::with_capacity(1 + profile.resume_by_id_args.len());
             argv.push(profile.command.clone());
@@ -329,7 +329,6 @@ pub fn build_resume_auto_type(
         // Fall through to resume_args — the profile has no per-id
         // resume verb (Codex), so the best we can do is "continue
         // most recent" or just re-launch.
-    }
 
     let mut argv: Vec<String> = Vec::with_capacity(1 + profile.resume_args.len());
     argv.push(profile.command.clone());

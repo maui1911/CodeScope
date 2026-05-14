@@ -3340,7 +3340,7 @@ impl Render for Sidebar {
 
         // ── Footer: Overview + New Project, stacked, separated from
         //    the tree by a 1 px divider. Mirrors the bottom block in
-        //    `src/CodeScope.Ui/Views/SidebarView.xaml`:
+        //    `legacy:CodeScope.Ui/Views/SidebarView.xaml`:
         //
         //    <Border BorderThickness="0,1,0,0" Padding="8">
         //      <StackPanel>
@@ -3492,7 +3492,7 @@ impl Render for Sidebar {
             .border_color(theme::divider(&theme))
             // Mirror the C# build's `Fig.Font.Sans` default for the
             // sidebar — TextElement.FontFamily on `SidebarView` (see
-            // `src/CodeScope.Ui/Views/SidebarView.xaml`). Branch labels
+            // `legacy:CodeScope.Ui/Views/SidebarView.xaml`). Branch labels
             // and status slugs override this with `theme::font_mono()`
             // on their own `div`, matching the per-element
             // `Fig.Font.Mono` overrides on those XAML nodes.

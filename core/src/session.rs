@@ -1,5 +1,5 @@
 //! Session lifecycle layer — Rust port of
-//! `src/CodeScope.Core/Services/{SessionManager,SessionStore (session
+//! `legacy:CodeScope.Core/Services/{SessionManager,SessionStore (session
 //! mutators),SessionRetentionPolicy,SessionDescriptor}.cs`. Provides
 //! the in-memory session-lifecycle primitives (open / soft-close /
 //! reopen / hard-remove / rename / retention sweep) consumed by the
@@ -482,11 +482,10 @@ impl SessionManager {
 
         let mut pruned = Vec::new();
         for project in cfg.projects.iter_mut() {
-            if let Some(filter) = project_filter {
-                if project.id != filter {
+            if let Some(filter) = project_filter
+                && project.id != filter {
                     continue;
                 }
-            }
 
             let mut keep: Vec<Session> = Vec::with_capacity(project.sessions.len());
             // Bucket by worktree_id (None collapses to a single
