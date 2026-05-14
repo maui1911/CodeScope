@@ -114,10 +114,6 @@ struct Tab {
     /// folder without going through the sidebar's active-project
     /// fallback (which may have shifted since save).
     working_directory: Option<std::path::PathBuf>,
-    /// Auto-typed command at spawn (None for plain shells, Some for
-    /// agent-launch tabs). Persisted so "New Claude session" comes
-    /// back as claude on restore.
-    auto_type: Option<SharedString>,
     /// Wall-clock spawn time, captured at `spawn_tab_in`. Used as the
     /// `since` filter for Claude session adoption — only `.jsonl`
     /// transcripts created/modified at or after this point qualify
@@ -1287,7 +1283,14 @@ impl AppShell {
         on_disk.focused_group_index = self.focused_group;
         on_disk.sidebar_visible = self.sidebar_visible;
         on_disk.sidebar_width = self.sidebar_width;
-        on_disk.open_tabs = self.snapshot_open_tabs();
+        on_disk.session_placements = self.snapshot_session_placements();
+        // Drop the legacy `open_tabs` array — `session_placements` is
+        // authoritative now, and `projects.json` carries the open-vs-
+        // closed answer. Belt-and-braces: `LayoutState::load` already
+        // clears `open_tabs` after migration, but a save kicked off
+        // before the next load (e.g. an upgrade installer that swaps
+        // binaries mid-session) would otherwise re-emit it.
+        on_disk.open_tabs.clear();
         if let Err(err) = on_disk.save(self.paths.as_ref()) {
             eprintln!("warning: failed to save layout.json: {err:#}");
             return;
@@ -1978,151 +1981,199 @@ impl AppShell {
     // Layout persistence
     // -----------------------------------------------------------------------
 
-    /// Build a `RestoreTab` for every currently-open tab. Tabs
-    /// without a known working directory are skipped — we'd have
-    /// nothing useful to spawn them with on rehydrate.
-    fn snapshot_open_tabs(&self) -> Vec<codescope_core::RestoreTab> {
+    /// Capture the on-disk placement of every currently-open tab whose
+    /// session id resolves to a row in `projects.json`. Mirrors C#
+    /// `MainViewModel.CaptureLayout` (`LayoutStore.Layout.SessionToGroup`):
+    /// the authoritative "is this session open?" answer lives in
+    /// `projects.json`'s `closed_at` field; this snapshot only records
+    /// the layout decisions (which group + which tab was active).
+    ///
+    /// Free-floating tabs (no project context at spawn time → no row
+    /// in `projects.json`) are skipped: they don't survive a restart
+    /// in the new model because the rehydrate path drives off live
+    /// sessions from `projects.json`. Matches C# where every tab
+    /// belongs to a project (the "unsorted" bucket is the catch-all).
+    fn snapshot_session_placements(&self) -> Vec<codescope_core::SessionPlacement> {
         let mut out = Vec::new();
         for (g_idx, group) in self.groups.iter().enumerate() {
             for (t_idx, tab) in group.tabs.iter().enumerate() {
-                let Some(ref wd) = tab.working_directory else { continue };
-                // Persist `session_id` only when this tab's id actually
-                // resolves to a row in `projects.json` — free-floating
-                // tabs (no project context at spawn time) mint an id
-                // that's never appended via `SessionManager::open`, so
-                // writing it here would (a) be unresolvable on next
-                // launch and (b) trick the rehydrate path into
-                // adopting a non-existent row (`allocate_session_id`
-                // skips the `open` append when `restore_session_id`
-                // is `Some`). Leave it `None` for those tabs so the
-                // rehydrate falls back to the legacy fresh-spawn
-                // path and still produces a working terminal.
-                let persisted_session_id = self
-                    .lookup_session_by_id(&tab.session_id)
-                    .map(|_| tab.session_id.clone());
-                out.push(codescope_core::RestoreTab {
-                    working_directory: wd.to_string_lossy().into_owned(),
-                    title: tab.title.to_string(),
-                    auto_type: tab.auto_type.as_ref().map(|s| s.to_string()),
+                if self.lookup_session_by_id(&tab.session_id).is_none() {
+                    continue;
+                }
+                out.push(codescope_core::SessionPlacement {
+                    session_id: tab.session_id.clone(),
                     group_index: g_idx,
                     active_in_group: t_idx == group.active_tab,
-                    // Persist the session id so the rehydrate path on
-                    // next launch can look up `agent_session_id` and
-                    // resume the *specific* conversation, not just
-                    // "most recent". Matches the C# build's behaviour
-                    // where layout-rehydrate goes through
-                    // `CreateAgentSession(resume: true, agentSessionId:
-                    // stored.AgentSessionId)`.
-                    session_id: persisted_session_id,
                 });
             }
         }
         out
     }
 
-    /// Restore tabs from `LayoutState::open_tabs`, or fall back to
-    /// the cold-start spawn when nothing's saved. Builds on PR #74's
-    /// group-shape rehydration: by the time this runs the AppShell
-    /// already has N empty groups; we just put a tab back into each.
-    /// Tabs whose working directory no longer exists are silently
-    /// dropped; if everything is dropped (rare) we cold-start so the
-    /// user isn't left staring at empty groups.
+    /// Rehydrate the tab strip from `projects.json` live sessions
+    /// (rows where `closed_at = None`). Mirrors C#
+    /// `MainViewModel.HydrateFromLoaded`: the authoritative source of
+    /// "what should be open" is the project store, and `layout.json`
+    /// only decides which group each session lands in (via
+    /// [`SessionPlacement`]) plus widths / focus. This guarantees that
+    /// a tab opened minutes before a crash — even with no intervening
+    /// `save_layout` — comes back on next launch, because the
+    /// `SessionManager::open` call that spawned the tab also persisted
+    /// the row to `projects.json`.
+    ///
+    /// Sessions whose `worktree_path` no longer exists are skipped
+    /// (matches C# `Directory.Exists` guard). When no live session
+    /// survives, we leave the window empty so the user lands on the
+    /// neutral cold-start state instead of an auto-spawned default
+    /// shell pinned to an arbitrary project.
     fn rehydrate_or_cold_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let saved: Vec<codescope_core::RestoreTab> = self.layout.open_tabs.clone();
-        if saved.is_empty() {
-            // Cold launch — leave the window empty. The user opens
-            // sessions explicitly via the sidebar (double-click on a
-            // worktree row), Ctrl+Shift+T, or the "+ new tab" button.
-            // The previous behaviour auto-spawned a default-shell tab
-            // pinned to the first project, which surprised users who
-            // had multiple projects and didn't expect one of them to
-            // be selected on every fresh boot. Mirrors C#'s empty
-            // workspace state ("CodeScope — add a project to begin.").
-            //
-            // Focus the AppShell root so app-level chords (Ctrl+Shift+T
-            // to open a new tab, Ctrl+Shift+P for the palette, etc.)
-            // fire from a fresh boot — without explicit focus there's
-            // no focused element at all and the key handler never
-            // triggers (Copilot caught this on PR #184).
+        // Snapshot the live sessions up front so the spawn loop can
+        // mutate `self` (focused_group, groups) without colliding with
+        // a long-lived borrow on `self.projects`. Project iteration
+        // order is the on-disk order, matching C#'s
+        // `foreach (var p in loaded.Projects) foreach (var s in p.Sessions)`.
+        struct RehydrateEntry {
+            session_id: String,
+            worktree_path: String,
+            agent_id: Option<String>,
+            agent_session_id: Option<String>,
+            project_name: String,
+            branch: Option<String>,
+            display_name: Option<String>,
+        }
+        let entries: Vec<RehydrateEntry> = self
+            .projects
+            .projects
+            .iter()
+            .flat_map(|p| {
+                let project_name = p.name.clone();
+                p.sessions.iter().filter_map(move |s| {
+                    if s.closed_at.is_some() {
+                        return None;
+                    }
+                    let branch = s.branch.clone().or_else(|| {
+                        p.worktrees
+                            .iter()
+                            .find(|w| Some(&w.id) == s.worktree_id.as_ref())
+                            .and_then(|w| w.branch.clone())
+                    });
+                    Some(RehydrateEntry {
+                        session_id: s.id.clone(),
+                        worktree_path: s.worktree_path.clone(),
+                        agent_id: s.agent_id.clone(),
+                        agent_session_id: s.agent_session_id.clone(),
+                        project_name: project_name.clone(),
+                        branch,
+                        display_name: s.display_name.clone(),
+                    })
+                })
+            })
+            .collect();
+
+        if entries.is_empty() {
+            // Cold launch — leave the window empty. Focus the AppShell
+            // root so app-level chords (Ctrl+Shift+T to open a new tab,
+            // Ctrl+Shift+P for the palette, etc.) fire from a fresh
+            // boot — without explicit focus there's no focused element
+            // at all and the key handler never triggers.
             self.focus_handle.focus(window);
             cx.notify();
             return;
         }
+
+        // Build a placement lookup keyed by session id. Stale entries
+        // (no matching live session) are skipped implicitly; missing
+        // entries fall back to group 0, non-active.
+        let placements: std::collections::HashMap<String, codescope_core::SessionPlacement> = self
+            .layout
+            .session_placements
+            .iter()
+            .map(|p| (p.session_id.clone(), p.clone()))
+            .collect();
+
         let group_count = self.groups.len();
         let mut active_by_group: Vec<Option<usize>> = vec![None; group_count];
         let mut spawned_any = false;
-        for tab in saved.into_iter() {
-            let path = std::path::PathBuf::from(&tab.working_directory);
+
+        for entry in entries {
+            let path = std::path::PathBuf::from(&entry.worktree_path);
             if !path.exists() {
                 eprintln!(
-                    "info: skipping restored tab — path no longer exists: {}",
-                    tab.working_directory
+                    "info: skipping live session — worktree path no longer exists: {} ({})",
+                    entry.worktree_path, entry.session_id
                 );
                 continue;
             }
-            let group_idx = tab.group_index.min(group_count.saturating_sub(1));
-            // `spawn_tab_in` always lands in the focused group, so
-            // we move focus first then restore the saved focus
-            // index after the loop.
-            self.focused_group = group_idx;
-            let title = SharedString::from(tab.title);
 
-            // Reattach to the persisted session row when the layout
-            // entry carries a `session_id` (post-resume-by-id
-            // builds). We re-resolve `auto_type` from the stored
-            // `Session.agent_id` + `Session.agent_session_id` so the
-            // rehydrated tab runs `claude --resume <id>` / `pi
-            // --session <id>` / `copilot --resume=<id>` instead of
-            // the original spawn command (which was just "claude").
-            // Falls back to the layout's recorded `auto_type` when
-            // the session row can't be found (project removed,
-            // layout.json from a pre-session-id build) so legacy
-            // entries still rehydrate as a fresh agent launch.
-            let stored_session = tab
-                .session_id
+            let placement = placements.get(&entry.session_id);
+            let group_idx = placement
+                .map(|p| p.group_index)
+                .unwrap_or(0)
+                .min(group_count.saturating_sub(1));
+            let active_in_group = placement.map(|p| p.active_in_group).unwrap_or(false);
+
+            // `spawn_tab_in` always lands in the focused group, so
+            // we move focus first then restore the saved focus index
+            // after the loop.
+            self.focused_group = group_idx;
+
+            // Resume-by-id when we have an agent + its session UUID.
+            // `build_resume_auto_type` returns `claude --resume <id>` /
+            // `pi --session <id>` / `copilot --resume=<id>` depending on
+            // the agent profile. Falls back to the agent's "most recent"
+            // resume args when the persisted `agent_session_id` is
+            // missing, and to `None` for plain shells.
+            let auto: Option<SharedString> = entry
+                .agent_id
                 .as_deref()
-                .and_then(|sid| self.lookup_session_by_id(sid));
-            let auto: Option<SharedString> = match stored_session.as_ref() {
-                Some(stored) => stored
-                    .agent_id
-                    .as_deref()
-                    .and_then(|aid| self.agent_registry.get_by_id(aid))
-                    .and_then(|profile| {
-                        codescope_core::build_resume_auto_type(
-                            profile,
-                            stored.agent_session_id.as_deref(),
-                        )
-                    })
-                    .map(SharedString::from)
-                    .or_else(|| tab.auto_type.clone().map(SharedString::from)),
-                None => tab.auto_type.clone().map(SharedString::from),
+                .and_then(|aid| self.agent_registry.get_by_id(aid))
+                .and_then(|profile| {
+                    codescope_core::build_resume_auto_type(
+                        profile,
+                        entry.agent_session_id.as_deref(),
+                    )
+                })
+                .map(SharedString::from);
+
+            // Title mirrors C# `MainViewModel.HydrateFromLoaded`:
+            // `{project} · {branch}` when we have a branch, else the
+            // user-set display name, else the project name. Display
+            // name wins last because the C# tab title binding pulls
+            // from descriptor.Title (project · branch); rename lives
+            // in a separate SessionTabViewModel projection.
+            let title: SharedString = if let Some(branch) = entry.branch.as_deref() {
+                SharedString::from(format!("{} · {}", entry.project_name, branch))
+            } else if let Some(name) = entry.display_name.as_deref() {
+                SharedString::from(name.to_string())
+            } else {
+                SharedString::from(entry.project_name.clone())
             };
-            // Re-bind to the stored session row only when the row
-            // actually exists in `projects.json` right now. Passing
-            // `Some(id)` makes `allocate_session_id` skip the
-            // `SessionManager::open` append (it assumes the row is
-            // already on disk), so handing it a ghost id would leave
-            // the tab bound to a session that history / close
-            // bookkeeping can't touch. When the row is gone (project
-            // removed, hard-remove from history, race with a sidebar
-            // write) we fall back to `None` and let
-            // `allocate_session_id` mint a fresh id + append a new
-            // row — matches the pre-resume-by-id rehydrate
-            // behaviour for legacy layout.json files.
-            let restore_session_id = stored_session.as_ref().map(|s| s.id.clone());
-            self.spawn_tab_in(Some(path), Some(title), auto, restore_session_id, window, cx);
+
+            self.spawn_tab_in(
+                Some(path),
+                Some(title),
+                auto,
+                Some(entry.session_id.clone()),
+                window,
+                cx,
+            );
             spawned_any = true;
-            if tab.active_in_group {
+            if active_in_group {
                 let new_idx = self.groups[group_idx].tabs.len() - 1;
                 active_by_group[group_idx] = Some(new_idx);
             }
         }
+
         if !spawned_any {
-            // Every saved path was missing — fall back to cold-start
-            // so the user gets *something*.
-            self.spawn_tab(window, cx);
+            // Every live session's worktree was missing — leave the
+            // window empty instead of fabricating a default-shell tab
+            // on a path the user already lost. Matches C#'s
+            // "everything skipped → empty workspace" behaviour.
+            self.focus_handle.focus(window);
+            cx.notify();
             return;
         }
+
         // Apply per-group active-tab selections.
         for (g_idx, active) in active_by_group.iter().enumerate() {
             if let Some(t_idx) = active
@@ -3011,7 +3062,6 @@ impl AppShell {
             title,
             terminal,
             working_directory: working_directory_for_tab,
-            auto_type: auto_type.clone(),
             spawned_at: SystemTime::now(),
             adopted_session_id: None,
             fired_session_ids: std::collections::HashSet::new(),
@@ -3019,6 +3069,15 @@ impl AppShell {
         });
         let new_idx = group.tabs.len() - 1;
         self.activate_tab(group_idx, new_idx, window, cx);
+        // Persist the placement now so a crash before the next state
+        // change (close / split / drag) still leaves a `layout.json`
+        // that mentions this session's group. `activate_tab` only
+        // saves when focused_group actually changes — for a spawn
+        // into the already-focused group it wouldn't fire, so the
+        // tab would come back in group 0 next launch even though
+        // `projects.json` carries the live row. The `projects.json`
+        // write already happened inside `allocate_session_id`.
+        self.save_layout();
 
         // Fallback: auto-type the agent command into the shell when we
         // *couldn't* build the agent into the shell argv up-front
