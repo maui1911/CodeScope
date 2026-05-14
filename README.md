@@ -138,6 +138,12 @@ Pre-1.0. The core session / worktree / PR workflows are stable and used daily; p
 
 See `docs/HANDOFF.md` for the live status cursor and `docs/DECISIONS.md` for the architectural record.
 
+### Code health
+
+<img src="docs/screenshots/desloppify-scorecard.png" width="100%">
+
+Scored by [desloppify](https://github.com/peteromallet/desloppify).
+
 ## Contributing
 
 - Conventional commits (`feat:`, `fix:`, `chore:`, `refactor:`, `test:`, `docs:`).
