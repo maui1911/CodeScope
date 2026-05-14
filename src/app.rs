@@ -1951,45 +1951,71 @@ impl AppShell {
                         );
                     });
                     if velopack_supported {
-                        // Mirror C# `UpdateService.CheckAsync`:
-                        // download in the background, then call
-                        // `ApplyUpdatesAndRestart` — Velopack exits
-                        // the process and the bootstrap helper
-                        // relaunches us on the new version. Errors
-                        // here are best-effort and only logged
+                        // Mirror C# `UpdateService.CheckAsync`, split
+                        // across two threads:
+                        //
+                        // * Background — `stage_pending_update` does
+                        //   `check_for_updates` + `download_updates`.
+                        //   Heavy IO that must not block the UI.
+                        // * Main thread — `apply_staged` calls
+                        //   `apply_updates_and_restart`, which ends
+                        //   in `std::process::exit(0)` inside
+                        //   velopack-rs. Running that on a worker
+                        //   thread while GPUI's message loop is still
+                        //   active on main races CRT teardown against
+                        //   foreground state and crashes the process
+                        //   with no recoverable panic (observed on
+                        //   v0.3.0-rc.7). See `velopack_bridge`
+                        //   module docs for the failure analysis.
+                        //
+                        // Errors are best-effort and only logged
                         // (matches C# `LogWarning(ex, …)`).
-                        cx.background_executor()
+                        let staged = cx
+                            .background_executor()
                             .spawn(async {
-                                match crate::velopack_bridge::maybe_apply_now() {
-                                    crate::velopack_bridge::ApplyOutcome::Applied => {
-                                        // Unreachable — apply_updates_and_restart
-                                        // exits the process on success.
-                                    }
-                                    crate::velopack_bridge::ApplyOutcome::UpToDate => {
-                                        // Race between our GitHub poll
-                                        // and Velopack's feed read: the
-                                        // poll saw a newer release but
-                                        // Velopack's view says we're
-                                        // current. Quietly drop it —
-                                        // the next 3-hour tick will
-                                        // re-converge.
-                                    }
-                                    crate::velopack_bridge::ApplyOutcome::Unsupported => {
-                                        // Shouldn't happen — we
-                                        // gated on `is_velopack_install`
-                                        // above. Log if it does so a
-                                        // future regression is visible.
-                                        eprintln!(
-                                            "[velopack] apply: Unsupported despite \
-                                             positive install probe"
-                                        );
-                                    }
-                                    crate::velopack_bridge::ApplyOutcome::Failed(msg) => {
+                                crate::velopack_bridge::stage_pending_update()
+                            })
+                            .await;
+                        if this.upgrade().is_none() {
+                            break;
+                        }
+                        let _ = this.update(cx, |_this, _cx| {
+                            use crate::velopack_bridge::StageOutcome;
+                            match staged {
+                                StageOutcome::Ready(s) => {
+                                    // Happy path doesn't return — the
+                                    // helper exits the process and
+                                    // the bootstrap relaunches us on
+                                    // the new version.
+                                    if let Err(msg) =
+                                        crate::velopack_bridge::apply_staged(s)
+                                    {
                                         eprintln!("[velopack] apply failed: {msg}");
                                     }
                                 }
-                            })
-                            .detach();
+                                StageOutcome::UpToDate => {
+                                    // Race between our GitHub poll
+                                    // and Velopack's feed read: the
+                                    // poll saw a newer release but
+                                    // Velopack's view says we're
+                                    // current. Quietly drop — the
+                                    // next 3-hour tick re-converges.
+                                }
+                                StageOutcome::Unsupported => {
+                                    // Shouldn't happen — we gated on
+                                    // `is_velopack_install` above.
+                                    // Log if it does so a future
+                                    // regression is visible.
+                                    eprintln!(
+                                        "[velopack] stage: Unsupported despite \
+                                         positive install probe"
+                                    );
+                                }
+                                StageOutcome::Failed(msg) => {
+                                    eprintln!("[velopack] stage failed: {msg}");
+                                }
+                            }
+                        });
                     }
                 }
                 cx.background_executor()
