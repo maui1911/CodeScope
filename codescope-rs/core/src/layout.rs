@@ -37,16 +37,31 @@ pub struct LayoutState {
     /// group count matches; out-of-range falls back to 0. Mirrors
     /// `WorkspaceLayout.FocusedGroupIndex`.
     pub focused_group_index: usize,
-    /// Open tabs to rehydrate at next launch. Each entry binds a
-    /// terminal session to a group + active flag. We don't try to
-    /// restore the *running process* (the pty was killed at app
-    /// shutdown) — `auto_type` re-runs whatever command was used to
-    /// spawn the original tab so "New Claude session" comes back as
-    /// claude and plain shells come back as plain shells. Tabs
-    /// whose `working_directory` no longer exists are silently
-    /// dropped on rehydrate. Empty → no tabs at last save (fresh
-    /// install / migration from older layout.json), AppShell falls
-    /// back to a single cold-start tab.
+    /// Placement metadata for the live sessions persisted in
+    /// `projects.json`. Each entry binds a `Session.id` to the group
+    /// it should rehydrate into. The authoritative list of *which*
+    /// sessions are open lives in `projects.json` (rows with
+    /// `closed_at = None`); this field only decides where each one
+    /// lands. Mirrors C# `LayoutStore.Layout.SessionToGroup` plus an
+    /// extra `active_in_group` flag because Rust has no per-group
+    /// "active tab" map elsewhere.
+    ///
+    /// Missing entries fall back to group 0 + non-active on
+    /// rehydrate. Stale entries (no matching live session) are
+    /// silently ignored. Empty → fresh install / pre-migration
+    /// layout.json; the legacy `open_tabs` field below feeds the
+    /// one-shot upgrade in [`LayoutState::migrate`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_placements: Vec<SessionPlacement>,
+    /// Legacy "open tabs" snapshot — Rust port's pre-parity bag of
+    /// (working_directory, title, auto_type, session_id, …) per
+    /// tab. New writes leave this empty (it's never serialised when
+    /// `session_placements` is the source); old writes are read
+    /// once and converted to [`session_placements`] via
+    /// [`LayoutState::migrate`] so users upgrading don't see their
+    /// tab layout shuffle. Deserialise-only after the migration
+    /// step runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_tabs: Vec<RestoreTab>,
     /// Project ids the user has collapsed in the sidebar tree.
     /// Restored on launch so chevron state survives a restart;
@@ -57,6 +72,26 @@ pub struct LayoutState {
     /// longer match a known project before saving so the file
     /// can't grow stale entries across many sessions.
     pub collapsed_projects: Vec<String>,
+}
+
+/// Where a single live session rehydrates on next launch. The
+/// session row itself lives in `projects.json`; this just tells the
+/// AppShell which group the matching tab should land in and whether
+/// it was the active tab in its group at save time. Mirrors C#
+/// `LayoutStore.Layout.SessionToGroup` plus an active-tab marker.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionPlacement {
+    /// `Session.id` from `projects.json`. Stale ids (no matching live
+    /// session at rehydrate time) are silently ignored.
+    pub session_id: String,
+    /// Group index this tab belongs to in `group_weights`'s
+    /// numbering. Restore clamps out-of-range values to 0.
+    pub group_index: usize,
+    /// Was this tab the active one in its group at save time?
+    /// Restore picks the first `true` per group; if none, the first
+    /// spawned tab in the group wins.
+    #[serde(default)]
+    pub active_in_group: bool,
 }
 
 /// One tab worth of restore metadata. Light enough to round-trip
@@ -105,6 +140,7 @@ impl Default for LayoutState {
             selected_project_id: None,
             group_weights: Vec::new(),
             focused_group_index: 0,
+            session_placements: Vec::new(),
             open_tabs: Vec::new(),
             collapsed_projects: Vec::new(),
         }
@@ -117,13 +153,51 @@ impl LayoutState {
     }
 
     pub fn load_from(path: &Path) -> Result<Self> {
-        match std::fs::read(path) {
-            Ok(bytes) if bytes.is_empty() => Ok(Self::default()),
+        let mut state: Self = match std::fs::read(path) {
+            Ok(bytes) if bytes.is_empty() => Self::default(),
             Ok(bytes) => serde_json::from_slice(&bytes)
-                .with_context(|| format!("parse {}", path.display())),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
+                .with_context(|| format!("parse {}", path.display()))?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+        };
+        state.migrate();
+        Ok(state)
+    }
+
+    /// Convert a legacy `open_tabs` snapshot into the slim
+    /// `session_placements` form. Idempotent: a no-op once
+    /// `session_placements` is populated (post-migration writes never
+    /// emit `open_tabs` again). Legacy entries without `session_id`
+    /// are dropped — they have no `projects.json` row to bind to and
+    /// the new rehydrate path drives off live sessions, not free-
+    /// floating descriptors.
+    ///
+    /// Runs unconditionally on load so old layout.json files upgrade
+    /// in place. The migration explicitly does NOT touch
+    /// `session_placements` when it's already non-empty so a manually
+    /// edited file with both fields stays under user control.
+    fn migrate(&mut self) {
+        if !self.session_placements.is_empty() {
+            // New shape already on disk; drop any legacy carry-over
+            // so the next save doesn't keep emitting it.
+            self.open_tabs.clear();
+            return;
         }
+        if self.open_tabs.is_empty() {
+            return;
+        }
+        let migrated: Vec<SessionPlacement> = std::mem::take(&mut self.open_tabs)
+            .into_iter()
+            .filter_map(|tab| {
+                let session_id = tab.session_id?;
+                Some(SessionPlacement {
+                    session_id,
+                    group_index: tab.group_index,
+                    active_in_group: tab.active_in_group,
+                })
+            })
+            .collect();
+        self.session_placements = migrated;
     }
 
     pub fn save(&self, paths: &AppPaths) -> Result<()> {
@@ -168,14 +242,12 @@ mod tests {
             selected_project_id: Some("proj-1".into()),
             group_weights: vec![1.5, 1.0],
             focused_group_index: 1,
-            open_tabs: vec![RestoreTab {
-                working_directory: "C:\\repos\\foo".into(),
-                title: "foo · main · claude".into(),
-                auto_type: Some("claude".into()),
+            session_placements: vec![SessionPlacement {
+                session_id: "sess-1".into(),
                 group_index: 0,
                 active_in_group: true,
-                session_id: Some("sess-1".into()),
             }],
+            open_tabs: Vec::new(),
             collapsed_projects: vec!["proj-2".into(), "proj-3".into()],
         };
         state.save_to(&path).unwrap();
@@ -184,11 +256,143 @@ mod tests {
         assert_eq!(loaded.selected_project_id.as_deref(), Some("proj-1"));
         assert_eq!(loaded.group_weights, vec![1.5, 1.0]);
         assert_eq!(loaded.focused_group_index, 1);
-        assert_eq!(loaded.open_tabs.len(), 1);
-        assert_eq!(loaded.open_tabs[0].auto_type.as_deref(), Some("claude"));
-        assert!(loaded.open_tabs[0].active_in_group);
-        assert_eq!(loaded.open_tabs[0].session_id.as_deref(), Some("sess-1"));
+        assert_eq!(loaded.session_placements.len(), 1);
+        assert_eq!(loaded.session_placements[0].session_id, "sess-1");
+        assert!(loaded.session_placements[0].active_in_group);
+        assert!(loaded.open_tabs.is_empty());
         assert_eq!(loaded.collapsed_projects, vec!["proj-2", "proj-3"]);
+    }
+
+    #[test]
+    fn save_omits_empty_legacy_open_tabs() {
+        // A migrated `LayoutState` has `open_tabs = []`. Serialising it
+        // must not emit an `"open_tabs": []` key; otherwise every save
+        // would write a redundant empty array and a second `cargo run`
+        // would still load (harmlessly) the legacy migration code path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        let state = LayoutState {
+            session_placements: vec![SessionPlacement {
+                session_id: "sess-1".into(),
+                group_index: 0,
+                active_in_group: false,
+            }],
+            ..LayoutState::default()
+        };
+        state.save_to(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("open_tabs"), "expected open_tabs key to be omitted: {raw}");
+        assert!(raw.contains("session_placements"), "{raw}");
+    }
+
+    #[test]
+    fn migrate_legacy_open_tabs_to_session_placements() {
+        // A layout.json written by a pre-stap-2 Rust build carries the
+        // wide `open_tabs` shape with `session_id` already present (the
+        // resume-by-id work). On load we drop everything except the
+        // (session_id, group_index, active_in_group) triple — the rest
+        // can be derived from the projects.json Session row at
+        // rehydrate time.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "sidebar_visible": true,
+              "sidebar_width": 240,
+              "open_tabs": [
+                {
+                  "working_directory": "C:\\repos\\foo",
+                  "title": "foo · main · claude",
+                  "auto_type": "claude",
+                  "group_index": 1,
+                  "active_in_group": true,
+                  "session_id": "sess-1"
+                },
+                {
+                  "working_directory": "C:\\repos\\bar",
+                  "title": "bar",
+                  "group_index": 0,
+                  "active_in_group": false,
+                  "session_id": "sess-2"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let loaded = LayoutState::load_from(&path).unwrap();
+        assert_eq!(loaded.session_placements.len(), 2);
+        assert_eq!(loaded.session_placements[0].session_id, "sess-1");
+        assert_eq!(loaded.session_placements[0].group_index, 1);
+        assert!(loaded.session_placements[0].active_in_group);
+        assert_eq!(loaded.session_placements[1].session_id, "sess-2");
+        assert!(!loaded.session_placements[1].active_in_group);
+        // open_tabs cleared so the next save doesn't keep round-tripping
+        // the legacy shape.
+        assert!(loaded.open_tabs.is_empty());
+    }
+
+    #[test]
+    fn migrate_drops_legacy_entries_without_session_id() {
+        // Pre-resume-by-id Rust builds wrote `RestoreTab` entries
+        // without a `session_id`. Those have no projects.json row to
+        // bind to and the new rehydrate path drives off live sessions,
+        // so they're silently dropped on migration. The user gets a
+        // slightly smaller tab strip on first launch after upgrade,
+        // not stale ghost tabs.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "open_tabs": [
+                {
+                  "working_directory": "C:\\repos\\foo",
+                  "title": "foo",
+                  "group_index": 0,
+                  "active_in_group": true
+                },
+                {
+                  "working_directory": "C:\\repos\\bar",
+                  "title": "bar",
+                  "group_index": 0,
+                  "active_in_group": false,
+                  "session_id": "sess-keeper"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let loaded = LayoutState::load_from(&path).unwrap();
+        assert_eq!(loaded.session_placements.len(), 1);
+        assert_eq!(loaded.session_placements[0].session_id, "sess-keeper");
+    }
+
+    #[test]
+    fn migrate_is_noop_when_session_placements_already_present() {
+        // A layout.json that already carries `session_placements` is
+        // already on the new shape. `open_tabs`, if somehow present
+        // (manual edit, partial revert), is dropped without
+        // overwriting the authoritative `session_placements`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "session_placements": [
+                { "session_id": "sess-real", "group_index": 0, "active_in_group": true }
+              ],
+              "open_tabs": [
+                { "working_directory": "C:\\stale", "title": "stale", "group_index": 0,
+                  "active_in_group": false, "session_id": "sess-stale" }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let loaded = LayoutState::load_from(&path).unwrap();
+        assert_eq!(loaded.session_placements.len(), 1);
+        assert_eq!(loaded.session_placements[0].session_id, "sess-real");
+        assert!(loaded.open_tabs.is_empty());
     }
 
     #[test]
@@ -208,24 +412,6 @@ mod tests {
         let loaded = LayoutState::load_from(&path).unwrap();
         assert_eq!(loaded.selected_project_id.as_deref(), Some("proj-x"));
         assert!(loaded.collapsed_projects.is_empty());
-    }
-
-    #[test]
-    fn legacy_restore_tab_without_session_id_loads() {
-        // layout.json files written before resume-by-explicit-id
-        // landed don't carry `session_id` on each tab. They must
-        // still load (with `session_id = None`) so a one-shot
-        // upgrade doesn't drop the user's restored tab strip.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("layout.json");
-        std::fs::write(
-            &path,
-            r#"{"sidebar_visible":true,"sidebar_width":240,"open_tabs":[{"working_directory":"C:\\repos\\foo","title":"foo","auto_type":"claude","group_index":0,"active_in_group":true}]}"#,
-        )
-        .unwrap();
-        let loaded = LayoutState::load_from(&path).unwrap();
-        assert_eq!(loaded.open_tabs.len(), 1);
-        assert!(loaded.open_tabs[0].session_id.is_none());
     }
 
     #[test]

@@ -507,3 +507,55 @@ sidebar's "+ New Project → Clone from URL" tab uses today.
 - If/when the C# build wires its clone flow, both ports converge
   on the same affordance.
 
+## ADR-0021 — Rust rehydrate is driven by `projects.json`, not `layout.json`
+
+**Date:** 2026-05-14
+**Status:** Accepted
+
+Until this ADR the Rust port had two sources of truth for "which
+sessions are open across a restart": `projects.json` carried the live
+`Session` rows (with `closed_at = None`), and `layout.json` carried a
+parallel `open_tabs: Vec<RestoreTab>` that the cold-start path
+(`AppShell::rehydrate_or_cold_start`) actually read. Any divergence
+between the two — a crash before `save_layout` fired after a spawn, a
+manual file edit, a partially-restored backup — left "live" rows in
+`projects.json` that were invisible to the user because they weren't
+in `layout.json`.
+
+The C# build doesn't have this problem: `LayoutStore.Layout` carries
+only `GroupCount`, `FocusedGroupIndex`, `Dictionary<string, int>
+SessionToGroup` and `GroupWidths`. `MainViewModel.HydrateFromLoaded`
+iterates every `Session` with `ClosedAt is null` and uses
+`SessionToGroup[s.Id]` purely to decide *where* the tab lands, not
+whether it lands at all.
+
+**Decision:** mirror the C# split. `LayoutState.session_placements:
+Vec<SessionPlacement>` replaces `open_tabs` as the placement record;
+each entry binds a `Session.id` to its group index and an
+`active_in_group` flag. The legacy `open_tabs` field stays
+deserialise-only and is migrated in place on first load, then dropped
+on next save. `rehydrate_or_cold_start` walks `self.projects.projects[].sessions`
+where `closed_at.is_none()` and falls back to group 0 / non-active for
+sessions without a placement.
+
+**Consequences:**
+
+- A session opened via `Ctrl+T` is durable from the moment
+  `SessionManager::open` writes `projects.json` — even a process kill
+  before the next `save_layout` keeps the tab on next launch (it just
+  comes back in group 0 if the placement wasn't captured yet).
+- `Tab.auto_type` is no longer persisted as separate state; the
+  resume command line is rebuilt at rehydrate time from
+  `Session.agent_id` + `Session.agent_session_id` via
+  `build_resume_auto_type`, matching the C# hydrate path.
+- Free-floating tabs (no project context at spawn time → no row in
+  `projects.json`) no longer survive a restart. This matches C#'s
+  invariant that every session belongs to a project (the "unsorted"
+  bucket is the catch-all; `AppShell` already routes there via the
+  Add Project flow).
+- One-shot migration: pre-ADR `layout.json` files keep their tab
+  groups via the `open_tabs → session_placements` conversion in
+  `LayoutState::migrate`; entries without `session_id` are dropped
+  (those predate resume-by-id and had no `projects.json` link
+  anyway).
+

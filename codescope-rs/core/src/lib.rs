@@ -66,7 +66,7 @@ pub use overview::{
 };
 pub use pi_discovery::POLL_INTERVAL_MS as PI_DISCOVERY_POLL_MS;
 pub use pi_telemetry::PiTranscriptTail;
-pub use layout::{LayoutState, RestoreTab};
+pub use layout::{LayoutState, RestoreTab, SessionPlacement};
 pub use paths::AppPaths;
 pub use projects::{Project, ProjectsConfig, Session, Worktree};
 pub use session::{RetentionPolicy, SessionDescriptor, SessionManager, build_agent_shell_args, now_iso8601};
