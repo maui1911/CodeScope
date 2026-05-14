@@ -25,15 +25,93 @@
 > `.github/workflows/release.yml` (was `rs--release.yml`) and now
 > triggers on plain `v*` tags.
 
-**Last updated:** 2026-05-14 (session 42 — C# build retirement, three-PR cutover sequence)
+**Last updated:** 2026-05-14 (session 43 — first post-cutover bug-fix release, sidebar halo centering + v0.3.0-rc.8 cut)
 **Branch:** `main`
-**Head:** `eca790c` (chore: flatten Rust tree to repo root + rename pack id (cutover-3), #210)
-**Release:** none cut this session — repo state is post-cutover and ready for the first `v*` tag (next push will be `v0.3.0-rc.7` or `v0.3.0` final, packaged under the new `codescope` Velopack pack id).
-**Build status:** ✅ `cargo build --workspace` clean from repo root.
-Tests: `codescope-core` (470) + `codescope-rs` bin (135) +
-`codescope-terminal` (28) + doctests (1 core + 0 terminal) — **634 total**, all passing.
-**Uncommitted work:** none — every change this session shipped through PRs #208 / #209 / #210.
+**Head:** `f1332f6` (chore: bump version to 0.3.0-rc.8, #214)
+**Release:** `v0.3.0-rc.8` tagged and published. Release workflow run `25859204689` all 8 jobs green; Velopack feeds published for all four platforms (`releases.{win,osx-arm64,osx-x64,linux-x64}.json` + matching `-Setup.exe` / `.app.zip` / `.AppImage` / nupkgs). First release that actually exercises the new `codescope` pack id auto-update path end-to-end (rc.7 → rc.8 delta nupkg present in the release).
+**Build status:** ✅ `cargo build --workspace` clean. Tests: 470 core + 135 bin + 28 terminal + 1 doctest = **634 total**, all passing (unchanged — session 43 was a one-line layout fix with no test surface to add).
+**Uncommitted work:** none — every change shipped through PR #213 / #214.
 **Open issues:** none checked this run.
+
+### Session 43 — sidebar busy-halo centering + first post-cutover release
+
+Bug-fix session that doubled as the validation vehicle for the new
+`codescope`-pack-id auto-update lineage (the next step on session 42's
+"User-side post-merge" list, after the user installed rc.7).
+
+**Bug.** With a busy worktree visible in the sidebar, dragging the
+sidebar narrower visibly drifted the red halo off-center from the red
+busy dot. Root cause: `src/sidebar.rs:2992` built a 14×14 container
+holding the 6 px dot (flex-centered via `items_center/justify_center`)
+and the 12 px halo (`absolute()` at `top(1) left(1)`). The container
+had no explicit `flex_shrink_0()`, so on a narrow sidebar the flex row
+shrank it. The dot followed the new center; the absolute halo kept its
+hard-coded offsets. They walked apart.
+
+**PR #213 (`c46b77f`) — fix.** One-line: add `.flex_shrink_0()` to
+the dot+halo container so it stays a hard 14×14 regardless of row
+width. Build clean, all 634 tests pass (no test surface — pure layout).
+Copilot review came back as a summary-only ack with no comments,
+admin-merged (branch protection requires an approving human review).
+
+**PR #214 (`f1332f6`) — bump to 0.3.0-rc.8.** Cargo.toml +
+Cargo.lock. Same review shape as #213.
+
+**Tag + release.** `git tag v0.3.0-rc.8 && git push origin v0.3.0-rc.8`
+→ `.github/workflows/release.yml` run `25859204689` all green: `plan`
++ 4× `build-local-artifacts` (Win x64, macOS arm64, macOS x64, Linux
+x64) + `build-global-artifacts` + `host` + `announce`. Notable
+artifact for the validation purpose: `codescope-0.3.0-rc.8-delta.nupkg`
+— this is the binary delta that an installed rc.7 should pick up via
+Velopack rather than re-downloading the full nupkg.
+
+**Auto-update validation — deferred.** User installed rc.7 at 13:46
+local; the first `update_check` poll fires 10 s after launch
+(`update_check::INITIAL_DELAY`, `src/app.rs:1882`) and then every 3 h
+(`update_check::POLL_INTERVAL`, line 1996). rc.7's first check at
+~13:46:10 ran *before* rc.8 was published (14:21:56 CEST), so the
+running rc.7 won't see rc.8 until ~16:46 local — or until the user
+restarts the app. User is busy at $work; validation will resume in a
+later session. Expected UI on detection: bell button gets the unread
+dot + title `CodeScope 0.3.0-rc.8 available`, detail
+`Downloading update in the background. Restart CodeScope when prompted
+to install.`, then `velopack_bridge::maybe_apply_now()` →
+`apply_updates_and_restart()` exits the process and the bootstrap
+helper relaunches on rc.8.
+
+**Sanity check on the installed state** (run mid-session):
+```
+$LOCALAPPDATA\CodeScope\
+  Update.exe                              ← Velopack bootstrap
+  current\codescope-rs.exe                ← live binary
+  packages\codescope-0.3.0-rc.7-full.nupkg← pack-id `codescope` ✓
+$APPDATA\CodeScope\
+  projects.json, settings.json            ← carried across from C# install
+```
+No `crash.log`, no `console.log` (the latter is a C#-era artifact in
+CLAUDE.md — Rust port only writes `crash.log`; eprintln output goes
+to stderr, only visible when launched from a terminal). Pack id
+matches the cutover-3 rename, so the rc.7 → rc.8 lineage should
+resolve cleanly.
+
+**Doc nit observed, not fixed:** `CLAUDE.md` mentions
+`%LOCALAPPDATA%\CodeScope\console.log` under the dev-mode paths
+section — that file never gets written by the Rust port. Worth a
+one-line correction in a follow-up.
+
+**Cursor for next session:**
+1. **Resume the auto-update validation.** Confirm with the user
+   whether their rc.7 install picked up rc.8 (bell notification +
+   automatic restart). If yes: the new `codescope` pack-id lineage
+   is end-to-end proven and the patient-iteration follow-ups can
+   start (next bullet). If no: investigate the Velopack feed match
+   (`velopack_bridge.rs` channel logic) and the `MIN_PUBLISHED_TRIPLE`
+   floor in `core/src/update_check.rs`.
+2. **Patient-iteration follow-ups from session 41**, in order:
+   PNG icon for mac/linux Velopack bundles → code signing
+   (Authenticode + Apple Developer / notarytool) → multi-channel
+   rings (beta/alpha layered over the platform slugs).
+3. **CLAUDE.md `console.log` doc nit** above.
 
 ### Session 42 — C# build retirement (cutover-1/2/3)
 
