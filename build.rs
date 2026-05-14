@@ -71,22 +71,19 @@ fn bake_version_slug() {
     // Failures (no git, not a repo, …) just skip the trigger — the
     // env-var / fallback path above still produces a usable slug.
     for relative in ["HEAD", "packed-refs", "index", "refs/tags"] {
-        if let Some(p) = git_path(relative) {
-            if p.exists() {
+        if let Some(p) = git_path(relative)
+            && p.exists() {
                 println!("cargo:rerun-if-changed={}", p.display());
             }
-        }
     }
     // The current branch's actual ref file. Resolves even when
     // packed (in which case the file may not exist; we already
     // watch `packed-refs` above).
-    if let Some(symref) = run_git(&["symbolic-ref", "--quiet", "HEAD"]) {
-        if let Some(p) = git_path(&symref) {
-            if p.exists() {
+    if let Some(symref) = run_git(&["symbolic-ref", "--quiet", "HEAD"])
+        && let Some(p) = git_path(&symref)
+            && p.exists() {
                 println!("cargo:rerun-if-changed={}", p.display());
             }
-        }
-    }
 }
 
 fn strip_v_prefix(s: &str) -> String {

@@ -671,7 +671,7 @@ mod tests {
 
     /// Read errors must leave `last_pos` unchanged so the next poll
     /// retries from the same offset rather than skipping bytes.
-    /// Mirrors the parity guarantee in `claude_telemetry::process_new_lines`.
+    /// Mirrors the parity guarantee in `agents::claude::telemetry::process_new_lines`.
     #[test]
     fn parser_skips_malformed_lines_without_advancing_past_them() {
         let tmp = tempfile::tempdir().unwrap();

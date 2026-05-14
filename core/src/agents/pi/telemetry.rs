@@ -941,7 +941,7 @@ mod tests {
 
     /// Read partial / malformed lines must NOT advance the cursor
     /// past the unread bytes — mirrors the parity guarantee in
-    /// `claude_telemetry::process_new_lines`. JSON parse errors on a
+    /// `agents::claude::telemetry::process_new_lines`. JSON parse errors on a
     /// fully-read line are skipped (line-by-line basis); IO errors
     /// during the read leave `last_pos` unchanged.
     #[test]
@@ -969,7 +969,7 @@ mod tests {
 
     /// `last_pos` advances to the reader's actual stream position,
     /// not the pre-read `metadata.len()`. Mirrors the parity guarantee
-    /// in `copilot_telemetry::process_new_lines`.
+    /// in `agents::copilot::telemetry::process_new_lines`.
     #[test]
     fn cursor_advances_past_pre_read_file_len_when_log_grew_during_read() {
         let tmp = tempfile::tempdir().unwrap();

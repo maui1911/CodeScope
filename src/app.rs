@@ -196,7 +196,7 @@ struct SplitterDrag {
 /// wrong project / worktree).
 fn path_eq_ci(a: &str, b: &str) -> bool {
     fn norm(s: &str) -> &str {
-        s.trim_end_matches(|c| c == '\\' || c == '/')
+        s.trim_end_matches(['\\', '/'])
     }
     let a = norm(a);
     let b = norm(b);
@@ -489,7 +489,7 @@ impl AgentTail {
         match self {
             AgentTail::Claude(t) => t.snapshot.clone(),
             AgentTail::Copilot(t) => t.snapshot.clone(),
-            AgentTail::OpenCode(t) => t.snapshot().cloned(),
+            AgentTail::OpenCode(t) => t.snapshot.clone(),
             AgentTail::Pi(t) => t.snapshot.clone(),
         }
     }
@@ -1417,8 +1417,8 @@ impl AppShell {
                     );
                     return;
                 };
-                AgentTail::OpenCode(codescope_core::OpenCodeMessageTail::new(
-                    root,
+                AgentTail::OpenCode(codescope_core::OpenCodeMessageTail::for_session(
+                    &root,
                     session_id.clone(),
                 ))
             }
@@ -1805,11 +1805,10 @@ impl AppShell {
                         }
                     }
                     for f in found {
-                        if let Some(prev) = f.previous_agent_session_id.as_deref() {
-                            if prev != f.new_agent_session_id {
+                        if let Some(prev) = f.previous_agent_session_id.as_deref()
+                            && prev != f.new_agent_session_id {
                                 this.unregister_telemetry(prev);
                             }
-                        }
                         this.register_telemetry(
                             f.agent_id,
                             f.new_agent_session_id.clone(),
@@ -1825,13 +1824,12 @@ impl AppShell {
                             &f.codescope_session_id,
                             &f.new_agent_session_id,
                         );
-                        if let Some(group) = this.groups.get_mut(f.group_idx) {
-                            if let Some(tab) = group.tabs.get_mut(f.tab_idx) {
+                        if let Some(group) = this.groups.get_mut(f.group_idx)
+                            && let Some(tab) = group.tabs.get_mut(f.tab_idx) {
                                 tab.adopted_session_id =
                                     Some(f.new_agent_session_id.clone());
                                 tab.fired_session_ids.insert(f.new_agent_session_id);
                             }
-                        }
                     }
                     if any_active { active } else { idle }
                 });
@@ -4993,15 +4991,14 @@ impl AppShell {
                 // subset whose telemetry state is `Busy` or
                 // `PendingToolUse`.
                 active.insert(canon.clone());
-                if let Some(snap) = self.telemetry_for(sid) {
-                    if matches!(
+                if let Some(snap) = self.telemetry_for(sid)
+                    && matches!(
                         snap.state,
                         codescope_core::SessionState::Busy
                             | codescope_core::SessionState::PendingToolUse
                     ) {
                         busy.insert(canon);
                     }
-                }
             }
         }
         self.sidebar.update(cx, |sidebar, cx| {

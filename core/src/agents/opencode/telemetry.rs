@@ -567,6 +567,12 @@ pub struct OpenCodeMessageTail {
     /// Last failed locate timestamp; used to throttle the recursive
     /// scan. Mirrors C# `LastLocateMissAtTicks`.
     last_locate_miss_at: Option<SystemTime>,
+    /// Latest snapshot, or `None` until at least one message is parsed.
+    /// Mirrored from `watch.snapshot` at the end of each poll so the
+    /// public surface matches sibling tails (ClaudeTranscriptTail,
+    /// CopilotTranscriptTail, PiTranscriptTail all expose a public
+    /// `snapshot` field).
+    pub snapshot: Option<TelemetrySnapshot>,
 }
 
 /// How long to skip `try_locate_message_dir` after a "not found"
@@ -577,11 +583,16 @@ impl OpenCodeMessageTail {
     /// Construct a tail for `(data_root, session_id)` and immediately
     /// attempt to locate + read the message directory so any existing
     /// content is consumed before the first poll interval fires.
-    pub fn new(data_root: PathBuf, session_id: impl Into<String>) -> Self {
+    ///
+    /// Matches the sibling-tail shape (`ClaudeTranscriptTail::for_session`,
+    /// `CopilotTranscriptTail::for_session`, etc.) so the AppShell
+    /// registration loop reads uniformly across the four agents.
+    pub fn for_session(data_root: &Path, session_id: impl Into<String>) -> Self {
         let mut tail = Self {
-            data_root,
+            data_root: data_root.to_path_buf(),
             watch: SessionWatch::new(session_id),
             last_locate_miss_at: None,
+            snapshot: None,
         };
         tail.poll();
         tail
@@ -590,11 +601,6 @@ impl OpenCodeMessageTail {
     /// Read-only view of the resolved directory, if located.
     pub fn message_dir(&self) -> Option<&Path> {
         self.watch.message_dir.as_deref()
-    }
-
-    /// Latest snapshot, or `None` until at least one entry is parsed.
-    pub fn snapshot(&self) -> Option<&TelemetrySnapshot> {
-        self.watch.snapshot.as_ref()
     }
 
     /// Re-locate (if needed) and walk the message directory.
@@ -621,7 +627,9 @@ impl OpenCodeMessageTail {
                 }
             }
         }
-        process_message_dir(&mut self.watch)
+        let changed = process_message_dir(&mut self.watch);
+        self.snapshot = self.watch.snapshot.clone();
+        changed
     }
 
     /// Suggested poll interval for the next wake-up. 250 ms while
@@ -1211,9 +1219,9 @@ mod tests {
             ),
         );
 
-        let tail = OpenCodeMessageTail::new(tmp.path().to_path_buf(), "sid-x");
+        let tail = OpenCodeMessageTail::for_session(tmp.path(), "sid-x");
         assert_eq!(tail.message_dir(), Some(dir.as_path()));
-        let snap = tail.snapshot().expect("initial poll should produce a snapshot");
+        let snap = tail.snapshot.as_ref().expect("initial poll should produce a snapshot");
         assert_eq!(snap.turn_count, 1);
         assert_eq!(snap.state, SessionState::Idle);
     }
@@ -1222,9 +1230,9 @@ mod tests {
     fn tail_locate_miss_does_not_panic_and_can_recover() {
         let tmp = tempfile::tempdir().unwrap();
         // Session dir doesn't exist yet.
-        let mut tail = OpenCodeMessageTail::new(tmp.path().to_path_buf(), "sid-late");
+        let mut tail = OpenCodeMessageTail::for_session(tmp.path(), "sid-late");
         assert!(tail.message_dir().is_none());
-        assert!(tail.snapshot().is_none());
+        assert!(tail.snapshot.is_none());
 
         // Create the dir + a message and force a re-locate by clearing
         // the throttle (simulating a poll after the TTL window).
@@ -1249,7 +1257,7 @@ mod tests {
             "msg_001.json",
             &user_msg_json("busy", 1_700_000_000_000),
         );
-        let busy_tail = OpenCodeMessageTail::new(tmp.path().to_path_buf(), "busy");
+        let busy_tail = OpenCodeMessageTail::for_session(tmp.path(), "busy");
         assert_eq!(busy_tail.poll_interval(), Duration::from_millis(250));
 
         let idle_dir = make_session_dir(tmp.path(), "p", "idle");
@@ -1274,7 +1282,7 @@ mod tests {
                 false,
             ),
         );
-        let idle_tail = OpenCodeMessageTail::new(tmp.path().to_path_buf(), "idle");
+        let idle_tail = OpenCodeMessageTail::for_session(tmp.path(), "idle");
         assert_eq!(idle_tail.poll_interval(), Duration::from_secs(2));
     }
 
@@ -1282,7 +1290,7 @@ mod tests {
     fn locate_throttle_skips_until_ttl_elapses() {
         let tmp = tempfile::tempdir().unwrap();
         // No session dir — first poll misses + sets the throttle.
-        let mut tail = OpenCodeMessageTail::new(tmp.path().to_path_buf(), "missing");
+        let mut tail = OpenCodeMessageTail::for_session(tmp.path(), "missing");
         assert!(tail.message_dir().is_none());
 
         // Even after creating the dir, a follow-up poll within the TTL

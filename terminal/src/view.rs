@@ -193,8 +193,8 @@ impl TerminalView {
                         _ => None,
                     }
                 };
-                if let Some(req) = to_apply {
-                    if this
+                if let Some(req) = to_apply
+                    && this
                         .update(cx, |view, cx| {
                             view.apply_resize(req.cols, req.rows, cx);
                         })
@@ -202,7 +202,6 @@ impl TerminalView {
                     {
                         break;
                     }
-                }
             }
         })
         .detach();
@@ -382,21 +381,19 @@ impl TerminalView {
         // never open a link inside them.
         let modifier = event.modifiers.control || event.modifiers.platform;
         let is_left = event.button == MouseButton::Left;
-        if is_left && modifier && !event.modifiers.shift {
-            if let Some((row, col)) = self.visible_rc(event.position) {
-                if let Some(uri) = self.snapshot.hyperlink_at(row, col) {
+        if is_left && modifier && !event.modifiers.shift
+            && let Some((row, col)) = self.visible_rc(event.position)
+                && let Some(uri) = self.snapshot.hyperlink_at(row, col) {
                     let _ = open::that_detached(uri.as_ref());
                     return;
                 }
-            }
-        }
 
         // Try mouse-reporting next. When a TUI like tmux/htop/vim
         // is in mouse mode, the click belongs to it — only fall
         // through to selection when reporting is off (or the user
         // held Shift to bypass).
-        if let Some(button) = to_mouse_button(event.button) {
-            if self.try_report_mouse(
+        if let Some(button) = to_mouse_button(event.button)
+            && self.try_report_mouse(
                 MouseEventKind::Press,
                 Some(button),
                 event.modifiers,
@@ -404,7 +401,6 @@ impl TerminalView {
             ) {
                 return;
             }
-        }
         if !is_left {
             return;
         }
@@ -462,8 +458,8 @@ impl TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
-        if let Some(button) = to_mouse_button(event.button) {
-            if self.try_report_mouse(
+        if let Some(button) = to_mouse_button(event.button)
+            && self.try_report_mouse(
                 MouseEventKind::Release,
                 Some(button),
                 event.modifiers,
@@ -472,7 +468,6 @@ impl TerminalView {
                 self.selecting = false;
                 return;
             }
-        }
         self.selecting = false;
     }
 

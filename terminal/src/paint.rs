@@ -118,8 +118,8 @@ pub fn paint_snapshot(
 
     // 4) cursor on top — but only when the blink phase is on.
     //    Steady cursors (`blinking = false`) always paint.
-    if let Some(cursor) = snapshot.cursor.as_ref() {
-        if !cursor.blinking || cursor_visible_now {
+    if let Some(cursor) = snapshot.cursor.as_ref()
+        && (!cursor.blinking || cursor_visible_now) {
             paint_cursor(
                 window,
                 cx,
@@ -131,7 +131,6 @@ pub fn paint_snapshot(
                 line_height,
             );
         }
-    }
 }
 
 fn paint_bg_rect(

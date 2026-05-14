@@ -406,11 +406,29 @@ pub struct GitStatus {
 pub fn git_status(repo: &Path) -> Result<Option<GitStatus>> {
     // ── 0. Early repo probe ────────────────────────────────────────
     // `rev-parse --is-inside-work-tree` exits 0 / prints "true" only
-    // inside an actual worktree. I/O failures (git missing, path not
-    // readable) propagate as `Err`; a successful probe that says "not
-    // a worktree" returns `Ok(None)` so callers can distinguish
-    // "valid repo but quiet" from "couldn't run git".
-    let probe = run_git(repo, &["rev-parse", "--is-inside-work-tree"])?;
+    // inside an actual worktree. We want three outcomes here:
+    //   * Ok(None)  — git ran, but this path isn't inside a worktree
+    //                  (covers "not a repo", "missing dir", and the
+    //                  default-status "false" case).
+    //   * Err       — git itself failed to start (binary missing, etc).
+    //   * Ok(Some)  — happy path, fall through.
+    // We can't go through `run_git` because it wraps non-zero exit as
+    // `Err`, which would collapse "not a worktree" into the I/O bucket.
+    let probe = match no_window_command("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(repo)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(anyhow!(err)),
+        // Other spawn errors (e.g. cwd doesn't exist) mean "git can't
+        // even look at this path" — caller treats that the same as
+        // "not a worktree" and retries on the next poll tick.
+        Err(_) => return Ok(None),
+    };
     if !probe.status.success() {
         return Ok(None);
     }

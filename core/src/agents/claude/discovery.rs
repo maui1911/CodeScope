@@ -84,22 +84,6 @@ pub fn scan(
     out
 }
 
-/// Does an auto-typed command launch a Claude Code session?
-///
-/// Mirrors the `agentId == "claude"` branch in C#
-/// `MainViewModel.RegisterAgentTelemetry`. We don't carry an
-/// `agentId` field on tabs — instead we match the literal command
-/// `claude` modulo leading whitespace and trailing args / flags.
-/// `claude --resume <id>` and `claude --new` both qualify; plain
-/// `pwsh` (`None`) and other agents (`pi`, `opencode`, `copilot`,
-/// `gemini`, …) do not.
-pub fn is_claude_auto_type(auto_type: Option<&str>) -> bool {
-    let Some(s) = auto_type else { return false };
-    let s = s.trim_start();
-    let first = s.split(|c: char| c.is_whitespace()).next().unwrap_or("");
-    first.eq_ignore_ascii_case("claude")
-}
-
 /// Recognise a Claude Code session id — the `.jsonl` filename without
 /// extension. The C# build uses `Guid.TryParseExact(id, "D")` which
 /// accepts the `8-4-4-4-12` UUID form *case-insensitively* (`D`
@@ -134,58 +118,6 @@ mod tests {
 
     const SID_A: &str = "11111111-2222-3333-4444-555555555555";
     const SID_B: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-
-    // --- is_claude_auto_type ---
-
-    #[test]
-    fn auto_type_none_is_not_claude() {
-        assert!(!is_claude_auto_type(None));
-    }
-
-    #[test]
-    fn auto_type_plain_claude_is_claude() {
-        assert!(is_claude_auto_type(Some("claude")));
-    }
-
-    #[test]
-    fn auto_type_claude_with_args_is_claude() {
-        assert!(is_claude_auto_type(Some("claude --resume abc-123")));
-        assert!(is_claude_auto_type(Some("claude --new")));
-    }
-
-    #[test]
-    fn auto_type_leading_whitespace_is_claude() {
-        assert!(is_claude_auto_type(Some("   claude")));
-        assert!(is_claude_auto_type(Some("\tclaude --new")));
-    }
-
-    #[test]
-    fn auto_type_case_insensitive() {
-        assert!(is_claude_auto_type(Some("Claude")));
-        assert!(is_claude_auto_type(Some("CLAUDE")));
-    }
-
-    #[test]
-    fn auto_type_other_agents_are_not_claude() {
-        assert!(!is_claude_auto_type(Some("pi")));
-        assert!(!is_claude_auto_type(Some("opencode")));
-        assert!(!is_claude_auto_type(Some("copilot")));
-        assert!(!is_claude_auto_type(Some("gemini")));
-        assert!(!is_claude_auto_type(Some("pwsh")));
-    }
-
-    #[test]
-    fn auto_type_empty_string_is_not_claude() {
-        assert!(!is_claude_auto_type(Some("")));
-        assert!(!is_claude_auto_type(Some("   ")));
-    }
-
-    #[test]
-    fn auto_type_substring_is_not_match() {
-        // "claudeflare" is not the agent — only `claude` itself.
-        assert!(!is_claude_auto_type(Some("claudeflare")));
-        assert!(!is_claude_auto_type(Some("notclaude")));
-    }
 
     // --- is_session_id ---
 

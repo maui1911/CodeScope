@@ -560,7 +560,7 @@ impl Sidebar {
                 }
             }
             Err(err) => {
-                let msg = err.to_string();
+                let msg = format!("{err:#}");
                 if let Some(state) = self.dialog_mut() {
                     state.error = Some(msg);
                 }
@@ -1201,166 +1201,6 @@ impl Sidebar {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sanitize_replaces_path_separators() {
-        assert_eq!(sanitize_branch_to_folder("feat/foo"), "feat-foo");
-        assert_eq!(sanitize_branch_to_folder(r"feat\bar"), "feat-bar");
-    }
-
-    #[test]
-    fn sanitize_replaces_windows_invalid_chars() {
-        assert_eq!(sanitize_branch_to_folder("a?b*c|d"), "a-b-c-d");
-        assert_eq!(sanitize_branch_to_folder(r#"a:b"c<d>e"#), "a-b-c-d-e");
-    }
-
-    #[test]
-    fn sanitize_trims_leading_trailing_dashes() {
-        // C# behaviour: `///` collapses to `-` triples then trims to "".
-        assert_eq!(sanitize_branch_to_folder("///"), "");
-        assert_eq!(sanitize_branch_to_folder("/feat/"), "feat");
-    }
-
-    #[test]
-    fn derived_folder_uses_backslash_when_root_is_windows_style() {
-        let path = derived_folder(r"C:\repos\proj.worktrees", "feat/x");
-        assert_eq!(path, r"C:\repos\proj.worktrees\feat-x");
-    }
-
-    #[test]
-    fn derived_folder_uses_slash_for_unix_style_root() {
-        let path = derived_folder("/home/me/proj.worktrees", "feat/x");
-        assert_eq!(path, "/home/me/proj.worktrees/feat-x");
-    }
-
-    #[test]
-    fn derived_folder_empty_when_branch_sanitises_to_empty() {
-        assert_eq!(derived_folder("/root", "///"), "");
-    }
-
-    #[test]
-    fn folder_leaf_extracts_last_segment() {
-        assert_eq!(folder_leaf(r"C:\a\b\feat-x"), "feat-x");
-        assert_eq!(folder_leaf("/a/b/feat-x"), "feat-x");
-        assert_eq!(folder_leaf("no-separators"), "no-separators");
-    }
-
-    // ─── State / filtering tests ─────────────────────────────────
-    //
-    // The dialog's pure helpers (`filter_branches`,
-    // `resolve_default_base`) are extracted as free functions so we
-    // can test them without constructing a `NewWorktreeDialogState`
-    // (which carries a `FocusHandle` we can't forge outside a gpui
-    // context).
-
-    fn branch(name: &str, is_remote: bool) -> BranchInfo {
-        BranchInfo {
-            name: name.into(),
-            is_remote,
-            short_sha: "abcdef0".into(),
-            relative_date: "2 days ago".into(),
-        }
-    }
-
-    #[test]
-    fn filter_branches_orders_locals_before_remotes() {
-        let bs = vec![
-            branch("origin/main", true),
-            branch("main", false),
-            branch("feat/x", false),
-            branch("origin/feat/x", true),
-        ];
-        let names: Vec<&str> = filter_branches(&bs, "")
-            .iter()
-            .map(|b| b.name.as_str())
-            .collect();
-        // Locals come first (in their input order), remotes after.
-        assert_eq!(names, vec!["main", "feat/x", "origin/main", "origin/feat/x"]);
-    }
-
-    #[test]
-    fn filter_branches_query_is_case_insensitive_substring() {
-        let bs = vec![
-            branch("Main", false),
-            branch("origin/main", true),
-            branch("feat/csv", false),
-        ];
-        let names: Vec<&str> = filter_branches(&bs, "MAIN")
-            .iter()
-            .map(|b| b.name.as_str())
-            .collect();
-        assert_eq!(names, vec!["Main", "origin/main"]);
-    }
-
-    #[test]
-    fn filter_branches_empty_query_returns_all() {
-        let bs = vec![branch("main", false), branch("origin/main", true)];
-        assert_eq!(filter_branches(&bs, "").len(), 2);
-        assert_eq!(filter_branches(&bs, "   ").len(), 2, "whitespace trims to empty");
-    }
-
-    #[test]
-    fn resolve_default_base_picks_local_match() {
-        let bs = vec![
-            branch("main", false),
-            branch("dev", false),
-            branch("origin/dev", true),
-        ];
-        assert_eq!(resolve_default_base(&bs, "dev").as_deref(), Some("dev"));
-    }
-
-    #[test]
-    fn resolve_default_base_ignores_remotes() {
-        // Only `origin/dev` exists; we don't fall back to it because
-        // the C# build's default-base lookup is "first local match"
-        // — and there are no locals here, so the result is `None`.
-        let bs = vec![branch("origin/dev", true)];
-        assert!(resolve_default_base(&bs, "dev").is_none());
-    }
-
-    #[test]
-    fn resolve_default_base_is_none_when_list_empty() {
-        let bs: Vec<BranchInfo> = vec![];
-        assert!(resolve_default_base(&bs, "main").is_none());
-    }
-
-    #[test]
-    fn resolve_default_base_falls_back_to_first_local_when_default_missing() {
-        // `default_branch = "master"` doesn't exist locally; the
-        // C# fallback picks the first local branch. Without this
-        // step the dialog would default to `(HEAD)` even when there
-        // was an obvious local choice — common after a `master` →
-        // `main` rename that hasn't been pulled.
-        let bs = vec![
-            branch("main", false),
-            branch("feat/x", false),
-            branch("origin/main", true),
-        ];
-        assert_eq!(
-            resolve_default_base(&bs, "master").as_deref(),
-            Some("main"),
-            "first local branch wins when default_branch is missing"
-        );
-    }
-
-    #[test]
-    fn resolve_default_base_fallback_skips_remotes() {
-        // Even when there's a remote that matches default_branch
-        // and no exact local match, fallback must stay on locals.
-        let bs = vec![
-            branch("origin/master", true),
-            branch("dev", false),
-        ];
-        assert_eq!(
-            resolve_default_base(&bs, "master").as_deref(),
-            Some("dev")
-        );
-    }
-}
-
 /// Top-level key handler for the dialog. Mutates the active
 /// `NewWorktreeDialogState` directly because gpui's listener helper
 /// gives us `&mut Sidebar` — there's nowhere to hang per-state
@@ -1518,6 +1358,166 @@ fn handle_key_down(
     if changed {
         sidebar.wake_text_blink(cx);
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_replaces_path_separators() {
+        assert_eq!(sanitize_branch_to_folder("feat/foo"), "feat-foo");
+        assert_eq!(sanitize_branch_to_folder(r"feat\bar"), "feat-bar");
+    }
+
+    #[test]
+    fn sanitize_replaces_windows_invalid_chars() {
+        assert_eq!(sanitize_branch_to_folder("a?b*c|d"), "a-b-c-d");
+        assert_eq!(sanitize_branch_to_folder(r#"a:b"c<d>e"#), "a-b-c-d-e");
+    }
+
+    #[test]
+    fn sanitize_trims_leading_trailing_dashes() {
+        // C# behaviour: `///` collapses to `-` triples then trims to "".
+        assert_eq!(sanitize_branch_to_folder("///"), "");
+        assert_eq!(sanitize_branch_to_folder("/feat/"), "feat");
+    }
+
+    #[test]
+    fn derived_folder_uses_backslash_when_root_is_windows_style() {
+        let path = derived_folder(r"C:\repos\proj.worktrees", "feat/x");
+        assert_eq!(path, r"C:\repos\proj.worktrees\feat-x");
+    }
+
+    #[test]
+    fn derived_folder_uses_slash_for_unix_style_root() {
+        let path = derived_folder("/home/me/proj.worktrees", "feat/x");
+        assert_eq!(path, "/home/me/proj.worktrees/feat-x");
+    }
+
+    #[test]
+    fn derived_folder_empty_when_branch_sanitises_to_empty() {
+        assert_eq!(derived_folder("/root", "///"), "");
+    }
+
+    #[test]
+    fn folder_leaf_extracts_last_segment() {
+        assert_eq!(folder_leaf(r"C:\a\b\feat-x"), "feat-x");
+        assert_eq!(folder_leaf("/a/b/feat-x"), "feat-x");
+        assert_eq!(folder_leaf("no-separators"), "no-separators");
+    }
+
+    // ─── State / filtering tests ─────────────────────────────────
+    //
+    // The dialog's pure helpers (`filter_branches`,
+    // `resolve_default_base`) are extracted as free functions so we
+    // can test them without constructing a `NewWorktreeDialogState`
+    // (which carries a `FocusHandle` we can't forge outside a gpui
+    // context).
+
+    fn branch(name: &str, is_remote: bool) -> BranchInfo {
+        BranchInfo {
+            name: name.into(),
+            is_remote,
+            short_sha: "abcdef0".into(),
+            relative_date: "2 days ago".into(),
+        }
+    }
+
+    #[test]
+    fn filter_branches_orders_locals_before_remotes() {
+        let bs = vec![
+            branch("origin/main", true),
+            branch("main", false),
+            branch("feat/x", false),
+            branch("origin/feat/x", true),
+        ];
+        let names: Vec<&str> = filter_branches(&bs, "")
+            .iter()
+            .map(|b| b.name.as_str())
+            .collect();
+        // Locals come first (in their input order), remotes after.
+        assert_eq!(names, vec!["main", "feat/x", "origin/main", "origin/feat/x"]);
+    }
+
+    #[test]
+    fn filter_branches_query_is_case_insensitive_substring() {
+        let bs = vec![
+            branch("Main", false),
+            branch("origin/main", true),
+            branch("feat/csv", false),
+        ];
+        let names: Vec<&str> = filter_branches(&bs, "MAIN")
+            .iter()
+            .map(|b| b.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Main", "origin/main"]);
+    }
+
+    #[test]
+    fn filter_branches_empty_query_returns_all() {
+        let bs = vec![branch("main", false), branch("origin/main", true)];
+        assert_eq!(filter_branches(&bs, "").len(), 2);
+        assert_eq!(filter_branches(&bs, "   ").len(), 2, "whitespace trims to empty");
+    }
+
+    #[test]
+    fn resolve_default_base_picks_local_match() {
+        let bs = vec![
+            branch("main", false),
+            branch("dev", false),
+            branch("origin/dev", true),
+        ];
+        assert_eq!(resolve_default_base(&bs, "dev").as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn resolve_default_base_ignores_remotes() {
+        // Only `origin/dev` exists; we don't fall back to it because
+        // the C# build's default-base lookup is "first local match"
+        // — and there are no locals here, so the result is `None`.
+        let bs = vec![branch("origin/dev", true)];
+        assert!(resolve_default_base(&bs, "dev").is_none());
+    }
+
+    #[test]
+    fn resolve_default_base_is_none_when_list_empty() {
+        let bs: Vec<BranchInfo> = vec![];
+        assert!(resolve_default_base(&bs, "main").is_none());
+    }
+
+    #[test]
+    fn resolve_default_base_falls_back_to_first_local_when_default_missing() {
+        // `default_branch = "master"` doesn't exist locally; the
+        // C# fallback picks the first local branch. Without this
+        // step the dialog would default to `(HEAD)` even when there
+        // was an obvious local choice — common after a `master` →
+        // `main` rename that hasn't been pulled.
+        let bs = vec![
+            branch("main", false),
+            branch("feat/x", false),
+            branch("origin/main", true),
+        ];
+        assert_eq!(
+            resolve_default_base(&bs, "master").as_deref(),
+            Some("main"),
+            "first local branch wins when default_branch is missing"
+        );
+    }
+
+    #[test]
+    fn resolve_default_base_fallback_skips_remotes() {
+        // Even when there's a remote that matches default_branch
+        // and no exact local match, fallback must stay on locals.
+        let bs = vec![
+            branch("origin/master", true),
+            branch("dev", false),
+        ];
+        assert_eq!(
+            resolve_default_base(&bs, "master").as_deref(),
+            Some("dev")
+        );
     }
 }
 

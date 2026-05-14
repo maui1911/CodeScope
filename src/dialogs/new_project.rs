@@ -440,40 +440,32 @@ impl Sidebar {
 
     /// Run the platform folder picker for the existing-mode path.
     pub fn pick_existing_project_folder(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.new_project_dialog().is_none() {
-            return;
-        }
-        let rx = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Add project".into()),
-        });
-        cx.spawn(async move |this, cx| {
-            let paths = match rx.await {
-                Ok(Ok(Some(paths))) => paths,
-                Ok(Ok(None)) | Err(_) => return,
-                Ok(Err(err)) => {
-                    eprintln!("warning: file picker failed: {err:#}");
-                    return;
-                }
-            };
-            if let Some(path) = paths.into_iter().next() {
-                let path_str = path.to_string_lossy().into_owned();
-                let _ = this.update(cx, |this, cx| {
-                    if let Some(state) = this.new_project_dialog_mut() {
-                        state.existing_path = path_str;
-                        state.error = None;
-                        cx.notify();
-                    }
-                });
-            }
-        })
-        .detach();
+        self.prompt_dialog_folder(
+            "Add project",
+            |state, path_str| state.existing_path = path_str,
+            cx,
+        );
     }
 
     /// Same picker, used by clone-mode's "Parent folder" Browse.
     pub fn pick_clone_parent_folder(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.prompt_dialog_folder(
+            "Pick parent folder",
+            |state, path_str| state.parent.set_text(path_str),
+            cx,
+        );
+    }
+
+    /// Shared body for the new-project folder pickers. Opens the
+    /// platform directory chooser with `prompt` as the title and feeds
+    /// the chosen path back into the dialog via `apply`, which mutates
+    /// the destination field on `NewProjectDialogState`.
+    fn prompt_dialog_folder(
+        &mut self,
+        prompt: &'static str,
+        apply: impl FnOnce(&mut NewProjectDialogState, String) + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
         if self.new_project_dialog().is_none() {
             return;
         }
@@ -481,7 +473,7 @@ impl Sidebar {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Pick parent folder".into()),
+            prompt: Some(prompt.into()),
         });
         cx.spawn(async move |this, cx| {
             let paths = match rx.await {
@@ -496,7 +488,7 @@ impl Sidebar {
                 let path_str = path.to_string_lossy().into_owned();
                 let _ = this.update(cx, |this, cx| {
                     if let Some(state) = this.new_project_dialog_mut() {
-                        state.parent.set_text(path_str);
+                        apply(state, path_str);
                         state.error = None;
                         cx.notify();
                     }
