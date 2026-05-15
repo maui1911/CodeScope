@@ -187,29 +187,6 @@ struct SplitterDrag {
     px_per_unit: f32,
 }
 
-/// Filesystem path equality after stripping any trailing separator.
-/// Case-insensitive on Windows (NTFS / ReFS are case-preserving but
-/// case-insensitive by default, so "C:\\Repo" and "c:\\repo" must
-/// compare equal); case-sensitive everywhere else (Linux ext4 / APFS
-/// in its default case-sensitive mode treat them as distinct paths,
-/// and a case-insensitive compare here would mis-route a tab to the
-/// wrong project / worktree).
-fn path_eq_ci(a: &str, b: &str) -> bool {
-    fn norm(s: &str) -> &str {
-        s.trim_end_matches(['\\', '/'])
-    }
-    let a = norm(a);
-    let b = norm(b);
-    if cfg!(windows) {
-        a.len() == b.len()
-            && a.chars()
-                .zip(b.chars())
-                .all(|(x, y)| x.eq_ignore_ascii_case(&y))
-    } else {
-        a == b
-    }
-}
-
 /// `mtime` for the watcher loop's "did the file change?" check.
 /// Returns `None` when the file is missing — that lets the loop
 /// detect reappearance (e.g. user re-creates `settings.json` after
@@ -2306,19 +2283,30 @@ impl AppShell {
 
     /// Find the project that owns `working_directory`, if any.
     /// Match order mirrors C# `MainViewModel`: a worktree path match
-    /// wins over a project-root path match, and case-insensitive
-    /// comparison handles Windows path quirks. Returns `(project_id,
-    /// worktree_id)` so the caller can stamp both fields on the
-    /// `Session` row exactly the way the C# build does.
+    /// wins over a project-root path match. Path comparison goes
+    /// through [`codescope_core::path_canon::paths_match`] so a
+    /// `C:\dev\repo` `wd` still matches a `c:/dev/repo` row in
+    /// projects.json (slash direction + case both collapse) — the
+    /// weaker `path_eq_ci` helper used to live here, but it only
+    /// trimmed trailing separators and case-folded on Windows, so a
+    /// spawn path that arrived with a different slash convention than
+    /// the persisted worktree fell through to "no project found" and
+    /// `allocate_session_id` minted a free-floating session row that
+    /// never landed in `projects.json` — `soft_close` then couldn't
+    /// find the id at tab close, the session never got a `closed_at`
+    /// stamp, and it never appeared in the worktree's history list.
+    /// Returns `(project_id, worktree_id)` so the caller can stamp
+    /// both fields on the `Session` row exactly the way the C# build
+    /// does.
     fn locate_project_for_path(&self, working_directory: &std::path::Path) -> Option<(String, Option<String>)> {
         let target = working_directory.to_string_lossy();
         for project in &self.projects.projects {
             for wt in &project.worktrees {
-                if path_eq_ci(&wt.path, &target) {
+                if codescope_core::path_canon::paths_match(&wt.path, &target) {
                     return Some((project.id.clone(), Some(wt.id.clone())));
                 }
             }
-            if path_eq_ci(&project.path, &target) {
+            if codescope_core::path_canon::paths_match(&project.path, &target) {
                 // Project root that has a primary worktree row will
                 // already have hit the loop above; the fall-through
                 // here covers legacy / partially-migrated configs.
@@ -7708,32 +7696,6 @@ mod tests {
         assert_eq!(candidates.first(), Some(&defaults.family));
         assert!(candidates.contains(&"Cascadia Mono".to_string()));
         assert!(candidates.contains(&"Consolas".to_string()));
-    }
-
-    #[test]
-    fn path_eq_ci_handles_trailing_slash_on_every_platform() {
-        // Trailing-separator stripping is platform-independent — both
-        // POSIX `/` and Windows `\` get trimmed regardless of host.
-        assert!(path_eq_ci("/usr/local/bin/", "/usr/local/bin"));
-        assert!(path_eq_ci("C:\\Repos\\Foo\\", "C:\\Repos\\Foo"));
-        assert!(!path_eq_ci("foo", "foobar"));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn path_eq_ci_on_windows_is_case_insensitive() {
-        assert!(path_eq_ci("C:\\Repos\\Foo", "c:\\repos\\foo"));
-        assert!(!path_eq_ci("C:\\Repos\\Foo", "C:\\Repos\\Bar"));
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn path_eq_ci_off_windows_is_case_sensitive() {
-        // Linux ext4 / case-sensitive APFS treat "/Repo" and "/repo"
-        // as distinct paths — comparing case-insensitively here would
-        // route a tab to the wrong project.
-        assert!(!path_eq_ci("/repos/Foo", "/repos/foo"));
-        assert!(path_eq_ci("/repos/foo", "/repos/foo"));
     }
 
     // ─── keystroke_digit_index ─────────────────────────────────────
