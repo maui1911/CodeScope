@@ -969,7 +969,9 @@ impl AppShell {
         // debounce task hit disk once the dust settles.
         cx.observe_window_bounds(window, {
             let pending = pending_window_save.clone();
+            let diag_paths = paths.clone();
             move |_, window, cx| {
+                append_window_diag(&diag_paths, "bounds_changed", window);
                 let state = window_state_from_window(window);
                 *pending.lock() = Some(PendingWindowSave {
                     state,
@@ -5960,8 +5962,13 @@ impl Render for AppShell {
         #[cfg(target_os = "windows")]
         let maximize_btn = maximize_btn.on_mouse_down(
             MouseButton::Left,
-            cx.listener(|_, _, window, cx| {
-                window.defer(cx, |window, _| crate::win32_titlebar::toggle_maximize(window));
+            cx.listener(|this, _, window, cx| {
+                append_window_diag(&this.paths, "maximize_clicked_pre", window);
+                let diag_paths = this.paths.clone();
+                window.defer(cx, move |window, _| {
+                    crate::win32_titlebar::toggle_maximize(window);
+                    append_window_diag(&diag_paths, "maximize_clicked_post", window);
+                });
             }),
         );
         #[cfg(target_os = "windows")]
@@ -7448,6 +7455,64 @@ impl AppShell {
 }
 
 // ─── Window-state extraction ────────────────────────────────────────
+
+/// Append one diagnostic line to `state_dir/window-diag.log`. Used to
+/// chase an intermittent Windows bug where the maximised window ends
+/// up positioned ~75 px below the monitor's work-area top (and runs
+/// off the bottom of the screen). The bug is live-race-only — it
+/// doesn't reproduce by loading a saved `window.json` — so the only
+/// way to catch it is to keep a continuous tape of bounds-observer
+/// ticks + caption-button clicks. The log line embeds a full Win32
+/// snapshot from [`crate::win32_titlebar::diag_snapshot`] on Windows
+/// so we can correlate `WindowBounds` (what gpui thinks) with the
+/// actual HWND rect, `WINDOWPLACEMENT`, and monitor work-area.
+///
+/// I/O errors are silently dropped — this is best-effort
+/// instrumentation, not load-bearing state. Caller is the bounds
+/// observer (fires on every resize tick) and the min/max/close
+/// caption-button click handlers.
+fn append_window_diag(paths: &AppPaths, event: &str, window: &Window) {
+    use std::fs::OpenOptions;
+    use std::io::Write as _;
+    let bounds = window.window_bounds();
+    let viewport = window.viewport_size();
+    let scale = window.scale_factor();
+    let is_max = window.is_maximized();
+    let bounds_kind = match bounds {
+        WindowBounds::Windowed(_) => "Windowed",
+        WindowBounds::Maximized(_) => "Maximized",
+        WindowBounds::Fullscreen(_) => "Fullscreen",
+    };
+    let (bx, by, bw, bh) = match bounds {
+        WindowBounds::Windowed(b) | WindowBounds::Maximized(b) | WindowBounds::Fullscreen(b) => (
+            f32::from(b.origin.x),
+            f32::from(b.origin.y),
+            f32::from(b.size.width),
+            f32::from(b.size.height),
+        ),
+    };
+    let vp_w = f32::from(viewport.width);
+    let vp_h = f32::from(viewport.height);
+
+    #[cfg(target_os = "windows")]
+    let win32 = crate::win32_titlebar::diag_snapshot(window)
+        .unwrap_or_else(|| "win32=unavailable".to_string());
+    #[cfg(not(target_os = "windows"))]
+    let win32 = "win32=n/a".to_string();
+
+    let ts = now_iso8601();
+    let line = format!(
+        "{ts} event={event} bounds={bounds_kind}(({bx:.1},{by:.1},{bw:.1},{bh:.1})) \
+         viewport=({vp_w:.1},{vp_h:.1}) scale={scale} is_maximized={is_max} {win32}\n"
+    );
+
+    let path = paths.state_dir.join("window-diag.log");
+    let _ = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| f.write_all(line.as_bytes()));
+}
 
 /// Snapshot the platform window into the on-disk `WindowState`. We
 /// always store the *restore* bounds so unmaximising lands at a
