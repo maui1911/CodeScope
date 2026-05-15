@@ -23,6 +23,9 @@
 use gpui::Window;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows::Win32::UI::Shell::ShellExecuteW;
@@ -213,6 +216,71 @@ pub fn minimize(window: &Window) {
             WPARAM(SC_MINIMIZE as usize),
             LPARAM(0),
         );
+    }
+}
+
+/// One-line snapshot of every Win32 piece of state that determines
+/// where a maximised window ends up — emitted from the bounds-change
+/// observer + caption-button click handlers so we can grep
+/// `window-diag.log` for the moment the geometry went bad.
+///
+/// Returns `None` only when the HWND can't be resolved (window has
+/// already been dropped); every other field is best-effort and falls
+/// back to a `?` placeholder if the underlying Win32 call fails so the
+/// log line still parses cleanly.
+///
+/// Format is intentionally one line, key=value pairs separated by
+/// spaces, so it can be piped through `grep`/`awk` and copied into a
+/// PR/issue body without losing structure.
+pub fn diag_snapshot(window: &Window) -> Option<String> {
+    let hwnd = hwnd(window)?;
+    unsafe {
+        let mut rect = RECT::default();
+        let win_rect = GetWindowRect(hwnd, &mut rect)
+            .map(|_| format!("({},{},{},{})", rect.left, rect.top, rect.right, rect.bottom))
+            .unwrap_or_else(|_| "?".to_string());
+
+        let zoomed = IsZoomed(hwnd).as_bool();
+
+        let mut placement = WINDOWPLACEMENT {
+            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+            ..Default::default()
+        };
+        let placement_str = if GetWindowPlacement(hwnd, &mut placement).is_ok() {
+            let n = placement.rcNormalPosition;
+            format!(
+                "showCmd={} rcNormal=({},{},{},{}) ptMaxPos=({},{}) flags={:#x}",
+                placement.showCmd,
+                n.left, n.top, n.right, n.bottom,
+                placement.ptMaxPosition.x, placement.ptMaxPosition.y,
+                placement.flags.0,
+            )
+        } else {
+            "showCmd=? rcNormal=? ptMaxPos=? flags=?".to_string()
+        };
+
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let monitor_str = if GetMonitorInfoW(monitor, &mut mi).as_bool() {
+            let m = mi.rcMonitor;
+            let w = mi.rcWork;
+            format!(
+                "rcMonitor=({},{},{},{}) rcWork=({},{},{},{})",
+                m.left, m.top, m.right, m.bottom,
+                w.left, w.top, w.right, w.bottom,
+            )
+        } else {
+            "rcMonitor=? rcWork=?".to_string()
+        };
+
+        let dpi = GetDpiForWindow(hwnd);
+
+        Some(format!(
+            "hwnd_rect={win_rect} zoomed={zoomed} {placement_str} {monitor_str} dpi={dpi}"
+        ))
     }
 }
 
