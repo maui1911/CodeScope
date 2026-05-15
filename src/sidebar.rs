@@ -244,6 +244,20 @@ pub enum SidebarEvent {
         /// the agent inline; `None` just opens a plain shell. The
         /// host adds the trailing CR.
         auto_type: Option<SharedString>,
+        /// Agent profile id to stamp on the persisted `Session` row
+        /// when this event spawns a fresh tab. Denormalised
+        /// alongside `auto_type` so the host doesn't have to
+        /// re-resolve the registry from the command string —
+        /// emitters that resolve the profile already have the id at
+        /// hand (`AgentProfile.id`). When `Some`, `reopen_session`
+        /// can later rebuild the same auto_type for that row by
+        /// looking the id up in the registry, instead of falling
+        /// back to a plain shell because the closed row was
+        /// stored with `agent_id: None`. `None` is the correct value
+        /// for plain-shell spawns ("Open session" with no agent,
+        /// new-worktree dialog's bare spawn) and the
+        /// no-default-agent fallback in the project menu.
+        agent_id: Option<SharedString>,
         /// When `true`, the host always spawns a fresh tab — used by
         /// the project menu's "New session" / "New Claude session"
         /// rows, the worktree menu's "New Claude session" row, and
@@ -1409,21 +1423,31 @@ impl Sidebar {
         cx.notify();
     }
 
-    /// Build the auto-type command string for the registry's default
-    /// agent (e.g. `"claude"` with the built-in Claude profile, or
-    /// `"my-cli --init fresh"` for a custom profile whose
-    /// `new_session_args` is `["--init", "fresh"]`). Used by the
-    /// double-click handler on a worktree row so opening a tab from
-    /// the sidebar lands in the user's configured default agent
-    /// instead of a plain shell. Mirrors AppShell::default_agent_auto_type
-    /// but reads from the sidebar's own cached registry — the two are
-    /// kept in lockstep via `apply_agent_registry`. The argv→string
-    /// joining lives in `codescope_core::build_new_session_auto_type`
-    /// so this path can't drift from `default_agent_auto_type_for` /
-    /// `render_new_session_submenu`.
-    fn default_agent_auto_type(&self) -> Option<SharedString> {
+    /// Resolve the registry's default agent into a paired
+    /// `(agent_id, auto_type)` launch spec — used by the
+    /// `SidebarEvent::OpenSession` emission sites that want a fresh
+    /// tab pinned to the user's configured default agent. The id is
+    /// the bare profile identifier (e.g. `"claude"`) and the
+    /// auto_type is the command string (`"claude"`, or
+    /// `"my-cli --init fresh"` for a custom profile with
+    /// `new_session_args`). Both pieces are needed: `auto_type`
+    /// drives what gets typed into the freshly-spawned pty, and
+    /// `agent_id` is persisted on the `Session` row so a later
+    /// `reopen_session` can rebuild the same auto_type without
+    /// having to re-guess from the command string.
+    ///
+    /// Returns `None` only when the registry has no default agent at
+    /// all. Returns `Some((id, None))` when a default agent exists
+    /// but its `command` is empty / whitespace — record the id so
+    /// reopen can still surface the right profile name, but skip
+    /// auto-typing to avoid feeding a leading-space argv to the pty.
+    /// Mirrors `default_agent_launch_for` in app.rs (same registry
+    /// shape, kept in lockstep by `apply_agent_registry`).
+    fn default_agent_launch(&self) -> Option<(SharedString, Option<SharedString>)> {
         let profile = self.agent_registry.get_default()?;
-        codescope_core::build_new_session_auto_type(profile).map(SharedString::from)
+        let id: SharedString = profile.id.clone().into();
+        let auto_type = codescope_core::build_new_session_auto_type(profile).map(SharedString::from);
+        Some((id, auto_type))
     }
 
     /// Open the project context menu at `position` (window coords)
@@ -2947,11 +2971,15 @@ impl Render for Sidebar {
                                 // via `apply_agent_registry` on save —
                                 // so a freshly-saved default takes
                                 // effect on the very next double-click.
-                                let auto_type = this.default_agent_auto_type();
+                                let (agent_id, auto_type) = match this.default_agent_launch() {
+                                    Some((id, at)) => (Some(id), at),
+                                    None => (None, None),
+                                };
                                 cx.emit(SidebarEvent::OpenSession {
                                     working_directory: PathBuf::from(&wt_path_for_event),
                                     title: title_label.clone(),
                                     auto_type,
+                                    agent_id,
                                     force_new: false,
                                 });
                             } else {
@@ -3701,14 +3729,22 @@ impl Sidebar {
         // Default agent — the row's primary click target (and the row
         // the submenu's "Default" entry highlights). Uses the shared
         // core helper so the parent-row click matches the submenu's
-        // "Default" entry, `Sidebar::default_agent_auto_type`, and
-        // `default_agent_auto_type_for` byte-for-byte. Resolves the
-        // profile via `get_default()` directly — no second `get_by_id`
-        // lookup, no intermediate `default_id` clone.
-        let default_cmd = self
+        // "Default" entry, `Sidebar::default_agent_launch`, and
+        // `default_agent_launch_for` byte-for-byte. Pairs the
+        // resolved `(agent_id, auto_type)` so the
+        // `SidebarEvent::OpenSession` emission below can persist the
+        // id on the session row — without it `reopen_session` would
+        // see `agent_id: None` and fall back to a plain shell.
+        let (default_id, default_cmd): (Option<String>, Option<String>) = match self
             .agent_registry
             .get_default()
-            .and_then(codescope_core::build_new_session_auto_type);
+        {
+            Some(profile) => (
+                Some(profile.id.clone()),
+                codescope_core::build_new_session_auto_type(profile),
+            ),
+            None => (None, None),
+        };
 
         let path = PathBuf::from(worktree_path);
         let title = title_prefix.clone();
@@ -3753,6 +3789,7 @@ impl Sidebar {
                             working_directory: path.clone(),
                             title: title.clone(),
                             auto_type: Some(cmd.into()),
+                            agent_id: default_id.clone().map(SharedString::from),
                             force_new: true,
                         });
                         this.close_menu(cx);
@@ -3764,6 +3801,7 @@ impl Sidebar {
                             working_directory: path.clone(),
                             title: title.clone(),
                             auto_type: None,
+                            agent_id: None,
                             force_new: true,
                         });
                         this.close_menu(cx);
@@ -3862,6 +3900,7 @@ impl Sidebar {
             // emitting `Some("")` would auto-type a `-Command "& {  }"`
             // scriptblock on Windows pwsh, which is *not* "no command".
             let cmd = codescope_core::build_new_session_auto_type(profile);
+            let agent_id_str: SharedString = profile.id.clone().into();
             let frost_hover = frost;
             let base_color = if is_default { ink } else { ink_dim };
             let hover_color = ink;
@@ -3885,6 +3924,7 @@ impl Sidebar {
                             working_directory: path.clone(),
                             title: title.clone(),
                             auto_type: cmd.clone().map(SharedString::from),
+                            agent_id: Some(agent_id_str.clone()),
                             force_new: true,
                         });
                         this.close_menu(cx);
@@ -4350,11 +4390,19 @@ impl Sidebar {
                         // focus-or-open rather than always-spawn —
                         // so a user already running a session for
                         // this worktree gets routed to it instead of
-                        // accidentally piling up duplicates.
+                        // accidentally piling up duplicates. When
+                        // the host falls through to a fresh spawn
+                        // (no open tab, no closed-history hit) it
+                        // resolves the default agent itself, so we
+                        // can leave `auto_type` / `agent_id` empty
+                        // here — same shape as a plain worktree row
+                        // click before the double-click branch
+                        // resolves the registry.
                         cx.emit(SidebarEvent::OpenSession {
                             working_directory: path_for_open.clone(),
                             title: title_for_open.clone(),
                             auto_type: None,
+                            agent_id: None,
                             force_new: false,
                         });
                         this.close_menu(cx);
