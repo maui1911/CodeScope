@@ -2605,7 +2605,17 @@ impl AppShell {
             Ok(_pruned) => {
                 if let Err(err) = self.projects.save(&self.paths) {
                     eprintln!("warning: failed to persist session soft-close: {err:#}");
-                    return;
+                    // Fall through to the sidebar mirror anyway —
+                    // the in-memory `closed_at` stamp is correct,
+                    // only the disk write failed. Letting the
+                    // sidebar see the new state keeps both snapshots
+                    // consistent until the next save retry; the
+                    // alternative (early-return) reintroduced the
+                    // exact "closed row doesn't appear in history
+                    // until a later sidebar mutation" symptom this
+                    // helper is supposed to prevent. `reopen_session`
+                    // uses the same pattern. (Copilot review on
+                    // PR #223.)
                 }
                 let projects_for_sidebar = self.projects.clone();
                 self.sidebar.update(cx, |sidebar, cx| {
