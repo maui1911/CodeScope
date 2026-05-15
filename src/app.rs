@@ -2609,13 +2609,13 @@ impl AppShell {
                     // the in-memory `closed_at` stamp is correct,
                     // only the disk write failed. Letting the
                     // sidebar see the new state keeps both snapshots
-                    // consistent until the next save retry; the
-                    // alternative (early-return) reintroduced the
-                    // exact "closed row doesn't appear in history
-                    // until a later sidebar mutation" symptom this
-                    // helper is supposed to prevent. `reopen_session`
-                    // uses the same pattern. (Copilot review on
-                    // PR #223.)
+                    // consistent until the next save retry; an early
+                    // return here would leave the sidebar's copy
+                    // stale until some unrelated mutation refreshed
+                    // it, which is the exact "closed row doesn't
+                    // show in history" symptom this helper is
+                    // supposed to prevent. `reopen_session` uses
+                    // the same pattern.
                 }
                 let projects_for_sidebar = self.projects.clone();
                 self.sidebar.update(cx, |sidebar, cx| {
@@ -6766,14 +6766,25 @@ impl AppShell {
                 // sidebar's OpenSession event hits.
                 self.open_or_focus_session(working_directory, title, None, false, window, cx);
             }
-            PaletteActionKind::Agent { command, display_name, .. } => {
+            PaletteActionKind::Agent { id, command, display_name } => {
                 // Start a fresh tab running the agent. `auto_type` is
                 // the command name; the shell will resolve it via PATH
                 // (claude / codex / opencode / etc — same UX as the
-                // sidebar's "New Claude session" rows).
+                // sidebar's "New Claude session" rows). `id` is the
+                // profile id (already on the palette action variant)
+                // and gets forwarded directly to the spawn so the
+                // persisted `Session.agent_id` is the user's actual
+                // pick even for custom profiles where `id != command`.
                 let cwd = self.active_project_path(cx).map(std::path::PathBuf::from);
                 let title: SharedString = display_name.clone().into();
-                self.spawn_palette_agent_tab(cwd, title, command.into(), window, cx);
+                self.spawn_palette_agent_tab(
+                    cwd,
+                    title,
+                    id.clone().into(),
+                    command.into(),
+                    window,
+                    cx,
+                );
             }
             PaletteActionKind::Theme { id, display_name } => {
                 // Live-apply: rewrite settings.theme, persist, and
@@ -7008,28 +7019,30 @@ impl AppShell {
     /// Spawn a new tab pinned to a working directory and auto-type a
     /// command into it — used by the palette's Agent action. Wrapped
     /// to keep the dispatch arm thin.
+    ///
+    /// `agent_id` is the profile id the palette dispatcher pulled
+    /// straight off `PaletteActionKind::Agent.id`. Threading it
+    /// through here (instead of re-deriving from `auto_type` via
+    /// `agent_id_from_auto_type`) keeps custom profiles where
+    /// `id != command` round-trippable — without this the spawn
+    /// would persist `agent_id: None` for any user-defined agent
+    /// whose command isn't one of the built-in names, and `reopen_
+    /// session` would fall back to the default agent instead of
+    /// resuming the row the user actually picked.
     fn spawn_palette_agent_tab(
         &mut self,
         working_directory: Option<std::path::PathBuf>,
         title: SharedString,
+        agent_id: SharedString,
         auto_type: SharedString,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Palette agent action spawns explicitly through this path
-        // with a known agent. The caller-side palette wiring doesn't
-        // currently surface the profile id alongside the auto_type
-        // string (it builds the auto_type from the agent_id at
-        // dispatch time) — re-derive via `agent_id_from_auto_type`
-        // so the persisted row matches the agent the user actually
-        // picked.
-        let persist_id = codescope_core::agent_id_from_auto_type(Some(auto_type.as_ref()))
-            .map(|aid| SharedString::from(aid.as_str()));
         self.spawn_tab_in(
             working_directory,
             Some(title),
             Some(auto_type),
-            persist_id,
+            Some(agent_id),
             None,
             window,
             cx,
