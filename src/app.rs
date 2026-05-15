@@ -812,6 +812,7 @@ impl AppShell {
                     working_directory,
                     title,
                     auto_type,
+                    agent_id,
                     force_new,
                 } => {
                     // Three-tier "open session" resolution, mirroring
@@ -890,11 +891,36 @@ impl AppShell {
                     // Tier 3: spawn a fresh session. Reached when
                     // `force_new` was set explicitly OR when there
                     // is neither an open tab nor a closed session
-                    // for this worktree.
+                    // for this worktree. The `agent_id` from the
+                    // event is denormalised alongside `auto_type`
+                    // (same `AgentProfile`) so the persisted Session
+                    // row can record which agent backed this tab —
+                    // without that stamp `reopen_session` would
+                    // later see `agent_id: None` and fall back to a
+                    // plain shell.
+                    //
+                    // "Open session" / generic worktree click emit
+                    // both fields as `None` (the emitter doesn't
+                    // know yet whether the spawn will actually
+                    // happen — focus-or-open might short-circuit it
+                    // away). For those we resolve the default agent
+                    // *here*, at the moment we know a fresh spawn
+                    // is happening, so the new row still gets a
+                    // useful `agent_id`.
+                    let (effective_agent_id, effective_auto_type) =
+                        match (agent_id.clone(), auto_type.clone()) {
+                            (Some(id), at) => (Some(id), at),
+                            (None, Some(at)) => (None, Some(at)),
+                            (None, None) => match default_agent_launch_for(&this.settings) {
+                                Some((id, at)) => (Some(id), at),
+                                None => (None, None),
+                            },
+                        };
                     this.spawn_tab_in(
                         Some(working_directory.clone()),
                         Some(title.clone()),
-                        auto_type.clone(),
+                        effective_auto_type,
+                        effective_agent_id,
                         None,
                         window,
                         cx,
@@ -2269,6 +2295,14 @@ impl AppShell {
                 Some(path),
                 Some(title),
                 auto,
+                // Rehydrate path: the persisted row already carries
+                // the `agent_id` we want (or `None` for legacy
+                // pre-fix rows / plain-shell sessions), and
+                // `restore_session_id = Some` short-circuits the
+                // `allocate_session_id` persistence branch entirely
+                // — projects.json is the source of truth, this
+                // arg is ignored once `restore_session_id` is set.
+                entry.agent_id.clone().map(SharedString::from),
                 Some(entry.session_id.clone()),
                 window,
                 cx,
@@ -2466,6 +2500,7 @@ impl AppShell {
     fn allocate_session_id(
         &mut self,
         working_directory: Option<&std::path::Path>,
+        persist_agent_id: Option<String>,
         restore_session_id: Option<String>,
     ) -> String {
         if let Some(id) = restore_session_id {
@@ -2498,7 +2533,14 @@ impl AppShell {
             id: new_id.clone(),
             worktree_path: wd.to_string_lossy().into_owned(),
             branch: None,
-            agent_id: None,
+            // Persist the agent the spawn was for so a later
+            // `reopen_session` lookup resolves the right profile —
+            // see the `persist_agent_id` doc on `spawn_tab_in` for
+            // the full rationale. `None` ends up as `null` in
+            // projects.json and lets reopen fall back to the
+            // current `Settings.default_agent` (handled in
+            // `reopen_session`).
+            agent_id: persist_agent_id,
             display_name: None,
             worktree_id,
             last_opened: None,
@@ -2805,8 +2847,22 @@ impl AppShell {
         // fall back to `resume_args` (`pi -c`, `copilot --continue`,
         // bare `claude`). Mirrors C# `SessionManager.CreateAgentSession`
         // resume branch + `JoinResumeByIdArgs`.
-        let auto_type: Option<SharedString> = restored
+        //
+        // Legacy / pre-fix rows persisted before the spawn-side
+        // started stamping `agent_id` (or plain-shell sessions
+        // closed under the old code path) come back with
+        // `restored.agent_id = None`. Falling back to a plain shell
+        // there is what surfaced the user-reported bug "reopen via
+        // worktree double-click hands me a shell instead of
+        // Claude". Resolve the current `Settings.default_agent` as
+        // the rescue value so a legacy row still reopens in the
+        // configured agent. New rows persisted after this PR will
+        // carry their own `agent_id` and never need the fallback.
+        let resolved_agent_id: Option<String> = restored
             .agent_id
+            .clone()
+            .or_else(|| default_agent_launch_for(&self.settings).map(|(id, _)| id.to_string()));
+        let auto_type: Option<SharedString> = resolved_agent_id
             .as_deref()
             .and_then(|id| self.agent_registry.get_by_id(id))
             .and_then(|profile| {
@@ -2821,6 +2877,7 @@ impl AppShell {
             Some(working_directory),
             Some(title),
             auto_type,
+            resolved_agent_id.map(SharedString::from),
             Some(restored.id),
             window,
             cx,
@@ -3002,21 +3059,6 @@ impl AppShell {
         &self.settings
     }
 
-    /// Resolve the default agent's auto-type command string from
-    /// `Settings.default_agent` via `AgentRegistry::from_settings`.
-    /// Returns `<command> [<new_session_args>...]` joined by spaces.
-    /// `None` only when the resulting registry has zero agents — in
-    /// practice `from_settings` re-seeds the built-ins when
-    /// `settings.agents` is empty and `get_default()` falls back to
-    /// the first profile, so a typo'd / missing `default_agent` still
-    /// resolves to *some* agent (just not the user's preferred one).
-    /// Mirrors the sidebar's "New session ▸" default-row builder
-    /// (see `render_new_session_row`) so Ctrl+Shift+T lands on the
-    /// same agent the worktree menu's primary click would.
-    pub(crate) fn default_agent_auto_type(&self) -> Option<SharedString> {
-        default_agent_auto_type_for(&self.settings)
-    }
-
     /// Open a fresh shell session and append it as a new tab. The new
     /// tab becomes the active one and the terminal grabs focus.
     ///
@@ -3037,12 +3079,15 @@ impl AppShell {
         // working directory to land the agent in — a plain shell
         // fallback keeps the empty / no-project state usable.
         let has_project_context = self.sidebar.read(cx).active_project().is_some();
-        let auto_type = if has_project_context {
-            self.default_agent_auto_type()
+        let (agent_id, auto_type) = if has_project_context {
+            match default_agent_launch_for(&self.settings) {
+                Some((id, at)) => (Some(id), at),
+                None => (None, None),
+            }
         } else {
-            None
+            (None, None)
         };
-        self.spawn_tab_in(None, None, auto_type, None, window, cx);
+        self.spawn_tab_in(None, None, auto_type, agent_id, None, window, cx);
     }
 
     fn spawn_tab_in(
@@ -3050,6 +3095,25 @@ impl AppShell {
         working_directory: Option<std::path::PathBuf>,
         title_override: Option<SharedString>,
         auto_type: Option<SharedString>,
+        // Agent profile id to stamp on the persisted `Session` row.
+        // Threaded through from `SidebarEvent::OpenSession` (or
+        // resolved at the spawn site via
+        // [`default_agent_launch_for`] when the emitter didn't know
+        // yet whether a fresh spawn would happen). `None` is the
+        // correct value for plain-shell spawns; non-`None` lets a
+        // later `reopen_session` rebuild the agent's auto_type by
+        // looking the id up in `AgentRegistry` instead of falling
+        // back to a plain shell because the row was stored with
+        // `agent_id: None`.
+        //
+        // Named `persist_agent_id` (not just `agent_id`) to keep it
+        // out of the way of `Tab.agent_id` — the latter is a runtime
+        // detection value derived from `auto_type` via
+        // `agent_id_from_auto_type`, used for telemetry-bus routing,
+        // and lives on the live `Tab` struct; this one is the
+        // *persisted* identifier that ends up in `projects.json`
+        // and is read back at reopen.
+        persist_agent_id: Option<SharedString>,
         // `Some` on the launch-time rehydrate path so the freshly
         // spawned `Tab` adopts an existing session row rather than
         // appending a new one. `None` on every other call site
@@ -3180,8 +3244,11 @@ impl AppShell {
         // row through `SessionManager::open`. Mirrors C#
         // `MainViewModel.NewSessionAsync` (open path) vs. cold-start
         // session restore.
-        let session_id =
-            self.allocate_session_id(working_directory_for_tab.as_deref(), restore_session_id);
+        let session_id = self.allocate_session_id(
+            working_directory_for_tab.as_deref(),
+            persist_agent_id.as_ref().map(|s| s.to_string()),
+            restore_session_id,
+        );
         let group_idx = self.focused_group;
         let group = &mut self.groups[group_idx];
         // Capture the entity so the fallback `auto_type` job below can
@@ -6907,10 +6974,21 @@ impl AppShell {
                 }
             }
         }
+        // Palette / "open or focus" fresh spawn — resolve the
+        // default agent here so the new row is persisted with the
+        // right id (mirrors the OpenSession handler's Tier 3).
+        let (effective_agent_id, effective_auto_type) = match auto_type.clone() {
+            Some(at) => (None, Some(at)),
+            None => match default_agent_launch_for(&self.settings) {
+                Some((id, at)) => (Some(id), at),
+                None => (None, None),
+            },
+        };
         self.spawn_tab_in(
             Some(working_directory),
             Some(title),
-            auto_type,
+            effective_auto_type,
+            effective_agent_id,
             None,
             window,
             cx,
@@ -6928,7 +7006,24 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.spawn_tab_in(working_directory, Some(title), Some(auto_type), None, window, cx);
+        // Palette agent action spawns explicitly through this path
+        // with a known agent. The caller-side palette wiring doesn't
+        // currently surface the profile id alongside the auto_type
+        // string (it builds the auto_type from the agent_id at
+        // dispatch time) — re-derive via `agent_id_from_auto_type`
+        // so the persisted row matches the agent the user actually
+        // picked.
+        let persist_id = codescope_core::agent_id_from_auto_type(Some(auto_type.as_ref()))
+            .map(|aid| SharedString::from(aid.as_str()));
+        self.spawn_tab_in(
+            working_directory,
+            Some(title),
+            Some(auto_type),
+            persist_id,
+            None,
+            window,
+            cx,
+        );
     }
 
     /// Active project's working directory, if any. Used by the agent
@@ -7695,31 +7790,32 @@ fn push_non_empty_font_candidate(candidates: &mut Vec<String>, family: &str) {
     }
 }
 
-/// Resolve the default agent's auto-type command string from a
-/// `Settings` snapshot. Pulled out of `AppShell::default_agent_auto_type`
-/// as a free function so it can be unit-tested without a gpui context.
-/// Returns `<command> [<new_session_args>...]` joined by spaces.
+/// Paired `(agent_id, auto_type)` resolver — the agent id half is
+/// what gets persisted on the `Session` row at spawn time so a later
+/// `reopen_session` can resolve the same agent profile back out of
+/// the registry, instead of falling through to a plain shell because
+/// the closed row carries `agent_id: None`. The auto_type half is the
+/// command string the host auto-types into the freshly-spawned pty
+/// to launch the agent inline (same value
+/// `default_agent_auto_type_for` returns on its own — this helper is
+/// the union of the two pieces of information that live on the same
+/// `AgentProfile`).
 ///
-/// `None` in two cases:
-///
-/// 1. `AgentRegistry::from_settings` yields an empty list and
-///    `get_default()` returns `None`. Today this only happens if
-///    `settings.agents` was passed in non-empty but every entry was
-///    filtered out somewhere upstream — `from_settings` re-seeds the
-///    built-in profiles when `settings.agents` is empty, and
-///    `get_default()` falls back to the first profile when no
-///    `is_default` flag is set, so a typo'd / missing `default_agent`
-///    still resolves to *some* agent (just not the user's preferred
-///    one).
-/// 2. The resolved profile has an empty `command`. This is a
-///    defensive fallback in `build_new_session_auto_type` — a
-///    hand-edited `settings.json` with a blank `command` would
-///    otherwise emit a leading-space argv. Returning `None` lets the
-///    caller fall back to a plain shell instead of auto-typing junk.
-fn default_agent_auto_type_for(settings: &Settings) -> Option<SharedString> {
+/// Returns `None` only when the registry has no default agent at all
+/// (empty list and `get_default()` is `None`). Returns
+/// `Some((id, None))` when a default agent exists but its `command`
+/// is empty / whitespace — preserves the id so reopen can name the
+/// profile, but skips auto-typing to avoid feeding a leading-space
+/// argv to the pty (same `Option` semantics
+/// `build_new_session_auto_type` already documents).
+fn default_agent_launch_for(
+    settings: &Settings,
+) -> Option<(SharedString, Option<SharedString>)> {
     let registry = codescope_core::AgentRegistry::from_settings(settings);
     let profile = registry.get_default()?;
-    codescope_core::build_new_session_auto_type(profile).map(SharedString::from)
+    let id: SharedString = profile.id.clone().into();
+    let auto_type = codescope_core::build_new_session_auto_type(profile).map(SharedString::from);
+    Some((id, auto_type))
 }
 
 /// Pure transition classifier for the bell notification — extracted so
@@ -7935,28 +8031,29 @@ mod tests {
         assert_eq!(keystroke_digit_index("", true), None);
     }
 
-    // ─── default_agent_auto_type_for ───────────────────────────────
+    // ─── default_agent_launch_for ──────────────────────────────────
     //
-    // Ctrl+Shift+T / the "+ new tab" button route through this helper
-    // to look up the user's preferred agent CLI from the registry. The
-    // tests below pin the contract `on_key_down` for Ctrl+Shift+T
-    // relies on: a vanilla Settings yields the Claude command; flipping
-    // `default_agent` picks the matching profile; an empty `agents`
-    // override returns `None` so the caller can fall back to a plain
-    // shell.
+    // Ctrl+Shift+T / the "+ new tab" button + the worktree
+    // double-click handler all route through this helper to look up
+    // the user's preferred agent CLI from the registry. The tests
+    // below pin the contract `on_key_down` for Ctrl+Shift+T relies
+    // on: a vanilla Settings yields the Claude profile; flipping
+    // `default_agent` picks the matching one; an empty `agents`
+    // override falls back to built-ins. The auto_type half of the
+    // returned pair is what gets typed into the freshly-spawned pty
+    // — the id half is what gets persisted on the `Session` row so
+    // `reopen_session` can resolve the same agent profile later.
 
     #[test]
-    fn default_agent_auto_type_for_default_settings_returns_claude() {
-        // Built-in default — vanilla settings should auto-type `claude`
-        // (no extra args; new-session args are empty in the built-in
-        // Claude profile).
+    fn default_agent_launch_for_default_settings_returns_claude() {
         let settings = Settings::default();
-        let cmd = default_agent_auto_type_for(&settings).expect("default present");
-        assert_eq!(cmd.as_ref(), "claude");
+        let (id, cmd) = default_agent_launch_for(&settings).expect("default present");
+        assert_eq!(id.as_ref(), "claude");
+        assert_eq!(cmd.as_deref().map(|s| s.as_ref()), Some("claude"));
     }
 
     #[test]
-    fn default_agent_auto_type_for_honours_default_agent_setting() {
+    fn default_agent_launch_for_honours_default_agent_setting() {
         // User changed `settings.default_agent` to Codex — the helper
         // must follow, otherwise Ctrl+Shift+T would silently keep
         // spawning Claude after the user reconfigured their default.
@@ -7964,11 +8061,9 @@ mod tests {
             default_agent: "codex".into(),
             ..Settings::default()
         };
-        let cmd = default_agent_auto_type_for(&settings).expect("default present");
-        // The built-in Codex profile uses the `codex` command. Asserting
-        // the prefix keeps the test resilient to future new-session-arg
-        // additions on the built-in profile while still catching a
-        // wrong-profile regression.
+        let (id, cmd) = default_agent_launch_for(&settings).expect("default present");
+        assert_eq!(id.as_ref(), "codex");
+        let cmd = cmd.expect("codex profile has a command");
         assert!(
             cmd.as_ref() == "codex" || cmd.as_ref().starts_with("codex "),
             "expected codex command, got {cmd:?}",
@@ -7976,7 +8071,7 @@ mod tests {
     }
 
     #[test]
-    fn default_agent_auto_type_for_joins_new_session_args() {
+    fn default_agent_launch_for_joins_new_session_args() {
         // A user-defined profile with new-session args should serialise
         // as `<command> <arg1> <arg2>...` so the terminal gets a single
         // ready-to-run line.
@@ -7995,22 +8090,23 @@ mod tests {
             }],
             ..Settings::default()
         };
-        let cmd = default_agent_auto_type_for(&settings).expect("default present");
-        assert_eq!(cmd.as_ref(), "my-cli --init fresh");
+        let (id, cmd) = default_agent_launch_for(&settings).expect("default present");
+        assert_eq!(id.as_ref(), "custom");
+        assert_eq!(cmd.as_deref().map(|s| s.as_ref()), Some("my-cli --init fresh"));
     }
 
     #[test]
-    fn default_agent_auto_type_for_empty_agents_falls_back_to_built_ins() {
+    fn default_agent_launch_for_empty_agents_falls_back_to_built_ins() {
         // Empty `agents` overrides → `from_settings` re-seeds the
-        // built-in agent set, so `default_agent_auto_type_for` still
-        // returns a Some (Claude). This pins the contract Ctrl+Shift+T
-        // relies on: a fresh / empty profile list never strands the
-        // user without an agent.
+        // built-in agent set, so the helper still returns `Some`
+        // (Claude). This pins the contract Ctrl+Shift+T relies on: a
+        // fresh / empty profile list never strands the user without
+        // an agent.
         let settings = Settings {
             agents: vec![],
             ..Settings::default()
         };
-        assert!(default_agent_auto_type_for(&settings).is_some());
+        assert!(default_agent_launch_for(&settings).is_some());
     }
 
     // ─── classify_activity_transition ──────────────────────────────

@@ -555,6 +555,7 @@ impl Sidebar {
                         working_directory: std::path::PathBuf::from(&folder),
                         title: format!("{project_name} · {branch}").into(),
                         auto_type: None,
+                        agent_id: None,
                         force_new: true,
                     });
                 }
