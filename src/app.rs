@@ -814,16 +814,25 @@ impl AppShell {
                     auto_type,
                     force_new,
                 } => {
-                    // Focus-or-open by default: walk every group's
-                    // tabs for one whose `working_directory` matches
-                    // and activate it. Only fall through to a fresh
-                    // spawn when nothing matches *or* the caller
-                    // explicitly asked for `force_new` (the
-                    // "New session" / "New Claude session" menu
-                    // rows). This is what the user means by
-                    // "clicking a worktree shouldn't pile up new
-                    // sessions every time".
+                    // Three-tier "open session" resolution, mirroring
+                    // the C# `MainViewModel.OnTreeDoubleClick` flow:
+                    //
+                    //   1. An open tab pinned to this `wd` already
+                    //      exists → just focus it.
+                    //   2. No open tab, but the worktree has a
+                    //      soft-closed session in history → reopen
+                    //      the most-recently-closed one. This is the
+                    //      user expectation for "double-click the
+                    //      same branch again" — pick up where you
+                    //      left off, don't keep stamping fresh
+                    //      free-floating sessions.
+                    //   3. Otherwise → spawn a brand new session
+                    //      (the same path `force_new` takes
+                    //      unconditionally for explicit "New
+                    //      session" / "New <agent> session" menu
+                    //      rows).
                     if !*force_new {
+                        // Tier 1: focus an already-open tab.
                         let mut focus_target: Option<(usize, usize)> = None;
                         for (g_idx, group) in this.groups.iter().enumerate() {
                             for (t_idx, tab) in group.tabs.iter().enumerate() {
@@ -840,7 +849,48 @@ impl AppShell {
                             this.activate_tab(g_idx, t_idx, window, cx);
                             return;
                         }
+
+                        // Tier 2: reopen the most-recent closed
+                        // session for this worktree. Path matching
+                        // goes through `paths_match` so a `\\`-vs-`/`
+                        // mismatch between the spawn event and the
+                        // persisted `worktree_path` doesn't drop the
+                        // history hit (same reason
+                        // `locate_project_for_path` uses it). Sort
+                        // by `closed_at` desc — newest first —
+                        // mirroring the sidebar's history disclosure
+                        // ordering so a double-click and the visible
+                        // top-of-history row stay in lockstep. ISO-
+                        // 8601 sorts lexicographically the same way
+                        // it sorts chronologically, so a plain str
+                        // cmp is enough.
+                        let wd_str = working_directory.to_string_lossy();
+                        let most_recent_closed = this
+                            .projects
+                            .projects
+                            .iter()
+                            .flat_map(|p| p.sessions.iter())
+                            .filter(|s| s.closed_at.is_some())
+                            .filter(|s| {
+                                codescope_core::path_canon::paths_match(
+                                    &s.worktree_path,
+                                    &wd_str,
+                                )
+                            })
+                            .max_by(|a, b| {
+                                a.closed_at.as_deref().cmp(&b.closed_at.as_deref())
+                            })
+                            .map(|s| s.id.clone());
+                        if let Some(session_id) = most_recent_closed {
+                            this.reopen_session(session_id, window, cx);
+                            return;
+                        }
                     }
+
+                    // Tier 3: spawn a fresh session. Reached when
+                    // `force_new` was set explicitly OR when there
+                    // is neither an open tab nor a closed session
+                    // for this worktree.
                     this.spawn_tab_in(
                         Some(working_directory.clone()),
                         Some(title.clone()),
@@ -2491,7 +2541,16 @@ impl AppShell {
     /// `projects.json` (path matched no project at spawn time) is a
     /// silent no-op rather than an error. Reload-then-mutate-then-save
     /// keeps us in sync with concurrent sidebar writes.
-    fn soft_close_session(&mut self, session_id: &str) {
+    ///
+    /// After a successful close we push the freshly-mutated
+    /// `ProjectsConfig` into the sidebar entity — the sidebar keeps
+    /// its own copy of `projects` and builds the per-worktree
+    /// closed-session disclosure off it at render time, so without
+    /// this push the new `closed_at` stamp would only become visible
+    /// after the next sidebar-side mutation refreshed the snapshot.
+    /// Mirrors the same `replace_projects` + `cx.notify()` dance
+    /// `reopen_session` does for the reverse transition.
+    fn soft_close_session(&mut self, session_id: &str, cx: &mut Context<Self>) {
         match ProjectsConfig::load(&self.paths) {
             Ok(cfg) => {
                 self.projects = cfg;
@@ -2504,7 +2563,13 @@ impl AppShell {
             Ok(_pruned) => {
                 if let Err(err) = self.projects.save(&self.paths) {
                     eprintln!("warning: failed to persist session soft-close: {err:#}");
+                    return;
                 }
+                let projects_for_sidebar = self.projects.clone();
+                self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.replace_projects(projects_for_sidebar);
+                    cx.notify();
+                });
             }
             Err(_) => {
                 // Free-floating session (no project context at spawn
@@ -3215,7 +3280,7 @@ impl AppShell {
         // failure logs and proceeds; the in-memory tab state is the
         // source of truth for what's on screen.
         if !codescope_session_id.is_empty() {
-            self.soft_close_session(&codescope_session_id);
+            self.soft_close_session(&codescope_session_id, cx);
         }
         let Some(group) = self.groups.get_mut(group_idx) else { return };
         if tab_idx >= group.tabs.len() {
