@@ -722,6 +722,9 @@ impl TerminalView {
     /// called from idle re-renders.
     fn maybe_resize(&self, cols: u16, rows: u16, _cx: &mut Context<Self>) {
         if cols == 0 || rows == 0 {
+            crate::diag::log(&format!(
+                "maybe_resize: skipped (zero-dim) cols={cols} rows={rows}"
+            ));
             return;
         }
         let (cur_cols, cur_rows) = *self.last_size.lock();
@@ -729,6 +732,9 @@ impl TerminalView {
             // Already at the target; if a stale pending request would
             // try to undo it, drop it.
             self.pending_size.lock().take();
+            crate::diag::log(&format!(
+                "maybe_resize: noop (already_at_target) cols={cols} rows={rows}"
+            ));
             return;
         }
         let mut pending = self.pending_size.lock();
@@ -737,7 +743,9 @@ impl TerminalView {
                 // Same target already pending — let the existing
                 // `set_at` age toward `RESIZE_DEBOUNCE` instead of
                 // resetting it every idle re-render. See the doc
-                // comment above for why this matters.
+                // comment on `maybe_resize` for the full rationale.
+                // No log noise here: this branch hits on every
+                // idle re-render and would flood the tape.
             }
             _ => {
                 *pending = Some(PendingResize {
@@ -745,6 +753,9 @@ impl TerminalView {
                     rows,
                     set_at: Instant::now(),
                 });
+                crate::diag::log(&format!(
+                    "maybe_resize: staged cols={cols} rows={rows} from cur=({cur_cols},{cur_rows})"
+                ));
             }
         }
     }
@@ -754,11 +765,18 @@ impl TerminalView {
     fn apply_resize(&mut self, cols: u16, rows: u16, cx: &mut Context<Self>) {
         let (cur_cols, cur_rows) = *self.last_size.lock();
         if cols == cur_cols && rows == cur_rows {
+            crate::diag::log(&format!(
+                "apply_resize: noop (already_at_target) cols={cols} rows={rows}"
+            ));
             return;
         }
         *self.last_size.lock() = (cols, rows);
         let cell_w_f32: f32 = self.font.cell_width.into();
         let cell_h_f32: f32 = self.font.line_height.into();
+        crate::diag::log(&format!(
+            "apply_resize: backend.resize cols={cols} rows={rows} \
+             from cur=({cur_cols},{cur_rows}) cell=({cell_w_f32:.2},{cell_h_f32:.2})"
+        ));
         self.backend.resize(TerminalSize {
             num_lines: rows,
             num_cols: cols,
@@ -987,14 +1005,19 @@ impl Render for TerminalView {
 
                     let cell_w_f32: f32 = cell_width.into();
                     let line_h_f32: f32 = line_height.into();
+                    let bw: f32 = bounds.size.width.into();
+                    let bh: f32 = bounds.size.height.into();
+                    let (last_cols, last_rows) = *last_size.lock();
                     if cell_w_f32 > 0.0 && line_h_f32 > 0.0 {
-                        let w: f32 = bounds.size.width.into();
-                        let h: f32 = bounds.size.height.into();
-                        let cols = (w / cell_w_f32).floor() as u16;
-                        let rows = (h / line_h_f32).floor() as u16;
+                        let cols = (bw / cell_w_f32).floor() as u16;
+                        let rows = (bh / line_h_f32).floor() as u16;
+                        crate::diag::log(&format!(
+                            "canvas_layout: bounds=({bw:.1}x{bh:.1}) cell=({cell_w_f32:.2},{line_h_f32:.2}) \
+                             computed=({cols},{rows}) last=({last_cols},{last_rows}) diff={}",
+                            cols != last_cols || rows != last_rows
+                        ));
 
-                        let (cur_cols, cur_rows) = *last_size.lock();
-                        if cols != cur_cols || rows != cur_rows {
+                        if cols != last_cols || rows != last_rows {
                             weak.update(cx, |view, cx| {
                                 view.font.cell_width = cell_width;
                                 view.font.line_height = line_height;
@@ -1002,6 +1025,10 @@ impl Render for TerminalView {
                             })
                             .ok();
                         }
+                    } else {
+                        crate::diag::log(&format!(
+                            "canvas_layout: bounds=({bw:.1}x{bh:.1}) cell=(zero-dim, skipping resize)"
+                        ));
                     }
 
                     CanvasLayout {

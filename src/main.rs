@@ -100,6 +100,17 @@ fn main() -> Result<()> {
     // ate the process. Cheap; <10 lines per launch.
     write_boot_phase(&paths, "main:enter");
 
+    // Resize-cascade diagnostic tape. PR #218/#219 fixed the
+    // bounds-observer half of the cascade but the user-reported
+    // "release-build resize doesn't repaint until tab-swap" symptom
+    // still reproduces (and also on splitter drag, which never goes
+    // through `observe_window_bounds`), so at least one checkpoint
+    // along the canvas-layout → maybe_resize → apply_resize chain is
+    // still racing. Wire the per-launch path here; the terminal
+    // crate's `view.rs` taps it from each checkpoint. No-op until
+    // this call sets the path.
+    codescope_terminal::diag::set_log_path(paths.state_dir.join("terminal-resize.log"));
+
     // Velopack install / uninstall / first-run / restarted-after-update
     // hooks. Safe no-op on builds that weren't installed via a Velopack
     // bootstrapper (`cargo run`, cargo-dist MSI, unpacked zip).
