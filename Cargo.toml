@@ -14,7 +14,7 @@ windows = "0.61"
 
 [package]
 name = "codescope-rs"
-version = "0.3.0-rc.9"
+version = "0.3.0-rc.10"
 edition = "2024"
 publish = false
 description = "CodeScope: gpui shell that orchestrates parallel AI coding agent CLI sessions with Git worktree isolation."
