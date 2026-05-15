@@ -7456,6 +7456,25 @@ impl AppShell {
 
 // ─── Window-state extraction ────────────────────────────────────────
 
+/// Process-global handle to `state_dir/window-diag.log`, kept open
+/// across calls so each [`append_window_diag`] tick is a single
+/// `WriteFile` syscall instead of `CreateFile` → `WriteFile` →
+/// `CloseHandle`. Matters during interactive drag-resize where the
+/// observer fires at frame rate: on Windows with antivirus filter
+/// drivers a `CreateFile` round-trip is routinely 1-5 ms, enough to
+/// introduce visible jank *and* alter the timing of the maximise-race
+/// we're trying to catch — diagnostic I/O is supposed to observe the
+/// system, not perturb it. (Copilot review on PR #222.)
+///
+/// `parking_lot::Mutex` because contention is non-existent (only the
+/// UI thread writes) and the std `Mutex` poison-on-panic semantics
+/// add noise to a best-effort logger. `Option<File>` because the
+/// open may legitimately fail (state_dir not writable, disk full,
+/// etc.) and we want to retry on the next tick rather than caching
+/// the failure forever.
+static WINDOW_DIAG_FILE: std::sync::OnceLock<parking_lot::Mutex<Option<std::fs::File>>> =
+    std::sync::OnceLock::new();
+
 /// Append one diagnostic line to `state_dir/window-diag.log`. Used to
 /// chase an intermittent Windows bug where the maximised window ends
 /// up positioned ~75 px below the monitor's work-area top (and runs
@@ -7467,12 +7486,15 @@ impl AppShell {
 /// so we can correlate `WindowBounds` (what gpui thinks) with the
 /// actual HWND rect, `WINDOWPLACEMENT`, and monitor work-area.
 ///
+/// Holds a process-global file handle ([`WINDOW_DIAG_FILE`]) to avoid
+/// re-opening the file on every tick — see that static's doc for the
+/// "diagnostic I/O must not perturb the race" rationale.
+///
 /// I/O errors are silently dropped — this is best-effort
-/// instrumentation, not load-bearing state. Caller is the bounds
-/// observer (fires on every resize tick) and the min/max/close
-/// caption-button click handlers.
+/// instrumentation, not load-bearing state. Callers are the bounds
+/// observer (fires on every resize tick) and the maximize
+/// caption-button click handler.
 fn append_window_diag(paths: &AppPaths, event: &str, window: &Window) {
-    use std::fs::OpenOptions;
     use std::io::Write as _;
     let bounds = window.window_bounds();
     let viewport = window.viewport_size();
@@ -7494,11 +7516,22 @@ fn append_window_diag(paths: &AppPaths, event: &str, window: &Window) {
     let vp_w = f32::from(viewport.width);
     let vp_h = f32::from(viewport.height);
 
+    // Win32 fragment is emitted with the same key set on every
+    // branch (success / open-call failure / non-Windows) so a grep
+    // for `hwnd_rect=` or `rcWork=` matches every row, not just the
+    // success path. The earlier `win32=unavailable` / `win32=n/a`
+    // placeholders had asymmetric keys and broke field-level greps
+    // — Copilot review on PR #222.
+    const WIN32_MISSING: &str =
+        "hwnd_rect=? zoomed=? showCmd=? rcNormal=? ptMaxPos=? flags=? rcMonitor=? rcWork=? dpi=?";
     #[cfg(target_os = "windows")]
     let win32 = crate::win32_titlebar::diag_snapshot(window)
-        .unwrap_or_else(|| "win32=unavailable".to_string());
+        .unwrap_or_else(|| WIN32_MISSING.to_string());
     #[cfg(not(target_os = "windows"))]
-    let win32 = "win32=n/a".to_string();
+    let win32 = {
+        let _ = window;
+        WIN32_MISSING.to_string()
+    };
 
     let ts = now_iso8601();
     let line = format!(
@@ -7506,12 +7539,18 @@ fn append_window_diag(paths: &AppPaths, event: &str, window: &Window) {
          viewport=({vp_w:.1},{vp_h:.1}) scale={scale} is_maximized={is_max} {win32}\n"
     );
 
-    let path = paths.state_dir.join("window-diag.log");
-    let _ = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .and_then(|mut f| f.write_all(line.as_bytes()));
+    let cell = WINDOW_DIAG_FILE.get_or_init(|| parking_lot::Mutex::new(None));
+    let mut slot = cell.lock();
+    if slot.is_none() {
+        let path = paths.state_dir.join("window-diag.log");
+        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(f) => *slot = Some(f),
+            Err(_) => return,
+        }
+    }
+    if let Some(file) = slot.as_mut() {
+        let _ = file.write_all(line.as_bytes());
+    }
 }
 
 /// Snapshot the platform window into the on-disk `WindowState`. We
