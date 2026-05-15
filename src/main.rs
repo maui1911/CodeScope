@@ -77,9 +77,9 @@ fn main() -> Result<()> {
     // `ensure_dirs` is idempotent, and `install_panic_hook` no-ops on
     // its second call via an `AtomicBool` guard — none of these
     // execute "twice" in any harmful sense if velopack later restarts
-    // the process. User report: "update crashed nog steeds het
-    // programma" on v0.3.0-rc.10, no crash.log produced — exactly
-    // this gap.
+    // the process. Motivated by a user report that v0.3.0-rc.10 still
+    // crashed during the auto-update without producing a `crash.log`
+    // — exactly this gap.
     let paths = AppPaths::detect();
     if let Err(err) = paths.ensure_dirs() {
         eprintln!(
@@ -98,6 +98,22 @@ fn main() -> Result<()> {
     // *after* the line is written still leaves the line on disk. Lets
     // us tell, on the next no-crash-log crash, exactly which phase
     // ate the process. Cheap; <10 lines per launch.
+    //
+    // Truncate at launch so the file only reflects the *current*
+    // run — without this the file grows unbounded across the
+    // lifetime of the install (5 lines / launch × N launches forever)
+    // and triaging "which phase died last" gets harder, not easier,
+    // the longer the install survives. Best-effort: a truncate
+    // failure (path is a directory, disk full, permission denied)
+    // silently falls through and the appender below behaves as it
+    // did before — old lines still in place, new lines tacked on.
+    {
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(paths.state_dir.join("boot.log"));
+    }
     write_boot_phase(&paths, "main:enter");
 
     // Resize-cascade diagnostic tape. PR #218/#219 fixed the
@@ -270,9 +286,13 @@ fn main() -> Result<()> {
 /// those bypasses the Rust panic handler entirely. The boot tape
 /// gives us a paper trail when `crash.log` stays empty.
 ///
-/// I/O errors are silently dropped — best-effort diagnostic. Caller
-/// must ensure `paths.state_dir` exists (`ensure_dirs` does that
-/// idempotently before the first call).
+/// I/O errors at any layer are silently dropped — best-effort
+/// diagnostic. `ensure_dirs` is called once from `main` and is
+/// allowed to fail without aborting startup, so this helper has to
+/// be robust against a missing `state_dir`: the `OpenOptions::open`
+/// call returns `Err`, the `let _ =` discards it, and the function
+/// returns without writing anything. A diagnostic mishap should
+/// never take down boot.
 fn write_boot_phase(paths: &AppPaths, phase: &str) {
     use std::fs::OpenOptions;
     use std::io::Write as _;

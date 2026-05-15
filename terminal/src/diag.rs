@@ -51,18 +51,30 @@ static DIAG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
 /// touching state. Caller is the binary's `main()` after
 /// `AppPaths::detect()` resolves the per-mode state directory.
 ///
+/// **Opens with `truncate(true)`**: the resize cascade fires a handful
+/// of lines per user gesture, and a long-running install would
+/// accumulate megabytes of tape over weeks. Triaging "what happened
+/// in *this* repro" gets harder, not easier, the longer the file
+/// survives — so each launch starts with an empty tape. Persistent
+/// historical state lives in commit logs / bug reports, not in this
+/// file.
+///
 /// I/O errors (path is a directory, disk full at open time, permission
-/// denied) are silently dropped — this is best-effort instrumentation
-/// and we don't want a logging mishap to abort startup. Caller must
-/// ensure the parent directory exists (`AppPaths::ensure_dirs` is the
-/// canonical call site for that).
+/// denied) are silently dropped — best-effort instrumentation that
+/// must not abort startup. If the open fails the [`log`] calls below
+/// stay no-ops for the rest of the process lifetime.
 pub fn set_log_path(path: PathBuf) {
     let cell = DIAG_FILE.get_or_init(|| Mutex::new(None));
     let mut slot = cell.lock();
     if slot.is_some() {
         return;
     }
-    if let Ok(file) = OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(file) = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+    {
         *slot = Some(file);
     }
 }
