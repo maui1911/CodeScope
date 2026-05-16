@@ -814,6 +814,7 @@ impl AppShell {
                     auto_type,
                     agent_id,
                     force_new,
+                    force_shell,
                 } => {
                     // Three-tier "open session" resolution, mirroring
                     // the C# `MainViewModel.OnTreeDoubleClick` flow:
@@ -911,6 +912,11 @@ impl AppShell {
                         match (agent_id.clone(), auto_type.clone()) {
                             (Some(id), at) => (Some(id), at),
                             (None, Some(at)) => (None, Some(at)),
+                            // Explicit shell intent: emitter wants a
+                            // bare terminal regardless of the user's
+                            // default agent. Skip the fallback so the
+                            // sidebar's "Shell" row keeps its promise.
+                            (None, None) if *force_shell => (None, None),
                             (None, None) => match default_agent_launch_for(&this.settings) {
                                 Some((id, at)) => (Some(id), at),
                                 None => (None, None),
