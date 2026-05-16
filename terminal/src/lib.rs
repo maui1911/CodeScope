@@ -15,6 +15,7 @@
 
 pub mod backend;
 pub mod colors;
+pub mod diag;
 pub mod event;
 pub mod input;
 pub mod mouse;

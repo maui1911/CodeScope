@@ -65,14 +65,21 @@ impl Render for Root {
 }
 
 fn main() -> Result<()> {
-    // Velopack install / uninstall / first-run / restarted-after-update
-    // hooks must dispatch before anything else — the Velopack
-    // bootstrap helper may need to exit/restart the process from this
-    // call. Safe no-op on builds that weren't installed via a Velopack
-    // bootstrapper (`cargo run`, cargo-dist MSI, unpacked zip).
-    // Mirrors the equivalent C# call site in `App.OnStartup`.
-    velopack_bridge::run_startup_hooks();
-
+    // Resolve paths + install the crash-log panic hook BEFORE
+    // velopack — the old order ran `VelopackApp::build().run()` first
+    // (on the theory "velopack can exit/restart from its hooks, so do
+    // it before any other side effects"), but any panic inside that
+    // call ran through the default panic handler (stderr + abort) —
+    // and stderr on the Windows GUI subsystem is a black hole, so
+    // crashes during the restarted-after-update hook left no
+    // `crash.log` and no observable trace. Reordering is safe:
+    // `AppPaths::detect` is a pure env-var read with no side effects,
+    // `ensure_dirs` is idempotent, and `install_panic_hook` no-ops on
+    // its second call via an `AtomicBool` guard — none of these
+    // execute "twice" in any harmful sense if velopack later restarts
+    // the process. Motivated by a user report that v0.3.0-rc.10 still
+    // crashed during the auto-update without producing a `crash.log`
+    // — exactly this gap.
     let paths = AppPaths::detect();
     if let Err(err) = paths.ensure_dirs() {
         eprintln!(
@@ -81,16 +88,63 @@ fn main() -> Result<()> {
             err
         );
     }
-
-    // Install the crash-log panic hook before any gpui state spins up so a
-    // panic during early boot still writes `%LOCALAPPDATA%\CodeScope\crash.log`
-    // (parity with C# `App.LogFatal`). Dev mode redirects to `CodeScope.Dev`
-    // automatically via `AppPaths`.
     codescope_core::crash_log::install_panic_hook(
         paths.clone(),
         env!("CODESCOPE_VERSION_DISPLAY").to_string(),
     );
 
+    // Per-phase boot tape — written line-by-line to `state_dir/boot.log`
+    // with the file handle dropped between phases so a process kill
+    // *after* the line is written still leaves the line on disk. Lets
+    // us tell, on the next no-crash-log crash, exactly which phase
+    // ate the process. Cheap; <10 lines per launch.
+    //
+    // **Rotate, don't just truncate.** The motivating bug is "auto-
+    // update crashed and left no crash.log"; the user's natural next
+    // action is to relaunch, which would wipe the only forensic
+    // artifact if we just truncated. Rename the current tape to
+    // `boot.prev.log` (replacing any older prev) so the previous
+    // launch survives one more run — long enough for the user to
+    // grab it after a crash. Best-effort at every step: a missing
+    // current file (first launch) makes `rename` a no-op-Err we
+    // discard; a `rename` failure (cross-volume, permission, …)
+    // falls through to the truncate, which itself silently no-ops
+    // on failure; either way `write_boot_phase` below starts a
+    // fresh file. We never lose more than the run-before-last.
+    {
+        let cur = paths.state_dir.join("boot.log");
+        let prev = paths.state_dir.join("boot.prev.log");
+        let _ = std::fs::rename(&cur, &prev);
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&cur);
+    }
+    write_boot_phase(&paths, "main:enter");
+
+    // Resize-cascade diagnostic tape. PR #218/#219 fixed the
+    // bounds-observer half of the cascade but the user-reported
+    // "release-build resize doesn't repaint until tab-swap" symptom
+    // still reproduces (and also on splitter drag, which never goes
+    // through `observe_window_bounds`), so at least one checkpoint
+    // along the canvas-layout → maybe_resize → apply_resize chain is
+    // still racing. Wire the per-launch path here; the terminal
+    // crate's `view.rs` taps it from each checkpoint. No-op until
+    // this call sets the path.
+    codescope_terminal::diag::set_log_path(paths.state_dir.join("terminal-resize.log"));
+
+    // Velopack install / uninstall / first-run / restarted-after-update
+    // hooks. Safe no-op on builds that weren't installed via a Velopack
+    // bootstrapper (`cargo run`, cargo-dist MSI, unpacked zip).
+    // Mirrors the equivalent C# call site in `App.OnStartup`. With the
+    // panic hook now installed above, a Rust panic in here lands in
+    // `crash.log` instead of stderr.
+    write_boot_phase(&paths, "velopack:run_startup_hooks:enter");
+    velopack_bridge::run_startup_hooks();
+    write_boot_phase(&paths, "velopack:run_startup_hooks:exit");
+
+    write_boot_phase(&paths, "memory_watchdog:start_if_dev");
     // Dev-only memory watchdog — surfaces working-set creep every 5 min
     // so per-session terminal scrollback regressions don't go unnoticed
     // during long dev runs (parity with the C# build's
@@ -172,6 +226,7 @@ fn main() -> Result<()> {
     };
 
     let window_bounds = saved_window.map(window_state_to_bounds);
+    write_boot_phase(&paths, "state_loaded:settings+projects+layout+window");
     let paths = Arc::new(paths);
 
     // `with_assets` registers our static SVG icon set so
@@ -181,6 +236,10 @@ fn main() -> Result<()> {
     // `SvgRenderer` silently no-ops every `svg()` element (the
     // default `()` source returns `None`). See `crate::assets`.
     let app = gpui::Application::new().with_assets(crate::assets::AppAssets);
+    {
+        let boot_paths = paths.as_ref();
+        write_boot_phase(boot_paths, "gpui:application_built:about_to_run");
+    }
 
     app.run(move |cx| {
         // `window.json` save lives inside `AppShell::new` (observes
@@ -220,6 +279,37 @@ fn main() -> Result<()> {
     });
 
     Ok(())
+}
+
+/// Append a single timestamped phase marker to
+/// `state_dir/boot.log`. Opens, writes, and closes the file per call
+/// so a process kill *immediately after* the line was written still
+/// leaves the line on disk — what we need to tell, on the next
+/// no-crash-log crash, which phase ate the process.
+///
+/// The auto-update path is the motivating use case: velopack's
+/// `run_startup_hooks` can call `std::process::exit` or hard-crash
+/// from inside the restarted-after-update handler, and either of
+/// those bypasses the Rust panic handler entirely. The boot tape
+/// gives us a paper trail when `crash.log` stays empty.
+///
+/// I/O errors at any layer are silently dropped — best-effort
+/// diagnostic. `ensure_dirs` is called once from `main` and is
+/// allowed to fail without aborting startup, so this helper has to
+/// be robust against a missing `state_dir`: the `OpenOptions::open`
+/// call returns `Err`, the `let _ =` discards it, and the function
+/// returns without writing anything. A diagnostic mishap should
+/// never take down boot.
+fn write_boot_phase(paths: &AppPaths, phase: &str) {
+    use std::fs::OpenOptions;
+    use std::io::Write as _;
+    let line = format!("{} {}\n", now_iso8601(), phase);
+    let path = paths.state_dir.join("boot.log");
+    let _ = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| f.write_all(line.as_bytes()));
 }
 
 fn window_state_to_bounds(state: WindowState) -> WindowBounds {
