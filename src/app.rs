@@ -2270,7 +2270,15 @@ impl AppShell {
                 .agent_id
                 .clone()
                 .or_else(|| default_agent_launch_for(&self.settings).map(|(id, _)| id.to_string()));
+            // Gate the persistence on `agent_session_id.is_some()` —
+            // only agent rows ever stamp that UUID, so its presence
+            // is positive evidence the row was an agent. Rows with
+            // both fields `None` could be legacy plain shells; writing
+            // `claude` to those would be a permanent regression for
+            // users who intend them as shells. Matches Copilot's
+            // review on #230 and the same gate `reopen_session` uses.
             if entry.agent_id.is_none()
+                && entry.agent_session_id.is_some()
                 && let Some(id) = resolved_agent_id.clone()
             {
                 pending_backfills.push((entry.session_id.clone(), id));
@@ -2844,13 +2852,22 @@ impl AppShell {
             }
         };
         // Legacy / pre-PR-#223 rows come back with `agent_id = None`
-        // even though the user has been running them as Claude. The
+        // even though the user has been running them as an agent. The
         // launch-side fallback below picks `settings.default_agent` so
         // the tab still resumes correctly; mirror that decision into
         // the persisted row so the next cold-start rehydrate doesn't
-        // need the same rescue. New rows already carry their own
-        // `agent_id` so this no-ops (`update_agent_id` is idempotent).
-        let backfill_agent_id: Option<String> = if restored.agent_id.is_none() {
+        // need the same rescue.
+        //
+        // Gate the persistence on `agent_session_id.is_some()` — only
+        // agent rows ever stamp that UUID, so its presence is positive
+        // evidence the row was an agent. Rows with both fields `None`
+        // could be legacy plain shells (or pre-fix agent rows that
+        // never logged a session id); writing `claude` to those would
+        // be a permanent regression for users who intend them as
+        // shells. The narrower gate matches Copilot's review on #230.
+        let backfill_agent_id: Option<String> = if restored.agent_id.is_none()
+            && restored.agent_session_id.is_some()
+        {
             default_agent_launch_for(&self.settings).map(|(id, _)| id.to_string())
         } else {
             None
