@@ -1007,8 +1007,14 @@ impl Render for TerminalView {
                     let line_h_f32: f32 = line_height.into();
                     let bw: f32 = bounds.size.width.into();
                     let bh: f32 = bounds.size.height.into();
-                    let (last_cols, last_rows) = *last_size.lock();
                     if cell_w_f32 > 0.0 && line_h_f32 > 0.0 {
+                        // Lock acquisition scoped to the branch that
+                        // actually reads `last_cols`/`last_rows` — the
+                        // zero-dim branch below only logs that it
+                        // skipped, so paying for the mutex on every
+                        // first-frame render before font metrics
+                        // resolve is wasted work on the hot path.
+                        let (last_cols, last_rows) = *last_size.lock();
                         let cols = (bw / cell_w_f32).floor() as u16;
                         let rows = (bh / line_h_f32).floor() as u16;
                         crate::diag::log(&format!(

@@ -99,20 +99,27 @@ fn main() -> Result<()> {
     // us tell, on the next no-crash-log crash, exactly which phase
     // ate the process. Cheap; <10 lines per launch.
     //
-    // Truncate at launch so the file only reflects the *current*
-    // run — without this the file grows unbounded across the
-    // lifetime of the install (5 lines / launch × N launches forever)
-    // and triaging "which phase died last" gets harder, not easier,
-    // the longer the install survives. Best-effort: a truncate
-    // failure (path is a directory, disk full, permission denied)
-    // silently falls through and the appender below behaves as it
-    // did before — old lines still in place, new lines tacked on.
+    // **Rotate, don't just truncate.** The motivating bug is "auto-
+    // update crashed and left no crash.log"; the user's natural next
+    // action is to relaunch, which would wipe the only forensic
+    // artifact if we just truncated. Rename the current tape to
+    // `boot.prev.log` (replacing any older prev) so the previous
+    // launch survives one more run — long enough for the user to
+    // grab it after a crash. Best-effort at every step: a missing
+    // current file (first launch) makes `rename` a no-op-Err we
+    // discard; a `rename` failure (cross-volume, permission, …)
+    // falls through to the truncate, which itself silently no-ops
+    // on failure; either way `write_boot_phase` below starts a
+    // fresh file. We never lose more than the run-before-last.
     {
+        let cur = paths.state_dir.join("boot.log");
+        let prev = paths.state_dir.join("boot.prev.log");
+        let _ = std::fs::rename(&cur, &prev);
         let _ = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(paths.state_dir.join("boot.log"));
+            .open(&cur);
     }
     write_boot_phase(&paths, "main:enter");
 

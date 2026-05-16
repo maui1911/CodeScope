@@ -51,23 +51,31 @@ static DIAG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
 /// touching state. Caller is the binary's `main()` after
 /// `AppPaths::detect()` resolves the per-mode state directory.
 ///
-/// **Opens with `truncate(true)`**: the resize cascade fires a handful
-/// of lines per user gesture, and a long-running install would
+/// **Rotate-then-truncate.** The resize cascade fires a handful of
+/// lines per user gesture, and a long-running install would
 /// accumulate megabytes of tape over weeks. Triaging "what happened
 /// in *this* repro" gets harder, not easier, the longer the file
-/// survives — so each launch starts with an empty tape. Persistent
-/// historical state lives in commit logs / bug reports, not in this
-/// file.
+/// survives — so each launch starts with an empty tape. We rotate
+/// the current file to a `.prev.log` sibling before truncating so
+/// the previous launch's tape survives one more run; the natural
+/// flow is "hit the bug → close the app → relaunch to grab the
+/// log" and a plain truncate would wipe the only forensic artifact
+/// at exactly the wrong moment.
 ///
-/// I/O errors (path is a directory, disk full at open time, permission
-/// denied) are silently dropped — best-effort instrumentation that
-/// must not abort startup. If the open fails the [`log`] calls below
-/// stay no-ops for the rest of the process lifetime.
+/// I/O errors at every layer are silently dropped — best-effort
+/// instrumentation that must not abort startup. A missing current
+/// file (first launch) makes `rename` a no-op-Err; a `rename`
+/// failure falls through to the truncate-open; if that itself
+/// fails the [`log`] calls below stay no-ops for the rest of the
+/// process lifetime.
 pub fn set_log_path(path: PathBuf) {
     let cell = DIAG_FILE.get_or_init(|| Mutex::new(None));
     let mut slot = cell.lock();
     if slot.is_some() {
         return;
+    }
+    if let Some(prev) = prev_path_for(&path) {
+        let _ = std::fs::rename(&path, &prev);
     }
     if let Ok(file) = OpenOptions::new()
         .write(true)
@@ -79,12 +87,34 @@ pub fn set_log_path(path: PathBuf) {
     }
 }
 
+/// Build the rotated-out filename next to `path`. Strips a single
+/// trailing extension and adds `.prev.<ext>` so
+/// `terminal-resize.log` rotates to `terminal-resize.prev.log`. A
+/// path with no extension or no file name short-circuits to `None`
+/// (caller skips the rename); we'd rather drop the rotation than
+/// stomp on something we don't understand.
+fn prev_path_for(path: &std::path::Path) -> Option<PathBuf> {
+    let stem = path.file_stem()?.to_str()?;
+    let ext = path.extension()?.to_str()?;
+    let parent = path.parent()?;
+    Some(parent.join(format!("{stem}.prev.{ext}")))
+}
+
 /// Append one timestamped line to the resize tape. No-op when
 /// `set_log_path` was never called (unit-test runs, or any host that
-/// doesn't want the diagnostics). Holds the file handle across the
-/// `write_all` so a process kill immediately after the call still
-/// leaves the line on disk — the same invariant the boot-tape in
-/// `src/main.rs` and the window-diag tape in `src/app.rs` rely on.
+/// doesn't want the diagnostics).
+///
+/// **Durability strategy:** this module keeps a *single long-lived*
+/// file handle open across the entire process lifetime and relies on
+/// `write_all` having handed the bytes to the kernel before any
+/// crash. A process kill after `write_all` returns still leaves the
+/// line on disk because the kernel buffer survives userspace
+/// teardown. Note this is a *different* strategy from the boot tape
+/// in `src/main.rs`, which open-write-closes per call and gets its
+/// durability from `close` flushing the kernel buffer — both achieve
+/// similar guarantees against a process kill but via different
+/// mechanisms, so don't read this comment and assume the boot tape
+/// works the same way.
 ///
 /// Format is `<iso8601> <line>\n` so the file can be piped through
 /// `grep` / `awk` and copied into a bug report without reformatting.
