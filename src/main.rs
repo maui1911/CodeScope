@@ -122,6 +122,17 @@ fn main() -> Result<()> {
             .open(&cur);
     }
     write_boot_phase(&paths, "main:enter");
+    // Log the full argv as a separate phase so the next time the
+    // post-update crash shows up we can tell *what* Update.exe
+    // passed in. The `--veloapp-updated` flag triggers velopack's
+    // unconditional `exit(0)` (see `velopack_bridge::run_startup_hooks`
+    // for the workaround) — knowing the actual argv on a fresh
+    // failure lets us tell that case from any future surprise flag
+    // we don't yet handle. One line per launch, no PII.
+    {
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        write_boot_phase(&paths, &format!("main:argv {argv:?}"));
+    }
 
     // Resize-cascade diagnostic tape. PR #218/#219 fixed the
     // bounds-observer half of the cascade but the user-reported
