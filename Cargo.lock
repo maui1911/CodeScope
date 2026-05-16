@@ -948,7 +948,7 @@ dependencies = [
 
 [[package]]
 name = "codescope-rs"
-version = "0.3.0-rc.10"
+version = "0.3.0-rc.11"
 dependencies = [
  "anyhow",
  "codescope-core",
