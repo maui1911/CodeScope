@@ -2415,7 +2415,15 @@ impl Sidebar {
             self.select(idx, cx);
             return;
         }
-        let project = Project::new(path);
+        let mut project = Project::new(path);
+        // If the user already has worktrees on disk for this repo
+        // (typical for anyone who adds a project they've been working
+        // in for a while), pull them into the project record now so
+        // they show up in the sidebar immediately. Swallows errors —
+        // a non-git folder, missing `git` binary, or a permission
+        // hiccup just lands the project with its primary row alone,
+        // matching the pre-existing behaviour.
+        project.adopt_existing_worktrees();
         let new_id = project.id.clone();
         // Clone-then-save: failure leaves `self.projects` untouched.
         let mut next = self.projects.clone();

@@ -104,6 +104,46 @@ impl Project {
             .clone()
             .unwrap_or_else(|| format!("{}.worktrees", self.path))
     }
+
+    /// Discover existing git worktrees under this project's primary
+    /// `path` and adopt any that aren't already tracked in
+    /// `self.worktrees`. Errors (path isn't a git repo, `git` missing,
+    /// path doesn't exist on disk, etc.) are swallowed — the project
+    /// still ends up added with just its primary row, same as before.
+    ///
+    /// Called once at project-add time so users who already have
+    /// worktrees on disk see them in the sidebar immediately, without
+    /// having to re-register each one through the "New worktree"
+    /// dialog. Idempotent: re-running on an already-up-to-date
+    /// project is a no-op via path-equality dedup.
+    ///
+    /// Primary worktree (the one git's porcelain marks first) is
+    /// skipped — `Project::new` already seeded that row; the branch
+    /// backfill is the `WorktreeStatusPoller`'s job, not ours.
+    pub fn adopt_existing_worktrees(&mut self) {
+        let Ok(found) = crate::git::list_worktrees(Path::new(&self.path)) else {
+            return;
+        };
+        for info in found {
+            if info.is_primary {
+                continue;
+            }
+            let needle = normalise_project_path(&info.path);
+            if self
+                .worktrees
+                .iter()
+                .any(|wt| normalise_project_path(&wt.path) == needle)
+            {
+                continue;
+            }
+            self.worktrees.push(Worktree {
+                id: uuid::Uuid::new_v4().to_string(),
+                path: info.path,
+                branch: info.branch,
+                is_primary: false,
+            });
+        }
+    }
 }
 
 /// Rename a project's display name. Mirrors C# `SessionStore.RenameProjectAsync`
@@ -315,6 +355,77 @@ pub fn normalise_project_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::no_window_command;
+
+    /// Skip-aware test helper — initialises a real git repo under a
+    /// tempdir and runs an empty seed commit so HEAD is real. Returns
+    /// `None` when `git` isn't on PATH so a CI image without git in
+    /// scope still goes green (same convention as `core::git::tests`).
+    fn init_repo_with_commit() -> Option<(tempfile::TempDir, std::path::PathBuf)> {
+        if no_window_command("git").arg("--version").output().is_err() {
+            eprintln!("skipping: `git` not on PATH");
+            return None;
+        }
+        let dir = tempfile::tempdir().ok()?;
+        let repo = dir.path().join("repo");
+        // Pre-create the default worktree root so `git worktree add`
+        // doesn't have to (it errors on a missing parent dir).
+        let worktrees_root = dir.path().join("repo.worktrees");
+        std::fs::create_dir_all(&repo).ok()?;
+        std::fs::create_dir_all(&worktrees_root).ok()?;
+        for args in [
+            &["-c", "init.defaultBranch=main", "init", "-q"][..],
+            &["config", "user.email", "test@example.invalid"][..],
+            &["config", "user.name", "Test"][..],
+            &["commit", "--allow-empty", "-m", "init", "-q"][..],
+        ] {
+            let out = no_window_command("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+        }
+        Some((dir, repo))
+    }
+
+    #[test]
+    fn adopt_existing_worktrees_picks_up_non_primary_rows() {
+        let Some((_guard, repo)) = init_repo_with_commit() else {
+            return;
+        };
+        let wt_path = repo.parent().unwrap().join("repo.worktrees").join("feat-x");
+        crate::git::add_worktree(&repo, &wt_path, "feat/x", None)
+            .expect("git worktree add succeeds");
+
+        let mut project = Project::new(repo.to_string_lossy().to_string());
+        assert_eq!(project.worktrees.len(), 1, "fresh project = primary only");
+
+        project.adopt_existing_worktrees();
+        assert_eq!(project.worktrees.len(), 2, "feat/x should be adopted");
+        let feat = &project.worktrees[1];
+        assert!(!feat.is_primary, "discovered worktree is non-primary");
+        assert!(feat.path.ends_with("feat-x"), "path: {}", feat.path);
+        assert_eq!(feat.branch.as_deref(), Some("feat/x"));
+        assert!(!feat.id.is_empty() && feat.id != "primary", "real uuid id");
+
+        // Idempotent: a second call must not duplicate the entry.
+        project.adopt_existing_worktrees();
+        assert_eq!(project.worktrees.len(), 2, "second pass no-ops");
+    }
+
+    #[test]
+    fn adopt_existing_worktrees_swallows_non_git_path() {
+        // Path that isn't a git repo at all — must not panic, must not
+        // mutate the worktrees list.
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = Project::new(dir.path().to_string_lossy().to_string());
+        let before = project.worktrees.len();
+        project.adopt_existing_worktrees();
+        assert_eq!(project.worktrees.len(), before, "no change on non-git path");
+    }
 
     #[test]
     fn missing_file_yields_empty_config() {
