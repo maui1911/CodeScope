@@ -3998,17 +3998,32 @@ impl AppShell {
                             .children(action.map(|a| {
                                 let kind = a.kind;
                                 let label = a.label.clone();
+                                // Match the empty-state primary CTA: solid
+                                // accent fill with `gpui::black()` text +
+                                // SEMIBOLD so the call to action reads
+                                // cleanly on the accent — the previous
+                                // `ink` foreground was a near-white that
+                                // washed out against the accent fill in
+                                // most themes. Subtle l-bump on hover (same
+                                // formula `empty_state.rs` uses for
+                                // `accent_hover`) keeps the affordance.
+                                let accent = theme::accent(theme);
+                                let accent_hover = gpui::Hsla {
+                                    l: (accent.l + 0.08).min(1.0),
+                                    ..accent
+                                };
                                 div().pt_2().child(
                                     div()
                                         .id(("toast-action", id))
                                         .px_3()
                                         .py_1p5()
                                         .rounded_sm()
-                                        .bg(accent_clean)
-                                        .text_color(ink)
+                                        .bg(accent)
+                                        .text_color(gpui::black())
                                         .text_size(px(12.0))
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
                                         .cursor_pointer()
-                                        .hover(move |s| s.opacity(0.85))
+                                        .hover(move |s| s.bg(accent_hover))
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(move |this, _, window, cx| {
