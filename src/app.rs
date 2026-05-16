@@ -5484,19 +5484,18 @@ impl AppShell {
             expires_at: Some(Instant::now() + lifetime),
             action: None,
         });
-        while self.toasts.len() > TOAST_VISIBLE_CAP {
-            self.toasts.pop_back();
-        }
+        self.evict_toasts_to_cap();
         cx.notify();
     }
 
     /// Push a *persistent* toast carrying an action affordance. The
     /// auto-dismiss task leaves these alone (`expires_at: None`); the
     /// toast stays until the user clicks the action or the dismiss
-    /// "×". Cap-eviction still applies — a flurry of regular toasts
-    /// could push a persistent one off the back, but that's bounded
-    /// by `TOAST_VISIBLE_CAP` and the persistent kinds we have today
-    /// are re-emitted on the next update-check tick anyway.
+    /// "×". Cap-eviction prefers non-persistent toasts (see
+    /// [`Self::evict_toasts_to_cap`]) so a flurry of regular toasts
+    /// can't push the action affordance — and its stashed
+    /// `staged_update` — off the back and leave the user without a
+    /// way to install until the next 3-hour poll.
     fn push_action_toast(
         &mut self,
         kind: ToastKind,
@@ -5515,10 +5514,29 @@ impl AppShell {
             expires_at: None,
             action: Some(action),
         });
-        while self.toasts.len() > TOAST_VISIBLE_CAP {
-            self.toasts.pop_back();
-        }
+        self.evict_toasts_to_cap();
         cx.notify();
+    }
+
+    /// Trim the visible-toast deque down to [`TOAST_VISIBLE_CAP`],
+    /// preferring **non-persistent** toasts as the eviction victim.
+    /// Only when every survivor is persistent do we fall back to
+    /// dropping the oldest persistent toast — that's the
+    /// degenerate "more action offers than visible slots" case
+    /// which doesn't exist today (only one persistent kind ships).
+    /// Closes a Copilot review on PR #232: without this preference
+    /// a burst of regular toasts could push the staged-update
+    /// action off the back, stranding `staged_update = Some` with
+    /// no UI affordance until the next 3-hour poll re-emits.
+    fn evict_toasts_to_cap(&mut self) {
+        while self.toasts.len() > TOAST_VISIBLE_CAP {
+            let victim_idx = self
+                .toasts
+                .iter()
+                .rposition(|t| t.expires_at.is_some())
+                .unwrap_or(self.toasts.len() - 1);
+            self.toasts.remove(victim_idx);
+        }
     }
 
     /// Walk every adopted-agent tab, diff its current telemetry state
