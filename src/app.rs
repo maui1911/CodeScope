@@ -2220,6 +2220,12 @@ impl AppShell {
         let group_count = self.groups.len();
         let mut active_by_group: Vec<Option<usize>> = vec![None; group_count];
         let mut spawned_any = false;
+        // `(session_id, resolved_agent_id)` pairs to backfill into
+        // projects.json after the loop. Populated only when a
+        // rehydrated row had `agent_id = None` and we rescued it via
+        // `settings.default_agent` — see the loop body for context.
+        // Empty in the steady state once all legacy rows are healed.
+        let mut pending_backfills: Vec<(String, String)> = Vec::new();
 
         // Suppress per-spawn `save_layout` writes while the loop runs;
         // we flush a single complete snapshot at the end. Without this,
@@ -2251,14 +2257,32 @@ impl AppShell {
             // after the loop.
             self.focused_group = group_idx;
 
+            // Legacy / pre-PR-#223 rows come back with `agent_id =
+            // None` (the spawn side started stamping the id only
+            // after that fix). Falling back to a plain shell there
+            // is the "1 of my Claude tabs rehydrated as PowerShell"
+            // bug reported on rc.11. Mirror `reopen_session`: rescue
+            // via `settings.default_agent` so the tab resumes as the
+            // configured agent. The backfill list below pushes the
+            // resolved id back into projects.json so the next boot
+            // skips the fallback entirely.
+            let resolved_agent_id: Option<String> = entry
+                .agent_id
+                .clone()
+                .or_else(|| default_agent_launch_for(&self.settings).map(|(id, _)| id.to_string()));
+            if entry.agent_id.is_none()
+                && let Some(id) = resolved_agent_id.clone()
+            {
+                pending_backfills.push((entry.session_id.clone(), id));
+            }
+
             // Resume-by-id when we have an agent + its session UUID.
             // `build_resume_auto_type` returns `claude --resume <id>` /
             // `pi --session <id>` / `copilot --resume=<id>` depending on
             // the agent profile. Falls back to the agent's "most recent"
             // resume args when the persisted `agent_session_id` is
             // missing, and to `None` for plain shells.
-            let agent_profile = entry
-                .agent_id
+            let agent_profile = resolved_agent_id
                 .as_deref()
                 .and_then(|aid| self.agent_registry.get_by_id(aid));
             let auto: Option<SharedString> = agent_profile
@@ -2301,14 +2325,14 @@ impl AppShell {
                 Some(path),
                 Some(title),
                 auto,
-                // Rehydrate path: the persisted row already carries
-                // the `agent_id` we want (or `None` for legacy
-                // pre-fix rows / plain-shell sessions), and
-                // `restore_session_id = Some` short-circuits the
-                // `allocate_session_id` persistence branch entirely
-                // — projects.json is the source of truth, this
-                // arg is ignored once `restore_session_id` is set.
-                entry.agent_id.clone().map(SharedString::from),
+                // Rehydrate path: pass `resolved_agent_id` so the
+                // in-memory tab state knows which agent it's running,
+                // even when projects.json still carries the legacy
+                // `agent_id: null`. `restore_session_id = Some`
+                // short-circuits the `allocate_session_id`
+                // persistence branch — the disk-side backfill goes
+                // through the `pending_backfills` flush below.
+                resolved_agent_id.clone().map(SharedString::from),
                 Some(entry.session_id.clone()),
                 window,
                 cx,
@@ -2325,6 +2349,35 @@ impl AppShell {
         // need to clear this — otherwise a later user action would
         // silently no-op every save_layout.
         self.suppress_layout_save = false;
+
+        // Heal legacy `agent_id = None` rows we rescued via the
+        // default-agent fallback. One disk write per rehydrate
+        // covers every row at once; subsequent boots skip the
+        // fallback because the row now carries the resolved id.
+        if !pending_backfills.is_empty() {
+            let mut changed = false;
+            for (sid, aid) in &pending_backfills {
+                match codescope_core::SessionManager::update_agent_id(
+                    &mut self.projects,
+                    sid,
+                    Some(aid),
+                ) {
+                    Ok(true) => changed = true,
+                    Ok(false) => {}
+                    Err(err) => {
+                        eprintln!(
+                            "warning: failed to backfill agent_id on rehydrate \
+                             (session {sid}): {err:#}"
+                        );
+                    }
+                }
+            }
+            if changed
+                && let Err(err) = self.projects.save(&self.paths)
+            {
+                eprintln!("warning: failed to persist rehydrate backfill: {err:#}");
+            }
+        }
 
         if !spawned_any {
             // Every live session's worktree was missing — leave the
@@ -2790,6 +2843,24 @@ impl AppShell {
                 return;
             }
         };
+        // Legacy / pre-PR-#223 rows come back with `agent_id = None`
+        // even though the user has been running them as Claude. The
+        // launch-side fallback below picks `settings.default_agent` so
+        // the tab still resumes correctly; mirror that decision into
+        // the persisted row so the next cold-start rehydrate doesn't
+        // need the same rescue. New rows already carry their own
+        // `agent_id` so this no-ops (`update_agent_id` is idempotent).
+        let backfill_agent_id: Option<String> = if restored.agent_id.is_none() {
+            default_agent_launch_for(&self.settings).map(|(id, _)| id.to_string())
+        } else {
+            None
+        };
+        if let Some(id) = backfill_agent_id.as_deref()
+            && let Err(err) =
+                SessionManager::update_agent_id(&mut self.projects, &session_id, Some(id))
+        {
+            eprintln!("warning: failed to backfill agent_id on reopen: {err:#}");
+        }
         if let Err(err) = self.projects.save(&self.paths) {
             eprintln!("warning: failed to persist session reopen: {err:#}");
         }

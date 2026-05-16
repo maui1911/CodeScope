@@ -411,6 +411,33 @@ impl SessionManager {
         Err(anyhow!("session '{session_id}' not found"))
     }
 
+    /// Backfill `agent_id` on a persisted session row. Returns `true`
+    /// when the value changed, `false` when it already matched (idempotent).
+    ///
+    /// Used by the cold-rehydrate + reopen fallback paths to repair
+    /// legacy rows that were persisted before the spawn-side started
+    /// stamping `agent_id` (pre-PR-#223). When such a row is resumed
+    /// under `settings.default_agent`, this writes the resolved id back
+    /// so the next boot doesn't need the fallback again. Mirrors the
+    /// shape of [`Self::update_agent_session_id`].
+    pub fn update_agent_id(
+        cfg: &mut ProjectsConfig,
+        session_id: &str,
+        agent_id: Option<&str>,
+    ) -> Result<bool> {
+        for project in cfg.projects.iter_mut() {
+            if let Some(s) = project.sessions.iter_mut().find(|s| s.id == session_id) {
+                let next = agent_id.map(|x| x.to_string());
+                if s.agent_id == next {
+                    return Ok(false);
+                }
+                s.agent_id = next;
+                return Ok(true);
+            }
+        }
+        Err(anyhow!("session '{session_id}' not found"))
+    }
+
     /// Lenient discovery-callback entry point: stamp `agent_session_id`
     /// on the session whose CodeScope id is `session_id`, returning
     /// `false` instead of erroring when the session id isn't found.
@@ -936,6 +963,41 @@ mod tests {
         SessionManager::rename(&mut cfg, "s1", Some("Re")).unwrap();
         SessionManager::rename(&mut cfg, "s1", None).unwrap();
         assert!(cfg.projects[0].sessions[0].display_name.is_none());
+    }
+
+    #[test]
+    fn update_agent_id_backfills_and_is_idempotent() {
+        // A legacy row with `agent_id = None` (pre-PR-#223 spawn-side
+        // bug) must accept a backfill. Calling again with the same
+        // value reports `false` so the caller can skip the save. A
+        // follow-up with `None` clears it back.
+        let mut cfg = ProjectsConfig::default();
+        let mut p = make_project("p1");
+        p.sessions.push(make_session("legacy", None));
+        cfg.projects.push(p);
+        assert!(cfg.projects[0].sessions[0].agent_id.is_none());
+
+        let changed = SessionManager::update_agent_id(&mut cfg, "legacy", Some("claude")).unwrap();
+        assert!(changed);
+        assert_eq!(
+            cfg.projects[0].sessions[0].agent_id.as_deref(),
+            Some("claude"),
+        );
+
+        let changed = SessionManager::update_agent_id(&mut cfg, "legacy", Some("claude")).unwrap();
+        assert!(!changed, "no-op write must not report a change");
+
+        let changed = SessionManager::update_agent_id(&mut cfg, "legacy", None).unwrap();
+        assert!(changed);
+        assert!(cfg.projects[0].sessions[0].agent_id.is_none());
+    }
+
+    #[test]
+    fn update_agent_id_unknown_session_errors() {
+        let mut cfg = ProjectsConfig::default();
+        cfg.projects.push(make_project("p1"));
+        let err = SessionManager::update_agent_id(&mut cfg, "ghost", Some("claude")).unwrap_err();
+        assert!(err.to_string().contains("ghost"));
     }
 
     #[test]
