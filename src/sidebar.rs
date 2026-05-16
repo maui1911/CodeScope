@@ -268,6 +268,17 @@ pub enum SidebarEvent {
         /// the worktree menu's "Open session" row, both of which
         /// would otherwise pile up a duplicate tab on every click.
         force_new: bool,
+        /// When `true`, AppShell must spawn a plain shell tab — skip
+        /// the `(agent_id=None, auto_type=None) → default_agent_launch_for`
+        /// fallback in the `OpenSession` handler. Used by the
+        /// submenu's explicit "Shell" row so a user with a default
+        /// agent configured still gets a bare terminal when they
+        /// click Shell. Implicit-shell paths (`force_new: false`
+        /// row clicks, new-worktree dialog auto-spawn, no-default-
+        /// agent parent-row fallback) leave this `false` so they
+        /// keep the historical "let AppShell pick a sensible
+        /// default" behaviour.
+        force_shell: bool,
     },
     /// Surface a status notification to the user. The sidebar emits
     /// these from menu actions (pull / fetch / open remote / discard)
@@ -2981,6 +2992,7 @@ impl Render for Sidebar {
                                     auto_type,
                                     agent_id,
                                     force_new: false,
+                                    force_shell: false,
                                 });
                             } else {
                                 this.select(project_idx_for_menu, cx);
@@ -3791,6 +3803,7 @@ impl Sidebar {
                             auto_type: Some(cmd.into()),
                             agent_id: default_id.clone().map(SharedString::from),
                             force_new: true,
+                            force_shell: false,
                         });
                         this.close_menu(cx);
                     } else {
@@ -3803,6 +3816,7 @@ impl Sidebar {
                             auto_type: None,
                             agent_id: None,
                             force_new: true,
+                            force_shell: false,
                         });
                         this.close_menu(cx);
                     }
@@ -3926,6 +3940,7 @@ impl Sidebar {
                             auto_type: cmd.clone().map(SharedString::from),
                             agent_id: Some(agent_id_str.clone()),
                             force_new: true,
+                            force_shell: false,
                         });
                         this.close_menu(cx);
                     }),
@@ -3952,6 +3967,52 @@ impl Sidebar {
             }
             first = false;
         }
+
+        // Plain-shell fallback row. Agents above are the primary
+        // actions; this row is for "I just want a terminal here, no
+        // agent." Separated by a divider so the visual grouping
+        // matches: default → other agents → shell.
+        //
+        // Pre-cutover the only way to reach a plain shell from this
+        // menu was clicking the parent row with no default agent
+        // configured (`build_new_session_parent_row`'s `None` branch
+        // emits `auto_type: None`). Users with a default agent had
+        // no surfaced path. Explicit row removes the trap.
+        let shell_path = PathBuf::from(worktree_path);
+        let shell_title = SharedString::from(format!("{title_prefix} · shell"));
+        let frost_hover = frost;
+        let shell_row = div()
+            .id(SharedString::from("submenu-new-shell"))
+            .h(px(28.0))
+            .px_3()
+            .flex()
+            .flex_row()
+            .items_center()
+            .text_size(px(12.5))
+            .text_color(ink_dim)
+            .cursor_pointer()
+            .hover(move |s| s.bg(frost_hover).text_color(ink))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(SidebarEvent::OpenSession {
+                        working_directory: shell_path.clone(),
+                        title: shell_title.clone(),
+                        auto_type: None,
+                        agent_id: None,
+                        force_new: true,
+                        // Explicit shell intent — bypass AppShell's
+                        // `(None, None) → default_agent_launch_for`
+                        // fallback so a user with a default agent
+                        // configured still gets a bare terminal.
+                        force_shell: true,
+                    });
+                    this.close_menu(cx);
+                }),
+            )
+            .child(div().flex_grow().child("Shell"));
+        body = body.child(div().h_px().bg(divider).my_1()).child(shell_row);
 
         body.into_any_element()
     }
@@ -4404,6 +4465,7 @@ impl Sidebar {
                             auto_type: None,
                             agent_id: None,
                             force_new: false,
+                            force_shell: false,
                         });
                         this.close_menu(cx);
                     }),

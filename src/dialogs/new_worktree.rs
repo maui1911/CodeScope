@@ -557,6 +557,7 @@ impl Sidebar {
                         auto_type: None,
                         agent_id: None,
                         force_new: true,
+                        force_shell: false,
                     });
                 }
             }
