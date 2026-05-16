@@ -692,6 +692,34 @@ impl TerminalView {
     /// Stage a resize request. Cheap — the actual call into the
     /// backend happens later, in [`Self::apply_resize`], when the
     /// request has been stable for [`RESIZE_DEBOUNCE`].
+    ///
+    /// **`set_at` is preserved when the staged target is unchanged.**
+    /// Canvas-layout runs on every render tick, not only when bounds
+    /// shift — a blinking cursor, fresh terminal output, or any
+    /// sibling-driven entity notify will re-fire layout against the
+    /// (now-mismatching-with-`last_size`) bounds. The old code
+    /// unconditionally reset `set_at = Instant::now()` on every call,
+    /// so the polling task's `set_at.elapsed() >= RESIZE_DEBOUNCE`
+    /// check never tripped while the entity was being re-rendered
+    /// for any other reason: a 5.8 MB diagnostic tape captured
+    /// 38 308 staged calls against just 59 successful `apply_resize`
+    /// runs (650 : 1) — `last_size` stayed stale, the canvas-layout
+    /// `diff` check stayed `true` forever, and `Backend::resize`
+    /// never fired so the terminal grid never picked up the new
+    /// window / splitter size. User-reported on rc.10
+    /// (`cargo run --release`): resize the window or drag the
+    /// splitter and the terminal pane stays at its pre-transition
+    /// size until you tab-swap.
+    ///
+    /// Fix: when the currently-staged request already targets the
+    /// same `(cols, rows)`, leave its `set_at` alone so the
+    /// debounce window can actually elapse. A *different* target
+    /// (the user is still dragging the window edge / splitter)
+    /// still resets the timer — that's the original "don't apply
+    /// mid-drag" invariant the debounce was built for. Once
+    /// `apply_resize` runs, `last_size` updates, the canvas-layout
+    /// `diff` flips to `false`, and `maybe_resize` stops being
+    /// called from idle re-renders.
     fn maybe_resize(&self, cols: u16, rows: u16, _cx: &mut Context<Self>) {
         if cols == 0 || rows == 0 {
             return;
@@ -703,11 +731,22 @@ impl TerminalView {
             self.pending_size.lock().take();
             return;
         }
-        *self.pending_size.lock() = Some(PendingResize {
-            cols,
-            rows,
-            set_at: Instant::now(),
-        });
+        let mut pending = self.pending_size.lock();
+        match pending.as_mut() {
+            Some(req) if req.cols == cols && req.rows == rows => {
+                // Same target already pending — let the existing
+                // `set_at` age toward `RESIZE_DEBOUNCE` instead of
+                // resetting it every idle re-render. See the doc
+                // comment above for why this matters.
+            }
+            _ => {
+                *pending = Some(PendingResize {
+                    cols,
+                    rows,
+                    set_at: Instant::now(),
+                });
+            }
+        }
     }
 
     /// Actually call `Backend::resize` and refresh the snapshot. Driven
