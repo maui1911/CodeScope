@@ -36,6 +36,14 @@ Snap a worktree into its own workspace with `Ctrl+\`. Two agents, side by side, 
 
 ![Overview grid](docs/screenshots/overview.png)
 
+### Paste screenshots straight into the prompt
+
+`Ctrl+V` of a clipboard image stores the bytes under `<worktree>/.codescope/attachments/<timestamp>-<hash>.<ext>` and pastes the slash-normalized relative path into the focused terminal — so any agent that accepts a file path (Claude, Codex, OpenCode, …) ingests it without you switching to a file dialog. The path is git-ignored automatically via `.git/info/exclude`, so screenshots don't leak into commits.
+
+### Themes
+
+Six built-ins selectable from the settings dialog (`Ctrl+Shift+,`): `codescope-default`, `vs-code-dark`, `one-dark`, `solarized-dark`, `tokyo-night`, `light`. Live-applied to chrome and the in-tree terminal. Persisted as the `theme` key in `settings.json`, so hand-editing works too.
+
 ### Also in the box
 
 - **Sidebar tree** — Projects → Worktrees → Sessions, drag-and-drop to add a project, F2 to rename.
@@ -61,6 +69,7 @@ Grab the latest release from the [**Releases page**](https://github.com/maui1911
 
 - `git` on `PATH`
 - At least one agent CLI on `PATH` (`claude`, `codex`, `copilot`, `opencode`, `pi`, etc.)
+- **Windows only:** PowerShell 7+ (`pwsh.exe`) on `PATH`. CodeScope spawns `pwsh.exe` for every terminal tab and for the `-Command "& { <agent> }"` wrapper that auto-types the agent CLI — legacy `powershell.exe` (Windows PowerShell 5.1) is not used. Override with the `CODESCOPE_SHELL` env var if you want a different shell.
 
 > **No Rust toolchain needed** — the release is self-contained.
 
@@ -99,6 +108,7 @@ For installer / Velopack packaging see `.github/workflows/release.yml`.
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
 | `Ctrl+1`…`Ctrl+9` | Jump to tab by index |
 | `Ctrl+K`, `Ctrl+Shift+P` | Command palette |
+| `Ctrl+Shift+,` | Open settings (theme, font, cursor, default agent) |
 | `Ctrl+Shift+O` | Toggle overview |
 | `Ctrl+F` | Focus sidebar filter |
 | `Ctrl+Shift+Enter` | Open selected worktree in a new group |

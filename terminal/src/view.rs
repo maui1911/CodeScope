@@ -935,8 +935,16 @@ pub(crate) fn is_app_level_shortcut(key: &str, mods: &gpui::Modifiers) -> bool {
         return true;
     }
     // Ctrl+Shift+, — open Settings. Plain Ctrl+, stays with the
-    // terminal in case the agent / shell has bound it.
+    // terminal in case the agent / shell has bound it. Accept both
+    // shapes: bare `","` with shift (non-US / non-Windows) and
+    // US-Windows folded `"<"` with shift cleared — gpui's Windows
+    // adapter folds shifted punctuation the same way it folds
+    // shifted digits. Without the second arm the chord is lost
+    // because the bubble-up check never matches.
     if key == "," && mods.shift {
+        return true;
+    }
+    if key == "<" && !mods.shift {
         return true;
     }
     // Ctrl+Shift+G — open active tab's worktree remote in browser.
@@ -1264,11 +1272,26 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_comma_bubbles_for_settings() {
-        // Only the shifted form opens Settings — plain Ctrl+, may
-        // be bound inside the terminal by user tooling.
+    fn ctrl_shift_comma_bubbles_in_both_keystroke_shapes() {
+        // Ctrl+Shift+, opens the Settings dialog. gpui surfaces the
+        // chord in two shapes depending on platform / layout — both
+        // must bubble or the chord silently doesn't work on US
+        // Windows (the most common install):
+        //
+        //   - bare `","` with `mods.shift` set (non-US layouts, most
+        //     non-Windows platforms)
+        //   - US-Windows folded `"<"` with shift cleared (same
+        //     folding the Windows adapter does for shifted digits →
+        //     `!@#$%^&*(`)
         assert!(is_app_level_shortcut(",", &ctrl_shift()));
+        assert!(is_app_level_shortcut("<", &ctrl()));
+        // Plain Ctrl+, stays with the terminal in case the agent /
+        // shell has bound it. Plain `<` with shift still set is the
+        // "non-folding layout sent the shifted character anyway"
+        // edge case — also stays with the terminal so we don't
+        // double-fire.
         assert!(!is_app_level_shortcut(",", &ctrl()));
+        assert!(!is_app_level_shortcut("<", &ctrl_shift()));
     }
 
     #[test]

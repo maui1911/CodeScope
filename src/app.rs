@@ -6106,8 +6106,20 @@ impl AppShell {
                     self.open_command_palette(window, cx);
                 }
             }
-            // Ctrl+Shift+, opens the Settings dialog.
+            // Ctrl+Shift+, opens the Settings dialog. Accepts both
+            // keystroke shapes gpui surfaces: bare `","` with
+            // `mods.shift` set (non-US layouts, most non-Windows
+            // platforms) and the US-Windows folded glyph `"<"` with
+            // shift cleared (the Windows adapter folds shifted
+            // punctuation the same way it folds shifted digits to
+            // `!@#$%^&*(` — see `keystroke_digit_index`). Without the
+            // second arm the chord silently doesn't fire on the most
+            // common Windows install.
             "," if mods.shift => {
+                cx.stop_propagation();
+                self.open_settings_dialog(window, cx);
+            }
+            "<" if !mods.shift => {
                 cx.stop_propagation();
                 self.open_settings_dialog(window, cx);
             }
