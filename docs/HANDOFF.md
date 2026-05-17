@@ -25,13 +25,226 @@
 > `.github/workflows/release.yml` (was `rs--release.yml`) and now
 > triggers on plain `v*` tags.
 
-**Last updated:** 2026-05-14 (session 43 — first post-cutover bug-fix release, sidebar halo centering + v0.3.0-rc.8 cut)
+**Last updated:** 2026-05-17 (session 44 — update-UX overhaul: rehydrate fallback, toast-gated apply, README features, Ctrl+Shift+, repair, velopack startup auto-apply disabled; v0.3.0-rc.12 → rc.14 cut)
 **Branch:** `main`
-**Head:** `f1332f6` (chore: bump version to 0.3.0-rc.8, #214)
-**Release:** `v0.3.0-rc.8` tagged and published. Release workflow run `25859204689` all 8 jobs green; Velopack feeds published for all four platforms (`releases.{win,osx-arm64,osx-x64,linux-x64}.json` + matching `-Setup.exe` / `.app.zip` / `.AppImage` / nupkgs). First release that actually exercises the new `codescope` pack id auto-update path end-to-end (rc.7 → rc.8 delta nupkg present in the release).
-**Build status:** ✅ `cargo build --workspace` clean. Tests: 470 core + 135 bin + 28 terminal + 1 doctest = **634 total**, all passing (unchanged — session 43 was a one-line layout fix with no test surface to add).
-**Uncommitted work:** none — every change shipped through PR #213 / #214.
+**Head:** `97ceb81` (fix(updates): disable velopack startup auto-apply, #236)
+**Release:** `v0.3.0-rc.14` re-tagged after the original rc.14 pipeline was cancelled mid-flight (the toast gate from #232 was found to leave velopack's startup auto-apply uncovered; #236 closes it). Run `25985078811` re-publishing now; rc.11/rc.12/rc.13 also published earlier this session via runs on the same workflow.
+**Build status:** ✅ `cargo build --workspace` clean. Tests: 484 core + 127 bin + 28 terminal + 1 doctest = **640 total**, all passing (+6 from session 43 — new `update_agent_id` idempotency tests in core, dual-shape `Ctrl+Shift+,` keystroke test in terminal, and the rest distributed across the touched modules).
+**Uncommitted work:** none — every change shipped through PRs #230–#236.
 **Open issues:** none checked this run.
+
+### Session 44 — update-UX overhaul + a pile of small rc bumps (rc.12 → rc.14)
+
+The user reported that auto-update "still crashes the entire app" on
+rc.11. The session dug into what that actually meant, fixed a couple
+of latent rehydrate bugs along the way, and ended with the update
+flow gated entirely behind a user-clickable toast.
+
+**Two priors from the session, before the update-flow work:**
+
+- **PR #230 (`8c15843`) — rehydrate legacy null `agent_id` rows as the
+  default agent.** Pre-PR-#223 spawn-side never persisted `agent_id`
+  on the `Session` row, so rows from before that fix came back with
+  `agent_id: null` even when the user had been running them as
+  Claude. `reopen_session` already rescued those rows via
+  `settings.default_agent` (`src/app.rs:2877`); the cold-start
+  rehydrate path did not, so a fresh restart turned the legacy rows
+  into generic shells. Mirrors the fallback into
+  `rehydrate_or_cold_start`. Plus a disk-side backfill: when the row
+  also has an `agent_session_id` (positive evidence it was an agent
+  row), the resolved id is written back into `projects.json` so the
+  next boot doesn't need the fallback. New
+  `SessionManager::update_agent_id` helper in
+  `core/src/session.rs` alongside the existing
+  `update_agent_session_id`. Copilot flagged the backfill was firing
+  on rows that could legitimately be plain shells — fix gated the
+  persistence on `agent_session_id.is_some()` (the launch-side
+  fallback was left ungated; matches PR #223 reopen behaviour and
+  consistent with the "we have positive evidence" rule).
+- **PR #231 (`6e34952`) — bump 0.3.0-rc.12.** Cargo.toml +
+  Cargo.lock + a one-line changelog in the PR body. Release `25925…`
+  green across all four platforms.
+
+**The "update crashed CodeScope" investigation.** The user installed
+rc.12 via auto-update from rc.11 and reported the same crash. The
+boot tape from PR #225 paid off: `boot.prev.log` showed only
+`main:enter` + `velopack:run_startup_hooks:enter`, dying silently
+inside `VelopackApp::run()` without producing a `crash.log` (so not
+a Rust panic).
+
+Reproduced locally by launching the installed exe with
+`CODESCOPE_DEV=1 codescope-rs.exe --veloapp-updated 0.3.0-rc.99`
+(dev path keeps the mutex separate from the running install). Same
+two-line boot.log, same silent exit within ~225 ms. Root cause:
+velopack-rs's `call_fast_hook` unconditionally calls `exit(0)` after
+the hook segment — even when no hook is registered — and `Update.exe`
+relaunches the new exe with `--veloapp-updated` /
+`--veloapp-install` flags after applying an update.
+
+Two further passes nailed down the real flow. First an attempted
+"strip the flag from velopack's argv" fix on branch
+`fix/velopack-updated-flag-strip` (later reverted before merging) —
+would have made `Update.exe`'s 30 s hook-completion timeout kill us,
+turning the brief flicker into a 30 s frozen window. Then a sandbox
+test against the real `Update.exe` with `--verbose --log` finally
+showed the full sequence:
+
+```
+1. Extract new package        (~100 ms)
+2. Run --veloapp-obsolete hook on current exe   (~225 ms, exit(0))
+3. Backup + replace files                       (~300 ms)
+4. Run --veloapp-updated hook on new exe        (~225 ms, exit(0))
+5. Setting env VELOPACK_RESTART=true
+6. Launch new exe normally                      → window opens
+```
+
+So Update.exe **does** do the normal launch after the hook
+short-exits — there's no actual crash, just the rc.11 process
+vanishing on `apply_updates_and_restart` (an instant `exit(0)`) with
+~1 s of dead time before step 6's window appears. The user's
+bell-popover toast literally promised *"Restart CodeScope when
+prompted to install"*, but the prompt never came; the apply just
+happened.
+
+**PR #232 (`9ea3bec`) — gate auto-apply behind an actionable toast.**
+Makes the toast match its own promise. The download flow
+(`stage_pending_update` on the background executor) is unchanged;
+the `apply_staged` call no longer fires automatically on `Ready`.
+Instead the `StagedUpdate` is stashed on `AppShell.staged_update`
+and a persistent toast appears: *"CodeScope X.Y.Z ready to install
+— [Install & restart]"*. No auto-dismiss. User clicks the action →
+`dispatch_toast_action` runs `apply_staged` on the main thread
+(still required — velopack-rs ends in `exit(0)`).
+
+Plumbing:
+- `Toast.expires_at: Option<Instant>` — `None` = persistent
+  (dismiss loop skips).
+- `Toast.action: Option<ToastAction>` + `ToastActionKind` enum so
+  the toast carries an opaque discriminator rather than a
+  cross-thread callback.
+- `AppShell.staged_update: Option<Box<StagedUpdate>>` — main-thread
+  ownership; the toast layer never touches the carrier.
+- `push_action_toast` builder for the actionable variant; existing
+  `push_toast` callers unchanged.
+- `dispatch_toast_action` matches on the action kind, calls
+  `apply_staged` for `ApplyStagedUpdate`. Surfaces an error toast
+  if the staged update was consumed by a concurrent poll.
+- `main.rs` now logs `env::args()` to `boot.log` so future
+  unexplained startup deaths show which flag (if any) `Update.exe`
+  passed in — caught the actual `--veloapp-install` flag in this
+  very session (see #236).
+
+Copilot review flagged that persistent action toasts were subject
+to FIFO cap eviction — a burst of regular toasts could push the
+update offer off the back while `staged_update = Some` remained
+set, stranding the user without the affordance until the next 3 h
+poll. Fix: pull eviction into `evict_toasts_to_cap`, pick the
+oldest non-persistent toast as the victim first
+(`rposition(expires_at.is_some())`), fall back to the oldest entry
+only when every survivor is persistent. Dismiss via "×" left
+unchanged — user picking dismiss = "not now"; the next poll
+re-emits naturally (the action toast still fires even though the
+bell-popover entry is suppressed by `last_announced_update`).
+
+UX detail: first cut of the toast action button used `bg(accent_clean)
++ text_color(ink)`. User screenshotted that the near-white label
+washed out against the accent fill on most themes. Mirror the
+empty-state primary CTA: `bg(accent)` + `gpui::black()` text +
+`SEMIBOLD` + same `+0.08` lightness hover formula. Verified visually
+via a temporary `CODESCOPE_DEV_FAKE_UPDATE_TOAST=1` env-gated trigger
+in `AppShell::new` (added then removed after the user confirmed).
+
+**PR #233 (`afb9e20`) — bump 0.3.0-rc.13.** Picks up #232.
+
+**PR #234 (`716f799`) — README features + repair Ctrl+Shift+, on US
+Windows.** Two threads in one PR because writing the keybinding
+into the README uncovered a real bug in it.
+
+README additions:
+- Windows-only requirement: PowerShell 7+ (`pwsh.exe`) on PATH —
+  the terminal layer (`src/app.rs:2980`, `:3349`) and the
+  agent-via-pwsh wrapper hard-code `pwsh.exe`; legacy
+  `powershell.exe` is never spawned. `CODESCOPE_SHELL` env var
+  overrides.
+- Feature blurb: `Ctrl+V` of a clipboard image stores bytes under
+  `<worktree>/.codescope/attachments/` and pastes the
+  slash-normalised relative path into the focused terminal.
+  Auto-excluded via `.git/info/exclude`.
+- Feature blurb: six built-in themes (`codescope-default`,
+  `vs-code-dark`, `one-dark`, `solarized-dark`, `tokyo-night`,
+  `light`) selectable from the settings dialog (`Ctrl+Shift+,`),
+  live-applied to chrome + the in-tree terminal.
+- `Ctrl+Shift+,` added to the keyboard shortcuts table.
+
+Keybinding fix: gpui's Windows adapter folds shifted punctuation
+the same way it folds shifted digits — `Shift+,` becomes `"<"` with
+`mods.shift` cleared (cf. the `keystroke_digit_index` /
+`!@#$%^&*(` precedent). The previous `key == "," && mods.shift`
+arm in both `src/app.rs:6110` and the terminal's
+`is_app_level_shortcut` (`terminal/src/view.rs:939`) therefore
+never matched: Ctrl+Shift+, silently went to the PTY instead of
+opening Settings. Added the folded shape (`"<"` with `!mods.shift`)
+as a second arm in both call sites, locked the dual-shape contract
+in a test mirroring `ctrl_shift_digit_bubbles_only_for_one_through_nine`.
+Existing single-shape `ctrl_shift_comma_bubbles_for_settings` test
+deleted to avoid asserting the same thing twice.
+
+**PR #235 (`92900fd`) — bump 0.3.0-rc.14.** Picks up #234.
+
+**PR #236 (`97ceb81`) — disable velopack startup auto-apply.**
+Caught while explaining the new flow to the user: PR #232 only
+gated the **poll → apply** path. velopack-rs's `VelopackApp::run()`
+has a separate auto-apply branch on startup (`velopack/src/app.rs:
+180-191`) that scans `<install>/packages/` for `version > current`
+and fires `apply_updates_and_restart` directly when `auto_apply ==
+true` (the default). So a user who closed the app between "toast
+appeared" and "I clicked Install & restart" would on next launch
+hit the silent auto-apply they thought they had opted out of.
+
+One-line fix: `.set_auto_apply_on_startup(false)` in
+`velopack_bridge::run_startup_hooks`. The toast is now the only
+path to apply, on every launch. Velopack still cleans up obsolete
+local packages, still fires install / restarted hooks, still
+discovers the same `latest_full` — it just doesn't unilaterally
+apply it.
+
+The rc.14 release pipeline was already in flight when the gap was
+found. Cancelled mid-pipeline (no GitHub release was published
+yet — verified via `gh release view v0.3.0-rc.14`), deleted the
+tag remote + local, merged #236, re-tagged. Re-published pipeline
+run `25985078811` running clean as of session end.
+
+**Caveat surfaced to the user.** The rc.12 → rc.14 transition the
+user just did will still feel like a crash, because the **running**
+code is rc.12 — it has no toast gate and no
+`set_auto_apply_on_startup(false)`. The new flow only kicks in
+once rc.14 is the running version. boot.prev.log from the user's
+machine after the update showed `main:argv ["--veloapp-install",
+"0.3.0-rc.14"]` (the actual flag Update.exe passed — different
+from the `--veloapp-updated` my sandbox-with-same-version repro
+suggested), confirming the same call_fast_hook → exit(0) path.
+sq.version after the update was 0.3.0-rc.14 and boot.log captured
+a clean post-relaunch boot — the install worked, the perception was
+the only issue.
+
+**Cursor for next session:**
+1. **Verify the new flow end-to-end on the next real update** —
+   user is now on rc.14, so the rc.14 → rc.15 cycle (whenever that
+   ships) is the first one that exercises the toast-gated path on
+   the running side. Watch boot.log for the `--veloapp-install`
+   /`--veloapp-updated` exit (still expected — it's a Velopack
+   thing, not ours) and confirm the visible flow is: toast →
+   click → ~1 s flicker → new version's window.
+2. **Optional polish** — a literal "Updating…" splash window during
+   the 1 s `apply_staged → relaunch` gap would close the last
+   piece of perceived-crash. Non-trivial; only worth it if the
+   user still complains after seeing the new flow once.
+3. **Patient-iteration follow-ups from session 41**, still open
+   from the cursor of session 43: PNG icon for mac/linux Velopack
+   bundles → code signing (Authenticode + Apple Developer /
+   notarytool) → multi-channel rings (beta/alpha layered over the
+   platform slugs).
+4. **CLAUDE.md `console.log` doc nit** still open from session 43.
 
 ### Session 43 — sidebar busy-halo centering + first post-cutover release
 
