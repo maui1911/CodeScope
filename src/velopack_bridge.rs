@@ -189,8 +189,30 @@ pub enum StageOutcome {
 /// missing manifest" and returns without side effects. Safe to call
 /// from `cargo run`, from a cargo-dist MSI install, or from an
 /// unpacked zip; it just won't do anything.
+///
+/// ## `set_auto_apply_on_startup(false)`
+///
+/// velopack-rs's `VelopackApp::run()` defaults `auto_apply == true`:
+/// on every startup that isn't a post-restart relaunch, it scans
+/// `<install>/packages/` for a `.nupkg` with `version > current`
+/// and — if one exists — fires `apply_updates_and_restart` directly,
+/// which ends in `std::process::exit(0)` and triggers the same
+/// "the app crashed during update" perception PR #232 set out to
+/// fix. PR #232 only gated the **download → apply** path through
+/// the actionable toast; the **startup-discovers-pending → apply**
+/// path stayed wide open. So a user who closed the app between
+/// "toast appeared" and "I clicked Install & restart" would on the
+/// next launch hit the silent auto-apply they thought they had
+/// opted out of.
+///
+/// Disable it. The toast is now the only path to apply, on every
+/// launch. Velopack still cleans up obsolete local packages, still
+/// fires the install / restarted hooks, still discovers the same
+/// `latest_full` — it just doesn't unilaterally apply it.
 pub fn run_startup_hooks() {
-    velopack::VelopackApp::build().run();
+    velopack::VelopackApp::build()
+        .set_auto_apply_on_startup(false)
+        .run();
 }
 
 /// Check for and download any pending update via Velopack.
