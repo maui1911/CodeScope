@@ -3641,6 +3641,16 @@ impl AppShell {
         self.focused_group = group_idx;
         let handle = self.groups[group_idx].tabs[tab_idx].terminal.read(cx).focus_handle(cx);
         handle.focus(window);
+        // The AppShell root has `track_focus(&self.focus_handle)`, which makes
+        // gpui register a bubble-phase mouse-down listener that auto-focuses
+        // AppShell on any click inside it (see `paint_mouse_listeners` in
+        // gpui's `div.rs`). When a tab is clicked, our user listener fires
+        // first (bubble runs deepest-child first), focuses the terminal, then
+        // AppShell's auto-focus fires and steals focus back — leaving the
+        // first keystrokes after the tab switch unrouted. `prevent_default`
+        // is the gpui-blessed way to suppress that ancestor auto-focus; it
+        // resets per dispatch so calls outside an event are harmless.
+        window.prevent_default();
         cx.notify();
         if prev_focused != group_idx {
             self.save_layout();
