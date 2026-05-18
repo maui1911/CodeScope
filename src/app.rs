@@ -6002,6 +6002,87 @@ impl AppShell {
         self.save_layout();
     }
 
+    /// Resolve the in-flight tab drag's cursor X to a `(target_group,
+    /// insert_slot)` and update [`Self::tab_drag_hover`] so the drop
+    /// indicator and the eventual `on_drop` index stay in sync.
+    ///
+    /// Shared by the strip *and* the pane drop targets — both elements
+    /// share the same column-relative X bounds within a group, so the
+    /// same math works for either attachment point. Issue #239 widened
+    /// the drop hit-zone from "just the tab strip" to "the entire
+    /// workspace column"; the cursor still resolves to a slot on the
+    /// strip's tab rects because that's where the indicator paints.
+    fn update_tab_drop_hover_for_group(
+        &mut self,
+        target_group_id: u64,
+        event: &gpui::DragMoveEvent<TabDragData>,
+        cx: &mut Context<Self>,
+    ) {
+        let cursor_x: f32 = event.event.position.x.into();
+        let bounds_left: f32 = event.bounds.origin.x.into();
+        let rel_x = cursor_x - bounds_left;
+        // Same fallback the indicator uses: this-frame rects first
+        // (already populated on subsequent frames), previous-frame
+        // copy second. Drag-move events can fire mid-frame before the
+        // canvas prepaint callbacks have run.
+        let source = self
+            .tab_rects
+            .get(&target_group_id)
+            .filter(|v| !v.is_empty())
+            .or_else(|| self.prev_tab_rects.get(&target_group_id));
+        let rects: Vec<codescope_core::TabRect> = source
+            .map(|v| {
+                v.iter()
+                    .map(|(_, b)| {
+                        let left: f32 = b.origin.x.into();
+                        let right: f32 = (b.origin.x + b.size.width).into();
+                        codescope_core::TabRect {
+                            left: left - bounds_left,
+                            right: right - bounds_left,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let drop_index = codescope_core::compute_drop_index(rel_x, &rects);
+        let next = Some(TabDropHover {
+            group_id: target_group_id,
+            drop_index,
+        });
+        if self.tab_drag_hover != next {
+            self.tab_drag_hover = next;
+            cx.notify();
+        }
+    }
+
+    /// Complete a tab drop on `target_group_id`, using the most
+    /// recently resolved [`TabDropHover`] for that group as the insert
+    /// slot (or appending when no hover ever fired — e.g. a drop with
+    /// no preceding `on_drag_move` because the cursor was over a
+    /// child element that swallowed the event).
+    fn handle_tab_drop_on_group(
+        &mut self,
+        target_group_id: u64,
+        payload: &TabDragData,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let drop_index = self
+            .tab_drag_hover
+            .filter(|h| h.group_id == target_group_id)
+            .map(|h| h.drop_index)
+            .unwrap_or(usize::MAX);
+        self.tab_drag_hover = None;
+        self.move_tab_to_group(
+            payload.source_group_id,
+            payload.source_tab_id,
+            target_group_id,
+            drop_index,
+            window,
+            cx,
+        );
+    }
+
     /// Move focus to the group at `idx`. Routes keyboard focus to the
     /// group's currently-active tab so typing resumes in the right
     /// terminal. No-op when the index is out of range or the group is
@@ -7826,67 +7907,17 @@ impl AppShell {
             )
             // Track the in-flight tab drag's cursor over this strip
             // so we can render the drop indicator at the right slot.
-            // The handler converts the window-coord cursor X into a
-            // strip-local X by subtracting the strip's left edge
-            // (provided by gpui via `event.bounds`), then resolves
-            // a drop index against the per-tab bounds captured this
-            // frame.
+            // The pane below this strip shares the same X bounds and
+            // wires the same handlers (issue #239: drop anywhere in
+            // the group's column lands the tab in this group's bar).
             .on_drag_move(cx.listener(
                 move |this, event: &gpui::DragMoveEvent<TabDragData>, _window, cx| {
-                    let cursor_x: f32 = event.event.position.x.into();
-                    let strip_left: f32 = event.bounds.origin.x.into();
-                    let rel_x = cursor_x - strip_left;
-                    // Same fallback the indicator uses: this-frame
-                    // rects first (already populated on subsequent
-                    // frames), previous-frame copy second. Drag-move
-                    // events can fire mid-frame before the canvas
-                    // prepaint callbacks have run.
-                    let source = this
-                        .tab_rects
-                        .get(&target_group_id)
-                        .filter(|v| !v.is_empty())
-                        .or_else(|| this.prev_tab_rects.get(&target_group_id));
-                    let rects: Vec<codescope_core::TabRect> = source
-                        .map(|v| {
-                            v.iter()
-                                .map(|(_, b)| {
-                                    let left: f32 = b.origin.x.into();
-                                    let right: f32 = (b.origin.x + b.size.width).into();
-                                    codescope_core::TabRect {
-                                        left: left - strip_left,
-                                        right: right - strip_left,
-                                    }
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let drop_index = codescope_core::compute_drop_index(rel_x, &rects);
-                    let next = Some(TabDropHover {
-                        group_id: target_group_id,
-                        drop_index,
-                    });
-                    if this.tab_drag_hover != next {
-                        this.tab_drag_hover = next;
-                        cx.notify();
-                    }
+                    this.update_tab_drop_hover_for_group(target_group_id, event, cx);
                 },
             ))
             .on_drop(
                 cx.listener(move |this, payload: &TabDragData, window, cx| {
-                    let drop_index = this
-                        .tab_drag_hover
-                        .filter(|h| h.group_id == target_group_id)
-                        .map(|h| h.drop_index)
-                        .unwrap_or(usize::MAX);
-                    this.tab_drag_hover = None;
-                    this.move_tab_to_group(
-                        payload.source_group_id,
-                        payload.source_tab_id,
-                        target_group_id,
-                        drop_index,
-                        window,
-                        cx,
-                    );
+                    this.handle_tab_drop_on_group(target_group_id, payload, window, cx);
                 }),
             );
         if let Some(indicator) = drop_indicator {
@@ -7936,6 +7967,14 @@ impl AppShell {
                 .child("Empty group · press Ctrl+Shift+T to open a tab")
                 .into_any_element()
         };
+        // The pane mirrors the strip's tab drop handlers so the user
+        // can release a dragged tab anywhere in the group's column,
+        // not just the narrow tab strip (issue #239). The pane shares
+        // the strip's X bounds (same flex cell), so the helper's
+        // bounds-relative math resolves cursor X to the same slot it
+        // would on the strip — the indicator still paints in the
+        // strip while the cursor hovers below.
+        let pane_target_group_id = group_id;
         let mut pane = div()
             .id(("group-pane", group_id))
             .h_full()
@@ -7949,6 +7988,16 @@ impl AppShell {
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
                     this.focus_group(group_idx, window, cx);
+                }),
+            )
+            .on_drag_move(cx.listener(
+                move |this, event: &gpui::DragMoveEvent<TabDragData>, _window, cx| {
+                    this.update_tab_drop_hover_for_group(pane_target_group_id, event, cx);
+                },
+            ))
+            .on_drop(
+                cx.listener(move |this, payload: &TabDragData, window, cx| {
+                    this.handle_tab_drop_on_group(pane_target_group_id, payload, window, cx);
                 }),
             )
             .child(body_inner);
