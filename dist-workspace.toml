@@ -32,36 +32,17 @@ members = ["cargo:."]
 #   Menu\Programs\` tree. No admin / UAC prompt at install or upgrade
 #   time. This matches VS Code Stable, Zed, Discord, Slack, and GitHub
 #   Desktop's modern default. The install dir name `codescope-rs/`
-#   predates the C# build retirement (see ADR-0022); cutover-3 renames
-#   the Velopack pack id to `codescope` but leaves the WiX install dir
-#   as `codescope-rs/` so existing installs aren't moved on disk.
+#   predates the C# build retirement (see ADR-0022) and is preserved
+#   so existing installs aren't moved on disk.
 #
 #   The directory chain + `InstallScope="perUser"` + `MSIINSTALLPERUSER=1`
 #   are authored in `wix/main.wxs` (a hand-edited cargo-wix template).
 #   `allow-dirty = ["msi"]` below tells cargo-dist to leave the
 #   template alone — see the comment near it.
-# - `install-updater = false` for now — Velopack handles the
-#   self-update path in-process (see `core/src/update_check.rs`
-#   and the velopack integration on the AppShell). The axoupdater
-#   shipped by cargo-dist would compete with Velopack for the same
-#   responsibility.
-# - Velopack packaging runs *alongside* cargo-dist in
-#   `.github/workflows/release.yml` for every target. The workflow
-#   installs `vpk` (the Velopack CLI, a .NET 8 tool — yes, the Rust
-#   SDK still needs the .NET tool for packaging), copies the
-#   cargo-built binary into a publish dir, downloads the prior GitHub
-#   release's feed + `.nupkg` (best-effort, for Delta generation),
-#   runs `vpk pack --channel <platform>`, and threads the resulting
-#   assets through the existing upload-artifact path so they land on
-#   the GitHub release alongside the cargo-dist outputs. Assets per
-#   channel: the canonical feed manifest `releases.<channel>.json`
-#   (what Velopack's `GithubSource` resolves via
-#   `CoreUtil.GetVeloReleaseIndexName(channel)` — see
-#   `src/velopack_bridge.rs`), the legacy `RELEASES`-style text
-#   manifest, the `Full.nupkg` package (and a `Delta.nupkg` from the
-#   second release onward), plus the per-platform installer / bundle
-#   (`*-Setup.exe` on Windows, `*.app.zip` on macOS, `*.AppImage` on
-#   Linux).
+# - `install-updater = false` — auto-update was removed from the
+#   runtime entirely; users upgrade by downloading a fresh installer
+#   from the GitHub release page. The axoupdater shipped by cargo-dist
+#   would reintroduce a self-update path we don't want.
 [dist]
 # Preferred dist version in CI. Bumped together with the workflow.
 cargo-dist-version = "0.31.0"
@@ -82,7 +63,8 @@ targets = [
 ]
 # Where to host releases.
 hosting = "github"
-# Don't bundle axoupdater; Velopack handles self-update.
+# Auto-update was removed from the runtime; don't let cargo-dist
+# inject axoupdater either. Users upgrade by re-running the installer.
 install-updater = false
 # Don't ship a generic source tarball — the project is public on GitHub
 # and the repo itself serves as the source archive.
