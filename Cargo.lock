@@ -927,7 +927,7 @@ dependencies = [
 
 [[package]]
 name = "codescope-rs"
-version = "0.3.0-rc.15"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "codescope-core",

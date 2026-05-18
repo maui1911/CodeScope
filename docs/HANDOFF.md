@@ -25,13 +25,152 @@
 > `.github/workflows/release.yml` (was `rs--release.yml`) and now
 > triggers on plain `v*` tags.
 
-**Last updated:** 2026-05-17 (session 44 — update-UX overhaul: rehydrate fallback, toast-gated apply, README features, Ctrl+Shift+, repair, velopack startup auto-apply disabled; v0.3.0-rc.12 → rc.14 cut)
+**Last updated:** 2026-05-19 (session 45 — tab-focus fix, full auto-update rip (runtime + CI), boot.log mode 0600, **first stable `v0.3.0` cut**)
 **Branch:** `main`
-**Head:** `97ceb81` (fix(updates): disable velopack startup auto-apply, #236)
-**Release:** `v0.3.0-rc.14` re-tagged after the original rc.14 pipeline was cancelled mid-flight (the toast gate from #232 was found to leave velopack's startup auto-apply uncovered; #236 closes it). Run `25985078811` re-publishing now; rc.11/rc.12/rc.13 also published earlier this session via runs on the same workflow.
-**Build status:** ✅ `cargo build --workspace` clean. Tests: 484 core + 127 bin + 28 terminal + 1 doctest = **640 total**, all passing (+6 from session 43 — new `update_agent_id` idempotency tests in core, dual-shape `Ctrl+Shift+,` keystroke test in terminal, and the rest distributed across the touched modules).
-**Uncommitted work:** none — every change shipped through PRs #230–#236.
-**Open issues:** none checked this run.
+**Head:** `cb457f6` (feat(updates): rip auto-update entirely, #244)
+**Release:** `v0.3.0` — first non-rc tag. Cuts off the `rc.N` cadence that ran rc.7 → rc.15. Pipeline triggered by `git push origin v0.3.0`; only cargo-dist artefacts (MSI / `.tar.xz`) now — velopack packaging was stripped in #244 along with the runtime.
+**Build status:** ✅ `cargo build --workspace` clean. Tests: 454 core + 120 bin + 28 terminal + 1 doctest = **603 total**, all passing (−37 from session 44: 30 `update_check` + 7 `velopack_bridge` tests vanished with their modules).
+**Uncommitted work:** none — PRs #240 + #244 shipped, session-45 bump-PR opens this entry.
+**Open issues:** #238 (terminal pane doesn't receive keyboard focus after tab click) closed by #240.
+
+### Session 45 — tab-focus fix, total auto-update rip, first stable `v0.3.0` cut
+
+Two PRs landed; one of them was the third sequential attempt to make
+the auto-update path stop crashing CodeScope and the user finally
+told us to pull the whole thing out. The session ends with the first
+non-rc tag in the Rust port's history.
+
+**PR #240 (`73bb382`) — focus tab terminal on click.** Issue #238:
+clicking a different tab made the tab "active" visually, but the
+first keystrokes after the click went into the void; a second click
+inside the terminal pane was needed before typing landed in the pty.
+Root cause sits at the intersection of two gpui patterns:
+
+- `AppShell`'s root div carries `.track_focus(&self.focus_handle)`
+  (`src/app.rs:6885`) for keyboard-shortcut routing.
+- gpui's `paint_mouse_listeners` (gpui-0.2.2 `elements/div.rs:2025-
+  2037`) auto-registers a bubble-phase mouse-down listener on any
+  element with `tracked_focus_handle`, which fires
+  `window.focus(&handle)` unless the event already has
+  `prevent_default` set.
+
+Mouse-down listeners fire in **reverse** registration order during
+bubble — so the tab's `on_mouse_down` fired first, called
+`activate_tab` (which focuses the terminal), and then AppShell's
+auto-focus fired second and stole focus back to the root. Keys then
+went to AppShell's shortcut-only `on_key_down` and were dropped.
+
+Fix is one line: `window.prevent_default()` after the explicit focus
+call in `AppShell::activate_tab` (`src/app.rs:3644`). That's the
+gpui-blessed signal — its own auto-focus checks
+`!window.default_prevented()` before acting. `default_prevented` is
+reset per dispatch, so the call is harmless from the non-mouse
+paths (`next_tab` / `prev_tab` / layout-restore / palette).
+
+Copilot review came back as overview-only with no inline comments;
+admin-merged after user tested the dev build and confirmed the three
+scenarios (tab-click, alt-tab back, `Ctrl+Tab` chord) all routed
+keys to the terminal on the first keystroke.
+
+**PR #244 (`cb457f6`) — rip auto-update entirely.** The user
+reported rc.14 still crashed on auto-update despite the toast gate
+(#232) and the `set_auto_apply_on_startup(false)` (#236) shipped
+last session. Three rc cycles in a row had landed a "fix" for the
+same symptom and the user was done. "Kun je alsjeblieft alles met
+auto-updaten eruit halen?"
+
+The rip landed in three commits inside the same PR:
+
+1. **`439a601` feat(updates): rip auto-update entirely.** Runtime.
+   - `src/velopack_bridge.rs` deleted in full (the whole module:
+     `run_startup_hooks`, `stage_pending_update`, `apply_staged`,
+     channel helpers, `StagedUpdate`, `StageOutcome`,
+     `is_velopack_install`, `channel_override`, all 7 tests). The
+     `velopack` crate dep dropped from root `Cargo.toml`.
+   - `core/src/update_check.rs` deleted in full (the 3-hour GitHub
+     release poll). `ureq` dep dropped from `core/Cargo.toml`.
+   - `AppShell` plumbing: `start_update_check_poll`, `staged_update`
+     field, `last_announced_update` field, `ToastAction`,
+     `ToastActionKind`, `push_action_toast`, `dispatch_toast_action`,
+     and the persistent-toast preference in `evict_toasts_to_cap`
+     all gone. `Toast.expires_at` collapsed from `Option<Instant>`
+     to `Instant` (no more persistent toasts), `Toast.action`
+     dropped. `render_toasts`'s action-button render branch dropped.
+   - `NotificationKind::Generic` removed — only existed for the
+     update-poll surface. The tests that referenced it now use
+     `SessionReady`.
+   - `src/main.rs` shed `mod velopack_bridge;`, the
+     `run_startup_hooks` call, the boot-tape `velopack:*` phase
+     markers, and the panic-hook-before-velopack rationale block.
+
+2. **`114de1c` chore(release): strip Velopack packaging from CI +
+   dist config.** Surfaced by the multi-pass review (see below).
+   With `velopack-rs` gone from the binary, the `vpk pack` /
+   `vpk download` / `velopack-params` block in `release.yml` was
+   producing a dormant `Update.exe` next to every install for no
+   reason. Dropped in full (~215 lines). `dist-workspace.toml` lost
+   the Velopack rationale blocks; `install-updater = false` stays
+   (we don't want axoupdater reintroducing self-update either).
+
+3. **`1ac630a` chore(diagnostics): create boot.log mode 0600 on
+   Unix.** Pre-existing hygiene gap that the multi-pass review
+   flagged: `boot.log` records launch argv + per-phase markers, and
+   on Unix it inherited the umask (commonly mode 644, readable by
+   other local users). Added a `boot_log_options` helper that
+   pre-applies `OpenOptionsExt::mode(0o600)` on Unix; Windows path
+   is unchanged (per-user ACL on `%LOCALAPPDATA%\CodeScope\` already
+   isolates it).
+
+The PR went through the user's `/multi-pass-branch-review` skill
+(four sequential Codex passes: plan adherence / architecture /
+bugs / security). Plan and architecture returned `NO FINDINGS`.
+Bugs flagged the CI velopack-pack block (commit 2 above). Security
+flagged the boot.log argv permissions (commit 3 above) — pre-
+existing but worth addressing while we were in the file. Triage
+dropped zero survivors; the user asked for both flagged items to
+be addressed anyway, hence the three-commit shape.
+
+Net diff: ~2400 lines removed, ~70 added across 12 files. Two
+source modules deleted outright.
+
+Copilot reviewed the first commit clean ("0 comments"). After the
+two follow-ups, Copilot doesn't auto-re-review and the gh CLI
+can't request a review from the bot ("not a collaborator"); user
+re-triggered via GitHub UI. Re-review surfaced one comment: the
+PR description still said "CI velopack packaging left alone for
+follow-up", which no longer matched the shipped diff. Body
+rewritten to reflect the three commits as shipped; reply posted on
+Copilot's thread; admin-merged after user OK.
+
+**Tab-focus side note.** Before the rip landed, the dev build
+launched at the top of the rip session under PowerShell-quoted env
+syntax (`$env:CODESCOPE_DEV = "1"; cargo run …`) ran the binary
+**without** `CODESCOPE_DEV=1` because the Bash tool's shell parsed
+`$env:CODESCOPE_DEV` as a literal command. That run hit the
+single-instance mutex against the user's installed CodeScope and
+exited 0 silently. Saved in feedback memory: never quote env
+prefixes for the Bash tool; use plain `KEY=VALUE cargo run …`.
+
+**Cursor for next session:**
+
+1. **First stable release (`v0.3.0`) tag** lands at the end of this
+   session via the bump-PR that carries this HANDOFF entry. The
+   tag triggers `.github/workflows/release.yml`; verify the run
+   publishes the three cargo-dist asset sets (Win MSI, macOS
+   `.tar.xz` arm64 / x64, Linux `.tar.xz`) and nothing else
+   (velopack assets should be absent — that's the test that the CI
+   strip in #244 actually took effect).
+2. **Open issues at session end:** none. #238 closed by #240. The
+   patient-iteration follow-ups inherited from session 41/43/44
+   are now mostly moot — code signing / multi-channel rings /
+   PNG icon were Velopack-shaped; with auto-update gone they're
+   not on the critical path anymore. The cargo-dist MSI does still
+   want code signing eventually for SmartScreen, but that's a
+   distinct workstream.
+3. **CLAUDE.md `console.log` doc nit** still open from session 43.
+4. **Terminal resize cascade** (the original session 41/44 thread)
+   still unresolved — `terminal-resize.log` taps remain in place;
+   no further investigation this session.
 
 ### Session 44 — update-UX overhaul + a pile of small rc bumps (rc.12 → rc.14)
 
