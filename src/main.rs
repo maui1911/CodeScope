@@ -94,7 +94,7 @@ fn main() -> Result<()> {
         let cur = paths.state_dir.join("boot.log");
         let prev = paths.state_dir.join("boot.prev.log");
         let _ = std::fs::rename(&cur, &prev);
-        let _ = std::fs::OpenOptions::new()
+        let _ = boot_log_options()
             .write(true)
             .create(true)
             .truncate(true)
@@ -268,15 +268,32 @@ fn main() -> Result<()> {
 /// returns without writing anything. A diagnostic mishap should
 /// never take down boot.
 fn write_boot_phase(paths: &AppPaths, phase: &str) {
-    use std::fs::OpenOptions;
     use std::io::Write as _;
     let line = format!("{} {}\n", now_iso8601(), phase);
     let path = paths.state_dir.join("boot.log");
-    let _ = OpenOptions::new()
+    let _ = boot_log_options()
         .create(true)
         .append(true)
         .open(&path)
         .and_then(|mut f| f.write_all(line.as_bytes()));
+}
+
+/// Open-options preconfigured for the boot tape. On Unix we set
+/// mode 0600 so `boot.log` (which records launch argv and per-phase
+/// markers) is readable only by the owning user, not by anything
+/// else on the box that happens to traverse the state dir. Windows
+/// inherits the per-user ACL from `%LOCALAPPDATA%\CodeScope\` and
+/// needs no extra flag.
+fn boot_log_options() -> std::fs::OpenOptions {
+    let opts = std::fs::OpenOptions::new();
+    #[cfg(unix)]
+    let opts = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut o = opts;
+        o.mode(0o600);
+        o
+    };
+    opts
 }
 
 fn window_state_to_bounds(state: WindowState) -> WindowBounds {
