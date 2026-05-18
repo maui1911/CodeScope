@@ -32,7 +32,6 @@ mod sidebar;
 mod taskbar_badge;
 mod text_field;
 mod theme;
-mod velopack_bridge;
 #[cfg(target_os = "windows")]
 mod win32_titlebar;
 
@@ -65,21 +64,6 @@ impl Render for Root {
 }
 
 fn main() -> Result<()> {
-    // Resolve paths + install the crash-log panic hook BEFORE
-    // velopack — the old order ran `VelopackApp::build().run()` first
-    // (on the theory "velopack can exit/restart from its hooks, so do
-    // it before any other side effects"), but any panic inside that
-    // call ran through the default panic handler (stderr + abort) —
-    // and stderr on the Windows GUI subsystem is a black hole, so
-    // crashes during the restarted-after-update hook left no
-    // `crash.log` and no observable trace. Reordering is safe:
-    // `AppPaths::detect` is a pure env-var read with no side effects,
-    // `ensure_dirs` is idempotent, and `install_panic_hook` no-ops on
-    // its second call via an `AtomicBool` guard — none of these
-    // execute "twice" in any harmful sense if velopack later restarts
-    // the process. Motivated by a user report that v0.3.0-rc.10 still
-    // crashed during the auto-update without producing a `crash.log`
-    // — exactly this gap.
     let paths = AppPaths::detect();
     if let Err(err) = paths.ensure_dirs() {
         eprintln!(
@@ -96,39 +80,27 @@ fn main() -> Result<()> {
     // Per-phase boot tape — written line-by-line to `state_dir/boot.log`
     // with the file handle dropped between phases so a process kill
     // *after* the line is written still leaves the line on disk. Lets
-    // us tell, on the next no-crash-log crash, exactly which phase
-    // ate the process. Cheap; <10 lines per launch.
+    // us tell, on a no-crash-log crash, exactly which phase ate the
+    // process. Cheap; <10 lines per launch.
     //
-    // **Rotate, don't just truncate.** The motivating bug is "auto-
-    // update crashed and left no crash.log"; the user's natural next
-    // action is to relaunch, which would wipe the only forensic
+    // **Rotate, don't just truncate.** A user's natural reaction to a
+    // crash is to relaunch, which would wipe the only forensic
     // artifact if we just truncated. Rename the current tape to
     // `boot.prev.log` (replacing any older prev) so the previous
-    // launch survives one more run — long enough for the user to
-    // grab it after a crash. Best-effort at every step: a missing
-    // current file (first launch) makes `rename` a no-op-Err we
-    // discard; a `rename` failure (cross-volume, permission, …)
-    // falls through to the truncate, which itself silently no-ops
-    // on failure; either way `write_boot_phase` below starts a
-    // fresh file. We never lose more than the run-before-last.
+    // launch survives one more run — long enough for the user to grab
+    // it after a crash. Best-effort at every step; we never lose more
+    // than the run-before-last.
     {
         let cur = paths.state_dir.join("boot.log");
         let prev = paths.state_dir.join("boot.prev.log");
         let _ = std::fs::rename(&cur, &prev);
-        let _ = std::fs::OpenOptions::new()
+        let _ = boot_log_options()
             .write(true)
             .create(true)
             .truncate(true)
             .open(&cur);
     }
     write_boot_phase(&paths, "main:enter");
-    // Log the full argv as a separate phase so the next time the
-    // post-update crash shows up we can tell *what* Update.exe
-    // passed in. The `--veloapp-updated` flag triggers velopack's
-    // unconditional `exit(0)` (see `velopack_bridge::run_startup_hooks`
-    // for the workaround) — knowing the actual argv on a fresh
-    // failure lets us tell that case from any future surprise flag
-    // we don't yet handle. One line per launch, no PII.
     {
         let argv: Vec<String> = std::env::args().skip(1).collect();
         write_boot_phase(&paths, &format!("main:argv {argv:?}"));
@@ -144,16 +116,6 @@ fn main() -> Result<()> {
     // crate's `view.rs` taps it from each checkpoint. No-op until
     // this call sets the path.
     codescope_terminal::diag::set_log_path(paths.state_dir.join("terminal-resize.log"));
-
-    // Velopack install / uninstall / first-run / restarted-after-update
-    // hooks. Safe no-op on builds that weren't installed via a Velopack
-    // bootstrapper (`cargo run`, cargo-dist MSI, unpacked zip).
-    // Mirrors the equivalent C# call site in `App.OnStartup`. With the
-    // panic hook now installed above, a Rust panic in here lands in
-    // `crash.log` instead of stderr.
-    write_boot_phase(&paths, "velopack:run_startup_hooks:enter");
-    velopack_bridge::run_startup_hooks();
-    write_boot_phase(&paths, "velopack:run_startup_hooks:exit");
 
     write_boot_phase(&paths, "memory_watchdog:start_if_dev");
     // Dev-only memory watchdog — surfaces working-set creep every 5 min
@@ -295,14 +257,8 @@ fn main() -> Result<()> {
 /// Append a single timestamped phase marker to
 /// `state_dir/boot.log`. Opens, writes, and closes the file per call
 /// so a process kill *immediately after* the line was written still
-/// leaves the line on disk — what we need to tell, on the next
-/// no-crash-log crash, which phase ate the process.
-///
-/// The auto-update path is the motivating use case: velopack's
-/// `run_startup_hooks` can call `std::process::exit` or hard-crash
-/// from inside the restarted-after-update handler, and either of
-/// those bypasses the Rust panic handler entirely. The boot tape
-/// gives us a paper trail when `crash.log` stays empty.
+/// leaves the line on disk — what we need to tell, on a no-crash-log
+/// crash, which phase ate the process.
 ///
 /// I/O errors at any layer are silently dropped — best-effort
 /// diagnostic. `ensure_dirs` is called once from `main` and is
@@ -312,15 +268,32 @@ fn main() -> Result<()> {
 /// returns without writing anything. A diagnostic mishap should
 /// never take down boot.
 fn write_boot_phase(paths: &AppPaths, phase: &str) {
-    use std::fs::OpenOptions;
     use std::io::Write as _;
     let line = format!("{} {}\n", now_iso8601(), phase);
     let path = paths.state_dir.join("boot.log");
-    let _ = OpenOptions::new()
+    let _ = boot_log_options()
         .create(true)
         .append(true)
         .open(&path)
         .and_then(|mut f| f.write_all(line.as_bytes()));
+}
+
+/// Open-options preconfigured for the boot tape. On Unix we set
+/// mode 0600 so `boot.log` (which records launch argv and per-phase
+/// markers) is readable only by the owning user, not by anything
+/// else on the box that happens to traverse the state dir. Windows
+/// inherits the per-user ACL from `%LOCALAPPDATA%\CodeScope\` and
+/// needs no extra flag.
+fn boot_log_options() -> std::fs::OpenOptions {
+    let opts = std::fs::OpenOptions::new();
+    #[cfg(unix)]
+    let opts = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut o = opts;
+        o.mode(0o600);
+        o
+    };
+    opts
 }
 
 fn window_state_to_bounds(state: WindowState) -> WindowBounds {

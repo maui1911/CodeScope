@@ -55,20 +55,6 @@ anyhow.workspace = true
 parking_lot.workspace = true
 uuid.workspace = true
 raw-window-handle = "0.6"
-# Velopack-rs apply path — mirrors the C# build's
-# `src/CodeScope.App/Updates/UpdateService.cs` Velopack integration.
-# At runtime we instantiate an `UpdateManager` against the same GitHub
-# releases endpoint the C# `vpk upload github` flow publishes to. If
-# the constructor returns `Err` we know this binary wasn't installed
-# via a Velopack bootstrapper (e.g. running from `cargo run`, or
-# installed via the cargo-dist MSI which doesn't embed a Velopack
-# manifest), and we fall back to the GitHub-polling notification path
-# in `codescope-core::update_check`. Velopack-rs is currently
-# Windows-first; we still pull it in on every target because the
-# crate compiles fine on non-Windows hosts (the platform-specific
-# pieces no-op there). Targeting Windows-only via cfg gates would
-# just add scaffolding for a code path no one currently runs.
-velopack = "0.0.1589-ga2c5a97"
 # `futures-channel::oneshot` for the themed ConfirmDialog's Future<bool>
 # API. gpui already pulls this in transitively for `window.prompt`'s
 # return type; we depend on it explicitly so the confirm dialog reads

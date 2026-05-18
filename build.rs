@@ -111,9 +111,8 @@ fn git_path(relative: &str) -> Option<PathBuf> {
 fn git_describe() -> Option<String> {
     // Release tags are `vX.Y.Z` (or `vX.Y.Z-rc.N`). Historical C#
     // `v0.2.X` tags resolve here too on a checkout of that legacy
-    // history; `update_check`'s runtime floor filters them out of
-    // the live update flow, and stamping the binary with the
-    // historical version is correct for that checkout.
+    // history; stamping the binary with the historical version is
+    // correct for that checkout.
     let raw = run_git(&["describe", "--tags", "--always", "--dirty", "--match", "v*"])?;
     Some(strip_v_prefix(&raw))
 }

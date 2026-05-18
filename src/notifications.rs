@@ -42,8 +42,6 @@ pub enum NotificationKind {
     SessionReady,
     /// Agent paused for a permission prompt (manual-mode tool_use).
     SessionWaiting,
-    /// Catch-all for future event sources.
-    Generic,
 }
 
 /// One entry in the ring buffer.  Mutable only for the `read` flag
@@ -268,8 +266,8 @@ mod tests {
     #[test]
     fn push_adds_entry_most_recent_first() {
         let mut n = Notifications::new();
-        n.push(NotificationKind::Generic, "first", "d", None);
-        n.push(NotificationKind::Generic, "second", "d", None);
+        n.push(NotificationKind::SessionReady, "first", "d", None);
+        n.push(NotificationKind::SessionReady, "second", "d", None);
         assert_eq!(n.entries().len(), 2);
         assert_eq!(n.entries()[0].title, SharedString::from("second"));
         assert_eq!(n.entries()[1].title, SharedString::from("first"));
@@ -279,7 +277,7 @@ mod tests {
     fn push_evicts_oldest_when_at_cap() {
         let mut n = Notifications::new();
         for i in 0..MAX_ENTRIES + 5 {
-            n.push(NotificationKind::Generic, format!("entry {i}"), "d", None);
+            n.push(NotificationKind::SessionReady, format!("entry {i}"), "d", None);
         }
         assert_eq!(n.entries().len(), MAX_ENTRIES);
         // Newest entry is at index 0.
@@ -291,7 +289,7 @@ mod tests {
 
     #[test]
     fn new_entries_are_unread() {
-        let (_, n) = push_one(NotificationKind::Generic, "t");
+        let (_, n) = push_one(NotificationKind::SessionReady, "t");
         assert!(n.has_unread());
         assert!(!n.entries()[0].read);
     }
@@ -299,7 +297,7 @@ mod tests {
     #[test]
     fn clear_all_empties_and_closes() {
         let mut n = Notifications::new();
-        n.push(NotificationKind::Generic, "a", "d", None);
+        n.push(NotificationKind::SessionReady, "a", "d", None);
         n.set_open(true);
         n.clear_all();
         assert!(!n.has_any());
@@ -312,7 +310,7 @@ mod tests {
         assert!(!n.has_any());
         assert!(!n.has_unread());
 
-        let id = n.push(NotificationKind::Generic, "t", "d", None);
+        let id = n.push(NotificationKind::SessionReady, "t", "d", None);
         assert!(n.has_any());
         assert!(n.has_unread());
 

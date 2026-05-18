@@ -282,41 +282,13 @@ const CAPTION_CTRLS_W: f32 = 4.0 * 46.0;
 /// right of the window. Mirrors C# `ToastHost` shape (Ok / Err /
 /// Info severities, auto-dismiss, top-newest stacking).
 ///
-/// `expires_at: None` marks a *persistent* toast that the dismiss
-/// task leaves alone — used for offers the user must act on (e.g.
-/// "Install & restart" for a downloaded update). Such toasts stay
-/// until the user clicks the action or the explicit dismiss "×".
 #[derive(Clone)]
 struct Toast {
     id: u64,
     kind: ToastKind,
     title: SharedString,
     detail: Option<SharedString>,
-    expires_at: Option<Instant>,
-    action: Option<ToastAction>,
-}
-
-/// Optional call-to-action rendered as a button inside a toast. The
-/// `kind` is dispatched through [`AppShell::dispatch_toast_action`]
-/// so the toast layer stays UI-only and doesn't carry callbacks
-/// across thread boundaries (which is awkward in gpui's entity
-/// model).
-#[derive(Clone)]
-struct ToastAction {
-    label: SharedString,
-    kind: ToastActionKind,
-}
-
-/// Discriminator for [`ToastAction`]. Only one variant today — kept
-/// as an enum so a second action (e.g. "Dismiss & remind later")
-/// slots in without re-plumbing the toast layer.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum ToastActionKind {
-    /// User clicked "Install & restart" on the update-ready toast.
-    /// Pulls `AppShell.staged_update` and calls
-    /// `velopack_bridge::apply_staged`. The apply call exits the
-    /// process; Update.exe then relaunches us on the new version.
-    ApplyStagedUpdate,
+    expires_at: Instant,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -678,25 +650,6 @@ pub struct AppShell {
     /// (0, 0). Refreshed every frame, so window resizes / status-bar
     /// reflows track the popover automatically.
     bell_bounds: Option<gpui::Bounds<gpui::Pixels>>,
-    /// The last release version we've already announced to the user
-    /// this process lifetime. Mirrors `_stagedVersion` in C#
-    /// `UpdateService` — keeps the 3-hourly re-poll from re-pushing the
-    /// same notification entry on every tick. `None` until the first
-    /// poll surfaces an `Available` result.
-    last_announced_update: Option<String>,
-    /// Fully-downloaded Velopack update waiting for the user to
-    /// click "Install & restart". `Some` between
-    /// `stage_pending_update` returning `Ready` and the user (or a
-    /// follow-up poll for a newer version) consuming it. Held on the
-    /// shell — not in the toast — because `apply_staged` must run on
-    /// the main thread (velopack-rs ends in `std::process::exit(0)`
-    /// and exit from a worker thread races CRT teardown). The toast
-    /// only carries an opaque [`ToastActionKind`] discriminator; the
-    /// actual `StagedUpdate` lives here so the action handler can
-    /// `take()` it without needing to thread anything through the
-    /// render layer. Mirrors the gated-apply UX C# `UpdateService`
-    /// gained in PR #205.
-    staged_update: Option<Box<crate::velopack_bridge::StagedUpdate>>,
     /// In-memory snapshot of the on-disk session catalog used by
     /// the session-lifecycle helpers. Initialised at construction
     /// from a [`SessionManager::load_with_sweep`] pass so the
@@ -1208,13 +1161,7 @@ impl AppShell {
                 let result = this.update(cx, |this, cx| {
                     let now = Instant::now();
                     let before = this.toasts.len();
-                    // Persistent toasts (`expires_at: None`) survive
-                    // every tick — they only leave via the explicit
-                    // dismiss "×" or by their action handler. Today
-                    // that's the update-ready offer; see
-                    // `push_action_toast`.
-                    this.toasts
-                        .retain(|t| t.expires_at.map(|e| e > now).unwrap_or(true));
+                    this.toasts.retain(|t| t.expires_at > now);
                     if this.toasts.len() != before {
                         cx.notify();
                     }
@@ -1326,8 +1273,6 @@ impl AppShell {
             window_active_cached: true,
             telemetry_tails: HashMap::new(),
             bell_bounds: None,
-            last_announced_update: None,
-            staged_update: None,
             projects: projects_for_sessions,
             agent_registry,
             command_palette: None,
@@ -1340,7 +1285,6 @@ impl AppShell {
         };
         shell.start_telemetry_poll(cx);
         shell.start_agent_discovery_poll(cx);
-        shell.start_update_check_poll(cx);
         shell.schedule_taskbar_badge_init(cx);
         shell.start_text_blink(cx);
         shell.rehydrate_or_cold_start(window, cx);
@@ -1979,201 +1923,6 @@ impl AppShell {
                     Ok(next) => interval = next,
                     Err(_) => break,
                 }
-            }
-        })
-        .detach();
-    }
-
-    /// Spawn the GitHub release polling loop — Velopack parity for the
-    /// Rust port.
-    ///
-    /// Runs once after `update_check::INITIAL_DELAY` (10 s) and every
-    /// `update_check::POLL_INTERVAL` (3 h) thereafter — the same
-    /// cadence the C# `App.xaml.cs` uses for `UpdateService.CheckAsync`.
-    /// Network work is dispatched through `cx.background_executor()`
-    /// so the UI thread never sees a blocking `ureq::call`. On
-    /// `UpdateStatus::Available` we push a single `Generic`
-    /// notification per unique version per process lifetime; the C#
-    /// build's `_stagedVersion` field plays the same role.
-    ///
-    /// Skipped entirely under `CODESCOPE_DEV=1` — mirrors C#
-    /// `UpdateService.CheckAsync`'s `IsDevMode` early return.
-    fn start_update_check_poll(&self, cx: &mut Context<Self>) {
-        let paths = self.paths.clone();
-        if !codescope_core::update_check::should_poll(&paths) {
-            return;
-        }
-        cx.spawn(async move |this, cx| {
-            // Initial 10 s delay — keeps the first network call off
-            // the startup-critical path.
-            cx.background_executor()
-                .timer(codescope_core::update_check::INITIAL_DELAY)
-                .await;
-            loop {
-                if this.upgrade().is_none() {
-                    break;
-                }
-                let status = cx
-                    .background_executor()
-                    .spawn(async move {
-                        codescope_core::update_check::check_once(env!(
-                            "CODESCOPE_VERSION_DISPLAY"
-                        ))
-                    })
-                    .await;
-                if this.upgrade().is_none() {
-                    break;
-                }
-                if let codescope_core::update_check::UpdateStatus::Available {
-                    version,
-                    url,
-                    body: _,
-                } = status
-                {
-                    // Probe Velopack-install state once on the
-                    // background executor — the call walks the
-                    // process's exe path to look for a Velopack
-                    // manifest, which is cheap but still IO. Cached
-                    // behind a `OnceLock` inside the bridge so we
-                    // only ever do it once per process lifetime.
-                    let velopack_supported = cx
-                        .background_executor()
-                        .spawn(async { crate::velopack_bridge::is_velopack_install() })
-                        .await;
-                    let _ = this.update(cx, |this, cx| {
-                        // Suppress duplicate announcements for the
-                        // same version this process lifetime, the
-                        // way C# `_stagedVersion` does.
-                        if this
-                            .last_announced_update
-                            .as_deref()
-                            .map(|v| v == version)
-                            .unwrap_or(false)
-                        {
-                            return;
-                        }
-                        this.last_announced_update = Some(version.clone());
-                        let title: SharedString =
-                            format!("CodeScope {version} available").into();
-                        // Detail text differs by install path:
-                        //
-                        // * Velopack install → "Downloading update…"
-                        //   so the user knows auto-apply is queued.
-                        //   We also kick off the actual apply below.
-                        // * cargo-dist MSI / `cargo run` / unpacked
-                        //   zip → keep the existing URL hint; the
-                        //   user opens the release page themselves.
-                        // Detail text differs by install path:
-                        //
-                        // * Velopack install → "Downloading update…"
-                        //   so the user knows download is in flight.
-                        //   When the download finishes we replace
-                        //   the bell-popover entry with an actionable
-                        //   toast (see below) — the popover entry
-                        //   itself is informational only.
-                        // * cargo-dist MSI / `cargo run` / unpacked
-                        //   zip → keep the existing URL hint; the
-                        //   user opens the release page themselves.
-                        let detail: SharedString = if velopack_supported {
-                            "Downloading update in the background. \
-                             You'll be prompted to install when it's ready."
-                                .into()
-                        } else {
-                            format!("A newer release is published. {url}").into()
-                        };
-                        this.push_notification(
-                            crate::notifications::NotificationKind::Generic,
-                            title,
-                            detail,
-                            None,
-                            cx,
-                        );
-                    });
-                    if velopack_supported {
-                        // Mirror C# `UpdateService.CheckAsync`, split
-                        // across two threads:
-                        //
-                        // * Background — `stage_pending_update` does
-                        //   `check_for_updates` + `download_updates`.
-                        //   Heavy IO that must not block the UI.
-                        // * Main thread — `apply_staged` is no longer
-                        //   called automatically. We stash the
-                        //   `StagedUpdate` on the shell and surface a
-                        //   persistent toast with an "Install &
-                        //   restart" action — the user clicks when
-                        //   ready, then `dispatch_toast_action` runs
-                        //   `apply_staged` on the main thread. This
-                        //   prevents the user-reported "the app
-                        //   crashed during update" perception caused
-                        //   by the auto-apply silently killing the
-                        //   running window before Update.exe could
-                        //   relaunch us. velopack-rs's
-                        //   `apply_updates_and_restart` still ends
-                        //   in `std::process::exit(0)`, which is why
-                        //   apply MUST run on the main thread.
-                        //
-                        // Errors are best-effort and only logged
-                        // (matches C# `LogWarning(ex, …)`).
-                        let staged = cx
-                            .background_executor()
-                            .spawn(async {
-                                crate::velopack_bridge::stage_pending_update()
-                            })
-                            .await;
-                        if this.upgrade().is_none() {
-                            break;
-                        }
-                        let version_for_toast = version.clone();
-                        let _ = this.update(cx, |this, cx| {
-                            use crate::velopack_bridge::StageOutcome;
-                            match staged {
-                                StageOutcome::Ready(s) => {
-                                    this.staged_update = Some(s);
-                                    this.push_action_toast(
-                                        ToastKind::Info,
-                                        format!(
-                                            "CodeScope {version_for_toast} ready to install"
-                                        ),
-                                        Some(
-                                            "Saves your session state, restarts on the \
-                                             new version."
-                                                .into(),
-                                        ),
-                                        ToastAction {
-                                            label: "Install & restart".into(),
-                                            kind: ToastActionKind::ApplyStagedUpdate,
-                                        },
-                                        cx,
-                                    );
-                                }
-                                StageOutcome::UpToDate => {
-                                    // Race between our GitHub poll
-                                    // and Velopack's feed read: the
-                                    // poll saw a newer release but
-                                    // Velopack's view says we're
-                                    // current. Quietly drop — the
-                                    // next 3-hour tick re-converges.
-                                }
-                                StageOutcome::Unsupported => {
-                                    // Shouldn't happen — we gated on
-                                    // `is_velopack_install` above.
-                                    // Log if it does so a future
-                                    // regression is visible.
-                                    eprintln!(
-                                        "[velopack] stage: Unsupported despite \
-                                         positive install probe"
-                                    );
-                                }
-                                StageOutcome::Failed(msg) => {
-                                    eprintln!("[velopack] stage failed: {msg}");
-                                }
-                            }
-                        });
-                    }
-                }
-                cx.background_executor()
-                    .timer(codescope_core::update_check::POLL_INTERVAL)
-                    .await;
             }
         })
         .detach();
@@ -3961,7 +3710,6 @@ impl AppShell {
                 };
                 let title = t.title.clone();
                 let detail = t.detail.clone();
-                let action = t.action.clone();
                 div()
                     .id(("toast", id))
                     .flex()
@@ -3999,51 +3747,6 @@ impl AppShell {
                                     .text_color(ink_dim)
                                     .text_size(px(11.0))
                                     .child(d)
-                            }))
-                            // Action button row — only rendered when
-                            // `Toast.action` is `Some`. Lives inside
-                            // the content column so it indents
-                            // beneath title/detail rather than
-                            // hugging the dismiss "×".
-                            .children(action.map(|a| {
-                                let kind = a.kind;
-                                let label = a.label.clone();
-                                // Match the empty-state primary CTA: solid
-                                // accent fill with `gpui::black()` text +
-                                // SEMIBOLD so the call to action reads
-                                // cleanly on the accent — the previous
-                                // `ink` foreground was a near-white that
-                                // washed out against the accent fill in
-                                // most themes. Subtle l-bump on hover (same
-                                // formula `empty_state.rs` uses for
-                                // `accent_hover`) keeps the affordance.
-                                let accent = theme::accent(theme);
-                                let accent_hover = gpui::Hsla {
-                                    l: (accent.l + 0.08).min(1.0),
-                                    ..accent
-                                };
-                                div().pt_2().child(
-                                    div()
-                                        .id(("toast-action", id))
-                                        .px_3()
-                                        .py_1p5()
-                                        .rounded_sm()
-                                        .bg(accent)
-                                        .text_color(gpui::black())
-                                        .text_size(px(12.0))
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .cursor_pointer()
-                                        .hover(move |s| s.bg(accent_hover))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, window, cx| {
-                                                this.dispatch_toast_action(
-                                                    id, kind, window, cx,
-                                                );
-                                            }),
-                                        )
-                                        .child(label),
-                                )
                             })),
                     )
                     .child(
@@ -4184,7 +3887,6 @@ impl AppShell {
                 .map(|(i, entry)| {
                     let id = entry.id;
                     let dot_color = match entry.kind {
-                        crate::notifications::NotificationKind::Generic => ink_dim,
                         crate::notifications::NotificationKind::SessionWaiting => signal_warn,
                         crate::notifications::NotificationKind::SessionReady => accent,
                     };
@@ -5491,62 +5193,12 @@ impl AppShell {
             kind,
             title: title.into(),
             detail,
-            expires_at: Some(Instant::now() + lifetime),
-            action: None,
+            expires_at: Instant::now() + lifetime,
         });
-        self.evict_toasts_to_cap();
-        cx.notify();
-    }
-
-    /// Push a *persistent* toast carrying an action affordance. The
-    /// auto-dismiss task leaves these alone (`expires_at: None`); the
-    /// toast stays until the user clicks the action or the dismiss
-    /// "×". Cap-eviction prefers non-persistent toasts (see
-    /// [`Self::evict_toasts_to_cap`]) so a flurry of regular toasts
-    /// can't push the action affordance — and its stashed
-    /// `staged_update` — off the back and leave the user without a
-    /// way to install until the next 3-hour poll.
-    fn push_action_toast(
-        &mut self,
-        kind: ToastKind,
-        title: impl Into<SharedString>,
-        detail: Option<SharedString>,
-        action: ToastAction,
-        cx: &mut Context<Self>,
-    ) {
-        let id = self.next_toast_id;
-        self.next_toast_id += 1;
-        self.toasts.push_front(Toast {
-            id,
-            kind,
-            title: title.into(),
-            detail,
-            expires_at: None,
-            action: Some(action),
-        });
-        self.evict_toasts_to_cap();
-        cx.notify();
-    }
-
-    /// Trim the visible-toast deque down to [`TOAST_VISIBLE_CAP`],
-    /// preferring **non-persistent** toasts as the eviction victim.
-    /// Only when every survivor is persistent do we fall back to
-    /// dropping the oldest persistent toast — that's the
-    /// degenerate "more action offers than visible slots" case
-    /// which doesn't exist today (only one persistent kind ships).
-    /// Closes a Copilot review on PR #232: without this preference
-    /// a burst of regular toasts could push the staged-update
-    /// action off the back, stranding `staged_update = Some` with
-    /// no UI affordance until the next 3-hour poll re-emits.
-    fn evict_toasts_to_cap(&mut self) {
         while self.toasts.len() > TOAST_VISIBLE_CAP {
-            let victim_idx = self
-                .toasts
-                .iter()
-                .rposition(|t| t.expires_at.is_some())
-                .unwrap_or(self.toasts.len() - 1);
-            self.toasts.remove(victim_idx);
+            self.toasts.pop_back();
         }
+        cx.notify();
     }
 
     /// Walk every adopted-agent tab, diff its current telemetry state
@@ -5722,54 +5374,6 @@ impl AppShell {
         self.toasts.retain(|t| t.id != id);
         if self.toasts.len() != before {
             cx.notify();
-        }
-    }
-
-    /// Handle a click on a toast's action button. Dispatches based
-    /// on the [`ToastActionKind`] discriminator the toast carried.
-    /// Dismisses the source toast so the user gets a visible
-    /// "click registered" signal — apply-staged then exits the
-    /// process within ~1 s anyway.
-    ///
-    /// `_window` is unused today but kept in the signature so
-    /// future action kinds that open dialogs / focus elements
-    /// don't have to reshape every call site.
-    fn dispatch_toast_action(
-        &mut self,
-        toast_id: u64,
-        kind: ToastActionKind,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.dismiss_toast(toast_id, cx);
-        match kind {
-            ToastActionKind::ApplyStagedUpdate => {
-                // `apply_staged` ends in `std::process::exit(0)`
-                // inside velopack-rs — must run on the main thread
-                // (we are). If the staged update is missing (rare:
-                // a concurrent UpToDate poll consumed it), surface
-                // a short error toast instead of silently no-oping.
-                let Some(staged) = self.staged_update.take() else {
-                    self.push_toast(
-                        ToastKind::Err,
-                        SharedString::from("Update no longer staged"),
-                        Some(SharedString::from(
-                            "Wait a moment for the next update check, then try again.",
-                        )),
-                        cx,
-                    );
-                    return;
-                };
-                if let Err(msg) = crate::velopack_bridge::apply_staged(staged) {
-                    eprintln!("[velopack] apply failed: {msg}");
-                    self.push_toast(
-                        ToastKind::Err,
-                        SharedString::from("Update failed"),
-                        Some(SharedString::from(msg)),
-                        cx,
-                    );
-                }
-            }
         }
     }
 
