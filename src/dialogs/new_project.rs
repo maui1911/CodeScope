@@ -393,6 +393,12 @@ impl Sidebar {
         let parent = default_clone_parent(&existing_paths, home.as_deref());
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
+        // AppShell's root `track_focus(&self.focus_handle)` registers a
+        // bubble-phase auto-focus that would otherwise steal focus to
+        // AppShell on the same click that opened the dialog, leaving
+        // keystrokes routed to AppShell's chord-only handler. Same
+        // primitive `activate_tab` uses (see `src/app.rs`).
+        window.prevent_default();
         let state = NewProjectDialogState::new(parent, focus_handle);
         self.set_new_project_dialog(Some(state));
         self.close_menu_no_notify();
@@ -665,8 +671,11 @@ impl Sidebar {
                 .cursor_pointer()
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
+                    cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
+                        // Keep AppShell's bubble auto-focus from
+                        // stealing focus off the dialog card.
+                        window.prevent_default();
                         this.set_new_project_mode(target, cx);
                     }),
                 )
@@ -778,8 +787,9 @@ impl Sidebar {
                 .items_center()
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                         cx.stop_propagation();
+                        window.prevent_default();
                         this.focus_new_project_field(this_field, cx);
                         if let Some(state) = this.new_project_dialog_mut() {
                             let idx = state
@@ -807,6 +817,7 @@ impl Sidebar {
                     &state.existing_path,
                     Box::new(cx.listener(|this, _, window, cx| {
                         cx.stop_propagation();
+                        window.prevent_default();
                         this.pick_existing_project_folder(window, cx);
                     })),
                 );
@@ -826,6 +837,7 @@ impl Sidebar {
                     state.parent.text(),
                     Box::new(cx.listener(|this, _, window, cx| {
                         cx.stop_propagation();
+                        window.prevent_default();
                         this.pick_clone_parent_folder(window, cx);
                     })),
                 );
@@ -964,7 +976,14 @@ impl Sidebar {
             .on_key_down(cx.listener(handle_key_down))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                cx.listener(|_, _, window, cx| {
+                    cx.stop_propagation();
+                    // Clicks on the card's padding / header bubble
+                    // through here without hitting a child listener;
+                    // suppress AppShell's bubble auto-focus so the
+                    // dialog's focus handle isn't yanked away.
+                    window.prevent_default();
+                }),
             )
             .child(header)
             .child(mode_toggle)
