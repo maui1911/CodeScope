@@ -222,14 +222,18 @@ Filename: "{app}\CodeScope.exe"; Description: "Launch CodeScope"; Flags: nowait 
 | Cargo bin target | `codescope-rs` | `codescope` |
 | Built executable | `codescope-rs.exe` | `codescope.exe`, renamed to `CodeScope.exe` during Windows staging |
 | Install dir (Windows) | `%LOCALAPPDATA%\Programs\codescope-rs\bin\` | `%LOCALAPPDATA%\Programs\CodeScope\` |
-| MSI ProductName | `codescope-rs` | n/a (MSI dropped) |
+| Apps & Features entry | `CodeScope (Rust)` / `CodeScope (Rust port)` | `CodeScope` |
+| MSI ProductName / DiskPrompt | `codescope-rs` / `CodeScope (Rust port)` | n/a (MSI dropped) |
 | Inno AppName | n/a | `CodeScope` |
-| Start Menu shortcut | `codescope-rs` | `CodeScope` |
+| Start Menu folder | `CodeScope (Rust)` | `CodeScope` |
+| Start Menu shortcut | `CodeScope (Rust)` | `CodeScope` |
 | Release asset prefix | `codescope-rs-` | `CodeScope-v` |
 | Member crates | `codescope-core`, `codescope-terminal` | unchanged (internal — not user-visible) |
 | `paths::AppPaths` data dirs | `%APPDATA%\CodeScope\` | unchanged (already correct) |
 | Window title | `CodeScope — …` | unchanged (already correct) |
 | Single-instance mutex | `Global\CodeScope.SingleInstance` | unchanged |
+
+The `(Rust)` / `(Rust port)` parentheticals currently live in `wix/main.wxs` (MSI `Manufacturer` description on line 75, `AppShortcutFolder` Name on line 200, shortcut Name on line 203, Description on line 204). Deleting the WiX template removes every instance in one move; the new Inno `.iss` uses `AppName=CodeScope` with no parenthetical, so Apps & Features will display just `CodeScope` after the next install.
 
 Touch points in code:
 
