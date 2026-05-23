@@ -6,7 +6,7 @@
 
 **Architecture:** Background thread polls GitHub Releases via the `self_update` crate; an `Arc<RwLock<UpdateStatus>>` slot bridges the thread to the GPUI render loop; the render loop surfaces a persistent toast with action buttons; the user-initiated **Update** action triggers `self_update::self_replace::self_replace` (atomic exe swap) on Windows + Linux, then `exit(0)`. macOS shows the toast but **Update** opens the GitHub releases page (no apply path until notarization lands). Windows packaging swaps cargo-dist's WiX-driven MSI for an Inno Setup `.iss` script that installs per-user to `%LOCALAPPDATA%\Programs\CodeScope\` — Inno's "dump files and forget" model is compatible with atomic swap; MSI's component-tracking is not.
 
-**Tech Stack:** Rust 2024 (workspace edition), `self_update` 0.41 (GitHub backend + archive-zip + archive-tar features), GPUI 0.2.2, `parking_lot::RwLock`, cargo-dist 0.31 (kept for mac/Linux tar.xz packaging), Inno Setup 6 (Windows installer), GitHub Actions matrix CI.
+**Tech Stack:** Rust 2024 (workspace edition), `self_update` 0.41 (GitHub backend + archive-zip + archive-tar features), GPUI 0.2.2, `parking_lot::RwLock`, cargo-dist 0.31 (kept for mac/Linux tar.gz packaging), Inno Setup 6 (Windows installer), GitHub Actions matrix CI.
 
 **Spec:** `docs/superpowers/specs/2026-05-22-auto-update-design.md`
 
@@ -252,7 +252,7 @@ installer/CodeScope.iss to produce CodeScope-vX.Y.Z-setup.exe. The
 zip serves as the future self_update target; the setup.exe is the
 fresh-install path.
 
-macOS / Linux remain on cargo-dist with tar.xz output."
+macOS / Linux remain on cargo-dist with tar.gz output."
 ```
 
 ---
@@ -282,7 +282,7 @@ members = ["cargo:."]
 #
 # - cargo-dist builds the release binary on native runners per target
 #   (`macos-14`, `macos-15-intel`, `ubuntu-22.04`) and packages each
-#   as a `.tar.xz`. Windows packaging is handled by a custom workflow
+#   as a `.tar.gz`. Windows packaging is handled by a custom workflow
 #   job that uses Inno Setup — see `.github/workflows/release.yml`'s
 #   `windows-package` job and `installer/CodeScope.iss`. cargo-dist
 #   does NOT package Windows here (its MSI flow was retired together
@@ -296,7 +296,7 @@ members = ["cargo:."]
 cargo-dist-version = "0.31.0"
 ci = "github"
 # No cargo-dist-managed installers. Windows ships via Inno Setup
-# (see release.yml); macOS / Linux ship as tar.xz archives directly.
+# (see release.yml); macOS / Linux ship as tar.gz archives directly.
 installers = []
 # macOS + Linux only. The Windows target is built by the
 # `windows-package` job in release.yml using Inno Setup, not by
@@ -364,7 +364,7 @@ Note every hit; these are the lines to fix.
 
 - [ ] **Step 2: Rewrite the README install table**
 
-Replace the install-asset table (around line 61-66) with the new artifact names. Exact lines depend on current README state — replace `codescope-rs-win-Setup.exe` with `CodeScope-vX.Y.Z-setup.exe`, drop the "auto-updates" claim (that's coming back in Phase 2, but the README shouldn't claim it before it ships), update the macOS / Linux entries to match cargo-dist's actual filenames (`CodeScope-vX.Y.Z-aarch64-apple-darwin.tar.xz` etc).
+Replace the install-asset table (around line 61-66) with the new artifact names. Exact lines depend on current README state — replace `codescope-rs-win-Setup.exe` with `CodeScope-vX.Y.Z-setup.exe`, drop the "auto-updates" claim (that's coming back in Phase 2, but the README shouldn't claim it before it ships), update the macOS / Linux entries to match cargo-dist's actual filenames (`CodeScope-vX.Y.Z-aarch64-apple-darwin.tar.gz` etc).
 
 Drop the "Pack id `codescope-rs`" caveat block — it's about the C# → Rust cutover and is no longer relevant.
 
@@ -401,7 +401,7 @@ git add README.md CLAUDE.md
 git commit -m "docs: refresh README + CLAUDE.md after codescope-rs rename
 
 - README install table now lists CodeScope-vX.Y.Z-setup.exe and the
-  tar.xz filenames cargo-dist actually produces.
+  tar.gz filenames cargo-dist actually produces.
 - Drops the 'auto-updates' claim from the install table — auto-update
   is coming back in a follow-up but the README shouldn't promise it
   before it ships.
@@ -465,7 +465,7 @@ At this point the branch contains the rename + Inno migration. If you want to sh
 
 1. Bump version to `0.3.1-rc.1` in `Cargo.toml`.
 2. Open a PR from `feat/auto-update-design` to `main`.
-3. After merge + tag, the CI produces `CodeScope-v0.3.1-rc.1-setup.exe` + `.zip` + the three tar.xz files.
+3. After merge + tag, the CI produces `CodeScope-v0.3.1-rc.1-setup.exe` + `.zip` + the three tar.gz files.
 4. Install the new build (after uninstalling the old `codescope-rs` MSI) and verify the rename is end-to-end clean.
 
 Or continue to Phase 2 on the same branch — your call.
@@ -489,7 +489,7 @@ Under `[dependencies]` add:
 # archive, and atomic-swaps the running exe. We use the GitHub
 # backend + the archive-zip / archive-tar / compression-flate2 +
 # compression-zstd features so the crate can extract our published
-# .zip (Windows) and .tar.xz (Linux) artifacts. Mac apply is
+# .zip (Windows) and .tar.gz (Linux) artifacts. Mac apply is
 # disabled until notarization lands — see src/update.rs.
 self_update = { version = "0.41", default-features = false, features = ["archive-zip", "archive-tar", "compression-flate2", "compression-zstd", "rustls"] }
 ```
@@ -592,7 +592,7 @@ Append to `core/src/update_check.rs`:
 /// Metadata about a single GitHub Release that's newer than the
 /// running binary. Carried from the poll to the toast surface and
 /// then to the apply step. `archive_url` is the platform-specific
-/// download (zip on Windows, tar.xz elsewhere); `release_notes_url`
+/// download (zip on Windows, tar.gz elsewhere); `release_notes_url`
 /// is the human-readable page we open if the user clicks through.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReleaseInfo {
@@ -614,17 +614,17 @@ pub fn target_archive_suffix() -> &'static str {
     }
     #[cfg(target_os = "linux")]
     {
-        "-x86_64-unknown-linux-gnu.tar.xz"
+        "-x86_64-unknown-linux-gnu.tar.gz"
     }
     #[cfg(target_os = "macos")]
     {
         #[cfg(target_arch = "aarch64")]
         {
-            "-aarch64-apple-darwin.tar.xz"
+            "-aarch64-apple-darwin.tar.gz"
         }
         #[cfg(target_arch = "x86_64")]
         {
-            "-x86_64-apple-darwin.tar.xz"
+            "-x86_64-apple-darwin.tar.gz"
         }
     }
 }
@@ -1359,7 +1359,7 @@ fn extract_binary(archive_path: &std::path::Path) -> anyhow::Result<std::path::P
     };
 
     // Look for the binary at the archive root, then one level down
-    // (mac/Linux tar.xz nests the binary inside a versioned folder
+    // (mac/Linux tar.gz nests the binary inside a versioned folder
     // by cargo-dist convention; Windows zip is flat).
     let candidates = [extract_dir.join(exe_name)];
     for c in candidates.iter() {
@@ -1611,12 +1611,12 @@ mandatory.
 
 ### 2. Fresh-install validation (Linux)
 
-- [ ] Download `CodeScope-vX.Y.Z-x86_64-unknown-linux-gnu.tar.xz`.
+- [ ] Download `CodeScope-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`.
 - [ ] Extract, run the binary on a Linux VM. App launches.
 
 ### 3. Fresh-install validation (macOS)
 
-- [ ] Download the matching tar.xz for your arch.
+- [ ] Download the matching tar.gz for your arch.
 - [ ] Extract, drag CodeScope to /Applications, launch.
 - [ ] (Until notarization lands: Gatekeeper warns once; right-click
       → Open clears it.)

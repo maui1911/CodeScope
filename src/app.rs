@@ -753,8 +753,8 @@ pub struct AppShell {
     suppress_layout_save: bool,
     /// Updater state slot — written by background threads in
     /// `crate::update::start_poll` / `start_install`, read every
-    /// render to decide whether to surface the update toast. Wired
-    /// into AppShell::new in a follow-up commit.
+    /// render to decide whether to surface the update toast.
+    /// Initialized and handed to `start_poll` in `AppShell::new`.
     update_state: crate::update::UpdateState,
     /// Tag (or sentinel string) of the most-recently-surfaced
     /// "update available" / "ready" / "failed" toast. Keeps the
@@ -5408,7 +5408,14 @@ impl AppShell {
                 crate::update::start_install(self.update_state.clone(), info);
             }
             ToastActionKind::RestartForUpdate => {
-                std::process::exit(0);
+                // Graceful quit rather than process::exit(0): runs
+                // gpui's normal shutdown so the user can relaunch into
+                // the freshly-swapped binary. layout.json / projects.json
+                // are already flushed synchronously on mutation; pending
+                // window geometry is debounced and treated as droppable
+                // at shutdown by design (see the window-save debounce
+                // loop in AppShell::new).
+                cx.quit();
             }
             ToastActionKind::OpenReleasesPage => {
                 if let Err(err) = crate::update::open_releases_page() {

@@ -1,14 +1,14 @@
 # Auto-update (manual-apply) + branding cleanup — design
 
 **Date:** 2026-05-22
-**Status:** draft — awaiting user review
+**Status:** approved (2026-05-22)
 **Related:** PR #244 (auto-update rip), session 44 HANDOFF (velopack post-mortem), ADR-0022 (C# → Rust)
 
 ## Problem
 
 Auto-update was ripped from CodeScope in PR #244 after crashing on three consecutive release cycles (rc.10 / rc.12 / rc.14). Root cause was velopack-rs's `VelopackApp::run()` calling `call_fast_hook`, which unconditionally `exit(0)`s — combined with `Update.exe` re-launching the new binary with `--veloapp-updated` / `--veloapp-install` argv flags that the app couldn't recover from. The user lost ~two sessions of work to this loop.
 
-Net of #244: no in-app update surface at all. Users upgrade by going to GitHub Releases, downloading the MSI, running it. CodeScope is shipped as cargo-dist MSI (Windows) + `.tar.xz` (macOS / Linux), with `install-updater = false` to keep axoupdater from creeping back in.
+Net of #244: no in-app update surface at all. Users upgrade by going to GitHub Releases, downloading the MSI, running it. CodeScope is shipped as cargo-dist MSI (Windows) + `.tar.xz` (macOS / Linux — this PR later switches unix to `.tar.gz` for `self_update` compatibility), with `install-updater = false` to keep axoupdater from creeping back in.
 
 The user wants update awareness back, but with two firm constraints:
 
@@ -29,7 +29,7 @@ In:
 - Branding rename: `codescope-rs` → `CodeScope` across install path, executable, MSI / Inno product metadata, Start Menu shortcut, release asset filenames. Cargo workspace package name stays `codescope`.
 - macOS = notifier-only. Toast surfaces the new release but the **Update** action opens the GitHub Releases page in the default browser (no in-app apply path).
 - A `.iss` Inno Setup script checked into the repo at `installer/CodeScope.iss`.
-- Release workflow rewrite: cargo-dist keeps building the binaries + tar.xz for macOS / Linux; Windows job adds `choco install innosetup` + `iscc` + zip-bundle steps.
+- Release workflow rewrite: cargo-dist keeps building the binaries + tar.gz for macOS / Linux; Windows job adds `choco install innosetup` + `iscc` + zip-bundle steps.
 
 Out (YAGNI):
 
@@ -81,7 +81,7 @@ If any step fails:
 
 ### macOS-specific divergence
 
-On macOS the toast says the same thing but the **Update** action does not download — it opens `https://github.com/maui1911/CodeScope/releases/latest` in the default browser. The user downloads the `.tar.xz`, extracts it, replaces their `.app` manually. Spec documents this is v1 behavior; full self_update on mac is a tracked follow-up issue gated on notarization.
+On macOS the toast says the same thing but the **Update** action does not download — it opens `https://github.com/maui1911/CodeScope/releases/latest` in the default browser. The user downloads the `.tar.gz`, extracts it, replaces their `.app` manually. Spec documents this is v1 behavior; full self_update on mac is a tracked follow-up issue gated on notarization.
 
 ## Architecture
 
@@ -146,9 +146,9 @@ The background thread never calls into GPUI; GPUI reads via the state slot. No r
 | Platform | Initial install | Update target archive | Apply path | macOS note |
 |---|---|---|---|---|
 | Windows x64 | `CodeScope-vX.Y.Z-setup.exe` (Inno) | `CodeScope-vX.Y.Z-windows.zip` | `self_update` atomic swap | — |
-| macOS arm64 | `CodeScope-vX.Y.Z-aarch64-apple-darwin.tar.xz` (cargo-dist) | n/a (v1) | Open Releases page | Gatekeeper would block unsigned swap |
-| macOS x64 | `CodeScope-vX.Y.Z-x86_64-apple-darwin.tar.xz` (cargo-dist) | n/a (v1) | Open Releases page | Same |
-| Linux x64 | `CodeScope-vX.Y.Z-x86_64-unknown-linux-gnu.tar.xz` (cargo-dist) | same `.tar.xz` | `self_update` atomic swap | — |
+| macOS arm64 | `CodeScope-vX.Y.Z-aarch64-apple-darwin.tar.gz` (cargo-dist) | n/a (v1) | Open Releases page | Gatekeeper would block unsigned swap |
+| macOS x64 | `CodeScope-vX.Y.Z-x86_64-apple-darwin.tar.gz` (cargo-dist) | n/a (v1) | Open Releases page | Same |
+| Linux x64 | `CodeScope-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` (cargo-dist) | same `.tar.gz` | `self_update` atomic swap | — |
 
 ## Release pipeline changes
 
@@ -168,7 +168,7 @@ windows-job:
 
 macos-arm64-job / macos-x64-job / linux-job:
   unchanged from current cargo-dist
-  → CodeScope-v${TAG}-<triple>.tar.xz
+  → CodeScope-v${TAG}-<triple>.tar.gz
 
 publish-job:
   - gh release create v${TAG} <all four artifacts>
@@ -245,7 +245,7 @@ Touch points in code:
 - `CLAUDE.md` Velopack mandate block — remove (stale since #244).
 - `docs/HANDOFF.md` — session 46 entry will document the rename.
 
-The Cargo root package + bin name are lowercased (`codescope`) because Cargo conventions resist CamelCase. The *displayed* binary on Windows is renamed to `CodeScope.exe` during staging (`Move-Item target\release\codescope.exe CodeScope.exe` before zipping + Inno). On macOS / Linux the binary inside the tar.xz can also be `CodeScope` if we want — cleaner for `which`. The member crates (`codescope-core`, `codescope-terminal`) keep their hyphenated names; they're never user-visible and renaming them would churn every `use codescope_core::*` import in the workspace for zero value.
+The Cargo root package + bin name are lowercased (`codescope`) because Cargo conventions resist CamelCase. The *displayed* binary on Windows is renamed to `CodeScope.exe` during staging (`Move-Item target\release\codescope.exe CodeScope.exe` before zipping + Inno). On macOS / Linux the binary inside the tar.gz can also be `CodeScope` if we want — cleaner for `which`. The member crates (`codescope-core`, `codescope-terminal`) keep their hyphenated names; they're never user-visible and renaming them would churn every `use codescope_core::*` import in the workspace for zero value.
 
 ### Migration story for existing installs
 
@@ -279,7 +279,7 @@ Add `docs/RELEASE-VALIDATION.md` — a checklist run on each `vX.Y.Z` tag before
 1. Fresh Windows VM: download `-setup.exe`, install, launch, verify `%LOCALAPPDATA%\Programs\CodeScope\CodeScope.exe` exists and runs.
 2. Trigger a fake-newer-version path via env (`CODESCOPE_DEV_FAKE_UPDATE_TOAST=1`) — same env we used for session 44 — to surface the toast in dev mode.
 3. Drop a hand-built newer-version zip into a local HTTP server, point `CODESCOPE_DEV_UPDATE_URL` at it, click **Update**, verify atomic swap + restart works.
-4. Linux VM equivalent with tar.xz.
+4. Linux VM equivalent with tar.gz.
 5. macOS: verify toast surfaces, **Update** opens the Releases page, browser opens correctly.
 
 ### What we will *not* rely on

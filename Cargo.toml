@@ -78,10 +78,12 @@ semver = "1"
 tempfile = "3"
 # In-app updater. Polls GitHub Releases, downloads the platform
 # archive, and atomic-swaps the running exe. Uses the GitHub backend
-# + archive-zip / archive-tar / compression-flate2 + compression-zstd
-# features so the crate can extract our published `.zip` (Windows) and
-# `.tar.xz` (Linux) artifacts. Mac apply is disabled until notarization
-# lands — see src/update.rs (added in a later commit).
+# + archive-zip / archive-tar / compression-flate2 features so the
+# crate can extract our published `.zip` (Windows) and `.tar.gz`
+# (Linux) artifacts — cargo-dist's unix-archive is set to `.tar.gz`
+# in dist-workspace.toml to match (self_update 0.41 has no xz/lzma
+# feature). Mac apply is disabled until notarization lands — see
+# src/update.rs.
 self_update = { version = "0.41", default-features = false, features = ["archive-zip", "archive-tar", "compression-flate2", "rustls"] }
 
 [target.'cfg(windows)'.dependencies]

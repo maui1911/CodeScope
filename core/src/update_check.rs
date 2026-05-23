@@ -95,52 +95,58 @@ pub fn check_latest(current: &Version) -> Result<Option<ReleaseInfo>> {
         .fetch()
         .context("fetch github releases")?;
 
-    // The list is newest-first per GitHub's ordering, but we don't
-    // trust that — explicitly pick the highest semver across the
-    // returned set. Pre-releases are filtered out for stable clients
-    // BEFORE the max-select (see select_update_target for the why: a
-    // newer pre-release must not shadow a newer stable release).
-    let want_prerelease = !current.pre.is_empty();
-    let latest = releases
+    let suffix = target_archive_suffix();
+
+    // Parse every release tag to a semver, keeping the release struct
+    // alongside it. Unparseable tags are dropped.
+    let candidates: Vec<_> = releases
         .into_iter()
         .filter_map(|r| {
             let v = Version::parse(r.version.trim_start_matches('v')).ok()?;
             Some((v, r))
         })
-        .filter(|(v, _)| want_prerelease || v.pre.is_empty())
-        .max_by(|a, b| a.0.cmp(&b.0));
+        .collect();
 
-    let Some((latest_version, latest_release)) = latest else {
+    // Project to the (version, has-matching-asset) view that the pure
+    // decision function consumes, then let `select_update_target` make
+    // the call. Routing the production path through the same function
+    // the unit tests exercise means the gating logic (pre-release
+    // filtering, max-select, version gate, asset gate) has exactly one
+    // implementation rather than a tested copy and a shipped copy.
+    let decision_input: Vec<(Version, bool)> = candidates
+        .iter()
+        .map(|(v, r)| {
+            let has_asset = r.assets.iter().any(|a| a.name.ends_with(suffix));
+            (v.clone(), has_asset)
+        })
+        .collect();
+
+    let Some(target_version) = select_update_target(&decision_input, current) else {
         return Ok(None);
     };
+    let target_version = target_version.clone();
 
-    if latest_version <= *current {
-        return Ok(None);
-    }
-
-    // A newer release with no matching platform asset means the
-    // release exists on GitHub but its artifacts are still uploading
-    // (or were never published for this platform). That is "no update
-    // yet", not an error — surfacing it as Err would flash a spurious
-    // "Update check failed" toast during the publish window. Mirrors
-    // select_update_target returning None when the asset is absent.
-    let suffix = target_archive_suffix();
-    let Some(asset) = latest_release
+    // `select_update_target` only returns a version that is present in
+    // the candidate list AND carries a matching asset, so both lookups
+    // below are guaranteed to succeed.
+    let (_, release) = candidates
+        .iter()
+        .find(|(v, _)| *v == target_version)
+        .expect("select_update_target returned a version not in the candidate list");
+    let asset = release
         .assets
         .iter()
         .find(|a| a.name.ends_with(suffix))
-    else {
-        return Ok(None);
-    };
+        .expect("select_update_target only returns versions with a matching asset");
 
     Ok(Some(ReleaseInfo {
-        version: latest_version,
-        tag: latest_release.version.clone(),
+        version: target_version,
+        tag: release.version.clone(),
         archive_url: asset.download_url.clone(),
         archive_name: asset.name.clone(),
         release_notes_url: format!(
             "https://github.com/{}/{}/releases/tag/{}",
-            REPO_OWNER, REPO_NAME, latest_release.version
+            REPO_OWNER, REPO_NAME, release.version
         ),
     }))
 }
@@ -253,7 +259,7 @@ mod select_update_target_tests {
     }
 
     #[test]
-    fn missing_asset_falls_through_to_older_with_asset() {
+    fn missing_asset_on_latest_does_not_fall_back_to_older() {
         // If the newest tag has no platform asset (release in
         // progress), we explicitly do NOT fall back to an older tag
         // that does — the user sees nothing this poll, the next poll
