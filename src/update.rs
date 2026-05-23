@@ -92,6 +92,24 @@ pub fn start_poll(state: UpdateState) {
 }
 
 fn run_one_poll(state: &UpdateState) {
+    // Don't clobber an in-flight or completed install. Once the user
+    // has started downloading (Downloading / Installing) or the swap
+    // is done and awaiting restart (Ready), a background poll must not
+    // reset the state machine back to Checking — that would wipe the
+    // "Restart to activate" prompt and re-offer the same update. The
+    // poll resumes normally after the user restarts into the new build.
+    {
+        let current = state.read();
+        if matches!(
+            *current,
+            UpdateStatus::Downloading { .. }
+                | UpdateStatus::Installing
+                | UpdateStatus::Ready(_)
+        ) {
+            return;
+        }
+    }
+
     if std::env::var("CODESCOPE_DEV_FAKE_UPDATE_TOAST").is_ok() {
         *state.write() = UpdateStatus::Available(fake_release_info());
         return;
