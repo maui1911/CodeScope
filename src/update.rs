@@ -180,11 +180,10 @@ fn dev_update_url_override() -> Option<String> {
 
 #[cfg(not(target_os = "macos"))]
 fn run_install(state: &UpdateState, info: ReleaseInfo) {
-    *state.write() = UpdateStatus::Downloading {
-        received: 0,
-        total: None,
-    };
-
+    // The first Downloading{received, total} state is written once the
+    // HTTP response is in hand (with the real Content-Length below), so
+    // there's no separate received=0/total=None pre-write here — it
+    // would only ever be overwritten before a frame could render it.
     let download_url = dev_update_url_override().unwrap_or_else(|| info.archive_url.clone());
 
     let temp_dir = match tempfile::tempdir() {

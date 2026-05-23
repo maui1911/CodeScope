@@ -5349,15 +5349,21 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) {
         let title = title.into();
-        if let Some(id) = self.update_progress_toast_id
-            && let Some(toast) = self.toasts.iter_mut().find(|t| t.id == id)
-        {
-            toast.title = title;
-            toast.detail = detail;
-            cx.notify();
+        // Once we've pushed a progress toast for this install, only ever
+        // update it in place — never re-push. If the user dismissed it
+        // (×) mid-download, `find` returns None and we respect that
+        // rather than re-spawning the toast every frame. The id is reset
+        // to None on Ready / Failed (via `.take()`), so the next install
+        // starts fresh.
+        if let Some(id) = self.update_progress_toast_id {
+            if let Some(toast) = self.toasts.iter_mut().find(|t| t.id == id) {
+                toast.title = title;
+                toast.detail = detail;
+                cx.notify();
+            }
             return;
         }
-        // No live toast yet (first frame, or it was dismissed) — push one.
+        // First progress frame of this install — push the persistent toast.
         let id = self.next_toast_id;
         self.next_toast_id += 1;
         self.toasts.push_front(Toast {
