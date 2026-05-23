@@ -62,6 +62,20 @@ futures-channel = "0.3"
 # Windows by this crate — the in-app bell handles tab routing already,
 # so the OS toast is intentionally show-only for v1.
 notify-rust = "4"
+# Wrap `open::that` to launch URLs / files in the default handler.
+# Used by src/update.rs's `open_releases_page` (macOS fallback and
+# "view release notes" action) and any future shell-out to the
+# browser.
+open = "5"
+# `semver::Version` is used directly in `src/update.rs`'s
+# `fake_release_info` to construct a synthetic Version for the dev
+# override toast. codescope-core uses its own copy; we pin the same
+# major here so both resolve to a single compiled crate.
+semver = "1"
+# `tempfile::tempdir()` for staging the downloaded archive before
+# extract + self_replace. self_update re-exports `TempDir` but not
+# the `tempdir()` constructor, so we depend on it explicitly.
+tempfile = "3"
 # In-app updater. Polls GitHub Releases, downloads the platform
 # archive, and atomic-swaps the running exe. Uses the GitHub backend
 # + archive-zip / archive-tar / compression-flate2 + compression-zstd

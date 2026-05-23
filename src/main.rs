@@ -32,6 +32,7 @@ mod sidebar;
 mod taskbar_badge;
 mod text_field;
 mod theme;
+mod update;
 #[cfg(target_os = "windows")]
 mod win32_titlebar;
 
