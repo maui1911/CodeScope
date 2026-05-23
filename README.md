@@ -59,9 +59,9 @@ Grab the latest release from the [**Releases page**](https://github.com/maui1911
 | Asset | Platform |
 |---|---|
 | **`CodeScope-vX.Y.Z-setup.exe`** | Windows 10 22H2+ / Windows 11 (x64) — Inno Setup installer, per-user, no UAC. Installs to `%LOCALAPPDATA%\Programs\CodeScope`. |
-| **`CodeScope-vX.Y.Z-aarch64-apple-darwin.tar.xz`** | macOS 13+ on Apple Silicon — extract and drag to `/Applications`. |
-| **`CodeScope-vX.Y.Z-x86_64-apple-darwin.tar.xz`** | macOS 13+ on Intel — extract and drag to `/Applications`. |
-| **`CodeScope-vX.Y.Z-x86_64-unknown-linux-gnu.tar.xz`** | Linux x64 — extract and run `CodeScope`. |
+| **`CodeScope-vX.Y.Z-aarch64-apple-darwin.tar.gz`** | macOS 13+ on Apple Silicon — extract and drag to `/Applications`. |
+| **`CodeScope-vX.Y.Z-x86_64-apple-darwin.tar.gz`** | macOS 13+ on Intel — extract and drag to `/Applications`. |
+| **`CodeScope-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`** | Linux x64 — extract and run `CodeScope`. |
 
 > **Upgrading from a `codescope-rs` build (v0.3.0 or earlier):** uninstall `codescope-rs` from *Add/Remove Programs* before running the new `CodeScope-setup.exe`. Your projects, layout, and settings (in `%APPDATA%\CodeScope\`) carry over unchanged.
 

@@ -7,7 +7,7 @@ members = ["cargo:."]
 #
 # - cargo-dist builds the release binary on native runners per target
 #   (`macos-14`, `macos-15-intel`, `ubuntu-22.04`) and packages each
-#   as a `.tar.xz`. Windows packaging is handled by a custom workflow
+#   as a `.tar.gz`. Windows packaging is handled by a custom workflow
 #   job that uses Inno Setup — see `.github/workflows/release.yml`'s
 #   `windows-package` job and `installer/CodeScope.iss`. cargo-dist
 #   does NOT package Windows here (its MSI flow was retired together
@@ -21,7 +21,7 @@ members = ["cargo:."]
 cargo-dist-version = "0.31.0"
 ci = "github"
 # No cargo-dist-managed installers. Windows ships via Inno Setup
-# (see release.yml); macOS / Linux ship as tar.xz archives directly.
+# (see release.yml); macOS / Linux ship as tar.gz archives directly.
 installers = []
 # macOS + Linux only. The Windows target is built by the
 # `windows-package` job in release.yml using Inno Setup, not by
@@ -40,6 +40,15 @@ install-updater = false
 source-tarball = false
 allow-dirty = ["ci"]
 pr-run-mode = "skip"
+# Archive format for unix targets. Default is `.tar.xz`, but
+# `self_update` 0.41 has no xz/lzma feature — it only supports
+# `compression-flate2` (gzip), `compression-zip-bzip2`, and
+# `compression-zip-deflate`. Switching to `.tar.gz` lets the in-app
+# updater on Linux extract the same artifact that fresh installs use.
+# macOS archive format changes too as a side effect; mac uses
+# notifier-only (browser fallback) for in-app updates so it doesn't
+# extract programmatically.
+unix-archive = ".tar.gz"
 
 [dist.dependencies.apt]
 libwayland-dev = "*"
