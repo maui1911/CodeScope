@@ -241,29 +241,38 @@ fn extract_binary(archive_path: &std::path::Path) -> anyhow::Result<std::path::P
         .extract_into(&extract_dir)
         .context("extract archive")?;
 
-    let exe_name = if cfg!(target_os = "windows") {
-        "CodeScope.exe"
+    // Candidate binary names, in preference order. The Windows zip is
+    // staged by release.yml which renames the binary to `CodeScope.exe`,
+    // but cargo-dist's Linux tar.gz packs the cargo bin name as-built —
+    // `codescope` (lowercase). List both per platform so a change to
+    // either packaging path doesn't silently break self-update.
+    let exe_names: &[&str] = if cfg!(target_os = "windows") {
+        &["CodeScope.exe", "codescope.exe"]
     } else {
-        "CodeScope"
+        &["codescope", "CodeScope"]
     };
 
     // Look for the binary at the archive root, then one level down
     // (tar.gz may nest the binary inside a versioned folder by
     // cargo-dist convention; Windows zip is flat).
-    let direct = extract_dir.join(exe_name);
-    if direct.exists() {
-        return Ok(direct);
+    for exe_name in exe_names {
+        let direct = extract_dir.join(exe_name);
+        if direct.exists() {
+            return Ok(direct);
+        }
     }
     for entry in std::fs::read_dir(&extract_dir)? {
         let entry = entry?;
-        let candidate = entry.path().join(exe_name);
-        if candidate.exists() {
-            return Ok(candidate);
+        for exe_name in exe_names {
+            let candidate = entry.path().join(exe_name);
+            if candidate.exists() {
+                return Ok(candidate);
+            }
         }
     }
     Err(anyhow!(
-        "could not find {} inside extracted archive at {}",
-        exe_name,
+        "could not find any of {:?} inside extracted archive at {}",
+        exe_names,
         extract_dir.display()
     ))
 }
