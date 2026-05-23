@@ -16,29 +16,6 @@ use semver::Version;
 pub const REPO_OWNER: &str = "maui1911";
 pub const REPO_NAME: &str = "CodeScope";
 
-/// The currently-running binary's semver, parsed from
-/// `CARGO_PKG_VERSION`. Panics at startup-time only if the manifest
-/// somehow holds a non-semver string — that would be a build-time
-/// bug, not a runtime concern.
-pub fn current_version() -> Version {
-    Version::parse(env!("CARGO_PKG_VERSION"))
-        .expect("CARGO_PKG_VERSION must be valid semver")
-}
-
-#[cfg(test)]
-mod current_version_tests {
-    use super::*;
-
-    #[test]
-    fn parses_cargo_pkg_version_as_semver() {
-        let v = current_version();
-        // Just assert it's parsable — actual major/minor/patch shift
-        // with every release. If this fires the [package] version in
-        // Cargo.toml has drifted off semver.
-        assert!(v.major <= 99);
-    }
-}
-
 /// Metadata about a single GitHub Release that's newer than the
 /// running binary. Carried from the poll to the toast surface and
 /// then to the apply step. `archive_url` is the platform-specific
@@ -102,7 +79,14 @@ mod target_archive_suffix_tests {
 ///
 /// Sync (not async) — called from a dedicated background thread, not
 /// the gpui executor. A 10-second timeout caps the worst case.
-pub fn check_latest() -> Result<Option<ReleaseInfo>> {
+///
+/// `current` is the running *binary's* version. The caller passes it
+/// in because `env!("CARGO_PKG_VERSION")` here would resolve to
+/// `codescope-core`'s package version (this is a library crate),
+/// which is independent of the application's release version. The
+/// binary crate evaluates `env!` in its own context and hands the
+/// answer to us.
+pub fn check_latest(current: &Version) -> Result<Option<ReleaseInfo>> {
     let releases = self_update::backends::github::ReleaseList::configure()
         .repo_owner(REPO_OWNER)
         .repo_name(REPO_NAME)
@@ -110,8 +94,6 @@ pub fn check_latest() -> Result<Option<ReleaseInfo>> {
         .context("configure github release list")?
         .fetch()
         .context("fetch github releases")?;
-
-    let current = current_version();
 
     // The list is newest-first per GitHub's ordering, but we don't
     // trust that — explicitly pick the highest semver across the
@@ -128,7 +110,7 @@ pub fn check_latest() -> Result<Option<ReleaseInfo>> {
         return Ok(None);
     };
 
-    if latest_version <= current {
+    if latest_version <= *current {
         return Ok(None);
     }
 

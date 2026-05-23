@@ -16,6 +16,17 @@ use std::time::Duration;
 use parking_lot::RwLock;
 
 use codescope_core::update_check::{self, ReleaseInfo};
+use semver::Version;
+
+/// The running binary's semver, parsed from `CARGO_PKG_VERSION`. Lives
+/// in the binary crate (not `codescope-core`) because `env!` expands
+/// in the crate being compiled — the core helper crate has its own
+/// independent version. The expect panics only if the root manifest
+/// holds a non-semver string, which would be a build-time bug.
+fn current_version() -> Version {
+    Version::parse(env!("CARGO_PKG_VERSION"))
+        .expect("CARGO_PKG_VERSION must be valid semver")
+}
 
 /// State machine for the updater. Transitions are driven by the
 /// poller (Idle / Checking ↔ Available / UpToDate) and the
@@ -87,7 +98,7 @@ fn run_one_poll(state: &UpdateState) {
     }
 
     *state.write() = UpdateStatus::Checking;
-    match update_check::check_latest() {
+    match update_check::check_latest(&current_version()) {
         Ok(Some(info)) => {
             *state.write() = UpdateStatus::Available(info);
         }
@@ -103,7 +114,6 @@ fn run_one_poll(state: &UpdateState) {
 }
 
 fn fake_release_info() -> ReleaseInfo {
-    use semver::Version;
     ReleaseInfo {
         version: Version::parse("99.0.0").unwrap(),
         tag: "v99.0.0".into(),
