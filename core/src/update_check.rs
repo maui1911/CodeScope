@@ -8,7 +8,7 @@
 //! without dragging gpui into core's dep graph — see lib.rs
 //! rationale.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use semver::Version;
 
 /// Repository in `owner/name` form. Public so the binary crate can
@@ -118,18 +118,20 @@ pub fn check_latest(current: &Version) -> Result<Option<ReleaseInfo>> {
         return Ok(None);
     }
 
+    // A newer release with no matching platform asset means the
+    // release exists on GitHub but its artifacts are still uploading
+    // (or were never published for this platform). That is "no update
+    // yet", not an error — surfacing it as Err would flash a spurious
+    // "Update check failed" toast during the publish window. Mirrors
+    // select_update_target returning None when the asset is absent.
     let suffix = target_archive_suffix();
-    let asset = latest_release
+    let Some(asset) = latest_release
         .assets
         .iter()
         .find(|a| a.name.ends_with(suffix))
-        .ok_or_else(|| {
-            anyhow!(
-                "release {} has no asset matching '{}'",
-                latest_release.version,
-                suffix
-            )
-        })?;
+    else {
+        return Ok(None);
+    };
 
     Ok(Some(ReleaseInfo {
         version: latest_version,
