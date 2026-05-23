@@ -10,7 +10,7 @@
 //!   only have to change it here, not in two places.
 //!
 //! No gpui, alacritty, or windows-rs imports here. Anything UI-bound
-//! lives in the root `codescope-rs` binary crate (`src/`). Anything
+//! lives in the root `codescope` binary crate (`src/`). Anything
 //! terminal-protocol-bound lives in `codescope-terminal`.
 
 pub mod agent;

@@ -87,7 +87,7 @@ cmd.exe /c "`"$vcvars`" >NUL 2>&1 && set" | ForEach-Object {
 
 # Run cargo from the spike root, forwarding all script args verbatim.
 # Changing directory keeps zero-arg, global-option, and `+toolchain` invocations valid while still
-# targeting codescope-rs.
+# targeting codescope.
 $manifestDir = Resolve-Path (Join-Path $PSScriptRoot '..')
 Push-Location $manifestDir
 try {

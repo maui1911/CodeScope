@@ -22,8 +22,9 @@ isolation. Ships on Windows, macOS (arm64 + x64), and Linux x64.
   do not suggest xterm.js + WebView2 or wrapping VS Code's terminal
 - Shell out to `git` — do not suggest `git2`/libgit2 bindings
 - `serde_json` for on-disk state — do not introduce other JSON crates
-- `velopack-rs` for auto-update — do not suggest Sparkle, Squirrel, or
-  custom updaters
+- `self_update` crate for in-app update detection + apply; Inno Setup
+  for the Windows installer. Velopack was retired in #244 after three
+  release-cycle crashes; do not reintroduce it.
 
 ## Design reference
 
@@ -55,12 +56,12 @@ Start the dev build with the `CODESCOPE_DEV` env var set:
 ```pwsh
 # Windows (PowerShell)
 $env:CODESCOPE_DEV = "1"
-cargo run --bin codescope-rs
+cargo run --bin codescope
 ```
 
 ```bash
 # macOS / Linux
-CODESCOPE_DEV=1 cargo run --bin codescope-rs
+CODESCOPE_DEV=1 cargo run --bin codescope
 ```
 
 `codescope_core::paths::AppPaths::detect()` resolves the env var once
