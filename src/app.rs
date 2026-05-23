@@ -756,6 +756,12 @@ pub struct AppShell {
     /// render to decide whether to surface the update toast. Wired
     /// into AppShell::new in a follow-up commit.
     update_state: crate::update::UpdateState,
+    /// Tag (or sentinel string) of the most-recently-surfaced
+    /// "update available" / "ready" / "failed" toast. Keeps the
+    /// per-frame `surface_update_state` from spam-pushing the same
+    /// toast over and over while the persistent bell entry is already
+    /// in place.
+    last_announced_update: Option<String>,
 }
 
 impl AppShell {
@@ -1276,6 +1282,14 @@ impl AppShell {
         // the sidebar entity could consume a clone for its worktree-
         // menu rows. We reuse the same registry here for the shell.
 
+        // Bind the updater state slot up-front so we can hand a
+        // clone to the background poll thread while keeping the
+        // canonical Arc on the AppShell. `start_poll` has a built-in
+        // ~15s startup delay so it stays off the first-frame
+        // critical path.
+        let update_state = crate::update::new_state();
+        crate::update::start_poll(update_state.clone());
+
         let mut shell = Self {
             groups,
             focused_group,
@@ -1315,7 +1329,8 @@ impl AppShell {
             confirm_dialog: None,
             taskbar_badge: crate::taskbar_badge::TaskbarBadge::new(window),
             suppress_layout_save: false,
-            update_state: crate::update::new_state(),
+            update_state,
+            last_announced_update: None,
         };
         shell.start_telemetry_poll(cx);
         shell.start_agent_discovery_poll(cx);
@@ -5217,6 +5232,82 @@ impl AppShell {
         (busy, idle)
     }
 
+    /// Snapshot the updater state slot and surface any state-machine
+    /// transitions as toasts / notifications. Called every render
+    /// tick — cheap because the snapshot is just an `Arc::read +
+    /// clone` and the per-state matching is constant time.
+    ///
+    /// Idempotency: each transition is guarded by `last_announced_update`
+    /// so a state that lingers across multiple frames does not retoast.
+    fn surface_update_state(&mut self, cx: &mut Context<Self>) {
+        let snapshot = crate::update::snapshot(&self.update_state);
+        match snapshot {
+            crate::update::UpdateStatus::Available(info) => {
+                if self.last_announced_update.as_deref() == Some(info.tag.as_str()) {
+                    return;
+                }
+                self.last_announced_update = Some(info.tag.clone());
+
+                let action_kind = if cfg!(target_os = "macos") {
+                    ToastActionKind::OpenReleasesPage
+                } else {
+                    ToastActionKind::ApplyUpdate(info.clone())
+                };
+
+                self.push_action_toast(
+                    ToastKind::Info,
+                    format!("CodeScope {} is available", info.tag),
+                    Some(
+                        format!("Current version: v{}", env!("CARGO_PKG_VERSION"))
+                            .into(),
+                    ),
+                    ToastAction {
+                        label: "Update".into(),
+                        kind: action_kind,
+                    },
+                    cx,
+                );
+
+                self.notifications.push(
+                    crate::notifications::NotificationKind::UpdateAvailable,
+                    format!("Update available — {}", info.tag),
+                    "Click the update toast or check the releases page.",
+                    None,
+                );
+            }
+            crate::update::UpdateStatus::Ready(info) => {
+                let sentinel = format!("{}-ready", info.tag);
+                if self.last_announced_update.as_deref() == Some(sentinel.as_str()) {
+                    return;
+                }
+                self.last_announced_update = Some(sentinel);
+                self.push_action_toast(
+                    ToastKind::Ok,
+                    "Update installed",
+                    Some("Restart CodeScope to activate.".into()),
+                    ToastAction {
+                        label: "Restart".into(),
+                        kind: ToastActionKind::RestartForUpdate,
+                    },
+                    cx,
+                );
+            }
+            crate::update::UpdateStatus::Failed { message } => {
+                if self.last_announced_update.as_deref() == Some("failed") {
+                    return;
+                }
+                self.last_announced_update = Some("failed".into());
+                self.push_toast(
+                    ToastKind::Err,
+                    "Update failed",
+                    Some(message.into()),
+                    cx,
+                );
+            }
+            _ => {}
+        }
+    }
+
     /// Push a toast onto the top of the floating stack. Each kind
     /// has its own lifetime — errors stay longer so the user can
     /// read / copy. New toasts go to the front so the stack reads
@@ -6102,6 +6193,10 @@ impl Render for AppShell {
         // `&Window` borrow. Updated every frame — at the 250 ms
         // telemetry cadence, one frame of staleness is invisible.
         self.window_active_cached = window.is_window_active();
+        // Surface any updater state-machine transitions before the
+        // heavy render work — pushes toasts / bell entries when the
+        // poller flips us into Available / Ready / Failed.
+        self.surface_update_state(cx);
         let theme = self.theme.clone();
         // Tab-drag rect cache: swap the just-built map into
         // `prev_tab_rects` so the in-flight render can still answer
