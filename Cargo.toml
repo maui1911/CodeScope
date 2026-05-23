@@ -62,6 +62,13 @@ futures-channel = "0.3"
 # Windows by this crate — the in-app bell handles tab routing already,
 # so the OS toast is intentionally show-only for v1.
 notify-rust = "4"
+# In-app updater. Polls GitHub Releases, downloads the platform
+# archive, and atomic-swaps the running exe. Uses the GitHub backend
+# + archive-zip / archive-tar / compression-flate2 + compression-zstd
+# features so the crate can extract our published `.zip` (Windows) and
+# `.tar.xz` (Linux) artifacts. Mac apply is disabled until notarization
+# lands — see src/update.rs (added in a later commit).
+self_update = { version = "0.41", default-features = false, features = ["archive-zip", "archive-tar", "compression-flate2", "rustls"] }
 
 [target.'cfg(windows)'.dependencies]
 # Direct Win32 access for the custom titlebar: gpui's
