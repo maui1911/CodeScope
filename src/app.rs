@@ -288,7 +288,11 @@ struct Toast {
     kind: ToastKind,
     title: SharedString,
     detail: Option<SharedString>,
-    expires_at: Instant,
+    /// `None` for persistent toasts (action-bearing ones). The
+    /// auto-dismiss task skips these; the user must click the action
+    /// or the explicit × to clear.
+    expires_at: Option<Instant>,
+    action: Option<ToastAction>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -296,6 +300,30 @@ pub(crate) enum ToastKind {
     Ok,
     Err,
     Info,
+}
+
+/// Action button payload attached to a toast. When present, the toast
+/// renders an extra button with `label` and disables auto-dismiss
+/// (the user must act on it or click the × explicitly).
+#[derive(Clone, Debug)]
+pub(crate) struct ToastAction {
+    pub label: SharedString,
+    pub kind: ToastActionKind,
+}
+
+/// What clicking a toast-action button does. Restricted to the
+/// update flow's exact needs; expand only when a new caller appears.
+#[derive(Clone, Debug)]
+pub(crate) enum ToastActionKind {
+    /// Start downloading + atomic-swapping the binary for this
+    /// release. macOS callers should use `OpenReleasesPage` instead —
+    /// Gatekeeper blocks unsigned swaps inside `.app` bundles.
+    ApplyUpdate(codescope_core::update_check::ReleaseInfo),
+    /// Atomic swap is done; click closes the app so the user can
+    /// re-launch the new binary.
+    RestartForUpdate,
+    /// Open the GitHub releases page in the default browser.
+    OpenReleasesPage,
 }
 
 /// How long a toast stays visible before the auto-dismiss task
@@ -723,6 +751,11 @@ pub struct AppShell {
     /// drop the rest (they would still come back via `projects.json`,
     /// but in group 0 instead of their saved group).
     suppress_layout_save: bool,
+    /// Updater state slot — written by background threads in
+    /// `crate::update::start_poll` / `start_install`, read every
+    /// render to decide whether to surface the update toast. Wired
+    /// into AppShell::new in a follow-up commit.
+    update_state: crate::update::UpdateState,
 }
 
 impl AppShell {
@@ -1161,7 +1194,7 @@ impl AppShell {
                 let result = this.update(cx, |this, cx| {
                     let now = Instant::now();
                     let before = this.toasts.len();
-                    this.toasts.retain(|t| t.expires_at > now);
+                    this.toasts.retain(|t| t.expires_at.map_or(true, |e| e > now));
                     if this.toasts.len() != before {
                         cx.notify();
                     }
@@ -1282,6 +1315,7 @@ impl AppShell {
             confirm_dialog: None,
             taskbar_badge: crate::taskbar_badge::TaskbarBadge::new(window),
             suppress_layout_save: false,
+            update_state: crate::update::new_state(),
         };
         shell.start_telemetry_poll(cx);
         shell.start_agent_discovery_poll(cx);
@@ -3749,6 +3783,28 @@ impl AppShell {
                                     .child(d)
                             })),
                     )
+                    .children(t.action.as_ref().map(|action| {
+                        let toast_id = t.id;
+                        let kind = action.kind.clone();
+                        let label = action.label.clone();
+                        div()
+                            .id(("toast-action", toast_id))
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(ink_dim)
+                            .text_color(elevated)
+                            .text_size(px(11.0))
+                            .cursor_pointer()
+                            .hover(|s| s.opacity(0.85))
+                            .child(label)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.dispatch_toast_action(toast_id, kind.clone(), cx);
+                                }),
+                            )
+                    }))
                     .child(
                         div()
                             .id(("toast-dismiss", id))
@@ -5193,10 +5249,85 @@ impl AppShell {
             kind,
             title: title.into(),
             detail,
-            expires_at: Instant::now() + lifetime,
+            expires_at: Some(Instant::now() + lifetime),
+            action: None,
         });
         while self.toasts.len() > TOAST_VISIBLE_CAP {
             self.toasts.pop_back();
+        }
+        cx.notify();
+    }
+
+    /// Push a persistent toast that carries an action button. Auto-
+    /// dismiss is disabled; the user dismisses by clicking the action
+    /// or the × on the toast.
+    ///
+    /// Cap-eviction respects persistence: a flurry of regular toasts
+    /// won't drop the persistent one off the back. If we're still over
+    /// cap after removing all expirables (extremely unlikely — would mean
+    /// >TOAST_VISIBLE_CAP open action prompts at once) the oldest
+    /// persistent wins.
+    pub(crate) fn push_action_toast(
+        &mut self,
+        kind: ToastKind,
+        title: impl Into<SharedString>,
+        detail: Option<SharedString>,
+        action: ToastAction,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.next_toast_id;
+        self.next_toast_id += 1;
+        self.toasts.push_front(Toast {
+            id,
+            kind,
+            title: title.into(),
+            detail,
+            expires_at: None,
+            action: Some(action),
+        });
+        while self.toasts.len() > TOAST_VISIBLE_CAP {
+            let drop_idx = self
+                .toasts
+                .iter()
+                .rposition(|t| t.action.is_none())
+                .or_else(|| self.toasts.len().checked_sub(1));
+            match drop_idx {
+                Some(i) => {
+                    self.toasts.remove(i);
+                }
+                None => break,
+            }
+        }
+        cx.notify();
+    }
+
+    /// Handle a click on a toast action button. Routes per
+    /// `ToastActionKind`; dismisses the source toast after the action
+    /// fires.
+    pub(crate) fn dispatch_toast_action(
+        &mut self,
+        toast_id: u64,
+        kind: ToastActionKind,
+        cx: &mut Context<Self>,
+    ) {
+        self.toasts.retain(|t| t.id != toast_id);
+        match kind {
+            ToastActionKind::ApplyUpdate(info) => {
+                crate::update::start_install(self.update_state.clone(), info);
+            }
+            ToastActionKind::RestartForUpdate => {
+                std::process::exit(0);
+            }
+            ToastActionKind::OpenReleasesPage => {
+                if let Err(err) = crate::update::open_releases_page() {
+                    self.push_toast(
+                        ToastKind::Err,
+                        "Could not open browser",
+                        Some(format!("{err:#}").into()),
+                        cx,
+                    );
+                }
+            }
         }
         cx.notify();
     }
