@@ -83,14 +83,17 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # the `tempdir()` constructor, so we depend on it explicitly.
 tempfile = "3"
 # In-app updater. Polls GitHub Releases, downloads the platform
-# archive, and atomic-swaps the running exe. Uses the GitHub backend
-# + archive-zip / archive-tar / compression-flate2 features so the
-# crate can extract our published `.zip` (Windows) and `.tar.gz`
-# (Linux) artifacts — cargo-dist's unix-archive is set to `.tar.gz`
-# in dist-workspace.toml to match (self_update 0.41 has no xz/lzma
-# feature). Mac apply is disabled until notarization lands — see
-# src/update.rs.
-self_update = { version = "0.41", default-features = false, features = ["archive-zip", "archive-tar", "compression-flate2", "rustls"] }
+# archive, and atomic-swaps the running exe. Features:
+#   - archive-zip + compression-zip-deflate → extract the Windows
+#     `.zip` (Compress-Archive / cargo-dist zips are DEFLATE-compressed;
+#     archive-zip alone only handles STORED entries and fails with
+#     "unsupported extraction method").
+#   - archive-tar + compression-flate2 → extract the Linux `.tar.gz`
+#     (cargo-dist's unix-archive is set to `.tar.gz` in
+#     dist-workspace.toml; self_update 0.41 has no xz/lzma feature).
+#   - rustls → keep us off OpenSSL.
+# Mac apply is disabled until notarization lands — see src/update.rs.
+self_update = { version = "0.41", default-features = false, features = ["archive-zip", "archive-tar", "compression-flate2", "compression-zip-deflate", "rustls"] }
 
 [target.'cfg(windows)'.dependencies]
 # Direct Win32 access for the custom titlebar: gpui's
