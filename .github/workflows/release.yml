@@ -339,15 +339,24 @@ jobs:
           submodules: recursive
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b  # stable, pinned 2026-05-23
+        with:
+          toolchain: stable
 
       - name: Build release binary
-        run: cargo build --release --bin codescope
+        shell: pwsh
+        run: |
+          $tag = "${{ needs.plan.outputs.tag }}".TrimStart('v')
+          if ([string]::IsNullOrEmpty($tag)) { Write-Error 'Tag is empty — refusing to package'; exit 1 }
+          $env:CODESCOPE_VERSION = $tag
+          Write-Host "Building with CODESCOPE_VERSION=$tag"
+          cargo build --release --bin codescope
 
       - name: Stage bundle
         shell: pwsh
         run: |
           $tag = "${{ needs.plan.outputs.tag }}".TrimStart('v')
+          if ([string]::IsNullOrEmpty($tag)) { Write-Error 'Tag is empty — refusing to package'; exit 1 }
           New-Item -ItemType Directory -Path dist/bundle -Force | Out-Null
           Copy-Item target/release/codescope.exe dist/bundle/CodeScope.exe
           Copy-Item LICENSE dist/bundle/
@@ -362,6 +371,7 @@ jobs:
         shell: pwsh
         run: |
           $tag = "${{ needs.plan.outputs.tag }}".TrimStart('v')
+          if ([string]::IsNullOrEmpty($tag)) { Write-Error 'Tag is empty — refusing to package'; exit 1 }
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=$tag /Qp installer\CodeScope.iss
 
       - name: Upload artifacts
