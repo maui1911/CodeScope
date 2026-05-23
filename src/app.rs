@@ -5293,10 +5293,16 @@ impl AppShell {
                 );
             }
             crate::update::UpdateStatus::Failed { message } => {
-                if self.last_announced_update.as_deref() == Some("failed") {
+                // Sentinel keyed on the message so a *different* failure
+                // (or a fresh failure after the user dismissed the last
+                // one) still surfaces. An identical message recurring on
+                // the next 3h poll stays de-duped, which avoids spamming
+                // the same error.
+                let sentinel = format!("failed:{message}");
+                if self.last_announced_update.as_deref() == Some(sentinel.as_str()) {
                     return;
                 }
-                self.last_announced_update = Some("failed".into());
+                self.last_announced_update = Some(sentinel);
                 self.push_toast(
                     ToastKind::Err,
                     "Update failed",

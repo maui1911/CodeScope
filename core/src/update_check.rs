@@ -78,7 +78,8 @@ mod target_archive_suffix_tests {
 /// suffix. Returns `None` when up-to-date.
 ///
 /// Sync (not async) — called from a dedicated background thread, not
-/// the gpui executor. A 10-second timeout caps the worst case.
+/// the gpui executor. Network timeouts rely on the `self_update`
+/// GitHub backend's reqwest defaults; we don't set an explicit bound.
 ///
 /// `current` is the running *binary's* version. The caller passes it
 /// in because `env!("CARGO_PKG_VERSION")` here would resolve to
