@@ -937,6 +937,7 @@ dependencies = [
  "parking_lot",
  "portable-pty",
  "raw-window-handle",
+ "reqwest",
  "self_update",
  "semver",
  "tempfile",

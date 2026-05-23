@@ -762,6 +762,11 @@ pub struct AppShell {
     /// toast over and over while the persistent bell entry is already
     /// in place.
     last_announced_update: Option<String>,
+    /// Id of the live progress toast shown during Downloading /
+    /// Installing. `Some` while an install is in flight; the toast's
+    /// title/detail are rewritten in place each frame from the
+    /// UpdateStatus snapshot, then it's removed on Ready / Failed.
+    update_progress_toast_id: Option<u64>,
 }
 
 impl AppShell {
@@ -1331,6 +1336,7 @@ impl AppShell {
             suppress_layout_save: false,
             update_state,
             last_announced_update: None,
+            update_progress_toast_id: None,
         };
         shell.start_telemetry_poll(cx);
         shell.start_agent_discovery_poll(cx);
@@ -5275,7 +5281,22 @@ impl AppShell {
                     None,
                 );
             }
+            crate::update::UpdateStatus::Downloading { received, total } => {
+                let detail = match total {
+                    Some(total) if total > 0 => Some(
+                        format!("{} / {}", fmt_bytes(received), fmt_bytes(total)).into(),
+                    ),
+                    _ => Some(fmt_bytes(received).into()),
+                };
+                self.set_progress_toast("Downloading update…", detail, cx);
+            }
+            crate::update::UpdateStatus::Installing => {
+                self.set_progress_toast("Installing update…", Some("Almost done.".into()), cx);
+            }
             crate::update::UpdateStatus::Ready(info) => {
+                if let Some(id) = self.update_progress_toast_id.take() {
+                    self.toasts.retain(|t| t.id != id);
+                }
                 let sentinel = format!("{}-ready", info.tag);
                 if self.last_announced_update.as_deref() == Some(sentinel.as_str()) {
                     return;
@@ -5293,6 +5314,9 @@ impl AppShell {
                 );
             }
             crate::update::UpdateStatus::Failed { message } => {
+                if let Some(id) = self.update_progress_toast_id.take() {
+                    self.toasts.retain(|t| t.id != id);
+                }
                 // Sentinel keyed on the message so a *different* failure
                 // (or a fresh failure after the user dismissed the last
                 // one) still surfaces. An identical message recurring on
@@ -5312,6 +5336,40 @@ impl AppShell {
             }
             _ => {}
         }
+    }
+
+    /// Ensure the live progress toast exists and rewrite its title/detail.
+    /// Pushes a persistent (non-expiring, action-less) toast on first call
+    /// and reuses it afterwards so per-frame progress updates mutate in
+    /// place instead of stacking new toasts.
+    fn set_progress_toast(
+        &mut self,
+        title: impl Into<SharedString>,
+        detail: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let title = title.into();
+        if let Some(id) = self.update_progress_toast_id
+            && let Some(toast) = self.toasts.iter_mut().find(|t| t.id == id)
+        {
+            toast.title = title;
+            toast.detail = detail;
+            cx.notify();
+            return;
+        }
+        // No live toast yet (first frame, or it was dismissed) — push one.
+        let id = self.next_toast_id;
+        self.next_toast_id += 1;
+        self.toasts.push_front(Toast {
+            id,
+            kind: ToastKind::Info,
+            title,
+            detail,
+            expires_at: None,
+            action: None,
+        });
+        self.update_progress_toast_id = Some(id);
+        cx.notify();
     }
 
     /// Push a toast onto the top of the floating stack. Each kind
@@ -7948,6 +8006,20 @@ fn append_window_diag(paths: &AppPaths, event: &str, window: &Window) {
     }
     if let Some(file) = slot.as_mut() {
         let _ = file.write_all(line.as_bytes());
+    }
+}
+
+/// Format a byte count as a compact human string (e.g. "12.4 MB").
+fn fmt_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    let b = bytes as f64;
+    if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.0} KB", b / KB)
+    } else {
+        format!("{bytes} B")
     }
 }
 

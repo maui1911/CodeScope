@@ -72,6 +72,12 @@ open = "5"
 # override toast. codescope-core uses its own copy; we pin the same
 # major here so both resolve to a single compiled crate.
 semver = "1"
+# Streaming download for the updater's byte-progress. self_update's
+# Download type has no programmatic progress callback in 0.41, so we
+# stream the GitHub asset ourselves to drive the Downloading{received,
+# total} state. rustls (not native-tls) keeps us off OpenSSL, matching
+# the self_update feature selection.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 # `tempfile::tempdir()` for staging the downloaded archive before
 # extract + self_replace. self_update re-exports `TempDir` but not
 # the `tempdir()` constructor, so we depend on it explicitly.

@@ -62,13 +62,13 @@ A toast appears in the bell-popover stack with severity `Info`:
 
 - Toast persists in the bell-popover (does not auto-dismiss). The transient toast tray surfaces it once when first detected; subsequent polls during the same session that hit the same version do **not** re-fire the transient surface (mirrors session 44's `last_announced_update` field).
 - **Update** triggers the download + apply flow (see next section).
-- **Later** dismisses the toast for the current session; if the user is still on the older version next launch, it re-surfaces.
+- The **Later** button shown in the sketch above is deferred: the toast carries only the **Update** action plus the standard × dismiss. Dismissing (×) clears it for now; the next 3-hour poll re-surfaces an available update, and it re-surfaces on next launch if the user is still on the older version (de-duped within a session via `last_announced_update`).
 
 ### When the user clicks **Update**
 
 Toast updates in place to show progress:
 
-1. `Downloading… (12.4 MB / 47.0 MB)` — driven by `self_update`'s progress callback.
+1. `Downloading… (12.4 MB / 47.0 MB)` — byte-progress streamed per chunk into `UpdateStatus::Downloading { received, total }`. self_update 0.41's `Download` type exposes no programmatic progress callback, so the asset is streamed via `reqwest::blocking` (rustls TLS, matching self_update's feature selection) and the running total is written to the state slot every 64 KB. The progress toast is persistent and rewrites its title/detail in place each frame (tracked by `update_progress_toast_id`) rather than stacking new toasts. When the server omits `Content-Length` the toast shows just the received count.
 2. `Installing…` — atomic swap in progress.
 3. `Klaar — herstart om te activeren` with a single **Restart** button.
 4. Click **Restart** → `exit(0)`. The user re-launches CodeScope from Start Menu / dock / shortcut. The new binary is in place.
@@ -76,7 +76,7 @@ Toast updates in place to show progress:
 If any step fails:
 
 - Toast switches to severity `Error` with the failure message.
-- A **Try again** button retries the download.
+- The **Try again** button is deferred: the failure toast has no retry action. The user dismisses it with × and the next 3-hour poll re-offers the available update (which re-runs the download on **Update**).
 - The current binary is untouched (atomic swap means partial state never leaks).
 
 ### macOS-specific divergence

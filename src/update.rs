@@ -41,7 +41,7 @@ pub enum UpdateStatus {
     Downloading {
         /// Bytes received so far.
         received: u64,
-        /// Total expected bytes. `None` when self_update doesn't
+        /// Total expected bytes. `None` when the server doesn't
         /// report Content-Length.
         total: Option<u64>,
     },
@@ -212,15 +212,72 @@ fn run_install(state: &UpdateState, info: ReleaseInfo) {
         }
     };
 
-    if let Err(err) = self_update::Download::from_url(&download_url)
-        .show_progress(false)
-        .download_to(&archive_file)
+    // Stream the download ourselves so we can drive byte-progress into
+    // the state slot. self_update::Download has no programmatic progress
+    // hook in 0.41. reqwest::blocking is safe here — run_install is on a
+    // plain std thread, not a tokio runtime.
+    let client = match reqwest::blocking::Client::builder()
+        .user_agent(concat!("CodeScope/", env!("CARGO_PKG_VERSION")))
+        .build()
     {
+        Ok(c) => c,
+        Err(err) => {
+            *state.write() = UpdateStatus::Failed {
+                message: format!("Could not build HTTP client: {err:#}"),
+            };
+            return;
+        }
+    };
+
+    let mut response = match client.get(&download_url).send() {
+        Ok(r) => r,
+        Err(err) => {
+            *state.write() = UpdateStatus::Failed {
+                message: format!("Download request failed: {err:#}"),
+            };
+            return;
+        }
+    };
+    if let Err(err) = response.error_for_status_ref() {
         *state.write() = UpdateStatus::Failed {
             message: format!("Download failed: {err:#}"),
         };
         return;
     }
+
+    let total = response.content_length();
+    let mut archive_file = archive_file; // rebind mut for write_all
+    let mut received: u64 = 0;
+    *state.write() = UpdateStatus::Downloading { received, total };
+
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = match std::io::Read::read(&mut response, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(err) => {
+                *state.write() = UpdateStatus::Failed {
+                    message: format!("Download read error: {err:#}"),
+                };
+                return;
+            }
+        };
+        if let Err(err) = std::io::Write::write_all(&mut archive_file, &buf[..n]) {
+            *state.write() = UpdateStatus::Failed {
+                message: format!("Write error: {err:#}"),
+            };
+            return;
+        }
+        received += n as u64;
+        *state.write() = UpdateStatus::Downloading { received, total };
+    }
+    if let Err(err) = std::io::Write::flush(&mut archive_file) {
+        *state.write() = UpdateStatus::Failed {
+            message: format!("Flush error: {err:#}"),
+        };
+        return;
+    }
+    drop(archive_file); // close before Extract reads it
 
     *state.write() = UpdateStatus::Installing;
 
