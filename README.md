@@ -54,16 +54,16 @@ Six built-ins selectable from the settings dialog (`Ctrl+Shift+,`): `codescope-d
 
 ## Install
 
-Grab the latest release from the [**Releases page**](https://github.com/maui1911/CodeScope/releases/latest). Each release ships a per-platform Velopack feed; pick the asset that matches your machine:
+Grab the latest release from the [**Releases page**](https://github.com/maui1911/CodeScope/releases/latest). Pick the asset that matches your machine:
 
 | Asset | Platform |
 |---|---|
-| **`codescope-rs-win-Setup.exe`** | Windows 10 22H2+ / Windows 11 (x64) — installs to `%LocalAppData%\codescope-rs`, auto-updates. |
-| **`codescope-rs-osx-arm64.app.zip`** | macOS 13+ on Apple Silicon — unzip and drag to `/Applications`. |
-| **`codescope-rs-osx-x64.app.zip`** | macOS 13+ on Intel — unzip and drag to `/Applications`. |
-| **`codescope-rs-linux-x64.AppImage`** | Linux x64 — `chmod +x` and run. |
+| **`CodeScope-vX.Y.Z-setup.exe`** | Windows 10 22H2+ / Windows 11 (x64) — Inno Setup installer, per-user, no UAC. Installs to `%LOCALAPPDATA%\Programs\CodeScope`. |
+| **`CodeScope-vX.Y.Z-aarch64-apple-darwin.tar.gz`** | macOS 13+ on Apple Silicon — extract and drag to `/Applications`. |
+| **`CodeScope-vX.Y.Z-x86_64-apple-darwin.tar.gz`** | macOS 13+ on Intel — extract and drag to `/Applications`. |
+| **`CodeScope-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`** | Linux x64 — extract and run `./codescope`. |
 
-> Pack id `codescope-rs` is in effect through the `0.3.0-rc.X` line. It is renamed to `codescope` in cutover-3 of the C# retirement; users on `codescope-rs` will need to uninstall and reinstall once when that release ships. `%APPDATA%\CodeScope\projects.json` carries over unchanged.
+> **Upgrading from a `codescope-rs` build (v0.3.0 or earlier):** uninstall `codescope-rs` from *Add/Remove Programs* before running the new `CodeScope-setup.exe`. Your projects, layout, and settings (in `%APPDATA%\CodeScope\`) carry over unchanged.
 
 ### Requirements
 
@@ -80,7 +80,7 @@ Only needed if you want to contribute or hack on CodeScope itself.
 ```pwsh
 # Prerequisites: stable Rust toolchain (1.85+, edition 2024), git
 cargo build --workspace
-cargo run --bin codescope-rs
+cargo run --bin codescope
 ```
 
 Run the tests:
@@ -95,7 +95,7 @@ Build a release binary:
 cargo build --workspace --release
 ```
 
-For installer / Velopack packaging see `.github/workflows/release.yml`.
+For installer packaging see `installer/CodeScope.iss` and `.github/workflows/release.yml`.
 
 ## Keyboard shortcuts
 
@@ -132,7 +132,7 @@ docs/
   HANDOFF.md     Rolling cursor between working sessions
   MIGRATION-csharp-to-rust.md  Historical note on the 2026-05-14 cutover
   screenshots/   README imagery
-Cargo.toml       Workspace root + the `codescope-rs` binary crate
+Cargo.toml       Workspace root + the `codescope` binary crate
 ```
 
 > Historical note: through `v0.2.6` the canonical tree was a .NET 10 / WPF
@@ -144,7 +144,7 @@ Cargo.toml       Workspace root + the `codescope-rs` binary crate
 
 ## Status
 
-Pre-1.0. The core session / worktree / PR workflows are stable and used daily; per-platform Velopack feeds ship from `rs-v0.3.0-rc.5` onward, and the C# implementation is being retired in three sequential PRs (see `docs/superpowers/specs/2026-05-14-csharp-build-retirement-design.md`).
+Pre-1.0. The core session / worktree / PR workflows are stable and used daily. The C# implementation was retired in `v0.3.0`; see `docs/MIGRATION-csharp-to-rust.md`.
 
 See `docs/HANDOFF.md` for the live status cursor and `docs/DECISIONS.md` for the architectural record.
 

@@ -7,7 +7,7 @@
 // builds for non-Windows targets ignore this attribute.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-//! `cargo run --bin codescope-rs` — launches the gpui app shell.
+//! `cargo run --bin codescope` — launches the gpui app shell.
 //!
 //! Boot sequence:
 //!
@@ -32,6 +32,7 @@ mod sidebar;
 mod taskbar_badge;
 mod text_field;
 mod theme;
+mod update;
 #[cfg(target_os = "windows")]
 mod win32_titlebar;
 

@@ -288,7 +288,11 @@ struct Toast {
     kind: ToastKind,
     title: SharedString,
     detail: Option<SharedString>,
-    expires_at: Instant,
+    /// `None` for persistent toasts (action-bearing ones). The
+    /// auto-dismiss task skips these; the user must click the action
+    /// or the explicit × to clear.
+    expires_at: Option<Instant>,
+    action: Option<ToastAction>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -296,6 +300,30 @@ pub(crate) enum ToastKind {
     Ok,
     Err,
     Info,
+}
+
+/// Action button payload attached to a toast. When present, the toast
+/// renders an extra button with `label` and disables auto-dismiss
+/// (the user must act on it or click the × explicitly).
+#[derive(Clone, Debug)]
+pub(crate) struct ToastAction {
+    pub label: SharedString,
+    pub kind: ToastActionKind,
+}
+
+/// What clicking a toast-action button does. Restricted to the
+/// update flow's exact needs; expand only when a new caller appears.
+#[derive(Clone, Debug)]
+pub(crate) enum ToastActionKind {
+    /// Start downloading + atomic-swapping the binary for this
+    /// release. macOS callers should use `OpenReleasesPage` instead —
+    /// Gatekeeper blocks unsigned swaps inside `.app` bundles.
+    ApplyUpdate(codescope_core::update_check::ReleaseInfo),
+    /// Atomic swap is done; click closes the app so the user can
+    /// re-launch the new binary.
+    RestartForUpdate,
+    /// Open the GitHub releases page in the default browser.
+    OpenReleasesPage,
 }
 
 /// How long a toast stays visible before the auto-dismiss task
@@ -723,6 +751,22 @@ pub struct AppShell {
     /// drop the rest (they would still come back via `projects.json`,
     /// but in group 0 instead of their saved group).
     suppress_layout_save: bool,
+    /// Updater state slot — written by background threads in
+    /// `crate::update::start_poll` / `start_install`, read every
+    /// render to decide whether to surface the update toast.
+    /// Initialized and handed to `start_poll` in `AppShell::new`.
+    update_state: crate::update::UpdateState,
+    /// Tag (or sentinel string) of the most-recently-surfaced
+    /// "update available" / "ready" / "failed" toast. Keeps the
+    /// per-frame `surface_update_state` from spam-pushing the same
+    /// toast over and over while the persistent bell entry is already
+    /// in place.
+    last_announced_update: Option<String>,
+    /// Id of the live progress toast shown during Downloading /
+    /// Installing. `Some` while an install is in flight; the toast's
+    /// title/detail are rewritten in place each frame from the
+    /// UpdateStatus snapshot, then it's removed on Ready / Failed.
+    update_progress_toast_id: Option<u64>,
 }
 
 impl AppShell {
@@ -1161,7 +1205,7 @@ impl AppShell {
                 let result = this.update(cx, |this, cx| {
                     let now = Instant::now();
                     let before = this.toasts.len();
-                    this.toasts.retain(|t| t.expires_at > now);
+                    this.toasts.retain(|t| t.expires_at.map_or(true, |e| e > now));
                     if this.toasts.len() != before {
                         cx.notify();
                     }
@@ -1243,6 +1287,14 @@ impl AppShell {
         // the sidebar entity could consume a clone for its worktree-
         // menu rows. We reuse the same registry here for the shell.
 
+        // Bind the updater state slot up-front so we can hand a
+        // clone to the background poll thread while keeping the
+        // canonical Arc on the AppShell. `start_poll` has a built-in
+        // ~15s startup delay so it stays off the first-frame
+        // critical path.
+        let update_state = crate::update::new_state();
+        crate::update::start_poll(update_state.clone());
+
         let mut shell = Self {
             groups,
             focused_group,
@@ -1282,6 +1334,9 @@ impl AppShell {
             confirm_dialog: None,
             taskbar_badge: crate::taskbar_badge::TaskbarBadge::new(window),
             suppress_layout_save: false,
+            update_state,
+            last_announced_update: None,
+            update_progress_toast_id: None,
         };
         shell.start_telemetry_poll(cx);
         shell.start_agent_discovery_poll(cx);
@@ -3749,6 +3804,28 @@ impl AppShell {
                                     .child(d)
                             })),
                     )
+                    .children(t.action.as_ref().map(|action| {
+                        let toast_id = t.id;
+                        let kind = action.kind.clone();
+                        let label = action.label.clone();
+                        div()
+                            .id(("toast-action", toast_id))
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(ink_dim)
+                            .text_color(elevated)
+                            .text_size(px(11.0))
+                            .cursor_pointer()
+                            .hover(|s| s.opacity(0.85))
+                            .child(label)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.dispatch_toast_action(toast_id, kind.clone(), cx);
+                                }),
+                            )
+                    }))
                     .child(
                         div()
                             .id(("toast-dismiss", id))
@@ -3889,6 +3966,7 @@ impl AppShell {
                     let dot_color = match entry.kind {
                         crate::notifications::NotificationKind::SessionWaiting => signal_warn,
                         crate::notifications::NotificationKind::SessionReady => accent,
+                        crate::notifications::NotificationKind::UpdateAvailable => accent,
                     };
                     let title = entry.title.clone();
                     let detail = entry.detail.clone();
@@ -5160,6 +5238,148 @@ impl AppShell {
         (busy, idle)
     }
 
+    /// Snapshot the updater state slot and surface any state-machine
+    /// transitions as toasts / notifications. Called every render
+    /// tick — cheap because the snapshot is just an `Arc::read +
+    /// clone` and the per-state matching is constant time.
+    ///
+    /// Idempotency: each transition is guarded by `last_announced_update`
+    /// so a state that lingers across multiple frames does not retoast.
+    fn surface_update_state(&mut self, cx: &mut Context<Self>) {
+        let snapshot = crate::update::snapshot(&self.update_state);
+        match snapshot {
+            crate::update::UpdateStatus::Available(info) => {
+                if self.last_announced_update.as_deref() == Some(info.tag.as_str()) {
+                    return;
+                }
+                self.last_announced_update = Some(info.tag.clone());
+
+                let action_kind = if cfg!(target_os = "macos") {
+                    ToastActionKind::OpenReleasesPage
+                } else {
+                    ToastActionKind::ApplyUpdate(info.clone())
+                };
+
+                self.push_action_toast(
+                    ToastKind::Info,
+                    format!("CodeScope {} is available", info.tag),
+                    Some(
+                        format!("Current version: v{}", env!("CARGO_PKG_VERSION"))
+                            .into(),
+                    ),
+                    ToastAction {
+                        label: "Update".into(),
+                        kind: action_kind,
+                    },
+                    cx,
+                );
+
+                self.notifications.push(
+                    crate::notifications::NotificationKind::UpdateAvailable,
+                    format!("Update available — {}", info.tag),
+                    "Click the update toast or check the releases page.",
+                    None,
+                );
+            }
+            crate::update::UpdateStatus::Downloading { received, total } => {
+                let detail = match total {
+                    Some(total) if total > 0 => Some(
+                        format!("{} / {}", fmt_bytes(received), fmt_bytes(total)).into(),
+                    ),
+                    _ => Some(fmt_bytes(received).into()),
+                };
+                self.set_progress_toast("Downloading update…", detail, cx);
+            }
+            crate::update::UpdateStatus::Installing => {
+                self.set_progress_toast("Installing update…", Some("Almost done.".into()), cx);
+            }
+            crate::update::UpdateStatus::Ready(info) => {
+                if let Some(id) = self.update_progress_toast_id.take() {
+                    self.toasts.retain(|t| t.id != id);
+                }
+                let sentinel = format!("{}-ready", info.tag);
+                if self.last_announced_update.as_deref() == Some(sentinel.as_str()) {
+                    return;
+                }
+                self.last_announced_update = Some(sentinel);
+                self.push_action_toast(
+                    ToastKind::Ok,
+                    "Update installed",
+                    Some("Restart CodeScope to activate.".into()),
+                    ToastAction {
+                        label: "Restart".into(),
+                        kind: ToastActionKind::RestartForUpdate,
+                    },
+                    cx,
+                );
+            }
+            crate::update::UpdateStatus::Failed { message } => {
+                if let Some(id) = self.update_progress_toast_id.take() {
+                    self.toasts.retain(|t| t.id != id);
+                }
+                // Sentinel keyed on the message so a *different* failure
+                // surfaces a new toast. `last_announced_update` is not
+                // cleared on dismiss, so an *identical* message stays
+                // de-duped for the rest of the session — including after
+                // the user dismisses the toast. That's deliberate:
+                // re-toasting the same error every 3h poll would be spam.
+                // A genuinely new error (different message) still shows.
+                let sentinel = format!("failed:{message}");
+                if self.last_announced_update.as_deref() == Some(sentinel.as_str()) {
+                    return;
+                }
+                self.last_announced_update = Some(sentinel);
+                self.push_toast(
+                    ToastKind::Err,
+                    "Update failed",
+                    Some(message.into()),
+                    cx,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// Ensure the live progress toast exists and rewrite its title/detail.
+    /// Pushes a persistent (non-expiring, action-less) toast on first call
+    /// and reuses it afterwards so per-frame progress updates mutate in
+    /// place instead of stacking new toasts.
+    fn set_progress_toast(
+        &mut self,
+        title: impl Into<SharedString>,
+        detail: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let title = title.into();
+        // Once we've pushed a progress toast for this install, only ever
+        // update it in place — never re-push. If the user dismissed it
+        // (×) mid-download, `find` returns None and we respect that
+        // rather than re-spawning the toast every frame. The id is reset
+        // to None on Ready / Failed (via `.take()`), so the next install
+        // starts fresh.
+        if let Some(id) = self.update_progress_toast_id {
+            if let Some(toast) = self.toasts.iter_mut().find(|t| t.id == id) {
+                toast.title = title;
+                toast.detail = detail;
+                cx.notify();
+            }
+            return;
+        }
+        // First progress frame of this install — push the persistent toast.
+        let id = self.next_toast_id;
+        self.next_toast_id += 1;
+        self.toasts.push_front(Toast {
+            id,
+            kind: ToastKind::Info,
+            title,
+            detail,
+            expires_at: None,
+            action: None,
+        });
+        self.update_progress_toast_id = Some(id);
+        cx.notify();
+    }
+
     /// Push a toast onto the top of the floating stack. Each kind
     /// has its own lifetime — errors stay longer so the user can
     /// read / copy. New toasts go to the front so the stack reads
@@ -5193,10 +5413,92 @@ impl AppShell {
             kind,
             title: title.into(),
             detail,
-            expires_at: Instant::now() + lifetime,
+            expires_at: Some(Instant::now() + lifetime),
+            action: None,
         });
         while self.toasts.len() > TOAST_VISIBLE_CAP {
             self.toasts.pop_back();
+        }
+        cx.notify();
+    }
+
+    /// Push a persistent toast that carries an action button. Auto-
+    /// dismiss is disabled; the user dismisses by clicking the action
+    /// or the × on the toast.
+    ///
+    /// Cap-eviction respects persistence: a flurry of regular toasts
+    /// won't drop the persistent one off the back. If we're still over
+    /// cap after removing all expirables (extremely unlikely — would mean
+    /// >TOAST_VISIBLE_CAP open action prompts at once) the oldest
+    /// persistent wins.
+    pub(crate) fn push_action_toast(
+        &mut self,
+        kind: ToastKind,
+        title: impl Into<SharedString>,
+        detail: Option<SharedString>,
+        action: ToastAction,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.next_toast_id;
+        self.next_toast_id += 1;
+        self.toasts.push_front(Toast {
+            id,
+            kind,
+            title: title.into(),
+            detail,
+            expires_at: None,
+            action: Some(action),
+        });
+        while self.toasts.len() > TOAST_VISIBLE_CAP {
+            let drop_idx = self
+                .toasts
+                .iter()
+                .rposition(|t| t.action.is_none())
+                .or_else(|| self.toasts.len().checked_sub(1));
+            match drop_idx {
+                Some(i) => {
+                    self.toasts.remove(i);
+                }
+                None => break,
+            }
+        }
+        cx.notify();
+    }
+
+    /// Handle a click on a toast action button. Routes per
+    /// `ToastActionKind`; dismisses the source toast after the action
+    /// fires.
+    pub(crate) fn dispatch_toast_action(
+        &mut self,
+        toast_id: u64,
+        kind: ToastActionKind,
+        cx: &mut Context<Self>,
+    ) {
+        self.toasts.retain(|t| t.id != toast_id);
+        match kind {
+            ToastActionKind::ApplyUpdate(info) => {
+                crate::update::start_install(self.update_state.clone(), info);
+            }
+            ToastActionKind::RestartForUpdate => {
+                // Graceful quit rather than process::exit(0): runs
+                // gpui's normal shutdown so the user can relaunch into
+                // the freshly-swapped binary. layout.json / projects.json
+                // are already flushed synchronously on mutation; pending
+                // window geometry is debounced and treated as droppable
+                // at shutdown by design (see the window-save debounce
+                // loop in AppShell::new).
+                cx.quit();
+            }
+            ToastActionKind::OpenReleasesPage => {
+                if let Err(err) = crate::update::open_releases_page() {
+                    self.push_toast(
+                        ToastKind::Err,
+                        "Could not open browser",
+                        Some(format!("{err:#}").into()),
+                        cx,
+                    );
+                }
+            }
         }
         cx.notify();
     }
@@ -5970,6 +6272,10 @@ impl Render for AppShell {
         // `&Window` borrow. Updated every frame — at the 250 ms
         // telemetry cadence, one frame of staleness is invisible.
         self.window_active_cached = window.is_window_active();
+        // Surface any updater state-machine transitions before the
+        // heavy render work — pushes toasts / bell entries when the
+        // poller flips us into Available / Ready / Failed.
+        self.surface_update_state(cx);
         let theme = self.theme.clone();
         // Tab-drag rect cache: swap the just-built map into
         // `prev_tab_rects` so the in-flight render can still answer
@@ -7708,6 +8014,20 @@ fn append_window_diag(paths: &AppPaths, event: &str, window: &Window) {
     }
     if let Some(file) = slot.as_mut() {
         let _ = file.write_all(line.as_bytes());
+    }
+}
+
+/// Format a byte count as a compact human string (e.g. "12.4 MB").
+fn fmt_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    let b = bytes as f64;
+    if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.0} KB", b / KB)
+    } else {
+        format!("{bytes} B")
     }
 }
 

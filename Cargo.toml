@@ -13,8 +13,8 @@ uuid = { version = "1", features = ["v4"] }
 windows = "0.61"
 
 [package]
-name = "codescope-rs"
-version = "0.3.0"
+name = "codescope"
+version = "0.3.1"
 edition = "2024"
 publish = false
 description = "CodeScope: gpui shell that orchestrates parallel AI coding agent CLI sessions with Git worktree isolation."
@@ -33,14 +33,8 @@ build = "build.rs"
 [package.metadata.dist]
 dist = true
 
-[package.metadata.wix]
-upgrade-guid = "A1FAA411-B556-490B-8C50-0FFDBE4EE0FD"
-path-guid = "3326208D-A1EE-453F-ACB6-EDBEE0D923C5"
-license = false
-eula = false
-
 [[bin]]
-name = "codescope-rs"
+name = "codescope"
 path = "src/main.rs"
 
 [[example]]
@@ -68,6 +62,38 @@ futures-channel = "0.3"
 # Windows by this crate — the in-app bell handles tab routing already,
 # so the OS toast is intentionally show-only for v1.
 notify-rust = "4"
+# Wrap `open::that` to launch URLs / files in the default handler.
+# Used by src/update.rs's `open_releases_page` (macOS fallback and
+# "view release notes" action) and any future shell-out to the
+# browser.
+open = "5"
+# `semver::Version` is used directly in `src/update.rs`'s
+# `fake_release_info` to construct a synthetic Version for the dev
+# override toast. codescope-core uses its own copy; we pin the same
+# major here so both resolve to a single compiled crate.
+semver = "1"
+# Streaming download for the updater's byte-progress. self_update's
+# Download type has no programmatic progress callback in 0.41, so we
+# stream the GitHub asset ourselves to drive the Downloading{received,
+# total} state. rustls (not native-tls) keeps us off OpenSSL, matching
+# the self_update feature selection.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+# `tempfile::tempdir()` for staging the downloaded archive before
+# extract + self_replace. self_update re-exports `TempDir` but not
+# the `tempdir()` constructor, so we depend on it explicitly.
+tempfile = "3"
+# In-app updater. Polls GitHub Releases, downloads the platform
+# archive, and atomic-swaps the running exe. Features:
+#   - archive-zip + compression-zip-deflate → extract the Windows
+#     `.zip` (Compress-Archive / cargo-dist zips are DEFLATE-compressed;
+#     archive-zip alone only handles STORED entries and fails with
+#     "unsupported extraction method").
+#   - archive-tar + compression-flate2 → extract the Linux `.tar.gz`
+#     (cargo-dist's unix-archive is set to `.tar.gz` in
+#     dist-workspace.toml; self_update 0.41 has no xz/lzma feature).
+#   - rustls → keep us off OpenSSL.
+# Mac apply is disabled until notarization lands — see src/update.rs.
+self_update = { version = "0.41", default-features = false, features = ["archive-zip", "archive-tar", "compression-flate2", "compression-zip-deflate", "rustls"] }
 
 [target.'cfg(windows)'.dependencies]
 # Direct Win32 access for the custom titlebar: gpui's

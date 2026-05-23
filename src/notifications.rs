@@ -42,6 +42,8 @@ pub enum NotificationKind {
     SessionReady,
     /// Agent paused for a permission prompt (manual-mode tool_use).
     SessionWaiting,
+    /// A newer CodeScope release is available on GitHub.
+    UpdateAvailable,
 }
 
 /// One entry in the ring buffer.  Mutable only for the `read` flag
