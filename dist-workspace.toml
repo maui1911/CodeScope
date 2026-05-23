@@ -5,93 +5,42 @@ members = ["cargo:."]
 #
 # Scope notes for CodeScope:
 #
-# - The pipeline runs natively on GitHub-hosted runners for each
-#   target — `windows-2022` (MSVC), `macos-14` (Apple Silicon),
-#   `macos-15-intel` (Intel x86_64), and `ubuntu-22.04` (glibc).
-#   cargo-dist 0.31 picks these runner labels itself from the target
-#   triple. Cross-compiling from the Windows dev box is *not*
-#   supported (ring's build.rs needs `cc` / `clang` / `zig` that
-#   aren't installed), but that's irrelevant on the native matrix.
-#   The visual chrome's Win32-only bits (custom titlebar,
-#   ITaskbarList3 badge) are `#[cfg(windows)]` gated with no-op
-#   stubs on macOS / Linux so the same crate compiles on every
-#   target.
-# - The MSI installer (Windows only) is built via WiX (cargo-dist's
-#   `msi` installer). On a stock GitHub-hosted `windows-latest`
-#   runner cargo-dist downloads the WiX toolset itself; no manual
-#   install required. macOS ships a `.tar.xz` of the binary +
-#   resources (cargo-dist's default for that platform); Linux ships
-#   a `.tar.xz` archive.
+# - cargo-dist builds the release binary on native runners per target
+#   (`macos-14`, `macos-15-intel`, `ubuntu-22.04`) and packages each
+#   as a `.tar.xz`. Windows packaging is handled by a custom workflow
+#   job that uses Inno Setup — see `.github/workflows/release.yml`'s
+#   `windows-package` job and `installer/CodeScope.iss`. cargo-dist
+#   does NOT package Windows here (its MSI flow was retired together
+#   with the auto-update rip in #244; the new self_update flow uses
+#   atomic exe-swap which is incompatible with MSI component tracking).
+#
 # - Linux runtime deps (gpui needs wayland + x11 + xkbcommon +
 #   fontconfig + freetype) are installed in the GH Actions Linux
-#   job via apt before `dist build` runs. See
-#   `.github/workflows/release.yml`.
-# - The MSI installs **per-user** to
-#   `%LOCALAPPDATA%\Programs\codescope-rs\bin\` and lays a Start Menu
-#   shortcut under the user's `%APPDATA%\Microsoft\Windows\Start
-#   Menu\Programs\` tree. No admin / UAC prompt at install or upgrade
-#   time. This matches VS Code Stable, Zed, Discord, Slack, and GitHub
-#   Desktop's modern default. The install dir name `codescope-rs/`
-#   predates the C# build retirement (see ADR-0022) and is preserved
-#   so existing installs aren't moved on disk.
-#
-#   The directory chain + `InstallScope="perUser"` + `MSIINSTALLPERUSER=1`
-#   are authored in `wix/main.wxs` (a hand-edited cargo-wix template).
-#   `allow-dirty = ["msi"]` below tells cargo-dist to leave the
-#   template alone — see the comment near it.
-# - `install-updater = false` — auto-update was removed from the
-#   runtime entirely; users upgrade by downloading a fresh installer
-#   from the GitHub release page. The axoupdater shipped by cargo-dist
-#   would reintroduce a self-update path we don't want.
+#   job via apt before `dist build` runs.
 [dist]
-# Preferred dist version in CI. Bumped together with the workflow.
 cargo-dist-version = "0.31.0"
-# CI backend.
 ci = "github"
-# Installers to generate per target platform. `msi` only applies on
-# Windows targets; cargo-dist silently skips it for macOS / Linux and
-# emits the default per-platform archive (`.tar.xz` on Linux / macOS,
-# `.zip` on Windows) alongside the installer.
-installers = ["msi"]
-# Target platforms. Native runners on the GH Actions matrix build each
-# triple — see the workflow for the runner / OS mapping.
+# No cargo-dist-managed installers. Windows ships via Inno Setup
+# (see release.yml); macOS / Linux ship as tar.xz archives directly.
+installers = []
+# macOS + Linux only. The Windows target is built by the
+# `windows-package` job in release.yml using Inno Setup, not by
+# cargo-dist's matrix.
 targets = [
-    "x86_64-pc-windows-msvc",
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
     "x86_64-unknown-linux-gnu",
 ]
-# Where to host releases.
 hosting = "github"
-# Auto-update was removed from the runtime; don't let cargo-dist
-# inject axoupdater either. Users upgrade by re-running the installer.
+# Don't let cargo-dist inject axoupdater. Auto-update is handled
+# in-app via self_update + a manual-apply toast (see core/src/
+# update_check.rs and src/update.rs); axoupdater would duplicate
+# that path.
 install-updater = false
-# Don't ship a generic source tarball — the project is public on GitHub
-# and the repo itself serves as the source archive.
 source-tarball = false
-# We hand-edit the generated workflow to drop the `pull_request:`
-# trigger (we only want tag pushes to spin up the release pipeline).
-# We also ship a custom WiX template at `wix/main.wxs` (per-user
-# install to `%LOCALAPPDATA%\Programs\codescope-rs\`, per-user Start
-# Menu shortcut, `InstallScope="perUser"` plus `MSIINSTALLPERUSER=1`
-# for no-UAC installs and upgrades — we do *not* set `ALLUSERS`
-# explicitly because WiX 3.14 rejects `Property@Value=""` and the
-# perUser InstallScope already handles the ALLUSERS bookkeeping).
-# `allow-dirty` tells cargo-dist not to fight the manual edits on
-# either path on every `dist plan` invocation.
-allow-dirty = ["ci", "msi"]
-# Don't fan out a PR-validation build matrix — the task brief says
-# "only trigger on tag pushes". This empties cargo-dist's PR mode so
-# the workflow's pull_request gate (when present) is a no-op.
+allow-dirty = ["ci"]
 pr-run-mode = "skip"
 
-# System packages required at build time for the Linux target.
-# gpui's Linux backend links against wayland-client, xkbcommon, X11,
-# fontconfig, and freetype; the matching `-dev` packages plus pkg-config
-# are needed for the build to succeed on a stock `ubuntu-22.04` runner.
-# cargo-dist injects this as the `packages_install` shell step in the
-# generated workflow, gated to the Linux job via the matrix entry's
-# `packages_install` field.
 [dist.dependencies.apt]
 libwayland-dev = "*"
 libxkbcommon-dev = "*"
