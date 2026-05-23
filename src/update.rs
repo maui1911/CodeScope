@@ -161,6 +161,23 @@ pub fn start_install(state: UpdateState, info: ReleaseInfo) {
         .expect("spawn update-install thread");
 }
 
+/// Dev-only override for the download URL (`CODESCOPE_DEV_UPDATE_URL`),
+/// used by the RELEASE-VALIDATION.md end-to-end loop to point the
+/// installer at a locally-served archive. Compiled out of release
+/// builds: honoring an arbitrary env-supplied URL in a shipped binary
+/// would let anyone who can set the process environment redirect the
+/// self-update to an attacker-controlled archive. Release builds always
+/// download from the GitHub release asset URL.
+#[cfg(all(not(target_os = "macos"), debug_assertions))]
+fn dev_update_url_override() -> Option<String> {
+    std::env::var("CODESCOPE_DEV_UPDATE_URL").ok()
+}
+
+#[cfg(all(not(target_os = "macos"), not(debug_assertions)))]
+fn dev_update_url_override() -> Option<String> {
+    None
+}
+
 #[cfg(not(target_os = "macos"))]
 fn run_install(state: &UpdateState, info: ReleaseInfo) {
     *state.write() = UpdateStatus::Downloading {
@@ -168,8 +185,7 @@ fn run_install(state: &UpdateState, info: ReleaseInfo) {
         total: None,
     };
 
-    let download_url = std::env::var("CODESCOPE_DEV_UPDATE_URL")
-        .unwrap_or_else(|_| info.archive_url.clone());
+    let download_url = dev_update_url_override().unwrap_or_else(|| info.archive_url.clone());
 
     let temp_dir = match tempfile::tempdir() {
         Ok(d) => d,
