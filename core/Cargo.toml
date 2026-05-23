@@ -6,9 +6,15 @@ publish = false
 description = "Shared models for CodeScope: settings, themes, env-aware paths. UI-free so it can be used from CLI tools and tests."
 
 [dependencies]
+anyhow.workspace = true
+# Used by update_check for the GitHub Releases list. We pull only the
+# HTTP + JSON parsing path — no archive features — so this doesn't drag
+# zip/tar/flate2 into core. The binary crate enables those features
+# separately for the apply step (see root Cargo.toml).
+self_update = { version = "0.41", default-features = false, features = ["rustls"] }
+semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-anyhow.workspace = true
 uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]

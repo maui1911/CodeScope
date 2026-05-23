@@ -35,6 +35,7 @@ pub mod tab_title;
 pub mod telemetry;
 pub mod theme;
 pub mod time;
+pub mod update_check;
 pub mod window_state;
 
 pub use agent::{AgentId, agent_id_from_auto_type};

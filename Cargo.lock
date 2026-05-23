@@ -947,6 +947,8 @@ name = "codescope-core"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "self_update",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",
