@@ -914,19 +914,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "codescope-core"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "tempfile",
- "uuid",
- "windows 0.61.3",
-]
-
-[[package]]
-name = "codescope-rs"
+name = "codescope"
 version = "0.3.0"
 dependencies = [
  "anyhow",
@@ -942,6 +930,18 @@ dependencies = [
  "uuid",
  "windows 0.61.3",
  "winreg 0.55.0",
+]
+
+[[package]]
+name = "codescope-core"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
+ "windows 0.61.3",
 ]
 
 [[package]]

@@ -13,7 +13,7 @@ uuid = { version = "1", features = ["v4"] }
 windows = "0.61"
 
 [package]
-name = "codescope-rs"
+name = "codescope"
 version = "0.3.0"
 edition = "2024"
 publish = false
@@ -33,14 +33,8 @@ build = "build.rs"
 [package.metadata.dist]
 dist = true
 
-[package.metadata.wix]
-upgrade-guid = "A1FAA411-B556-490B-8C50-0FFDBE4EE0FD"
-path-guid = "3326208D-A1EE-453F-ACB6-EDBEE0D923C5"
-license = false
-eula = false
-
 [[bin]]
-name = "codescope-rs"
+name = "codescope"
 path = "src/main.rs"
 
 [[example]]
