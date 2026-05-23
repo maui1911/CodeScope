@@ -97,13 +97,17 @@ pub fn check_latest(current: &Version) -> Result<Option<ReleaseInfo>> {
 
     // The list is newest-first per GitHub's ordering, but we don't
     // trust that — explicitly pick the highest semver across the
-    // returned set.
+    // returned set. Pre-releases are filtered out for stable clients
+    // BEFORE the max-select (see select_update_target for the why: a
+    // newer pre-release must not shadow a newer stable release).
+    let want_prerelease = !current.pre.is_empty();
     let latest = releases
         .into_iter()
         .filter_map(|r| {
             let v = Version::parse(r.version.trim_start_matches('v')).ok()?;
             Some((v, r))
         })
+        .filter(|(v, _)| want_prerelease || v.pre.is_empty())
         .max_by(|a, b| a.0.cmp(&b.0));
 
     let Some((latest_version, latest_release)) = latest else {
@@ -111,14 +115,6 @@ pub fn check_latest(current: &Version) -> Result<Option<ReleaseInfo>> {
     };
 
     if latest_version <= *current {
-        return Ok(None);
-    }
-
-    // Honour the pre-release gate: a stable build (no pre-release
-    // segment) does not surface a pre-release update. Pre-release
-    // builds see everything newer than themselves regardless of
-    // pre-release status.
-    if !latest_version.pre.is_empty() && current.pre.is_empty() {
         return Ok(None);
     }
 
@@ -156,11 +152,17 @@ pub fn select_update_target<'a>(
     candidates: &'a [(Version, bool)],
     current: &Version,
 ) -> Option<&'a Version> {
-    let latest = candidates.iter().max_by(|a, b| a.0.cmp(&b.0))?;
+    // Stable clients never see pre-releases. The filter must run
+    // BEFORE the max-select: otherwise a newer pre-release (e.g.
+    // 0.4.0-rc.1) wins the max and then gets rejected by the gate,
+    // shadowing a newer *stable* release (0.3.1) that the stable user
+    // should have been offered. Pre-release clients keep everything.
+    let want_prerelease = !current.pre.is_empty();
+    let latest = candidates
+        .iter()
+        .filter(|(v, _)| want_prerelease || v.pre.is_empty())
+        .max_by(|a, b| a.0.cmp(&b.0))?;
     if latest.0 <= *current {
-        return None;
-    }
-    if !latest.0.pre.is_empty() && current.pre.is_empty() {
         return None;
     }
     if !latest.1 {
@@ -214,6 +216,17 @@ mod select_update_target_tests {
         let current = v("0.3.0");
         let cands = vec![(v("0.3.1-rc.1"), true)];
         assert_eq!(select_update_target(&cands, &current), None);
+    }
+
+    #[test]
+    fn stable_user_sees_stable_behind_newer_prerelease() {
+        // Regression: a newer pre-release must not shadow a newer
+        // stable release for a stable client. Highest semver here is
+        // 0.4.0-rc.1, but the stable user on 0.3.0 should be offered
+        // 0.3.1 — the pre-release is filtered before the max-select.
+        let current = v("0.3.0");
+        let cands = vec![(v("0.4.0-rc.1"), true), (v("0.3.1"), true)];
+        assert_eq!(select_update_target(&cands, &current), Some(&v("0.3.1")));
     }
 
     #[test]
