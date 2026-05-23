@@ -5318,10 +5318,12 @@ impl AppShell {
                     self.toasts.retain(|t| t.id != id);
                 }
                 // Sentinel keyed on the message so a *different* failure
-                // (or a fresh failure after the user dismissed the last
-                // one) still surfaces. An identical message recurring on
-                // the next 3h poll stays de-duped, which avoids spamming
-                // the same error.
+                // surfaces a new toast. `last_announced_update` is not
+                // cleared on dismiss, so an *identical* message stays
+                // de-duped for the rest of the session — including after
+                // the user dismisses the toast. That's deliberate:
+                // re-toasting the same error every 3h poll would be spam.
+                // A genuinely new error (different message) still shows.
                 let sentinel = format!("failed:{message}");
                 if self.last_announced_update.as_deref() == Some(sentinel.as_str()) {
                     return;
