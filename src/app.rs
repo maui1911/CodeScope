@@ -3945,6 +3945,7 @@ impl AppShell {
                     let dot_color = match entry.kind {
                         crate::notifications::NotificationKind::SessionWaiting => signal_warn,
                         crate::notifications::NotificationKind::SessionReady => accent,
+                        crate::notifications::NotificationKind::UpdateAvailable => accent,
                     };
                     let title = entry.title.clone();
                     let detail = entry.detail.clone();
