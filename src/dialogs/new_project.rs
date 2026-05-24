@@ -918,8 +918,14 @@ impl Sidebar {
             .hover(move |s| s.bg(frost).text_color(ink))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
+                cx.listener(|this, _, window, cx| {
                     cx.stop_propagation();
+                    // Keep AppShell's bubble auto-focus off the dialog
+                    // card on this click — a failed submit (e.g. the
+                    // duplicate-path guard) leaves the dialog open, so
+                    // focus must stay put. Harmless on Cancel, which
+                    // closes the dialog regardless.
+                    window.prevent_default();
                     this.cancel_new_project_dialog(cx);
                 }),
             )
@@ -941,8 +947,13 @@ impl Sidebar {
                     .cursor_pointer()
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
+                        cx.listener(|this, _, window, cx| {
                             cx.stop_propagation();
+                            // A duplicate-path submit keeps the dialog
+                            // open with an inline error; suppress
+                            // AppShell's bubble auto-focus so the user
+                            // can keep editing without re-clicking.
+                            window.prevent_default();
                             this.submit_new_project_dialog(cx);
                         }),
                     );
