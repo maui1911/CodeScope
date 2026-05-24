@@ -7480,18 +7480,28 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Double-click detection. `click_count` is authoritative when no
-        // drag echo intervened (the maximized path never starts a drag on
-        // the press). For the windowed path the echo resets gpui's
-        // `ClickState`, so we also accept two presses that land close in
-        // time and space by our own reckoning. See `last_titlebar_down`.
+        // Double-click detection. gpui's `click_count` honours the OS
+        // double-click time + spatial tolerance and is authoritative
+        // *except* on the Windows windowed path: starting the drag on the
+        // press posts a synthetic `WM_NCLBUTTONDOWN(LPARAM(0))` that
+        // corrupts gpui's `ClickState`, so the real second click reads as
+        // count 1. Only there do we fall back to our own time+space
+        // check. We deliberately do NOT apply it on non-Windows (no drag
+        // echo) or maximized Windows (the press doesn't start a drag, so
+        // `click_count` stays correct) — a hard-coded threshold there
+        // would only risk false positives that diverge from the user's OS
+        // double-click settings.
         let now = std::time::Instant::now();
         let prev = self.last_titlebar_down.replace((now, event.position));
-        let own_double = prev.is_some_and(|(t, p)| {
-            now.duration_since(t) < std::time::Duration::from_millis(500)
-                && (event.position.x - p.x).abs() < px(6.0)
-                && (event.position.y - p.y).abs() < px(6.0)
-        });
+        #[cfg(target_os = "windows")]
+        let own_double = !window.is_maximized()
+            && prev.is_some_and(|(t, p)| {
+                now.duration_since(t) < std::time::Duration::from_millis(500)
+                    && (event.position.x - p.x).abs() < px(6.0)
+                    && (event.position.y - p.y).abs() < px(6.0)
+            });
+        #[cfg(not(target_os = "windows"))]
+        let own_double = false;
         if event.click_count >= 2 || own_double {
             self.titlebar_press = None;
             self.last_titlebar_down = None; // don't let a third click re-toggle
