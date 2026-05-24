@@ -29,6 +29,7 @@ mod idle_notifier;
 mod notifications;
 mod overview;
 mod sidebar;
+mod single_instance;
 mod taskbar_badge;
 mod text_field;
 mod theme;
@@ -106,6 +107,25 @@ fn main() -> Result<()> {
         let argv: Vec<String> = std::env::args().skip(1).collect();
         write_boot_phase(&paths, &format!("main:argv {argv:?}"));
     }
+
+    // Single-instance guard (#247). One running CodeScope per user;
+    // `CODESCOPE_DEV=1` carries its own mutex identity (resolved inside
+    // `single_instance_mutex()`) so a dev build sits alongside the
+    // installed app instead of blocking it. Mirrors the C#
+    // `App.OnStartup` named-mutex guard: a second launch informs the
+    // user and exits before any window is created. Held in
+    // `_single_instance` for the process lifetime — do not drop early.
+    let _single_instance = match single_instance::acquire(&paths.single_instance_mutex()) {
+        single_instance::Acquire::First(guard) => {
+            write_boot_phase(&paths, "single_instance:acquired");
+            guard
+        }
+        single_instance::Acquire::AlreadyRunning => {
+            write_boot_phase(&paths, "single_instance:already_running");
+            single_instance::notify_already_running();
+            return Ok(());
+        }
+    };
 
     // Resize-cascade diagnostic tape. PR #218/#219 fixed the
     // bounds-observer half of the cascade but the user-reported
