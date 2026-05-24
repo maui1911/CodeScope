@@ -3554,6 +3554,10 @@ impl AppShell {
         // (the previously focused group's). Once the user types Ctrl+T
         // / clicks +, `activate_tab` will rehome focus.
         self.focus_handle.focus(window);
+        // The newly-focused group is empty, so there's no active tab —
+        // clear the sidebar's active-context wash (#248). It returns
+        // when `activate_tab` runs for a tab opened here.
+        self.push_sidebar_active_context(cx);
         cx.notify();
         self.save_layout();
     }
@@ -6042,6 +6046,9 @@ impl AppShell {
         if self.groups[idx].tabs.is_empty() {
             self.focused_group = idx;
             self.focus_handle.focus(window);
+            // Focused an empty group — no active tab, so clear the
+            // sidebar's active-context wash (#248).
+            self.push_sidebar_active_context(cx);
             cx.notify();
             return;
         }

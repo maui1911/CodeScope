@@ -560,8 +560,12 @@ pub struct Sidebar {
     active_paths: HashSet<String>,
     /// Canonicalised worktree path of the *currently focused* tab (the
     /// active tab in the focused group), or `None` when no tab is
-    /// focused or it isn't tied to a tracked worktree. Distinct from
-    /// `active_paths`, which marks *every* worktree with a live session:
+    /// focused or it has no working directory. The path is stored as-is;
+    /// if it doesn't match any tracked worktree row (e.g. a tab opened
+    /// in an unrelated directory) it simply highlights nothing — the
+    /// render does the matching, so no up-front filtering is needed.
+    /// Distinct from `active_paths`, which marks *every* worktree with a
+    /// live session:
     /// this marks the single row the user is looking at right now.
     /// Drives the accent-tinted "active context" wash on the matching
     /// worktree row and a fainter wash on its parent project row (so a
