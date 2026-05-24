@@ -8,8 +8,10 @@
 //!
 //! The mutex name comes from [`AppPaths::single_instance_mutex`], which
 //! already encodes the `CODESCOPE_DEV=1` split
-//! (`Global\CodeScope.SingleInstance` vs `…SingleInstance.Dev`) so a
-//! dev build coexists with the installed app rather than blocking it.
+//! (`Local\CodeScope.SingleInstance` vs `…SingleInstance.Dev`) so a dev
+//! build coexists with the installed app rather than blocking it. The
+//! `Local\` namespace is per-logon-session, so this allows one instance
+//! per user/session (the #247 intent) rather than one per machine.
 //!
 //! Scope: this is the Windows regression called out in #247. On other
 //! platforms [`acquire`] is a no-op that always reports `First`, so
@@ -22,8 +24,23 @@
 /// every handle on termination — so an early `return` from `main`
 /// without an explicit drop is equally safe.
 pub struct SingleInstance {
+    /// `true` when the guard is operating as designed — the Windows
+    /// mutex is held, or (on non-Windows) the deliberate no-op path.
+    /// `false` only when a Windows `CreateMutexW` error forced a
+    /// fail-open start, so the caller can log that enforcement was
+    /// skipped rather than silently masking it.
+    enforced: bool,
     #[cfg(target_os = "windows")]
     handle: windows::Win32::Foundation::HANDLE,
+}
+
+impl SingleInstance {
+    /// Whether single-instance enforcement is actually active. `false`
+    /// means [`acquire`] failed open on a Win32 error — startup
+    /// proceeds, but a second instance is not being prevented.
+    pub fn enforced(&self) -> bool {
+        self.enforced
+    }
 }
 
 /// Outcome of trying to claim the single-instance lock.
@@ -63,15 +80,20 @@ pub fn acquire(mutex_name: &str) -> Acquire {
                 }
                 Acquire::AlreadyRunning
             } else {
-                Acquire::First(SingleInstance { handle: h })
+                Acquire::First(SingleInstance {
+                    enforced: true,
+                    handle: h,
+                })
             }
         }
         // Couldn't create the mutex at all (e.g. a transient OS error).
         // Fail open: let the launch proceed rather than lock the user
         // out of their own app. Worst case is the pre-#247 behaviour
         // (a possible second instance), never a startup that refuses to
-        // run. An invalid handle makes the `Drop` close a no-op.
+        // run. `enforced: false` lets `main` log this; an invalid handle
+        // makes the `Drop` close a no-op.
         Err(_) => Acquire::First(SingleInstance {
+            enforced: false,
             handle: HANDLE::default(),
         }),
     }
@@ -123,8 +145,9 @@ impl Drop for SingleInstance {
 pub fn acquire(_mutex_name: &str) -> Acquire {
     // No cross-platform single-instance guard yet — #247 scopes the
     // regression to Windows. Always report `First` so dev launches on
-    // Linux/macOS are unaffected.
-    Acquire::First(SingleInstance {})
+    // Linux/macOS are unaffected. `enforced: true` because the no-op is
+    // the designed behaviour here, not a fail-open.
+    Acquire::First(SingleInstance { enforced: true })
 }
 
 #[cfg(not(target_os = "windows"))]

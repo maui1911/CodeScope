@@ -108,16 +108,27 @@ fn main() -> Result<()> {
         write_boot_phase(&paths, &format!("main:argv {argv:?}"));
     }
 
-    // Single-instance guard (#247). One running CodeScope per user;
-    // `CODESCOPE_DEV=1` carries its own mutex identity (resolved inside
-    // `single_instance_mutex()`) so a dev build sits alongside the
-    // installed app instead of blocking it. Mirrors the C#
-    // `App.OnStartup` named-mutex guard: a second launch informs the
+    // Single-instance guard (#247). One running CodeScope per
+    // user/session (the mutex lives in the per-session `Local\`
+    // namespace); `CODESCOPE_DEV=1` carries its own mutex identity
+    // (resolved inside `single_instance_mutex()`) so a dev build sits
+    // alongside the installed app instead of blocking it. Mirrors the
+    // C# `App.OnStartup` named-mutex guard: a second launch informs the
     // user and exits before any window is created. Held in
     // `_single_instance` for the process lifetime — do not drop early.
     let _single_instance = match single_instance::acquire(&paths.single_instance_mutex()) {
         single_instance::Acquire::First(guard) => {
-            write_boot_phase(&paths, "single_instance:acquired");
+            // Distinguish a real lock from a fail-open start (the guard
+            // proceeds on a CreateMutexW error so a Win32 hiccup never
+            // locks the user out) so the boot tape doesn't mask it.
+            write_boot_phase(
+                &paths,
+                if guard.enforced() {
+                    "single_instance:acquired"
+                } else {
+                    "single_instance:fail_open"
+                },
+            );
             guard
         }
         single_instance::Acquire::AlreadyRunning => {

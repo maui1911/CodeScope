@@ -67,13 +67,20 @@ impl AppPaths {
     /// `%LOCALAPPDATA%\CodeScope\window.json` — last window pos/size.
     pub fn window_file(&self) -> PathBuf { self.state_dir.join("window.json") }
 
-    /// Single-instance mutex name — `Global\CodeScope.SingleInstance`
+    /// Single-instance mutex name — `Local\CodeScope.SingleInstance`
     /// (and dev equivalent). Only meaningful on Windows.
+    ///
+    /// The `Local\` namespace is per-logon-session, so the guard allows
+    /// one instance per user/session (issue #247) rather than one per
+    /// machine: a second user on the same box, or a separate RDP /
+    /// fast-user-switch session, gets their own instance. (The retired
+    /// C# build used `Global\`, which was system-wide; the `Local\`
+    /// scope matches the stated per-session intent.)
     pub fn single_instance_mutex(&self) -> String {
         if self.dev_mode {
-            "Global\\CodeScope.SingleInstance.Dev".to_string()
+            "Local\\CodeScope.SingleInstance.Dev".to_string()
         } else {
-            "Global\\CodeScope.SingleInstance".to_string()
+            "Local\\CodeScope.SingleInstance".to_string()
         }
     }
 
@@ -196,8 +203,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let prod = rooted_for_tests(false, dir.path());
         let dev = rooted_for_tests(true, dir.path());
-        assert_eq!(prod.single_instance_mutex(), "Global\\CodeScope.SingleInstance");
-        assert_eq!(dev.single_instance_mutex(), "Global\\CodeScope.SingleInstance.Dev");
+        assert_eq!(prod.single_instance_mutex(), "Local\\CodeScope.SingleInstance");
+        assert_eq!(dev.single_instance_mutex(), "Local\\CodeScope.SingleInstance.Dev");
     }
 
     #[test]
