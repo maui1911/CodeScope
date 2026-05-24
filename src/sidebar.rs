@@ -558,6 +558,17 @@ pub struct Sidebar {
     /// the C# `WorktreeViewModel.HasActiveSession` boolean — same
     /// 2 px rail trigger on the sidebar row chrome.
     active_paths: HashSet<String>,
+    /// Canonicalised worktree path of the *currently focused* tab (the
+    /// active tab in the focused group), or `None` when no tab is
+    /// focused or it isn't tied to a tracked worktree. Distinct from
+    /// `active_paths`, which marks *every* worktree with a live session:
+    /// this marks the single row the user is looking at right now.
+    /// Drives the accent-tinted "active context" wash on the matching
+    /// worktree row and a fainter wash on its parent project row (so a
+    /// collapsed project still shows the active tab is inside it). Pushed
+    /// by `AppShell::push_sidebar_active_context` (issue #248). A new
+    /// Rust behaviour — the C# build never followed the focused tab.
+    active_context_path: Option<String>,
     /// Whether the Overview panel is currently on stage. Pushed by
     /// `AppShell::set_show_overview`; drives the footer "Overview"
     /// button's active look (accent rail + accent foreground) so the
@@ -644,6 +655,7 @@ impl Sidebar {
             expanded_worktrees: HashSet::new(),
             busy_paths: HashSet::new(),
             active_paths: HashSet::new(),
+            active_context_path: None,
             overview_visible: false,
             agent_registry,
             filter: String::new(),
@@ -739,6 +751,19 @@ impl Sidebar {
         }
         self.busy_paths = busy;
         self.active_paths = active;
+        cx.notify();
+    }
+
+    /// Set the focused tab's worktree path (canonicalised by the
+    /// caller) so the matching sidebar row gets the accent-tinted
+    /// "active context" wash. `None` clears it (e.g. the last tab in
+    /// the workspace was closed). No-op + no notify when unchanged, so
+    /// re-pushing the same context on a redraw is free. Issue #248.
+    pub fn set_active_context(&mut self, path: Option<String>, cx: &mut Context<Self>) {
+        if self.active_context_path == path {
+            return;
+        }
+        self.active_context_path = path;
         cx.notify();
     }
 
@@ -2697,6 +2722,17 @@ impl Render for Sidebar {
                 !wt.canonical_path.is_empty()
                     && self.busy_paths.contains(&wt.canonical_path)
             });
+            // Issue #248: does the currently focused tab live in one of
+            // this project's worktrees? If so the project row carries a
+            // faint accent wash — which is the *only* active-context cue
+            // when the project is collapsed and its child worktree row
+            // is hidden. Compared against the same per-row cached
+            // `canonical_path` as `any_busy_child`.
+            let is_active_context_project = self.active_context_path.as_ref().is_some_and(|p| {
+                worktrees
+                    .iter()
+                    .any(|wt| !wt.canonical_path.is_empty() && &wt.canonical_path == p)
+            });
             // Sidebar row hover / selection fill — `#141414`
             // (Surface.Color.Elev). C# `SidebarView.xaml` hard-codes
             // `#141414` on both `IsMouseOver` and `IsSelected` triggers,
@@ -2704,6 +2740,12 @@ impl Render for Sidebar {
             // the `frost_10` overlay we used before.
             let bg = if active {
                 theme::surface_elev(&theme)
+            } else if is_active_context_project {
+                // Faint accent wash — distinct from the solid grey
+                // selection fill above. Selection wins when a project is
+                // both selected and the active context; the child
+                // worktree row still carries the stronger wash.
+                theme::active_context_wash_dim(&theme)
             } else {
                 gpui::transparent_black()
             };
@@ -2916,6 +2958,13 @@ impl Render for Sidebar {
                     !wt_canon.is_empty() && self.active_paths.contains(wt_canon);
                 let has_busy_session =
                     !wt_canon.is_empty() && self.busy_paths.contains(wt_canon);
+                // Issue #248: is this the worktree of the currently
+                // focused tab? Exactly one row matches at a time (the
+                // active tab in the focused group). Gets the stronger
+                // accent wash — distinct from the thin `has_active_session`
+                // rail (which marks *any* worktree with a live session).
+                let is_active_context = !wt_canon.is_empty()
+                    && self.active_context_path.as_deref() == Some(wt_canon);
                 let dot_color = if has_busy_session {
                     theme::signal_warn()
                 } else if has_active_session {
@@ -2942,6 +2991,15 @@ impl Render for Sidebar {
                 } else {
                     gpui::transparent_black()
                 };
+                // Base row fill — accent wash for the focused tab's
+                // worktree (#248), transparent otherwise. The `.hover`
+                // fill below overrides it on pointer-over, which is the
+                // intended momentary feedback.
+                let active_context_bg = if is_active_context {
+                    theme::active_context_wash(&theme)
+                } else {
+                    gpui::transparent_black()
+                };
                 let wt_row = div()
                     .id(("worktree", id_hash(&wt_row_id)))
                     .h(px(28.0))
@@ -2950,6 +3008,7 @@ impl Render for Sidebar {
                     .items_center()
                     .border_l_2()
                     .border_color(rail_color)
+                    .bg(active_context_bg)
                     // 32 px content inset (was 34 before the 2 px rail
                     // was added) so the dot sits at the same column as
                     // before. Border lives outside `pl` in gpui's box
