@@ -25,13 +25,93 @@
 > `.github/workflows/release.yml` (was `rs--release.yml`) and now
 > triggers on plain `v*` tags.
 
-**Last updated:** 2026-05-19 (session 45 — tab-focus fix, full auto-update rip (runtime + CI), boot.log mode 0600, **first stable `v0.3.0` cut**)
-**Branch:** `main`
-**Head:** `cb457f6` (feat(updates): rip auto-update entirely, #244)
-**Release:** `v0.3.0` — first non-rc tag. Cuts off the `rc.N` cadence that ran rc.7 → rc.15. Pipeline triggered by `git push origin v0.3.0`; only cargo-dist artefacts (MSI / `.tar.xz`) now — velopack packaging was stripped in #244 along with the runtime.
-**Build status:** ✅ `cargo build --workspace` clean. Tests: 454 core + 120 bin + 28 terminal + 1 doctest = **603 total**, all passing (−37 from session 44: 30 `update_check` + 7 `velopack_bridge` tests vanished with their modules).
-**Uncommitted work:** none — PRs #240 + #244 shipped, session-45 bump-PR opens this entry.
-**Open issues:** #238 (terminal pane doesn't receive keyboard focus after tab click) closed by #240.
+**Last updated:** 2026-05-24 (session 46 — Windows titlebar drag + double-click-maximize rework, #251)
+**Branch:** `main` (work shipped on `fix/titlebar-doubleclick-maximize` → PR #251, squash-merged once Copilot was clean)
+**Head:** #251 — titlebar drag/double-click rework, on top of #249 (auto-update restored via `self_update` + Inno Setup; `codescope-rs` → `CodeScope` rename) and #250 (Cargo.lock deflate sync — see cursor).
+**Release:** version is now `0.3.1` (bumped in #249). Auto-update is **back** (manual-apply via `self_update` + Inno Setup installer); Velopack stays retired — see CLAUDE.md non-negotiables.
+**Build status:** ✅ `cargo check` + `cargo clippy --bin codescope` clean on changed files. Session 46 was a UI change (no test surface — TDD is for `codescope-core` logic, not gpui views), so the full `cargo test --workspace` suite was **not** re-run this session.
+**Uncommitted work:** none on the titlebar branch. **PR #250 still open** (Cargo.lock deflate sync) — see cursor.
+**Open issues:** none tracked. Pre-existing clippy debt in `src/app.rs` (18 warnings) untouched.
+
+### Session 46 — Windows titlebar drag + double-click-maximize rework (#251)
+
+User reported the custom caption row felt broken on Windows: a single
+click on a maximized window restored it, double-click-to-maximize was
+unreliable, and dragging "felt vague" — especially dragging *upward*,
+which often did nothing while down/sideways worked.
+
+This took several wrong turns before the evidence (temporary `eprintln!`
+diagnostics in the dev build, read back from the background-task stderr
+log) made the real constraints clear. Three gpui/Win32 facts, verified
+against the gpui-0.2.2 source and Zed's `PlatformTitleBar`:
+
+1. **`Window::start_window_move()` is a no-op on Windows** — a default
+   trait method (`platform.rs:536`) that `WindowsWindow` never overrides.
+   So a window move can only be started by posting
+   `WM_NCLBUTTONDOWN(HTCAPTION)` ourselves (`win32_titlebar::start_drag`).
+   Zed relies on the same native path; the gpui example `window_shadow.rs`
+   uses `start_window_move`, which silently does nothing on Windows.
+2. **gpui does not dispatch mouse-*move* events while the cursor is over a
+   `WindowControlArea` region** (treated as platform-owned). Diagnostics
+   confirmed: presses reach our handler across the whole title bar, but
+   the drag-threshold only fired once the cursor crossed *below* the 40 px
+   caption into the content area. That's why a move-threshold made upward
+   drags fail (cursor leaves the window top before any move fires) while
+   downward drags worked.
+3. **`start_drag`'s synthetic `WM_NCLBUTTONDOWN(LPARAM(0))` corrupts
+   gpui's `ClickState`** — the bogus screen-origin position resets
+   `last_position`, so the *second* click of a double-click reads as
+   `click_count == 1`. This silently broke double-click-to-maximize, but
+   only on the windowed path (the maximized path doesn't start a drag on
+   the press, so its `click_count` stays correct).
+
+**Final design (`handle_titlebar_press` / `update_titlebar_drag` in
+`src/app.rs`):**
+
+- **Windowed:** start the OS drag *on the press* — the only reliable
+  signal, since moves don't fire over the title bar. `start_drag`'s modal
+  move loop then tracks the cursor natively in every direction; a click
+  with no drag is a harmless no-op. `start_drag` is called directly (not
+  via `window.defer`) — its `ReleaseCapture()` can emit
+  `WM_CAPTURECHANGED`, but gpui doesn't handle that message and the modal
+  loop only begins once the posted `WM_NCLBUTTONDOWN` is pumped after the
+  listener returns.
+- **Maximized:** *arm* on the press (store origin in `titlebar_press`) and
+  start the restore-and-drag only once the cursor moves into the content
+  area (`update_titlebar_drag`, fed by the root `on_mouse_move`). A bare
+  click no longer restores; you un-maximize by dragging *down*, which is
+  exactly where moves fire.
+- **Double-click → toggle maximize/restore:** gpui's `click_count >= 2`
+  *plus* our own time+space check (`last_titlebar_down`, 500 ms / 6 px),
+  the latter gated to **Windows + non-maximized** to recover the
+  echo-corrupted count. Copilot's one review finding flagged that the
+  fallback shouldn't run where `click_count` is already reliable
+  (non-Windows, maximized) — scoped accordingly in `95456fb`.
+
+User verified in the dev build across windowed/maximized: single-click
+no-op, all-direction drag, double-click maximize, maximized double-click
+restore, drag-down-to-restore. No test surface (UI); `cargo check` +
+`cargo clippy` clean on `src/app.rs`.
+
+**Context — what landed since session 45 (never separately HANDOFF'd):**
+- **#249** restored in-app auto-update via the `self_update` crate + Inno
+  Setup installer, and renamed `codescope-rs` → `CodeScope` everywhere
+  user-visible. Version is now `0.3.1`. Velopack stays retired.
+- **#250** (`fix/cargo-lock-deflate-sync`) syncs `Cargo.lock` for the
+  `compression-zip-deflate` feature; **still open**.
+
+**Cursor for next session:**
+1. **PR #250 still open** — Cargo.lock deflate sync. Merge it (or confirm
+   superseded). Note: cargo runs on a branch off `main` re-add `zopfli` to
+   `Cargo.lock` until #250 lands, so `git checkout -- Cargo.lock` before
+   committing on feature branches to avoid churn.
+2. **Pre-existing clippy debt** in `src/app.rs` (18 warnings), including an
+   orphaned doc comment ("Build one group's tab strip…") just above
+   `handle_titlebar_press`. Out of scope this session; a cleanup pass
+   would clear them.
+3. **Release validation for the restored auto-update (#249)** — see
+   `docs/RELEASE-VALIDATION.md` §6 (mandatory archive-extraction
+   regression: the flow must reach "Installing" → "Update installed").
 
 ### Session 45 — tab-focus fix, total auto-update rip, first stable `v0.3.0` cut
 
