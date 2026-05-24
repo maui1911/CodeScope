@@ -604,21 +604,28 @@ pub struct AppShell {
     /// Left rail. Lives behind a feature flag in the layout state —
     /// hidden when the user collapses the sidebar (later).
     sidebar: Entity<Sidebar>,
-    /// Timestamp of the most recent left-mouse-down inside any of the
-    /// title-bar drag regions. Used to detect titlebar double-clicks
-    /// while filtering out the *synthetic* `WM_NCLBUTTONDOWN` event
-    /// our own `start_drag` posts: when we `PostMessageW(WM_NCLBUTTONDOWN,
-    /// HTCAPTION)` the OS turns it back into a non-client mouse-down
-    /// that gpui re-dispatches through our listener stack with
-    /// `click_count` already bumped to 2 (gpui's `ClickState` treats
-    /// the synthetic press as a continuation of the real click).
-    /// That would otherwise toggle maximize on every single click and
-    /// no-op on every real double-click. We discriminate by
-    /// time-delta from the previous press: synthetic events arrive
-    /// in the same message-loop tick (sub-millisecond), real human
-    /// double-clicks are 100 ms+ apart. Anything under 10 ms is
-    /// treated as the synthetic echo and ignored.
-    last_titlebar_press_at: Option<std::time::Instant>,
+    /// Set to the press origin only while a *maximized* window has an
+    /// armed-but-not-yet-started title-bar drag; `None` otherwise.
+    /// A windowed press starts its drag immediately and never sets this
+    /// (see [`AppShell::handle_titlebar_press`]); a maximized press arms
+    /// it so [`AppShell::update_titlebar_drag`] can start the
+    /// restore-and-drag once the cursor moves into the content area, and
+    /// `on_mouse_up` clears it. The stored point isn't read back — it's
+    /// just an "armed" marker — but is kept as an origin in case a future
+    /// change wants a movement threshold. Double-click is handled
+    /// separately — see [`AppShell::last_titlebar_down`].
+    titlebar_press: Option<gpui::Point<gpui::Pixels>>,
+    /// `(time, position)` of the previous title-bar left-press, for our
+    /// own double-click detection. We can't rely solely on gpui's
+    /// `MouseDownEvent::click_count` for the *windowed* case: starting
+    /// the drag on the press posts a synthetic `WM_NCLBUTTONDOWN` whose
+    /// `LPARAM(0)` makes gpui's `ClickState` record a bogus position,
+    /// which resets the count so the real second click reads as 1 — and
+    /// double-click-to-maximize silently breaks. We therefore also fire
+    /// the maximize toggle when two presses land close in time *and*
+    /// space ourselves. (Maximized double-click never starts a drag, so
+    /// `click_count` stays correct there; this is the windowed fix.)
+    last_titlebar_down: Option<(std::time::Instant, gpui::Point<gpui::Pixels>)>,
     /// Global blink phase for dialog input fields (rename, new-project,
     /// new-worktree, settings, command palette). `true` paints the
     /// caret bar; `false` hides it. Flipped on a 530 ms cadence by the
@@ -1317,7 +1324,8 @@ impl AppShell {
             settings,
             theme,
             sidebar,
-            last_titlebar_press_at: None,
+            titlebar_press: None,
+            last_titlebar_down: None,
             text_blink_phase: true,
             notifications: crate::notifications::Notifications::new(),
             last_session_state: HashMap::new(),
@@ -6885,12 +6893,15 @@ impl Render for AppShell {
             .key_context("AppShell")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
-            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, window, cx| {
                 if this.splitter_drag.is_some() {
                     this.update_splitter_drag(event.position.x, cx);
                 }
                 if this.sidebar_drag.is_some() {
                     this.update_sidebar_drag(event.position.x, cx);
+                }
+                if this.titlebar_press.is_some() {
+                    this.update_titlebar_drag(event, window, cx);
                 }
             }))
             .on_mouse_up(
@@ -6898,6 +6909,7 @@ impl Render for AppShell {
                 cx.listener(|this, _, _, cx| {
                     this.end_splitter_drag(cx);
                     this.end_sidebar_drag(cx);
+                    this.titlebar_press = None;
                 }),
             )
             .size_full()
@@ -7437,19 +7449,30 @@ impl AppShell {
     /// same column.
 
     /// Handle a left-press on any of the title-bar drag regions
-    /// (brand mark, strip-left padding, per-group trailing
-    /// whitespace). Discriminates real human clicks from the
-    /// *synthetic* `WM_NCLBUTTONDOWN` echo our own `start_drag` posts:
+    /// (brand mark, strip-left padding, per-group trailing whitespace).
     ///
-    /// 1. Sub-10 ms after the previous press ⇒ synthetic, ignore.
-    /// 2. 10–500 ms after the previous press ⇒ real double-click,
-    ///    toggle maximize.
-    /// 3. Otherwise ⇒ first press of a real click sequence, start
-    ///    the OS drag (or window-move on non-Windows).
+    /// A double-click (gpui's `click_count >= 2`, derived from the OS
+    /// double-click time + spatial tolerance) toggles maximize/restore.
     ///
-    /// On non-Windows there's no synthetic echo because we use
-    /// `start_window_move` instead of `PostMessage`, but the same
-    /// time-delta logic still gives us double-click → zoom_window.
+    /// A single press starts the window drag. The split below is forced
+    /// by a gpui quirk: it does **not** dispatch mouse-*move* events
+    /// while the cursor is over the title bar (it treats a
+    /// `WindowControlArea` region as platform-owned), so a
+    /// move-threshold can't reliably detect a drag there — only the
+    /// press is dependable.
+    ///
+    /// - **Windowed:** start the OS drag immediately on the press.
+    ///   `start_drag`'s modal move loop then tracks the cursor natively
+    ///   in every direction, and a click with no drag is a harmless
+    ///   no-op (nothing to restore).
+    /// - **Maximized:** `start_drag` restores eagerly, so starting on
+    ///   the press would restore on a bare click. Instead *arm* a drag
+    ///   and let [`AppShell::update_titlebar_drag`] start it once the
+    ///   cursor moves down into the content area — the natural
+    ///   un-maximize gesture, and the one place moves actually fire.
+    ///
+    /// Non-Windows uses `start_window_move` (no eager restore), so it
+    /// can start on the press in every case.
     #[allow(unused_variables)]
     fn handle_titlebar_press(
         &mut self,
@@ -7457,34 +7480,85 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Double-click detection. gpui's `click_count` honours the OS
+        // double-click time + spatial tolerance and is authoritative
+        // *except* on the Windows windowed path: starting the drag on the
+        // press posts a synthetic `WM_NCLBUTTONDOWN(LPARAM(0))` that
+        // corrupts gpui's `ClickState`, so the real second click reads as
+        // count 1. Only there do we fall back to our own time+space
+        // check. We deliberately do NOT apply it on non-Windows (no drag
+        // echo) or maximized Windows (the press doesn't start a drag, so
+        // `click_count` stays correct) — a hard-coded threshold there
+        // would only risk false positives that diverge from the user's OS
+        // double-click settings.
         let now = std::time::Instant::now();
-        let prev = self.last_titlebar_press_at;
-        self.last_titlebar_press_at = Some(now);
-
-        if let Some(prev_t) = prev {
-            let dt = now.duration_since(prev_t);
-            if dt < std::time::Duration::from_millis(10) {
-                // Synthetic echo from our own PostMessage(WM_NCLBUTTONDOWN).
-                // Roll the timestamp back so a *real* second click
-                // measures from the original press, not from the echo.
-                self.last_titlebar_press_at = Some(prev_t);
-                return;
-            }
-            if dt < std::time::Duration::from_millis(500) {
-                #[cfg(target_os = "windows")]
-                window.defer(cx, |window, _| {
-                    crate::win32_titlebar::toggle_maximize(window);
-                });
-                #[cfg(not(target_os = "windows"))]
-                window.zoom_window();
-                return;
-            }
+        let prev = self.last_titlebar_down.replace((now, event.position));
+        #[cfg(target_os = "windows")]
+        let own_double = !window.is_maximized()
+            && prev.is_some_and(|(t, p)| {
+                now.duration_since(t) < std::time::Duration::from_millis(500)
+                    && (event.position.x - p.x).abs() < px(6.0)
+                    && (event.position.y - p.y).abs() < px(6.0)
+            });
+        #[cfg(not(target_os = "windows"))]
+        let own_double = false;
+        if event.click_count >= 2 || own_double {
+            self.titlebar_press = None;
+            self.last_titlebar_down = None; // don't let a third click re-toggle
+            #[cfg(target_os = "windows")]
+            window.defer(cx, |window, _| {
+                crate::win32_titlebar::toggle_maximize(window);
+            });
+            #[cfg(not(target_os = "windows"))]
+            window.zoom_window();
+            return;
         }
 
         #[cfg(target_os = "windows")]
-        window.defer(cx, |window, _| {
+        if window.is_maximized() {
+            self.titlebar_press = Some(event.position);
+        } else {
+            self.titlebar_press = None;
             crate::win32_titlebar::start_drag(window);
-        });
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.titlebar_press = None;
+            window.start_window_move();
+        }
+    }
+
+    /// Window-level mouse-move hook that starts a *maximized* window's
+    /// restore-and-drag once the cursor leaves the title bar. Only an
+    /// armed press on a maximized window reaches here with
+    /// `titlebar_press` set (a windowed press already started its drag in
+    /// [`AppShell::handle_titlebar_press`]); the move is delivered once
+    /// the cursor crosses into the content area, where — unlike over the
+    /// title bar — gpui does dispatch mouse-moves. By that point the
+    /// cursor has clearly left the caption, so any movement counts; the
+    /// pressed-button guard keeps a stray armed press from turning a
+    /// plain hover into a drag.
+    #[allow(unused_variables)]
+    fn update_titlebar_drag(
+        &mut self,
+        event: &gpui::MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.pressed_button != Some(MouseButton::Left) {
+            return;
+        }
+        if self.titlebar_press.take().is_none() {
+            return;
+        }
+        // `start_drag` is safe to call directly (not via `window.defer`):
+        // its `ReleaseCapture()` can synchronously emit
+        // `WM_CAPTURECHANGED`, but gpui doesn't handle that message, and
+        // the modal move loop only begins once the posted
+        // `WM_NCLBUTTONDOWN` is pumped after this listener returns.
+        #[cfg(target_os = "windows")]
+        crate::win32_titlebar::start_drag(window);
         #[cfg(not(target_os = "windows"))]
         window.start_window_move();
     }
