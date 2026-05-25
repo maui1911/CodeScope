@@ -25,13 +25,79 @@
 > `.github/workflows/release.yml` (was `rs--release.yml`) and now
 > triggers on plain `v*` tags.
 
-**Last updated:** 2026-05-24 (session 46 — Windows titlebar drag + double-click-maximize rework, #251)
-**Branch:** `main` (work shipped on `fix/titlebar-doubleclick-maximize` → PR #251, squash-merged once Copilot was clean)
-**Head:** #251 — titlebar drag/double-click rework, on top of #249 (auto-update restored via `self_update` + Inno Setup; `codescope-rs` → `CodeScope` rename) and #250 (Cargo.lock deflate sync — see cursor).
-**Release:** version is now `0.3.1` (bumped in #249). Auto-update is **back** (manual-apply via `self_update` + Inno Setup installer); Velopack stays retired — see CLAUDE.md non-negotiables.
-**Build status:** ✅ `cargo check` + `cargo clippy --bin codescope` clean on changed files. Session 46 was a UI change (no test surface — TDD is for `codescope-core` logic, not gpui views), so the full `cargo test --workspace` suite was **not** re-run this session.
-**Uncommitted work:** none on the titlebar branch. **PR #250 still open** (Cargo.lock deflate sync) — see cursor.
-**Open issues:** none tracked. Pre-existing clippy debt in `src/app.rs` (18 warnings) untouched.
+**Last updated:** 2026-05-25 (session 47 — open-PR/issue sweep: #246, #243, #247, #248)
+**Branch:** `main` (three PRs shipped on feature branches → #246 / #252 / #253, each squash-merged with `--admin` after its Copilot review was addressed + resolved; plus issue #243 closed — no PR)
+**Head:** #253 — sidebar active-tab highlight, on top of #252 (single-instance guard) and #246 (new-project dialog focus). All on top of session 46's #251.
+**Release:** version `0.3.1`. Auto-update is **back** (manual-apply via `self_update` + Inno Setup installer); Velopack stays retired — see CLAUDE.md non-negotiables.
+**Build status:** ✅ `cargo check` + `cargo clippy -p codescope --all-targets` clean on changed files for every PR. Mostly UI/platform glue (no test surface); the one `codescope-core` change (#247, PR #252) updated + passes its `single_instance_mutex` test. Full `cargo test --workspace` not re-run.
+**Uncommitted work:** none. All four list items merged/closed; `main` at the #253 squash-merge (`1a9b56b`).
+**Open issues:** none tracked. Pre-existing clippy debt in `src/app.rs` (18 `doc_lazy_continuation` warnings under rust-1.95) untouched. **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree (let-chain indentation, etc.) because `main` was last formatted with an older rustfmt — do **NOT** run repo-wide `cargo fmt`; hand-format changed hunks and leave the rest. See the session-47 note.
+
+### Session 47 — open-PR/issue sweep: #246, #243, #247, #248
+
+Worked the backlog of open PRs/issues in the order the user set. Four
+units, each its own feature branch + PR + addressed Copilot review +
+`--admin` squash-merge:
+
+- **PR #246** (`fix/clone-url-input`, new-project dialog focus) — was
+  already open from session ~44. Copilot had flagged that the footer
+  Cancel/Add handlers called `cx.stop_propagation()` but not
+  `window.prevent_default()`, so AppShell's bubble auto-focus could still
+  steal focus on those clicks. Real for **Add**: `submit_new_project_dialog`
+  returns early on the duplicate-path guard, leaving the dialog open, so
+  focus must stay. Added `prevent_default()` to both footer handlers
+  (`efa7a85`), merged (`c0a0a08`).
+- **Issue #243** (installer/update UX + Microsoft Store) — closed as
+  completed. The installer/update cleanup it centered on already landed
+  via **#244** (auto-update ripped) + **#249** (restored installer-agnostic
+  via `self_update`, Inno Setup canonical, `codescope-rs`→`CodeScope`
+  rename resolving the naming divergence). The remaining **MSIX / Store**
+  track was deliberately parked (not tracked as an open item); scoping
+  notes live in the closed thread.
+- **Issue #247 / PR #252** (single-instance regression) — `AppPaths::
+  single_instance_mutex()` existed (with a test) but had **zero callers**;
+  enforcement was never ported from C#. Added `src/single_instance.rs`:
+  `acquire()` creates the named mutex in `main()` (after the argv boot
+  line), shows a native "already running" `MessageBox` + exits on
+  `ERROR_ALREADY_EXISTS`, **fails open** on any `CreateMutexW` error so a
+  Win32 hiccup never locks the user out. Held in `_single_instance` for
+  process lifetime. Non-Windows is a no-op. Copilot review →
+  (a) switched the mutex from system-wide `Global\` to the **per-session
+  `Local\`** namespace in `core/paths.rs` (+ test) to match #247's "per
+  user/session" intent — the C# build used `Global\`, judged an oversight;
+  (b) added `SingleInstance::enforced()` + a distinct `single_instance:
+  fail_open` boot phase so a fail-open start isn't masked as `acquired`.
+  Needed `Win32_System_Threading` in the `windows` features. Merged
+  (`29fff2e`).
+- **Issue #248 / PR #253** (sidebar follows the active tab) — **new
+  behaviour, not C# parity** (verified: the C# sidebar only had user-click
+  `TreeViewItem.IsSelected`, never followed the focused tab). The focused
+  tab's worktree row now gets an accent-tinted background **wash**
+  (`theme::active_context_wash`, accent @ 14 %) and its parent project row
+  a fainter wash (@ 7 %, the only cue when the project is collapsed) —
+  distinct from the grey `surface_elev` selection fill and the thin accent
+  session rail, which mean different things. Plumbing:
+  `AppShell::push_sidebar_active_context()` pushes the focused tab's
+  canonical worktree path to `Sidebar::set_active_context()`, called from
+  `activate_tab` (the universal funnel) + `close_tab`'s last-tab branch.
+  Copilot review → also push from the two focus paths that change the
+  focused group to an *empty* one without going through `activate_tab`
+  (`split_right`, `focus_group`-empty), so the wash clears reliably. User
+  approved the visual in the dev build. Merged (`1a9b56b`).
+
+**Process notes for a fresh session:**
+- **rustfmt version skew (important).** Local rustfmt is `1.9.0-stable`;
+  `main` was last formatted with an older one, so a plain `cargo fmt`
+  rewrites ~20 files (mostly let-chain indentation) — a giant unrelated
+  diff. There is **no CI fmt gate** (only `release.yml`). So: hand-format
+  changed hunks, never commit a repo-wide `cargo fmt`. (Cost me one
+  revert this session.)
+- **PR #246's branch predated the `codescope-rs`→`CodeScope` rename**, so
+  its crate is still `codescope-rs`; squash-merge replayed cleanly onto
+  the renamed tree. The branch lived in a worktree (`worktree2`) — removed
+  after merge.
+- Both #247 and #248 were checked against `legacy/v0.2.6-final` for C#
+  parity per the user's standing rule before deciding they were new work.
 
 ### Session 46 — Windows titlebar drag + double-click-maximize rework (#251)
 
@@ -101,17 +167,23 @@ restore, drag-down-to-restore. No test surface (UI); `cargo check` +
   `compression-zip-deflate` feature; **still open**.
 
 **Cursor for next session:**
-1. **PR #250 still open** — Cargo.lock deflate sync. Merge it (or confirm
-   superseded). Note: cargo runs on a branch off `main` re-add `zopfli` to
-   `Cargo.lock` until #250 lands, so `git checkout -- Cargo.lock` before
-   committing on feature branches to avoid churn.
-2. **Pre-existing clippy debt** in `src/app.rs` (18 warnings), including an
-   orphaned doc comment ("Build one group's tab strip…") just above
-   `handle_titlebar_press`. Out of scope this session; a cleanup pass
-   would clear them.
-3. **Release validation for the restored auto-update (#249)** — see
+No open PRs and no tracked issues — the backlog the user pointed at
+(#246/#243/#247/#248, plus session 46's #251 and #250) is fully cleared.
+Candidate follow-ups, none urgent:
+1. **Pre-existing clippy debt** in `src/app.rs` (18 `doc_lazy_continuation`
+   warnings under rust-1.95), including an orphaned doc comment ("Build
+   one group's tab strip…") above `handle_titlebar_press`. A focused
+   cleanup pass would clear them; untouched all session.
+2. **Release validation for the restored auto-update (#249)** — see
    `docs/RELEASE-VALIDATION.md` §6 (mandatory archive-extraction
    regression: the flow must reach "Installing" → "Update installed").
+3. **MSIX / Microsoft Store packaging** — parked when #243 was closed;
+   reopen as a fresh focused issue if/when pursued (scoping notes are in
+   the closed #243 thread).
+4. **Single-instance follow-up (optional)** — #247 shipped inform+exit
+   parity; programmatic activation of the existing window (focus it on a
+   second launch) was deferred (GPUI owns the wndproc). Only worth it if
+   the user asks.
 
 ### Session 45 — tab-focus fix, total auto-update rip, first stable `v0.3.0` cut
 
