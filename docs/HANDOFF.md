@@ -25,12 +25,12 @@
 > `.github/workflows/release.yml` (was `rs--release.yml`) and now
 > triggers on plain `v*` tags.
 
-**Last updated:** 2026-05-25 (session 47 — open-PR/issue sweep: #246, #243, #247, #248)
+**Last updated:** 2026-05-25 (session 47 — open-PR/issue sweep: #246, #243, #247, #248; cut **v0.4.0** release)
 **Branch:** `main` (three PRs shipped on feature branches → #246 / #252 / #253, each squash-merged with `--admin` after its Copilot review was addressed + resolved; plus issue #243 closed — no PR)
 **Head:** #253 — sidebar active-tab highlight, on top of #252 (single-instance guard) and #246 (new-project dialog focus). All on top of session 46's #251.
-**Release:** version `0.3.1`. Auto-update is **back** (manual-apply via `self_update` + Inno Setup installer); Velopack stays retired — see CLAUDE.md non-negotiables.
+**Release:** **`v0.4.0` — tagged + released this session** (cargo-dist pipeline green in ~10 min; GitHub release is *Latest*, with `CodeScope-v0.4.0-setup.exe` + `-windows.zip` and the mac/Linux tarballs). Auto-update is **back** (manual-apply via `self_update` + Inno Setup installer); Velopack stays retired — see CLAUDE.md non-negotiables. ⚠ **The mandatory auto-update validation has NOT been run yet** — see cursor #1.
 **Build status:** ✅ `cargo check` + `cargo clippy -p codescope --all-targets` clean on changed files for every PR. Mostly UI/platform glue (no test surface); the one `codescope-core` change (#247, PR #252) updated + passes its `single_instance_mutex` test. Full `cargo test --workspace` not re-run.
-**Uncommitted work:** none. All four list items merged/closed; `main` at the #253 squash-merge (`1a9b56b`).
+**Uncommitted work:** none. All four list items merged/closed; `main` at the v0.4.0 version bump (`f61ca57`, #255), tagged `v0.4.0`.
 **Open issues:** none tracked. Pre-existing clippy debt in `src/app.rs` (18 `doc_lazy_continuation` warnings under rust-1.95) untouched. **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree (let-chain indentation, etc.) because `main` was last formatted with an older rustfmt — do **NOT** run repo-wide `cargo fmt`; hand-format changed hunks and leave the rest. See the session-47 note.
 
 ### Session 47 — open-PR/issue sweep: #246, #243, #247, #248
@@ -85,7 +85,23 @@ units, each its own feature branch + PR + addressed Copilot review +
   (`split_right`, `focus_group`-empty), so the wash clears reliably. User
   approved the visual in the dev build. Merged (`1a9b56b`).
 
+**Release — `v0.4.0`:** after the four units landed, the user called for a
+new tag and chose a minor bump (the content since v0.3.0 — auto-update
+return, rename, single-instance, sidebar highlight — outgrew a patch).
+Bumped `0.3.1` → `0.4.0` (Cargo.toml + Cargo.lock, #255), merged, then
+pushed an annotated `v0.4.0` tag on the bump commit (`f61ca57`). The
+cargo-dist `release.yml` pipeline went green in ~10 min and published the
+*Latest* GitHub release with all artifacts. **Not yet done:** the
+mandatory auto-update validation (cursor #1).
+
 **Process notes for a fresh session:**
+- **Releasing:** cargo-dist requires the `v*` tag to match the workspace
+  version, so bump `Cargo.toml` (root package only — `core`/`terminal`
+  stay `0.0.1`) in a PR *first*, merge, then `git tag -a vX.Y.Z <merge>`
+  + push. The tag push alone triggers the build + GitHub release; no
+  manual `gh release create`. `build.rs` / the `.iss` take the version
+  from CI env, not hardcoded. The `0.3.1` strings in
+  `core/src/update_check.rs` are test fixtures — never bump those.
 - **rustfmt version skew (important).** Local rustfmt is `1.9.0-stable`;
   `main` was last formatted with an older one, so a plain `cargo fmt`
   rewrites ~20 files (mostly let-chain indentation) — a giant unrelated
@@ -168,15 +184,18 @@ restore, drag-down-to-restore. No test surface (UI); `cargo check` +
 
 **Cursor for next session:**
 No open PRs and no tracked issues — the backlog the user pointed at
-(#246/#243/#247/#248, plus session 46's #251 and #250) is fully cleared.
-Candidate follow-ups, none urgent:
-1. **Pre-existing clippy debt** in `src/app.rs` (18 `doc_lazy_continuation`
+(#246/#243/#247/#248, plus session 46's #251 and #250) is fully cleared,
+and **`v0.4.0` is tagged + released**. Follow-ups:
+1. **⚠ Validate the v0.4.0 auto-update (not yet done, most urgent).** The
+   release shipped but the mandatory archive-extraction check —
+   `docs/RELEASE-VALIDATION.md` §6 — has not been run. From an installed
+   build, update to v0.4.0 and confirm the flow reaches "Installing" →
+   "Update installed" (this is the exact path that crashed the old
+   updater three times). Only runnable from a real installed build.
+2. **Pre-existing clippy debt** in `src/app.rs` (18 `doc_lazy_continuation`
    warnings under rust-1.95), including an orphaned doc comment ("Build
    one group's tab strip…") above `handle_titlebar_press`. A focused
    cleanup pass would clear them; untouched all session.
-2. **Release validation for the restored auto-update (#249)** — see
-   `docs/RELEASE-VALIDATION.md` §6 (mandatory archive-extraction
-   regression: the flow must reach "Installing" → "Update installed").
 3. **MSIX / Microsoft Store packaging** — parked when #243 was closed;
    reopen as a fresh focused issue if/when pursued (scoping notes are in
    the closed #243 thread).
