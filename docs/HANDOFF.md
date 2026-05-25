@@ -26,10 +26,10 @@
 > triggers on plain `v*` tags.
 
 **Last updated:** 2026-05-25 (session 47 — open-PR/issue sweep: #246, #243, #247, #248)
-**Branch:** `main` (four units shipped on feature branches → PRs #246 / #252 / #253, each squash-merged with `--admin` after its Copilot review was addressed + resolved; issue #243 closed)
+**Branch:** `main` (three PRs shipped on feature branches → #246 / #252 / #253, each squash-merged with `--admin` after its Copilot review was addressed + resolved; plus issue #243 closed — no PR)
 **Head:** #253 — sidebar active-tab highlight, on top of #252 (single-instance guard) and #246 (new-project dialog focus). All on top of session 46's #251.
 **Release:** version `0.3.1`. Auto-update is **back** (manual-apply via `self_update` + Inno Setup installer); Velopack stays retired — see CLAUDE.md non-negotiables.
-**Build status:** ✅ `cargo check` + `cargo clippy -p codescope --all-targets` clean on changed files for every PR. Mostly UI/platform glue (no test surface); the one `codescope-core` change (#247) updated + passes its `single_instance_mutex` test. Full `cargo test --workspace` not re-run.
+**Build status:** ✅ `cargo check` + `cargo clippy -p codescope --all-targets` clean on changed files for every PR. Mostly UI/platform glue (no test surface); the one `codescope-core` change (#247, PR #252) updated + passes its `single_instance_mutex` test. Full `cargo test --workspace` not re-run.
 **Uncommitted work:** none. All four list items merged/closed; `main` at the #253 squash-merge (`1a9b56b`).
 **Open issues:** none tracked. Pre-existing clippy debt in `src/app.rs` (18 `doc_lazy_continuation` warnings under rust-1.95) untouched. **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree (let-chain indentation, etc.) because `main` was last formatted with an older rustfmt — do **NOT** run repo-wide `cargo fmt`; hand-format changed hunks and leave the rest. See the session-47 note.
 
