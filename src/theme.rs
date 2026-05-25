@@ -85,6 +85,17 @@ pub fn frost_50(theme: &Theme) -> Hsla { with_alpha(theme.chrome.ink, 0.50) }
 pub fn ink_dim(theme: &Theme) -> Hsla { with_alpha(theme.chrome.ink, 0.60) }
 pub fn ink_ghost(theme: &Theme) -> Hsla { with_alpha(theme.chrome.ink, 0.40) }
 
+/// Accent-tinted background washes for the "active tab context"
+/// highlight (issue #248) — the sidebar rows tied to the currently
+/// focused tab. A low-alpha accent fill reads as "your active tab lives
+/// here", distinct from both the solid grey `surface_elev` click-
+/// selection fill and the thin accent rail. The worktree row gets the
+/// stronger wash; the parent project row gets the fainter one so a
+/// collapsed project still hints at the context without competing with
+/// its (hidden) child worktree row.
+pub fn active_context_wash(theme: &Theme) -> Hsla { with_alpha(theme.chrome.accent, 0.14) }
+pub fn active_context_wash_dim(theme: &Theme) -> Hsla { with_alpha(theme.chrome.accent, 0.07) }
+
 /// Worktree clean indicator. Reuses the accent colour so a fully-
 /// clean worktree visually rhymes with the focus / accent rail
 /// elsewhere in the chrome.

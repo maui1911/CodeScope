@@ -3360,6 +3360,9 @@ impl AppShell {
                 // every other app chord) still fires from the empty
                 // state. Copilot caught this on PR #184.
                 self.focus_handle.focus(window);
+                // No focused tab left — clear the sidebar's active
+                // context highlight (issue #248).
+                self.push_sidebar_active_context(cx);
                 cx.notify();
                 return;
             }
@@ -3463,6 +3466,10 @@ impl AppShell {
         // is the gpui-blessed way to suppress that ancestor auto-focus; it
         // resets per dispatch so calls outside an event are harmless.
         window.prevent_default();
+        // Follow the focused tab in the sidebar — highlight the
+        // project/worktree row it belongs to (issue #248). Cheap +
+        // no-ops in the sidebar when the context is unchanged.
+        self.push_sidebar_active_context(cx);
         cx.notify();
         if prev_focused != group_idx {
             self.save_layout();
@@ -3547,6 +3554,10 @@ impl AppShell {
         // (the previously focused group's). Once the user types Ctrl+T
         // / clicks +, `activate_tab` will rehome focus.
         self.focus_handle.focus(window);
+        // The newly-focused group is empty, so there's no active tab —
+        // clear the sidebar's active-context wash (#248). It returns
+        // when `activate_tab` runs for a tab opened here.
+        self.push_sidebar_active_context(cx);
         cx.notify();
         self.save_layout();
     }
@@ -5208,6 +5219,32 @@ impl AppShell {
         });
     }
 
+    /// Canonicalised worktree path of the currently focused tab (the
+    /// active tab in the focused group), or `None` when the focused
+    /// group is empty or the tab has no working directory. Unlike the
+    /// `push_sidebar_session_paths` sets, this does *not* require an
+    /// adopted agent session — a plain shell tab still has a worktree
+    /// context worth highlighting (issue #248).
+    fn focused_tab_worktree_path(&self) -> Option<String> {
+        let group = self.groups.get(self.focused_group)?;
+        let tab = group.tabs.get(group.active_tab)?;
+        let wd = tab.working_directory.as_ref()?;
+        let canon = codescope_core::path_canon::canonicalize_path(&wd.to_string_lossy());
+        (!canon.is_empty()).then_some(canon)
+    }
+
+    /// Push the focused tab's worktree path to the sidebar so the
+    /// matching project/worktree row gets the accent-tinted "active
+    /// context" highlight (issue #248). Called from `activate_tab` (the
+    /// universal tab-activation funnel) and from `close_tab` when the
+    /// last tab closes and there's no longer a focused tab.
+    fn push_sidebar_active_context(&self, cx: &mut Context<Self>) {
+        let path = self.focused_tab_worktree_path();
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_active_context(path, cx);
+        });
+    }
+
     /// Recompute the OS-level taskbar / dock overlay from the
     /// current agent rollup. Mirrors C#
     /// `MainViewModel.RecomputeTaskbarBadge` — busy / agent counts
@@ -6009,6 +6046,9 @@ impl AppShell {
         if self.groups[idx].tabs.is_empty() {
             self.focused_group = idx;
             self.focus_handle.focus(window);
+            // Focused an empty group — no active tab, so clear the
+            // sidebar's active-context wash (#248).
+            self.push_sidebar_active_context(cx);
             cx.notify();
             return;
         }
