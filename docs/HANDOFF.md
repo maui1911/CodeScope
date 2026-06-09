@@ -29,7 +29,7 @@
 **Branch:** `main` unchanged; five feature branches with open PRs: #262 (`fix/main-row-min-height`), #263 (`fix/terminal-theme-repaint`), #264 (`fix/osc52-clipboard`), #265 (`feat/file-path-links`), #266 (`feat/diff-viewer`), plus this HANDOFF PR.
 **Head:** `main` still at `672d028` (#256). All five PRs branch directly off it — independent, no stacking, any merge order works (squash-merge each).
 **Release:** `v0.4.0` is still the latest release. ⚠ **The mandatory auto-update validation has STILL not been run** — see cursor list.
-**Build status:** ✅ per-PR `cargo clippy` clean on changed files; `cargo test --workspace` green on the diff-viewer branch (625 tests: 120 bin + 476 core + 28 terminal + 1 doctest; counts on the other branches differ only by their own new tests). Copilot reviews: #262/#264 came back with no inline comments; #263/#265 each had findings, addressed + replied + resolved (commits `e073468` / `d50cfed`); #266 review pending at write time.
+**Build status:** ✅ per-PR `cargo clippy` clean on changed files; `cargo test --workspace` green on the diff-viewer branch (625 tests: 120 bin + 476 core + 28 terminal + 1 doctest; counts on the other branches differ only by their own new tests). Copilot reviews: #262/#264 came back with no inline comments; #263/#265/#266 each had findings, all addressed + replied + resolved (commits `e073468` / `d50cfed` / `6cffcf6` — the #266 pass fixed a whole-file read on untracked previews, O(n²) hunk line-numbering, and two misleading detail-pane labels).
 **Uncommitted work:** none on any branch.
 **Open issues:** #257–#261 all have a fixing PR attached (auto-close keywords in the PR bodies). Pre-existing clippy debt in `src/app.rs` (18 `doc_lazy_continuation` warnings under rust-1.95) untouched. **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree — do **NOT** run repo-wide `cargo fmt`; hand-format changed hunks. See the session-47 note.
 
@@ -115,7 +115,10 @@ branches off `main`, each with its own PR + Copilot review pass:
 2. **⚠ v0.4.0 auto-update validation** (carried from session 47,
    still the most urgent non-code item): from an installed build,
    update and confirm "Installing" → "Update installed"
-   (`docs/RELEASE-VALIDATION.md` §6).
+   (`docs/RELEASE-VALIDATION.md` **§4**, the in-app update flow —
+   session 47's cursor cited §6, but that section is the dev-mode
+   archive-extraction regression check, not the installed-build
+   flow).
 3. After the merges land, consider a `v0.5.0` (diff viewer + four
    fixes outgrow a patch).
 4. Pre-existing clippy debt in `src/app.rs` (18 warnings) — still
