@@ -294,6 +294,10 @@ pub enum SidebarEvent {
     /// a "coming soon" toast — so this event is a placeholder hook
     /// the host can wire up to the real Overview once it lands.
     OpenOverview,
+    /// User picked "View changes" in a worktree's context menu. The
+    /// host opens the full-pane diff viewer for that worktree —
+    /// same panel `Ctrl+Shift+D` opens for the focused tab.
+    OpenDiff { worktree_path: PathBuf },
     /// Reopen a soft-closed session by id. AppShell looks up the row,
     /// calls `SessionManager::reopen`, then spawns a tab pinned to
     /// the persisted `worktree_path` + `agent_id`. Mirrors C#
@@ -4543,11 +4547,25 @@ impl Sidebar {
                 )
             })
             // ── Git ─────────────────────────────────────────────
-            // Pull / Copy branch / Open remote in browser. The
-            // dirty-state aware Rebase + Discard rows from the C#
-            // build land when the worktree polling infra does;
-            // these three are stateless enough to ship now.
+            // View changes / Pull / Copy branch / Open remote in
+            // browser. The dirty-state aware Rebase + Discard rows
+            // from the C# build land when the worktree polling infra
+            // does; these are stateless enough to ship now.
             .child(div().h_px().bg(divider).my_1())
+            .child({
+                let path_for_diff = PathBuf::from(&worktree.path);
+                item(
+                    "wt-menu-view-changes",
+                    "View changes",
+                    false,
+                    Box::new(move |this, _window, cx| {
+                        cx.emit(SidebarEvent::OpenDiff {
+                            worktree_path: path_for_diff.clone(),
+                        });
+                        this.close_menu(cx);
+                    }),
+                )
+            })
             .child({
                 let id_for_pull = worktree_id.clone();
                 item(

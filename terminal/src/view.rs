@@ -929,6 +929,11 @@ pub(crate) fn is_app_level_shortcut(key: &str, mods: &gpui::Modifiers) -> bool {
     if key == "o" && mods.shift {
         return true;
     }
+    // Ctrl+Shift+D — diff viewer. Plain Ctrl+D stays with the
+    // terminal (EOF / readline delete-char).
+    if key == "d" && mods.shift {
+        return true;
+    }
     // Ctrl+Shift+B — toggle sidebar. Plain Ctrl+B stays with the
     // terminal (readline backward-char).
     if key == "b" && mods.shift {
