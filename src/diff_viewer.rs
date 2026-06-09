@@ -511,10 +511,13 @@ impl AppShell {
                     .text_size(px(11.0))
                     .text_color(theme::text_faint())
                     .font(theme::font_mono())
-                    .child(SharedString::from(format!(
-                        "+{} −{}",
-                        file.added, file.removed
-                    ))),
+                    // "+0 −0" on a binary diff would read as "no
+                    // changes" — mirror the file list's "bin" badge.
+                    .child(if file.binary {
+                        SharedString::new_static("bin")
+                    } else {
+                        SharedString::from(format!("+{} −{}", file.added, file.removed))
+                    }),
             );
 
         let mut sections: Vec<gpui::AnyElement> = Vec::new();
@@ -522,10 +525,18 @@ impl AppShell {
         if file.binary {
             sections.push(centered_note("Binary file — no preview.").into_any_element());
         } else if file.hunks.is_empty() {
-            sections.push(
-                centered_note("No textual changes (mode or metadata only).")
-                    .into_any_element(),
-            );
+            // Empty hunks mean different things per status: an empty
+            // new/untracked file has no content to show, a rename can
+            // be content-identical, and a tracked file can change
+            // mode-only. Don't claim "mode only" for the others.
+            let note = match file.status {
+                FileStatus::Added | FileStatus::Untracked => "Empty file.",
+                FileStatus::Renamed => "Renamed — content unchanged.",
+                FileStatus::Modified | FileStatus::Deleted => {
+                    "No textual changes (mode or metadata only)."
+                }
+            };
+            sections.push(centered_note(note).into_any_element());
         } else {
             let mut rendered = 0usize;
             'hunks: for hunk in &file.hunks {

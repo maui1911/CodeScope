@@ -112,6 +112,10 @@ pub struct DiffLine {
 /// empty vec.
 pub fn parse_unified_diff(input: &str) -> Vec<DiffFile> {
     let mut files: Vec<DiffFile> = Vec::new();
+    // Running (old, new) line numbers for the hunk currently being
+    // filled — reset by every `@@` header. Kept outside the hunk so
+    // appending a line is O(1) instead of re-counting the hunk.
+    let mut counters: (u32, u32) = (0, 0);
 
     for line in input.lines() {
         let line = line.strip_suffix('\r').unwrap_or(line);
@@ -141,17 +145,17 @@ pub fn parse_unified_diff(input: &str) -> Vec<DiffFile> {
             // falls through to header handling below.
             match line.as_bytes().first() {
                 Some(b'+') => {
-                    push_hunk_line(hunk, LineKind::Added, &line[1..]);
+                    push_hunk_line(hunk, LineKind::Added, &line[1..], &mut counters);
                     file.added += 1;
                     continue;
                 }
                 Some(b'-') => {
-                    push_hunk_line(hunk, LineKind::Removed, &line[1..]);
+                    push_hunk_line(hunk, LineKind::Removed, &line[1..], &mut counters);
                     file.removed += 1;
                     continue;
                 }
                 Some(b' ') => {
-                    push_hunk_line(hunk, LineKind::Context, &line[1..]);
+                    push_hunk_line(hunk, LineKind::Context, &line[1..], &mut counters);
                     continue;
                 }
                 // `\ No newline at end of file` — metadata, not text.
@@ -159,7 +163,7 @@ pub fn parse_unified_diff(input: &str) -> Vec<DiffFile> {
                 // Empty context line: git emits a fully blank line for
                 // a context line whose content is empty.
                 None => {
-                    push_hunk_line(hunk, LineKind::Context, "");
+                    push_hunk_line(hunk, LineKind::Context, "", &mut counters);
                     continue;
                 }
                 _ => {}
@@ -168,6 +172,7 @@ pub fn parse_unified_diff(input: &str) -> Vec<DiffFile> {
 
         if let Some(header) = line.strip_prefix("@@ ") {
             if let Some((old_start, new_start)) = parse_hunk_header(header) {
+                counters = (old_start, new_start);
                 file.hunks.push(DiffHunk {
                     header: line.to_string(),
                     old_start,
@@ -212,22 +217,33 @@ pub fn parse_unified_diff(input: &str) -> Vec<DiffFile> {
     files
 }
 
-/// Append a line to `hunk`, deriving its old/new line numbers from the
-/// hunk's running counters.
-fn push_hunk_line(hunk: &mut DiffHunk, kind: LineKind, text: &str) {
-    let (mut next_old, mut next_new) = (hunk.old_start, hunk.new_start);
-    for l in &hunk.lines {
-        if l.old_no.is_some() {
-            next_old += 1;
-        }
-        if l.new_no.is_some() {
-            next_new += 1;
-        }
-    }
+/// Append a line to `hunk`, consuming line numbers from the parser's
+/// running `(old, new)` counters (reset by each `@@` header). O(1)
+/// per line — re-deriving the numbers from the hunk contents would
+/// make parsing quadratic on large hunks.
+fn push_hunk_line(
+    hunk: &mut DiffHunk,
+    kind: LineKind,
+    text: &str,
+    counters: &mut (u32, u32),
+) {
     let (old_no, new_no) = match kind {
-        LineKind::Context => (Some(next_old), Some(next_new)),
-        LineKind::Added => (None, Some(next_new)),
-        LineKind::Removed => (Some(next_old), None),
+        LineKind::Context => {
+            let nos = (Some(counters.0), Some(counters.1));
+            counters.0 += 1;
+            counters.1 += 1;
+            nos
+        }
+        LineKind::Added => {
+            let nos = (None, Some(counters.1));
+            counters.1 += 1;
+            nos
+        }
+        LineKind::Removed => {
+            let nos = (Some(counters.0), None);
+            counters.0 += 1;
+            nos
+        }
     };
     hunk.lines.push(DiffLine {
         kind,
@@ -405,14 +421,28 @@ fn untracked_file_entry(worktree: &Path, rel_path: &str) -> DiffFile {
         truncated: false,
     };
 
+    // Bounded read: pull at most cap+1 bytes off disk (the +1 tells
+    // truncation apart from an exactly-cap-sized file) so a multi-GB
+    // untracked artifact never lands in memory just to be previewed.
     let abs = worktree.join(rel_path);
-    let too_big = std::fs::metadata(&abs)
-        .map(|m| m.len() > MAX_UNTRACKED_BYTES)
-        .unwrap_or(false);
-    let Ok(bytes) = std::fs::read(&abs) else {
-        entry.binary = true;
-        return entry;
+    let bytes = {
+        use std::io::Read as _;
+        let Ok(file) = std::fs::File::open(&abs) else {
+            entry.binary = true;
+            return entry;
+        };
+        let mut buf = Vec::new();
+        if file
+            .take(MAX_UNTRACKED_BYTES + 1)
+            .read_to_end(&mut buf)
+            .is_err()
+        {
+            entry.binary = true;
+            return entry;
+        }
+        buf
     };
+    let too_big = bytes.len() as u64 > MAX_UNTRACKED_BYTES;
     if bytes[..bytes.len().min(8192)].contains(&0) {
         entry.binary = true;
         return entry;
