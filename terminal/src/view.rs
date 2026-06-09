@@ -264,6 +264,17 @@ impl TerminalView {
         self.backend.write_input(bytes);
     }
 
+    /// Swap the colour palette and immediately re-resolve the current
+    /// grid against it, so the terminal repaints in the new colours on
+    /// this frame instead of keeping its spawn-time palette until the
+    /// next PTY event. The app shell calls this for every open tab
+    /// when the user switches theme.
+    pub fn set_palette(&mut self, palette: ColorPalette, cx: &mut Context<Self>) {
+        self.palette = palette;
+        self.snapshot = self.backend.snapshot(&self.palette);
+        cx.notify();
+    }
+
     /// Snap the cursor to its visible phase. Called whenever the user
     /// types so the cursor never disappears mid-keystroke.
     fn show_cursor_now(&self) {
