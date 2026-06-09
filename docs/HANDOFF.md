@@ -25,13 +25,103 @@
 > `.github/workflows/release.yml` (was `rs--release.yml`) and now
 > triggers on plain `v*` tags.
 
-**Last updated:** 2026-05-25 (session 47 — open-PR/issue sweep: #246, #243, #247, #248; cut **v0.4.0** release)
-**Branch:** `main` (three PRs shipped on feature branches → #246 / #252 / #253, each squash-merged with `--admin` after its Copilot review was addressed + resolved; plus issue #243 closed — no PR)
-**Head:** #253 — sidebar active-tab highlight, on top of #252 (single-instance guard) and #246 (new-project dialog focus). All on top of session 46's #251.
-**Release:** **`v0.4.0` — tagged + released this session** (cargo-dist pipeline green in ~10 min; GitHub release is *Latest*, with `CodeScope-v0.4.0-setup.exe` + `-windows.zip` and the mac/Linux tarballs). Auto-update is **back** (manual-apply via `self_update` + Inno Setup installer); Velopack stays retired — see CLAUDE.md non-negotiables. ⚠ **The mandatory auto-update validation has NOT been run yet** — see cursor #1.
-**Build status:** ✅ `cargo check` + `cargo clippy -p codescope --all-targets` clean on changed files for every PR. Mostly UI/platform glue (no test surface); the one `codescope-core` change (#247, PR #252) updated + passes its `single_instance_mutex` test. Full `cargo test --workspace` not re-run.
-**Uncommitted work:** none. All four list items merged/closed; `main` at the v0.4.0 version bump (`f61ca57`, #255), tagged `v0.4.0`.
-**Open issues:** none tracked. Pre-existing clippy debt in `src/app.rs` (18 `doc_lazy_continuation` warnings under rust-1.95) untouched. **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree (let-chain indentation, etc.) because `main` was last formatted with an older rustfmt — do **NOT** run repo-wide `cargo fmt`; hand-format changed hunks and leave the rest. See the session-47 note.
+**Last updated:** 2026-06-09 (session 48 — autonomous issue sweep: #257–#261 → five PRs opened, **none merged**, awaiting the user's review)
+**Branch:** `main` unchanged; five feature branches with open PRs: #262 (`fix/main-row-min-height`), #263 (`fix/terminal-theme-repaint`), #264 (`fix/osc52-clipboard`), #265 (`feat/file-path-links`), #266 (`feat/diff-viewer`), plus this HANDOFF PR.
+**Head:** `main` still at `672d028` (#256). All five PRs branch directly off it — independent, no stacking, any merge order works (squash-merge each).
+**Release:** `v0.4.0` is still the latest release. ⚠ **The mandatory auto-update validation has STILL not been run** — see cursor list.
+**Build status:** ✅ per-PR `cargo clippy` clean on changed files; `cargo test --workspace` green on the diff-viewer branch (625 tests: 120 bin + 476 core + 28 terminal + 1 doctest; counts on the other branches differ only by their own new tests). Copilot reviews: #262/#264 came back with no inline comments; #263/#265 each had findings, addressed + replied + resolved (commits `e073468` / `d50cfed`); #266 review pending at write time.
+**Uncommitted work:** none on any branch.
+**Open issues:** #257–#261 all have a fixing PR attached (auto-close keywords in the PR bodies). Pre-existing clippy debt in `src/app.rs` (18 `doc_lazy_continuation` warnings under rust-1.95) untouched. **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree — do **NOT** run repo-wide `cargo fmt`; hand-format changed hunks. See the session-47 note.
+
+### Session 48 — autonomous issue sweep: five issues → five PRs (#262–#266)
+
+User asked for all open GitHub issues to be fixed autonomously, PRs
+prepared for review (not merged). Five issues, five independent
+branches off `main`, each with its own PR + Copilot review pass:
+
+- **PR #262 → issue #260** (tall sidebar pushes the work area
+  off-screen). One-line layout fix: `main_row` (sidebar + work area)
+  was missing the `min_size.height = 0` clamp the sidebar body /
+  palette list / overview body already use, so a sidebar taller than
+  the window inflated the row and clipped the terminals + status bar
+  below the window edge. Copilot: no comments.
+- **PR #263 → issue #257** (theme switch doesn't repaint running
+  terminals). `TerminalView` baked its `ColorPalette` in at spawn;
+  new `set_palette()` re-resolves the snapshot immediately, and
+  `AppShell::push_palette_to_terminals()` pushes the live theme's
+  palette into every tab from both `apply_settings` (Save) and
+  `set_theme_preview` (live preview / Cancel restore). Copilot
+  flagged two real things, both fixed in `e073468`: the
+  `EventProxy`'s OSC 4/10-12 colour-query palette is now mutex'd +
+  updated too (`Backend::update_palette`), and `set_palette` reuses
+  `refresh_snapshot` instead of duplicating it.
+- **PR #264 → issue #259** (Copilot CLI "copied to clipboard" but
+  clipboard empty). Root cause: `TerminalView`'s event-drain loop
+  bound every `BackendEvent` as `_event`, so the OSC 52
+  `ClipboardStore` that alacritty already parses (and `EventProxy`
+  forwards) was silently dropped. Now matched →
+  `cx.write_to_clipboard`. OSC 52 *load* (paste request) is
+  deliberately ignored — honouring it would let any program in the
+  terminal read the user's clipboard. Copilot: no comments.
+- **PR #265 → issue #261** (clickable file paths, like URLs).
+  Second post-processing pass in `Backend::snapshot`
+  (`inject_file_path_hyperlinks` next to the URL pass): conservative
+  token scan (`looks_like_path` — separator or `stem.ext` with a
+  letter in the extension, so `v0.4.0`-style versions never stat),
+  `:line:col` suffix stripped from the target but kept in the
+  clickable span, resolution against the spawn cwd, and an
+  existence gate with a bounded memo cache (4096 entries) that runs
+  *outside* the Term lock. Click side unchanged — hyperlinked runs
+  already route through `open::that_detached`, which opens plain
+  absolute paths in the OS default app. 11 new tests. Copilot
+  flagged the `working_directory: None` case → fixed in `d50cfed`
+  (fall back to host cwd, which is where the child actually spawns).
+- **PR #266 → issue #258** (a really nice diff viewer). Two halves:
+  - `core/src/diff.rs` (TDD, 11 tests incl. temp-repo integration):
+    `parse_unified_diff` (files → hunks → lines with both-side line
+    numbers), `intraline_emphasis` (common prefix/suffix trim on
+    positionally paired ±lines), `worktree_diff` (`git diff HEAD -M`
+    + `git status --porcelain`; untracked files synthesized as
+    all-added with byte/line caps + NUL binary sniff; no-`HEAD`
+    repos degrade to untracked-only). `git.rs`'s `run_git` went
+    `pub(crate)` for reuse.
+  - `src/diff_viewer.rs`: full-pane master/detail panel in the
+    Overview's work-area slot (`AppShell.diff_viewer:
+    Option<DiffViewerState>`, mutually exclusive with
+    `show_overview`). File list with badges + per-file ± counts;
+    detail pane with hunk headers, dual line-number gutters,
+    green/red row washes, stronger intraline emphasis spans,
+    explicit loading/clean/error/binary/truncated states, 4 000
+    rendered-line cap. Background compute via `cx.background_spawn`
+    with a request-sequence stamp so stale results are dropped.
+    Entry points: **Ctrl+Shift+D** (added to the terminal
+    bubble-up list; plain Ctrl+D stays with the PTY), palette
+    "View diff", and a new "View changes" row in the worktree
+    context menu (`SidebarEvent::OpenDiff`).
+
+**Process notes:**
+- Everything validated with `cargo clippy` on changed files +
+  `cargo test` (workspace on #266); **no dev-build visual pass** —
+  GPUI has no automation surface, so #266 (and the sidebar wash in
+  #262) still want a quick human look before merge.
+- The five branches are all rooted at `672d028`; the only files
+  touched by more than one PR are `terminal/src/view.rs` (#263,
+  #264, #265 — different hunks; squash-merges should replay
+  cleanly) and `src/app.rs` (#262, #263, #266 — different hunks).
+
+**Cursor for next session:**
+1. **User reviews + merges PRs #262–#266** (and this HANDOFF PR).
+   Address any human-review feedback; squash-merge per repo habit.
+2. **⚠ v0.4.0 auto-update validation** (carried from session 47,
+   still the most urgent non-code item): from an installed build,
+   update and confirm "Installing" → "Update installed"
+   (`docs/RELEASE-VALIDATION.md` §6).
+3. After the merges land, consider a `v0.5.0` (diff viewer + four
+   fixes outgrow a patch).
+4. Pre-existing clippy debt in `src/app.rs` (18 warnings) — still
+   open, untouched.
+5. MSIX / Store packaging still parked (closed #243 thread has the
+   scoping notes).
 
 ### Session 47 — open-PR/issue sweep: #246, #243, #247, #248
 
