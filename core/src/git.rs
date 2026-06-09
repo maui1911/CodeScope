@@ -584,7 +584,9 @@ pub(crate) fn parse_ahead_behind(line: &str) -> (u32, u32) {
 
 /// Run `git <args...>` in `cwd`. Returns the captured `Output` on
 /// success; bubbles up stderr (trimmed) on non-zero exit.
-fn run_git(cwd: &Path, args: &[&str]) -> Result<Output> {
+/// `pub(crate)` so sibling git-consumers (`crate::diff`) reuse the
+/// same no-window spawn + error shape instead of growing their own.
+pub(crate) fn run_git(cwd: &Path, args: &[&str]) -> Result<Output> {
     let output = no_window_command("git")
         .args(args)
         .current_dir(cwd)

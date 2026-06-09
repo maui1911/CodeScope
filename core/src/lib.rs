@@ -19,6 +19,7 @@ pub mod agents;
 pub mod attachments;
 pub mod command_palette;
 pub mod crash_log;
+pub mod diff;
 pub mod git;
 pub mod layout;
 pub mod memory_watchdog;
