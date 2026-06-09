@@ -184,7 +184,14 @@ impl Backend {
             escape_args,
         } = config;
 
-        let working_directory_for_links = working_directory.clone();
+        // Fall back to the host process's cwd when the caller didn't
+        // pin one — that's where the PTY child actually starts in
+        // that case (alacritty's tty layer inherits the parent cwd),
+        // so relative-path link resolution keeps working for default
+        // spawns (e.g. examples) too.
+        let working_directory_for_links = working_directory
+            .clone()
+            .or_else(|| std::env::current_dir().ok());
         let mut tty_options = TtyOptions {
             shell,
             working_directory,
