@@ -25,13 +25,213 @@
 > `.github/workflows/release.yml` (was `rs--release.yml`) and now
 > triggers on plain `v*` tags.
 
-**Last updated:** 2026-05-25 (session 47 — open-PR/issue sweep: #246, #243, #247, #248; cut **v0.4.0** release)
-**Branch:** `main` (three PRs shipped on feature branches → #246 / #252 / #253, each squash-merged with `--admin` after its Copilot review was addressed + resolved; plus issue #243 closed — no PR)
-**Head:** #253 — sidebar active-tab highlight, on top of #252 (single-instance guard) and #246 (new-project dialog focus). All on top of session 46's #251.
-**Release:** **`v0.4.0` — tagged + released this session** (cargo-dist pipeline green in ~10 min; GitHub release is *Latest*, with `CodeScope-v0.4.0-setup.exe` + `-windows.zip` and the mac/Linux tarballs). Auto-update is **back** (manual-apply via `self_update` + Inno Setup installer); Velopack stays retired — see CLAUDE.md non-negotiables. ⚠ **The mandatory auto-update validation has NOT been run yet** — see cursor #1.
-**Build status:** ✅ `cargo check` + `cargo clippy -p codescope --all-targets` clean on changed files for every PR. Mostly UI/platform glue (no test surface); the one `codescope-core` change (#247, PR #252) updated + passes its `single_instance_mutex` test. Full `cargo test --workspace` not re-run.
-**Uncommitted work:** none. All four list items merged/closed; `main` at the v0.4.0 version bump (`f61ca57`, #255), tagged `v0.4.0`.
-**Open issues:** none tracked. Pre-existing clippy debt in `src/app.rs` (18 `doc_lazy_continuation` warnings under rust-1.95) untouched. **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree (let-chain indentation, etc.) because `main` was last formatted with an older rustfmt — do **NOT** run repo-wide `cargo fmt`; hand-format changed hunks and leave the rest. See the session-47 note.
+**Last updated:** 2026-06-11 (session 50 — manual user verification of #262–#266; all five squash-merged)
+**Branch:** `main`; only this HANDOFF PR (#267) remains open.
+**Head:** `main` at `15eeadc` (#266). Merge order #262 → #263 → #264 → #265 → #266 (`2d91d7b`, `a0dbf30`, `3f1ab58`, `1f2c539`, `15eeadc`); each branch was updated with main before its manual test, so later PRs were tested on top of the earlier merges.
+**Release:** `v0.4.0` is still the latest release. ⚠ **The mandatory auto-update validation has STILL not been run** — see cursor list.
+**Build status:** ✅ `main` builds clean; the workspace suite was 631 tests green on the final #266 head before merge. Copilot reviews on all five PRs were fully addressed + resolved before merging.
+**Uncommitted work:** none.
+**Open issues:** #257–#261 auto-closed by the PR merges. Pre-existing clippy debt in `src/app.rs` (18 `doc_lazy_continuation` warnings under rust-1.95) untouched. **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree — do **NOT** run repo-wide `cargo fmt`; hand-format changed hunks. See the session-47 note.
+
+### Session 50 — manual verification + merge of #262–#266
+
+The user tested every PR by hand in a dev build (`CODESCOPE_DEV=1`),
+one at a time: check out branch → `gh pr update-branch` → build →
+launch → scripted manual checks → user verdict → squash-merge with
+`--admin --delete-branch`. All five passed first try; no findings
+beyond session 49's. Notes:
+
+- The seeded Dev store (pwsh-only agent) initially read as a bug
+  ("why can I only open PowerShell sessions?") — that is the
+  session-49 fixture `settings.json`, not a regression. Left in place
+  by user choice; restore from the `.bak-20260611` twins when fixture
+  testing is done.
+- **Process rule refined by the user:** dev-build instances may be
+  closed/killed programmatically (identify by PID/exe path under
+  `target*/debug/`, never by image name); only the *installed* build
+  is untouchable — it hosts the live agent sessions.
+- #265's Ctrl+click open-in-editor — the one path session 49 could
+  not automate — was confirmed working by hand.
+- Follow-up still unfiled: palette theme-apply drops keyboard focus
+  (pre-existing, noted in session 49).
+
+### Session 49 — visual verification of #262–#266 with gpui-driver
+
+The user's [gpui-driver](https://github.com/maui1911/gpui-driver)
+(in-process JSON-RPC automation for GPUI apps: element tree, synthetic
+clicks/keys, renderer screenshots) made the previously-impossible
+visual pass possible. Setup that had to exist first, all reusable:
+
+- **`compat/gpui-crates-io` branch in `C:/dev/gpui-driver`** — builds
+  the driver lib against crates.io gpui 0.2.2 (CodeScope's version)
+  instead of the pinned zed rev. Differences handled: no
+  `Window::render_to_image` (PrintWindow fallback only, window must be
+  visible), `AsyncApp::update` is fallible, `dispatch_event` leaks a
+  `pub(crate)` type so clicks/scrolls are synthesized as real Win32
+  `PostMessageW` window messages (works without focus; modifiers via
+  `keybd_event` = global keyboard state), occlusion pre-check removed
+  (gpui's `TrackMouseEvent(TME_LEAVE)` wipes synthetic hover instantly
+  when the real cursor is elsewhere). CLI quirk: `type` renders `-` as
+  "minus" — avoid dashes in typed strings (pwsh aliases `gcb`/`scb`
+  help).
+- **Local-only branch `test/visual-verify-262-266`** — all five PR
+  branches merged + optional `driver` feature (gpui-driver path dep,
+  `gpui_driver::init` in main, `driver_id` annotations on sidebar
+  worktree rows, the View-changes menu item, and diff-viewer
+  controls) + `CODESCOPE_DEV_MUTEX_SUFFIX` escape hatch so extra dev
+  instances coexist. **Never merge this branch.** Build with
+  `cargo build --features driver`; never ship the feature.
+- Dev store seeded with 12 fixture repos in
+  `C:/dev/codescope-fixtures/` (alpha has 4 worktrees + a rich dirty
+  state) and a pwsh-only agent so sessions never spawn a real AI CLI.
+  The user's previous Dev store is preserved in
+  `%APPDATA%/CodeScope.Dev.bak-20260611` and
+  `%LOCALAPPDATA%/CodeScope.Dev.bak-20260611` — restore by copying
+  back after closing the verify instances.
+
+**Results** (screenshots in `.verify-shots/`, git-ignored locally):
+
+- **#262 layout clamp — PASS.** 12-project sidebar taller than a
+  720px window; terminal prompt stays visible at the bottom after
+  120 lines of output.
+- **#263 theme repaint — PASS.** Palette → Solarized Dark: running
+  terminal (existing prompt output) repainted instantly, both
+  directions. Side-observation: after applying a theme from the
+  palette, keyboard focus is dropped until the user clicks something
+  — pre-existing palette behavior, not introduced by the PR; worth a
+  follow-up issue.
+- **#264 OSC 52 — PASS** (second attempt). The first run was blocked:
+  the desktop session was locked (LogonUI active) and Windows denies
+  clipboard access session-wide while locked (`clip.exe` → "Access is
+  denied", `Set-Clipboard` silently no-ops) — worth remembering for
+  any future clipboard testing. After the user unlocked, emitting
+  `ESC]52;c;b3NjNTIgd2Vya3Qh BEL` from pwsh inside a tab put the
+  decoded payload on the system clipboard, confirmed via
+  `Get-Clipboard` in the same tab.
+- **#265 file-path links — PASS** for detection: existing
+  `src/main.rs:2` underlined (incl. `:line` suffix, inside quoted
+  output), non-existent `src/nope.rs` correctly bare. Ctrl+click
+  open-in-default-app not exercised (cell-precise clicks aren't
+  addressable; locked session would hide the spawned editor anyway).
+- **#266 diff viewer — PASS after one real fix.** Context-menu route,
+  all five status kinds (M/D/R/U + binary "bin" badge), intraline
+  emphasis, refresh with selection pinned by path, Back button,
+  Ctrl+Shift+D toggle, error-state UI all verified on screen. **Bug
+  found:** the keyboard/palette route resolved the worktree via
+  `focused_tab_worktree_path()` — the `path_canon` comparison key
+  (lowercased, colon-stripped), not a real path — so Ctrl+Shift+D
+  died with "directory name is invalid (os error 267)" on Windows.
+  Fixed in `64031d9` on `feat/diff-viewer` with a new
+  `focused_tab_working_directory()` accessor; re-verified visually.
+  The push kicked off an iterative Copilot loop (rounds 2–7, every
+  finding accepted and fixed; round 8 came back clean, 0 unresolved):
+  `1e273ea` porcelain `-z` raw paths + allocation-free emphasis
+  spans · `b35b5e2` `core.quotepath=false` on the diff invocation ·
+  `e247ec7` XY-wide rename detection + C-quoted `diff --git` split
+  (matters for binary diffs with spaced/quoted names) · `6f6b3d6`
+  single-line error text + "Toggle diff viewer" palette title ·
+  `9fcd1c1` C-decode `---`/`+++` paths + shrinkable header subtitle ·
+  `e53b365` Ctrl+Shift+D chord test. Workspace suite now 631 tests,
+  green.
+
+Three instrumented dev instances were left running for the user to
+close (the session being locked meant they could not be closed
+programmatically; "never kill codescope processes" applies). Closing
+them releases `target/debug/codescope.exe` and the two verify target
+dirs (`target-verify/`, `target-verify2/`, deletable).
+
+### Session 48 — autonomous issue sweep: five issues → five PRs (#262–#266)
+
+User asked for all open GitHub issues to be fixed autonomously, PRs
+prepared for review (not merged). Five issues, five independent
+branches off `main`, each with its own PR + Copilot review pass:
+
+- **PR #262 → issue #260** (tall sidebar pushes the work area
+  off-screen). One-line layout fix: `main_row` (sidebar + work area)
+  was missing the `min_size.height = 0` clamp the sidebar body /
+  palette list / overview body already use, so a sidebar taller than
+  the window inflated the row and clipped the terminals + status bar
+  below the window edge. Copilot: no comments.
+- **PR #263 → issue #257** (theme switch doesn't repaint running
+  terminals). `TerminalView` baked its `ColorPalette` in at spawn;
+  new `set_palette()` re-resolves the snapshot immediately, and
+  `AppShell::push_palette_to_terminals()` pushes the live theme's
+  palette into every tab from both `apply_settings` (Save) and
+  `set_theme_preview` (live preview / Cancel restore). Copilot
+  flagged two real things, both fixed in `e073468`: the
+  `EventProxy`'s OSC 4/10-12 colour-query palette is now mutex'd +
+  updated too (`Backend::update_palette`), and `set_palette` reuses
+  `refresh_snapshot` instead of duplicating it.
+- **PR #264 → issue #259** (Copilot CLI "copied to clipboard" but
+  clipboard empty). Root cause: `TerminalView`'s event-drain loop
+  bound every `BackendEvent` as `_event`, so the OSC 52
+  `ClipboardStore` that alacritty already parses (and `EventProxy`
+  forwards) was silently dropped. Now matched →
+  `cx.write_to_clipboard`. OSC 52 *load* (paste request) is
+  deliberately ignored — honouring it would let any program in the
+  terminal read the user's clipboard. Copilot: no comments.
+- **PR #265 → issue #261** (clickable file paths, like URLs).
+  Second post-processing pass in `Backend::snapshot`
+  (`inject_file_path_hyperlinks` next to the URL pass): conservative
+  token scan (`looks_like_path` — separator or `stem.ext` with a
+  letter in the extension, so `v0.4.0`-style versions never stat),
+  `:line:col` suffix stripped from the target but kept in the
+  clickable span, resolution against the spawn cwd, and an
+  existence gate with a bounded memo cache (4096 entries) that runs
+  *outside* the Term lock. Click side unchanged — hyperlinked runs
+  already route through `open::that_detached`, which opens plain
+  absolute paths in the OS default app. 11 new tests. Copilot
+  flagged the `working_directory: None` case → fixed in `d50cfed`
+  (fall back to host cwd, which is where the child actually spawns).
+- **PR #266 → issue #258** (a really nice diff viewer). Two halves:
+  - `core/src/diff.rs` (TDD, 11 tests incl. temp-repo integration):
+    `parse_unified_diff` (files → hunks → lines with both-side line
+    numbers), `intraline_emphasis` (common prefix/suffix trim on
+    positionally paired ±lines), `worktree_diff` (`git diff HEAD -M`
+    + `git status --porcelain`; untracked files synthesized as
+    all-added with byte/line caps + NUL binary sniff; no-`HEAD`
+    repos degrade to untracked-only). `git.rs`'s `run_git` went
+    `pub(crate)` for reuse.
+  - `src/diff_viewer.rs`: full-pane master/detail panel in the
+    Overview's work-area slot (`AppShell.diff_viewer:
+    Option<DiffViewerState>`, mutually exclusive with
+    `show_overview`). File list with badges + per-file ± counts;
+    detail pane with hunk headers, dual line-number gutters,
+    green/red row washes, stronger intraline emphasis spans,
+    explicit loading/clean/error/binary/truncated states, 4 000
+    rendered-line cap. Background compute via `cx.background_spawn`
+    with a request-sequence stamp so stale results are dropped.
+    Entry points: **Ctrl+Shift+D** (added to the terminal
+    bubble-up list; plain Ctrl+D stays with the PTY), palette
+    "View diff", and a new "View changes" row in the worktree
+    context menu (`SidebarEvent::OpenDiff`).
+
+**Process notes:**
+- Everything validated with `cargo clippy` on changed files +
+  `cargo test` (workspace on #266); **no dev-build visual pass** —
+  GPUI has no automation surface, so #266 (and the sidebar wash in
+  #262) still want a quick human look before merge.
+- The five branches are all rooted at `672d028`; the only files
+  touched by more than one PR are `terminal/src/view.rs` (#263,
+  #264, #265 — different hunks; squash-merges should replay
+  cleanly) and `src/app.rs` (#262, #263, #266 — different hunks).
+
+**Cursor for next session:**
+1. ~~User reviews + merges PRs #262–#266~~ — done in session 50, all
+   five merged (see header).
+2. **⚠ v0.4.0 auto-update validation** (carried from session 47,
+   still the most urgent non-code item): from an installed build,
+   update and confirm "Installing" → "Update installed"
+   (`docs/RELEASE-VALIDATION.md` **§4**, the in-app update flow —
+   session 47's cursor cited §6, but that section is the dev-mode
+   archive-extraction regression check, not the installed-build
+   flow).
+3. The merges have landed — consider a `v0.5.0` (diff viewer + four
+   fixes outgrow a patch).
+4. Pre-existing clippy debt in `src/app.rs` (18 warnings) — still
+   open, untouched.
+5. MSIX / Store packaging still parked (closed #243 thread has the
+   scoping notes).
 
 ### Session 47 — open-PR/issue sweep: #246, #243, #247, #248
 
