@@ -88,7 +88,9 @@ struct Inner {
     /// don't get a quick response. Sending the answer from the
     /// event-loop thread directly (instead of routing through gpui's
     /// async update tick on the View) keeps round-trip below a frame.
-    palette: ColorPalette,
+    /// Behind a mutex so a theme switch can swap it mid-session and
+    /// colour queries keep matching what's painted on screen.
+    palette: Mutex<ColorPalette>,
     /// Latest `WindowSize` the View pushed to the backend, used to
     /// answer `\x1b[14t` text-area-size queries instantly. The View
     /// updates this on every resize.
@@ -104,7 +106,7 @@ impl EventProxy {
             inner: Arc::new(Inner {
                 tx,
                 pty_writer: OnceLock::new(),
-                palette,
+                palette: Mutex::new(palette),
                 size: Arc::new(Mutex::new(initial_size)),
             }),
         };
@@ -121,6 +123,13 @@ impl EventProxy {
     /// answers reflect the latest layout. Cheap — just a mutex write.
     pub fn update_size(&self, size: WindowSize) {
         *self.inner.size.lock() = size;
+    }
+
+    /// Swap the palette used to answer OSC 4 / 10-12 colour queries so
+    /// TUIs probing colours after a theme switch get values that match
+    /// what's actually painted. Cheap — just a mutex write.
+    pub fn update_palette(&self, palette: ColorPalette) {
+        *self.inner.palette.lock() = palette;
     }
 
     fn forward(&self, event: BackendEvent) {
@@ -168,7 +177,7 @@ impl EventListener for EventProxy {
             // OSC 4 overrides are rare and not worth the deadlock risk
             // of locking the term from the event loop thread.
             Event::ColorRequest(index, response) => {
-                let rgb = self.inner.palette.resolve_rgb_no_overrides(index);
+                let rgb = self.inner.palette.lock().resolve_rgb_no_overrides(index);
                 self.write_pty(response(rgb));
             }
             Event::TextAreaSizeRequest(response) => {
