@@ -35,9 +35,9 @@ use std::sync::Arc;
 
 use codescope_core::Theme;
 use gpui::{
-    App, Bounds, ElementId, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId,
-    PaintQuad, ParentElement, Pixels, Point, ShapedLine, SharedString, Style, TextRun, Window,
-    div, fill, point, px, relative, size,
+    App, Bounds, ElementId, GlobalElementId, Hsla, InspectorElementId, IntoElement, Keystroke,
+    LayoutId, PaintQuad, ParentElement, Pixels, Point, ShapedLine, SharedString, Style, TextRun,
+    Window, div, fill, point, px, relative, size,
 };
 use parking_lot::Mutex;
 
@@ -145,6 +145,23 @@ impl TextField {
         self.caret = caret + ch.len_utf8();
     }
 
+    /// Insert every non-control char of `s` at the caret (the paste
+    /// path). Control characters are stripped rather than rejected so
+    /// a multi-line clipboard value still yields a usable single-line
+    /// field — lines are joined, which matches what a URL or name
+    /// field wants from a trailing-newline copy. Returns `true` when
+    /// the buffer actually changed.
+    pub fn insert_str(&mut self, s: &str) -> bool {
+        let mut changed = false;
+        for ch in s.chars() {
+            if !ch.is_control() {
+                self.insert_char(ch);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Delete the char to the left of the caret (Backspace). Returns
     /// `true` when the buffer actually shrank — `false` on a no-op
     /// (caret at start). The return drives whether the caller should
@@ -246,6 +263,20 @@ impl TextField {
             c -= 1;
         }
         c
+    }
+}
+
+/// Shared paste-chord test for the dialog key handlers: Ctrl+V
+/// (Cmd+V via gpui's `platform` modifier on macOS) or Shift+Insert.
+/// Shift is tolerated on the V chord so Ctrl+Shift+V pastes too;
+/// Alt is rejected because Ctrl+Alt (AltGr) types glyphs on several
+/// European layouts and must keep reaching the `key_char` path.
+pub fn is_paste_chord(keystroke: &Keystroke) -> bool {
+    let mods = &keystroke.modifiers;
+    match keystroke.key.as_str() {
+        "v" => !mods.alt && (mods.control || mods.platform),
+        "insert" => mods.shift && !mods.control && !mods.alt && !mods.platform,
+        _ => false,
     }
 }
 
@@ -589,5 +620,64 @@ mod tests {
         // Past the end → clamp to end.
         f.set_caret(99);
         assert_eq!(f.caret(), 6);
+    }
+
+    #[test]
+    fn insert_str_inserts_at_caret() {
+        let mut f = TextField::with_text("ac");
+        f.move_left();
+        assert!(f.insert_str("b"));
+        assert_eq!(f.text(), "abc");
+        assert_eq!(f.caret(), 2);
+    }
+
+    #[test]
+    fn insert_str_strips_control_chars() {
+        let mut f = TextField::new();
+        assert!(f.insert_str("https://example.com/repo.git\r\n"));
+        assert_eq!(f.text(), "https://example.com/repo.git");
+        assert_eq!(f.caret(), f.text().len());
+    }
+
+    #[test]
+    fn insert_str_joins_multiline_clipboard() {
+        let mut f = TextField::new();
+        assert!(f.insert_str("one\ntwo\tthree"));
+        assert_eq!(f.text(), "onetwothree");
+    }
+
+    #[test]
+    fn insert_str_control_only_is_noop() {
+        let mut f = TextField::with_text("x");
+        assert!(!f.insert_str("\r\n\t"));
+        assert!(!f.insert_str(""));
+        assert_eq!(f.text(), "x");
+    }
+
+    #[test]
+    fn paste_chord_matches_platform_conventions() {
+        use gpui::Modifiers;
+        let ks = |key: &str, modifiers: Modifiers| Keystroke {
+            modifiers,
+            key: key.into(),
+            key_char: None,
+        };
+        let ctrl = Modifiers { control: true, ..Default::default() };
+        let cmd = Modifiers { platform: true, ..Default::default() };
+        let ctrl_shift = Modifiers { control: true, shift: true, ..Default::default() };
+        let ctrl_alt = Modifiers { control: true, alt: true, ..Default::default() };
+        let shift = Modifiers { shift: true, ..Default::default() };
+
+        assert!(is_paste_chord(&ks("v", ctrl)));
+        assert!(is_paste_chord(&ks("v", cmd)));
+        assert!(is_paste_chord(&ks("v", ctrl_shift)));
+        assert!(is_paste_chord(&ks("insert", shift)));
+
+        // AltGr (Ctrl+Alt) types glyphs on some layouts — not a paste.
+        assert!(!is_paste_chord(&ks("v", ctrl_alt)));
+        assert!(!is_paste_chord(&ks("v", shift)));
+        assert!(!is_paste_chord(&ks("v", Modifiers::default())));
+        assert!(!is_paste_chord(&ks("insert", ctrl)));
+        assert!(!is_paste_chord(&ks("insert", Modifiers::default())));
     }
 }

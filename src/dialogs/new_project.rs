@@ -195,6 +195,36 @@ impl NewProjectDialogState {
         true
     }
 
+    /// Paste `s` into the focused field. Same auto-derive +
+    /// read-only rules as [`Self::insert_char`], but the name redrive
+    /// runs once for the whole string instead of per character.
+    pub fn insert_str(&mut self, s: &str) -> bool {
+        if self.focused_field_mut().is_none() {
+            return false;
+        }
+        let changed = match self.focused_field {
+            DialogField::Url => {
+                let c = self.url.insert_str(s);
+                if c {
+                    self.maybe_redrive_name();
+                }
+                c
+            }
+            DialogField::Parent => self.parent.insert_str(s),
+            DialogField::Name => {
+                let c = self.name.insert_str(s);
+                if c {
+                    self.name_auto = false;
+                }
+                c
+            }
+        };
+        if changed {
+            self.error = None;
+        }
+        changed
+    }
+
     pub fn backspace(&mut self) -> bool {
         if self.focused_field_mut().is_none() {
             return false;
@@ -1050,6 +1080,18 @@ fn handle_key_down(
         .new_project_dialog()
         .map(|s| s.mode)
         .unwrap_or(DialogMode::Existing);
+
+    if crate::text_field::is_paste_chord(&event.keystroke) {
+        let pasted = cx.read_from_clipboard().and_then(|item| item.text());
+        let changed = pasted
+            .and_then(|text| sidebar.new_project_dialog_mut().map(|s| s.insert_str(&text)))
+            .unwrap_or(false);
+        if changed {
+            sidebar.wake_text_blink(cx);
+            cx.notify();
+        }
+        return;
+    }
 
     match key {
         "escape" => {

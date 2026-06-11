@@ -444,6 +444,26 @@ fn handle_key_down(
     let key = event.keystroke.key.as_str();
     cx.stop_propagation();
 
+    if crate::text_field::is_paste_chord(&event.keystroke) {
+        let pasted = cx.read_from_clipboard().and_then(|item| item.text());
+        let changed = pasted
+            .and_then(|text| {
+                shell.rename_dialog.as_mut().map(|s| {
+                    let c = s.name.insert_str(&text);
+                    if c {
+                        s.error = None;
+                    }
+                    c
+                })
+            })
+            .unwrap_or(false);
+        if changed {
+            shell.wake_text_blink(cx);
+            cx.notify();
+        }
+        return;
+    }
+
     match key {
         "escape" => {
             shell.cancel_rename_dialog(cx);

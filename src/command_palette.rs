@@ -271,6 +271,17 @@ impl CommandPaletteState {
         self.refresh_filter();
     }
 
+    /// Paste `s` into the search query (control chars stripped by
+    /// `TextField::insert_str`); the filter refreshes once for the
+    /// whole string rather than per character.
+    pub fn insert_str(&mut self, s: &str) -> bool {
+        let changed = self.query.insert_str(s);
+        if changed {
+            self.refresh_filter();
+        }
+        changed
+    }
+
     pub fn backspace(&mut self) -> bool {
         let changed = self.query.backspace();
         if changed {
@@ -576,6 +587,18 @@ fn handle_key_down(
     let mods = &event.keystroke.modifiers;
     if key == "p" && (mods.control || mods.platform) && mods.shift {
         shell.close_command_palette(cx);
+        return;
+    }
+
+    if crate::text_field::is_paste_chord(&event.keystroke) {
+        let pasted = cx.read_from_clipboard().and_then(|item| item.text());
+        let changed = pasted
+            .and_then(|text| shell.command_palette_mut().map(|s| s.insert_str(&text)))
+            .unwrap_or(false);
+        if changed {
+            shell.wake_text_blink(cx);
+            cx.notify();
+        }
         return;
     }
 

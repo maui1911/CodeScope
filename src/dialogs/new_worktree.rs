@@ -235,6 +235,11 @@ impl NewWorktreeDialogState {
             true
         })
     }
+    /// Paste `s` into the focused field (control chars stripped by
+    /// `TextField::insert_str`).
+    pub fn insert_str(&mut self, s: &str) -> bool {
+        self.with_focused_field(|f| f.insert_str(s))
+    }
     pub fn backspace(&mut self) -> bool {
         self.with_focused_field(|f| f.backspace())
     }
@@ -1230,6 +1235,18 @@ fn handle_key_down(
         .dialog()
         .map(|s| s.base_popup_open)
         .unwrap_or(false);
+
+    if crate::text_field::is_paste_chord(&event.keystroke) {
+        let pasted = cx.read_from_clipboard().and_then(|item| item.text());
+        let changed = pasted
+            .and_then(|text| sidebar.dialog_mut().map(|s| s.insert_str(&text)))
+            .unwrap_or(false);
+        if changed {
+            sidebar.wake_text_blink(cx);
+            cx.notify();
+        }
+        return;
+    }
 
     match key {
         "escape" => {
