@@ -1269,6 +1269,14 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_shift_d_bubbles_for_diff_viewer() {
+        // Plain Ctrl+D is the shell's EOF / logout and stays with the
+        // terminal; only the shifted chord toggles the diff viewer.
+        assert!(is_app_level_shortcut("d", &ctrl_shift()));
+        assert!(!is_app_level_shortcut("d", &ctrl()));
+    }
+
+    #[test]
     fn ctrl_shift_b_bubbles_for_sidebar() {
         // Ctrl+Shift+B opens the sidebar. Plain Ctrl+B is readline
         // backward-char and stays with the terminal.
