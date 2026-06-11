@@ -25,6 +25,7 @@ use parking_lot::Mutex;
 
 use crate::backend::{Backend, TerminalSize, TerminalSnapshot};
 use crate::colors::ColorPalette;
+use crate::event::BackendEvent;
 use crate::input::keystroke_to_bytes;
 use crate::mouse::{self, MouseEventKind};
 use crate::paint::paint_snapshot;
@@ -164,11 +165,26 @@ impl TerminalView {
         let pending_size: Arc<Mutex<Option<PendingResize>>> = Arc::new(Mutex::new(None));
 
         cx.spawn(async move |this, cx| {
-            while let Ok(_event) = events.recv_async().await {
+            while let Ok(event) = events.recv_async().await {
                 if this
-                    .update(cx, |view: &mut Self, cx| {
-                        view.snapshot = view.backend.snapshot(&view.palette);
-                        cx.notify();
+                    .update(cx, |view: &mut Self, cx| match event {
+                        // OSC 52 copy: the program running in the
+                        // terminal (e.g. Copilot CLI's "copy to
+                        // clipboard" action) asked us to set the system
+                        // clipboard. Alacritty has already base64-
+                        // decoded the payload.
+                        BackendEvent::ClipboardStore(text) => {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        }
+                        // OSC 52 paste requests are deliberately not
+                        // honoured: answering would let any program
+                        // running in the terminal silently read the
+                        // user's clipboard.
+                        BackendEvent::ClipboardLoad => {}
+                        _ => {
+                            view.snapshot = view.backend.snapshot(&view.palette);
+                            cx.notify();
+                        }
                     })
                     .is_err()
                 {
@@ -262,6 +278,19 @@ impl TerminalView {
         B: Into<std::borrow::Cow<'static, [u8]>>,
     {
         self.backend.write_input(bytes);
+    }
+
+    /// Swap the colour palette and immediately re-resolve the current
+    /// grid against it, so the terminal repaints in the new colours on
+    /// this frame instead of keeping its spawn-time palette until the
+    /// next PTY event. The backend's event proxy gets the new palette
+    /// too, so OSC 4 / 10-12 colour queries from running TUIs answer
+    /// in the live theme's colours. The app shell calls this for every
+    /// open tab when the user switches theme.
+    pub fn set_palette(&mut self, palette: ColorPalette, cx: &mut Context<Self>) {
+        self.backend.update_palette(&palette);
+        self.palette = palette;
+        self.refresh_snapshot(cx);
     }
 
     /// Snap the cursor to its visible phase. Called whenever the user

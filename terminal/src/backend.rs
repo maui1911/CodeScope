@@ -307,6 +307,14 @@ impl Backend {
         self.events.clone()
     }
 
+    /// Push a new palette into the event proxy so OSC 4 / 10-12 colour
+    /// queries answer against the live theme instead of the spawn-time
+    /// one. Pairs with re-snapshotting on the View side — both halves
+    /// together make a theme switch fully take over a running terminal.
+    pub fn update_palette(&self, palette: &ColorPalette) {
+        self.proxy.update_palette(palette.clone());
+    }
+
     /// Capture a styled snapshot of the visible grid. Each line is a
     /// list of [`StyledRun`]s with already-resolved gpui colours, flags,
     /// and exact column positions, so the renderer can paint quads and
