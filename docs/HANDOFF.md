@@ -25,13 +25,35 @@
 > `.github/workflows/release.yml` (was `rs--release.yml`) and now
 > triggers on plain `v*` tags.
 
-**Last updated:** 2026-06-11 (session 49 — gpui-driver visual verification of all five PRs, all PASS; one real bug found in #266 and fixed)
-**Branch:** `main` unchanged; five feature branches with open PRs: #262 (`fix/main-row-min-height`), #263 (`fix/terminal-theme-repaint`), #264 (`fix/osc52-clipboard`), #265 (`feat/file-path-links`), #266 (`feat/diff-viewer`), plus this HANDOFF PR.
-**Head:** `main` still at `672d028` (#256). All five PRs branch directly off it — independent, no stacking, any merge order works (squash-merge each).
+**Last updated:** 2026-06-11 (session 50 — manual user verification of #262–#266; all five squash-merged)
+**Branch:** `main`; only this HANDOFF PR (#267) remains open.
+**Head:** `main` at `15eeadc` (#266). Merge order #262 → #263 → #264 → #265 → #266 (`2d91d7b`, `a0dbf30`, `3f1ab58`, `1f2c539`, `15eeadc`); each branch was updated with main before its manual test, so later PRs were tested on top of the earlier merges.
 **Release:** `v0.4.0` is still the latest release. ⚠ **The mandatory auto-update validation has STILL not been run** — see cursor list.
-**Build status:** ✅ per-PR `cargo clippy` clean on changed files; `cargo test --workspace` green on the diff-viewer branch (625 tests: 120 bin + 476 core + 28 terminal + 1 doctest; counts on the other branches differ only by their own new tests). Copilot reviews: #262/#264 came back with no inline comments; #263/#265/#266 each had findings, all addressed + replied + resolved (commits `e073468` / `d50cfed` / `6cffcf6` — the #266 pass fixed a whole-file read on untracked previews, O(n²) hunk line-numbering, and two misleading detail-pane labels).
-**Uncommitted work:** none on any branch.
-**Open issues:** #257–#261 all have a fixing PR attached (auto-close keywords in the PR bodies). Pre-existing clippy debt in `src/app.rs` (18 `doc_lazy_continuation` warnings under rust-1.95) untouched. **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree — do **NOT** run repo-wide `cargo fmt`; hand-format changed hunks. See the session-47 note.
+**Build status:** ✅ `main` builds clean; the workspace suite was 631 tests green on the final #266 head before merge. Copilot reviews on all five PRs were fully addressed + resolved before merging.
+**Uncommitted work:** none.
+**Open issues:** #257–#261 auto-closed by the PR merges. Pre-existing clippy debt in `src/app.rs` (18 `doc_lazy_continuation` warnings under rust-1.95) untouched. **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree — do **NOT** run repo-wide `cargo fmt`; hand-format changed hunks. See the session-47 note.
+
+### Session 50 — manual verification + merge of #262–#266
+
+The user tested every PR by hand in a dev build (`CODESCOPE_DEV=1`),
+one at a time: check out branch → `gh pr update-branch` → build →
+launch → scripted manual checks → user verdict → squash-merge with
+`--admin --delete-branch`. All five passed first try; no findings
+beyond session 49's. Notes:
+
+- The seeded Dev store (pwsh-only agent) initially read as a bug
+  ("why can I only open PowerShell sessions?") — that is the
+  session-49 fixture `settings.json`, not a regression. Left in place
+  by user choice; restore from the `.bak-20260611` twins when fixture
+  testing is done.
+- **Process rule refined by the user:** dev-build instances may be
+  closed/killed programmatically (identify by PID/exe path under
+  `target*/debug/`, never by image name); only the *installed* build
+  is untouchable — it hosts the live agent sessions.
+- #265's Ctrl+click open-in-editor — the one path session 49 could
+  not automate — was confirmed working by hand.
+- Follow-up still unfiled: palette theme-apply drops keyboard focus
+  (pre-existing, noted in session 49).
 
 ### Session 49 — visual verification of #262–#266 with gpui-driver
 
