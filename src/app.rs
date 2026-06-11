@@ -795,6 +795,21 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
+        // Whenever the focused element disappears from the tree — a
+        // dialog or the command palette closing is the common case —
+        // gpui leaves the window with no focus at all, and keystrokes
+        // (including the global chords on this entity's root handler)
+        // stop dispatching entirely until the user clicks something
+        // (#270). Catch that here and hand focus back to the active
+        // tab's terminal, falling back to the AppShell root handle so
+        // the chords keep working when no tab is open.
+        cx.on_focus_lost(window, |this: &mut AppShell, window, cx| {
+            let handle = this
+                .focused_tab_terminal_handle(cx)
+                .unwrap_or_else(|| this.focus_handle.clone());
+            handle.focus(window);
+        })
+        .detach();
         // The sidebar reads sidebar-* fields and selectedProjectId
         // out of the same `LayoutState`; we keep our own clone for
         // the group fields so save-on-change here doesn't trample
@@ -5269,6 +5284,16 @@ impl AppShell {
         (!canon.is_empty()).then_some(canon)
     }
 
+    /// Focus handle of the focused group's active tab terminal, if
+    /// any tab is open. Used by the window focus-lost hook (see
+    /// `AppShell::new`) to pick where focus should land after the
+    /// focused element vanished from the tree.
+    fn focused_tab_terminal_handle(&self, cx: &gpui::App) -> Option<gpui::FocusHandle> {
+        let group = self.groups.get(self.focused_group)?;
+        let tab = group.tabs.get(group.active_tab)?;
+        Some(tab.terminal.read(cx).focus_handle(cx))
+    }
+
     /// The focused tab's working directory as a real filesystem path,
     /// suitable for spawning `git` in. Contrast with
     /// [`Self::focused_tab_worktree_path`], which returns the
@@ -7140,9 +7165,10 @@ impl AppShell {
         cx.notify();
     }
 
-    /// Close without dispatching. Drops the state; the focus handle is
-    /// dropped with it so a follow-up key press routes to the AppShell
-    /// root handler again.
+    /// Close without dispatching. Drops the state; the focus handle
+    /// dies with it, which fires the window focus-lost hook registered
+    /// in `AppShell::new` — that hook re-focuses the active terminal
+    /// (or the AppShell root), keeping keyboard input alive (#270).
     pub fn close_command_palette(&mut self, cx: &mut Context<Self>) {
         if self.command_palette.take().is_some() {
             cx.notify();
