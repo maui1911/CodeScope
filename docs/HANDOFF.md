@@ -25,13 +25,87 @@
 > `.github/workflows/release.yml` (was `rs--release.yml`) and now
 > triggers on plain `v*` tags.
 
-**Last updated:** 2026-06-09 (session 48 — autonomous issue sweep: #257–#261 → five PRs opened, **none merged**, awaiting the user's review)
+**Last updated:** 2026-06-11 (session 49 — gpui-driver visual verification of all five PRs; one real bug found in #266 and fixed in `64031d9`)
 **Branch:** `main` unchanged; five feature branches with open PRs: #262 (`fix/main-row-min-height`), #263 (`fix/terminal-theme-repaint`), #264 (`fix/osc52-clipboard`), #265 (`feat/file-path-links`), #266 (`feat/diff-viewer`), plus this HANDOFF PR.
 **Head:** `main` still at `672d028` (#256). All five PRs branch directly off it — independent, no stacking, any merge order works (squash-merge each).
 **Release:** `v0.4.0` is still the latest release. ⚠ **The mandatory auto-update validation has STILL not been run** — see cursor list.
 **Build status:** ✅ per-PR `cargo clippy` clean on changed files; `cargo test --workspace` green on the diff-viewer branch (625 tests: 120 bin + 476 core + 28 terminal + 1 doctest; counts on the other branches differ only by their own new tests). Copilot reviews: #262/#264 came back with no inline comments; #263/#265/#266 each had findings, all addressed + replied + resolved (commits `e073468` / `d50cfed` / `6cffcf6` — the #266 pass fixed a whole-file read on untracked previews, O(n²) hunk line-numbering, and two misleading detail-pane labels).
 **Uncommitted work:** none on any branch.
 **Open issues:** #257–#261 all have a fixing PR attached (auto-close keywords in the PR bodies). Pre-existing clippy debt in `src/app.rs` (18 `doc_lazy_continuation` warnings under rust-1.95) untouched. **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree — do **NOT** run repo-wide `cargo fmt`; hand-format changed hunks. See the session-47 note.
+
+### Session 49 — visual verification of #262–#266 with gpui-driver
+
+The user's [gpui-driver](https://github.com/maui1911/gpui-driver)
+(in-process JSON-RPC automation for GPUI apps: element tree, synthetic
+clicks/keys, renderer screenshots) made the previously-impossible
+visual pass possible. Setup that had to exist first, all reusable:
+
+- **`compat/gpui-crates-io` branch in `C:/dev/gpui-driver`** — builds
+  the driver lib against crates.io gpui 0.2.2 (CodeScope's version)
+  instead of the pinned zed rev. Differences handled: no
+  `Window::render_to_image` (PrintWindow fallback only, window must be
+  visible), `AsyncApp::update` is fallible, `dispatch_event` leaks a
+  `pub(crate)` type so clicks/scrolls are synthesized as real Win32
+  `PostMessageW` window messages (works without focus; modifiers via
+  `keybd_event` = global keyboard state), occlusion pre-check removed
+  (gpui's `TrackMouseEvent(TME_LEAVE)` wipes synthetic hover instantly
+  when the real cursor is elsewhere). CLI quirk: `type` renders `-` as
+  "minus" — avoid dashes in typed strings (pwsh aliases `gcb`/`scb`
+  help).
+- **Local-only branch `test/visual-verify-262-266`** — all five PR
+  branches merged + optional `driver` feature (gpui-driver path dep,
+  `gpui_driver::init` in main, `driver_id` annotations on sidebar
+  worktree rows, the View-changes menu item, and diff-viewer
+  controls) + `CODESCOPE_DEV_MUTEX_SUFFIX` escape hatch so extra dev
+  instances coexist. **Never merge this branch.** Build with
+  `cargo build --features driver`; never ship the feature.
+- Dev store seeded with 12 fixture repos in
+  `C:/dev/codescope-fixtures/` (alpha has 4 worktrees + a rich dirty
+  state) and a pwsh-only agent so sessions never spawn a real AI CLI.
+  The user's previous Dev store is preserved in
+  `%APPDATA%/CodeScope.Dev.bak-20260611` and
+  `%LOCALAPPDATA%/CodeScope.Dev.bak-20260611` — restore by copying
+  back after closing the verify instances.
+
+**Results** (screenshots in `.verify-shots/`, git-ignored locally):
+
+- **#262 layout clamp — PASS.** 12-project sidebar taller than a
+  720px window; terminal prompt stays visible at the bottom after
+  120 lines of output.
+- **#263 theme repaint — PASS.** Palette → Solarized Dark: running
+  terminal (existing prompt output) repainted instantly, both
+  directions. Side-observation: after applying a theme from the
+  palette, keyboard focus is dropped until the user clicks something
+  — pre-existing palette behavior, not introduced by the PR; worth a
+  follow-up issue.
+- **#264 OSC 52 — BLOCKED, not falsified.** The desktop session was
+  locked during the entire run (LogonUI active), and Windows denies
+  clipboard access session-wide while locked (`clip.exe` → "Access is
+  denied", `Set-Clipboard` no-ops). Event plumbing
+  (`ClipboardStore` → `cx.write_to_clipboard`) verified in code; the
+  end-to-end pass needs an unlocked session: emit
+  `ESC]52;c;<base64>BEL` in a tab, then paste/`gcb`.
+- **#265 file-path links — PASS** for detection: existing
+  `src/main.rs:2` underlined (incl. `:line` suffix, inside quoted
+  output), non-existent `src/nope.rs` correctly bare. Ctrl+click
+  open-in-default-app not exercised (cell-precise clicks aren't
+  addressable; locked session would hide the spawned editor anyway).
+- **#266 diff viewer — PASS after one real fix.** Context-menu route,
+  all five status kinds (M/D/R/U + binary "bin" badge), intraline
+  emphasis, refresh with selection pinned by path, Back button,
+  Ctrl+Shift+D toggle, error-state UI all verified on screen. **Bug
+  found:** the keyboard/palette route resolved the worktree via
+  `focused_tab_worktree_path()` — the `path_canon` comparison key
+  (lowercased, colon-stripped), not a real path — so Ctrl+Shift+D
+  died with "directory name is invalid (os error 267)" on Windows.
+  Fixed in `64031d9` on `feat/diff-viewer` with a new
+  `focused_tab_working_directory()` accessor; re-verified visually.
+
+Three instrumented dev instances were left running for the user to
+close (the session being locked meant they could not be closed
+programmatically; "never kill codescope processes" applies). Closing
+them releases `target/debug/codescope.exe` and the two verify target
+dirs (`target-verify/`, `target-verify2/`, deletable).
 
 ### Session 48 — autonomous issue sweep: five issues → five PRs (#262–#266)
 
