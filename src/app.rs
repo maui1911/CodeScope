@@ -52,7 +52,7 @@ use codescope_terminal::{
 use gpui::StatefulInteractiveElement;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, InteractiveElement,
+    App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, SharedString, Styled, Window,
     WindowBounds, WindowControlArea, div, px, svg,
 };
@@ -5288,7 +5288,7 @@ impl AppShell {
     /// any tab is open. Used by the window focus-lost hook (see
     /// `AppShell::new`) to pick where focus should land after the
     /// focused element vanished from the tree.
-    fn focused_tab_terminal_handle(&self, cx: &gpui::App) -> Option<gpui::FocusHandle> {
+    fn focused_tab_terminal_handle(&self, cx: &App) -> Option<FocusHandle> {
         let group = self.groups.get(self.focused_group)?;
         let tab = group.tabs.get(group.active_tab)?;
         Some(tab.terminal.read(cx).focus_handle(cx))
