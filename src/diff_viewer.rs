@@ -72,9 +72,10 @@ impl AppShell {
         worktree: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) {
-        let Some(worktree) =
-            worktree.or_else(|| self.focused_tab_worktree_path().map(PathBuf::from))
-        else {
+        // NB: `focused_tab_working_directory`, not the canonicalised
+        // `focused_tab_worktree_path` — the latter is a comparison key
+        // (lowercased, colon-stripped), not a path git can run in.
+        let Some(worktree) = worktree.or_else(|| self.focused_tab_working_directory()) else {
             self.push_toast(
                 ToastKind::Info,
                 SharedString::new_static("No worktree to diff"),

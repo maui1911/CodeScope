@@ -5251,6 +5251,18 @@ impl AppShell {
         (!canon.is_empty()).then_some(canon)
     }
 
+    /// The focused tab's working directory as a real filesystem path,
+    /// suitable for spawning `git` in. Contrast with
+    /// [`Self::focused_tab_worktree_path`], which returns the
+    /// `path_canon` *comparison key* (lowercased, colon-stripped,
+    /// slash-normalised) used for sidebar highlight matching — feeding
+    /// that to the OS fails on Windows ("c/dev/…" has no drive).
+    pub(crate) fn focused_tab_working_directory(&self) -> Option<std::path::PathBuf> {
+        let group = self.groups.get(self.focused_group)?;
+        let tab = group.tabs.get(group.active_tab)?;
+        tab.working_directory.clone()
+    }
+
     /// Push the focused tab's worktree path to the sidebar so the
     /// matching project/worktree row gets the accent-tinted "active
     /// context" highlight (issue #248). Called from `activate_tab` (the
