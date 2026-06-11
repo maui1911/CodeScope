@@ -217,8 +217,8 @@ branches off `main`, each with its own PR + Copilot review pass:
   cleanly) and `src/app.rs` (#262, #263, #266 — different hunks).
 
 **Cursor for next session:**
-1. **User reviews + merges PRs #262–#266** (and this HANDOFF PR).
-   Address any human-review feedback; squash-merge per repo habit.
+1. ~~User reviews + merges PRs #262–#266~~ — done in session 50, all
+   five merged (see header).
 2. **⚠ v0.4.0 auto-update validation** (carried from session 47,
    still the most urgent non-code item): from an installed build,
    update and confirm "Installing" → "Update installed"
@@ -226,7 +226,7 @@ branches off `main`, each with its own PR + Copilot review pass:
    session 47's cursor cited §6, but that section is the dev-mode
    archive-extraction regression check, not the installed-build
    flow).
-3. After the merges land, consider a `v0.5.0` (diff viewer + four
+3. The merges have landed — consider a `v0.5.0` (diff viewer + four
    fixes outgrow a patch).
 4. Pre-existing clippy debt in `src/app.rs` (18 warnings) — still
    open, untouched.
