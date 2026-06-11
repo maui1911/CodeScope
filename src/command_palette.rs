@@ -124,7 +124,7 @@ impl BuiltInCommand {
     pub fn title(self) -> &'static str {
         match self {
             BuiltInCommand::ToggleOverview => "Toggle overview",
-            BuiltInCommand::ToggleDiffViewer => "View diff",
+            BuiltInCommand::ToggleDiffViewer => "Toggle diff viewer",
             BuiltInCommand::ToggleSidebar => "Toggle sidebar",
             BuiltInCommand::NewProject => "New project",
             BuiltInCommand::NewSession => "New session",

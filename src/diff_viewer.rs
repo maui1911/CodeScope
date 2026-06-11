@@ -164,7 +164,15 @@ impl AppShell {
                         state.error = None;
                     }
                     Err(err) => {
-                        state.error = Some(format!("{err:#}"));
+                        // The header subtitle is a single-line row;
+                        // anyhow's `:#` chain is one line, but wrapped
+                        // git stderr can smuggle newlines into a
+                        // message — flatten all whitespace runs.
+                        let flat = format!("{err:#}")
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        state.error = Some(flat);
                     }
                 }
                 cx.notify();
