@@ -646,22 +646,33 @@ fn render_diff_line(theme: &Arc<Theme>, line: &DiffLine) -> impl IntoElement {
         .font(theme::font_mono());
     match line.emphasis {
         Some((start, end)) if start < end && line.kind != LineKind::Context => {
-            let chars: Vec<char> = line.text.chars().collect();
-            let pre: String = chars[..start.min(chars.len())].iter().collect();
-            let mid: String = chars[start.min(chars.len())..end.min(chars.len())]
-                .iter()
-                .collect();
-            let post: String = chars[end.min(chars.len())..].iter().collect();
-            if !pre.is_empty() {
-                content = content.child(SharedString::from(pre));
+            // Map the char-index span to byte offsets in one pass so the
+            // three spans can be sliced as `&str` — no per-line
+            // `Vec<char>` + intermediate `String`s on the UI thread.
+            let mut start_b = line.text.len();
+            let mut end_b = line.text.len();
+            for (count, (b, _)) in line.text.char_indices().enumerate() {
+                if count == start {
+                    start_b = b;
+                }
+                if count == end {
+                    end_b = b;
+                    break;
+                }
             }
-            let mut mid_el = div().child(SharedString::from(mid));
+            let pre = &line.text[..start_b];
+            let mid = &line.text[start_b..end_b];
+            let post = &line.text[end_b..];
+            if !pre.is_empty() {
+                content = content.child(SharedString::from(pre.to_owned()));
+            }
+            let mut mid_el = div().child(SharedString::from(mid.to_owned()));
             if let Some(bg) = span_bg {
                 mid_el = mid_el.bg(bg).rounded(px(2.0));
             }
             content = content.child(mid_el);
             if !post.is_empty() {
-                content = content.child(SharedString::from(post));
+                content = content.child(SharedString::from(post.to_owned()));
             }
         }
         _ => {

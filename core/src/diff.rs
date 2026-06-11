@@ -379,31 +379,33 @@ pub fn worktree_diff(worktree: &Path) -> Result<Vec<DiffFile>> {
         Vec::new()
     };
 
-    let status = run_git(worktree, &["status", "--porcelain", "--untracked-files=all"])
-        .context("git status --porcelain")?;
+    // `-z`: NUL-terminated entries with RAW paths — no C-style
+    // quoting/escaping to undo, so names with spaces, quotes, or
+    // backslash escapes resolve on disk exactly as git reported them.
+    let status = run_git(
+        worktree,
+        &["status", "--porcelain", "-z", "--untracked-files=all"],
+    )
+    .context("git status --porcelain -z")?;
     let stdout = String::from_utf8_lossy(&status.stdout);
-    let mut untracked: Vec<DiffFile> = stdout
-        .lines()
-        .filter_map(|l| l.strip_prefix("?? "))
-        .map(|p| {
-            let path = unquote_porcelain_path(p);
-            untracked_file_entry(worktree, &path)
-        })
-        .collect();
+    let mut untracked: Vec<DiffFile> = Vec::new();
+    let mut fields = stdout.split('\0');
+    while let Some(entry) = fields.next() {
+        // Entry shape: two status chars + space + path.
+        let Some(path) = entry.get(3..) else { continue };
+        let code = &entry[..3];
+        // Rename/copy entries carry the original path as the *next*
+        // NUL field — consume it so it can't be misread as an entry.
+        if code.starts_with('R') || code.starts_with('C') {
+            let _ = fields.next();
+        }
+        if code == "?? " {
+            untracked.push(untracked_file_entry(worktree, path));
+        }
+    }
     untracked.sort_by(|a, b| a.path.cmp(&b.path));
     files.append(&mut untracked);
     Ok(files)
-}
-
-/// Porcelain quotes paths containing special chars (`"a b.txt"`).
-/// Strip the quotes; embedded escapes are left as-is (the entry still
-/// renders, existence-dependent features degrade gracefully).
-fn unquote_porcelain_path(raw: &str) -> String {
-    let raw = raw.trim();
-    raw.strip_prefix('"')
-        .and_then(|r| r.strip_suffix('"'))
-        .unwrap_or(raw)
-        .to_string()
 }
 
 /// Build the synthetic all-added [`DiffFile`] for an untracked path.
@@ -713,5 +715,20 @@ Binary files a/img.png and b/img.png differ
         assert_eq!(files.len(), 1);
         assert!(files[0].binary);
         assert!(files[0].hunks.is_empty());
+    }
+
+    /// Without `-z`, default `core.quotepath` octal-escapes non-ASCII
+    /// names in porcelain output (`"n\303\266tes \303\274.txt"`); the
+    /// on-disk lookup then fails and the entry is mis-flagged binary.
+    #[test]
+    fn untracked_non_ascii_path_resolves() {
+        let Some((_guard, repo)) = init_repo() else { return };
+        let name = "nötes ü.txt";
+        std::fs::write(repo.join(name), "hello\n").unwrap();
+        let files = worktree_diff(&repo).expect("diff succeeds");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, name);
+        assert!(!files[0].binary, "quoted path failed to resolve on disk");
+        assert_eq!(files[0].added, 1);
     }
 }
