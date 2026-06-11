@@ -25,6 +25,7 @@ use parking_lot::Mutex;
 
 use crate::backend::{Backend, TerminalSize, TerminalSnapshot};
 use crate::colors::ColorPalette;
+use crate::event::BackendEvent;
 use crate::input::keystroke_to_bytes;
 use crate::mouse::{self, MouseEventKind};
 use crate::paint::paint_snapshot;
@@ -164,11 +165,26 @@ impl TerminalView {
         let pending_size: Arc<Mutex<Option<PendingResize>>> = Arc::new(Mutex::new(None));
 
         cx.spawn(async move |this, cx| {
-            while let Ok(_event) = events.recv_async().await {
+            while let Ok(event) = events.recv_async().await {
                 if this
-                    .update(cx, |view: &mut Self, cx| {
-                        view.snapshot = view.backend.snapshot(&view.palette);
-                        cx.notify();
+                    .update(cx, |view: &mut Self, cx| match event {
+                        // OSC 52 copy: the program running in the
+                        // terminal (e.g. Copilot CLI's "copy to
+                        // clipboard" action) asked us to set the system
+                        // clipboard. Alacritty has already base64-
+                        // decoded the payload.
+                        BackendEvent::ClipboardStore(text) => {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        }
+                        // OSC 52 paste requests are deliberately not
+                        // honoured: answering would let any program
+                        // running in the terminal silently read the
+                        // user's clipboard.
+                        BackendEvent::ClipboardLoad => {}
+                        _ => {
+                            view.snapshot = view.backend.snapshot(&view.palette);
+                            cx.notify();
+                        }
                     })
                     .is_err()
                 {
