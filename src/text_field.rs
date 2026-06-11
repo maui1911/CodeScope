@@ -20,8 +20,8 @@
 //! This module owns the data side (a small editable buffer with a
 //! caret index, char-boundary-safe) plus a custom gpui [`Element`]
 //! that shapes the rendered line, paints the caret at
-//! `ShapedLine::x_for_index(caret_byte)`, and caches the shaped line
-//! + the painted bounds back onto the field so the parent's
+//! `ShapedLine::x_for_index(caret_byte)`, and caches the shaped
+//! line + the painted bounds back onto the field so the parent's
 //! `on_mouse_down` listener can read them and translate a click
 //! position into a byte index via `ShapedLine::closest_index_for_x`.
 //!

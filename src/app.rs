@@ -5521,9 +5521,9 @@ impl AppShell {
     ///
     /// Cap-eviction respects persistence: a flurry of regular toasts
     /// won't drop the persistent one off the back. If we're still over
-    /// cap after removing all expirables (extremely unlikely — would mean
-    /// >TOAST_VISIBLE_CAP open action prompts at once) the oldest
-    /// persistent wins.
+    /// cap after removing all expirables (extremely unlikely — would
+    /// mean more than `TOAST_VISIBLE_CAP` open action prompts at once)
+    /// the oldest persistent wins.
     pub(crate) fn push_action_toast(
         &mut self,
         kind: ToastKind,
@@ -7558,11 +7558,6 @@ impl AppShell {
 }
 
 impl AppShell {
-    /// Build one group's tab strip section + body pane. Returned as a
-    /// pair so `render` can interleave dividers between adjacent
-    /// groups while keeping the strip and the pane below it in the
-    /// same column.
-
     /// Handle a left-press on any of the title-bar drag regions
     /// (brand mark, strip-left padding, per-group trailing whitespace).
     ///
@@ -7678,6 +7673,10 @@ impl AppShell {
         window.start_window_move();
     }
 
+    /// Build one group's tab strip section + body pane. Returned as a
+    /// pair so `render` can interleave dividers between adjacent
+    /// groups while keeping the strip and the pane below it in the
+    /// same column.
     fn render_group(
         &self,
         theme: &Arc<Theme>,

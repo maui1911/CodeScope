@@ -299,7 +299,7 @@ mod tests {
     //! * `Fig.Color.Ink`        = `#FFFFFFFF`
     //! * `Fig.Color.InkMuted`   = `#FFA6A6A6`
     //! * `Fig.Color.Divider`    = `#22FFFFFF` (alpha-blended white over
-    //!    `Canvas` flattens to ≈ `#222222`)
+    //!   `Canvas` flattens to ≈ `#222222`)
     //! * `Framer.Color.Blue`    = `#FF0099FF`
     //!
     //! Any accidental drift in these values silently shifts the chrome

@@ -104,8 +104,8 @@ impl ColorPalette {
     /// Themes shipped from the built-in registry always provide a full
     /// 256-entry `extended` table. If a theme loaded from disk (or a
     /// future hand-edited file) supplies fewer than 256 entries we
-    /// synthesize the missing slots with the standard xterm 6×6×6 cube
-    /// + 24-step grayscale ramp — the terminal renderer indexes
+    /// synthesize the missing slots with the standard xterm 6×6×6
+    /// cube + 24-step grayscale ramp — the terminal renderer indexes
     /// straight into this table for `Color::Indexed`, so a partial
     /// table would otherwise paint as black.
     pub fn from_theme_palette(palette: &codescope_core::ThemePalette) -> Self {

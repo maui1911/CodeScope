@@ -331,8 +331,8 @@ pub fn remove_worktree(repo: &Path, path: &Path, force: bool) -> Result<()> {
 /// * `"↑N"` / `"↓N"` / `"↑N ↓N"` — clean but out of sync,
 /// * `"idle"` — clean and in sync with upstream,
 /// * `""`     — no upstream and not dirty (the C# build still
-///              shows "idle"; we hide the label so a brand-new
-///              standalone branch doesn't claim sync state).
+///   shows "idle"; we hide the label so a brand-new standalone
+///   branch doesn't claim sync state).
 pub fn worktree_status_label(status: &GitStatus) -> String {
     worktree_status_label_with_ci(status, crate::pr::CiStatus::None)
 }
