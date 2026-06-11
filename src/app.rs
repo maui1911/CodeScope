@@ -6899,7 +6899,7 @@ impl Render for AppShell {
                     ),
             );
 
-        let main_row = if self.sidebar_visible {
+        let mut main_row = if self.sidebar_visible {
             div()
                 .flex_grow()
                 .flex()
@@ -6920,6 +6920,14 @@ impl Render for AppShell {
                 .flex_row()
                 .child(work_area)
         };
+        // Mirror the sidebar body's `min_h(0)` trick: without it a
+        // flex child defaults to its intrinsic content height, so a
+        // sidebar taller than the window inflates this row past the
+        // root column's bounds and pushes the work area's bottom (and
+        // the status bar) off-screen (#260). Clamping min-height to 0
+        // keeps the row at the column's allocated height and lets the
+        // sidebar scroll internally instead.
+        main_row.style().min_size.height = Some(gpui::Length::Definite(px(0.0).into()));
 
         // While a splitter drag is in flight we listen for mouse
         // moves anywhere in the window (the cursor commonly leaves
