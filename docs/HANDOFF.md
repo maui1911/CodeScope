@@ -108,7 +108,7 @@ visual pass possible. Setup that had to exist first, all reusable:
   (matters for binary diffs with spaced/quoted names) · `6f6b3d6`
   single-line error text + "Toggle diff viewer" palette title ·
   `9fcd1c1` C-decode `---`/`+++` paths + shrinkable header subtitle ·
-  `e53b365` Ctrl+Shift+D chord test. Workspace suite now 633 tests,
+  `e53b365` Ctrl+Shift+D chord test. Workspace suite now 631 tests,
   green.
 
 Three instrumented dev instances were left running for the user to
