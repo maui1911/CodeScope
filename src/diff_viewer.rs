@@ -1,6 +1,7 @@
 //! Diff viewer — full-pane working-tree diff for one worktree.
 //!
-//! Toggled via `Ctrl+Shift+D`, the command palette ("View diff"), or
+//! Toggled via `Ctrl+Shift+D`, the command palette ("Toggle diff
+//! viewer"), or
 //! the sidebar worktree menu's "View changes" row. While visible it
 //! replaces the work area (per-group tab strip + terminal grid) the
 //! same way the Overview panel does, so the sidebar + status bar stay
@@ -238,6 +239,8 @@ impl AppShell {
                 state.worktree.to_string_lossy().into_owned(),
             ));
 
+        // Shrinkable + truncating: a long git error must squeeze, not
+        // push the Refresh / Back buttons out of the 56px header.
         let subtitle_el = div()
             .ml(px(12.0))
             .text_size(px(12.0))
@@ -247,7 +250,8 @@ impl AppShell {
                 theme::ink_dim(theme)
             })
             .font(theme::font_sans())
-            .flex_shrink_0()
+            .min_w(px(0.0))
+            .truncate()
             .child(subtitle);
 
         let refresh_button = div()

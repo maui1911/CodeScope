@@ -264,16 +264,30 @@ fn parse_hunk_header(header: &str) -> Option<(u32, u32)> {
     Some((old_start, new_start))
 }
 
-/// Strip the `a/` / `b/` prefix (and optional quoting) from a
-/// `---` / `+++` path. Returns `None` for `/dev/null`.
+/// Strip the `a/` / `b/` prefix (and optional C-quoting, decoded the
+/// same way as `paths_from_diff_git`) from a `---` / `+++` path.
+/// Returns `None` for `/dev/null`.
 fn strip_diff_path(raw: &str, prefix: &str) -> Option<String> {
     let raw = raw.trim_end();
-    let raw = raw.strip_prefix('"').unwrap_or(raw);
-    let raw = raw.strip_suffix('"').unwrap_or(raw);
-    if raw == "/dev/null" {
+    let decoded = if raw.starts_with('"') {
+        match take_c_quoted(raw) {
+            Some((value, _)) => value,
+            // Unterminated quote — keep the raw text rather than
+            // dropping the line.
+            None => raw.to_string(),
+        }
+    } else {
+        raw.to_string()
+    };
+    if decoded == "/dev/null" {
         return None;
     }
-    Some(raw.strip_prefix(prefix).unwrap_or(raw).to_string())
+    Some(
+        decoded
+            .strip_prefix(prefix)
+            .unwrap_or(&decoded)
+            .to_string(),
+    )
 }
 
 /// Best-effort path split of the `a/<p> b/<p>` tail of a `diff --git`
