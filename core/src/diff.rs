@@ -369,9 +369,22 @@ pub fn worktree_diff(worktree: &Path) -> Result<Vec<DiffFile>> {
     let has_head = run_git(worktree, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_ok();
 
     let mut files = if has_head {
+        // `core.quotepath=false`: default git octal-escapes non-ASCII
+        // filenames in the `diff --git`/`---`/`+++` headers, which
+        // `parse_unified_diff` would pass through verbatim as mangled
+        // display paths. Force raw (UTF-8) paths instead — same reason
+        // the status call below uses `-z`.
         let output = run_git(
             worktree,
-            &["diff", "HEAD", "-M", "--no-color", "--no-ext-diff"],
+            &[
+                "-c",
+                "core.quotepath=false",
+                "diff",
+                "HEAD",
+                "-M",
+                "--no-color",
+                "--no-ext-diff",
+            ],
         )
         .context("git diff HEAD")?;
         parse_unified_diff(&String::from_utf8_lossy(&output.stdout))
@@ -715,6 +728,24 @@ Binary files a/img.png and b/img.png differ
         assert_eq!(files.len(), 1);
         assert!(files[0].binary);
         assert!(files[0].hunks.is_empty());
+    }
+
+    /// Without `-c core.quotepath=false`, default git octal-escapes
+    /// non-ASCII names in the `diff --git` headers and the viewer
+    /// would display the mangled `"n\303\266tes.txt"` form.
+    #[test]
+    fn tracked_non_ascii_path_displays_raw() {
+        let Some((_guard, repo)) = init_repo() else { return };
+        let name = "nötes.txt";
+        std::fs::write(repo.join(name), "a\n").unwrap();
+        run(&repo, &["add", "-A"]);
+        run(&repo, &["commit", "-m", "seed", "-q"]);
+        std::fs::write(repo.join(name), "a\nb\n").unwrap();
+        let files = worktree_diff(&repo).expect("diff succeeds");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, name);
+        assert_eq!(files[0].status, FileStatus::Modified);
+        assert_eq!(files[0].added, 1);
     }
 
     /// Without `-z`, default `core.quotepath` octal-escapes non-ASCII
