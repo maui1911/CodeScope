@@ -100,11 +100,16 @@ visual pass possible. Setup that had to exist first, all reusable:
   died with "directory name is invalid (os error 267)" on Windows.
   Fixed in `64031d9` on `feat/diff-viewer` with a new
   `focused_tab_working_directory()` accessor; re-verified visually.
-  Copilot's follow-up round on that push produced two more accepted
-  findings, fixed in `1e273ea`: `git status --porcelain -z` (raw
-  NUL-separated paths — non-ASCII/quoted untracked names no longer
-  mis-flag as binary; regression test added) and allocation-free
-  intraline emphasis spans in `render_diff_line`.
+  The push kicked off an iterative Copilot loop (rounds 2–7, every
+  finding accepted and fixed; round 8 came back clean, 0 unresolved):
+  `1e273ea` porcelain `-z` raw paths + allocation-free emphasis
+  spans · `b35b5e2` `core.quotepath=false` on the diff invocation ·
+  `e247ec7` XY-wide rename detection + C-quoted `diff --git` split
+  (matters for binary diffs with spaced/quoted names) · `6f6b3d6`
+  single-line error text + "Toggle diff viewer" palette title ·
+  `9fcd1c1` C-decode `---`/`+++` paths + shrinkable header subtitle ·
+  `e53b365` Ctrl+Shift+D chord test. Workspace suite now 633 tests,
+  green.
 
 Three instrumented dev instances were left running for the user to
 close (the session being locked meant they could not be closed
