@@ -958,6 +958,11 @@ pub(crate) fn is_app_level_shortcut(key: &str, mods: &gpui::Modifiers) -> bool {
     if key == "o" && mods.shift {
         return true;
     }
+    // Ctrl+Shift+D — diff viewer. Plain Ctrl+D stays with the
+    // terminal (EOF / readline delete-char).
+    if key == "d" && mods.shift {
+        return true;
+    }
     // Ctrl+Shift+B — toggle sidebar. Plain Ctrl+B stays with the
     // terminal (readline backward-char).
     if key == "b" && mods.shift {
@@ -1290,6 +1295,14 @@ mod tests {
     fn ctrl_shift_o_bubbles_for_overview() {
         assert!(is_app_level_shortcut("o", &ctrl_shift()));
         assert!(!is_app_level_shortcut("o", &ctrl()));
+    }
+
+    #[test]
+    fn ctrl_shift_d_bubbles_for_diff_viewer() {
+        // Plain Ctrl+D is the shell's EOF / logout and stays with the
+        // terminal; only the shifted chord toggles the diff viewer.
+        assert!(is_app_level_shortcut("d", &ctrl_shift()));
+        assert!(!is_app_level_shortcut("d", &ctrl()));
     }
 
     #[test]
