@@ -129,6 +129,16 @@ impl SettingsDialogState {
         true
     }
 
+    /// Paste `s` into the focused field (control chars stripped by
+    /// `TextField::insert_str`).
+    pub fn insert_str(&mut self, s: &str) -> bool {
+        let changed = self.focused_field_mut().insert_str(s);
+        if changed {
+            self.error = None;
+        }
+        changed
+    }
+
     pub fn backspace(&mut self) -> bool {
         let changed = self.focused_field_mut().backspace();
         if changed {
@@ -858,6 +868,18 @@ fn handle_key_down(
 ) {
     let key = event.keystroke.key.as_str();
     cx.stop_propagation();
+
+    if crate::text_field::is_paste_chord(&event.keystroke) {
+        let pasted = cx.read_from_clipboard().and_then(|item| item.text());
+        let changed = pasted
+            .and_then(|text| shell.settings_dialog.as_mut().map(|s| s.insert_str(&text)))
+            .unwrap_or(false);
+        if changed {
+            shell.wake_text_blink(cx);
+            cx.notify();
+        }
+        return;
+    }
 
     match key {
         "escape" => {
