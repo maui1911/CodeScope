@@ -3001,12 +3001,10 @@ impl AppShell {
     /// Apply a freshly-loaded `Settings` to the shell. Resolves the
     /// theme by name from the built-in registry, swaps both the
     /// settings and theme `Arc`s, and forwards the new theme to the
-    /// sidebar so its chrome repaints in the same frame. Existing
-    /// terminals keep their baked-in palette / font; the swap takes
-    /// effect for chrome immediately and for new tabs on next spawn.
-    /// Live-reapplying palette / font to running terminals lands
-    /// when the renderer exposes that knob — until then a settings
-    /// edit fully takes over only after the next Ctrl+Shift+T.
+    /// sidebar so its chrome repaints in the same frame. Running
+    /// terminals get the new palette pushed via
+    /// `push_palette_to_terminals` so the grid recolours live too;
+    /// font changes still take effect on next spawn only.
     pub(crate) fn apply_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
         let theme = Arc::new(codescope_core::theme::builtin::by_name(&settings.theme));
         // Rebuild the AgentRegistry from the new settings so the
@@ -3022,6 +3020,7 @@ impl AppShell {
             sidebar.apply_theme(theme, cx);
             sidebar.apply_agent_registry(agent_registry, cx);
         });
+        self.push_palette_to_terminals(cx);
         cx.notify();
     }
 
@@ -3038,7 +3037,26 @@ impl AppShell {
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.apply_theme(theme, cx);
         });
+        self.push_palette_to_terminals(cx);
         cx.notify();
+    }
+
+    /// Re-derive the terminal colour palette from the active theme and
+    /// push it into every open tab's `TerminalView`, recolouring the
+    /// running grids in place (#257). Terminals bake their palette in
+    /// at spawn time, so without this a theme switch only repainted
+    /// the chrome and the consoles kept the old colours until the tab
+    /// was reopened.
+    fn push_palette_to_terminals(&mut self, cx: &mut Context<Self>) {
+        let palette = ColorPalette::from_theme_palette(&self.theme.palette);
+        for group in &self.groups {
+            for tab in &group.tabs {
+                let palette = palette.clone();
+                tab.terminal.update(cx, |view, cx| {
+                    view.set_palette(palette, cx);
+                });
+            }
+        }
     }
 
     /// Read-only borrow of the on-disk path bundle. Used by the
@@ -6942,7 +6960,7 @@ impl Render for AppShell {
                     ),
             );
 
-        let main_row = if self.sidebar_visible {
+        let mut main_row = if self.sidebar_visible {
             div()
                 .flex_grow()
                 .flex()
@@ -6963,6 +6981,14 @@ impl Render for AppShell {
                 .flex_row()
                 .child(work_area)
         };
+        // Mirror the sidebar body's `min_h(0)` trick: without it a
+        // flex child defaults to its intrinsic content height, so a
+        // sidebar taller than the window inflates this row past the
+        // root column's bounds and pushes the work area's bottom (and
+        // the status bar) off-screen (#260). Clamping min-height to 0
+        // keeps the row at the column's allocated height and lets the
+        // sidebar scroll internally instead.
+        main_row.style().min_size.height = Some(gpui::Length::Definite(px(0.0).into()));
 
         // While a splitter drag is in flight we listen for mouse
         // moves anywhere in the window (the cursor commonly leaves

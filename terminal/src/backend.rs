@@ -13,9 +13,11 @@
 //! coordinates.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+
+use parking_lot::Mutex;
 
 use alacritty_terminal::event::{Notify, OnResize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, Notifier, State};
@@ -154,6 +156,17 @@ pub struct Backend {
     /// Kept around so resize calls can update the cached size the
     /// proxy uses to answer text-area-size queries.
     proxy: EventProxy,
+    /// Directory the child was spawned in — the anchor for resolving
+    /// relative file paths during link detection in [`Backend::snapshot`].
+    working_directory: Option<PathBuf>,
+    /// Memoised `Path::exists` answers for file-path link detection.
+    /// Snapshots run on every PTY wakeup, so without this each frame
+    /// would re-stat every path-looking token on screen. Bounded by
+    /// [`PATH_EXISTS_CACHE_CAP`]; cleared wholesale on overflow. The
+    /// trade-off: a file created *after* its path scrolled on screen
+    /// stays non-clickable until the cache turns over — acceptable for
+    /// a hover affordance.
+    path_exists_cache: Mutex<HashMap<PathBuf, bool>>,
 }
 
 impl Backend {
@@ -171,6 +184,14 @@ impl Backend {
             escape_args,
         } = config;
 
+        // Fall back to the host process's cwd when the caller didn't
+        // pin one — that's where the PTY child actually starts in
+        // that case (alacritty's tty layer inherits the parent cwd),
+        // so relative-path link resolution keeps working for default
+        // spawns (e.g. examples) too.
+        let working_directory_for_links = working_directory
+            .clone()
+            .or_else(|| std::env::current_dir().ok());
         let mut tty_options = TtyOptions {
             shell,
             working_directory,
@@ -250,6 +271,8 @@ impl Backend {
             join: Some(join),
             events,
             proxy,
+            working_directory: working_directory_for_links,
+            path_exists_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -284,6 +307,14 @@ impl Backend {
         self.events.clone()
     }
 
+    /// Push a new palette into the event proxy so OSC 4 / 10-12 colour
+    /// queries answer against the live theme instead of the spawn-time
+    /// one. Pairs with re-snapshotting on the View side — both halves
+    /// together make a theme switch fully take over a running terminal.
+    pub fn update_palette(&self, palette: &ColorPalette) {
+        self.proxy.update_palette(palette.clone());
+    }
+
     /// Capture a styled snapshot of the visible grid. Each line is a
     /// list of [`StyledRun`]s with already-resolved gpui colours, flags,
     /// and exact column positions, so the renderer can paint quads and
@@ -299,7 +330,7 @@ impl Backend {
     /// paints the cursor as a quad on top of text, so we don't bake
     /// inverted colours into the run.
     pub fn snapshot(&self, palette: &ColorPalette) -> TerminalSnapshot {
-        self.with_term(|term| {
+        let mut snapshot = self.with_term(|term| {
             let columns = term.columns();
             let screen_lines = term.screen_lines();
             let mut lines: Vec<Vec<StyledRun>> = vec![Vec::new(); screen_lines];
@@ -484,7 +515,36 @@ impl Backend {
                 default_fg,
                 default_bg,
             }
-        })
+        });
+
+        // File-path link detection runs *outside* `with_term` — a
+        // cache miss costs a filesystem stat, and the event-loop
+        // thread must not wait on disk I/O to feed the parser.
+        {
+            let mut cache = self.path_exists_cache.lock();
+            let mut exists = |path: &Path| {
+                if let Some(&hit) = cache.get(path) {
+                    return hit;
+                }
+                let result = path.exists();
+                // Crude but sufficient eviction: visible screens
+                // repeat the same handful of paths frame after frame,
+                // so a full clear on overflow still keeps the steady-
+                // state hit rate near 100 %.
+                if cache.len() >= PATH_EXISTS_CACHE_CAP {
+                    cache.clear();
+                }
+                cache.insert(path.to_path_buf(), result);
+                result
+            };
+            inject_file_path_hyperlinks(
+                &mut snapshot.lines,
+                self.working_directory.as_deref(),
+                &mut exists,
+            );
+        }
+
+        snapshot
     }
 
     /// Current terminal mode (used by the keystroke encoder for
@@ -588,47 +648,223 @@ fn inject_url_hyperlinks(lines: &mut [Vec<StyledRun>]) {
         if line.is_empty() {
             continue;
         }
-        // Build column-aligned text. With ASCII content (URLs are
-        // always ASCII) the byte index inside `text` matches the
-        // column on screen, so linkify's byte ranges translate
-        // directly to columns. Wide-char runs throw the alignment
-        // off — `apply_url_to_line` skips runs in that case.
-        //
-        // Track `current_col` alongside the string so padding is
-        // O(total_chars) instead of O(chars²) — `chars().count()`
-        // in a while-loop rescans the whole string per padded
-        // space, which would dominate snapshot time on long lines.
-        let mut text = String::new();
-        let mut current_col: usize = 0;
-        for run in line.iter() {
-            while current_col < run.start_col {
-                text.push(' ');
-                current_col += 1;
-            }
-            text.push_str(&run.text);
-            current_col += run.text.chars().count();
-        }
+        let text = line_text(line);
         let urls: Vec<(usize, usize, Arc<str>)> = finder
             .links(&text)
             .filter(|link| link.kind() == &linkify::LinkKind::Url)
             .map(|link| (link.start(), link.end(), Arc::from(link.as_str())))
             .collect();
         for (b_start, b_end, url) in urls {
-            // For ASCII URLs (always the case) byte == char ==
-            // column. The general `chars().count()` is kept as the
-            // safe path in case a future regex-pass admits non-ASCII
-            // matches, but the common path stays O(1) per URL.
-            let col_start = if text.is_char_boundary(b_start) && text[..b_start].is_ascii() {
-                b_start
-            } else {
-                text[..b_start].chars().count()
-            };
-            let col_end = if text.is_char_boundary(b_end) && text[..b_end].is_ascii() {
-                b_end
-            } else {
-                text[..b_end].chars().count()
-            };
+            let col_start = byte_to_col(&text, b_start);
+            let col_end = byte_to_col(&text, b_end);
             apply_url_to_line(line, col_start, col_end, url);
+        }
+    }
+}
+
+/// Rebuild a row's column-aligned plain text from its styled runs.
+/// Gaps between runs are padded with spaces so byte/char positions in
+/// the result line up with screen columns (modulo wide chars — see
+/// `apply_url_to_line`'s skip rule).
+///
+/// `current_col` is tracked alongside the string so padding is
+/// O(total_chars) instead of O(chars²) — `chars().count()` in a
+/// while-loop rescans the whole string per padded space, which would
+/// dominate snapshot time on long lines.
+fn line_text(line: &[StyledRun]) -> String {
+    let mut text = String::new();
+    let mut current_col: usize = 0;
+    for run in line.iter() {
+        while current_col < run.start_col {
+            text.push(' ');
+            current_col += 1;
+        }
+        text.push_str(&run.text);
+        current_col += run.text.chars().count();
+    }
+    text
+}
+
+/// Translate a byte index inside reconstructed line text to a screen
+/// column. For ASCII prefixes (URLs and the vast majority of paths)
+/// byte == char == column, so the common path stays O(1); the
+/// `chars().count()` fallback handles non-ASCII content.
+fn byte_to_col(text: &str, byte: usize) -> usize {
+    if text.is_char_boundary(byte) && text[..byte].is_ascii() {
+        byte
+    } else {
+        text[..byte].chars().count()
+    }
+}
+
+/// Upper bound on [`Backend::path_exists_cache`]. 4096 distinct paths
+/// is far beyond what a visible screen plus scroll churn produces
+/// between clears, while capping worst-case memory at well under a
+/// megabyte.
+const PATH_EXISTS_CACHE_CAP: usize = 4096;
+
+/// A candidate file-path span inside one line of reconstructed text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PathCandidate {
+    /// Byte offset where the clickable span starts.
+    start: usize,
+    /// Byte offset one past the clickable span. Includes a trailing
+    /// `:line` / `:line:col` suffix when present — visually the suffix
+    /// reads as part of the link, even though the opener ignores it.
+    end: usize,
+    /// The bare path text: wrapping punctuation and any `:line:col`
+    /// suffix stripped.
+    path: String,
+}
+
+/// Scan one line of text for tokens that look like file paths.
+///
+/// Deliberately conservative: whitespace-delimited tokens only (paths
+/// with spaces are undetectable without quoting context), wrapping
+/// punctuation peeled, URLs and CLI flags rejected. A token qualifies
+/// when it contains a path separator or looks like `stem.ext`. Whether
+/// the path actually exists is the caller's job — shape alone would
+/// produce far too many false positives (`and/or`, version strings).
+fn file_path_candidates(text: &str) -> Vec<PathCandidate> {
+    const LEADING_TRIM: &[char] = &['(', '[', '{', '<', '"', '\'', '`'];
+    const TRAILING_TRIM: &[char] = &[')', ']', '}', '>', '"', '\'', '`', '.', ',', ';', ':', '!', '?'];
+    /// Tokens longer than this are never paths worth stat-ing.
+    const MAX_TOKEN_LEN: usize = 512;
+
+    let mut out = Vec::new();
+    let mut tokens: Vec<(usize, &str)> = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, ch) in text.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(s) = start.take() {
+                tokens.push((s, &text[s..i]));
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(s) = start {
+        tokens.push((s, &text[s..]));
+    }
+
+    for (tok_start, raw) in tokens {
+        let mut span_start = tok_start;
+        let mut tok = raw;
+        while let Some(ch) = tok.chars().next() {
+            if !LEADING_TRIM.contains(&ch) {
+                break;
+            }
+            span_start += ch.len_utf8();
+            tok = &tok[ch.len_utf8()..];
+        }
+        while let Some(ch) = tok.chars().last() {
+            if !TRAILING_TRIM.contains(&ch) {
+                break;
+            }
+            tok = &tok[..tok.len() - ch.len_utf8()];
+        }
+        if tok.len() < 2 || tok.len() > MAX_TOKEN_LEN {
+            continue;
+        }
+        // URLs belong to `inject_url_hyperlinks`; flags are never paths.
+        if tok.contains("://") || tok.starts_with('-') {
+            continue;
+        }
+        // Strip up to two trailing `:digits` groups — the `path:line`
+        // and `path:line:col` shapes every compiler/grepper emits.
+        let mut path = tok;
+        for _ in 0..2 {
+            match path.rfind(':') {
+                Some(idx)
+                    if !path[idx + 1..].is_empty()
+                        && path[idx + 1..].bytes().all(|b| b.is_ascii_digit()) =>
+                {
+                    path = &path[..idx];
+                }
+                _ => break,
+            }
+        }
+        if !looks_like_path(path) {
+            continue;
+        }
+        out.push(PathCandidate {
+            start: span_start,
+            end: span_start + tok.len(),
+            path: path.to_string(),
+        });
+    }
+    out
+}
+
+/// Shape gate for [`file_path_candidates`]: a separator anywhere, or a
+/// bare `stem.ext` filename. The extension must contain a letter so
+/// version strings (`v0.4.0`, `rc.14`) don't trigger a filesystem stat
+/// for every numeric token on screen.
+fn looks_like_path(token: &str) -> bool {
+    if token.is_empty() || token.chars().all(|c| c == '/' || c == '\\' || c == '.') {
+        return false;
+    }
+    if token.contains('/') || token.contains('\\') {
+        return true;
+    }
+    match token.rsplit_once('.') {
+        Some((stem, ext)) => {
+            !stem.is_empty()
+                && !ext.is_empty()
+                && ext.len() <= 10
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                && ext.chars().any(|c| c.is_ascii_alphabetic())
+        }
+        None => false,
+    }
+}
+
+/// Resolve a detected path against the terminal's working directory.
+/// Absolute paths pass through; relative ones need a base. Windows
+/// drive-rooted-but-driveless shapes (`\foo`) resolve against the
+/// base's drive via `Path::join`'s own semantics.
+fn resolve_candidate(path: &str, base_dir: Option<&Path>) -> Option<PathBuf> {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        Some(p.to_path_buf())
+    } else {
+        base_dir.map(|base| base.join(p))
+    }
+}
+
+/// Post-processing pass that finds file-path tokens (`src\app.rs:3644`,
+/// `./scripts/build.ps1`, `C:\dev\foo\Cargo.toml`, …) in each line and
+/// retro-tags the matching cells with a hyperlink carrying the resolved
+/// absolute path, so Ctrl+click opens the file in the OS default
+/// application — same affordance bare URLs already get.
+///
+/// Only paths that pass the `exists` probe become links; shape alone
+/// would underline half of every build log. `exists` is injected (and
+/// memoised by the caller) so tests stay hermetic and snapshots stay
+/// cheap. Runs with an explicit OSC 8 hyperlink or a detected URL are
+/// never overridden — this pass runs last and `apply_url_to_line`
+/// skips already-linked runs.
+fn inject_file_path_hyperlinks(
+    lines: &mut [Vec<StyledRun>],
+    base_dir: Option<&Path>,
+    exists: &mut dyn FnMut(&Path) -> bool,
+) {
+    for line in lines.iter_mut() {
+        if line.is_empty() {
+            continue;
+        }
+        let text = line_text(line);
+        for cand in file_path_candidates(&text) {
+            let Some(resolved) = resolve_candidate(&cand.path, base_dir) else {
+                continue;
+            };
+            if !exists(&resolved) {
+                continue;
+            }
+            let col_start = byte_to_col(&text, cand.start);
+            let col_end = byte_to_col(&text, cand.end);
+            let uri: Arc<str> = Arc::from(resolved.to_string_lossy().as_ref());
+            apply_url_to_line(line, col_start, col_end, uri);
         }
     }
 }
@@ -798,5 +1034,185 @@ impl Drop for Backend {
         if let Some(handle) = self.join.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plain_run(text: &str, start_col: usize) -> StyledRun {
+        StyledRun {
+            text: text.to_string(),
+            start_col,
+            len_cols: text.chars().count(),
+            fg: gpui::black(),
+            bg: gpui::black(),
+            bold: false,
+            italic: false,
+            underline: false,
+            hyperlink: None,
+        }
+    }
+
+    fn single_run_line(text: &str) -> Vec<StyledRun> {
+        vec![plain_run(text, 0)]
+    }
+
+    fn candidate_paths(text: &str) -> Vec<String> {
+        file_path_candidates(text)
+            .into_iter()
+            .map(|c| c.path)
+            .collect()
+    }
+
+    #[test]
+    fn candidates_detects_separator_and_bare_filename_tokens() {
+        assert_eq!(
+            candidate_paths("edit src/main.rs and Cargo.toml please"),
+            vec!["src/main.rs".to_string(), "Cargo.toml".to_string()]
+        );
+        assert_eq!(
+            candidate_paths(r"error in C:\dev\foo\bar.txt today"),
+            vec![r"C:\dev\foo\bar.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn candidates_strips_line_col_suffix_but_keeps_it_in_the_span() {
+        let text = r"  --> src\app.rs:3644:9";
+        let cands = file_path_candidates(text);
+        assert_eq!(cands.len(), 1);
+        let cand = &cands[0];
+        assert_eq!(cand.path, r"src\app.rs");
+        assert_eq!(&text[cand.start..cand.end], r"src\app.rs:3644:9");
+    }
+
+    #[test]
+    fn candidates_peels_wrapping_punctuation() {
+        let text = r#"see (src/sidebar.rs), "docs/DESIGN.md" and `core/paths.rs`."#;
+        assert_eq!(
+            candidate_paths(text),
+            vec![
+                "src/sidebar.rs".to_string(),
+                "docs/DESIGN.md".to_string(),
+                "core/paths.rs".to_string(),
+            ]
+        );
+        // Spans must not include the wrapping punctuation.
+        let first = &file_path_candidates(text)[0];
+        assert_eq!(&text[first.start..first.end], "src/sidebar.rs");
+    }
+
+    #[test]
+    fn candidates_rejects_urls_flags_versions_and_separator_noise() {
+        assert!(candidate_paths("https://example.com/a/b.html").is_empty());
+        assert!(candidate_paths("--manifest-path foo").is_empty());
+        assert!(candidate_paths("v0.4.0 and rc.14 and 1.2.3").is_empty());
+        assert!(candidate_paths("/ \\ . .. ./ ...").is_empty());
+    }
+
+    #[test]
+    fn looks_like_path_requires_a_letter_in_the_extension() {
+        assert!(looks_like_path("main.rs"));
+        assert!(looks_like_path("archive.7z"));
+        assert!(looks_like_path("a/b"));
+        assert!(!looks_like_path("v0.4.0"));
+        assert!(!looks_like_path("readme"));
+        assert!(!looks_like_path(".gitignore-ish.")); // trailing dot → empty ext
+    }
+
+    #[test]
+    fn resolve_candidate_joins_relative_against_base_and_passes_absolute() {
+        let base = Path::new(r"C:\repo");
+        assert_eq!(
+            resolve_candidate("src/main.rs", Some(base)),
+            Some(base.join("src/main.rs"))
+        );
+        // Relative paths without a base are unresolvable.
+        assert_eq!(resolve_candidate("src/main.rs", None), None);
+        #[cfg(windows)]
+        assert_eq!(
+            resolve_candidate(r"C:\other\x.rs", Some(base)),
+            Some(PathBuf::from(r"C:\other\x.rs"))
+        );
+    }
+
+    #[test]
+    fn inject_marks_existing_paths_and_leaves_missing_ones_alone() {
+        let base = Path::new(r"C:\repo");
+        let mut lines = vec![
+            single_run_line("edit src/main.rs now"),
+            single_run_line("ghost src/missing.rs here"),
+        ];
+        let expected = base.join("src/main.rs");
+        let mut exists = |p: &Path| p == expected;
+        inject_file_path_hyperlinks(&mut lines, Some(base), &mut exists);
+
+        // Existing path: run split in three, middle one clickable.
+        let linked: Vec<_> = lines[0]
+            .iter()
+            .filter(|r| r.hyperlink.is_some())
+            .collect();
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].text, "src/main.rs");
+        assert!(linked[0].underline);
+        assert_eq!(
+            linked[0].hyperlink.as_deref(),
+            Some(expected.to_string_lossy().as_ref())
+        );
+
+        // Missing path: untouched single run.
+        assert_eq!(lines[1].len(), 1);
+        assert!(lines[1][0].hyperlink.is_none());
+    }
+
+    #[test]
+    fn inject_clickable_span_includes_line_col_suffix() {
+        let base = Path::new(r"C:\repo");
+        let mut lines = vec![single_run_line(r"  --> src\app.rs:3644:9")];
+        let mut exists = |_: &Path| true;
+        inject_file_path_hyperlinks(&mut lines, Some(base), &mut exists);
+
+        let linked: Vec<_> = lines[0]
+            .iter()
+            .filter(|r| r.hyperlink.is_some())
+            .collect();
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].text, r"src\app.rs:3644:9");
+        // The link target is the resolved path *without* the suffix.
+        assert_eq!(
+            linked[0].hyperlink.as_deref(),
+            Some(base.join(r"src\app.rs").to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn inject_skips_relative_paths_without_a_working_directory() {
+        let mut lines = vec![single_run_line("edit src/main.rs now")];
+        let mut exists = |_: &Path| true;
+        inject_file_path_hyperlinks(&mut lines, None, &mut exists);
+        assert!(lines[0].iter().all(|r| r.hyperlink.is_none()));
+    }
+
+    #[test]
+    fn inject_never_overrides_an_existing_hyperlink() {
+        let base = Path::new(r"C:\repo");
+        let mut run = plain_run("src/main.rs", 0);
+        run.hyperlink = Some(Arc::from("https://example.com"));
+        let mut lines = vec![vec![run]];
+        let mut exists = |_: &Path| true;
+        inject_file_path_hyperlinks(&mut lines, Some(base), &mut exists);
+        assert_eq!(lines[0].len(), 1);
+        assert_eq!(
+            lines[0][0].hyperlink.as_deref(),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn line_text_pads_gaps_between_runs_to_screen_columns() {
+        let line = vec![plain_run("ab", 0), plain_run("cd", 5)];
+        assert_eq!(line_text(&line), "ab   cd");
     }
 }
