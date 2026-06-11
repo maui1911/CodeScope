@@ -24,6 +24,7 @@ mod app;
 mod assets;
 mod command_palette;
 mod dialogs;
+mod diff_viewer;
 mod empty_state;
 mod idle_notifier;
 mod notifications;

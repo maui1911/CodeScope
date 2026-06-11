@@ -719,6 +719,14 @@ pub struct AppShell {
     /// shortcut, and the in-panel "← Back to workspace" link.
     /// Mirrors C# `MainViewModel.IsOverviewVisible`.
     show_overview: bool,
+    /// Diff viewer panel state; `Some` = visible, replacing the work
+    /// area exactly like `show_overview` does (the two are mutually
+    /// exclusive — opening one closes the other). See
+    /// [`crate::diff_viewer`].
+    pub(crate) diff_viewer: Option<crate::diff_viewer::DiffViewerState>,
+    /// Monotonic sequence for diff-viewer background requests, so a
+    /// stale `git diff` result can never clobber a newer one.
+    pub(crate) diff_request_seq: u64,
     /// Open Settings dialog, if any. Surfaces `settings.json` fields
     /// via a centered modal — the Rust port's replacement for the C#
     /// build's hand-edit-the-file workflow. See ADR-0018. Visible
@@ -996,6 +1004,9 @@ impl AppShell {
                 }
                 SidebarEvent::ReopenSession { session_id } => {
                     this.reopen_session(session_id.clone(), window, cx);
+                }
+                SidebarEvent::OpenDiff { worktree_path } => {
+                    this.open_diff_viewer(Some(worktree_path.clone()), cx);
                 }
                 SidebarEvent::OpenRenameDialog { target, current_name } => {
                     // Reload `projects.json` before opening so the
@@ -1337,6 +1348,8 @@ impl AppShell {
             agent_registry,
             command_palette: None,
             show_overview: false,
+            diff_viewer: None,
+            diff_request_seq: 0,
             settings_dialog: None,
             rename_dialog: None,
             confirm_dialog: None,
@@ -2923,6 +2936,11 @@ impl AppShell {
         if self.show_overview == value {
             return;
         }
+        // Overview and the diff viewer share the work-area slot;
+        // flipping the Overview on dismisses an open diff viewer.
+        if value {
+            self.close_diff_viewer(cx);
+        }
         self.show_overview = value;
         // Push the new state into the sidebar so its footer
         // "Overview" button can flip into / out of the active look
@@ -2983,12 +3001,10 @@ impl AppShell {
     /// Apply a freshly-loaded `Settings` to the shell. Resolves the
     /// theme by name from the built-in registry, swaps both the
     /// settings and theme `Arc`s, and forwards the new theme to the
-    /// sidebar so its chrome repaints in the same frame. Existing
-    /// terminals keep their baked-in palette / font; the swap takes
-    /// effect for chrome immediately and for new tabs on next spawn.
-    /// Live-reapplying palette / font to running terminals lands
-    /// when the renderer exposes that knob — until then a settings
-    /// edit fully takes over only after the next Ctrl+Shift+T.
+    /// sidebar so its chrome repaints in the same frame. Running
+    /// terminals get the new palette pushed via
+    /// `push_palette_to_terminals` so the grid recolours live too;
+    /// font changes still take effect on next spawn only.
     pub(crate) fn apply_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
         let theme = Arc::new(codescope_core::theme::builtin::by_name(&settings.theme));
         // Rebuild the AgentRegistry from the new settings so the
@@ -3004,6 +3020,7 @@ impl AppShell {
             sidebar.apply_theme(theme, cx);
             sidebar.apply_agent_registry(agent_registry, cx);
         });
+        self.push_palette_to_terminals(cx);
         cx.notify();
     }
 
@@ -3020,7 +3037,26 @@ impl AppShell {
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.apply_theme(theme, cx);
         });
+        self.push_palette_to_terminals(cx);
         cx.notify();
+    }
+
+    /// Re-derive the terminal colour palette from the active theme and
+    /// push it into every open tab's `TerminalView`, recolouring the
+    /// running grids in place (#257). Terminals bake their palette in
+    /// at spawn time, so without this a theme switch only repainted
+    /// the chrome and the consoles kept the old colours until the tab
+    /// was reopened.
+    fn push_palette_to_terminals(&mut self, cx: &mut Context<Self>) {
+        let palette = ColorPalette::from_theme_palette(&self.theme.palette);
+        for group in &self.groups {
+            for tab in &group.tabs {
+                let palette = palette.clone();
+                tab.terminal.update(cx, |view, cx| {
+                    view.set_palette(palette, cx);
+                });
+            }
+        }
     }
 
     /// Read-only borrow of the on-disk path bundle. Used by the
@@ -5225,12 +5261,24 @@ impl AppShell {
     /// `push_sidebar_session_paths` sets, this does *not* require an
     /// adopted agent session — a plain shell tab still has a worktree
     /// context worth highlighting (issue #248).
-    fn focused_tab_worktree_path(&self) -> Option<String> {
+    pub(crate) fn focused_tab_worktree_path(&self) -> Option<String> {
         let group = self.groups.get(self.focused_group)?;
         let tab = group.tabs.get(group.active_tab)?;
         let wd = tab.working_directory.as_ref()?;
         let canon = codescope_core::path_canon::canonicalize_path(&wd.to_string_lossy());
         (!canon.is_empty()).then_some(canon)
+    }
+
+    /// The focused tab's working directory as a real filesystem path,
+    /// suitable for spawning `git` in. Contrast with
+    /// [`Self::focused_tab_worktree_path`], which returns the
+    /// `path_canon` *comparison key* (lowercased, colon-stripped,
+    /// slash-normalised) used for sidebar highlight matching — feeding
+    /// that to the OS fails on Windows ("c/dev/…" has no drive).
+    pub(crate) fn focused_tab_working_directory(&self) -> Option<std::path::PathBuf> {
+        let group = self.groups.get(self.focused_group)?;
+        let tab = group.tabs.get(group.active_tab)?;
+        tab.working_directory.clone()
     }
 
     /// Push the focused tab's worktree path to the sidebar so the
@@ -6129,6 +6177,7 @@ impl AppShell {
         //   Ctrl+Shift+,            settings dialog
         //   Ctrl+Shift+P            command palette (toggle)
         //   Ctrl+Shift+O            overview pane (toggle)
+        //   Ctrl+Shift+D            diff viewer (toggle)
         //   Ctrl+Shift+\            split right
         //   Ctrl+Shift+G            open active tab's remote in browser
         //   Ctrl+Shift+R            open active tab's PR in browser
@@ -6214,6 +6263,14 @@ impl AppShell {
                 cx.stop_propagation();
                 let next = !self.show_overview;
                 self.set_show_overview(next, cx);
+            }
+            // Ctrl+Shift+D — toggle the diff viewer for the focused
+            // tab's worktree. Plain Ctrl+D stays with the terminal
+            // (EOF / readline delete-char — agents and shells rely
+            // on it).
+            "d" if mods.shift => {
+                cx.stop_propagation();
+                self.toggle_diff_viewer(cx);
             }
             // Ctrl+Shift+G — open the active tab's worktree origin
             // remote in the browser. Plain Ctrl+G is "abort" /
@@ -6770,12 +6827,12 @@ impl Render for AppShell {
                 }),
             );
 
-        // While the Overview is visible the per-group tab strip is
-        // structurally meaningless — its only target (the group
-        // grid below) is hidden. Render an empty placeholder so the
-        // caption row keeps the same layout footprint but doesn't
-        // surface stale tab affordances.
-        let tab_strip_inline = if self.show_overview {
+        // While the Overview (or the diff viewer) is visible the
+        // per-group tab strip is structurally meaningless — its only
+        // target (the group grid below) is hidden. Render an empty
+        // placeholder so the caption row keeps the same layout
+        // footprint but doesn't surface stale tab affordances.
+        let tab_strip_inline = if self.show_overview || self.diff_viewer.is_some() {
             div()
                 .flex()
                 .flex_row()
@@ -6845,7 +6902,11 @@ impl Render for AppShell {
         // anchored on either side / below so the user can dismiss
         // via the same sidebar button. Mirrors the C# build's
         // `IsOverviewVisible` DataTrigger swap in `MainWindow.xaml`.
-        let work_area: gpui::AnyElement = if self.show_overview {
+        let work_area: gpui::AnyElement = if self.diff_viewer.is_some() {
+            // Diff viewer wins the slot — `set_show_overview(true)`
+            // closes it, so the two can't be up at the same time.
+            self.render_diff_viewer(&theme, cx).into_any_element()
+        } else if self.show_overview {
             self.render_overview(&theme, cx).into_any_element()
         } else if projects_empty {
             // First-run hero takes over the work area whenever no
@@ -6899,7 +6960,7 @@ impl Render for AppShell {
                     ),
             );
 
-        let main_row = if self.sidebar_visible {
+        let mut main_row = if self.sidebar_visible {
             div()
                 .flex_grow()
                 .flex()
@@ -6920,6 +6981,14 @@ impl Render for AppShell {
                 .flex_row()
                 .child(work_area)
         };
+        // Mirror the sidebar body's `min_h(0)` trick: without it a
+        // flex child defaults to its intrinsic content height, so a
+        // sidebar taller than the window inflates this row past the
+        // root column's bounds and pushes the work area's bottom (and
+        // the status bar) off-screen (#260). Clamping min-height to 0
+        // keeps the row at the column's allocated height and lets the
+        // sidebar scroll internally instead.
+        main_row.style().min_size.height = Some(gpui::Length::Definite(px(0.0).into()));
 
         // While a splitter drag is in flight we listen for mouse
         // moves anywhere in the window (the cursor commonly leaves
@@ -7190,6 +7259,11 @@ impl AppShell {
                     let next = !self.show_overview;
                     self.set_show_overview(next, cx);
                 }
+                BuiltInCommand::ToggleDiffViewer => {
+                    // Same entry point as the Ctrl+Shift+D chord and
+                    // the worktree menu's "View changes" row.
+                    self.toggle_diff_viewer(cx);
+                }
                 BuiltInCommand::ToggleSidebar => {
                     self.toggle_sidebar(cx);
                 }
@@ -7260,6 +7334,7 @@ impl AppShell {
             BuiltInCommand::NewSession,
             BuiltInCommand::ToggleSidebar,
             BuiltInCommand::ToggleOverview,
+            BuiltInCommand::ToggleDiffViewer,
             BuiltInCommand::NewProject,
             BuiltInCommand::OpenSettings,
             BuiltInCommand::ReloadTheme,

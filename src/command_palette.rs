@@ -85,6 +85,10 @@ pub enum BuiltInCommand {
     /// sidebar's `OpenOverview` event the same way the footer button
     /// does. Keymap hint: Ctrl+Shift+O.
     ToggleOverview,
+    /// Toggle the diff viewer for the focused tab's worktree —
+    /// same panel the `Ctrl+Shift+D` chord and the worktree menu's
+    /// "View changes" row open. Keymap hint: Ctrl+Shift+D.
+    ToggleDiffViewer,
     /// Show / hide the sidebar. Keymap hint: Ctrl+Shift+B.
     ToggleSidebar,
     /// Open the "Add project" dialog. Keymap hint: none (the `+` button).
@@ -120,6 +124,7 @@ impl BuiltInCommand {
     pub fn title(self) -> &'static str {
         match self {
             BuiltInCommand::ToggleOverview => "Toggle overview",
+            BuiltInCommand::ToggleDiffViewer => "Toggle diff viewer",
             BuiltInCommand::ToggleSidebar => "Toggle sidebar",
             BuiltInCommand::NewProject => "New project",
             BuiltInCommand::NewSession => "New session",
@@ -135,6 +140,7 @@ impl BuiltInCommand {
     pub fn hint(self) -> &'static str {
         match self {
             BuiltInCommand::ToggleOverview => "Ctrl+Shift+O",
+            BuiltInCommand::ToggleDiffViewer => "Ctrl+Shift+D",
             BuiltInCommand::ToggleSidebar => "Ctrl+Shift+B",
             BuiltInCommand::NewProject => "+",
             BuiltInCommand::NewSession => "Ctrl+Shift+T",
