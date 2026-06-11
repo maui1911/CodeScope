@@ -152,14 +152,14 @@ impl TextField {
     /// field wants from a trailing-newline copy. Returns `true` when
     /// the buffer actually changed.
     pub fn insert_str(&mut self, s: &str) -> bool {
-        let mut changed = false;
-        for ch in s.chars() {
-            if !ch.is_control() {
-                self.insert_char(ch);
-                changed = true;
-            }
+        let filtered: String = s.chars().filter(|ch| !ch.is_control()).collect();
+        if filtered.is_empty() {
+            return false;
         }
-        changed
+        let caret = self.clamped_caret();
+        self.text.insert_str(caret, &filtered);
+        self.caret = caret + filtered.len();
+        true
     }
 
     /// Delete the char to the left of the caret (Backspace). Returns
