@@ -277,16 +277,95 @@ fn strip_diff_path(raw: &str, prefix: &str) -> Option<String> {
 }
 
 /// Best-effort path split of the `a/<p> b/<p>` tail of a `diff --git`
-/// line. Ambiguous for paths with spaces — the `+++` / `---` handlers
-/// overwrite with the authoritative value when those lines arrive.
+/// line. Handles git's C-quoted form (`"a/sp ace"`, emitted even under
+/// `core.quotepath=false` for names with quotes/control bytes) and
+/// disambiguates bare names containing spaces via the equal-halves
+/// heuristic. Matters most for binary diffs, which have no `---` /
+/// `+++` lines to overwrite with the authoritative value.
 fn paths_from_diff_git(rest: &str) -> (String, String) {
     let rest = rest.trim();
-    if let Some(idx) = rest.find(" b/") {
+
+    // Quoted form: parse the leading C-quoted token; the second half
+    // is either quoted too or the bare remainder.
+    if rest.starts_with('"') {
+        if let Some((old_raw, rem)) = take_c_quoted(rest) {
+            let rem = rem.trim_start();
+            let new_raw = if rem.starts_with('"') {
+                take_c_quoted(rem).map(|(s, _)| s)
+            } else if !rem.is_empty() {
+                Some(rem.to_string())
+            } else {
+                None
+            };
+            if let Some(new_raw) = new_raw {
+                let old = old_raw.strip_prefix("a/").unwrap_or(&old_raw);
+                let new = new_raw.strip_prefix("b/").unwrap_or(&new_raw);
+                return (old.to_string(), new.to_string());
+            }
+        }
+        return (rest.to_string(), rest.to_string());
+    }
+
+    // Bare form: prefer a ` b/` split where both halves agree — the
+    // common non-rename case stays correct even when the name itself
+    // contains ` b/`. Renames fall back to the first occurrence (the
+    // rename header's explicit `rename from/to` lines are unambiguous
+    // and the `---`/`+++` overwrite applies to their text hunks).
+    let candidates: Vec<usize> = rest.match_indices(" b/").map(|(i, _)| i).collect();
+    for &idx in &candidates {
+        let old = rest[..idx].strip_prefix("a/").unwrap_or(&rest[..idx]);
+        let new = &rest[idx + 3..];
+        if old == new {
+            return (old.to_string(), new.to_string());
+        }
+    }
+    if let Some(&idx) = candidates.first() {
         let old = rest[..idx].strip_prefix("a/").unwrap_or(&rest[..idx]);
         let new = &rest[idx + 3..];
         return (old.to_string(), new.to_string());
     }
     (rest.to_string(), rest.to_string())
+}
+
+/// Parse a leading C-quoted string (git's path quoting: `\"`, `\\`,
+/// `\t`, `\n`, `\r`, and octal `\NNN` byte escapes). Returns the
+/// decoded value plus the remainder after the closing quote, or `None`
+/// when the input doesn't start with a quote / never closes it.
+fn take_c_quoted(s: &str) -> Option<(String, &str)> {
+    let inner = s.strip_prefix('"')?;
+    let bytes = inner.as_bytes();
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                return Some((String::from_utf8_lossy(&out).into_owned(), &inner[i + 1..]));
+            }
+            b'\\' if i + 1 < bytes.len() => {
+                i += 1;
+                match bytes[i] {
+                    b'n' => out.push(b'\n'),
+                    b't' => out.push(b'\t'),
+                    b'r' => out.push(b'\r'),
+                    b'0'..=b'7' => {
+                        let mut val: u32 = 0;
+                        let mut digits = 0;
+                        while digits < 3 && i < bytes.len() && (b'0'..=b'7').contains(&bytes[i]) {
+                            val = val * 8 + u32::from(bytes[i] - b'0');
+                            i += 1;
+                            digits += 1;
+                        }
+                        i -= 1; // loop tail re-adds one
+                        out.push(val as u8);
+                    }
+                    other => out.push(other),
+                }
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Compute the changed char span between two versions of a line by
@@ -409,7 +488,10 @@ pub fn worktree_diff(worktree: &Path) -> Result<Vec<DiffFile>> {
         let code = &entry[..3];
         // Rename/copy entries carry the original path as the *next*
         // NUL field — consume it so it can't be misread as an entry.
-        if code.starts_with('R') || code.starts_with('C') {
+        // R/C can sit in either XY column (staged vs. worktree rename
+        // detection), so scan both status chars.
+        let xy = &code[..2];
+        if xy.contains('R') || xy.contains('C') {
             let _ = fields.next();
         }
         if code == "?? " {
@@ -521,6 +603,33 @@ index 0000000..3333333
 +# Title
 +body
 ";
+
+    #[test]
+    fn diff_git_paths_quoted_binary_with_spaces() {
+        // Binary diffs have no ---/+++ overwrite, so the diff --git
+        // split must already be right for quoted spaced names.
+        let diff = "diff --git \"a/sp ace.bin\" \"b/sp ace.bin\"\n\
+                    index 1111111..2222222 100644\n\
+                    Binary files \"a/sp ace.bin\" and \"b/sp ace.bin\" differ\n";
+        let files = parse_unified_diff(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "sp ace.bin");
+        assert!(files[0].binary);
+    }
+
+    #[test]
+    fn diff_git_paths_bare_with_spaces() {
+        let (old, new) = paths_from_diff_git("a/foo bar.bin b/foo bar.bin");
+        assert_eq!(old, "foo bar.bin");
+        assert_eq!(new, "foo bar.bin");
+    }
+
+    #[test]
+    fn c_quoted_octal_escapes_decode() {
+        let (val, rest) = take_c_quoted("\"a/n\\303\\266tes \\\"q\\\".txt\" tail").unwrap();
+        assert_eq!(val, "a/nötes \"q\".txt");
+        assert_eq!(rest, " tail");
+    }
 
     #[test]
     fn parses_files_hunks_and_counts() {
