@@ -25,7 +25,7 @@
 > `.github/workflows/release.yml` (was `rs--release.yml`) and now
 > triggers on plain `v*` tags.
 
-**Last updated:** 2026-06-11 (session 49 — gpui-driver visual verification of all five PRs; one real bug found in #266 and fixed in `64031d9`)
+**Last updated:** 2026-06-11 (session 49 — gpui-driver visual verification of all five PRs, all PASS; one real bug found in #266 and fixed)
 **Branch:** `main` unchanged; five feature branches with open PRs: #262 (`fix/main-row-min-height`), #263 (`fix/terminal-theme-repaint`), #264 (`fix/osc52-clipboard`), #265 (`feat/file-path-links`), #266 (`feat/diff-viewer`), plus this HANDOFF PR.
 **Head:** `main` still at `672d028` (#256). All five PRs branch directly off it — independent, no stacking, any merge order works (squash-merge each).
 **Release:** `v0.4.0` is still the latest release. ⚠ **The mandatory auto-update validation has STILL not been run** — see cursor list.
@@ -78,13 +78,14 @@ visual pass possible. Setup that had to exist first, all reusable:
   palette, keyboard focus is dropped until the user clicks something
   — pre-existing palette behavior, not introduced by the PR; worth a
   follow-up issue.
-- **#264 OSC 52 — BLOCKED, not falsified.** The desktop session was
-  locked during the entire run (LogonUI active), and Windows denies
+- **#264 OSC 52 — PASS** (second attempt). The first run was blocked:
+  the desktop session was locked (LogonUI active) and Windows denies
   clipboard access session-wide while locked (`clip.exe` → "Access is
-  denied", `Set-Clipboard` no-ops). Event plumbing
-  (`ClipboardStore` → `cx.write_to_clipboard`) verified in code; the
-  end-to-end pass needs an unlocked session: emit
-  `ESC]52;c;<base64>BEL` in a tab, then paste/`gcb`.
+  denied", `Set-Clipboard` silently no-ops) — worth remembering for
+  any future clipboard testing. After the user unlocked, emitting
+  `ESC]52;c;b3NjNTIgd2Vya3Qh BEL` from pwsh inside a tab put the
+  decoded payload on the system clipboard, confirmed via
+  `Get-Clipboard` in the same tab.
 - **#265 file-path links — PASS** for detection: existing
   `src/main.rs:2` underlined (incl. `:line` suffix, inside quoted
   output), non-existent `src/nope.rs` correctly bare. Ctrl+click
