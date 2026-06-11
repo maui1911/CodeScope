@@ -100,6 +100,11 @@ visual pass possible. Setup that had to exist first, all reusable:
   died with "directory name is invalid (os error 267)" on Windows.
   Fixed in `64031d9` on `feat/diff-viewer` with a new
   `focused_tab_working_directory()` accessor; re-verified visually.
+  Copilot's follow-up round on that push produced two more accepted
+  findings, fixed in `1e273ea`: `git status --porcelain -z` (raw
+  NUL-separated paths — non-ASCII/quoted untracked names no longer
+  mis-flag as binary; regression test added) and allocation-free
+  intraline emphasis spans in `render_diff_line`.
 
 Three instrumented dev instances were left running for the user to
 close (the session being locked meant they could not be closed
