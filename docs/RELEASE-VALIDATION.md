@@ -86,12 +86,13 @@ Copy-Item target/release/codescope.exe dist/fake/CodeScope.exe
 Compress-Archive -Path dist/fake/* `
   -DestinationPath "dist/CodeScope-v99.0.0-windows.zip" -Force
 
-# 2. Serve it. A THROTTLED server (vs. `python -m http.server`) makes
-#    the byte-progress toast visibly tick instead of completing
-#    instantly over localhost — needed to eyeball the "N / M MB"
-#    progress. See dist/slow_server.py in PR #249's history, or any
-#    rate-limited static server on :8000.
-python dist/slow_server.py  # leave running; serves at ~512 KB/s
+# 2. Serve it on :8000. Any static server works for the extraction
+#    check; `truncating_server.py --truncate-first 0` (full, no cut)
+#    is in-repo. The byte-progress toast completes near-instantly over
+#    localhost — to eyeball it ticking you need a rate-limited server
+#    (the retired dist/slow_server.py lives in PR #249's history, or
+#    use any throttling proxy). Extraction success doesn't depend on it.
+python dist/truncating_server.py dist/CodeScope-v99.0.0-windows.zip --port 8000 --truncate-first 0
 
 # 3. Launch the DEBUG dev build with the override pointing at the zip.
 #    (A release build ignores CODESCOPE_DEV_UPDATE_URL — it's gated
@@ -136,7 +137,11 @@ PR #275). This check guards that resilience.
 cuts the body short on the first N requests, then serves it in full —
 a faithful stand-in for a middlebox clipping a large HTTPS download.
 
-Stage the same fake v99 archive as §6, then:
+Stage the fake v99 archive with §6's staging block only — `cargo build
+--release --bin codescope`, copy the exe to `dist/fake/CodeScope.exe`,
+then `Compress-Archive` it to `dist/CodeScope-v99.0.0-windows.zip` (do
+**not** use §6's `slow_server.py` step — that script isn't in the repo;
+`truncating_server.py` below replaces it). Then:
 
 ```pwsh
 # Self-heal: cut the first 2 attempts, serve the 3rd in full.
