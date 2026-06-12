@@ -137,11 +137,10 @@ PR #275). This check guards that resilience.
 cuts the body short on the first N requests, then serves it in full —
 a faithful stand-in for a middlebox clipping a large HTTPS download.
 
-Stage the fake v99 archive with §6's staging block only — `cargo build
+Stage the fake v99 archive with §6's staging commands — `cargo build
 --release --bin codescope`, copy the exe to `dist/fake/CodeScope.exe`,
-then `Compress-Archive` it to `dist/CodeScope-v99.0.0-windows.zip` (do
-**not** use §6's `slow_server.py` step — that script isn't in the repo;
-`truncating_server.py` below replaces it). Then:
+then `Compress-Archive` it to `dist/CodeScope-v99.0.0-windows.zip`.
+Then serve it with the truncating server instead of §6's full one:
 
 ```pwsh
 # Self-heal: cut the first 2 attempts, serve the 3rd in full.
@@ -184,6 +183,6 @@ python dist/truncating_server.py dist/CodeScope-v99.0.0-windows.zip `
 
 ### Sign-off
 
-When all of 1-6 (incl. 6b) pass, the release is OK to announce. Push the
+When all checks (1-6b) pass, the release is OK to announce. Push the
 release notes to the GitHub release body, mention any breaking
 changes, and link relevant PRs.
