@@ -25,10 +25,10 @@
 > `.github/workflows/release.yml` (was `rs--release.yml`) and now
 > triggers on plain `v*` tags.
 
-**Last updated:** 2026-06-12 (session 51 — dialog paste fix, clippy doc debt cleared, dialog-close focus restore; all merged)
+**Last updated:** 2026-06-12 (session 51, continued — **v0.5.0 released**: bump #273, §6 regression PASS, tag pushed, pipeline green)
 **Branch:** `main`; no open PRs, no open issues.
-**Head:** `main` at `4a21ae8` (#271). This session's merges: #268 dialog paste (`eecf631`), #269 clippy doc warnings (`cc1c38e`), #271 focus restore fixing #270 (`4a21ae8`).
-**Release:** `v0.4.0` is still the latest release. ⚠ **Auto-update validation:** the user will run it themselves on the next real release (upgrade installed build → verify "Update installed"), most likely when `v0.5.0` ships — see cursor list.
+**Head:** `main` at `459f46e` (#273, the 0.5.0 bump). Earlier this session: #268 dialog paste (`eecf631`), #269 clippy doc warnings (`cc1c38e`), #271 focus restore fixing #270 (`4a21ae8`).
+**Release:** **`v0.5.0` is published** (run 27397592072, all assets incl. `CodeScope-v0.5.0-setup.exe` + `-windows.zip`). The mandatory §6 dev-mode archive-extraction regression was run pre-tag and **PASSED**, automated with gpui-driver: fake v99.0.0 DEFLATE zip (python `ZIP_DEFLATED`, same method as Compress-Archive) served on localhost → toast → Update → "Installing" → **"Update installed"** → Restart exits → self-replaced binary relaunches (screenshots 34/35 in `.verify-shots/`; byte-progress ticking not eyeballed — localhost is instant; debug binary relinked afterwards). ⚠ **§4 in-app update validation (installed v0.4.0 → v0.5.0) is now the user's next step** — note the installed build hosts the live sessions, so the restart interrupts them.
 **Build status:** ✅ `main` builds clean; `cargo clippy --workspace --all-targets` now reports **zero doc-comment warnings** (remaining findings are the known non-doc ones: too-many-arguments, enum size, etc.); workspace suite 647 tests green.
 **Uncommitted work:** none.
 **Open issues:** none. #270 (keyboard dead after dialog close) was filed and fixed this session. **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree — do **NOT** run repo-wide `cargo fmt`; hand-format changed hunks. See the session-47 note.
@@ -264,13 +264,11 @@ branches off `main`, each with its own PR + Copilot review pass:
 **Cursor for next session:**
 1. ~~User reviews + merges PRs #262–#266~~ — done in session 50, all
    five merged (see header).
-2. **`v0.5.0`** is the natural next step — since v0.4.0 main gained
-   the diff viewer, four sweep fixes, dialog paste and the focus
-   restore. When it ships, the user runs the **auto-update
-   validation** themselves (upgrade the installed v0.4.0 →
-   "Installing" → "Update installed" → restart;
-   `docs/RELEASE-VALIDATION.md` **§4** — §6, the dev-mode
-   archive-extraction check, remains mandatory pre-tag).
+2. ~~`v0.5.0`~~ — **shipped** (see header). What remains is the
+   user-run **§4 auto-update validation**: upgrade the installed
+   v0.4.0 → "Installing" → "Update installed" → restart → About
+   shows v0.5.0 (`docs/RELEASE-VALIDATION.md` **§4**). §6 was run
+   and passed pre-tag.
 3. ~~Clippy doc-comment debt~~ — cleared in #269 (session 51); the
    remaining clippy findings (too-many-arguments, enum size, …) are
    accepted for now.
