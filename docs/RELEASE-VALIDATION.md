@@ -104,8 +104,10 @@ cargo run --bin codescope
 ```
 
 - [ ] Toast appears (~15s after launch).
-- [ ] Click "Update". The toast switches to "Downloading update… N / M"
-      and the byte count **visibly advances** (throttled server).
+- [ ] Click "Update". The toast switches to "Downloading update… N / M".
+      With a throttled server the byte count **visibly advances**; over
+      a plain localhost server it may jump near-instantly to the total —
+      either is fine, the extraction check below is what matters.
 - [ ] **Extraction succeeds:** the toast reaches "Installing update…"
       then "Update installed". (A failure here with "unsupported
       extraction method" means a `self_update` compression feature is
