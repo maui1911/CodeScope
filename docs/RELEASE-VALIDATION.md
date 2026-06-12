@@ -120,8 +120,65 @@ cargo run --bin codescope
 > `compression-flate2` feature) whenever the `self_update` feature set
 > or `dist-workspace.toml`'s `unix-archive` changes.
 
+### 6b. Truncated-download resilience (MANDATORY)
+
+Why this exists: §6 serves the archive from a *localhost* server,
+which never truncates — so it proves extraction works but structurally
+**cannot** catch a download that is cut short on a real network. That
+gap shipped a v0.5.0 update that failed for a user behind a
+TLS-inspecting proxy with the baffling `ZipError: ... Could not find
+EOCD` (the downloaded zip was truncated; the failure only surfaced at
+extract time). The installer now verifies `received == Content-Length`
+and retries (`download_archive` / `verify_complete` in `src/update.rs`,
+PR #275). This check guards that resilience.
+
+`dist/truncating_server.py` advertises the real `Content-Length` but
+cuts the body short on the first N requests, then serves it in full —
+a faithful stand-in for a middlebox clipping a large HTTPS download.
+
+Stage the same fake v99 archive as §6, then:
+
+```pwsh
+# Self-heal: cut the first 2 attempts, serve the 3rd in full.
+# DOWNLOAD_ATTEMPTS is 3, so the install should recover on attempt 3.
+python dist/truncating_server.py dist/CodeScope-v99.0.0-windows.zip `
+  --port 8000 --truncate-first 2 --fraction 0.5
+
+# (separate window) launch the DEBUG dev build pointed at it:
+$env:CODESCOPE_DEV = "1"
+$env:CODESCOPE_DEV_FAKE_UPDATE_TOAST = "1"
+$env:CODESCOPE_DEV_UPDATE_URL = "http://127.0.0.1:8000/CodeScope-v99.0.0-windows.zip"
+cargo run --bin codescope
+```
+
+- [ ] Click "Update". The server log prints two `TRUNCATED` lines then
+      one `full` line, and the toast **self-heals** through to
+      "Installing update…" → "Update installed". (The progress bar may
+      visibly reset between attempts.)
+
+Then restart the server to truncate **every** attempt and confirm the
+honest failure (this is the case the EOCD bug used to mangle):
+
+```pwsh
+python dist/truncating_server.py dist/CodeScope-v99.0.0-windows.zip `
+  --port 8000 --truncate-first 999 --fraction 0.5
+```
+
+- [ ] Click "Update". The server log shows exactly **3** `TRUNCATED`
+      lines (the retry budget — *not* a single request that jumps
+      straight to an extract error), and the toast ends on
+      **"Download incomplete: received N of M bytes (connection
+      truncated …)"** — **not** "Could not find EOCD". The failure
+      toast is brief; watch for it, or read the count of attempts in
+      the server log as the proof the verify+retry path ran (old code
+      issued a single GET then failed at extract).
+
+> The unit tests in `src/update.rs` (`verify_complete`) pin the exact
+> truncated / over-read / unknown-length wording; this manual pass
+> proves the wiring end-to-end against a real socket.
+
 ### Sign-off
 
-When all of 1-6 pass, the release is OK to announce. Push the
+When all of 1-6 (incl. 6b) pass, the release is OK to announce. Push the
 release notes to the GitHub release body, mention any breaking
 changes, and link relevant PRs.
