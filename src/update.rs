@@ -189,6 +189,112 @@ fn dev_update_url_override() -> Option<String> {
     None
 }
 
+/// How many times to (re)attempt the archive download before giving
+/// up. Truncation by a middlebox is usually transient, so a couple of
+/// fresh attempts clear it; 3 keeps the worst-case wait bounded.
+#[cfg(not(target_os = "macos"))]
+const DOWNLOAD_ATTEMPTS: u32 = 3;
+
+/// Verdict on whether a finished download received the whole body.
+/// Pure so the truncation rule is unit-testable without a socket. A
+/// `None` total means the server sent no `Content-Length` and we
+/// can't verify — we accept it rather than reject a legitimate
+/// chunked response.
+#[cfg(not(target_os = "macos"))]
+fn verify_complete(received: u64, total: Option<u64>) -> Result<(), String> {
+    match total {
+        // Short read — the common, retryable case: a middlebox cutting
+        // a large HTTPS download ends the body early with a clean EOF.
+        Some(total) if received < total => Err(format!(
+            "Download incomplete: received {received} of {total} bytes \
+             (connection truncated — check a VPN/proxy or antivirus that \
+             inspects HTTPS, then retry)"
+        )),
+        // Over-read — the server sent more than it advertised. Not a
+        // truncation; the archive is suspect either way, so reject with
+        // an honest, distinct message rather than the "incomplete" one.
+        Some(total) if received > total => Err(format!(
+            "Download size mismatch: received {received} bytes but the \
+             server advertised {total} (unexpected — retry)"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Download `url` into `archive_path`, streaming byte-progress into
+/// `state`, with completeness verification and a small retry budget.
+/// Returns the user-facing failure message on the final failure.
+#[cfg(not(target_os = "macos"))]
+fn download_archive(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    archive_path: &std::path::Path,
+    state: &UpdateState,
+) -> Result<(), String> {
+    let mut last_err = String::from("Download failed");
+    for attempt in 1..=DOWNLOAD_ATTEMPTS {
+        match download_once(client, url, archive_path, state) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_err = err;
+                if attempt < DOWNLOAD_ATTEMPTS {
+                    // Linear backoff; the file is recreated (truncated)
+                    // on the next attempt by `download_once`.
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        750 * attempt as u64,
+                    ));
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+/// One download attempt: (re)create the file, stream the body, verify
+/// the full length arrived. Each call truncates `archive_path` so a
+/// retry never appends onto a partial file.
+#[cfg(not(target_os = "macos"))]
+fn download_once(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    archive_path: &std::path::Path,
+    state: &UpdateState,
+) -> Result<(), String> {
+    let mut archive_file = std::fs::File::create(archive_path).map_err(|err| {
+        format!("Could not create archive file {}: {err:#}", archive_path.display())
+    })?;
+
+    let mut response = client
+        .get(url)
+        .send()
+        .map_err(|err| format!("Download request failed: {err:#}"))?;
+    response
+        .error_for_status_ref()
+        .map_err(|err| format!("Download failed: {err:#}"))?;
+
+    let total = response.content_length();
+    let mut received: u64 = 0;
+    *state.write() = UpdateStatus::Downloading { received, total };
+
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = match std::io::Read::read(&mut response, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(err) => return Err(format!("Download read error: {err:#}")),
+        };
+        std::io::Write::write_all(&mut archive_file, &buf[..n])
+            .map_err(|err| format!("Write error: {err:#}"))?;
+        received += n as u64;
+        *state.write() = UpdateStatus::Downloading { received, total };
+    }
+    std::io::Write::flush(&mut archive_file)
+        .map_err(|err| format!("Flush error: {err:#}"))?;
+    drop(archive_file); // close before Extract reads it
+
+    verify_complete(received, total)
+}
+
 #[cfg(not(target_os = "macos"))]
 fn run_install(state: &UpdateState, info: ReleaseInfo) {
     // The first Downloading{received, total} state is written once the
@@ -209,19 +315,6 @@ fn run_install(state: &UpdateState, info: ReleaseInfo) {
 
     let archive_path = temp_dir.path().join(&info.archive_name);
 
-    let archive_file = match std::fs::File::create(&archive_path) {
-        Ok(f) => f,
-        Err(err) => {
-            *state.write() = UpdateStatus::Failed {
-                message: format!(
-                    "Could not create archive file {}: {err:#}",
-                    archive_path.display()
-                ),
-            };
-            return;
-        }
-    };
-
     // Stream the download ourselves so we can drive byte-progress into
     // the state slot. self_update::Download has no programmatic progress
     // hook in 0.41. reqwest::blocking is safe here — run_install is on a
@@ -239,55 +332,18 @@ fn run_install(state: &UpdateState, info: ReleaseInfo) {
         }
     };
 
-    let mut response = match client.get(&download_url).send() {
-        Ok(r) => r,
-        Err(err) => {
-            *state.write() = UpdateStatus::Failed {
-                message: format!("Download request failed: {err:#}"),
-            };
-            return;
-        }
-    };
-    if let Err(err) = response.error_for_status_ref() {
-        *state.write() = UpdateStatus::Failed {
-            message: format!("Download failed: {err:#}"),
-        };
+    // Download with completeness verification + a few retries. A
+    // TLS-inspecting proxy / middlebox cutting a large download short
+    // ends the body with a clean EOF, so a naive read loop accepts a
+    // truncated zip and the failure only surfaces later as a baffling
+    // "Could not find EOCD" extract error (#270-follow-up). Verifying
+    // received == Content-Length here turns that into an honest
+    // "download incomplete", and retrying self-heals transient
+    // truncation.
+    if let Err(message) = download_archive(&client, &download_url, &archive_path, state) {
+        *state.write() = UpdateStatus::Failed { message };
         return;
     }
-
-    let total = response.content_length();
-    let mut archive_file = archive_file; // rebind mut for write_all
-    let mut received: u64 = 0;
-    *state.write() = UpdateStatus::Downloading { received, total };
-
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = match std::io::Read::read(&mut response, &mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(err) => {
-                *state.write() = UpdateStatus::Failed {
-                    message: format!("Download read error: {err:#}"),
-                };
-                return;
-            }
-        };
-        if let Err(err) = std::io::Write::write_all(&mut archive_file, &buf[..n]) {
-            *state.write() = UpdateStatus::Failed {
-                message: format!("Write error: {err:#}"),
-            };
-            return;
-        }
-        received += n as u64;
-        *state.write() = UpdateStatus::Downloading { received, total };
-    }
-    if let Err(err) = std::io::Write::flush(&mut archive_file) {
-        *state.write() = UpdateStatus::Failed {
-            message: format!("Flush error: {err:#}"),
-        };
-        return;
-    }
-    drop(archive_file); // close before Extract reads it
 
     *state.write() = UpdateStatus::Installing;
 
@@ -387,4 +443,39 @@ pub fn open_releases_page() -> anyhow::Result<()> {
         update_check::REPO_NAME
     );
     open::that(&url).map_err(Into::into)
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod tests {
+    use super::verify_complete;
+
+    #[test]
+    fn full_download_is_complete() {
+        assert!(verify_complete(5_717_213, Some(5_717_213)).is_ok());
+    }
+
+    #[test]
+    fn truncated_download_is_rejected() {
+        // A middlebox cutting the stream short: fewer bytes than the
+        // advertised Content-Length must fail here, before extract.
+        let err = verify_complete(1_000, Some(5_717_213)).unwrap_err();
+        assert!(err.contains("received 1000 of 5717213"), "{err}");
+        assert!(err.to_lowercase().contains("incomplete"), "{err}");
+    }
+
+    #[test]
+    fn unknown_total_cannot_be_verified_so_accepts() {
+        // No Content-Length header → we can't prove truncation, so we
+        // don't reject a legitimate chunked response.
+        assert!(verify_complete(1_000, None).is_ok());
+    }
+
+    #[test]
+    fn over_read_is_rejected_with_a_distinct_message() {
+        // More bytes than advertised must fail, but not as a
+        // "truncated/incomplete" download — that wording would be wrong.
+        let err = verify_complete(6_000_000, Some(5_717_213)).unwrap_err();
+        assert!(err.contains("size mismatch"), "{err}");
+        assert!(!err.to_lowercase().contains("incomplete"), "{err}");
+    }
 }
