@@ -203,10 +203,19 @@ const DOWNLOAD_ATTEMPTS: u32 = 3;
 #[cfg(not(target_os = "macos"))]
 fn verify_complete(received: u64, total: Option<u64>) -> Result<(), String> {
     match total {
-        Some(total) if received != total => Err(format!(
+        // Short read — the common, retryable case: a middlebox cutting
+        // a large HTTPS download ends the body early with a clean EOF.
+        Some(total) if received < total => Err(format!(
             "Download incomplete: received {received} of {total} bytes \
              (connection truncated — check a VPN/proxy or antivirus that \
              inspects HTTPS, then retry)"
+        )),
+        // Over-read — the server sent more than it advertised. Not a
+        // truncation; the archive is suspect either way, so reject with
+        // an honest, distinct message rather than the "incomplete" one.
+        Some(total) if received > total => Err(format!(
+            "Download size mismatch: received {received} bytes but the \
+             server advertised {total} (unexpected — retry)"
         )),
         _ => Ok(()),
     }
@@ -462,9 +471,11 @@ mod tests {
     }
 
     #[test]
-    fn over_read_is_not_silently_accepted_as_equal() {
-        // Defensive: more bytes than advertised is also "not equal" and
-        // must not pass the equality gate.
-        assert!(verify_complete(6_000_000, Some(5_717_213)).is_err());
+    fn over_read_is_rejected_with_a_distinct_message() {
+        // More bytes than advertised must fail, but not as a
+        // "truncated/incomplete" download — that wording would be wrong.
+        let err = verify_complete(6_000_000, Some(5_717_213)).unwrap_err();
+        assert!(err.contains("size mismatch"), "{err}");
+        assert!(!err.to_lowercase().contains("incomplete"), "{err}");
     }
 }
