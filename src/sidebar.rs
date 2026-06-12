@@ -682,8 +682,8 @@ impl Sidebar {
     }
 
     /// Drive the caret blink for the sidebar-owned dialogs
-    /// ("Add project", "New worktree from branch"; rename + settings
-    /// + command palette live on AppShell with their own timer).
+    /// ("Add project", "New worktree from branch"; rename, settings
+    /// and command palette live on AppShell with their own timer).
     /// Shares the [`crate::app::TEXT_BLINK_PERIOD`] cadence so paired
     /// inputs across the two entities flip in lockstep — two timers
     /// on the same ms-grid drift by at most one tick across a

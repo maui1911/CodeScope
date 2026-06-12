@@ -8,10 +8,10 @@
 //! - **Projects**  — focus / select the project in the sidebar.
 //! - **Worktrees** — open or focus its session.
 //! - **Agents**   — start a new session running that agent in the
-//!                  active worktree.
+//!   active worktree.
 //! - **Themes**   — live-apply (writes `settings.theme`, re-renders chrome).
 //! - **Commands** — static built-ins (toggle overview / sidebar, new
-//!                  project, open settings, reload theme).
+//!   project, open settings, reload theme).
 //!
 //! Arrow keys move selection; Enter activates the highlighted row;
 //! Esc closes. The dropdown is grouped by kind so the user can
