@@ -25,13 +25,58 @@
 > `.github/workflows/release.yml` (was `rs--release.yml`) and now
 > triggers on plain `v*` tags.
 
-**Last updated:** 2026-06-11 (session 50 — manual user verification of #262–#266; all five squash-merged)
-**Branch:** `main`; only this HANDOFF PR (#267) remains open.
-**Head:** `main` at `15eeadc` (#266). Merge order #262 → #263 → #264 → #265 → #266 (`2d91d7b`, `a0dbf30`, `3f1ab58`, `1f2c539`, `15eeadc`); each branch was updated with main before its manual test, so later PRs were tested on top of the earlier merges.
-**Release:** `v0.4.0` is still the latest release. ⚠ **The mandatory auto-update validation has STILL not been run** — see cursor list.
-**Build status:** ✅ `main` builds clean; the workspace suite was 631 tests green on the final #266 head before merge. Copilot reviews on all five PRs were fully addressed + resolved before merging.
+**Last updated:** 2026-06-12 (session 51 — dialog paste fix, clippy doc debt cleared, dialog-close focus restore; all merged)
+**Branch:** `main`; no open PRs, no open issues.
+**Head:** `main` at `4a21ae8` (#271). This session's merges: #268 dialog paste (`eecf631`), #269 clippy doc warnings (`cc1c38e`), #271 focus restore fixing #270 (`4a21ae8`).
+**Release:** `v0.4.0` is still the latest release. ⚠ **Auto-update validation:** the user will run it themselves on the next real release (upgrade installed build → verify "Update installed"), most likely when `v0.5.0` ships — see cursor list.
+**Build status:** ✅ `main` builds clean; `cargo clippy --workspace --all-targets` now reports **zero doc-comment warnings** (remaining findings are the known non-doc ones: too-many-arguments, enum size, etc.); workspace suite 647 tests green.
 **Uncommitted work:** none.
-**Open issues:** #257–#261 auto-closed by the PR merges. Pre-existing clippy debt in `src/app.rs` (18 `doc_lazy_continuation` warnings under rust-1.95) untouched. **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree — do **NOT** run repo-wide `cargo fmt`; hand-format changed hunks. See the session-47 note.
+**Open issues:** none. #270 (keyboard dead after dialog close) was filed and fixed this session. **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree — do **NOT** run repo-wide `cargo fmt`; hand-format changed hunks. See the session-47 note.
+
+### Session 51 — paste fix, clippy debt, focus restore (#268–#271)
+
+Follow-on from the session-50 merge round; the user kept testing and
+found one bug, which cascaded into clearing two pieces of debt:
+
+- **PR #268 — paste in dialog text fields** (user-found: "I can't
+  paste into Clone from URL"). Dialog inputs use the minimal
+  `TextField` and their key handlers only consumed per-character
+  `key_char`; Ctrl+V arrives as bare `v` + modifier with no
+  `key_char`, so paste did nothing in *any* dialog. Added
+  `TextField::insert_str` (control chars stripped, single
+  allocation) + shared `is_paste_chord` (Ctrl/Cmd+V, Shift+Insert;
+  AltGr rejected for glyph layouts) and wired all five surfaces:
+  new-project (URL paste re-derives the name once), rename,
+  new-worktree, settings, command palette. **Driver-verified** on a
+  live build: URL paste + auto-derived name, Shift+Insert at caret,
+  palette query paste (screenshots in `.verify-shots/`).
+- **PR #269 — clippy doc-comment debt cleared** (16 warnings, was
+  tracked as "18 in app.rs" — stale count). Lines starting with `+`
+  parsed as Markdown list items, over/under-indented continuations,
+  a `>`-initial line parsed as blockquote, and `render_group`'s doc
+  block orphaned above the titlebar handler. All cosmetic;
+  workspace clippy is doc-warning-free now.
+- **Issue #270 + PR #271 — keyboard dead after closing any
+  dialog/palette.** The session-49 "palette drops focus" observation
+  turned out structural: all five close paths just drop the dialog
+  state; its `FocusHandle` dies, window focus becomes `None`, and
+  gpui dispatches keystrokes only along the focus path — so even
+  AppShell's root chords died until a mouse click. Fix: one central
+  `cx.on_focus_lost` hook in `AppShell::new` (gpui's documented
+  mechanism for exactly this) refocuses the active tab's terminal,
+  falling back to the AppShell root. Covers every close path incl.
+  async completions. **Driver-verified:** chord redispatches after
+  Escape; typing after dialog-close lands in the terminal prompt.
+
+Process notes: the gpui-driver instrumentation pattern got reused
+twice (local-only branches `test/verify-268`, `test/verify-270` —
+cherry-pick `7e98cb0` onto any branch, build `--features driver`);
+the new-project mode toggle got a test-only `driver_id` there. The
+dev store still carries the session-49 fixtures + pwsh-only agent
+(user's choice; restore from the `.bak-20260611` twins when done).
+Per the user: dev-build instances may be killed programmatically
+(identify by exe path under `target*/debug/`), only the installed
+build is untouchable.
 
 ### Session 50 — manual verification + merge of #262–#266
 
@@ -219,18 +264,17 @@ branches off `main`, each with its own PR + Copilot review pass:
 **Cursor for next session:**
 1. ~~User reviews + merges PRs #262–#266~~ — done in session 50, all
    five merged (see header).
-2. **⚠ v0.4.0 auto-update validation** (carried from session 47,
-   still the most urgent non-code item): from an installed build,
-   update and confirm "Installing" → "Update installed"
-   (`docs/RELEASE-VALIDATION.md` **§4**, the in-app update flow —
-   session 47's cursor cited §6, but that section is the dev-mode
-   archive-extraction regression check, not the installed-build
-   flow).
-3. The merges have landed — consider a `v0.5.0` (diff viewer + four
-   fixes outgrow a patch).
-4. Pre-existing clippy debt in `src/app.rs` (18 warnings) — still
-   open, untouched.
-5. MSIX / Store packaging still parked (closed #243 thread has the
+2. **`v0.5.0`** is the natural next step — since v0.4.0 main gained
+   the diff viewer, four sweep fixes, dialog paste and the focus
+   restore. When it ships, the user runs the **auto-update
+   validation** themselves (upgrade the installed v0.4.0 →
+   "Installing" → "Update installed" → restart;
+   `docs/RELEASE-VALIDATION.md` **§4** — §6, the dev-mode
+   archive-extraction check, remains mandatory pre-tag).
+3. ~~Clippy doc-comment debt~~ — cleared in #269 (session 51); the
+   remaining clippy findings (too-many-arguments, enum size, …) are
+   accepted for now.
+4. MSIX / Store packaging still parked (closed #243 thread has the
    scoping notes).
 
 ### Session 47 — open-PR/issue sweep: #246, #243, #247, #248
