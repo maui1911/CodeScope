@@ -25,13 +25,52 @@
 > `.github/workflows/release.yml` (was `rs--release.yml`) and now
 > triggers on plain `v*` tags.
 
-**Last updated:** 2026-06-12 (session 51, continued — **v0.5.0 released**: bump #273, §6 regression PASS, tag pushed, pipeline green)
+**Last updated:** 2026-06-12 (session 51, continued — **v0.5.1 released**: diagnosed + fixed the in-app updater truncated-download bug, added a regression test, shipped the patch)
 **Branch:** `main`; no open PRs, no open issues.
-**Head:** `main` at `459f46e` (#273, the 0.5.0 bump). Earlier this session: #268 dialog paste (`eecf631`), #269 clippy doc warnings (`cc1c38e`), #271 focus restore fixing #270 (`4a21ae8`).
-**Release:** **`v0.5.0` is published** (run 27397592072, all assets incl. `CodeScope-v0.5.0-setup.exe` + `-windows.zip`). The mandatory §6 dev-mode archive-extraction regression was run pre-tag and **PASSED**, automated with gpui-driver: fake v99.0.0 DEFLATE zip (python `ZIP_DEFLATED`, same method as Compress-Archive) served on localhost → toast → Update → "Installing" → **"Update installed"** → Restart exits → self-replaced binary relaunches (screenshots 34/35 in `.verify-shots/`; byte-progress ticking not eyeballed — localhost is instant; debug binary relinked afterwards). ⚠ **§4 in-app update validation (installed v0.4.0 → v0.5.0) is now the user's next step** — note the installed build hosts the live sessions, so the restart interrupts them.
-**Build status:** ✅ `main` builds clean; `cargo clippy --workspace --all-targets` now reports **zero doc-comment warnings** (remaining findings are the known non-doc ones: too-many-arguments, enum size, etc.); workspace suite 647 tests green.
+**Head:** `main` at `dcbbb8a` (#277, the 0.5.1 bump). Update-saga merges this session: #275 truncated-download fix (`10b57b5`), #276 §6b resilience test (`fa655b1`), #277 bump (`dcbbb8a`). Earlier: v0.5.0 (#262–#274).
+**Release:** **`v0.5.1` is published** (pipeline run 27406124661). It's a patch over v0.5.0 carrying the in-app updater robustness fix. **`v0.5.0` is also still up** but its updater can mis-handle a truncated download — see below.
+**The v0.5.0 update bug (root-caused + fixed this session):** the user's installed v0.4.0 → v0.5.0 in-app update failed (twice) with `Extract failed: … ZipError: invalid Zip archive: Could not find EOCD`. EOCD-missing = the downloaded zip was **truncated**. The published v0.5.0 artifact is **fine** (verified end-to-end: full GitHub download, valid `PK\x03\x04`, extracts cleanly with identical code + dep pins). Root cause was in `src/update.rs`'s downloader: the read loop broke on the first `Ok(0)` EOF and proceeded to extract **without checking `received == Content-Length`**, so a TLS-inspecting proxy / AV middlebox clipping the HTTPS download (a *clean* early EOF) silently produced a short zip. Fix (#275): `verify_complete` (pure, unit-tested) + `download_once` + `download_archive` (3 attempts, linear backoff). A short download now fails as honest "Download incomplete: received N of M bytes" and self-heals on retry. #276 added `dist/truncating_server.py` + RELEASE-VALIDATION §6b to guard it (§6 served from localhost, which never truncates — that's why the bug shipped).
+**⚠ The user is behind a network that truncates** large HTTPS downloads, so the v0.4.0/v0.5.0 in-app updater fails for them. Path forward given to them: run `CodeScope-v0.5.1-setup.exe` from the release directly (bypasses the updater) to land on the build that *has* the fix; after that the in-app updater self-heals. The verified-complete `CodeScope-v0.5.0-setup.exe` was earlier downloaded to `C:\Users\maui\Downloads\`.
+**Diagnostic logging gap (open):** the installer writes update failures only to a transient toast (auto-dismissed) and the temp dir (`tempfile::tempdir()` under `%TEMP%`, auto-deleted on return) — nothing persists to disk, so "do you have logs?" came up empty. Worth a follow-up: log the update flow + full error chain to `%LOCALAPPDATA%\CodeScope\update.log`. Not yet filed.
+**Build status:** ✅ `main` builds clean; workspace suite green (4 new `verify_complete` unit tests in #275). Clippy clean on changed files.
 **Uncommitted work:** none.
-**Open issues:** none. #270 (keyboard dead after dialog close) was filed and fixed this session. **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree — do **NOT** run repo-wide `cargo fmt`; hand-format changed hunks. See the session-47 note.
+**Open issues:** none. **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree — do **NOT** run repo-wide `cargo fmt`; hand-format changed hunks. See the session-47 note.
+
+### Session 51c — v0.5.0 update bug → v0.5.1 (#275–#277)
+
+After v0.5.0 shipped, the user's installed v0.4.0 → v0.5.0 in-app
+update failed twice with `Could not find EOCD`. Investigation (kept
+honest, evidence-first):
+
+- Verified the published v0.5.0 artifact is good — full GitHub
+  download (200, `application/octet-stream`, all 5,717,213 bytes,
+  `PK\x03\x04` header) extracts cleanly via a throwaway example that
+  replays `extract_binary` with the exact dep pins. Code + deps
+  (`self_update 0.41`, `zip 2.4.2`, …) are byte-identical between
+  v0.4.0 and v0.5.0, and `compression-zip-deflate` is in both. So it
+  was never a release/code/extraction bug.
+- The error screenshot (`EOCD` missing) pinned it to a **truncated
+  download**. Root cause in the downloader: read loop broke on the
+  first `Ok(0)` and extracted without verifying `received ==
+  Content-Length`. A TLS-inspecting middlebox clipping the HTTPS body
+  (clean early EOF) silently produced a short zip.
+- **#275** fix: `verify_complete` (pure + unit-tested) + retry loop
+  (`download_archive`/`download_once`, 3 attempts, backoff). Honest
+  "Download incomplete" instead of a later EOCD; self-heals on retry.
+- **#276** regression guard: `dist/truncating_server.py` (advertises
+  full Content-Length, cuts the body on the first N requests) +
+  RELEASE-VALIDATION **§6b**. Verified end-to-end with the driver
+  build: truncate-first 2 → "Update installed" (self-heal);
+  always-truncate → exactly 3 attempts then honest failure (3 GETs
+  can only be the new verify+retry loop — old code did 1 GET → EOCD).
+- **#277** bumped to v0.5.1, tagged → published.
+
+Reusable: the `test/verify-*` pattern (cherry-pick the gpui-driver
+instrumentation `afdb770` + the toast-action `driver_id` commit onto a
+throwaway branch, build `--features driver`). Note: a dev install test
+self-replaces `target/debug/codescope.exe` with the payload — `rm` it
++ `touch src/main.rs` to force a clean relink afterward (cargo's
+fingerprint won't notice the swap on its own).
 
 ### Session 51 — paste fix, clippy debt, focus restore (#268–#271)
 
@@ -264,15 +303,18 @@ branches off `main`, each with its own PR + Copilot review pass:
 **Cursor for next session:**
 1. ~~User reviews + merges PRs #262–#266~~ — done in session 50, all
    five merged (see header).
-2. ~~`v0.5.0`~~ — **shipped** (see header). What remains is the
-   user-run **§4 auto-update validation**: upgrade the installed
-   v0.4.0 → "Installing" → "Update installed" → restart → About
-   shows v0.5.0 (`docs/RELEASE-VALIDATION.md` **§4**). §6 was run
-   and passed pre-tag.
-3. ~~Clippy doc-comment debt~~ — cleared in #269 (session 51); the
-   remaining clippy findings (too-many-arguments, enum size, …) are
-   accepted for now.
-4. MSIX / Store packaging still parked (closed #243 thread has the
+2. ~~`v0.5.0`~~ / ~~`v0.5.1`~~ — both **shipped**. v0.5.1 carries the
+   updater truncated-download fix. **User's next concrete step:** run
+   `CodeScope-v0.5.1-setup.exe` from the release to bypass the
+   truncating in-app updater and land on a build that has the fix;
+   after that the in-app updater self-heals. (Their network truncates
+   large HTTPS downloads — see header.)
+3. **Persist update-failure logging** (not yet filed): the installer
+   keeps no on-disk record of update errors, so a failure can't be
+   diagnosed after the toast dismisses. Add a `%LOCALAPPDATA%\
+   CodeScope\update.log` writing the flow + full error chain.
+4. ~~Clippy doc-comment debt~~ — cleared in #269 (session 51).
+5. MSIX / Store packaging still parked (closed #243 thread has the
    scoping notes).
 
 ### Session 47 — open-PR/issue sweep: #246, #243, #247, #248
