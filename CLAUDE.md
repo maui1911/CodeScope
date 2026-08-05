@@ -80,7 +80,9 @@ methods — `projects_file()`, `layout_file()`, `window_file()`,
 - macOS: `~/Library/Application Support/CodeScope/` →
   `~/Library/Application Support/CodeScope.Dev/` (both config and
   state — Apple's HIG keeps them together)
-- window title → `CodeScope [dev] — …`
+- window title → `CodeScope [dev]` (taskbar / alt-tab), plus a
+  matching accent-coloured `[dev]` badge next to the wordmark in the
+  custom titlebar. Installed builds stay `CodeScope`
 
 The Dev store is independent — projects opened in the dev build are
 separate from the installed build's projects. Typical loop: keep the

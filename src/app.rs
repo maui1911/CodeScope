@@ -6830,6 +6830,25 @@ impl Render for AppShell {
                     .text_color(theme::ink(&theme))
                     .child("CodeScope"),
             )
+            // `[dev]` marker — only on a `CODESCOPE_DEV` run. The
+            // documented dev loop keeps an installed CodeScope open
+            // next to the dev build (it hosts the sessions working on
+            // this repo), and two identical windows are a reliable way
+            // to test the wrong one. Accent-coloured rather than faint:
+            // this is the one label you want to catch at a glance. The
+            // OS window title carries the same marker, see
+            // `main::window_title`.
+            .when(self.paths.dev_mode, |row| {
+                row.child(
+                    div()
+                        .font(theme::font_mono())
+                        .text_size(px(10.0))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme::accent(&theme))
+                        .flex_none()
+                        .child("[dev]"),
+                )
+            })
             // Flex filler so the version slug pushes to the right edge
             // of the sidebar column (mirrors `Grid.Column="3"` in
             // `MainWindow.xaml`'s brand grid).
