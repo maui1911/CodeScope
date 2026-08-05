@@ -884,15 +884,23 @@ fn to_mouse_button(button: MouseButton) -> Option<mouse::MouseButton> {
 /// while the terminal has focus bubbles up to the shell instead of
 /// being eaten + forwarded to the PTY.
 ///
-/// **All app chords require Ctrl+Shift** so they don't collide with
-/// the wealth of plain-Ctrl bindings coding agents inside the
-/// terminal rely on (Ctrl+W = backward-kill-word, Ctrl+P = previous
+/// **Every Ctrl-based app chord requires Ctrl+Shift** so they don't
+/// collide with the wealth of plain-Ctrl bindings coding agents inside
+/// the terminal rely on (Ctrl+W = backward-kill-word, Ctrl+P = previous
 /// history, Ctrl+T = transpose, Ctrl+B = backward-char, Ctrl+1..9
 /// often mapped to history selection, …). Plain Ctrl+letter falls
 /// through to the PTY untouched.
 ///
-/// The only chords still on plain Ctrl are Ctrl+Tab / Ctrl+Shift+Tab
-/// (no shell binds Ctrl+Tab — shift is intrinsic to "prev" tab).
+/// Three documented exceptions to that rule:
+///
+/// * Ctrl+Tab / Ctrl+Shift+Tab — tab cycling. No shell binds Ctrl+Tab,
+///   and shift is intrinsic to "prev" tab.
+/// * Alt+Left / Alt+Right — group-focus cycling. Alt-only, because
+///   `AppShell` has always bound it there; shells and agents use
+///   Alt+B / Alt+F for word motion, not Alt+arrow.
+/// * Everything else with Alt held falls through to the PTY, including
+///   Alt+**Shift**+arrow — that's a different chord, nothing binds it,
+///   and swallowing it would cost the PTY its `CSI 1;4D`.
 pub(crate) fn is_app_level_shortcut(key: &str, mods: &gpui::Modifiers) -> bool {
     // Alt+Left / Alt+Right — AppShell group-focus cycling, the one
     // documented chord that isn't on Ctrl+Shift. Shells and agents use
@@ -900,7 +908,17 @@ pub(crate) fn is_app_level_shortcut(key: &str, mods: &gpui::Modifiers) -> bool {
     // here. Checked before the Ctrl gate below because this chord has
     // no Ctrl in it — without the early return the terminal swallows it
     // and sends `CSI 1;3D` to the PTY instead.
-    if mods.alt && !mods.control && !mods.platform && matches!(key, "left" | "right") {
+    //
+    // Exactly Alt+arrow: adding Shift (or Ctrl) makes it a chord
+    // nothing in the app binds, so it has to reach the PTY as
+    // `CSI 1;4D`. The matching guard lives on `AppShell`'s arm —
+    // the two tables are kept in lockstep.
+    if mods.alt
+        && !mods.shift
+        && !mods.control
+        && !mods.platform
+        && matches!(key, "left" | "right")
+    {
         return true;
     }
     let app_mod = mods.control || mods.platform;
@@ -1183,6 +1201,14 @@ mod tests {
         }
     }
 
+    fn alt_shift() -> Modifiers {
+        Modifiers {
+            alt: true,
+            shift: true,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn clipboard_image_detects_image_entries() {
         let image = Image::from_bytes(ImageFormat::Png, b"png".to_vec());
@@ -1290,9 +1316,13 @@ mod tests {
         assert!(!is_app_level_shortcut("b", &alt()));
         assert!(!is_app_level_shortcut("f", &alt()));
         assert!(!is_app_level_shortcut("p", &alt()));
-        // Ctrl+Alt+Left is a different chord — nothing binds it, and it
-        // must not masquerade as the group-focus one.
+        // Ctrl+Alt+Left and Alt+Shift+Left are *different* chords —
+        // nothing in the app binds either, so both must reach the PTY
+        // with their own modifier parameter (`CSI 1;8D` / `CSI 1;4D`)
+        // rather than masquerading as group-focus.
         assert!(!is_app_level_shortcut("left", &ctrl_alt()));
+        assert!(!is_app_level_shortcut("left", &alt_shift()));
+        assert!(!is_app_level_shortcut("right", &alt_shift()));
     }
 
     #[test]
