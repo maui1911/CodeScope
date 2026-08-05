@@ -233,6 +233,9 @@ fn main() -> Result<()> {
 
     let window_bounds = saved_window.map(window_state_to_bounds);
     write_boot_phase(&paths, "state_loaded:settings+projects+layout+window");
+    // Captured before `paths` moves into the window closure — the OS
+    // window title has to be decided up front, at `open_window`.
+    let window_title = window_title(paths.dev_mode);
     let paths = Arc::new(paths);
 
     // `with_assets` registers our static SVG icon set so
@@ -258,7 +261,7 @@ fn main() -> Result<()> {
                 WindowOptions {
                     window_bounds,
                     titlebar: Some(TitlebarOptions {
-                        title: Some("CodeScope".into()),
+                        title: Some(window_title.into()),
                         appears_transparent: true,
                         ..Default::default()
                     }),
@@ -285,6 +288,24 @@ fn main() -> Result<()> {
     });
 
     Ok(())
+}
+
+/// OS window title — what the taskbar, alt-tab and
+/// `Get-Process | Select MainWindowTitle` show.
+///
+/// Dev builds get a `[dev]` marker because the documented dev loop runs
+/// them *alongside* an installed CodeScope (the installed build hosts
+/// the sessions working on this repo, so it can't be closed — see
+/// `CLAUDE.md`). Two windows both called "CodeScope" are impossible to
+/// tell apart in the taskbar, which is exactly the confusion this
+/// avoids. The visible wordmark carries the same marker; see the brand
+/// cluster in [`crate::app::AppShell`]'s render.
+fn window_title(dev_mode: bool) -> &'static str {
+    if dev_mode {
+        "CodeScope [dev]"
+    } else {
+        "CodeScope"
+    }
 }
 
 /// Append a single timestamped phase marker to
@@ -338,6 +359,29 @@ fn window_state_to_bounds(state: WindowState) -> WindowBounds {
         WindowBounds::Maximized(bounds)
     } else {
         WindowBounds::Windowed(bounds)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::window_title;
+
+    #[test]
+    fn dev_runs_are_distinguishable_in_the_taskbar() {
+        // The whole point: an installed build and a dev build run side
+        // by side, so the titles must differ.
+        assert_eq!(window_title(false), "CodeScope");
+        assert_eq!(window_title(true), "CodeScope [dev]");
+        assert_ne!(window_title(true), window_title(false));
+    }
+
+    #[test]
+    fn release_title_stays_the_bare_product_name() {
+        // Nothing in the tree matches on the window title, so this
+        // guards the user-facing side only: an installed build must
+        // never leak dev chrome into alt-tab.
+        assert!(!window_title(false).contains("dev"));
+        assert!(!window_title(false).contains('['));
     }
 }
 
