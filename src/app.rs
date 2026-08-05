@@ -6837,7 +6837,7 @@ impl Render for AppShell {
             // to test the wrong one. Accent-coloured rather than faint:
             // this is the one label you want to catch at a glance. The
             // OS window title carries the same marker, see
-            // `main::window_title`.
+            // `crate::window_title`.
             .when(self.paths.dev_mode, |row| {
                 row.child(
                     div()

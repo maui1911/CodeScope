@@ -298,8 +298,8 @@ fn main() -> Result<()> {
 /// the sessions working on this repo, so it can't be closed — see
 /// `CLAUDE.md`). Two windows both called "CodeScope" are impossible to
 /// tell apart in the taskbar, which is exactly the confusion this
-/// avoids. The visible wordmark carries the same marker; see
-/// `AppShell::render`'s brand cluster.
+/// avoids. The visible wordmark carries the same marker; see the brand
+/// cluster in [`crate::app::AppShell`]'s render.
 fn window_title(dev_mode: bool) -> &'static str {
     if dev_mode {
         "CodeScope [dev]"
