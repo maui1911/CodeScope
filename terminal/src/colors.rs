@@ -175,21 +175,21 @@ impl ColorPalette {
     /// secondary text. Without this, faint text painted with the plain
     /// resolver is indistinguishable from normal text.
     ///
-    /// Named palette slots map to their dim counterpart the way xterm
-    /// and alacritty do (`Foreground` → `DimForeground`, `Red` →
-    /// `DimRed`, bright → normal), so a theme that spells out its own
-    /// dim colours still wins. RGB (`SGR 38;2`) and 256-colour cells
-    /// have no dim slot to map to, so their lightness is scaled by
-    /// [`DIM_FACTOR`] instead.
+    /// Every colour kind takes the same path: resolve normally, then
+    /// scale the result by [`DIM_FACTOR`]. Two things this deliberately
+    /// does *not* do, both learned the hard way:
+    ///
+    /// * It doesn't remap named slots through `NamedColor::to_dim()`.
+    ///   Alacritty can, because it ships a hand-tuned dim palette;
+    ///   `ThemePalette` has no dim slots, so ours are synthesized
+    ///   anyway — and the bright→normal half of that mapping collapsed
+    ///   dim bright-black onto plain black, which on tokyo-night is
+    ///   `#15161e` against a `#1a1b26` background. Invisible text.
+    /// * It doesn't scale HSL lightness. Lightness alone keeps
+    ///   saturation, which turns a pastel like tokyo-night's `#c0caf5`
+    ///   foreground into a *vivid* `#4f6be3` rather than dimming it.
     pub fn resolve_faint(&self, color: Color, colors: &Colors) -> Hsla {
-        match color {
-            Color::Named(named) => self.resolve(Color::Named(named.to_dim()), colors),
-            other => {
-                let mut c = self.resolve(other, colors);
-                c.l *= DIM_FACTOR;
-                c
-            }
-        }
+        scale_rgb(self.resolve(color, colors), DIM_FACTOR)
     }
 
     /// Resolve an alacritty colour-table index back to an `Rgb` triplet
@@ -261,13 +261,27 @@ fn build_extended_with_fallback(
     out
 }
 
-/// Lightness scale applied to a faint (SGR 2) cell whose colour has no
-/// dim palette slot to fall back on — alacritty's `DIM_FACTOR`.
+/// Multiplier applied to a faint (SGR 2) cell's foreground —
+/// alacritty's `DIM_FACTOR`. Applied to the RGB components, which is
+/// what alacritty means by it; see [`ColorPalette::resolve_faint`] for
+/// why scaling HSL lightness instead is wrong.
 const DIM_FACTOR: f32 = 0.66;
 
-fn dim(mut c: Hsla) -> Hsla {
-    c.l *= 0.7;
-    c
+/// Scale a colour's RGB components toward black, preserving alpha.
+/// Keeps the channel ratios intact, so a dimmed colour reads as the
+/// same colour rather than a more saturated cousin of it.
+fn scale_rgb(c: Hsla, factor: f32) -> Hsla {
+    let rgba = c.to_rgb();
+    Hsla::from(gpui::Rgba {
+        r: rgba.r * factor,
+        g: rgba.g * factor,
+        b: rgba.b * factor,
+        a: rgba.a,
+    })
+}
+
+fn dim(c: Hsla) -> Hsla {
+    scale_rgb(c, DIM_FACTOR)
 }
 
 fn bright(mut c: Hsla) -> Hsla {
@@ -305,48 +319,73 @@ fn rgb_to_hsla(rgb: Rgb) -> Hsla {
 mod tests {
     use super::*;
 
+    fn rgb8(c: Hsla) -> (u8, u8, u8) {
+        let rgba = c.to_rgb();
+        (
+            (rgba.r * 255.0).round() as u8,
+            (rgba.g * 255.0).round() as u8,
+            (rgba.b * 255.0).round() as u8,
+        )
+    }
+
     #[test]
-    fn faint_named_colours_map_to_their_dim_slot() {
+    fn faint_scales_rgb_channels_uniformly() {
         let palette = ColorPalette::default();
         let colors = Colors::default();
 
-        // SGR 2 on the default foreground — the shape claude-code emits
-        // for hints — must land visibly darker than plain foreground.
-        let normal = palette.resolve(Color::Named(NamedColor::Foreground), &colors);
-        let faint = palette.resolve_faint(Color::Named(NamedColor::Foreground), &colors);
-        assert!(
-            faint.l < normal.l,
-            "faint foreground ({}) should be darker than normal ({})",
-            faint.l,
-            normal.l
-        );
-        assert_eq!(
-            faint,
-            palette.resolve(Color::Named(NamedColor::DimForeground), &colors)
-        );
+        // Every colour kind takes the same path, so a faint cell is
+        // always the same colour at 66% brightness.
+        for color in [
+            Color::Named(NamedColor::Foreground),
+            Color::Named(NamedColor::Red),
+            Color::Named(NamedColor::BrightBlack),
+            Color::Indexed(42),
+            Color::Spec(Rgb { r: 0xc0, g: 0xca, b: 0xf5 }),
+        ] {
+            let (nr, ng, nb) = rgb8(palette.resolve(color, &colors));
+            let (fr, fg, fb) = rgb8(palette.resolve_faint(color, &colors));
+            for (normal, faint) in [(nr, fr), (ng, fg), (nb, fb)] {
+                let want = (f32::from(normal) * DIM_FACTOR).round() as u8;
+                assert!(
+                    faint.abs_diff(want) <= 1,
+                    "{color:?}: channel {normal} dimmed to {faint}, expected ~{want}"
+                );
+            }
+        }
+    }
 
-        // Bright colours step down to their normal variant, matching
-        // xterm / alacritty rather than getting scaled twice.
-        assert_eq!(
-            palette.resolve_faint(Color::Named(NamedColor::BrightRed), &colors),
-            palette.resolve(Color::Named(NamedColor::Red), &colors)
+    #[test]
+    fn faint_pastels_stay_pastel() {
+        // The regression that shipped in the first cut: scaling HSL
+        // lightness kept saturation, so tokyo-night's `#c0caf5`
+        // foreground dimmed into a vivid `#4f6be3`. Channel scaling
+        // keeps it a muted version of itself.
+        let palette = ColorPalette::default();
+        let colors = Colors::default();
+        let pastel = Color::Spec(Rgb { r: 0xc0, g: 0xca, b: 0xf5 });
+
+        let normal = palette.resolve(pastel, &colors);
+        let faint = palette.resolve_faint(pastel, &colors);
+        assert_eq!(rgb8(faint), (0x7f, 0x85, 0xa2));
+        assert!(
+            faint.s <= normal.s + 1e-3,
+            "dimming must not add saturation ({} → {})",
+            normal.s,
+            faint.s
         );
     }
 
     #[test]
-    fn faint_rgb_and_indexed_colours_are_scaled() {
+    fn faint_bright_black_stays_clear_of_the_background() {
+        // The other half of that regression: routing named slots through
+        // `NamedColor::to_dim()` collapsed dim bright-black onto plain
+        // black, which on a dark theme is the background. Text vanished.
         let palette = ColorPalette::default();
         let colors = Colors::default();
 
-        let spec = Color::Spec(Rgb { r: 0xc0, g: 0xc0, b: 0xc0 });
-        let normal = palette.resolve(spec, &colors);
-        let faint = palette.resolve_faint(spec, &colors);
-        assert!((faint.l - normal.l * DIM_FACTOR).abs() < 1e-6);
-        // Hue and saturation survive — only lightness moves, so a faint
-        // green still reads as green.
-        assert_eq!((faint.h, faint.s), (normal.h, normal.s));
-
-        let indexed = Color::Indexed(42);
-        assert!(palette.resolve_faint(indexed, &colors).l < palette.resolve(indexed, &colors).l);
+        let faint = palette.resolve_faint(Color::Named(NamedColor::BrightBlack), &colors);
+        let black = palette.resolve(Color::Named(NamedColor::Black), &colors);
+        assert_ne!(rgb8(faint), rgb8(black));
+        assert!(faint.l > black.l);
     }
 }

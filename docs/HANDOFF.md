@@ -81,20 +81,42 @@ F5-F12). Notes worth keeping:
 `Flags::BOLD`, `ITALIC`, `UNDERLINE`, `INVERSE` and ignored
 `Flags::DIM`, so every claude-code hint / shortcut legend painted at
 full strength and the visual hierarchy was lost. Added
-`ColorPalette::resolve_faint`: named slots map to their dim counterpart
-the way xterm/alacritty do (`Foreground` → `DimForeground`, `Red` →
-`DimRed`, bright → normal, so a theme's own dim colours still win), and
-RGB / 256-colour cells — which have no dim slot — get lightness scaled
-by `DIM_FACTOR` (0.66, alacritty's constant). Foreground only; the
-background is never dimmed.
+`ColorPalette::resolve_faint`, which resolves the colour normally and
+then scales its **RGB channels** by `DIM_FACTOR` (0.66, alacritty's
+constant). Foreground only; the background is never dimmed.
+
+The first cut of that function was wrong in two ways, both surfaced by
+the user testing the dev build against installed v0.5.1 — worth
+recording, because both look reasonable on paper:
+
+- It scaled **HSL lightness** instead of the RGB channels. Lightness
+  alone keeps saturation, so tokyo-night's pastel `#c0caf5` foreground
+  dimmed into a *vivid* `#4f6be3`. Channel scaling gives `#7f85a2` — a
+  muted version of the same colour. `DIM_FACTOR` is alacritty's
+  constant and alacritty means it per channel.
+- It routed named slots through `NamedColor::to_dim()` (`Red` →
+  `DimRed`, bright → normal). Alacritty can do that because it ships a
+  hand-tuned dim palette; `ThemePalette` has **no dim slots**, so ours
+  were synthesized anyway — and the bright→normal half collapsed dim
+  bright-black onto plain black, which on tokyo-night is `#15161e`
+  against a `#1a1b26` background. Invisible text.
+
+Now uniform: one path for every colour kind. The pre-existing `dim()`
+helper (explicit `Dim*` named colours) shares `scale_rgb` so the two
+can't drift apart. Three `colors.rs` tests pin it — channel scaling,
+pastels staying pastel, dim bright-black staying clear of the
+background.
 
 **Verified end-to-end, not just unit-tested.** A throwaway example
 (`terminal/examples/dimcheck.rs`, deleted after use) spawned a real PTY
 and measured the render + input paths:
 
-- `cmd /c type` of a file of raw escape bytes → faint default fg
-  `l=0.560` vs normal `0.800`; faint red `0.349` vs `0.498`; faint
-  24-bit `0.497` vs `0.753`. Hue/saturation preserved.
+- `cmd /c type` of a file of raw escape bytes → SGR 2 reached the
+  snapshot as a distinctly darker foreground on all three colour kinds
+  (default fg, named red, 24-bit). Re-measured against the user's
+  actual tokyo-night palette after the RGB-scaling fix: fg `#c0caf5` →
+  `#7f85a2`, red `#f7768e` → `#a34e5e`, bright-black `#414868` →
+  `#2b3045` (background is `#1a1b26`, so still legible).
 - A live `pwsh` session driven through `keystroke_to_bytes`: typing
   `echo hello world` + Ctrl+Left + `X` produced `echo hello Xworld`
   (word motion arrived); Ctrl+Backspace after `echo alpha beta` killed
