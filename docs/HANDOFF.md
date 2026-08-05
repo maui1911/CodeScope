@@ -26,13 +26,13 @@
 > triggers on plain `v*` tags.
 
 **Last updated:** 2026-08-05 (session 52 — terminal input: xterm modifier encoding for the named keys; renderer: SGR 2 (faint) support)
-**Branch:** `fix/terminal-modified-keys-and-dim` (PR open); `main` otherwise clean.
-**Head:** `main` at `dcbbb8a` (#277, the 0.5.1 bump). Update-saga merges this session: #275 truncated-download fix (`10b57b5`), #276 §6b resilience test (`fa655b1`), #277 bump (`dcbbb8a`). Earlier: v0.5.0 (#262–#274).
+**Branch:** `main`; both session-52 PRs merged, no open PRs.
+**Head:** `main` at `32d6e33`. Session-52 merges: #280 modifier encoding + faint rendering, #281 `[dev]` window title / titlebar badge. Both took a Copilot review round (Alt+Shift+arrow must reach the PTY, not the app; a stale doc invariant; a dead `main::` doc path) — all three addressed, threads resolved. Earlier this session: #275–#277 (v0.5.1), #262–#274 (v0.5.0).
 **Release:** **`v0.5.1` is published** (pipeline run 27406124661). It's a patch over v0.5.0 carrying the in-app updater robustness fix. **`v0.5.0` is also still up** but its updater can mis-handle a truncated download — see below.
 **The v0.5.0 update bug (root-caused + fixed this session):** the user's installed v0.4.0 → v0.5.0 in-app update failed (twice) with `Extract failed: … ZipError: invalid Zip archive: Could not find EOCD`. EOCD-missing = the downloaded zip was **truncated**. The published v0.5.0 artifact is **fine** (verified end-to-end: full GitHub download, valid `PK\x03\x04`, extracts cleanly with identical code + dep pins). Root cause was in `src/update.rs`'s downloader: the read loop broke on the first `Ok(0)` EOF and proceeded to extract **without checking `received == Content-Length`**, so a TLS-inspecting proxy / AV middlebox clipping the HTTPS download (a *clean* early EOF) silently produced a short zip. Fix (#275): `verify_complete` (pure, unit-tested) + `download_once` + `download_archive` (3 attempts, linear backoff). A short download now fails as honest "Download incomplete: received N of M bytes" and self-heals on retry. #276 added `dist/truncating_server.py` + RELEASE-VALIDATION §6b to guard it (§6 served from localhost, which never truncates — that's why the bug shipped).
 **⚠ The user is behind a network that truncates** large HTTPS downloads, so the v0.4.0/v0.5.0 in-app updater fails for them. Path forward given to them: run `CodeScope-v0.5.1-setup.exe` from the release directly (bypasses the updater) to land on the build that *has* the fix; after that the in-app updater self-heals. The verified-complete `CodeScope-v0.5.0-setup.exe` was earlier downloaded to `C:\Users\maui\Downloads\`.
 **Diagnostic logging gap (open):** the installer writes update failures only to a transient toast (auto-dismissed) and the temp dir (`tempfile::tempdir()` under `%TEMP%`, auto-deleted on return) — nothing persists to disk, so "do you have logs?" came up empty. Worth a follow-up: log the update flow + full error chain to `%LOCALAPPDATA%\CodeScope\update.log`. Not yet filed.
-**Build status:** ✅ workspace builds clean; suite green — 52 tests in `codescope-terminal` (11 new: 9 `input.rs`, 2 `colors.rs`), 481 in `codescope-core`, 129 in `codescope`. Clippy clean on changed files.
+**Build status:** ✅ workspace builds clean; suite green — 53 tests in `codescope-terminal` (12 new: 9 `input.rs`, 3 `colors.rs`), 481 in `codescope-core`, 131 in `codescope` (2 new: `window_title`). Clippy clean on changed files.
 **Uncommitted work:** none.
 **Open issues:** none filed. **Pre-existing failure on `main`:** the `core/src/path_canon.rs` doctest (line 11) fails under `cargo test --workspace` — the identical assertions pass as unit tests in the same file, so it's a doctest-harness quirk, not a `canonicalize_path` bug. Not touched by session 52 (zero diff in `core/`); worth a one-liner fix or `no_run`. **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree — do **NOT** run repo-wide `cargo fmt`; hand-format changed hunks. See the session-47 note. (Session 52 ran it by accident, got 2708 lines of churn across 60 files, and had to `git restore` + re-apply by hand. The warning is real.)
 
@@ -138,20 +138,35 @@ before you burn an hour on a phantom bug:**
    all of it. It looks exactly like a catastrophic palette regression.
    Strip them first:
    `Remove-Item env:NO_COLOR, env:CLAUDECODE, env:CLAUDE_CODE_*`.
-2. **The `[dev]` window title in `CLAUDE.md` does not exist.**
-   `src/main.rs` hardcodes `title: Some("CodeScope".into())` and there
-   is no `[dev]` suffix anywhere in the tree, so the dev window and the
-   installed window are indistinguishable in the taskbar and in
-   `Get-Process | Select MainWindowTitle`. Either implement the suffix
-   (three lines: thread `paths.dev_mode` into `TitlebarOptions`) or fix
-   `CLAUDE.md`. Not done here — out of scope for this PR.
+2. **The `[dev]` window title `CLAUDE.md` promised didn't exist — fixed
+   in #281.** `src/main.rs` hardcoded `title: Some("CodeScope".into())`
+   with no `[dev]` suffix anywhere in the tree, so the dev window and
+   the installed window were indistinguishable in the taskbar, in
+   alt-tab and in `Get-Process | Select MainWindowTitle`. That is how
+   this session nearly tested the wrong window. Now `window_title(
+   dev_mode)` sets the OS title and an accent-coloured `[dev]` badge
+   sits next to the wordmark in the custom titlebar (the visible one —
+   the titlebar is `appears_transparent`). `CLAUDE.md` was trimmed to
+   describe what is actually rendered; the ` — …` project-name suffix it
+   used to promise was never implemented and is still not.
 
-**Known gap to set expectations on:** claude-code's documented word
-navigation is **Alt+B / Alt+F**, not Ctrl+Left/Right — those aren't in
-its shortcut table. CodeScope now sends the standard sequences, so
-PSReadLine, bash/readline and any TUI that binds them work; if
-Ctrl+arrow still does nothing *inside* claude-code, that's an upstream
-gap, not an emulator one.
+**What the user confirmed, and the one gap that stays open.** Word
+navigation and Ctrl+Backspace both work inside claude-code after #280,
+and faint rendering looks right on tokyo-night. **Shift+arrow text
+selection does not work — and that is upstream, not ours.** The user
+verified it in a standalone pwsh outside CodeScope: same behaviour, so
+the emulator isn't the variable. claude-code has no selection shortcut
+at all in its documented table (it has `Ctrl+W`/`Ctrl+U`/`Ctrl+K` for
+cutting, and mouse drag is the *terminal* selecting screen text for
+copy, not claude-code tracking a selection in its input). Don't
+re-investigate this as a CodeScope bug; it needs a feature request on
+`anthropics/claude-code`.
+
+Related expectation: claude-code's documented word navigation is
+**Alt+B / Alt+F**, not Ctrl+Left/Right — those aren't in its shortcut
+table either, though they do work in practice via ConPTY's key-event
+translation. PSReadLine and bash/readline bind the standard sequences
+directly.
 
 ### Session 51c — v0.5.0 update bug → v0.5.1 (#275–#277)
 
