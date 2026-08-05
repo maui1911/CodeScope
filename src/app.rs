@@ -6147,14 +6147,20 @@ impl AppShell {
         // Ctrl-based tab chords below so they don't conflict.
         if mods.alt && !app_mod {
             match key {
-                "left" => {
+                // Exactly Alt+arrow. Alt+Shift+arrow is a different
+                // chord that nothing here binds, so it must fall
+                // through to the terminal and reach the PTY as
+                // `CSI 1;4D` — the terminal's `is_app_level_shortcut`
+                // carries the same guard, and the two are kept in
+                // lockstep.
+                "left" if !mods.shift => {
                     cx.stop_propagation();
                     if self.focused_group > 0 {
                         self.focus_group(self.focused_group - 1, window, cx);
                     }
                     return;
                 }
-                "right" => {
+                "right" if !mods.shift => {
                     cx.stop_propagation();
                     if self.focused_group + 1 < self.groups.len() {
                         self.focus_group(self.focused_group + 1, window, cx);

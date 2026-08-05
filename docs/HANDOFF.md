@@ -25,16 +25,133 @@
 > `.github/workflows/release.yml` (was `rs--release.yml`) and now
 > triggers on plain `v*` tags.
 
-**Last updated:** 2026-06-12 (session 51, continued — **v0.5.1 released**: diagnosed + fixed the in-app updater truncated-download bug, added a regression test, shipped the patch)
-**Branch:** `main`; no open PRs, no open issues.
+**Last updated:** 2026-08-05 (session 52 — terminal input: xterm modifier encoding for the named keys; renderer: SGR 2 (faint) support)
+**Branch:** `fix/terminal-modified-keys-and-dim` (PR open); `main` otherwise clean.
 **Head:** `main` at `dcbbb8a` (#277, the 0.5.1 bump). Update-saga merges this session: #275 truncated-download fix (`10b57b5`), #276 §6b resilience test (`fa655b1`), #277 bump (`dcbbb8a`). Earlier: v0.5.0 (#262–#274).
 **Release:** **`v0.5.1` is published** (pipeline run 27406124661). It's a patch over v0.5.0 carrying the in-app updater robustness fix. **`v0.5.0` is also still up** but its updater can mis-handle a truncated download — see below.
 **The v0.5.0 update bug (root-caused + fixed this session):** the user's installed v0.4.0 → v0.5.0 in-app update failed (twice) with `Extract failed: … ZipError: invalid Zip archive: Could not find EOCD`. EOCD-missing = the downloaded zip was **truncated**. The published v0.5.0 artifact is **fine** (verified end-to-end: full GitHub download, valid `PK\x03\x04`, extracts cleanly with identical code + dep pins). Root cause was in `src/update.rs`'s downloader: the read loop broke on the first `Ok(0)` EOF and proceeded to extract **without checking `received == Content-Length`**, so a TLS-inspecting proxy / AV middlebox clipping the HTTPS download (a *clean* early EOF) silently produced a short zip. Fix (#275): `verify_complete` (pure, unit-tested) + `download_once` + `download_archive` (3 attempts, linear backoff). A short download now fails as honest "Download incomplete: received N of M bytes" and self-heals on retry. #276 added `dist/truncating_server.py` + RELEASE-VALIDATION §6b to guard it (§6 served from localhost, which never truncates — that's why the bug shipped).
 **⚠ The user is behind a network that truncates** large HTTPS downloads, so the v0.4.0/v0.5.0 in-app updater fails for them. Path forward given to them: run `CodeScope-v0.5.1-setup.exe` from the release directly (bypasses the updater) to land on the build that *has* the fix; after that the in-app updater self-heals. The verified-complete `CodeScope-v0.5.0-setup.exe` was earlier downloaded to `C:\Users\maui\Downloads\`.
 **Diagnostic logging gap (open):** the installer writes update failures only to a transient toast (auto-dismissed) and the temp dir (`tempfile::tempdir()` under `%TEMP%`, auto-deleted on return) — nothing persists to disk, so "do you have logs?" came up empty. Worth a follow-up: log the update flow + full error chain to `%LOCALAPPDATA%\CodeScope\update.log`. Not yet filed.
-**Build status:** ✅ `main` builds clean; workspace suite green (4 new `verify_complete` unit tests in #275). Clippy clean on changed files.
+**Build status:** ✅ workspace builds clean; suite green — 52 tests in `codescope-terminal` (11 new: 9 `input.rs`, 2 `colors.rs`), 481 in `codescope-core`, 129 in `codescope`. Clippy clean on changed files.
 **Uncommitted work:** none.
-**Open issues:** none. **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree — do **NOT** run repo-wide `cargo fmt`; hand-format changed hunks. See the session-47 note.
+**Open issues:** none filed. **Pre-existing failure on `main`:** the `core/src/path_canon.rs` doctest (line 11) fails under `cargo test --workspace` — the identical assertions pass as unit tests in the same file, so it's a doctest-harness quirk, not a `canonicalize_path` bug. Not touched by session 52 (zero diff in `core/`); worth a one-liner fix or `no_run`. **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree — do **NOT** run repo-wide `cargo fmt`; hand-format changed hunks. See the session-47 note. (Session 52 ran it by accident, got 2708 lines of churn across 60 files, and had to `git restore` + re-apply by hand. The warning is real.)
+
+### Session 52 — modified-key encoding + faint (SGR 2) rendering
+
+Five user-reported terminal bugs, all in `codescope-terminal`, all with
+the same shape: an attribute or modifier the emulator simply dropped.
+
+**1–4. Ctrl / Shift / Ctrl+Shift + named keys did nothing.**
+`input.rs::keystroke_to_bytes` carried only the *unmodified* xterm
+table, so Ctrl+Left was emitted as a bare `CSI D`, Shift+End as `CSI F`,
+and Ctrl+Backspace as plain `DEL` — the agent inside the PTY could not
+tell them apart from the unmodified key. Added xterm's modifier
+encoding: `modifier_param` = `1 + shift(1) + alt(2) + ctrl(4)`, then
+`CSI 1 ; <mod> <final>` for the cursor keys / Home / End / F1-F4 and
+`CSI <n> ; <mod> ~` for the tilde block (Insert, Delete, PageUp/Down,
+F5-F12). Notes worth keeping:
+
+- Modified cursor keys always use the CSI form, **never** SS3, even in
+  DECCKM application-cursor mode — xterm has no modified SS3 encoding.
+  Unmodified keys keep the old SS3/CSI split.
+- Backspace now splits the way xterm does and the way ConPTY reverses
+  back into console key events: **DEL (`0x7f`) for Backspace, BS
+  (`0x08`) for Ctrl+Backspace**, ESC-prefixed for Alt. This is what
+  makes Ctrl+Backspace delete a word — claude-code documents
+  Ctrl+Backspace as "delete previous word" *on Windows* precisely
+  because Windows terminals send BS there.
+- `Modifiers::platform` (Cmd / Win) is deliberately left out of the
+  meta bit — it drives the app chords on macOS, and no TUI expects
+  `CSI 1;9D`.
+- Alt+Enter now emits `ESC CR` (the generic meta rule), which gives
+  agents a second multiline path next to `Ctrl+J` / `\`+Enter.
+- Fallout fix: with Alt+arrow finally producing bytes, the documented
+  **Alt+Left / Alt+Right group-focus chord** would have been swallowed
+  by the terminal and sent to the PTY as `CSI 1;3D`. Added them to
+  `view.rs::is_app_level_shortcut` so they bubble to `AppShell`. Only
+  the arrows — Alt+B/F (word motion), Alt+P, Alt+T, Alt+O, Alt+M are
+  all bound inside coding agents and stay with the PTY. The old
+  `alt_chord_stays_with_terminal` test asserted the opposite intent
+  with a comment claiming gpui delivers Alt+arrow at the window root;
+  it doesn't — the terminal element gets the key first and
+  `stop_propagation` ate it, so that chord was dead with terminal
+  focus. Replaced by `alt_arrows_bubble_for_group_focus`.
+
+**5. Faint (SGR 2) text rendered as normal text.** `backend.rs` read
+`Flags::BOLD`, `ITALIC`, `UNDERLINE`, `INVERSE` and ignored
+`Flags::DIM`, so every claude-code hint / shortcut legend painted at
+full strength and the visual hierarchy was lost. Added
+`ColorPalette::resolve_faint`, which resolves the colour normally and
+then scales its **RGB channels** by `DIM_FACTOR` (0.66, alacritty's
+constant). Foreground only; the background is never dimmed.
+
+The first cut of that function was wrong in two ways, both surfaced by
+the user testing the dev build against installed v0.5.1 — worth
+recording, because both look reasonable on paper:
+
+- It scaled **HSL lightness** instead of the RGB channels. Lightness
+  alone keeps saturation, so tokyo-night's pastel `#c0caf5` foreground
+  dimmed into a *vivid* `#4f6be3`. Channel scaling gives `#7f85a2` — a
+  muted version of the same colour. `DIM_FACTOR` is alacritty's
+  constant and alacritty means it per channel.
+- It routed named slots through `NamedColor::to_dim()` (`Red` →
+  `DimRed`, bright → normal). Alacritty can do that because it ships a
+  hand-tuned dim palette; `ThemePalette` has **no dim slots**, so ours
+  were synthesized anyway — and the bright→normal half collapsed dim
+  bright-black onto plain black, which on tokyo-night is `#15161e`
+  against a `#1a1b26` background. Invisible text.
+
+Now uniform: one path for every colour kind. The pre-existing `dim()`
+helper (explicit `Dim*` named colours) shares `scale_rgb` so the two
+can't drift apart. Three `colors.rs` tests pin it — channel scaling,
+pastels staying pastel, dim bright-black staying clear of the
+background.
+
+**Verified end-to-end, not just unit-tested.** A throwaway example
+(`terminal/examples/dimcheck.rs`, deleted after use) spawned a real PTY
+and measured the render + input paths:
+
+- `cmd /c type` of a file of raw escape bytes → SGR 2 reached the
+  snapshot as a distinctly darker foreground on all three colour kinds
+  (default fg, named red, 24-bit). Re-measured against the user's
+  actual tokyo-night palette after the RGB-scaling fix: fg `#c0caf5` →
+  `#7f85a2`, red `#f7768e` → `#a34e5e`, bright-black `#414868` →
+  `#2b3045` (background is `#1a1b26`, so still legible).
+- A live `pwsh` session driven through `keystroke_to_bytes`: typing
+  `echo hello world` + Ctrl+Left + `X` produced `echo hello Xworld`
+  (word motion arrived); Ctrl+Backspace after `echo alpha beta` killed
+  the whole word `beta`; Ctrl+Shift+Left was consumed cleanly with no
+  literal `[1;6D` garbage on the line. ConPTY translates our sequences
+  back into console key events, which is the same path claude-code
+  reads on Windows.
+
+**Two dev-loop traps found while testing this, both worth knowing
+before you burn an hour on a phantom bug:**
+
+1. **Never launch the dev build from a Claude Code tool shell without
+   scrubbing the environment.** That shell has `NO_COLOR=1` (claude-code
+   sets it so command output isn't polluted with ANSI codes), plus
+   `CLAUDECODE=1`, `CLAUDE_CODE_*` and `TERM_PROGRAM=CodeScope`.
+   `SpawnConfig.env` merges on top of the parent process env, so every
+   PTY child of the dev build inherits `NO_COLOR` and renders
+   **everything in the default theme foreground** — pwsh, claude, pi,
+   all of it. It looks exactly like a catastrophic palette regression.
+   Strip them first:
+   `Remove-Item env:NO_COLOR, env:CLAUDECODE, env:CLAUDE_CODE_*`.
+2. **The `[dev]` window title in `CLAUDE.md` does not exist.**
+   `src/main.rs` hardcodes `title: Some("CodeScope".into())` and there
+   is no `[dev]` suffix anywhere in the tree, so the dev window and the
+   installed window are indistinguishable in the taskbar and in
+   `Get-Process | Select MainWindowTitle`. Either implement the suffix
+   (three lines: thread `paths.dev_mode` into `TitlebarOptions`) or fix
+   `CLAUDE.md`. Not done here — out of scope for this PR.
+
+**Known gap to set expectations on:** claude-code's documented word
+navigation is **Alt+B / Alt+F**, not Ctrl+Left/Right — those aren't in
+its shortcut table. CodeScope now sends the standard sequences, so
+PSReadLine, bash/readline and any TUI that binds them work; if
+Ctrl+arrow still does nothing *inside* claude-code, that's an upstream
+gap, not an emulator one.
 
 ### Session 51c — v0.5.0 update bug → v0.5.1 (#275–#277)
 
@@ -1208,6 +1325,29 @@ gpui's Windows keyboard adapter folds shifted digits into `!@#$%^&*(`
 and clears `mods.shift`, so `keystroke_digit_index` (and the matching
 match arm in the terminal whitelist) accept both shapes — see the
 unit tests in both files.
+
+Everything *not* on that list goes to the PTY through
+`terminal/src/input.rs::keystroke_to_bytes`, which since session 52
+carries xterm's full modifier encoding — `1 + shift(1) + alt(2) +
+ctrl(4)`:
+
+| Key                     | Unmodified      | With modifier `m`   |
+|-------------------------|-----------------|---------------------|
+| Up/Down/Right/Left      | `CSI A/B/C/D` (`SS3` in DECCKM) | `CSI 1;m A/B/C/D` |
+| Home / End              | `CSI H` / `CSI F` | `CSI 1;m H/F`     |
+| Insert / Delete         | `CSI 2~` / `CSI 3~` | `CSI 2;m ~` / `CSI 3;m ~` |
+| PageUp / PageDown       | `CSI 5~` / `CSI 6~` | `CSI 5;m ~` / `CSI 6;m ~` |
+| F1-F4                   | `SS3 P/Q/R/S`   | `CSI 1;m P/Q/R/S`   |
+| F5-F12                  | `CSI 15/17…24 ~` | `CSI 15;m ~` …     |
+| Backspace               | `DEL` (`0x7f`)  | Ctrl → `BS` (`0x08`), Alt → `ESC DEL` |
+| Enter                   | `CR`            | Alt → `ESC CR`      |
+| Tab                     | `HT`            | Shift → `CSI Z`     |
+
+Modified cursor keys never use SS3 (xterm has no modified SS3 form),
+and `Modifiers::platform` is not folded into the meta bit. The
+Backspace split is what makes Ctrl+Backspace delete a word: ConPTY
+turns `BS` back into a Ctrl+Backspace console key event, which is what
+claude-code reads on Windows.
 
 ### Cursor — what's next
 

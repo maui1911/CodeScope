@@ -396,7 +396,16 @@ impl Backend {
                 let len_cols = if flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
 
                 let inverse = flags.contains(Flags::INVERSE);
-                let mut fg = palette.resolve(cell.fg, content.colors);
+                // SGR 2 (faint) dims the *foreground* only — never the
+                // background, same as xterm / alacritty. claude-code
+                // leans on it for hints and shortcut legends, so
+                // dropping the flag rendered that text at full
+                // strength and lost the visual hierarchy.
+                let mut fg = if flags.contains(Flags::DIM) {
+                    palette.resolve_faint(cell.fg, content.colors)
+                } else {
+                    palette.resolve(cell.fg, content.colors)
+                };
                 let mut bg = palette.resolve(cell.bg, content.colors);
                 if inverse {
                     std::mem::swap(&mut fg, &mut bg);
