@@ -125,6 +125,27 @@ and measured the render + input paths:
   back into console key events, which is the same path claude-code
   reads on Windows.
 
+**Two dev-loop traps found while testing this, both worth knowing
+before you burn an hour on a phantom bug:**
+
+1. **Never launch the dev build from a Claude Code tool shell without
+   scrubbing the environment.** That shell has `NO_COLOR=1` (claude-code
+   sets it so command output isn't polluted with ANSI codes), plus
+   `CLAUDECODE=1`, `CLAUDE_CODE_*` and `TERM_PROGRAM=CodeScope`.
+   `SpawnConfig.env` merges on top of the parent process env, so every
+   PTY child of the dev build inherits `NO_COLOR` and renders
+   **everything in the default theme foreground** — pwsh, claude, pi,
+   all of it. It looks exactly like a catastrophic palette regression.
+   Strip them first:
+   `Remove-Item env:NO_COLOR, env:CLAUDECODE, env:CLAUDE_CODE_*`.
+2. **The `[dev]` window title in `CLAUDE.md` does not exist.**
+   `src/main.rs` hardcodes `title: Some("CodeScope".into())` and there
+   is no `[dev]` suffix anywhere in the tree, so the dev window and the
+   installed window are indistinguishable in the taskbar and in
+   `Get-Process | Select MainWindowTitle`. Either implement the suffix
+   (three lines: thread `paths.dev_mode` into `TitlebarOptions`) or fix
+   `CLAUDE.md`. Not done here — out of scope for this PR.
+
 **Known gap to set expectations on:** claude-code's documented word
 navigation is **Alt+B / Alt+F**, not Ctrl+Left/Right — those aren't in
 its shortcut table. CodeScope now sends the standard sequences, so
