@@ -894,6 +894,15 @@ fn to_mouse_button(button: MouseButton) -> Option<mouse::MouseButton> {
 /// The only chords still on plain Ctrl are Ctrl+Tab / Ctrl+Shift+Tab
 /// (no shell binds Ctrl+Tab — shift is intrinsic to "prev" tab).
 pub(crate) fn is_app_level_shortcut(key: &str, mods: &gpui::Modifiers) -> bool {
+    // Alt+Left / Alt+Right — AppShell group-focus cycling, the one
+    // documented chord that isn't on Ctrl+Shift. Shells and agents use
+    // Alt+B / Alt+F for word motion, not Alt+arrow, so the app wins
+    // here. Checked before the Ctrl gate below because this chord has
+    // no Ctrl in it — without the early return the terminal swallows it
+    // and sends `CSI 1;3D` to the PTY instead.
+    if mods.alt && !mods.control && !mods.platform && matches!(key, "left" | "right") {
+        return true;
+    }
     let app_mod = mods.control || mods.platform;
     if !app_mod || mods.alt {
         return false;
@@ -1167,6 +1176,13 @@ mod tests {
         }
     }
 
+    fn alt() -> Modifiers {
+        Modifiers {
+            alt: true,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn clipboard_image_detects_image_entries() {
         let image = Image::from_bytes(ImageFormat::Png, b"png".to_vec());
@@ -1261,10 +1277,21 @@ mod tests {
     }
 
     #[test]
-    fn alt_chord_stays_with_terminal() {
-        // Alt+Left/Right etc. are app-level for group focus, but
-        // they aren't app-level *here* — gpui delivers them at the
-        // window root, not via terminal bubbling.
+    fn alt_arrows_bubble_for_group_focus() {
+        // Alt+Left / Alt+Right cycle the focused group. The terminal
+        // element sits below AppShell in the dispatch tree and gets the
+        // key first, so it has to opt out explicitly — otherwise
+        // `stop_propagation` eats the chord and the PTY receives
+        // `CSI 1;3D` instead.
+        assert!(is_app_level_shortcut("left", &alt()));
+        assert!(is_app_level_shortcut("right", &alt()));
+        // Only the arrows. Alt+B / Alt+F (word motion), Alt+P, Alt+T,
+        // Alt+O and Alt+M are all bound inside coding agents.
+        assert!(!is_app_level_shortcut("b", &alt()));
+        assert!(!is_app_level_shortcut("f", &alt()));
+        assert!(!is_app_level_shortcut("p", &alt()));
+        // Ctrl+Alt+Left is a different chord — nothing binds it, and it
+        // must not masquerade as the group-focus one.
         assert!(!is_app_level_shortcut("left", &ctrl_alt()));
     }
 

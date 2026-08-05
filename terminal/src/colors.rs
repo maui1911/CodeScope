@@ -170,6 +170,28 @@ impl ColorPalette {
         }
     }
 
+    /// Resolve a cell foreground that carries SGR 2 (faint) — the
+    /// attribute claude-code uses for hints, shortcut legends and other
+    /// secondary text. Without this, faint text painted with the plain
+    /// resolver is indistinguishable from normal text.
+    ///
+    /// Named palette slots map to their dim counterpart the way xterm
+    /// and alacritty do (`Foreground` → `DimForeground`, `Red` →
+    /// `DimRed`, bright → normal), so a theme that spells out its own
+    /// dim colours still wins. RGB (`SGR 38;2`) and 256-colour cells
+    /// have no dim slot to map to, so their lightness is scaled by
+    /// [`DIM_FACTOR`] instead.
+    pub fn resolve_faint(&self, color: Color, colors: &Colors) -> Hsla {
+        match color {
+            Color::Named(named) => self.resolve(Color::Named(named.to_dim()), colors),
+            other => {
+                let mut c = self.resolve(other, colors);
+                c.l *= DIM_FACTOR;
+                c
+            }
+        }
+    }
+
     /// Resolve an alacritty colour-table index back to an `Rgb` triplet
     /// for OSC 4 / OSC 10-12 query responses. The index follows
     /// alacritty's `Colors` layout: 0..16 = ANSI, 16..256 = 256-colour
@@ -239,6 +261,10 @@ fn build_extended_with_fallback(
     out
 }
 
+/// Lightness scale applied to a faint (SGR 2) cell whose colour has no
+/// dim palette slot to fall back on — alacritty's `DIM_FACTOR`.
+const DIM_FACTOR: f32 = 0.66;
+
 fn dim(mut c: Hsla) -> Hsla {
     c.l *= 0.7;
     c
@@ -273,4 +299,54 @@ fn rgb_to_hsla(rgb: Rgb) -> Hsla {
     };
     let h = if h < 0.0 { h + 360.0 } else { h } / 360.0;
     Hsla { h, s, l, a: 1.0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn faint_named_colours_map_to_their_dim_slot() {
+        let palette = ColorPalette::default();
+        let colors = Colors::default();
+
+        // SGR 2 on the default foreground — the shape claude-code emits
+        // for hints — must land visibly darker than plain foreground.
+        let normal = palette.resolve(Color::Named(NamedColor::Foreground), &colors);
+        let faint = palette.resolve_faint(Color::Named(NamedColor::Foreground), &colors);
+        assert!(
+            faint.l < normal.l,
+            "faint foreground ({}) should be darker than normal ({})",
+            faint.l,
+            normal.l
+        );
+        assert_eq!(
+            faint,
+            palette.resolve(Color::Named(NamedColor::DimForeground), &colors)
+        );
+
+        // Bright colours step down to their normal variant, matching
+        // xterm / alacritty rather than getting scaled twice.
+        assert_eq!(
+            palette.resolve_faint(Color::Named(NamedColor::BrightRed), &colors),
+            palette.resolve(Color::Named(NamedColor::Red), &colors)
+        );
+    }
+
+    #[test]
+    fn faint_rgb_and_indexed_colours_are_scaled() {
+        let palette = ColorPalette::default();
+        let colors = Colors::default();
+
+        let spec = Color::Spec(Rgb { r: 0xc0, g: 0xc0, b: 0xc0 });
+        let normal = palette.resolve(spec, &colors);
+        let faint = palette.resolve_faint(spec, &colors);
+        assert!((faint.l - normal.l * DIM_FACTOR).abs() < 1e-6);
+        // Hue and saturation survive — only lightness moves, so a faint
+        // green still reads as green.
+        assert_eq!((faint.h, faint.s), (normal.h, normal.s));
+
+        let indexed = Color::Indexed(42);
+        assert!(palette.resolve_faint(indexed, &colors).l < palette.resolve(indexed, &colors).l);
+    }
 }
