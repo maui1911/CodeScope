@@ -25,16 +25,132 @@
 > `.github/workflows/release.yml` (was `rs--release.yml`) and now
 > triggers on plain `v*` tags.
 
-**Last updated:** 2026-08-05 (session 52 — terminal input: xterm modifier encoding for the named keys; renderer: SGR 2 (faint) support)
-**Branch:** `main`; both session-52 PRs merged, no open PRs.
-**Head:** `main` at `32d6e33`. Session-52 merges: #280 modifier encoding + faint rendering, #281 `[dev]` window title / titlebar badge. Both took a Copilot review round (Alt+Shift+arrow must reach the PTY, not the app; a stale doc invariant; a dead `main::` doc path) — all three addressed, threads resolved. Earlier this session: #275–#277 (v0.5.1), #262–#274 (v0.5.0).
+**Last updated:** 2026-08-09 (session 53 — session ↔ transcript mapping: cross-tab adoption claims, and retention for transcripts the agent CLI already deleted)
+**Branch:** `main`; both session-53 PRs merged, no open PRs.
+**Head:** `main` at `3933eb7`. Session-53 merges: #285 adoption claims, #286 dangling-transcript prune. Both took two Copilot rounds plus a four-pass Codex review; details below. Session 52 merged #280 modifier encoding + faint rendering, #281 `[dev]` window title / titlebar badge. Earlier: #275–#277 (v0.5.1), #262–#274 (v0.5.0).
 **Release:** **`v0.5.1` is published** (pipeline run 27406124661). It's a patch over v0.5.0 carrying the in-app updater robustness fix. **`v0.5.0` is also still up** but its updater can mis-handle a truncated download — see below.
 **The v0.5.0 update bug (root-caused + fixed this session):** the user's installed v0.4.0 → v0.5.0 in-app update failed (twice) with `Extract failed: … ZipError: invalid Zip archive: Could not find EOCD`. EOCD-missing = the downloaded zip was **truncated**. The published v0.5.0 artifact is **fine** (verified end-to-end: full GitHub download, valid `PK\x03\x04`, extracts cleanly with identical code + dep pins). Root cause was in `src/update.rs`'s downloader: the read loop broke on the first `Ok(0)` EOF and proceeded to extract **without checking `received == Content-Length`**, so a TLS-inspecting proxy / AV middlebox clipping the HTTPS download (a *clean* early EOF) silently produced a short zip. Fix (#275): `verify_complete` (pure, unit-tested) + `download_once` + `download_archive` (3 attempts, linear backoff). A short download now fails as honest "Download incomplete: received N of M bytes" and self-heals on retry. #276 added `dist/truncating_server.py` + RELEASE-VALIDATION §6b to guard it (§6 served from localhost, which never truncates — that's why the bug shipped).
 **⚠ The user is behind a network that truncates** large HTTPS downloads, so the v0.4.0/v0.5.0 in-app updater fails for them. Path forward given to them: run `CodeScope-v0.5.1-setup.exe` from the release directly (bypasses the updater) to land on the build that *has* the fix; after that the in-app updater self-heals. The verified-complete `CodeScope-v0.5.0-setup.exe` was earlier downloaded to `C:\Users\maui\Downloads\`.
 **Diagnostic logging gap (open):** the installer writes update failures only to a transient toast (auto-dismissed) and the temp dir (`tempfile::tempdir()` under `%TEMP%`, auto-deleted on return) — nothing persists to disk, so "do you have logs?" came up empty. Worth a follow-up: log the update flow + full error chain to `%LOCALAPPDATA%\CodeScope\update.log`. Not yet filed.
-**Build status:** ✅ workspace builds clean; suite green — 53 tests in `codescope-terminal` (12 new: 9 `input.rs`, 3 `colors.rs`), 481 in `codescope-core`, 131 in `codescope` (2 new: `window_title`). Clippy clean on changed files.
+**Build status:** ✅ workspace builds clean; suite green on `main` — 53 in `codescope-terminal`, 491 in `codescope-core` (+10 this session), 136 in `codescope` (+5). Clippy: 0 errors, only the pre-existing warnings (`app.rs` `map_or` / `spawn_tab_in` arg count / large enum variant, `core` `from_str` / `sort_by_key`).
 **Uncommitted work:** none.
-**Open issues:** none filed. **Pre-existing failure on `main`:** the `core/src/path_canon.rs` doctest (line 11) fails under `cargo test --workspace` — the identical assertions pass as unit tests in the same file, so it's a doctest-harness quirk, not a `canonicalize_path` bug. Not touched by session 52 (zero diff in `core/`); worth a one-liner fix or `no_run`. **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree — do **NOT** run repo-wide `cargo fmt`; hand-format changed hunks. See the session-47 note. (Session 52 ran it by accident, got 2708 lines of churn across 60 files, and had to `git restore` + re-apply by hand. The warning is real.)
+**Open issues:** none filed. **The `core/src/path_canon.rs` doctest now passes** — `cargo test --workspace` reported a green doctest run all session, so the session-52 note about it failing no longer reproduces; drop it if a later session confirms. **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree — do **NOT** run repo-wide `cargo fmt`; hand-format changed hunks. See the session-47 note. (Session 52 ran it by accident, got 2708 lines of churn across 60 files, and had to `git restore` + re-apply by hand. The warning is real.)
+
+### Session 53 — session ↔ transcript mapping
+
+User report: "reopening old sessions doesn't save right, like the
+mapping is off." It was. Both PRs come out of that one sentence.
+
+**#285 — two tabs could adopt the same transcript.**
+`start_agent_discovery_poll` picked, per tab, the newest transcript in
+the tab's cwd that *that tab* hadn't fired, with no exclusion between
+tabs. Two tabs on one working directory — the normal case, since "new
+session" opens another tab on the project's primary path — scan the
+same `~/.claude/projects/<encoded-cwd>/` listing, so a tab whose own
+agent hadn't written yet adopted its neighbour's transcript and
+`persist_agent_session_id` stamped that UUID onto the wrong row.
+
+Found in the user's real store: 4 groups of rows sharing one
+`agentSessionId`, including three distinct `Werk` sessions
+("Nascholing", "Email", "Nieuwsbrief") on one Claude conversation. The
+newest duplicate was minted on v0.5.2, so it was live.
+
+Three parts, and the order they were added in matters:
+
+- `select_adoption` skips candidates claimed by another tab; a tab's
+  own adopted id stays exempt so a restored tab can re-fire what it is
+  resuming.
+- The claim set is seeded from **every `agent_session_id` in
+  `projects.json`**, not just the open tabs. Closing a tab drops its
+  `Tab` struct, which would otherwise release its transcript to a
+  sibling on the very next tick.
+- Selection runs in **two rounds, unadopted tabs first**. This one was
+  found by review, not by design: with claims exclusive but no
+  ordering rule, a tab that already owned a transcript would rotate
+  onto the one its neighbour just minted — stealing it *and* locking
+  the rightful tab out permanently. That is worse than the original
+  bug. Do not remove the rounds without replacing them.
+
+`spawn_tab_in` seeds `Tab::adopted_session_id` from the persisted row
+so rehydrate / reopen claim from tick zero; only the first tab to claim
+an id seeds it, so stores already carrying duplicates converge.
+
+**The contract is uniqueness, not ownership.** Nothing proves a
+transcript was minted by the tab adopting it — within a round,
+iteration order decides. Three ceilings are documented on
+`select_adoption`: a `/clear` rotation among tabs that all already
+adopted; two tabs that have *neither* adopted yet (crosses the two
+mappings if the second tab's agent writes first — each still gets one
+transcript, so it is a wrong label, not starvation); and dev vs
+installed builds sharing `~/.claude/projects/` with separate stores.
+All three need the agent to report its own session id back to us.
+
+**#286 — closed rows outliving their conversation.** Claude Code
+deletes transcripts after ~30 days; `RetentionPolicy::MAX_AGE_DAYS` is
+90. 19 of 30 rows with an `agentSessionId` pointed at a transcript that
+no longer existed, and reopening one runs `claude --resume <id>`
+against a session the CLI has forgotten.
+`SessionManager::prune_missing_transcripts` drops those rows from
+`load_and_sweep` (load only — a just-closed session still has its
+transcript).
+
+Because it deletes history, the probe is three-way and only a definite
+`Some(false)` removes anything. `None` (undecidable, always keeps) is
+the verdict for: no `agent_id` / `agent_session_id`; a blank
+`worktree_path`; an id outside the agent's UUID grammar; an
+unresolvable or unreadable agent root; a missing per-session directory
+(so a moved or renamed worktree keeps its rows); and Pi / OpenCode /
+Codex, whose layouts need a tree walk (OpenCode's `storage/` slug is
+derived from the project path and not predictable). Existence goes
+through `entry_presence`, which only answers `Some(false)` for a
+genuine `NotFound` — `Path::exists()` reports `false` for permission
+errors too, which in a deleting probe means destroyed history.
+
+**Two of those guards came from review, and both were real bugs.** A
+blank `worktree_path` makes `encode_cwd("")` empty, so `root.join("")`
+lands back on the projects root — a readable directory that passes the
+parent guard while never holding the transcript, i.e. a confident
+wrong deletion. And an unvalidated id went straight into `join` /
+`format!`, so `..` or an absolute path could aim the check anywhere.
+
+**Verification harness worth reusing.** #285 was proven with an A/B
+against `main` through a `driver`-instrumented dev build: a fixture
+project, a `claude.cmd` shim on PATH so tabs resolve to
+`AgentId::Claude` without spawning the real CLI (`agent_id_from_auto_type`
+only matches the first token), and hand-written `.jsonl` transcripts
+for deterministic timing. On `main` both rows converged onto one
+transcript; with the fix each kept its own. The instrumentation lives
+on local-only branches `test/verify-285-driver` /
+`test/verify285-baseline` — never merge them.
+
+**Manual data repair on the user's installed store** (backups in the
+session scratchpad). One duplicate group still had a live transcript,
+and the owner was reconstructable from `lastOpened` vs the transcript's
+creation time — the 6-second-old session that adopted it was cleared,
+the real owner kept its id. The other three groups pointed at
+transcripts gone from `~/.claude` entirely, so all 7 rows were removed
+outright. Store went 69 → 62 sessions, 0 duplicates. The remaining 19
+dangling rows were left for #286's sweep: 12 will be pruned on the
+first launch of a build carrying it, 1 depends on whether
+`~/.copilot/session-state/` exists, and 6 stay by design (3 missing
+transcript dirs, 3 legacy rows with no `agentId`).
+
+**⚠ The dev store was overwritten** while building the harness:
+`%APPDATA%\CodeScope.Dev\projects.json` now holds only the `alpha`
+fixture project, and `settings.json` was set to `defaultAgent: claude`
+with a single profile. Any other fixture projects that were there are
+gone.
+
+**Review notes.** Copilot's substantive catches: the per-tick `Scan`
+clones (fixed by carrying indices + a `has_adoption` flag and
+re-reading the tab), `Path::exists()`, a doc comment my insertion stole
+from `encode_cwd`, and a contract mismatch — #285's title and body
+promised ownership after the code doc had already conceded the third
+ceiling, so the PR was narrowed to "stop two tabs *sharing* one id".
+The four-pass Codex review produced 12 findings, 6 survived triage. The
+dropped ones are worth knowing: the load→prune→save TOCTOU already
+exists on `main` via `apply_retention`, and dev/installed use separate
+stores anyway.
 
 ### Session 52 — modified-key encoding + faint (SGR 2) rendering
 
