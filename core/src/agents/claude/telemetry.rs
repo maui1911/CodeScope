@@ -16,6 +16,7 @@
 //! while idle) — this module is pure logic; there is no background
 //! thread inside it.
 
+use std::collections::HashSet;
 use std::io::{BufRead as _, BufReader, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -192,6 +193,56 @@ fn parse_iso8601(s: &str) -> Option<f64> {
 }
 
 // ---------------------------------------------------------------------------
+// Background subagents
+// ---------------------------------------------------------------------------
+
+/// Text Claude Code writes into the `tool_result` of an `Agent` call
+/// that was launched in the background. The agent id follows on the
+/// next line as `agentId: <id>`.
+const AGENT_LAUNCH_MARKER: &str = "Async agent launched successfully";
+
+/// Wrapper element of the message Claude Code injects when a
+/// background task stops. Carries `<task-id>` plus a `<status>` that
+/// is always terminal (`completed` / `failed` / `killed` / `stopped`),
+/// so any notification for an id retires it.
+const TASK_NOTIFICATION_MARKER: &str = "<task-notification>";
+
+/// Update `pending` from one **user** transcript line.
+///
+/// Both markers only ever reach the transcript inside user entries
+/// (the launch as a `tool_result`, the completion as an injected
+/// `<task-notification>` message), so the caller gates on
+/// [`EntryKind::User`] and we can scan the raw JSON text instead of
+/// walking a `content` shape that differs between the two.
+///
+/// One line can carry several markers — two `Agent` calls in a single
+/// assistant message produce two `tool_result` blocks in one user
+/// entry, and queued notifications batch the same way.
+fn apply_agent_markers(line: &str, pending: &mut HashSet<String>) {
+    for (idx, _) in line.match_indices(AGENT_LAUNCH_MARKER) {
+        if let Some(id) = tagged_value(&line[idx..], "agentId: ", |c| c.is_ascii_alphanumeric()) {
+            pending.insert(id);
+        }
+    }
+    if line.contains(TASK_NOTIFICATION_MARKER) {
+        for (idx, _) in line.match_indices("<task-id>") {
+            if let Some(id) = tagged_value(&line[idx..], "<task-id>", |c| c != '<') {
+                pending.remove(&id);
+            }
+        }
+    }
+}
+
+/// First `prefix`-introduced run of `accept` characters in `hay`, or
+/// `None` when the prefix is absent or immediately followed by a
+/// rejected character.
+fn tagged_value(hay: &str, prefix: &str, accept: impl Fn(char) -> bool) -> Option<String> {
+    let start = hay.find(prefix)? + prefix.len();
+    let value: String = hay[start..].chars().take_while(|c| accept(*c)).collect();
+    (!value.is_empty()).then_some(value)
+}
+
+// ---------------------------------------------------------------------------
 // Incremental reader
 // ---------------------------------------------------------------------------
 
@@ -206,12 +257,19 @@ fn parse_iso8601(s: &str) -> Option<f64> {
 /// shrinks (truncated / replaced) `tail.last_pos` is reset to 0 and
 /// the file is re-read from the beginning.
 ///
+/// `pending_agents` accumulates the ids of background subagents that
+/// were launched but have not reported back yet; while it is
+/// non-empty an otherwise-`Idle` session stays [`SessionState::Busy`]
+/// (issue #284 — the main agent finishes its turn while its
+/// background agents keep working, and the green dot lied).
+///
 /// Mirrors `ClaudeTelemetryService.TryRead` from the C# build.
 pub fn process_new_lines(
     path: &Path,
     tail: &mut FileTail,
     snapshot: &mut Option<TelemetrySnapshot>,
     last_user_ts: &mut Option<f64>,
+    pending_agents: &mut HashSet<String>,
 ) -> bool {
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
@@ -236,6 +294,21 @@ pub fn process_new_lines(
         *last_user_ts = None;
         *snapshot = None;
     }
+
+    // A read that starts at byte 0 is replaying history: either the
+    // tail was just created (the agent process behind this transcript
+    // cannot be older than the tail — a resumed session gets a fresh
+    // CLI) or the file was rewritten. Background agents launched in
+    // that history are therefore all dead, so the pending set is
+    // dropped once the replay finishes rather than pinning the
+    // session to `Busy` forever.
+    //
+    // ponytail: the cost is a launch that lands in the very first
+    // read (adoption racing the first `Agent` call) being missed —
+    // that degrades to the pre-#284 behaviour for one agent, where
+    // keeping it would mean a permanently wrong red dot after every
+    // resume. Needs the agent to report liveness to do better.
+    let catch_up = tail.last_pos == 0;
 
     if let Err(err) = f.seek(SeekFrom::Start(tail.last_pos)) {
         eprintln!("[claude_telemetry] seek failed for {path:?}: {err}");
@@ -286,6 +359,7 @@ pub fn process_new_lines(
                 if !entry.user_carries_tool_result {
                     *last_user_ts = entry.timestamp_secs;
                 }
+                apply_agent_markers(&line, pending_agents);
                 changed = true;
             }
             EntryKind::Assistant => {
@@ -348,6 +422,18 @@ pub fn process_new_lines(
         tail.last_mtime = crate::telemetry::modified_or_none(&meta);
     }
 
+    if catch_up {
+        pending_agents.clear();
+    }
+
+    // The main agent ending its turn does not mean the session is
+    // done — background subagents outlive it, and their completion
+    // arrives later as a `<task-notification>` user entry (which
+    // flips the state back to `Busy` on its own).
+    if state == SessionState::Idle && !pending_agents.is_empty() {
+        state = SessionState::Busy;
+    }
+
     if changed {
         let context_window = model.as_deref().and_then(context_window_for_model);
         // Clamp to [0.0, 1.0] — the doc-comment promises the value
@@ -386,6 +472,9 @@ pub struct ClaudeTranscriptTail {
     /// seconds since the Unix epoch (from the transcript, not wall
     /// clock). Used to compute `last_turn_duration`.
     last_user_ts: Option<f64>,
+    /// Ids of background subagents launched from this session that
+    /// have not reported back yet. See [`process_new_lines`].
+    pending_agents: HashSet<String>,
     /// Latest computed snapshot, or `None` if no entries have been
     /// parsed yet.
     pub snapshot: Option<TelemetrySnapshot>,
@@ -400,6 +489,7 @@ impl ClaudeTranscriptTail {
             path,
             tail: FileTail::default(),
             last_user_ts: None,
+            pending_agents: HashSet::new(),
             snapshot: None,
         };
         tail.poll();
@@ -423,6 +513,7 @@ impl ClaudeTranscriptTail {
             &mut self.tail,
             &mut self.snapshot,
             &mut self.last_user_ts,
+            &mut self.pending_agents,
         )
     }
 
@@ -494,6 +585,18 @@ pub use crate::telemetry::{format_context_pct, format_tokens};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`process_new_lines`] without the background-subagent set —
+    /// the tests that predate issue #284 don't exercise it and a
+    /// fresh set per call keeps their signatures unchanged.
+    fn read_lines(
+        path: &Path,
+        tail: &mut FileTail,
+        snapshot: &mut Option<TelemetrySnapshot>,
+        last_user_ts: &mut Option<f64>,
+    ) -> bool {
+        process_new_lines(path, tail, snapshot, last_user_ts, &mut HashSet::new())
+    }
 
     // --- parse_line ---
 
@@ -626,7 +729,7 @@ mod tests {
         let mut tail = FileTail::default();
         let mut snap: Option<TelemetrySnapshot> = None;
         let mut last_user_ts = None;
-        let changed = process_new_lines(&path.to_path_buf(), &mut tail, &mut snap, &mut last_user_ts);
+        let changed = read_lines(&path.to_path_buf(), &mut tail, &mut snap, &mut last_user_ts);
 
         assert!(changed);
         let s = snap.as_ref().unwrap();
@@ -656,7 +759,7 @@ mod tests {
         let mut tail = FileTail::default();
         let mut snap: Option<TelemetrySnapshot> = None;
         let mut last_user_ts = None;
-        process_new_lines(&path.to_path_buf(), &mut tail, &mut snap, &mut last_user_ts);
+        read_lines(&path.to_path_buf(), &mut tail, &mut snap, &mut last_user_ts);
 
         assert_eq!(snap.unwrap().state, SessionState::PendingToolUse);
     }
@@ -676,7 +779,7 @@ mod tests {
         let mut tail = FileTail::default();
         let mut snap: Option<TelemetrySnapshot> = None;
         let mut last_user_ts = None;
-        process_new_lines(&path.to_path_buf(), &mut tail, &mut snap, &mut last_user_ts);
+        read_lines(&path.to_path_buf(), &mut tail, &mut snap, &mut last_user_ts);
 
         assert_eq!(snap.unwrap().state, SessionState::Busy);
     }
@@ -708,7 +811,7 @@ mod tests {
         let mut tail = FileTail::default();
         let mut snap: Option<TelemetrySnapshot> = None;
         let mut last_user_ts = None;
-        process_new_lines(path.as_path(), &mut tail, &mut snap, &mut last_user_ts);
+        read_lines(path.as_path(), &mut tail, &mut snap, &mut last_user_ts);
 
         let s = snap.unwrap();
         // Two assistant-with-usage entries → two turns.
@@ -731,7 +834,7 @@ mod tests {
         let mut tail = FileTail::default();
         let mut snap: Option<TelemetrySnapshot> = None;
         let mut last_user_ts = None;
-        process_new_lines(&path.to_path_buf(), &mut tail, &mut snap, &mut last_user_ts);
+        read_lines(&path.to_path_buf(), &mut tail, &mut snap, &mut last_user_ts);
 
         let s = snap.unwrap();
         assert_eq!(s.model.as_deref(), Some("claude-opus-4-7[1m]"));
@@ -753,15 +856,14 @@ mod tests {
         let mut tail = FileTail::default();
         let mut snap: Option<TelemetrySnapshot> = None;
         let mut last_user_ts = None;
-        process_new_lines(&path.to_path_buf(), &mut tail, &mut snap, &mut last_user_ts);
+        read_lines(&path.to_path_buf(), &mut tail, &mut snap, &mut last_user_ts);
 
         let snap1_tokens = snap.as_ref().unwrap().tokens_used;
         let pos_after_first = tail.last_pos;
         assert!(pos_after_first > 0);
 
         // Second poll — nothing new, should not change.
-        let changed =
-            process_new_lines(&path.to_path_buf(), &mut tail, &mut snap, &mut last_user_ts);
+        let changed = read_lines(&path.to_path_buf(), &mut tail, &mut snap, &mut last_user_ts);
         assert!(!changed);
         assert_eq!(snap.as_ref().unwrap().tokens_used, snap1_tokens);
 
@@ -772,8 +874,7 @@ mod tests {
               r#"{"type":"assistant","sessionId":"s","timestamp":"2026-04-22T08:02:00Z","message":{"role":"assistant","stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":200,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#],
         );
 
-        let changed =
-            process_new_lines(&path.to_path_buf(), &mut tail, &mut snap, &mut last_user_ts);
+        let changed = read_lines(&path.to_path_buf(), &mut tail, &mut snap, &mut last_user_ts);
         assert!(changed);
         // New tokens_used = 100 + 200 (overwrite, not accumulate).
         assert_eq!(snap.as_ref().unwrap().tokens_used, 300);
@@ -785,7 +886,7 @@ mod tests {
         let mut tail = FileTail::default();
         let mut snap: Option<TelemetrySnapshot> = None;
         let mut last_user_ts = None;
-        let changed = process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts);
+        let changed = read_lines(&path, &mut tail, &mut snap, &mut last_user_ts);
         assert!(!changed);
         assert!(snap.is_none());
     }
@@ -845,6 +946,88 @@ mod tests {
             ClaudeTranscriptTail::format_duration(Duration::from_secs(7_265)),
             "2h 1m"
         );
+    }
+
+    // --- background subagents (issue #284) ---
+
+    const PROMPT: &str = r#"{"type":"user","sessionId":"s","timestamp":"2026-08-09T08:00:00Z","message":{"role":"user","content":"go"}}"#;
+    const LAUNCH: &str = r#"{"type":"user","sessionId":"s","timestamp":"2026-08-09T08:00:10Z","message":{"role":"user","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":[{"type":"text","text":"Async agent launched successfully. (internal metadata)\nagentId: a02e36f821d048123 (internal ID - do not mention to user.)"}]}]}}"#;
+    const NOTIFICATION: &str = r#"{"type":"user","sessionId":"s","timestamp":"2026-08-09T08:05:00Z","message":{"role":"user","content":"<task-notification>\n<task-id>a02e36f821d048123</task-id>\n<status>completed</status>\n</task-notification>"}}"#;
+    const END_TURN: &str = r#"{"type":"assistant","sessionId":"s","timestamp":"2026-08-09T08:00:20Z","message":{"role":"assistant","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#;
+
+    #[test]
+    fn background_subagent_keeps_session_busy_after_end_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, &[PROMPT]);
+
+        let mut tail = FileTail::default();
+        let mut snap: Option<TelemetrySnapshot> = None;
+        let mut last_user_ts = None;
+        let mut pending = HashSet::new();
+        // Catch-up read first, so the launch below is seen live.
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
+
+        // Main agent spawns a background subagent and then wraps up
+        // its own turn — the state must not go green yet.
+        append_lines(&path, &[LAUNCH, END_TURN]);
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Busy);
+
+        // Subagent reports back; the main agent's next end_turn is
+        // the real idle.
+        append_lines(&path, &[NOTIFICATION, END_TURN]);
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
+        assert!(pending.is_empty());
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Idle);
+    }
+
+    #[test]
+    fn subagent_launched_before_the_tail_existed_is_not_pending() {
+        // Replaying history (fresh tail / resumed session): the agent
+        // process that launched this subagent is gone, so it must not
+        // pin the session to Busy.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, &[PROMPT, LAUNCH, END_TURN]);
+
+        let mut tail = FileTail::default();
+        let mut snap: Option<TelemetrySnapshot> = None;
+        let mut last_user_ts = None;
+        let mut pending = HashSet::new();
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
+
+        assert!(pending.is_empty());
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Idle);
+    }
+
+    #[test]
+    fn agent_markers_handle_several_ids_per_line() {
+        let mut pending = HashSet::new();
+        // Two `Agent` calls in one assistant message answer with two
+        // tool_result blocks inside a single user entry.
+        apply_agent_markers(
+            r#"Async agent launched successfully.\nagentId: aaa111 (internal ID) … Async agent launched successfully.\nagentId: bbb222 (internal ID)"#,
+            &mut pending,
+        );
+        assert_eq!(pending.len(), 2);
+
+        apply_agent_markers(
+            r#"<task-notification>\n<task-id>aaa111</task-id>\n<status>killed</status>"#,
+            &mut pending,
+        );
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains("bbb222"));
+    }
+
+    #[test]
+    fn task_id_outside_a_notification_is_ignored() {
+        // Guard the gate: a bare `<task-id>` (e.g. quoted in a prompt)
+        // must not retire a live agent.
+        let mut pending = HashSet::new();
+        pending.insert("aaa111".to_string());
+        apply_agent_markers("<task-id>aaa111</task-id>", &mut pending);
+        assert!(pending.contains("aaa111"));
     }
 
     // --- model_display_name ---
