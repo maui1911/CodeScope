@@ -108,6 +108,39 @@ struct WindowPlacement {
     work_area: Option<(i32, i32, i32, i32)>,
 }
 
+/// True when the window came out of minimized at a plain restored
+/// size even though it was maximized when it went in.
+///
+/// Windows never does this on its own: `SC_RESTORE` on a window that
+/// was minimized from maximized brings it back **maximized**
+/// (measured — `showCmd` 2 → 3), and there is no user gesture that
+/// un-minimizes to a normal size. The one thing that does it is
+/// gpui's `WM_DISPLAYCHANGE` handler
+/// (`platform/windows/events.rs`), which reacts to our monitor
+/// disappearing by calling `ShowWindow(SW_SHOWNORMAL)` to
+/// de-minimize — and `SW_SHOWNORMAL` throws the restore-to-maximized
+/// state away where `SW_RESTORE` would have honoured it.
+///
+/// That is what a session lock looks like when the screens power
+/// down while the window is minimized (issue #279):
+///
+/// ```text
+/// 13:07:37 showCmd=3  ← maximized
+/// 13:09:30 showCmd=2  ← lock, minimized
+/// 17:20:47 showCmd=1  ← unlock, restored *flat*
+/// ```
+///
+/// `WINDOWPLACEMENT.flags` is no help in telling this apart:
+/// `WPF_RESTORETOMAXIMIZED` was set on every single tick of that
+/// window's life, including plain restore-downs.
+fn unminimized_without_maximize(
+    prev: &WindowPlacement,
+    now: &WindowPlacement,
+    maximized_before_minimize: bool,
+) -> bool {
+    prev.minimized && !now.minimized && !now.maximized && maximized_before_minimize
+}
+
 /// True when the window went from maximized to a plain restored size
 /// *because the desktop was reconfigured under it*, not because the
 /// user asked for it.
@@ -128,6 +161,9 @@ struct WindowPlacement {
 ///
 /// The window stayed restored after the monitors came back, until the
 /// user maximized it by hand 42 minutes later.
+///
+/// Sibling case: [`unminimized_without_maximize`], when the window
+/// was already minimized as the monitors went away.
 fn unmaximized_by_display_change(prev: &WindowPlacement, now: &WindowPlacement) -> bool {
     prev.maximized
         && !now.maximized
@@ -782,6 +818,10 @@ pub struct AppShell {
     /// Placement seen on the previous bounds-observer tick. Feeds
     /// [`unmaximized_by_display_change`]; `None` until the first tick.
     last_window_placement: Option<WindowPlacement>,
+    /// Whether the window was maximized when it was last minimized.
+    /// Feeds [`unminimized_without_maximize`]; cleared once the
+    /// window is out of minimized again so it can't go stale.
+    maximized_before_minimize: bool,
     /// Window-coordinate bounds of the bell button as recorded by the
     /// `canvas` overlay child during the most recent layout pass.
     /// Used by `render_notifications_popover` to position the popover
@@ -1212,8 +1252,8 @@ impl AppShell {
             move |this, window, cx| {
                 append_window_diag(&diag_paths, "bounds_changed", window);
 
-                // Two ways a session lock takes the window out of
-                // maximized behind the user's back (issue #279), both
+                // Three ways a session lock takes the window out of
+                // maximized behind the user's back (issue #279), all
                 // of which gpui reports as a plain
                 // `Windowed(<restore bounds>)` with
                 // `is_maximized() == false`:
@@ -1224,23 +1264,33 @@ impl AppShell {
                 //    500 ms debounce flushed it to `window.json` —
                 //    so the *next launch* is windowed.
                 // 2. The monitors drop away and Windows un-maximizes
-                //    the window while re-enumerating them. This one
-                //    the user sees immediately: the window stays
-                //    restored after the unlock.
+                //    the window while re-enumerating them.
+                // 3. The window was minimized when the monitors
+                //    dropped, and it comes back at a plain restored
+                //    size instead of maximized.
                 //
-                // Skip the save in both cases, and undo the second.
+                // Skip the save in all three, and undo 2 and 3.
                 let placement = WindowPlacement {
                     maximized: window.is_maximized(),
                     minimized: window_is_minimized(window),
                     work_area: window_work_area(window),
                 };
-                let display_change = this
-                    .last_window_placement
+                let prev = this.last_window_placement;
+                if placement.minimized && !prev.is_some_and(|p| p.minimized) {
+                    this.maximized_before_minimize = prev.is_some_and(|p| p.maximized);
+                }
+                let display_change = prev
                     .as_ref()
                     .is_some_and(|prev| unmaximized_by_display_change(prev, &placement));
+                let flat_unminimize = prev.as_ref().is_some_and(|prev| {
+                    unminimized_without_maximize(prev, &placement, this.maximized_before_minimize)
+                });
+                if !placement.minimized {
+                    this.maximized_before_minimize = false;
+                }
                 this.last_window_placement = Some(placement);
 
-                if display_change {
+                if display_change || flat_unminimize {
                     append_window_diag(&diag_paths, "remaximize_after_display_change", window);
                     request_maximize(window);
                 } else if !placement.minimized {
@@ -1501,6 +1551,7 @@ impl AppShell {
             window_active_cached: true,
             telemetry_tails: HashMap::new(),
             last_window_placement: None,
+            maximized_before_minimize: false,
             bell_bounds: None,
             projects: projects_for_sessions,
             agent_registry,
@@ -8792,6 +8843,50 @@ mod tests {
         assert!(!unmaximized_by_display_change(
             &placement(true, false, TWO_MONITORS),
             &placement(false, false, None),
+        ));
+    }
+
+    // ─── unminimized_without_maximize (issue #279) ─────────────────
+
+    #[test]
+    fn lock_returning_a_maximized_window_flat_is_corrected() {
+        // The 13:07 maximized → 13:09 minimized → 17:20 restored-flat
+        // cycle from the reporter's log.
+        assert!(unminimized_without_maximize(
+            &placement(false, true, ONE_MONITOR),
+            &placement(false, false, ONE_MONITOR),
+            true,
+        ));
+    }
+
+    #[test]
+    fn unminimizing_a_windowed_window_is_left_alone() {
+        // Minimized from a normal size — it must come back normal.
+        assert!(!unminimized_without_maximize(
+            &placement(false, true, ONE_MONITOR),
+            &placement(false, false, ONE_MONITOR),
+            false,
+        ));
+    }
+
+    #[test]
+    fn unminimizing_straight_back_to_maximized_needs_no_help() {
+        assert!(!unminimized_without_maximize(
+            &placement(false, true, ONE_MONITOR),
+            &placement(true, false, ONE_MONITOR),
+            true,
+        ));
+    }
+
+    #[test]
+    fn restore_down_without_a_minimize_is_left_alone() {
+        // No minimize on the previous tick — this is the user
+        // un-maximizing, and the flag is stale-proofed by clearing it
+        // whenever the window is not minimized.
+        assert!(!unminimized_without_maximize(
+            &placement(true, false, ONE_MONITOR),
+            &placement(false, false, ONE_MONITOR),
+            true,
         ));
     }
 
