@@ -24,19 +24,19 @@ use serde_json::Value;
 
 pub use crate::telemetry::{FileTail, SessionState, TelemetrySnapshot, context_window_for_model};
 
+/// Default Claude Code projects root: `<home>/.claude/projects`.
+/// Mirrors the sibling agents' `default_*_root` helpers so callers
+/// that need a transcript path don't hand-roll the join.
+pub fn default_projects_root() -> Option<PathBuf> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    Some(PathBuf::from(home).join(".claude").join("projects"))
+}
+
 /// Encode an absolute path to the `~/.claude/projects/<name>` directory
 /// name used by Claude Code.
 ///
 /// Claude replaces `:`, `\`, `/`, and `.` with `-`.
 /// E.g. `C:\dev\codescope` → `C--dev-codescope`.
-/// Default Claude Code projects root: `<home>/.claude/projects`.
-/// Mirrors the sibling agents' `default_*_root` helpers so callers
-/// that need a transcript path don't hand-roll the join.
-pub fn default_projects_root() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
-    Some(std::path::PathBuf::from(home).join(".claude").join("projects"))
-}
-
 pub fn encode_cwd(path: &str) -> String {
     path.chars()
         .map(|c| match c {

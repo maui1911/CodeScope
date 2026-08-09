@@ -237,19 +237,38 @@ pub fn transcript_presence(session: &Session) -> Option<bool> {
             let dir = root.join(crate::agents::claude::telemetry::encode_cwd(
                 &session.worktree_path,
             ));
-            if !dir.is_dir() {
+            if entry_presence(&dir, |m| m.is_dir()) != Some(true) {
                 return None;
             }
-            Some(dir.join(format!("{sid}.jsonl")).exists())
+            entry_presence(&dir.join(format!("{sid}.jsonl")), |m| m.is_file())
         }
         crate::AgentId::Copilot => {
             let root = crate::agents::copilot::telemetry::default_session_state_root()?;
-            if !root.is_dir() {
+            if entry_presence(&root, |m| m.is_dir()) != Some(true) {
                 return None;
             }
-            Some(root.join(sid).is_dir())
+            entry_presence(&root.join(sid), |m| m.is_dir())
         }
         crate::AgentId::Pi | crate::AgentId::OpenCode | crate::AgentId::Codex => None,
+    }
+}
+
+/// Does `path` exist and match the expected kind, as far as we can
+/// actually tell?
+///
+/// `Path::exists` collapses "not there" and "couldn't look" into
+/// `false`, which for a caller that deletes history is the one
+/// confusion we can't afford: a permission error or an I/O hiccup would
+/// read as "the conversation is gone". So this only answers
+/// `Some(false)` for a genuine `NotFound`, and `None` for any other
+/// error. `Some(true)` additionally requires the entry to be the kind
+/// we expect — a directory sitting where a transcript file belongs is
+/// not a transcript.
+fn entry_presence(path: &Path, is_expected_kind: fn(&std::fs::Metadata) -> bool) -> Option<bool> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Some(is_expected_kind(&meta)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
     }
 }
 
@@ -850,6 +869,24 @@ mod tests {
         let mut s = closed_agent_session("s1", "sid");
         s.worktree_path = "C:\\definitely\\not\\a\\real\\worktree\\xyzzy".into();
         assert_eq!(transcript_presence(&s), None);
+    }
+
+    #[test]
+    fn entry_presence_separates_absent_from_unanswerable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("transcript.jsonl");
+        std::fs::write(&file, b"{}\n").unwrap();
+
+        assert_eq!(entry_presence(&file, |m| m.is_file()), Some(true));
+        assert_eq!(
+            entry_presence(&tmp.path().join("nope.jsonl"), |m| m.is_file()),
+            Some(false),
+            "a genuine NotFound is the one verdict allowed to delete"
+        );
+        // Wrong kind: a directory where the transcript file belongs is
+        // not a transcript, but it is an answer.
+        assert_eq!(entry_presence(tmp.path(), |m| m.is_file()), Some(false));
+        assert_eq!(entry_presence(tmp.path(), |m| m.is_dir()), Some(true));
     }
 
     // ---- open / soft_close / reopen / hard_remove --------------
