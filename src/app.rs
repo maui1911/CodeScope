@@ -108,26 +108,6 @@ struct WindowPlacement {
     work_area: Option<(i32, i32, i32, i32)>,
 }
 
-/// True when the window went from maximized to a plain restored size
-/// *because the desktop was reconfigured under it*, not because the
-/// user asked for it.
-///
-/// Locking the PC drops the external monitors, and Windows
-/// un-maximizes the window while re-enumerating them. From gpui that
-/// is indistinguishable from a user restore-down — both arrive as
-/// `WindowBounds::Windowed` with `is_maximized() == false`. The
-/// monitor work area is the discriminator: it changes on the same
-/// tick as the reconfiguration and stays put for a user gesture.
-///
-/// Two rows from the reporter's `window-diag.log` (issue #279):
-///
-/// ```text
-/// 17:32:26 Maximized rcWork=(-841,1440,4279,2880)  ← two monitors
-/// 17:43:47 Windowed  rcWork=(0,0,3440,1392)        ← lock, one monitor
-/// ```
-///
-/// The window stayed restored after the monitors came back, until the
-/// user maximized it by hand 42 minutes later.
 /// True when the window came out of minimized at a plain restored
 /// size even though it was maximized when it went in.
 ///
@@ -161,6 +141,29 @@ fn unminimized_without_maximize(
     prev.minimized && !now.minimized && !now.maximized && maximized_before_minimize
 }
 
+/// True when the window went from maximized to a plain restored size
+/// *because the desktop was reconfigured under it*, not because the
+/// user asked for it.
+///
+/// Locking the PC drops the external monitors, and Windows
+/// un-maximizes the window while re-enumerating them. From gpui that
+/// is indistinguishable from a user restore-down — both arrive as
+/// `WindowBounds::Windowed` with `is_maximized() == false`. The
+/// monitor work area is the discriminator: it changes on the same
+/// tick as the reconfiguration and stays put for a user gesture.
+///
+/// Two rows from the reporter's `window-diag.log` (issue #279):
+///
+/// ```text
+/// 17:32:26 Maximized rcWork=(-841,1440,4279,2880)  ← two monitors
+/// 17:43:47 Windowed  rcWork=(0,0,3440,1392)        ← lock, one monitor
+/// ```
+///
+/// The window stayed restored after the monitors came back, until the
+/// user maximized it by hand 42 minutes later.
+///
+/// Sibling case: [`unminimized_without_maximize`], when the window
+/// was already minimized as the monitors went away.
 fn unmaximized_by_display_change(prev: &WindowPlacement, now: &WindowPlacement) -> bool {
     prev.maximized
         && !now.maximized
