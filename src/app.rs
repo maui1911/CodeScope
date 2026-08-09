@@ -151,6 +151,69 @@ struct Tab {
     agent_id: Option<codescope_core::AgentId>,
 }
 
+/// Pick the transcript a tab should adopt this tick: the newest
+/// candidate it hasn't already fired and that no *other* tab has
+/// claimed.
+///
+/// `claimed` holds every agent session id owned by any tab (adopted or
+/// previously fired) plus the ids handed out earlier in the same pass.
+/// Without that filter two tabs sharing a working directory — the
+/// normal case, since "new session" opens another tab on the project's
+/// primary path — see the same `~/.claude/projects/<encoded-cwd>/`
+/// listing, and a tab whose own agent hasn't written yet adopts its
+/// neighbour's transcript. `persist_agent_session_id` then writes that
+/// id onto the wrong row in `projects.json`, so both sessions resume
+/// the same conversation on the next launch (observed: three `Werk`
+/// rows pointing at one Claude session).
+///
+/// The tab's own `adopted` id is exempt from the claim check so a
+/// restored tab can re-fire the transcript it is resuming.
+///
+/// The caller runs this in two rounds — tabs with no adoption yet
+/// first — so a tab that already owns a transcript can't rotate onto
+/// the one its neighbour just minted.
+///
+/// Remaining ceilings. The first two are the same gap — the rounds
+/// separate adopted tabs from unadopted ones, but *within* a round
+/// nothing distinguishes same-cwd tabs, so iteration order decides.
+/// Closing either needs the agent to report its own session id back to
+/// us:
+///
+/// * Same-cwd tabs that *all* already own a transcript: a `/clear`
+///   rotation in one of them goes to whichever comes first.
+/// * Same-cwd tabs that *none* of which have adopted yet: the first
+///   transcript to appear goes to the first tab, which is only right
+///   because tab order follows spawn order and an agent normally
+///   writes its transcript at startup. If the second tab's agent
+///   writes first, the two tabs end up holding each other's ids.
+///   Both still get exactly one transcript — this crosses the mapping,
+///   it does not starve a tab.
+/// * The dev build and the installed build share
+///   `~/.claude/projects/` but keep separate `projects.json` stores,
+///   so neither sees the other's claims. A tab in one instance can
+///   still adopt a transcript minted in the other.
+fn select_adoption(
+    hits: &[(String, SystemTime)],
+    fired: &HashSet<String>,
+    adopted: Option<&str>,
+    claimed: &HashSet<String>,
+) -> Option<String> {
+    let mut newest: Option<(SystemTime, &str)> = None;
+    for (sid, mtime) in hits {
+        if fired.contains(sid) {
+            continue;
+        }
+        if claimed.contains(sid) && adopted != Some(sid.as_str()) {
+            continue;
+        }
+        let take = newest.map(|(prev, _)| *mtime >= prev).unwrap_or(true);
+        if take {
+            newest = Some((*mtime, sid.as_str()));
+        }
+    }
+    newest.map(|(_, sid)| sid.to_owned())
+}
+
 /// One column in the work area: a tab strip + the currently-selected
 /// tab's terminal. Mirrors `EditorGroupViewModel` from the C# build —
 /// flat list, no recursion. The group's identity is its `id` so we can
@@ -1864,7 +1927,28 @@ impl AppShell {
                         /// `projects.json::Session.id`.
                         codescope_session_id: String,
                     }
-                    let mut found = Vec::new();
+                    /// One tab's scan result, captured before any
+                    /// selection happens so the two selection rounds
+                    /// below can run over the whole workspace instead
+                    /// of deciding tab-by-tab as we walk it.
+    ///
+                    /// Holds indices rather than copies of the tab's
+                    /// state: selection re-reads the tab through them,
+                    /// so a tick that adopts nothing (the overwhelming
+                    /// majority, at ~350 ms) allocates nothing beyond
+                    /// the hit list itself.
+                    struct Scan {
+                        group_idx: usize,
+                        tab_idx: usize,
+                        agent_id: codescope_core::AgentId,
+                        /// Mirrors `Tab::adopted_session_id.is_some()`
+                        /// — the two selection rounds only need the
+                        /// flag, not the id.
+                        has_adoption: bool,
+                        /// `(agent session id, transcript mtime)`.
+                        hits: Vec<(String, SystemTime)>,
+                    }
+                    let mut scans: Vec<Scan> = Vec::new();
                     let mut any_active = false;
                     for (g_idx, group) in this.groups.iter().enumerate() {
                         for (t_idx, tab) in group.tabs.iter().enumerate() {
@@ -1951,35 +2035,93 @@ impl AppShell {
                                     continue;
                                 }
                             };
-                            let mut newest: Option<(SystemTime, String)> = None;
-                            for (sid, path) in hits {
-                                if tab.fired_session_ids.contains(&sid) {
-                                    continue;
-                                }
-                                let mtime = std::fs::metadata(&path)
-                                    .ok()
-                                    .and_then(|m| m.modified().ok())
-                                    .unwrap_or(SystemTime::UNIX_EPOCH);
-                                let take = newest
-                                    .as_ref()
-                                    .map(|(prev, _)| mtime >= *prev)
-                                    .unwrap_or(true);
-                                if take {
-                                    newest = Some((mtime, sid));
-                                }
-                            }
-                            if let Some((_, sid)) = newest {
-                                found.push(Found {
-                                    group_idx: g_idx,
-                                    tab_idx: t_idx,
-                                    agent_id,
-                                    previous_agent_session_id: tab.adopted_session_id.clone(),
-                                    new_agent_session_id: sid,
-                                    working_directory: wd_str,
-                                    codescope_session_id: tab.session_id.clone(),
-                                });
-                            }
+                            let hits: Vec<(String, SystemTime)> = hits
+                                .into_iter()
+                                .map(|(sid, path)| {
+                                    let mtime = std::fs::metadata(&path)
+                                        .ok()
+                                        .and_then(|m| m.modified().ok())
+                                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                                    (sid, mtime)
+                                })
+                                .collect();
+                            scans.push(Scan {
+                                group_idx: g_idx,
+                                tab_idx: t_idx,
+                                agent_id,
+                                has_adoption: tab.adopted_session_id.is_some(),
+                                hits,
+                            });
                         }
+                    }
+                    // Every agent session id that is already spoken
+                    // for: what the open tabs own, plus every id
+                    // persisted in `projects.json`. The persisted half
+                    // matters because closing a tab drops its `Tab`
+                    // struct — without it, a sibling in the same folder
+                    // would adopt the just-closed session's transcript
+                    // on the very next tick and stamp its id onto its
+                    // own row. Grown as this pass hands ids out, so two
+                    // tabs can't take the same transcript in one tick.
+                    let mut claimed: HashSet<String> = this
+                        .projects
+                        .projects
+                        .iter()
+                        .flat_map(|p| p.sessions.iter())
+                        .filter_map(|s| s.agent_session_id.clone())
+                        .chain(this.groups.iter().flat_map(|g| g.tabs.iter()).flat_map(|t| {
+                            t.adopted_session_id
+                                .iter()
+                                .chain(t.fired_session_ids.iter())
+                                .cloned()
+                        }))
+                        .collect();
+                    // Tabs that own nothing yet choose first. A tab
+                    // that already has a live transcript would
+                    // otherwise "rotate" onto a brand-new one minted by
+                    // the neighbour it shares a working directory with
+                    // — stealing the conversation *and*, now that
+                    // claims are exclusive, locking the rightful tab
+                    // out for good. Stable sort, so iteration order
+                    // still decides within each class.
+                    let mut order: Vec<usize> = (0..scans.len()).collect();
+                    order.sort_by_key(|&i| scans[i].has_adoption);
+                    let mut found = Vec::new();
+                    for i in order {
+                        let s = &scans[i];
+                        // Re-read the tab instead of carrying copies of
+                        // its state through the scan — nothing has
+                        // mutated `groups` since, and the clones below
+                        // only happen for a tab that actually adopts.
+                        let Some(tab) = this
+                            .groups
+                            .get(s.group_idx)
+                            .and_then(|g| g.tabs.get(s.tab_idx))
+                        else {
+                            continue;
+                        };
+                        let Some(sid) = select_adoption(
+                            &s.hits,
+                            &tab.fired_session_ids,
+                            tab.adopted_session_id.as_deref(),
+                            &claimed,
+                        ) else {
+                            continue;
+                        };
+                        claimed.insert(sid.clone());
+                        found.push(Found {
+                            group_idx: s.group_idx,
+                            tab_idx: s.tab_idx,
+                            agent_id: s.agent_id,
+                            previous_agent_session_id: tab.adopted_session_id.clone(),
+                            new_agent_session_id: sid,
+                            working_directory: tab
+                                .working_directory
+                                .as_ref()
+                                .map(|wd| wd.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                            codescope_session_id: tab.session_id.clone(),
+                        });
                     }
                     for f in found {
                         if let Some(prev) = f.previous_agent_session_id.as_deref()
@@ -3290,6 +3432,30 @@ impl AppShell {
             persist_agent_id.as_ref().map(|s| s.to_string()),
             restore_session_id,
         );
+        // Claim the persisted transcript from the first discovery tick
+        // on the restore paths (launch rehydrate / reopen from history):
+        // the tab is resuming that conversation by id, so no sibling tab
+        // in the same working directory may adopt it. `None` for fresh
+        // spawns — the row `allocate_session_id` just wrote carries no
+        // `agent_session_id` yet.
+        //
+        // Stores written before the claim rule landed can hold the same
+        // `agent_session_id` on several rows (that was the bug). Only
+        // the first tab to come up seeds it; the rest start unclaimed
+        // and adopt their own transcript on the next `/clear` or
+        // re-invocation, rather than all firing one id — which would
+        // have them fight over a single telemetry tail and re-persist
+        // the duplicate forever.
+        let adopted_session_id = self
+            .lookup_session_by_id(&session_id)
+            .and_then(|s| s.agent_session_id)
+            .filter(|sid| {
+                !self
+                    .groups
+                    .iter()
+                    .flat_map(|g| g.tabs.iter())
+                    .any(|t| t.adopted_session_id.as_deref() == Some(sid.as_str()))
+            });
         let group_idx = self.focused_group;
         let group = &mut self.groups[group_idx];
         // Capture the entity so the fallback `auto_type` job below can
@@ -3315,7 +3481,7 @@ impl AppShell {
             terminal,
             working_directory: working_directory_for_tab,
             spawned_at: SystemTime::now(),
-            adopted_session_id: None,
+            adopted_session_id,
             fired_session_ids: std::collections::HashSet::new(),
             agent_id,
         });
@@ -8429,6 +8595,96 @@ fn classify_activity_transition(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── select_adoption ───────────────────────────────────────────
+    //
+    // Two tabs on the same project path share one
+    // `~/.claude/projects/<encoded-cwd>/` listing, so the claim set is
+    // the only thing keeping their transcripts apart. When it fails,
+    // `persist_agent_session_id` stamps one Claude session onto several
+    // `projects.json` rows and every one of them resumes the same
+    // conversation on the next launch.
+
+    const SID_A: &str = "11111111-2222-3333-4444-555555555555";
+    const SID_B: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn ids(v: &[&str]) -> HashSet<String> {
+        v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn select_adoption_takes_newest_unclaimed() {
+        let hits = vec![(SID_A.to_owned(), at(10)), (SID_B.to_owned(), at(20))];
+        assert_eq!(
+            select_adoption(&hits, &ids(&[]), None, &ids(&[])),
+            Some(SID_B.to_owned())
+        );
+    }
+
+    #[test]
+    fn select_adoption_skips_transcripts_owned_by_another_tab() {
+        // The sibling tab's transcript is the newest one — a fresh tab
+        // in the same folder must still come back empty-handed rather
+        // than steal it.
+        let hits = vec![(SID_A.to_owned(), at(10)), (SID_B.to_owned(), at(20))];
+        assert_eq!(
+            select_adoption(&hits, &ids(&[]), None, &ids(&[SID_B])),
+            Some(SID_A.to_owned())
+        );
+        assert_eq!(
+            select_adoption(&hits, &ids(&[]), None, &ids(&[SID_A, SID_B])),
+            None
+        );
+    }
+
+    #[test]
+    fn select_adoption_allows_own_adopted_id_through_the_claim_set() {
+        // Restore path: the tab carries its persisted id from spawn, so
+        // that id is in `claimed` — as *its own* claim. It must still
+        // fire once the resumed transcript is written, otherwise the
+        // telemetry tail never registers.
+        let hits = vec![(SID_A.to_owned(), at(10))];
+        assert_eq!(
+            select_adoption(&hits, &ids(&[]), Some(SID_A), &ids(&[SID_A])),
+            Some(SID_A.to_owned())
+        );
+    }
+
+    #[test]
+    fn unadopted_tab_wins_the_new_transcript_over_an_adopted_sibling() {
+        // Two tabs on one path: A already owns SID_A, B has nothing
+        // yet, and B's agent has just written SID_B (the newest file
+        // in the shared directory). The caller's two rounds must hand
+        // SID_B to B — if A picked first it would "rotate" onto its
+        // neighbour's conversation and, with claims exclusive, leave B
+        // locked out permanently.
+        let hits = vec![(SID_A.to_owned(), at(10)), (SID_B.to_owned(), at(20))];
+        let mut claimed = ids(&[SID_A]);
+
+        // Round 1 — tabs with no adoption yet.
+        let picked = select_adoption(&hits, &ids(&[]), None, &claimed);
+        assert_eq!(picked, Some(SID_B.to_owned()));
+        claimed.insert(picked.unwrap());
+
+        // Round 2 — A, which already fired SID_A, finds nothing left.
+        assert_eq!(
+            select_adoption(&hits, &ids(&[SID_A]), Some(SID_A), &claimed),
+            None
+        );
+    }
+
+    #[test]
+    fn select_adoption_skips_already_fired_ids() {
+        let hits = vec![(SID_A.to_owned(), at(10))];
+        assert_eq!(
+            select_adoption(&hits, &ids(&[SID_A]), Some(SID_A), &ids(&[SID_A])),
+            None
+        );
+    }
 
     // ─── normalise_group_weights ───────────────────────────────────
     //
