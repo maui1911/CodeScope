@@ -199,6 +199,48 @@ pub fn is_minimized(window: &Window) -> bool {
     unsafe { IsIconic(hwnd).as_bool() }
 }
 
+/// Work area (`MONITORINFO.rcWork`) of the monitor the window sits
+/// on, as `(left, top, right, bottom)`.
+///
+/// The bounds observer keeps the previous tick's value to tell a
+/// display reconfiguration — monitors dropping away on a session
+/// lock — apart from a user restore-down; both arrive as the same
+/// "no longer maximized" gpui event (issue #279).
+///
+/// `None` when the HWND or the monitor info can't be read; the caller
+/// treats that as "no information" and never acts on it.
+pub fn work_area(window: &Window) -> Option<(i32, i32, i32, i32)> {
+    let hwnd = hwnd(window)?;
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut mi).as_bool() {
+            return None;
+        }
+        let w = mi.rcWork;
+        Some((w.left, w.top, w.right, w.bottom))
+    }
+}
+
+/// Post `SC_MAXIMIZE`. Used to put the window back after Windows
+/// un-maximized it behind the user's back — see the caller in
+/// `app.rs`. Posts rather than sends for the same re-entrancy reason
+/// as [`start_drag`].
+pub fn maximize(window: &Window) {
+    let Some(hwnd) = hwnd(window) else { return };
+    unsafe {
+        let _ = PostMessageW(
+            Some(hwnd),
+            WM_SYSCOMMAND,
+            WPARAM(SC_MAXIMIZE as usize),
+            LPARAM(0),
+        );
+    }
+}
+
 /// Toggle maximize ↔ restore via `WM_SYSCOMMAND`. `IsZoomed` is the
 /// canonical "is this window maximized?" check; we post
 /// `SC_RESTORE` when it is and `SC_MAXIMIZE` otherwise. Posts so
