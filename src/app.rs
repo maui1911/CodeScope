@@ -1922,14 +1922,20 @@ impl AppShell {
                     /// selection happens so the two selection rounds
                     /// below can run over the whole workspace instead
                     /// of deciding tab-by-tab as we walk it.
+    ///
+                    /// Holds indices rather than copies of the tab's
+                    /// state: selection re-reads the tab through them,
+                    /// so a tick that adopts nothing (the overwhelming
+                    /// majority, at ~350 ms) allocates nothing beyond
+                    /// the hit list itself.
                     struct Scan {
                         group_idx: usize,
                         tab_idx: usize,
                         agent_id: codescope_core::AgentId,
-                        working_directory: String,
-                        codescope_session_id: String,
-                        adopted: Option<String>,
-                        fired: HashSet<String>,
+                        /// Mirrors `Tab::adopted_session_id.is_some()`
+                        /// — the two selection rounds only need the
+                        /// flag, not the id.
+                        has_adoption: bool,
                         /// `(agent session id, transcript mtime)`.
                         hits: Vec<(String, SystemTime)>,
                     }
@@ -2034,10 +2040,7 @@ impl AppShell {
                                 group_idx: g_idx,
                                 tab_idx: t_idx,
                                 agent_id,
-                                working_directory: wd_str,
-                                codescope_session_id: tab.session_id.clone(),
-                                adopted: tab.adopted_session_id.clone(),
-                                fired: tab.fired_session_ids.clone(),
+                                has_adoption: tab.adopted_session_id.is_some(),
                                 hits,
                             });
                         }
@@ -2073,13 +2076,27 @@ impl AppShell {
                     // out for good. Stable sort, so iteration order
                     // still decides within each class.
                     let mut order: Vec<usize> = (0..scans.len()).collect();
-                    order.sort_by_key(|&i| scans[i].adopted.is_some());
+                    order.sort_by_key(|&i| scans[i].has_adoption);
                     let mut found = Vec::new();
                     for i in order {
                         let s = &scans[i];
-                        let Some(sid) =
-                            select_adoption(&s.hits, &s.fired, s.adopted.as_deref(), &claimed)
+                        // Re-read the tab instead of carrying copies of
+                        // its state through the scan — nothing has
+                        // mutated `groups` since, and the clones below
+                        // only happen for a tab that actually adopts.
+                        let Some(tab) = this
+                            .groups
+                            .get(s.group_idx)
+                            .and_then(|g| g.tabs.get(s.tab_idx))
                         else {
+                            continue;
+                        };
+                        let Some(sid) = select_adoption(
+                            &s.hits,
+                            &tab.fired_session_ids,
+                            tab.adopted_session_id.as_deref(),
+                            &claimed,
+                        ) else {
                             continue;
                         };
                         claimed.insert(sid.clone());
@@ -2087,10 +2104,14 @@ impl AppShell {
                             group_idx: s.group_idx,
                             tab_idx: s.tab_idx,
                             agent_id: s.agent_id,
-                            previous_agent_session_id: s.adopted.clone(),
+                            previous_agent_session_id: tab.adopted_session_id.clone(),
                             new_agent_session_id: sid,
-                            working_directory: s.working_directory.clone(),
-                            codescope_session_id: s.codescope_session_id.clone(),
+                            working_directory: tab
+                                .working_directory
+                                .as_ref()
+                                .map(|wd| wd.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                            codescope_session_id: tab.session_id.clone(),
                         });
                     }
                     for f in found {
