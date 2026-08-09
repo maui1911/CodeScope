@@ -1016,7 +1016,8 @@ mod tests {
             r#"<task-notification>\n<task-id>aaa111</task-id>\n<status>killed</status>"#,
             &mut pending,
         );
-        assert_eq!(pending.into_iter().collect::<Vec<_>>(), vec!["bbb222"]);
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains("bbb222"));
     }
 
     #[test]
