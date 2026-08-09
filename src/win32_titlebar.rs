@@ -31,7 +31,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetWindowPlacement, GetWindowRect, HTCAPTION, IsZoomed, PostMessageW,
+    GetCursorPos, GetWindowPlacement, GetWindowRect, HTCAPTION, IsIconic, IsZoomed, PostMessageW,
     SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SW_SHOWNORMAL, SetWindowPlacement,
     WINDOWPLACEMENT, WM_NCLBUTTONDOWN, WM_SYSCOMMAND,
 };
@@ -179,6 +179,65 @@ unsafe fn reposition_for_restore_under_cursor(hwnd: HWND) {
             bottom: new_top + restored_height,
         };
         let _ = SetWindowPlacement(hwnd, &placement);
+    }
+}
+
+/// True while the window is minimized (`SW_SHOWMINIMIZED`).
+///
+/// gpui has no equivalent accessor: a minimized window reports
+/// `WindowBounds::Windowed(<restore bounds>)` and `is_maximized() ==
+/// false`, which is indistinguishable from a user restore-down. The
+/// window-state persister needs the difference — see the caller in
+/// `app.rs` (issue #279).
+///
+/// Returns `false` when the HWND can't be resolved; the caller then
+/// behaves exactly as it did before this guard existed.
+pub fn is_minimized(window: &Window) -> bool {
+    let Some(hwnd) = hwnd(window) else {
+        return false;
+    };
+    unsafe { IsIconic(hwnd).as_bool() }
+}
+
+/// Work area (`MONITORINFO.rcWork`) of the monitor the window sits
+/// on, as `(left, top, right, bottom)`.
+///
+/// The bounds observer keeps the previous tick's value to tell a
+/// display reconfiguration — monitors dropping away on a session
+/// lock — apart from a user restore-down; both arrive as the same
+/// "no longer maximized" gpui event (issue #279).
+///
+/// `None` when the HWND or the monitor info can't be read; the caller
+/// treats that as "no information" and never acts on it.
+pub fn work_area(window: &Window) -> Option<(i32, i32, i32, i32)> {
+    let hwnd = hwnd(window)?;
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut mi).as_bool() {
+            return None;
+        }
+        let w = mi.rcWork;
+        Some((w.left, w.top, w.right, w.bottom))
+    }
+}
+
+/// Post `SC_MAXIMIZE`. Used to put the window back after Windows
+/// un-maximized it behind the user's back — see the caller in
+/// `app.rs`. Posts rather than sends for the same re-entrancy reason
+/// as [`start_drag`].
+pub fn maximize(window: &Window) {
+    let Some(hwnd) = hwnd(window) else { return };
+    unsafe {
+        let _ = PostMessageW(
+            Some(hwnd),
+            WM_SYSCOMMAND,
+            WPARAM(SC_MAXIMIZE as usize),
+            LPARAM(0),
+        );
     }
 }
 

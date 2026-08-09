@@ -95,6 +95,48 @@ struct PendingWindowSave {
     set_at: Instant,
 }
 
+/// What the platform window looked like on one bounds-observer tick.
+/// Kept from tick to tick so the next one can tell *why* the window
+/// stopped being maximized — see [`unmaximized_by_display_change`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct WindowPlacement {
+    maximized: bool,
+    minimized: bool,
+    /// Work area of the monitor the window is on, or `None` where the
+    /// platform can't tell us (everything except Windows, plus the
+    /// rare Win32 failure).
+    work_area: Option<(i32, i32, i32, i32)>,
+}
+
+/// True when the window went from maximized to a plain restored size
+/// *because the desktop was reconfigured under it*, not because the
+/// user asked for it.
+///
+/// Locking the PC drops the external monitors, and Windows
+/// un-maximizes the window while re-enumerating them. From gpui that
+/// is indistinguishable from a user restore-down — both arrive as
+/// `WindowBounds::Windowed` with `is_maximized() == false`. The
+/// monitor work area is the discriminator: it changes on the same
+/// tick as the reconfiguration and stays put for a user gesture.
+///
+/// Two rows from the reporter's `window-diag.log` (issue #279):
+///
+/// ```text
+/// 17:32:26 Maximized rcWork=(-841,1440,4279,2880)  ← two monitors
+/// 17:43:47 Windowed  rcWork=(0,0,3440,1392)        ← lock, one monitor
+/// ```
+///
+/// The window stayed restored after the monitors came back, until the
+/// user maximized it by hand 42 minutes later.
+fn unmaximized_by_display_change(prev: &WindowPlacement, now: &WindowPlacement) -> bool {
+    prev.maximized
+        && !now.maximized
+        && !now.minimized
+        && prev.work_area.is_some()
+        && now.work_area.is_some()
+        && prev.work_area != now.work_area
+}
+
 /// One tab = one terminal session.
 struct Tab {
     id: u64,
@@ -737,6 +779,9 @@ pub struct AppShell {
     /// `MainViewModel.RegisterAgentTelemetry` / `UnregisterAgentTelemetry`
     /// dispatching to four distinct `*TelemetryService` instances.
     telemetry_tails: HashMap<String, AgentTail>,
+    /// Placement seen on the previous bounds-observer tick. Feeds
+    /// [`unmaximized_by_display_change`]; `None` until the first tick.
+    last_window_placement: Option<WindowPlacement>,
     /// Window-coordinate bounds of the bell button as recorded by the
     /// `canvas` overlay child during the most recent layout pass.
     /// Used by `render_notifications_popover` to position the popover
@@ -1164,13 +1209,47 @@ impl AppShell {
         cx.observe_window_bounds(window, {
             let pending = pending_window_save.clone();
             let diag_paths = paths.clone();
-            move |_, window, cx| {
+            move |this, window, cx| {
                 append_window_diag(&diag_paths, "bounds_changed", window);
-                let state = window_state_from_window(window);
-                *pending.lock() = Some(PendingWindowSave {
-                    state,
-                    set_at: Instant::now(),
-                });
+
+                // Two ways a session lock takes the window out of
+                // maximized behind the user's back (issue #279), both
+                // of which gpui reports as a plain
+                // `Windowed(<restore bounds>)` with
+                // `is_maximized() == false`:
+                //
+                // 1. It minimizes the window. The window itself comes
+                //    back on unlock, but `window_state_from_window`
+                //    already recorded `maximised: false` and the
+                //    500 ms debounce flushed it to `window.json` —
+                //    so the *next launch* is windowed.
+                // 2. The monitors drop away and Windows un-maximizes
+                //    the window while re-enumerating them. This one
+                //    the user sees immediately: the window stays
+                //    restored after the unlock.
+                //
+                // Skip the save in both cases, and undo the second.
+                let placement = WindowPlacement {
+                    maximized: window.is_maximized(),
+                    minimized: window_is_minimized(window),
+                    work_area: window_work_area(window),
+                };
+                let display_change = this
+                    .last_window_placement
+                    .as_ref()
+                    .is_some_and(|prev| unmaximized_by_display_change(prev, &placement));
+                this.last_window_placement = Some(placement);
+
+                if display_change {
+                    append_window_diag(&diag_paths, "remaximize_after_display_change", window);
+                    request_maximize(window);
+                } else if !placement.minimized {
+                    let state = window_state_from_window(window);
+                    *pending.lock() = Some(PendingWindowSave {
+                        state,
+                        set_at: Instant::now(),
+                    });
+                }
                 // Force a re-render so the entity tree picks up the
                 // new viewport bounds (otherwise the terminal panes
                 // keep their pre-transition layout until something
@@ -1421,6 +1500,7 @@ impl AppShell {
             idle_notifier: crate::idle_notifier::IdleNotifier::new(),
             window_active_cached: true,
             telemetry_tails: HashMap::new(),
+            last_window_placement: None,
             bell_bounds: None,
             projects: projects_for_sessions,
             agent_registry,
@@ -8438,6 +8518,52 @@ fn fmt_bytes(bytes: u64) -> String {
     }
 }
 
+/// True while the window is minimized. Only Windows is known to
+/// minimize the window behind the user's back (session switch /
+/// lock), and it is the only platform with a cheap query for it, so
+/// every other target keeps the pre-#279 behaviour of persisting
+/// whatever the bounds observer reports.
+fn window_is_minimized(window: &Window) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        crate::win32_titlebar::is_minimized(window)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+        false
+    }
+}
+
+/// Work area of the monitor the window is on. `None` off Windows —
+/// no other platform is known to un-maximize the window behind the
+/// user's back, and [`unmaximized_by_display_change`] never fires
+/// without a value on both sides.
+fn window_work_area(window: &Window) -> Option<(i32, i32, i32, i32)> {
+    #[cfg(target_os = "windows")]
+    {
+        crate::win32_titlebar::work_area(window)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+        None
+    }
+}
+
+/// Ask the platform to maximize the window again. No-op off Windows,
+/// which is the only caller path — see [`window_work_area`].
+fn request_maximize(window: &Window) {
+    #[cfg(target_os = "windows")]
+    {
+        crate::win32_titlebar::maximize(window);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+    }
+}
+
 /// Snapshot the platform window into the on-disk `WindowState`. We
 /// always store the *restore* bounds so unmaximising lands at a
 /// sensible size; `maximised` is a separate flag the loader uses to
@@ -8597,6 +8723,77 @@ fn classify_activity_transition(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── unmaximized_by_display_change (issue #279) ────────────────
+
+    /// The two work areas from the reporter's `window-diag.log`:
+    /// both monitors, then the single one a session lock leaves.
+    const TWO_MONITORS: Option<(i32, i32, i32, i32)> = Some((-841, 1440, 4279, 2880));
+    const ONE_MONITOR: Option<(i32, i32, i32, i32)> = Some((0, 0, 3440, 1392));
+
+    fn placement(
+        maximized: bool,
+        minimized: bool,
+        work_area: Option<(i32, i32, i32, i32)>,
+    ) -> WindowPlacement {
+        WindowPlacement {
+            maximized,
+            minimized,
+            work_area,
+        }
+    }
+
+    #[test]
+    fn lock_dropping_a_monitor_counts_as_a_display_change() {
+        assert!(unmaximized_by_display_change(
+            &placement(true, false, TWO_MONITORS),
+            &placement(false, false, ONE_MONITOR),
+        ));
+    }
+
+    #[test]
+    fn user_restore_down_is_left_alone() {
+        // Same desktop on both ticks — the user clicked restore, and
+        // re-maximizing here would fight them.
+        assert!(!unmaximized_by_display_change(
+            &placement(true, false, TWO_MONITORS),
+            &placement(false, false, TWO_MONITORS),
+        ));
+    }
+
+    #[test]
+    fn minimize_is_not_a_display_change() {
+        // A lock that minimizes instead is handled by skipping the
+        // save, not by re-maximizing a window the user can't see.
+        assert!(!unmaximized_by_display_change(
+            &placement(true, false, TWO_MONITORS),
+            &placement(false, true, ONE_MONITOR),
+        ));
+    }
+
+    #[test]
+    fn display_change_while_already_windowed_is_left_alone() {
+        // Plugging a monitor into a deliberately windowed app must
+        // not maximize it.
+        assert!(!unmaximized_by_display_change(
+            &placement(false, false, TWO_MONITORS),
+            &placement(false, false, ONE_MONITOR),
+        ));
+    }
+
+    #[test]
+    fn missing_work_area_never_triggers() {
+        // Non-Windows, or a Win32 read that failed: no information is
+        // not evidence of a reconfiguration.
+        assert!(!unmaximized_by_display_change(
+            &placement(true, false, None),
+            &placement(false, false, ONE_MONITOR),
+        ));
+        assert!(!unmaximized_by_display_change(
+            &placement(true, false, TWO_MONITORS),
+            &placement(false, false, None),
+        ));
+    }
 
     // ─── select_adoption ───────────────────────────────────────────
     //
