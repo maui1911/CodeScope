@@ -199,30 +199,28 @@ pub fn is_minimized(window: &Window) -> bool {
     unsafe { IsIconic(hwnd).as_bool() }
 }
 
-/// Work area (`MONITORINFO.rcWork`) of the monitor the window sits
-/// on, as `(left, top, right, bottom)`.
+/// `HMONITOR` of the monitor the window sits on, as a plain integer
+/// so callers can compare it across ticks without carrying a Win32
+/// type around.
 ///
-/// The bounds observer keeps the previous tick's value to tell a
-/// display reconfiguration — monitors dropping away on a session
-/// lock — apart from a user restore-down; both arrive as the same
-/// "no longer maximized" gpui event (issue #279).
+/// This is the handle gpui itself keys on: its `WM_DISPLAYCHANGE`
+/// handler calls `ShowWindow(SW_SHOWNORMAL)` — which drops the
+/// maximized state — exactly when the window's previous `HMONITOR`
+/// is no longer connected. Comparing handles is therefore the same
+/// test gpui makes, and it catches monitors that come back at an
+/// identical resolution and position (where `rcWork` is unchanged
+/// but the handle is new).
 ///
-/// `None` when the HWND or the monitor info can't be read; the caller
-/// treats that as "no information" and never acts on it.
-pub fn work_area(window: &Window) -> Option<(i32, i32, i32, i32)> {
+/// `None` when the HWND can't be resolved or Windows reports no
+/// monitor; the caller treats that as "no information" and never
+/// acts on it.
+pub fn monitor_handle(window: &Window) -> Option<isize> {
     let hwnd = hwnd(window)?;
-    unsafe {
-        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-        let mut mi = MONITORINFO {
-            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        if !GetMonitorInfoW(monitor, &mut mi).as_bool() {
-            return None;
-        }
-        let w = mi.rcWork;
-        Some((w.left, w.top, w.right, w.bottom))
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    if monitor.is_invalid() {
+        return None;
     }
+    Some(monitor.0 as isize)
 }
 
 /// Post `SC_MAXIMIZE`. Used to put the window back after Windows
@@ -327,12 +325,13 @@ pub fn diag_snapshot(window: &Window) -> Option<String> {
             let m = mi.rcMonitor;
             let w = mi.rcWork;
             format!(
-                "rcMonitor=({},{},{},{}) rcWork=({},{},{},{})",
+                "hmon={:#x} rcMonitor=({},{},{},{}) rcWork=({},{},{},{})",
+                monitor.0 as isize,
                 m.left, m.top, m.right, m.bottom,
                 w.left, w.top, w.right, w.bottom,
             )
         } else {
-            "rcMonitor=? rcWork=?".to_string()
+            "hmon=? rcMonitor=? rcWork=?".to_string()
         };
 
         let dpi = GetDpiForWindow(hwnd);

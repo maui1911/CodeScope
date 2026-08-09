@@ -102,10 +102,10 @@ struct PendingWindowSave {
 struct WindowPlacement {
     maximized: bool,
     minimized: bool,
-    /// Work area of the monitor the window is on, or `None` where the
-    /// platform can't tell us (everything except Windows, plus the
-    /// rare Win32 failure).
-    work_area: Option<(i32, i32, i32, i32)>,
+    /// `HMONITOR` the window is on, or `None` where the platform
+    /// can't tell us (everything except Windows, plus the rare Win32
+    /// failure).
+    monitor: Option<isize>,
 }
 
 /// True when the window came out of minimized at a plain restored
@@ -145,22 +145,36 @@ fn unminimized_without_maximize(
 /// *because the desktop was reconfigured under it*, not because the
 /// user asked for it.
 ///
-/// Locking the PC drops the external monitors, and Windows
-/// un-maximizes the window while re-enumerating them. From gpui that
-/// is indistinguishable from a user restore-down — both arrive as
-/// `WindowBounds::Windowed` with `is_maximized() == false`. The
-/// monitor work area is the discriminator: it changes on the same
-/// tick as the reconfiguration and stays put for a user gesture.
+/// Locking the PC drops the monitors, and gpui's `WM_DISPLAYCHANGE`
+/// handler answers that by calling `ShowWindow(SW_SHOWNORMAL)` —
+/// which takes the window out of maximized. From the bounds observer
+/// that is indistinguishable from a user restore-down: both arrive as
+/// `WindowBounds::Windowed` with `is_maximized() == false`.
 ///
-/// Two rows from the reporter's `window-diag.log` (issue #279):
+/// The `HMONITOR` is the discriminator, because it is the same test
+/// gpui makes — it only fires that `ShowWindow` when the window's
+/// previous handle is no longer connected. A user gesture never
+/// changes the handle.
+///
+/// The first cut of this compared `MONITORINFO.rcWork` instead, which
+/// held for the case that motivated it:
 ///
 /// ```text
 /// 17:32:26 Maximized rcWork=(-841,1440,4279,2880)  ← two monitors
 /// 17:43:47 Windowed  rcWork=(0,0,3440,1392)        ← lock, one monitor
 /// ```
 ///
-/// The window stayed restored after the monitors came back, until the
-/// user maximized it by hand 42 minutes later.
+/// and then missed the very next one, where the monitors came back at
+/// an identical resolution and position so the rectangle never moved:
+///
+/// ```text
+/// 17:50:11 Maximized rcWork=(0,0,3440,1392)
+/// 18:01:32 Windowed  rcWork=(0,0,3440,1392)  ← same rect, new handle
+/// ```
+///
+/// Geometry describes the desktop; the handle describes the device.
+/// Only the second one answers "is this still the monitor gpui was
+/// holding on to".
 ///
 /// Sibling case: [`unminimized_without_maximize`], when the window
 /// was already minimized as the monitors went away.
@@ -168,9 +182,9 @@ fn unmaximized_by_display_change(prev: &WindowPlacement, now: &WindowPlacement) 
     prev.maximized
         && !now.maximized
         && !now.minimized
-        && prev.work_area.is_some()
-        && now.work_area.is_some()
-        && prev.work_area != now.work_area
+        && prev.monitor.is_some()
+        && now.monitor.is_some()
+        && prev.monitor != now.monitor
 }
 
 /// One tab = one terminal session.
@@ -1273,7 +1287,7 @@ impl AppShell {
                 let placement = WindowPlacement {
                     maximized: window.is_maximized(),
                     minimized: window_is_minimized(window),
-                    work_area: window_work_area(window),
+                    monitor: window_monitor(window),
                 };
                 let prev = this.last_window_placement;
                 if placement.minimized && !prev.is_some_and(|p| p.minimized) {
@@ -8524,8 +8538,8 @@ fn append_window_diag(paths: &AppPaths, event: &str, window: &Window) {
     // success path. The earlier `win32=unavailable` / `win32=n/a`
     // placeholders had asymmetric keys and broke field-level greps
     // — Copilot review on PR #222.
-    const WIN32_MISSING: &str =
-        "hwnd_rect=? zoomed=? showCmd=? rcNormal=? ptMaxPos=? flags=? rcMonitor=? rcWork=? dpi=?";
+    const WIN32_MISSING: &str = "hwnd_rect=? zoomed=? showCmd=? rcNormal=? ptMaxPos=? flags=? \
+         hmon=? rcMonitor=? rcWork=? dpi=?";
     #[cfg(target_os = "windows")]
     let win32 = crate::win32_titlebar::diag_snapshot(window)
         .unwrap_or_else(|| WIN32_MISSING.to_string());
@@ -8586,14 +8600,14 @@ fn window_is_minimized(window: &Window) -> bool {
     }
 }
 
-/// Work area of the monitor the window is on. `None` off Windows —
-/// no other platform is known to un-maximize the window behind the
-/// user's back, and [`unmaximized_by_display_change`] never fires
-/// without a value on both sides.
-fn window_work_area(window: &Window) -> Option<(i32, i32, i32, i32)> {
+/// `HMONITOR` the window is on. `None` off Windows — no other
+/// platform is known to un-maximize the window behind the user's
+/// back, and [`unmaximized_by_display_change`] never fires without a
+/// value on both sides.
+fn window_monitor(window: &Window) -> Option<isize> {
     #[cfg(target_os = "windows")]
     {
-        crate::win32_titlebar::work_area(window)
+        crate::win32_titlebar::monitor_handle(window)
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -8603,7 +8617,7 @@ fn window_work_area(window: &Window) -> Option<(i32, i32, i32, i32)> {
 }
 
 /// Ask the platform to maximize the window again. No-op off Windows,
-/// which is the only caller path — see [`window_work_area`].
+/// which is the only caller path — see [`window_monitor`].
 fn request_maximize(window: &Window) {
     #[cfg(target_os = "windows")]
     {
@@ -8777,38 +8791,47 @@ mod tests {
 
     // ─── unmaximized_by_display_change (issue #279) ────────────────
 
-    /// The two work areas from the reporter's `window-diag.log`:
-    /// both monitors, then the single one a session lock leaves.
-    const TWO_MONITORS: Option<(i32, i32, i32, i32)> = Some((-841, 1440, 4279, 2880));
-    const ONE_MONITOR: Option<(i32, i32, i32, i32)> = Some((0, 0, 3440, 1392));
+    /// Two distinct `HMONITOR`s. The values are arbitrary — all that
+    /// matters is that the handle before the lock differs from the
+    /// one after it.
+    const MON_A: Option<isize> = Some(0x0001_0007);
+    const MON_B: Option<isize> = Some(0x0002_0009);
 
-    fn placement(
-        maximized: bool,
-        minimized: bool,
-        work_area: Option<(i32, i32, i32, i32)>,
-    ) -> WindowPlacement {
+    fn placement(maximized: bool, minimized: bool, monitor: Option<isize>) -> WindowPlacement {
         WindowPlacement {
             maximized,
             minimized,
-            work_area,
+            monitor,
         }
     }
 
     #[test]
-    fn lock_dropping_a_monitor_counts_as_a_display_change() {
+    fn lock_cycling_the_monitor_counts_as_a_display_change() {
         assert!(unmaximized_by_display_change(
-            &placement(true, false, TWO_MONITORS),
-            &placement(false, false, ONE_MONITOR),
+            &placement(true, false, MON_A),
+            &placement(false, false, MON_B),
         ));
     }
 
     #[test]
     fn user_restore_down_is_left_alone() {
-        // Same desktop on both ticks — the user clicked restore, and
-        // re-maximizing here would fight them.
+        // Same monitor on both ticks — the user restored the window,
+        // and re-maximizing here would fight them.
         assert!(!unmaximized_by_display_change(
-            &placement(true, false, TWO_MONITORS),
-            &placement(false, false, TWO_MONITORS),
+            &placement(true, false, MON_A),
+            &placement(false, false, MON_A),
+        ));
+    }
+
+    #[test]
+    fn same_geometry_on_a_new_handle_still_counts() {
+        // The case that broke the first cut of this rule: the monitor
+        // came back at an identical resolution and position, so
+        // `rcWork` never moved — but the handle is new, which is what
+        // gpui keys on.
+        assert!(unmaximized_by_display_change(
+            &placement(true, false, MON_A),
+            &placement(false, false, MON_B),
         ));
     }
 
@@ -8817,8 +8840,8 @@ mod tests {
         // A lock that minimizes instead is handled by skipping the
         // save, not by re-maximizing a window the user can't see.
         assert!(!unmaximized_by_display_change(
-            &placement(true, false, TWO_MONITORS),
-            &placement(false, true, ONE_MONITOR),
+            &placement(true, false, MON_A),
+            &placement(false, true, MON_B),
         ));
     }
 
@@ -8827,21 +8850,21 @@ mod tests {
         // Plugging a monitor into a deliberately windowed app must
         // not maximize it.
         assert!(!unmaximized_by_display_change(
-            &placement(false, false, TWO_MONITORS),
-            &placement(false, false, ONE_MONITOR),
+            &placement(false, false, MON_A),
+            &placement(false, false, MON_B),
         ));
     }
 
     #[test]
-    fn missing_work_area_never_triggers() {
+    fn missing_monitor_never_triggers() {
         // Non-Windows, or a Win32 read that failed: no information is
         // not evidence of a reconfiguration.
         assert!(!unmaximized_by_display_change(
             &placement(true, false, None),
-            &placement(false, false, ONE_MONITOR),
+            &placement(false, false, MON_B),
         ));
         assert!(!unmaximized_by_display_change(
-            &placement(true, false, TWO_MONITORS),
+            &placement(true, false, MON_A),
             &placement(false, false, None),
         ));
     }
@@ -8853,8 +8876,8 @@ mod tests {
         // The 13:07 maximized → 13:09 minimized → 17:20 restored-flat
         // cycle from the reporter's log.
         assert!(unminimized_without_maximize(
-            &placement(false, true, ONE_MONITOR),
-            &placement(false, false, ONE_MONITOR),
+            &placement(false, true, MON_A),
+            &placement(false, false, MON_A),
             true,
         ));
     }
@@ -8863,8 +8886,8 @@ mod tests {
     fn unminimizing_a_windowed_window_is_left_alone() {
         // Minimized from a normal size — it must come back normal.
         assert!(!unminimized_without_maximize(
-            &placement(false, true, ONE_MONITOR),
-            &placement(false, false, ONE_MONITOR),
+            &placement(false, true, MON_A),
+            &placement(false, false, MON_A),
             false,
         ));
     }
@@ -8872,8 +8895,8 @@ mod tests {
     #[test]
     fn unminimizing_straight_back_to_maximized_needs_no_help() {
         assert!(!unminimized_without_maximize(
-            &placement(false, true, ONE_MONITOR),
-            &placement(true, false, ONE_MONITOR),
+            &placement(false, true, MON_A),
+            &placement(true, false, MON_A),
             true,
         ));
     }
@@ -8884,8 +8907,8 @@ mod tests {
         // un-maximizing, and the flag is stale-proofed by clearing it
         // whenever the window is not minimized.
         assert!(!unminimized_without_maximize(
-            &placement(true, false, ONE_MONITOR),
-            &placement(false, false, ONE_MONITOR),
+            &placement(true, false, MON_A),
+            &placement(false, false, MON_A),
             true,
         ));
     }
