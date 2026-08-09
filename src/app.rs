@@ -1791,9 +1791,11 @@ impl AppShell {
     /// USERPROFILE nor HOME is set — same gate `register_telemetry`
     /// uses, kept here so the discovery poll skips silently instead
     /// of repeatedly logging.
+    ///
+    /// Thin wrapper over the core helper so both this crate and the
+    /// transcript-presence probe resolve the root the same way.
     fn claude_projects_root() -> Option<std::path::PathBuf> {
-        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
-        Some(std::path::PathBuf::from(home).join(".claude").join("projects"))
+        codescope_core::agents::claude::telemetry::default_projects_root()
     }
 
     /// Spawn the background per-tab agent session adoption loop.
