@@ -334,8 +334,7 @@ impl CopilotTranscriptTail {
     ///
     /// Default root is `~/.copilot/session-state/`; use [`default_session_state_root`].
     pub fn for_session(session_state_root: &Path, session_id: &str) -> Self {
-        let path = session_state_root.join(session_id).join("events.jsonl");
-        Self::new(path)
+        Self::new(session_dir(session_state_root, session_id).join("events.jsonl"))
     }
 
     /// Check for new bytes in the file and update `snapshot`.
@@ -360,6 +359,15 @@ impl CopilotTranscriptTail {
             _ => Duration::from_secs(2),
         }
     }
+}
+
+/// Directory Copilot keeps one session's state in:
+/// `<session_state_root>/<session_id>/`.
+///
+/// The single definition of that layout — the tail constructor and the
+/// retention probe both go through it, so neither can drift.
+pub fn session_dir(session_state_root: &Path, session_id: &str) -> PathBuf {
+    session_state_root.join(session_id)
 }
 
 /// Default Copilot session-state root: `<home>/.copilot/session-state`.

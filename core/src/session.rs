@@ -225,14 +225,29 @@ pub fn format_closed_at_relative(closed_at_iso: Option<&str>, now_iso: &str) -> 
 ///   in the Rust port at all. Their rows are left to the age / cap
 ///   sweep. Worth revisiting if those rows start piling up — the walk
 ///   is affordable if its result is cached across one sweep.
-pub fn transcript_presence(session: &Session) -> Option<bool> {
+pub(crate) fn transcript_presence(session: &Session) -> Option<bool> {
     let agent_id = crate::AgentId::from_str(session.agent_id.as_deref()?)?;
     let sid = session.agent_session_id.as_deref()?;
-    if sid.is_empty() {
+    // Both fields are interpolated into a path below, and `projects.json`
+    // is hand-editable, so neither is trusted here.
+    //
+    // A blank worktree path is the dangerous one: `encode_cwd("")` is
+    // empty, `root.join("")` lands back on the projects root, and the
+    // root *is* a readable directory — so the probe would sail past the
+    // directory guard and confidently report the transcript missing
+    // from a directory it was never in.
+    if session.worktree_path.trim().is_empty() {
         return None;
     }
     match agent_id {
         crate::AgentId::Claude => {
+            // Discovery only ever adopts UUID-named transcripts, so
+            // holding persisted ids to the same grammar costs nothing
+            // and keeps `..`, separators and absolute paths out of the
+            // join.
+            if !crate::agents::claude::discovery::is_session_id(sid) {
+                return None;
+            }
             let root = crate::agents::claude::telemetry::default_projects_root()?;
             let dir = root.join(crate::agents::claude::telemetry::encode_cwd(
                 &session.worktree_path,
@@ -240,14 +255,27 @@ pub fn transcript_presence(session: &Session) -> Option<bool> {
             if entry_presence(&dir, |m| m.is_dir()) != Some(true) {
                 return None;
             }
-            entry_presence(&dir.join(format!("{sid}.jsonl")), |m| m.is_file())
+            entry_presence(
+                &crate::agents::claude::telemetry::transcript_path(
+                    &root,
+                    &session.worktree_path,
+                    sid,
+                ),
+                |m| m.is_file(),
+            )
         }
         crate::AgentId::Copilot => {
+            if !crate::agents::copilot::discovery::is_uuid(sid) {
+                return None;
+            }
             let root = crate::agents::copilot::telemetry::default_session_state_root()?;
             if entry_presence(&root, |m| m.is_dir()) != Some(true) {
                 return None;
             }
-            entry_presence(&root.join(sid), |m| m.is_dir())
+            entry_presence(
+                &crate::agents::copilot::telemetry::session_dir(&root, sid),
+                |m| m.is_dir(),
+            )
         }
         crate::AgentId::Pi | crate::AgentId::OpenCode | crate::AgentId::Codex => None,
     }
@@ -312,7 +340,8 @@ impl SessionManager {
     /// `if (prunedSessionIds.Count > 0) { await SaveSnapshotAsync(); }`
     /// finally-block.
     pub fn load_with_sweep(paths: &AppPaths, now_iso: &str) -> Result<ProjectsConfig> {
-        let (cfg, _pruned) = Self::load_and_sweep(ProjectsConfig::load(paths)?, now_iso);
+        let (cfg, _pruned) =
+            Self::load_and_sweep(ProjectsConfig::load(paths)?, now_iso, transcript_presence);
         Ok(cfg)
     }
 
@@ -330,7 +359,8 @@ impl SessionManager {
         paths: &AppPaths,
         now_iso: &str,
     ) -> Result<(ProjectsConfig, Option<anyhow::Error>)> {
-        let (cfg, pruned) = Self::load_and_sweep(ProjectsConfig::load(paths)?, now_iso);
+        let (cfg, pruned) =
+            Self::load_and_sweep(ProjectsConfig::load(paths)?, now_iso, transcript_presence);
         if pruned.is_empty() {
             return Ok((cfg, None));
         }
@@ -341,8 +371,18 @@ impl SessionManager {
     /// Same as [`Self::load_with_sweep`] but reads from an explicit
     /// path. Used by tests to avoid hitting the user's real
     /// `%APPDATA%`.
+    ///
+    /// Runs the age / cap sweep **only**. The transcript prune is
+    /// deliberately skipped: it deletes rows based on the ambient
+    /// `HOME` / `USERPROFILE`, which the caller of an explicit-path
+    /// entry point has by definition not opted into. A test whose
+    /// fixture worktree path happened to match a real transcript
+    /// directory would otherwise have rows deleted out from under it.
+    /// Exercise the prune directly via
+    /// [`Self::prune_missing_transcripts`] with a probe you control.
     pub fn load_from_with_sweep(path: &Path, now_iso: &str) -> Result<ProjectsConfig> {
-        let (cfg, _pruned) = Self::load_and_sweep(ProjectsConfig::load_from(path)?, now_iso);
+        let (cfg, _pruned) =
+            Self::load_and_sweep(ProjectsConfig::load_from(path)?, now_iso, |_| None);
         Ok(cfg)
     }
 
@@ -355,12 +395,17 @@ impl SessionManager {
     /// dangling-transcript prune. The latter is load-only — a session
     /// closed a moment ago still has its transcript, so re-running it
     /// on every soft-close would only spend syscalls.
+    ///
+    /// `presence` is threaded in rather than hardcoded so each entry
+    /// point decides whether consulting the ambient home directory is
+    /// appropriate; see [`Self::load_from_with_sweep`], which opts out.
     fn load_and_sweep(
         mut cfg: ProjectsConfig,
         now_iso: &str,
+        presence: impl Fn(&Session) -> Option<bool>,
     ) -> (ProjectsConfig, Vec<String>) {
         let mut pruned = Self::apply_retention(&mut cfg, now_iso, None);
-        pruned.extend(Self::prune_missing_transcripts(&mut cfg, transcript_presence));
+        pruned.extend(Self::prune_missing_transcripts(&mut cfg, presence));
         (cfg, pruned)
     }
 
@@ -869,6 +914,47 @@ mod tests {
         let mut s = closed_agent_session("s1", "sid");
         s.worktree_path = "C:\\definitely\\not\\a\\real\\worktree\\xyzzy".into();
         assert_eq!(transcript_presence(&s), None);
+    }
+
+    #[test]
+    fn presence_is_undecidable_for_a_blank_worktree_path() {
+        // `encode_cwd("")` is empty, so `root.join("")` resolves back to
+        // the projects root — a directory that exists and passes the
+        // parent guard, while never holding the transcript. Left
+        // unguarded this is a confident wrong `Some(false)`, i.e. a
+        // deleted row for a conversation that is still on disk.
+        for blank in ["", "   "] {
+            let mut s = closed_agent_session("s1", "11111111-2222-3333-4444-555555555555");
+            s.worktree_path = blank.into();
+            assert_eq!(transcript_presence(&s), None, "worktree_path {blank:?}");
+        }
+    }
+
+    #[test]
+    fn presence_is_undecidable_for_ids_outside_the_agent_grammar() {
+        // `projects.json` is hand-editable and the id is interpolated
+        // into a path. Anything that isn't the UUID form discovery
+        // would have adopted is refused before the join.
+        //
+        // Both this and the blank-worktree test pin the guards' "answer
+        // before touching the filesystem" contract; they can't prove
+        // the filesystem branch is unreachable, because the probe
+        // resolves its root from the ambient home directory rather than
+        // taking one.
+        for id in [
+            "",
+            "   ",
+            "..",
+            "../../etc/passwd",
+            "sub/dir",
+            "C:\\Windows\\System32",
+            "not-a-uuid",
+        ] {
+            let mut claude = closed_agent_session("s1", id);
+            assert_eq!(transcript_presence(&claude), None, "claude id {id:?}");
+            claude.agent_id = Some("copilot".into());
+            assert_eq!(transcript_presence(&claude), None, "copilot id {id:?}");
+        }
     }
 
     #[test]

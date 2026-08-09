@@ -32,6 +32,18 @@ pub fn default_projects_root() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".claude").join("projects"))
 }
 
+/// Absolute path of the transcript Claude Code writes for
+/// `session_id` while running in `working_directory`:
+/// `<projects_root>/<encoded-cwd>/<session_id>.jsonl`.
+///
+/// The single definition of that layout — the tail constructor and the
+/// retention probe both go through it, so neither can drift.
+pub fn transcript_path(projects_root: &Path, working_directory: &str, session_id: &str) -> PathBuf {
+    projects_root
+        .join(encode_cwd(working_directory))
+        .join(format!("{session_id}.jsonl"))
+}
+
 /// Encode an absolute path to the `~/.claude/projects/<name>` directory
 /// name used by Claude Code.
 ///
@@ -399,11 +411,7 @@ impl ClaudeTranscriptTail {
     /// the file exists — the caller should handle missing-file
     /// gracefully via `poll()`.
     pub fn for_session(projects_root: &Path, working_directory: &str, session_id: &str) -> Self {
-        let encoded = encode_cwd(working_directory);
-        let path = projects_root
-            .join(encoded)
-            .join(format!("{session_id}.jsonl"));
-        Self::new(path)
+        Self::new(transcript_path(projects_root, working_directory, session_id))
     }
 
     /// Check for new bytes in the file and update `snapshot`.
