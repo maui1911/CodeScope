@@ -24,6 +24,26 @@ use serde_json::Value;
 
 pub use crate::telemetry::{FileTail, SessionState, TelemetrySnapshot, context_window_for_model};
 
+/// Default Claude Code projects root: `<home>/.claude/projects`.
+/// Mirrors the sibling agents' `default_*_root` helpers so callers
+/// that need a transcript path don't hand-roll the join.
+pub fn default_projects_root() -> Option<PathBuf> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    Some(PathBuf::from(home).join(".claude").join("projects"))
+}
+
+/// Absolute path of the transcript Claude Code writes for
+/// `session_id` while running in `working_directory`:
+/// `<projects_root>/<encoded-cwd>/<session_id>.jsonl`.
+///
+/// The single definition of that layout — the tail constructor and the
+/// retention probe both go through it, so neither can drift.
+pub fn transcript_path(projects_root: &Path, working_directory: &str, session_id: &str) -> PathBuf {
+    projects_root
+        .join(encode_cwd(working_directory))
+        .join(format!("{session_id}.jsonl"))
+}
+
 /// Encode an absolute path to the `~/.claude/projects/<name>` directory
 /// name used by Claude Code.
 ///
@@ -391,11 +411,7 @@ impl ClaudeTranscriptTail {
     /// the file exists — the caller should handle missing-file
     /// gracefully via `poll()`.
     pub fn for_session(projects_root: &Path, working_directory: &str, session_id: &str) -> Self {
-        let encoded = encode_cwd(working_directory);
-        let path = projects_root
-            .join(encoded)
-            .join(format!("{session_id}.jsonl"));
-        Self::new(path)
+        Self::new(transcript_path(projects_root, working_directory, session_id))
     }
 
     /// Check for new bytes in the file and update `snapshot`.

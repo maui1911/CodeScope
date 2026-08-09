@@ -94,7 +94,10 @@ pub fn scan(
 }
 
 /// Accepts the canonical `8-4-4-4-12` UUID form (case-insensitive).
-fn is_uuid(s: &str) -> bool {
+///
+/// Public so the retention probe can hold a persisted `agentSessionId`
+/// to the same grammar adoption applied when it minted the row.
+pub fn is_uuid(s: &str) -> bool {
     if s.len() != 36 {
         return false;
     }

@@ -193,6 +193,113 @@ pub fn format_closed_at_relative(closed_at_iso: Option<&str>, now_iso: &str) -> 
     format!("{month} {day}", day = dt.day)
 }
 
+/// Does this closed row's agent transcript still exist on disk?
+///
+/// The production probe behind
+/// [`SessionManager::prune_missing_transcripts`], and the only place
+/// that knows where each agent keeps its transcripts.
+///
+/// * `Some(true)` — the transcript is there.
+/// * `Some(false)` — the directory it belongs in is readable and the
+///   transcript is not in it. **Only this verdict deletes a row.**
+/// * `None` — undecidable; the caller keeps the row.
+///
+/// Undecidable covers every way we could be wrong about a transcript
+/// that actually exists, because the cost of a false `Some(false)` is
+/// destroyed history:
+///
+/// * the row carries no `agent_id` / `agent_session_id` (a plain shell
+///   tab has no transcript to begin with, and a legacy row predating
+///   `agent_id` can't be routed to a layout);
+/// * the agent's root can't be resolved (no `USERPROFILE` / `HOME`) or
+///   isn't a readable directory — a missing root means "we can't see
+///   the disk", never "every conversation is gone";
+/// * the per-session directory the transcript belongs in doesn't
+///   exist. For Claude that directory is derived from the worktree
+///   path, so a moved or renamed worktree lands here and keeps its
+///   rows instead of losing them;
+/// * the agent is Pi, OpenCode or Codex. Pi and OpenCode can only be
+///   located by walking their trees (Pi matches `*_<sid>.jsonl`
+///   recursively; OpenCode's `storage/` slug is derived from the
+///   project path and not predictable), and Codex has no layout wired
+///   in the Rust port at all. Their rows are left to the age / cap
+///   sweep. Worth revisiting if those rows start piling up — the walk
+///   is affordable if its result is cached across one sweep.
+pub(crate) fn transcript_presence(session: &Session) -> Option<bool> {
+    let agent_id = crate::AgentId::from_str(session.agent_id.as_deref()?)?;
+    let sid = session.agent_session_id.as_deref()?;
+    // Both fields are interpolated into a path below, and `projects.json`
+    // is hand-editable, so neither is trusted here.
+    //
+    // A blank worktree path is the dangerous one: `encode_cwd("")` is
+    // empty, `root.join("")` lands back on the projects root, and the
+    // root *is* a readable directory — so the probe would sail past the
+    // directory guard and confidently report the transcript missing
+    // from a directory it was never in.
+    if session.worktree_path.trim().is_empty() {
+        return None;
+    }
+    match agent_id {
+        crate::AgentId::Claude => {
+            // Discovery only ever adopts UUID-named transcripts, so
+            // holding persisted ids to the same grammar costs nothing
+            // and keeps `..`, separators and absolute paths out of the
+            // join.
+            if !crate::agents::claude::discovery::is_session_id(sid) {
+                return None;
+            }
+            let root = crate::agents::claude::telemetry::default_projects_root()?;
+            let dir = root.join(crate::agents::claude::telemetry::encode_cwd(
+                &session.worktree_path,
+            ));
+            if entry_presence(&dir, |m| m.is_dir()) != Some(true) {
+                return None;
+            }
+            entry_presence(
+                &crate::agents::claude::telemetry::transcript_path(
+                    &root,
+                    &session.worktree_path,
+                    sid,
+                ),
+                |m| m.is_file(),
+            )
+        }
+        crate::AgentId::Copilot => {
+            if !crate::agents::copilot::discovery::is_uuid(sid) {
+                return None;
+            }
+            let root = crate::agents::copilot::telemetry::default_session_state_root()?;
+            if entry_presence(&root, |m| m.is_dir()) != Some(true) {
+                return None;
+            }
+            entry_presence(
+                &crate::agents::copilot::telemetry::session_dir(&root, sid),
+                |m| m.is_dir(),
+            )
+        }
+        crate::AgentId::Pi | crate::AgentId::OpenCode | crate::AgentId::Codex => None,
+    }
+}
+
+/// Does `path` exist and match the expected kind, as far as we can
+/// actually tell?
+///
+/// `Path::exists` collapses "not there" and "couldn't look" into
+/// `false`, which for a caller that deletes history is the one
+/// confusion we can't afford: a permission error or an I/O hiccup would
+/// read as "the conversation is gone". So this only answers
+/// `Some(false)` for a genuine `NotFound`, and `None` for any other
+/// error. `Some(true)` additionally requires the entry to be the kind
+/// we expect — a directory sitting where a transcript file belongs is
+/// not a transcript.
+fn entry_presence(path: &Path, is_expected_kind: fn(&std::fs::Metadata) -> bool) -> Option<bool> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Some(is_expected_kind(&meta)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
+}
+
 /// In-memory orchestration over the persisted `Session` rows in a
 /// [`ProjectsConfig`]. Mirrors the session-lifecycle slice of C#
 /// `SessionStore` (`AddSessionAsync` / `SoftCloseSessionAsync` /
@@ -233,7 +340,8 @@ impl SessionManager {
     /// `if (prunedSessionIds.Count > 0) { await SaveSnapshotAsync(); }`
     /// finally-block.
     pub fn load_with_sweep(paths: &AppPaths, now_iso: &str) -> Result<ProjectsConfig> {
-        let (cfg, _pruned) = Self::load_and_sweep(ProjectsConfig::load(paths)?, now_iso);
+        let (cfg, _pruned) =
+            Self::load_and_sweep(ProjectsConfig::load(paths)?, now_iso, transcript_presence);
         Ok(cfg)
     }
 
@@ -251,7 +359,8 @@ impl SessionManager {
         paths: &AppPaths,
         now_iso: &str,
     ) -> Result<(ProjectsConfig, Option<anyhow::Error>)> {
-        let (cfg, pruned) = Self::load_and_sweep(ProjectsConfig::load(paths)?, now_iso);
+        let (cfg, pruned) =
+            Self::load_and_sweep(ProjectsConfig::load(paths)?, now_iso, transcript_presence);
         if pruned.is_empty() {
             return Ok((cfg, None));
         }
@@ -262,8 +371,18 @@ impl SessionManager {
     /// Same as [`Self::load_with_sweep`] but reads from an explicit
     /// path. Used by tests to avoid hitting the user's real
     /// `%APPDATA%`.
+    ///
+    /// Runs the age / cap sweep **only**. The transcript prune is
+    /// deliberately skipped: it deletes rows based on the ambient
+    /// `HOME` / `USERPROFILE`, which the caller of an explicit-path
+    /// entry point has by definition not opted into. A test whose
+    /// fixture worktree path happened to match a real transcript
+    /// directory would otherwise have rows deleted out from under it.
+    /// Exercise the prune directly via
+    /// [`Self::prune_missing_transcripts`] with a probe you control.
     pub fn load_from_with_sweep(path: &Path, now_iso: &str) -> Result<ProjectsConfig> {
-        let (cfg, _pruned) = Self::load_and_sweep(ProjectsConfig::load_from(path)?, now_iso);
+        let (cfg, _pruned) =
+            Self::load_and_sweep(ProjectsConfig::load_from(path)?, now_iso, |_| None);
         Ok(cfg)
     }
 
@@ -271,11 +390,22 @@ impl SessionManager {
     /// sweep to an already-loaded config and return (config, pruned
     /// session ids). Pulled out so each public variant only carries
     /// the bit that differs (path source, persistence policy).
+    ///
+    /// Runs two sweeps: the age / cap retention policy, then the
+    /// dangling-transcript prune. The latter is load-only — a session
+    /// closed a moment ago still has its transcript, so re-running it
+    /// on every soft-close would only spend syscalls.
+    ///
+    /// `presence` is threaded in rather than hardcoded so each entry
+    /// point decides whether consulting the ambient home directory is
+    /// appropriate; see [`Self::load_from_with_sweep`], which opts out.
     fn load_and_sweep(
         mut cfg: ProjectsConfig,
         now_iso: &str,
+        presence: impl Fn(&Session) -> Option<bool>,
     ) -> (ProjectsConfig, Vec<String>) {
-        let pruned = Self::apply_retention(&mut cfg, now_iso, None);
+        let mut pruned = Self::apply_retention(&mut cfg, now_iso, None);
+        pruned.extend(Self::prune_missing_transcripts(&mut cfg, presence));
         (cfg, pruned)
     }
 
@@ -492,6 +622,45 @@ impl SessionManager {
 
     // ---- retention -------------------------------------------------
 
+    /// Drop closed sessions whose agent transcript is provably gone,
+    /// returning the ids removed so the caller can invalidate caches —
+    /// same contract as [`Self::apply_retention`].
+    ///
+    /// Agent CLIs run their own retention (Claude Code deletes
+    /// transcripts after 30 days by default) well inside our
+    /// [`RetentionPolicy::MAX_AGE_DAYS`] window, so a closed row can
+    /// outlive the conversation it points at by two months. Reopening
+    /// one resumes a session id the CLI no longer knows and errors out.
+    ///
+    /// `presence` answers "does this row's transcript still exist?" —
+    /// `Some(false)` is the only verdict that deletes. `None` means
+    /// *undecidable* and always keeps the row; see
+    /// [`transcript_presence`] for what makes a verdict undecidable.
+    /// Injected rather than called directly so this stays a pure
+    /// function over `cfg`.
+    ///
+    /// Live rows (`closed_at = None`) are never touched, matching the
+    /// rest of the sweep.
+    pub fn prune_missing_transcripts(
+        cfg: &mut ProjectsConfig,
+        presence: impl Fn(&Session) -> Option<bool>,
+    ) -> Vec<String> {
+        let mut pruned = Vec::new();
+        for project in cfg.projects.iter_mut() {
+            project.sessions.retain(|s| {
+                if s.closed_at.is_none() {
+                    return true;
+                }
+                if presence(s) == Some(false) {
+                    pruned.push(s.id.clone());
+                    return false;
+                }
+                true
+            });
+        }
+        pruned
+    }
+
     /// Apply the closed-session retention policy in place. Returns the
     /// ids of sessions dropped from `cfg` so the caller can raise
     /// removal events / invalidate caches. Idempotent: re-running on
@@ -627,6 +796,183 @@ mod tests {
             agent_session_id: None,
             closed_at: None,
         }
+    }
+
+    // ---- prune_missing_transcripts -----------------------------
+    //
+    // Deletes history, so the guard rails matter more than the happy
+    // path: only a definite "the transcript is gone" verdict may drop
+    // a row, and only for a closed one.
+
+    /// Closed agent row — the only shape the prune is allowed to touch.
+    fn closed_agent_session(id: &str, agent_session_id: &str) -> Session {
+        let mut s = make_session(id, Some("primary"));
+        s.agent_id = Some("claude".into());
+        s.agent_session_id = Some(agent_session_id.to_string());
+        s.closed_at = Some("2026-04-01T10:00:00Z".into());
+        s
+    }
+
+    fn ids_in(cfg: &ProjectsConfig) -> Vec<String> {
+        cfg.projects[0].sessions.iter().map(|s| s.id.clone()).collect()
+    }
+
+    #[test]
+    fn prune_drops_closed_rows_whose_transcript_is_gone() {
+        let mut cfg = ProjectsConfig::default();
+        cfg.projects.push(make_project("p1"));
+        cfg.projects[0].sessions.push(closed_agent_session("gone", "sid-gone"));
+        cfg.projects[0].sessions.push(closed_agent_session("kept", "sid-kept"));
+
+        let pruned = SessionManager::prune_missing_transcripts(&mut cfg, |s| {
+            Some(s.agent_session_id.as_deref() == Some("sid-kept"))
+        });
+
+        assert_eq!(pruned, vec!["gone".to_string()]);
+        assert_eq!(ids_in(&cfg), vec!["kept".to_string()]);
+    }
+
+    #[test]
+    fn prune_never_touches_live_rows() {
+        // A live tab's transcript can legitimately not exist yet — the
+        // agent may not have written its first line. Dropping the row
+        // would delete a session the user is looking at.
+        let mut cfg = ProjectsConfig::default();
+        cfg.projects.push(make_project("p1"));
+        let mut live = closed_agent_session("live", "sid-live");
+        live.closed_at = None;
+        cfg.projects[0].sessions.push(live);
+
+        let pruned = SessionManager::prune_missing_transcripts(&mut cfg, |_| Some(false));
+
+        assert!(pruned.is_empty());
+        assert_eq!(ids_in(&cfg), vec!["live".to_string()]);
+    }
+
+    #[test]
+    fn prune_keeps_rows_the_probe_cannot_judge() {
+        // `None` is the verdict for an unreadable root, an unknown
+        // agent, or a plain shell row. None of those may delete.
+        let mut cfg = ProjectsConfig::default();
+        cfg.projects.push(make_project("p1"));
+        cfg.projects[0].sessions.push(closed_agent_session("undecidable", "sid"));
+        let mut shell = make_session("shell", Some("primary"));
+        shell.closed_at = Some("2026-04-01T10:00:00Z".into());
+        cfg.projects[0].sessions.push(shell);
+
+        let pruned = SessionManager::prune_missing_transcripts(&mut cfg, |_| None);
+
+        assert!(pruned.is_empty());
+        assert_eq!(ids_in(&cfg), vec!["undecidable".to_string(), "shell".to_string()]);
+    }
+
+    #[test]
+    fn prune_is_idempotent() {
+        let mut cfg = ProjectsConfig::default();
+        cfg.projects.push(make_project("p1"));
+        cfg.projects[0].sessions.push(closed_agent_session("gone", "sid-gone"));
+
+        assert_eq!(
+            SessionManager::prune_missing_transcripts(&mut cfg, |_| Some(false)).len(),
+            1
+        );
+        assert!(SessionManager::prune_missing_transcripts(&mut cfg, |_| Some(false)).is_empty());
+        assert!(ids_in(&cfg).is_empty());
+    }
+
+    // ---- transcript_presence (the production probe) ------------
+
+    #[test]
+    fn presence_is_undecidable_without_an_agent_or_session_id() {
+        // Plain shell row, and an agent row that never adopted.
+        let shell = make_session("s1", Some("primary"));
+        assert_eq!(transcript_presence(&shell), None);
+
+        let mut adopted_nothing = closed_agent_session("s2", "sid");
+        adopted_nothing.agent_session_id = None;
+        assert_eq!(transcript_presence(&adopted_nothing), None);
+
+        let mut empty_id = closed_agent_session("s3", "");
+        empty_id.agent_session_id = Some(String::new());
+        assert_eq!(transcript_presence(&empty_id), None);
+    }
+
+    #[test]
+    fn presence_is_undecidable_for_agents_without_a_predictable_layout() {
+        for agent in ["pi", "opencode", "codex"] {
+            let mut s = closed_agent_session("s1", "sid");
+            s.agent_id = Some(agent.to_string());
+            assert_eq!(transcript_presence(&s), None, "agent {agent}");
+        }
+    }
+
+    #[test]
+    fn presence_is_undecidable_when_the_transcript_directory_is_missing() {
+        // Worktree path that no `~/.claude/projects/<encoded>` dir can
+        // exist for — the shape a moved or renamed worktree produces.
+        // Must not read as "the conversation is gone".
+        let mut s = closed_agent_session("s1", "sid");
+        s.worktree_path = "C:\\definitely\\not\\a\\real\\worktree\\xyzzy".into();
+        assert_eq!(transcript_presence(&s), None);
+    }
+
+    #[test]
+    fn presence_is_undecidable_for_a_blank_worktree_path() {
+        // `encode_cwd("")` is empty, so `root.join("")` resolves back to
+        // the projects root — a directory that exists and passes the
+        // parent guard, while never holding the transcript. Left
+        // unguarded this is a confident wrong `Some(false)`, i.e. a
+        // deleted row for a conversation that is still on disk.
+        for blank in ["", "   "] {
+            let mut s = closed_agent_session("s1", "11111111-2222-3333-4444-555555555555");
+            s.worktree_path = blank.into();
+            assert_eq!(transcript_presence(&s), None, "worktree_path {blank:?}");
+        }
+    }
+
+    #[test]
+    fn presence_is_undecidable_for_ids_outside_the_agent_grammar() {
+        // `projects.json` is hand-editable and the id is interpolated
+        // into a path. Anything that isn't the UUID form discovery
+        // would have adopted is refused before the join.
+        //
+        // Both this and the blank-worktree test pin the guards' "answer
+        // before touching the filesystem" contract; they can't prove
+        // the filesystem branch is unreachable, because the probe
+        // resolves its root from the ambient home directory rather than
+        // taking one.
+        for id in [
+            "",
+            "   ",
+            "..",
+            "../../etc/passwd",
+            "sub/dir",
+            "C:\\Windows\\System32",
+            "not-a-uuid",
+        ] {
+            let mut claude = closed_agent_session("s1", id);
+            assert_eq!(transcript_presence(&claude), None, "claude id {id:?}");
+            claude.agent_id = Some("copilot".into());
+            assert_eq!(transcript_presence(&claude), None, "copilot id {id:?}");
+        }
+    }
+
+    #[test]
+    fn entry_presence_separates_absent_from_unanswerable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("transcript.jsonl");
+        std::fs::write(&file, b"{}\n").unwrap();
+
+        assert_eq!(entry_presence(&file, |m| m.is_file()), Some(true));
+        assert_eq!(
+            entry_presence(&tmp.path().join("nope.jsonl"), |m| m.is_file()),
+            Some(false),
+            "a genuine NotFound is the one verdict allowed to delete"
+        );
+        // Wrong kind: a directory where the transcript file belongs is
+        // not a transcript, but it is an answer.
+        assert_eq!(entry_presence(tmp.path(), |m| m.is_file()), Some(false));
+        assert_eq!(entry_presence(tmp.path(), |m| m.is_dir()), Some(true));
     }
 
     // ---- open / soft_close / reopen / hard_remove --------------
