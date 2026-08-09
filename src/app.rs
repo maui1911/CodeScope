@@ -1166,11 +1166,23 @@ impl AppShell {
             let diag_paths = paths.clone();
             move |_, window, cx| {
                 append_window_diag(&diag_paths, "bounds_changed", window);
-                let state = window_state_from_window(window);
-                *pending.lock() = Some(PendingWindowSave {
-                    state,
-                    set_at: Instant::now(),
-                });
+                // Never let a minimized window overwrite the saved
+                // geometry (issue #279). Windows minimizes the window
+                // on some session switches — a lock/unlock cycle shows
+                // up in `window-diag.log` as `showCmd=2` with
+                // `is_maximized=false`, and gpui reports plain
+                // `Windowed(<restore bounds>)` for it, so
+                // `window_state_from_window` records `maximised:
+                // false`. The 500 ms debounce flushes that to
+                // `window.json` long before the unlock restores the
+                // real state, and the next launch comes back windowed.
+                if !window_is_minimized(window) {
+                    let state = window_state_from_window(window);
+                    *pending.lock() = Some(PendingWindowSave {
+                        state,
+                        set_at: Instant::now(),
+                    });
+                }
                 // Force a re-render so the entity tree picks up the
                 // new viewport bounds (otherwise the terminal panes
                 // keep their pre-transition layout until something
@@ -8435,6 +8447,23 @@ fn fmt_bytes(bytes: u64) -> String {
         format!("{:.0} KB", b / KB)
     } else {
         format!("{bytes} B")
+    }
+}
+
+/// True while the window is minimized. Only Windows is known to
+/// minimize the window behind the user's back (session switch /
+/// lock), and it is the only platform with a cheap query for it, so
+/// every other target keeps the pre-#279 behaviour of persisting
+/// whatever the bounds observer reports.
+fn window_is_minimized(window: &Window) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        crate::win32_titlebar::is_minimized(window)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+        false
     }
 }
 

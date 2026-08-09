@@ -31,7 +31,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetWindowPlacement, GetWindowRect, HTCAPTION, IsZoomed, PostMessageW,
+    GetCursorPos, GetWindowPlacement, GetWindowRect, HTCAPTION, IsIconic, IsZoomed, PostMessageW,
     SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, SW_SHOWNORMAL, SetWindowPlacement,
     WINDOWPLACEMENT, WM_NCLBUTTONDOWN, WM_SYSCOMMAND,
 };
@@ -180,6 +180,23 @@ unsafe fn reposition_for_restore_under_cursor(hwnd: HWND) {
         };
         let _ = SetWindowPlacement(hwnd, &placement);
     }
+}
+
+/// True while the window is minimized (`SW_SHOWMINIMIZED`).
+///
+/// gpui has no equivalent accessor: a minimized window reports
+/// `WindowBounds::Windowed(<restore bounds>)` and `is_maximized() ==
+/// false`, which is indistinguishable from a user restore-down. The
+/// window-state persister needs the difference — see the caller in
+/// `app.rs` (issue #279).
+///
+/// Returns `false` when the HWND can't be resolved; the caller then
+/// behaves exactly as it did before this guard existed.
+pub fn is_minimized(window: &Window) -> bool {
+    let Some(hwnd) = hwnd(window) else {
+        return false;
+    };
+    unsafe { IsIconic(hwnd).as_bool() }
 }
 
 /// Toggle maximize ↔ restore via `WM_SYSCOMMAND`. `IsZoomed` is the
