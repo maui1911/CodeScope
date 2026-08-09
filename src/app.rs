@@ -173,12 +173,21 @@ struct Tab {
 /// first — so a tab that already owns a transcript can't rotate onto
 /// the one its neighbour just minted.
 ///
-/// Remaining ceilings, both needing the agent to report its own id
-/// back to us before they can close:
+/// Remaining ceilings. The first two are the same gap — the rounds
+/// separate adopted tabs from unadopted ones, but *within* a round
+/// nothing distinguishes same-cwd tabs, so iteration order decides.
+/// Closing either needs the agent to report its own session id back to
+/// us:
 ///
-/// * Several same-cwd tabs that *all* already own a transcript: a
-///   `/clear` rotation in one of them is taken by whichever comes
-///   first in iteration order.
+/// * Same-cwd tabs that *all* already own a transcript: a `/clear`
+///   rotation in one of them goes to whichever comes first.
+/// * Same-cwd tabs that *none* of which have adopted yet: the first
+///   transcript to appear goes to the first tab, which is only right
+///   because tab order follows spawn order and an agent normally
+///   writes its transcript at startup. If the second tab's agent
+///   writes first, the two tabs end up holding each other's ids.
+///   Both still get exactly one transcript — this crosses the mapping,
+///   it does not starve a tab.
 /// * The dev build and the installed build share
 ///   `~/.claude/projects/` but keep separate `projects.json` stores,
 ///   so neither sees the other's claims. A tab in one instance can
