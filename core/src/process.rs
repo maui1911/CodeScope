@@ -49,8 +49,19 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// Call this for `git`, `gh`, or any other tool we shell out to for
 /// machine-readable output — i.e. anything where the user must never
 /// see a flashing console window.
+///
+/// Also sets `GIT_OPTIONAL_LOCKS=0` (issue #294): our status/diff
+/// pollers run `git status` about once a second across all open
+/// projects, and by default every one of those refreshes the index —
+/// taking `index.lock` — as a side effect. Agents committing in the
+/// same worktree lose that race and their commits fail. The env var
+/// skips only *optional* lock-taking (the opportunistic index
+/// refresh); mandatory locks for real writes (`commit`, `worktree
+/// add`, …) are unaffected. Set here at the shared choke point so
+/// every current and future git spawn inherits it; `gh` ignores it.
 pub fn no_window_command(program: impl AsRef<OsStr>) -> Command {
     let mut cmd = Command::new(program);
+    cmd.env("GIT_OPTIONAL_LOCKS", "0");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -72,5 +83,17 @@ mod tests {
     fn returns_command_for_program() {
         let cmd = no_window_command("git");
         assert_eq!(cmd.get_program(), "git");
+    }
+
+    /// Polled `git status` must never take `index.lock` (issue #294)
+    /// — the env var that guarantees it has to be present on every
+    /// spawned command.
+    #[test]
+    fn disables_optional_git_locks() {
+        let cmd = no_window_command("git");
+        assert!(
+            cmd.get_envs()
+                .any(|(k, v)| k == "GIT_OPTIONAL_LOCKS" && v == Some(OsStr::new("0")))
+        );
     }
 }
