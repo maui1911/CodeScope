@@ -25,16 +25,80 @@
 > `.github/workflows/release.yml` (was `rs--release.yml`) and now
 > triggers on plain `v*` tags.
 
-**Last updated:** 2026-08-09 (session 53 — session ↔ transcript mapping: cross-tab adoption claims, and retention for transcripts the agent CLI already deleted)
-**Branch:** `main`; both session-53 PRs merged, no open PRs.
-**Head:** `main` at `3933eb7`. Session-53 merges: #285 adoption claims, #286 dangling-transcript prune. Both took two Copilot rounds plus a four-pass Codex review; details below. Session 52 merged #280 modifier encoding + faint rendering, #281 `[dev]` window title / titlebar badge. Earlier: #275–#277 (v0.5.1), #262–#274 (v0.5.0).
+**Last updated:** 2026-08-10 (session 54 — five user-reported fixes: window re-maximize burst race, taskbar badge after display change, git index.lock contention, reveal-in-explorer slashes, waiting-on-input shown as busy)
+**Branch:** `main`; all session-54 PRs merged, no open PRs.
+**Head:** `main` at `265589a`. Session-54 merges: #295 monitor-swap grace window, #296 badge repaint after display change, #297 `GIT_OPTIONAL_LOCKS=0`, #298 explorer backslashes, #299 AskUserQuestion → Idle. Issues #279 (re-opened for the burst race), #292, #293, #294 all closed. Session 53 merged #285 adoption claims + #286 dangling-transcript prune (details below). Session 52 merged #280 modifier encoding + faint rendering, #281 `[dev]` window title / titlebar badge. Earlier: #287–#291 (sessions 53b/54a window+telemetry), #275–#277 (v0.5.1), #262–#274 (v0.5.0).
 **Release:** **`v0.5.1` is published** (pipeline run 27406124661). It's a patch over v0.5.0 carrying the in-app updater robustness fix. **`v0.5.0` is also still up** but its updater can mis-handle a truncated download — see below.
 **The v0.5.0 update bug (root-caused + fixed this session):** the user's installed v0.4.0 → v0.5.0 in-app update failed (twice) with `Extract failed: … ZipError: invalid Zip archive: Could not find EOCD`. EOCD-missing = the downloaded zip was **truncated**. The published v0.5.0 artifact is **fine** (verified end-to-end: full GitHub download, valid `PK\x03\x04`, extracts cleanly with identical code + dep pins). Root cause was in `src/update.rs`'s downloader: the read loop broke on the first `Ok(0)` EOF and proceeded to extract **without checking `received == Content-Length`**, so a TLS-inspecting proxy / AV middlebox clipping the HTTPS download (a *clean* early EOF) silently produced a short zip. Fix (#275): `verify_complete` (pure, unit-tested) + `download_once` + `download_archive` (3 attempts, linear backoff). A short download now fails as honest "Download incomplete: received N of M bytes" and self-heals on retry. #276 added `dist/truncating_server.py` + RELEASE-VALIDATION §6b to guard it (§6 served from localhost, which never truncates — that's why the bug shipped).
 **⚠ The user is behind a network that truncates** large HTTPS downloads, so the v0.4.0/v0.5.0 in-app updater fails for them. Path forward given to them: run `CodeScope-v0.5.1-setup.exe` from the release directly (bypasses the updater) to land on the build that *has* the fix; after that the in-app updater self-heals. The verified-complete `CodeScope-v0.5.0-setup.exe` was earlier downloaded to `C:\Users\maui\Downloads\`.
 **Diagnostic logging gap (open):** the installer writes update failures only to a transient toast (auto-dismissed) and the temp dir (`tempfile::tempdir()` under `%TEMP%`, auto-deleted on return) — nothing persists to disk, so "do you have logs?" came up empty. Worth a follow-up: log the update flow + full error chain to `%LOCALAPPDATA%\CodeScope\update.log`. Not yet filed.
-**Build status:** ✅ workspace builds clean; suite green on `main` — 53 in `codescope-terminal`, 491 in `codescope-core` (+10 this session), 136 in `codescope` (+5). Clippy: 0 errors, only the pre-existing warnings (`app.rs` `map_or` / `spawn_tab_in` arg count / large enum variant, `core` `from_str` / `sort_by_key`).
+**Build status:** ✅ workspace builds clean; suite green on `main` — 53 in `codescope-terminal`, 501 in `codescope-core` (+5 this session), 147 in `codescope` (+11 across sessions 53b–54). Clippy: 0 errors, only the pre-existing warnings (`app.rs` `map_or` / `spawn_tab_in` arg count / large enum variant, `core` `from_str` / `sort_by_key`, `taskbar_badge.rs` `gy` loop indexing, `opencode` arg count).
 **Uncommitted work:** none.
-**Open issues:** none filed. **The `core/src/path_canon.rs` doctest now passes** — `cargo test --workspace` reported a green doctest run all session, so the session-52 note about it failing no longer reproduces; drop it if a later session confirms. **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree — do **NOT** run repo-wide `cargo fmt`; hand-format changed hunks. See the session-47 note. (Session 52 ran it by accident, got 2708 lines of churn across 60 files, and had to `git restore` + re-apply by hand. The warning is real.)
+**Open issues:** none — all four open issues were closed this session (#292, #293, #294, plus #279 re-opened and re-closed). **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree — do **NOT** run repo-wide `cargo fmt`, and note that even `cargo fmt -- src/app.rs` (with a file argument!) reformatted all 59 files this session; hand-format changed hunks, always. See the session-47 note.
+
+### Session 54 — five user-reported fixes (#295–#299)
+
+All five started from live evidence — the user's own `window-diag.log`,
+issue screenshots, or real transcripts — not from code reading alone.
+
+**#295 — the #291 re-maximize guard missed the burst case.** The
+HMONITOR guard compared handles across *adjacent* bounds ticks, but
+bounds ticks fire between the handle swap and gpui's deferred
+`ShowWindow(SW_SHOWNORMAL)`, so both sides of the un-maximize pair
+already held the new handle (log: swap at 19:05:34 while still
+maximized, un-maximize at 19:05:37 on the same new handle). Now
+`monitor_changed` stamps `last_monitor_change` on whatever tick the
+swap surfaces, and an un-maximize within `MONITOR_CHANGE_GRACE` (10 s)
+is attributed to the display change. Ceiling: a user restore-down
+within 10 s of a swap gets fought once — same trade-off class as the
+minimize heuristic. Issue #279 re-closed; user confirmed working.
+
+**#296 — taskbar badge vanished for a workday.** A session reconnect
+(RDP / lock) can hand the shell a recreated taskbar whose overlay is
+gone while `TaskbarBadge`'s de-dupe cache still says it is painted.
+The monitor-swap signal from #295 now calls `invalidate()` so the next
+250 ms telemetry tick repaints; `SetOverlayIcon` / GDI failures return
+"not applied" instead of poisoning the cache. Ceiling: an explorer
+restart with *no* display change still loses the overlay until the
+next count change — needs a `TaskbarCreated` listener in gpui's
+wndproc; not built until observed.
+
+**#297 — pollers took `index.lock` and broke agent commits.** The
+reporter's Claude traced failed commits to two git PIDs parented by
+CodeScope.exe: the ~1/s aggregate `status --porcelain` + `diff
+--numstat` polls each refreshed the index as a side effect. Fix is one
+line at the shared choke point: `GIT_OPTIONAL_LOCKS=0` in
+`no_window_command`, so *every* git spawn (current and future) skips
+optional locks; mandatory write locks unaffected. Poll cadence
+unchanged — a lock-free read blocks nobody.
+
+**#298 — "Reveal in File Explorer" opened Documents.** `explorer.exe`
+silently falls back to Documents for forward-slash paths, and
+`adopt_existing_worktrees` stores `git worktree list --porcelain`
+output verbatim (`C:/dev/...`). That is why only externally-created
+worktrees broke — dialog-created ones carry backslashes. Fixed with a
+`replace('/', "\\")` in `reveal_path_in_file_browser`, covering all
+callers and all already-stored paths.
+
+**#299 — waiting on AskUserQuestion showed busy.** In the transcript
+that is a plain `stop_reason:"tool_use"` assistant entry →
+`PendingToolUse` → red dot, while the agent is blocked on the human.
+Assistant entries whose tool_use blocks are **all** user-interaction
+prompts (`AskUserQuestion` / `ExitPlanMode`) now map to `Idle`; the
+answer's tool-result user entry flips back to `Busy` on its own.
+Conservative rules from review: unnamed tool_use blocks count as real
+tools; a question racing a real tool stays pending; the #289
+pending-subagents guard still wins. Ceiling: a bare *permission*
+prompt is indistinguishable from a long-running tool in the transcript
+— nothing to key on. Claude backend only.
+
+**Process notes.** Every PR waited for + addressed its Copilot review
+before an `--admin` squash-merge. Copilot's catches this session were
+all real: stale doc on `window_monitor` (#295), transient GDI failures
+(#296), unnamed-tool_use misclassification (#299). And once more with
+feeling: `cargo fmt -- src/app.rs` *with a file argument* still
+reformatted the whole tree — `git checkout -- .` + re-apply by hand
+was the recovery.
 
 ### Session 53 — session ↔ transcript mapping
 
