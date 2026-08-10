@@ -426,10 +426,11 @@ mod windows_impl {
                     return ok;
                 }
             }
-            // Icon construction failed — deterministic (GDI resource
-            // shape, not shell state), so retrying won't help. Report
-            // "applied" to stop the poll loop from spinning on it.
-            true
+            // Icon construction failed — GDI failures can be
+            // transient (handle pressure), so report "not applied"
+            // and let the next telemetry tick retry. A permanently
+            // failing retry is one cheap GDI call per tick.
+            false
         }
 
         pub(super) fn clear(&mut self) {
