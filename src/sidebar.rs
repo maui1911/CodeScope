@@ -5108,8 +5108,14 @@ async fn commit_worktree_removal(
 /// status since the user sees the result on their desktop. Also called
 /// from the tab right-click menu in `app.rs`.
 pub(crate) fn reveal_path_in_file_browser(path: &str) {
+    // explorer.exe silently opens the Documents folder when handed a
+    // path with forward slashes — which is exactly what `git worktree
+    // list --porcelain` emits on Windows, and what
+    // `adopt_existing_worktrees` stores verbatim (issue #292).
     #[cfg(target_os = "windows")]
-    let result = Command::new("explorer.exe").arg(path).spawn();
+    let result = Command::new("explorer.exe")
+        .arg(path.replace('/', "\\"))
+        .spawn();
     #[cfg(target_os = "macos")]
     let result = Command::new("open").arg(path).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
