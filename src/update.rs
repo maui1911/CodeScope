@@ -195,6 +195,23 @@ fn dev_update_url_override() -> Option<String> {
 #[cfg(not(target_os = "macos"))]
 const DOWNLOAD_ATTEMPTS: u32 = 3;
 
+/// Append one timestamped line to `update.log` in the state dir
+/// (`%LOCALAPPDATA%\CodeScope\` on Windows). Update failures used to
+/// surface only in a transient toast and a temp dir that
+/// `tempfile::tempdir()` deletes on return — two user-reported
+/// failures in a row came back with "no logs" (HANDOFF sessions
+/// 53/54). Best-effort: a failure to log must never fail the update.
+fn log_update(msg: &str) {
+    use std::io::Write as _;
+    let path = codescope_core::paths::AppPaths::detect()
+        .state_dir
+        .join("update.log");
+    let ts = codescope_core::time::now_iso8601();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{ts} {msg}");
+    }
+}
+
 /// Verdict on whether a finished download received the whole body.
 /// Pure so the truncation rule is unit-testable without a socket. A
 /// `None` total means the server sent no `Content-Length` and we
@@ -236,6 +253,9 @@ fn download_archive(
         match download_once(client, url, archive_path, state) {
             Ok(()) => return Ok(()),
             Err(err) => {
+                log_update(&format!(
+                    "download attempt {attempt}/{DOWNLOAD_ATTEMPTS} failed: {err}"
+                ));
                 last_err = err;
                 if attempt < DOWNLOAD_ATTEMPTS {
                     // Linear backoff; the file is recreated (truncated)
@@ -302,6 +322,11 @@ fn run_install(state: &UpdateState, info: ReleaseInfo) {
     // there's no separate received=0/total=None pre-write here — it
     // would only ever be overwritten before a frame could render it.
     let download_url = dev_update_url_override().unwrap_or_else(|| info.archive_url.clone());
+    log_update(&format!(
+        "install start: v{} from {download_url} (running v{})",
+        info.version,
+        env!("CARGO_PKG_VERSION"),
+    ));
 
     let temp_dir = match tempfile::tempdir() {
         Ok(d) => d,
@@ -319,8 +344,23 @@ fn run_install(state: &UpdateState, info: ReleaseInfo) {
     // the state slot. self_update::Download has no programmatic progress
     // hook in 0.41. reqwest::blocking is safe here — run_install is on a
     // plain std thread, not a tokio runtime.
+    //
+    // Timeouts: the blocking client's default is a 30-second cap on
+    // the *entire request*, body included — any download slower than
+    // 30 s died mid-stream, every retry died the same way, and the
+    // user saw "the download never finishes" on a perfectly fine
+    // connection (the v0.5.1 → v0.5.2 failure). `timeout(None)` lifts
+    // the total cap; the connect timeout still fails an unreachable
+    // host fast.
+    //
+    // ponytail: a connection that hangs *mid-body* now stalls until
+    // the OS drops the socket — reqwest 0.12's blocking builder has
+    // no per-read timeout to guard that. Progress freezing in the UI
+    // is the tell; add a stall watchdog if it is ever actually seen.
     let client = match reqwest::blocking::Client::builder()
         .user_agent(concat!("CodeScope/", env!("CARGO_PKG_VERSION")))
+        .timeout(None)
+        .connect_timeout(std::time::Duration::from_secs(30))
         .build()
     {
         Ok(c) => c,
@@ -341,6 +381,7 @@ fn run_install(state: &UpdateState, info: ReleaseInfo) {
     // "download incomplete", and retrying self-heals transient
     // truncation.
     if let Err(message) = download_archive(&client, &download_url, &archive_path, state) {
+        log_update(&format!("install failed: {message}"));
         *state.write() = UpdateStatus::Failed { message };
         return;
     }
@@ -353,20 +394,21 @@ fn run_install(state: &UpdateState, info: ReleaseInfo) {
     let extracted = match extract_binary(&archive_path) {
         Ok(p) => p,
         Err(err) => {
-            *state.write() = UpdateStatus::Failed {
-                message: format!("Extract failed: {err:#}"),
-            };
+            let message = format!("Extract failed: {err:#}");
+            log_update(&format!("install failed: {message}"));
+            *state.write() = UpdateStatus::Failed { message };
             return;
         }
     };
 
     if let Err(err) = self_update::self_replace::self_replace(&extracted) {
-        *state.write() = UpdateStatus::Failed {
-            message: format!("Self-replace failed: {err:#}"),
-        };
+        let message = format!("Self-replace failed: {err:#}");
+        log_update(&format!("install failed: {message}"));
+        *state.write() = UpdateStatus::Failed { message };
         return;
     }
 
+    log_update(&format!("install complete: v{} ready, restart to apply", info.version));
     *state.write() = UpdateStatus::Ready(info);
 }
 
