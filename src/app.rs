@@ -8648,8 +8648,11 @@ fn window_is_minimized(window: &Window) -> bool {
 
 /// `HMONITOR` the window is on. `None` off Windows — no other
 /// platform is known to un-maximize the window behind the user's
-/// back, and [`unmaximized_by_display_change`] never fires without a
-/// value on both sides.
+/// back, and [`monitor_changed`] never stamps a swap without a value
+/// on both sides, so [`unmaximized_by_display_change`] can never fire
+/// there. A rare failed Win32 read *after* a stamped swap is fine:
+/// the swap itself was witnessed, and the read failure doesn't
+/// un-happen it.
 fn window_monitor(window: &Window) -> Option<isize> {
     #[cfg(target_os = "windows")]
     {
