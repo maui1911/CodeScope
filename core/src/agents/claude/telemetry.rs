@@ -178,25 +178,30 @@ fn parse_line(line: &str) -> Option<Entry> {
 
         // Detect assistant entries blocked on the human: every
         // tool_use block is a user-interaction prompt. See the
-        // field doc on `Entry::awaiting_user_input`.
+        // field doc on `Entry::awaiting_user_input`. Single pass, no
+        // allocation; a tool_use block with a missing or non-string
+        // `name` counts as a real tool, so a malformed batch never
+        // classifies as idle (Copilot review on PR #299).
         if kind == EntryKind::Assistant
             && stop_reason.as_deref() == Some("tool_use")
             && let Some(content) = msg.get("content").and_then(Value::as_array) {
-                let tool_names: Vec<&str> = content
-                    .iter()
-                    .filter_map(|item| {
-                        let o = item.as_object()?;
-                        if o.get("type").and_then(Value::as_str) == Some("tool_use") {
-                            o.get("name").and_then(Value::as_str)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                awaiting_user_input = !tool_names.is_empty()
-                    && tool_names
-                        .iter()
-                        .all(|n| matches!(*n, "AskUserQuestion" | "ExitPlanMode"));
+                let mut any_tool_use = false;
+                let mut all_user_prompts = true;
+                for item in content {
+                    let Some(o) = item.as_object() else { continue };
+                    if o.get("type").and_then(Value::as_str) != Some("tool_use") {
+                        continue;
+                    }
+                    any_tool_use = true;
+                    if !matches!(
+                        o.get("name").and_then(Value::as_str),
+                        Some("AskUserQuestion" | "ExitPlanMode")
+                    ) {
+                        all_user_prompts = false;
+                        break;
+                    }
+                }
+                awaiting_user_input = any_tool_use && all_user_prompts;
             }
     }
 
@@ -855,6 +860,28 @@ mod tests {
             &path,
             &[
                 r#"{"type":"assistant","sessionId":"s","timestamp":"2026-04-22T08:01:00Z","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}},{"type":"tool_use","id":"t2","name":"AskUserQuestion","input":{}}],"usage":{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+            ],
+        );
+
+        let mut tail = FileTail::default();
+        let mut snap: Option<TelemetrySnapshot> = None;
+        let mut last_user_ts = None;
+        read_lines(&path.to_path_buf(), &mut tail, &mut snap, &mut last_user_ts);
+
+        assert_eq!(snap.unwrap().state, SessionState::PendingToolUse);
+    }
+
+    #[test]
+    fn unnamed_tool_use_block_never_classifies_as_idle() {
+        // A tool_use block missing its name must count as a real
+        // tool — a malformed batch must not read as "waiting on the
+        // user" (Copilot review on PR #299).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(
+            &path,
+            &[
+                r#"{"type":"assistant","sessionId":"s","timestamp":"2026-04-22T08:01:00Z","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1"},{"type":"tool_use","id":"t2","name":"AskUserQuestion","input":{}}],"usage":{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
             ],
         );
 
