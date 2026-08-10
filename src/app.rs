@@ -176,16 +176,48 @@ fn unminimized_without_maximize(
 /// Only the second one answers "is this still the monitor gpui was
 /// holding on to".
 ///
+/// The second cut compared the handle across *adjacent* ticks only,
+/// and missed the burst case (issue #279): bounds ticks fire between
+/// the handle swap and gpui's deferred `ShowWindow`, so by the time
+/// the un-maximize arrives, both sides of the pair already hold the
+/// new handle:
+///
+/// ```text
+/// 19:01:00 Maximized hmon=0x20d1a
+/// 19:05:34 Maximized hmon=0x440d9b  ← handle swapped, still maximized
+/// 19:05:37 Windowed  hmon=0x440d9b  ← un-maximize, same handle
+/// ```
+///
+/// So the caller times the swap instead: [`monitor_changed`] spots it
+/// on whatever tick it surfaces, and an un-maximize within
+/// [`MONITOR_CHANGE_GRACE`] of it is attributed to the display
+/// change. A user restore-down minutes later is outside the window
+/// and left alone.
+///
 /// Sibling case: [`unminimized_without_maximize`], when the window
 /// was already minimized as the monitors went away.
-fn unmaximized_by_display_change(prev: &WindowPlacement, now: &WindowPlacement) -> bool {
-    prev.maximized
-        && !now.maximized
-        && !now.minimized
-        && prev.monitor.is_some()
-        && now.monitor.is_some()
-        && prev.monitor != now.monitor
+fn unmaximized_by_display_change(
+    prev: &WindowPlacement,
+    now: &WindowPlacement,
+    monitor_changed_recently: bool,
+) -> bool {
+    prev.maximized && !now.maximized && !now.minimized && monitor_changed_recently
 }
+
+/// True when the window sits on a different monitor than it did on
+/// the previous tick. Two `None`s — non-Windows, or a failed Win32
+/// read — never count: no information is not evidence of a
+/// reconfiguration.
+fn monitor_changed(prev: &WindowPlacement, now: &WindowPlacement) -> bool {
+    prev.monitor.is_some() && now.monitor.is_some() && prev.monitor != now.monitor
+}
+
+/// How long after a monitor swap an un-maximize is still blamed on
+/// it. The reporter's log shows a 3 s gap between the swap surfacing
+/// and gpui's `ShowWindow` landing; 10 s covers slower
+/// reconfigurations while staying far below any plausible user
+/// restore-down cadence.
+const MONITOR_CHANGE_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// One tab = one terminal session.
 struct Tab {
@@ -832,6 +864,10 @@ pub struct AppShell {
     /// Placement seen on the previous bounds-observer tick. Feeds
     /// [`unmaximized_by_display_change`]; `None` until the first tick.
     last_window_placement: Option<WindowPlacement>,
+    /// When [`monitor_changed`] last fired. An un-maximize within
+    /// [`MONITOR_CHANGE_GRACE`] of this is a display change, not a
+    /// user restore-down — see [`unmaximized_by_display_change`].
+    last_monitor_change: Option<Instant>,
     /// Whether the window was maximized when it was last minimized.
     /// Feeds [`unminimized_without_maximize`]; cleared once the
     /// window is out of minimized again so it can't go stale.
@@ -1293,9 +1329,18 @@ impl AppShell {
                 if placement.minimized && !prev.is_some_and(|p| p.minimized) {
                     this.maximized_before_minimize = prev.is_some_and(|p| p.maximized);
                 }
-                let display_change = prev
+                if prev
                     .as_ref()
-                    .is_some_and(|prev| unmaximized_by_display_change(prev, &placement));
+                    .is_some_and(|prev| monitor_changed(prev, &placement))
+                {
+                    this.last_monitor_change = Some(Instant::now());
+                }
+                let monitor_changed_recently = this
+                    .last_monitor_change
+                    .is_some_and(|at| at.elapsed() <= MONITOR_CHANGE_GRACE);
+                let display_change = prev.as_ref().is_some_and(|prev| {
+                    unmaximized_by_display_change(prev, &placement, monitor_changed_recently)
+                });
                 let flat_unminimize = prev.as_ref().is_some_and(|prev| {
                     unminimized_without_maximize(prev, &placement, this.maximized_before_minimize)
                 });
@@ -1565,6 +1610,7 @@ impl AppShell {
             window_active_cached: true,
             telemetry_tails: HashMap::new(),
             last_window_placement: None,
+            last_monitor_change: None,
             maximized_before_minimize: false,
             bell_bounds: None,
             projects: projects_for_sessions,
@@ -8602,8 +8648,11 @@ fn window_is_minimized(window: &Window) -> bool {
 
 /// `HMONITOR` the window is on. `None` off Windows — no other
 /// platform is known to un-maximize the window behind the user's
-/// back, and [`unmaximized_by_display_change`] never fires without a
-/// value on both sides.
+/// back, and [`monitor_changed`] never stamps a swap without a value
+/// on both sides, so [`unmaximized_by_display_change`] can never fire
+/// there. A rare failed Win32 read *after* a stamped swap is fine:
+/// the swap itself was witnessed, and the read failure doesn't
+/// un-happen it.
 fn window_monitor(window: &Window) -> Option<isize> {
     #[cfg(target_os = "windows")]
     {
@@ -8810,28 +8859,31 @@ mod tests {
         assert!(unmaximized_by_display_change(
             &placement(true, false, MON_A),
             &placement(false, false, MON_B),
+            true,
         ));
     }
 
     #[test]
     fn user_restore_down_is_left_alone() {
-        // Same monitor on both ticks — the user restored the window,
-        // and re-maximizing here would fight them.
+        // No recent monitor swap — the user restored the window, and
+        // re-maximizing here would fight them.
         assert!(!unmaximized_by_display_change(
             &placement(true, false, MON_A),
             &placement(false, false, MON_A),
+            false,
         ));
     }
 
     #[test]
-    fn same_geometry_on_a_new_handle_still_counts() {
-        // The case that broke the first cut of this rule: the monitor
-        // came back at an identical resolution and position, so
-        // `rcWork` never moved — but the handle is new, which is what
-        // gpui keys on.
+    fn unmaximize_shortly_after_a_monitor_swap_still_counts() {
+        // The burst case (issue #279): the handle swapped on an
+        // earlier tick while still maximized, so both sides of this
+        // pair hold the same (new) handle — the grace window is what
+        // ties the un-maximize back to the swap.
         assert!(unmaximized_by_display_change(
-            &placement(true, false, MON_A),
+            &placement(true, false, MON_B),
             &placement(false, false, MON_B),
+            true,
         ));
     }
 
@@ -8842,6 +8894,7 @@ mod tests {
         assert!(!unmaximized_by_display_change(
             &placement(true, false, MON_A),
             &placement(false, true, MON_B),
+            true,
         ));
     }
 
@@ -8852,19 +8905,36 @@ mod tests {
         assert!(!unmaximized_by_display_change(
             &placement(false, false, MON_A),
             &placement(false, false, MON_B),
+            true,
         ));
     }
 
     #[test]
-    fn missing_monitor_never_triggers() {
+    fn monitor_swap_is_spotted_across_ticks() {
+        assert!(monitor_changed(
+            &placement(true, false, MON_A),
+            &placement(true, false, MON_B),
+        ));
+        assert!(!monitor_changed(
+            &placement(true, false, MON_A),
+            &placement(false, false, MON_A),
+        ));
+    }
+
+    #[test]
+    fn missing_monitor_is_not_a_swap() {
         // Non-Windows, or a Win32 read that failed: no information is
         // not evidence of a reconfiguration.
-        assert!(!unmaximized_by_display_change(
+        assert!(!monitor_changed(
             &placement(true, false, None),
             &placement(false, false, MON_B),
         ));
-        assert!(!unmaximized_by_display_change(
+        assert!(!monitor_changed(
             &placement(true, false, MON_A),
+            &placement(false, false, None),
+        ));
+        assert!(!monitor_changed(
+            &placement(true, false, None),
             &placement(false, false, None),
         ));
     }
