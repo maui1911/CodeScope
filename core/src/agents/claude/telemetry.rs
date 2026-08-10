@@ -80,6 +80,13 @@ struct Entry {
     /// least one `{"type":"tool_result",...}` item — i.e. a tool-call
     /// answer, not a fresh user prompt.
     user_carries_tool_result: bool,
+    /// True when this is an assistant `stop_reason == "tool_use"`
+    /// entry whose tool calls are *all* user-interaction prompts
+    /// (`AskUserQuestion` / `ExitPlanMode`). The agent is blocked on
+    /// the human, not working — the busy dot must not show red
+    /// (issue #293). A mixed batch (a real tool racing a question)
+    /// still counts as working.
+    awaiting_user_input: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -124,6 +131,7 @@ fn parse_line(line: &str) -> Option<Entry> {
     let mut stop_reason: Option<String> = None;
     let mut model: Option<String> = None;
     let mut user_carries_tool_result = false;
+    let mut awaiting_user_input = false;
 
     if let Some(msg) = obj.get("message").and_then(Value::as_object) {
         if let Some(usage) = msg.get("usage").and_then(Value::as_object) {
@@ -167,6 +175,29 @@ fn parse_line(line: &str) -> Option<Entry> {
                         == Some("tool_result")
                 });
             }
+
+        // Detect assistant entries blocked on the human: every
+        // tool_use block is a user-interaction prompt. See the
+        // field doc on `Entry::awaiting_user_input`.
+        if kind == EntryKind::Assistant
+            && stop_reason.as_deref() == Some("tool_use")
+            && let Some(content) = msg.get("content").and_then(Value::as_array) {
+                let tool_names: Vec<&str> = content
+                    .iter()
+                    .filter_map(|item| {
+                        let o = item.as_object()?;
+                        if o.get("type").and_then(Value::as_str) == Some("tool_use") {
+                            o.get("name").and_then(Value::as_str)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                awaiting_user_input = !tool_names.is_empty()
+                    && tool_names
+                        .iter()
+                        .all(|n| matches!(*n, "AskUserQuestion" | "ExitPlanMode"));
+            }
     }
 
     Some(Entry {
@@ -179,6 +210,7 @@ fn parse_line(line: &str) -> Option<Entry> {
         model,
         timestamp_secs,
         user_carries_tool_result,
+        awaiting_user_input,
     })
 }
 
@@ -364,6 +396,13 @@ pub fn process_new_lines(
             }
             EntryKind::Assistant => {
                 state = match entry.stop_reason.as_deref() {
+                    // A "tool call" that is really a question to the
+                    // human (AskUserQuestion / plan approval) blocks
+                    // until they answer — that is idle time, not work
+                    // (issue #293). The answer arrives as a
+                    // tool-result user entry, which flips the state
+                    // back to `Busy` on its own.
+                    Some("tool_use") if entry.awaiting_user_input => SessionState::Idle,
                     Some("tool_use") => SessionState::PendingToolUse,
                     Some("end_turn") => SessionState::Idle,
                     _ => state,
@@ -762,6 +801,90 @@ mod tests {
         read_lines(&path.to_path_buf(), &mut tail, &mut snap, &mut last_user_ts);
 
         assert_eq!(snap.unwrap().state, SessionState::PendingToolUse);
+    }
+
+    #[test]
+    fn ask_user_question_is_idle_not_busy() {
+        // Issue #293: the agent asking the human a question blocks
+        // until they answer — the red dot lied for the whole wait.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(
+            &path,
+            &[
+                r#"{"type":"user","sessionId":"s","timestamp":"2026-04-22T08:00:00Z","message":{"role":"user","content":"do it"}}"#,
+                r#"{"type":"assistant","sessionId":"s","timestamp":"2026-04-22T08:01:00Z","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"AskUserQuestion","input":{}}],"usage":{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+            ],
+        );
+
+        let mut tail = FileTail::default();
+        let mut snap: Option<TelemetrySnapshot> = None;
+        let mut last_user_ts = None;
+        read_lines(&path.to_path_buf(), &mut tail, &mut snap, &mut last_user_ts);
+
+        assert_eq!(snap.unwrap().state, SessionState::Idle);
+    }
+
+    #[test]
+    fn plan_approval_is_idle_not_busy() {
+        // ExitPlanMode blocks on the user the same way.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(
+            &path,
+            &[
+                r#"{"type":"assistant","sessionId":"s","timestamp":"2026-04-22T08:01:00Z","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"ExitPlanMode","input":{}}],"usage":{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+            ],
+        );
+
+        let mut tail = FileTail::default();
+        let mut snap: Option<TelemetrySnapshot> = None;
+        let mut last_user_ts = None;
+        read_lines(&path.to_path_buf(), &mut tail, &mut snap, &mut last_user_ts);
+
+        assert_eq!(snap.unwrap().state, SessionState::Idle);
+    }
+
+    #[test]
+    fn question_racing_a_real_tool_stays_pending() {
+        // A batch mixing AskUserQuestion with a real tool call means
+        // work is still running — that is not idle.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(
+            &path,
+            &[
+                r#"{"type":"assistant","sessionId":"s","timestamp":"2026-04-22T08:01:00Z","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}},{"type":"tool_use","id":"t2","name":"AskUserQuestion","input":{}}],"usage":{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+            ],
+        );
+
+        let mut tail = FileTail::default();
+        let mut snap: Option<TelemetrySnapshot> = None;
+        let mut last_user_ts = None;
+        read_lines(&path.to_path_buf(), &mut tail, &mut snap, &mut last_user_ts);
+
+        assert_eq!(snap.unwrap().state, SessionState::PendingToolUse);
+    }
+
+    #[test]
+    fn answering_the_question_goes_back_to_busy() {
+        // The answer arrives as a tool-result user entry.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(
+            &path,
+            &[
+                r#"{"type":"assistant","sessionId":"s","timestamp":"2026-04-22T08:01:00Z","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"AskUserQuestion","input":{}}],"usage":{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+                r#"{"type":"user","sessionId":"s","timestamp":"2026-04-22T08:05:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"picked option A"}]}}"#,
+            ],
+        );
+
+        let mut tail = FileTail::default();
+        let mut snap: Option<TelemetrySnapshot> = None;
+        let mut last_user_ts = None;
+        read_lines(&path.to_path_buf(), &mut tail, &mut snap, &mut last_user_ts);
+
+        assert_eq!(snap.unwrap().state, SessionState::Busy);
     }
 
     #[test]
