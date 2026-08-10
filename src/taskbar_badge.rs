@@ -192,6 +192,16 @@ impl TaskbarBadge {
         // COM slot.
     }
 
+    /// Forget the last applied state so the next telemetry tick
+    /// repaints unconditionally. Called when the display
+    /// configuration changes: a session reconnect (RDP, lock/unlock)
+    /// can hand the shell a recreated taskbar whose overlay is gone,
+    /// while our cache still says the badge is painted — so nothing
+    /// would repaint it until the agent counts happened to change.
+    pub fn invalidate(&mut self) {
+        self.last = None;
+    }
+
     /// Force-clear the overlay. Called from `AppShell::drop` for a
     /// graceful teardown — best-effort: a hard abort / OS-level
     /// kill skips destructors, so we rely on Windows itself to
@@ -381,10 +391,11 @@ mod windows_impl {
                 return false;
             };
             if agents == 0 {
-                unsafe {
-                    let _ = tb.SetOverlayIcon(hwnd, null_hicon(), PCWSTR::null());
-                }
-                return true;
+                // Propagate failure so the cache stays un-poisoned
+                // and the next telemetry tick retries — the shell can
+                // reject the call transiently (e.g. mid taskbar
+                // recreate on a session reconnect).
+                return unsafe { tb.SetOverlayIcon(hwnd, null_hicon(), PCWSTR::null()).is_ok() };
             }
             let digit = super::format_badge_text(busy);
             let (r, g, b) = if busy == 0 {
@@ -406,13 +417,18 @@ mod windows_impl {
             let desc_wide = to_wide_nul(&description);
             if let Some(icon) = build_badge_icon(r, g, b, digit.as_deref()) {
                 unsafe {
-                    let _ = tb.SetOverlayIcon(hwnd, icon, PCWSTR(desc_wide.as_ptr()));
+                    let ok = tb.SetOverlayIcon(hwnd, icon, PCWSTR(desc_wide.as_ptr())).is_ok();
                     // SetOverlayIcon copies the icon contents, so we
                     // can free our handle immediately. Skipping this
                     // would leak a kernel object per state change.
                     let _ = DestroyIcon(icon);
+                    // Same retry rationale as the clear path above.
+                    return ok;
                 }
             }
+            // Icon construction failed — deterministic (GDI resource
+            // shape, not shell state), so retrying won't help. Report
+            // "applied" to stop the poll loop from spinning on it.
             true
         }
 

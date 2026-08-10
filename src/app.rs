@@ -1334,6 +1334,11 @@ impl AppShell {
                     .is_some_and(|prev| monitor_changed(prev, &placement))
                 {
                     this.last_monitor_change = Some(Instant::now());
+                    // A session reconnect that swaps the monitor can
+                    // also hand the shell a recreated taskbar whose
+                    // overlay is gone — forget the cached badge so
+                    // the next telemetry tick repaints it.
+                    this.taskbar_badge.invalidate();
                 }
                 let monitor_changed_recently = this
                     .last_monitor_change
