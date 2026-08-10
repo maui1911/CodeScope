@@ -203,9 +203,15 @@ const DOWNLOAD_ATTEMPTS: u32 = 3;
 /// 53/54). Best-effort: a failure to log must never fail the update.
 fn log_update(msg: &str) {
     use std::io::Write as _;
-    let path = codescope_core::paths::AppPaths::detect()
-        .state_dir
-        .join("update.log");
+    // Detect once and make sure the state dir exists — `AppPaths` is
+    // a resolve-once contract, and an update can run before anything
+    // else has created the dir (Copilot review on PR #301).
+    static LOG_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    let path = LOG_PATH.get_or_init(|| {
+        let paths = codescope_core::paths::AppPaths::detect();
+        let _ = std::fs::create_dir_all(&paths.state_dir);
+        paths.state_dir.join("update.log")
+    });
     let ts = codescope_core::time::now_iso8601();
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "{ts} {msg}");
@@ -345,21 +351,20 @@ fn run_install(state: &UpdateState, info: ReleaseInfo) {
     // hook in 0.41. reqwest::blocking is safe here — run_install is on a
     // plain std thread, not a tokio runtime.
     //
-    // Timeouts: the blocking client's default is a 30-second cap on
-    // the *entire request*, body included — any download slower than
-    // 30 s died mid-stream, every retry died the same way, and the
-    // user saw "the download never finishes" on a perfectly fine
-    // connection (the v0.5.1 → v0.5.2 failure). `timeout(None)` lifts
-    // the total cap; the connect timeout still fails an unreachable
+    // Timeouts, measured against a local slow/stalling server: the
+    // blocking client's default `timeout` (30 s) applies per
+    // read/write *operation*, not to the whole request — a slow but
+    // moving download never trips it, but a mid-body stall longer
+    // than 30 s (a CDN hiccup) kills the attempt, and all three
+    // retries land inside the same hiccup window (~92 s total). That
+    // matches the v0.5.1 → v0.5.2 in-app update failing on a gigabit
+    // line. 120 s per operation rides out such stalls, while a
+    // genuinely hung socket still fails cleanly instead of hanging
+    // the updater forever; the connect timeout fails an unreachable
     // host fast.
-    //
-    // ponytail: a connection that hangs *mid-body* now stalls until
-    // the OS drops the socket — reqwest 0.12's blocking builder has
-    // no per-read timeout to guard that. Progress freezing in the UI
-    // is the tell; add a stall watchdog if it is ever actually seen.
     let client = match reqwest::blocking::Client::builder()
         .user_agent(concat!("CodeScope/", env!("CARGO_PKG_VERSION")))
-        .timeout(None)
+        .timeout(std::time::Duration::from_secs(120))
         .connect_timeout(std::time::Duration::from_secs(30))
         .build()
     {
