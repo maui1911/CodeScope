@@ -48,14 +48,43 @@ pub fn transcript_path(projects_root: &Path, working_directory: &str, session_id
 /// Encode an absolute path to the `~/.claude/projects/<name>` directory
 /// name used by Claude Code.
 ///
-/// Claude replaces `:`, `\`, `/`, and `.` with `-`.
-/// E.g. `C:\dev\codescope` → `C--dev-codescope`.
+/// **Every character outside `[a-zA-Z0-9]` becomes `-`** — not just the
+/// separators. Claude Code's own encoder, lifted from its bundle:
+///
+/// ```js
+/// function Uso(e){ return e.replace(/[^a-zA-Z0-9]/g,"-") }
+/// function vv(e){ let t=Uso(e); if(t.length<=BZ) return t;
+///                 return `${t.slice(0,BZ)}-${VNg(e)}` }   // BZ = 200
+/// function Vz(e){ return join(join(claudeDir(),"projects"), vv(e)) }
+/// ```
+///
+/// This used to list only `:`, `\`, `/`, `.` — an under-generalisation
+/// from paths that happened to contain nothing else. **Spaces were the
+/// one that bit:** a session in
+/// `D:\Dev\...\Web Object Projects\Profit Connector` had us looking in
+/// `D--Dev-...-Web Object Projects-Profit Connector` while Claude wrote
+/// to `…-Web-Object-Projects-Profit-Connector`. The directory never
+/// resolved, so transcript discovery found nothing, no
+/// `agent_session_id` was ever persisted, and reopening the session
+/// gave a blank terminal even though `claude -r` could still find the
+/// conversation. Telemetry (model / tokens / turns / busy) was dark for
+/// the same reason.
+///
+/// Verified against the user's real `~/.claude/projects/` by aligning
+/// each transcript's `cwd` field with its containing directory name,
+/// character for character: space, `.`, `:` and `\` all map to `-`,
+/// alphanumerics and `-` map to themselves.
+///
+/// **Known gap:** the `BZ = 200` truncate-and-append-hash branch is not
+/// implemented — `VNg` is a base36 string hash we'd have to reproduce
+/// bit-exactly to be useful, and guessing it wrong is worse than not
+/// having it. Encoded names over 200 chars therefore still miss. No
+/// path in the user's store comes close (longest is 68), so this is
+/// latent, not live; a directory scan comparing each candidate's
+/// `cwd` would be the robust fix if it ever bites.
 pub fn encode_cwd(path: &str) -> String {
     path.chars()
-        .map(|c| match c {
-            ':' | '\\' | '/' | '.' => '-',
-            other => other,
-        })
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
 }
 
@@ -719,6 +748,34 @@ mod tests {
             encode_cwd("/home/user/myrepo"),
             "-home-user-myrepo"
         );
+    }
+
+    #[test]
+    fn encode_cwd_replaces_spaces() {
+        // The regression this rule was widened for. Path and expected
+        // directory name are both copied from the user's real machine:
+        // the session was live, its transcripts existed, and CodeScope
+        // could not see them.
+        assert_eq!(
+            encode_cwd(r"D:\Dev\profit\src\Anta\Projects\Web Object Projects\Profit Connector"),
+            "D--Dev-profit-src-Anta-Projects-Web-Object-Projects-Profit-Connector"
+        );
+    }
+
+    #[test]
+    fn encode_cwd_replaces_every_non_alphanumeric() {
+        // Claude's encoder is `[^a-zA-Z0-9] -> '-'`, so underscores,
+        // parens and `#` go too — a hyphen is the only punctuation that
+        // survives, and only because replacing it yields itself.
+        assert_eq!(
+            encode_cwd(r"C:\dev\my_repo (copy)\v#2"),
+            "C--dev-my-repo--copy--v-2"
+        );
+        // Non-ASCII is outside the class as well: JS `[a-zA-Z0-9]` does
+        // not match `é`, so neither does `is_ascii_alphanumeric`.
+        assert_eq!(encode_cwd("/tmp/café"), "-tmp-caf-");
+        // Hyphens and digits are preserved verbatim.
+        assert_eq!(encode_cwd(r"D:\Dev\online.worktrees\worktree-2"), "D--Dev-online-worktrees-worktree-2");
     }
 
     // --- parse_iso8601 ---
