@@ -29,13 +29,69 @@
 **Branch:** `claude/release-issue-credits-q2k3sw` (session 55, pushed to origin, **no PR opened yet**). Session-54 PRs all merged.
 **Head:** `main` at `265589a`. Session-54 merges: #295 monitor-swap grace window, #296 badge repaint after display change, #297 `GIT_OPTIONAL_LOCKS=0`, #298 explorer backslashes, #299 AskUserQuestion → Idle. Issues #279 (re-opened for the burst race), #292, #293, #294 all closed. Session 53 merged #285 adoption claims + #286 dangling-transcript prune (details below). Session 52 merged #280 modifier encoding + faint rendering, #281 `[dev]` window title / titlebar badge. Earlier: #287–#291 (sessions 53b/54a window+telemetry), #275–#277 (v0.5.1), #262–#274 (v0.5.0).
 **Release:** **`v0.5.1` is published** (pipeline run 27406124661). It's a patch over v0.5.0 carrying the in-app updater robustness fix. **`v0.5.0` is also still up** but its updater can mis-handle a truncated download — see below.
-**The v0.5.0 update bug (root-caused + fixed this session):** the user's installed v0.4.0 → v0.5.0 in-app update failed (twice) with `Extract failed: … ZipError: invalid Zip archive: Could not find EOCD`. EOCD-missing = the downloaded zip was **truncated**. The published v0.5.0 artifact is **fine** (verified end-to-end: full GitHub download, valid `PK\x03\x04`, extracts cleanly with identical code + dep pins). Root cause was in `src/update.rs`'s downloader: the read loop broke on the first `Ok(0)` EOF and proceeded to extract **without checking `received == Content-Length`**, so a TLS-inspecting proxy / AV middlebox clipping the HTTPS download (a *clean* early EOF) silently produced a short zip. Fix (#275): `verify_complete` (pure, unit-tested) + `download_once` + `download_archive` (3 attempts, linear backoff). A short download now fails as honest "Download incomplete: received N of M bytes" and self-heals on retry. #276 added `dist/truncating_server.py` + RELEASE-VALIDATION §6b to guard it (§6 served from localhost, which never truncates — that's why the bug shipped).
-**⚠ The user is behind a network that truncates** large HTTPS downloads, so the v0.4.0/v0.5.0 in-app updater fails for them. Path forward given to them: run `CodeScope-v0.5.1-setup.exe` from the release directly (bypasses the updater) to land on the build that *has* the fix; after that the in-app updater self-heals. The verified-complete `CodeScope-v0.5.0-setup.exe` was earlier downloaded to `C:\Users\maui\Downloads\`.
-**Diagnostic logging gap (open):** the installer writes update failures only to a transient toast (auto-dismissed) and the temp dir (`tempfile::tempdir()` under `%TEMP%`, auto-deleted on return) — nothing persists to disk, so "do you have logs?" came up empty. Worth a follow-up: log the update flow + full error chain to `%LOCALAPPDATA%\CodeScope\update.log`. Not yet filed.
+**⚠ The "Could not find EOCD" update bug was MISDIAGNOSED TWICE — real root cause found in session 56 (#305).** It is **not** truncation and **not** a timeout: the updater was downloading GitHub's *API asset URL* without `Accept: application/octet-stream`, so it wrote ~1.6 KB of asset **metadata JSON** to disk and handed that to the zip extractor. See the session-56 entry below. The earlier theories are kept here only so nobody re-derives them: #275 (truncation → `verify_complete` + retries) and #301 (timeouts) are both real hardening and stay, but neither was the cause. **The user is NOT behind a truncating network** — that claim, carried in this file since session 51c, was wrong; their machine downloads the release asset cleanly (verified: 200, exact byte count, valid zip, no proxy, stock Defender).
+**Diagnostic logging (closed in #301):** the installer now appends to `%LOCALAPPDATA%\CodeScope\update.log`. Note it only ships from **v0.5.3**, which is why the failing v0.5.2 install left zero evidence behind.
 **Build status:** ✅ workspace builds clean; suite green on `main` — 53 in `codescope-terminal`, 501 in `codescope-core` (+5 this session), 147 in `codescope` (+11 across sessions 53b–54). Clippy: 0 errors, only the pre-existing warnings (`app.rs` `map_or` / `spawn_tab_in` arg count / large enum variant, `core` `from_str` / `sort_by_key`, `taskbar_badge.rs` `gy` loop indexing, `opencode` arg count).
 **Uncommitted work:** none.
 **⚠ Manual step still outstanding:** the published **v0.5.3 notes credit nobody**. Running the credit logic over the real v0.5.2..v0.5.3 range gives four lines, all @maxim12358: #289←#284, #297←#294, #298←#292, #299←#293. Note **#289←#284 (subagents keep a session busy) is not in the release bullets at all** — it merged after v0.5.2 and shipped in v0.5.3, which is very likely the missing seventh of "Seven fixes". #279 was self-filed so it correctly drops out; the taskbar-badge (#296) and updater (#301) fixes came from informal reports with no issue, so there is nobody to credit. The automation only runs on future releases, so v0.5.3 needs a hand edit — and **release editing is blocked from cloud sessions** (`Creating, editing, or deleting releases is not permitted for this session type`), so it cannot be done from a web session at all. Paste-ready body was handed to the user.
 **Open issues:** none — all four open issues were closed this session (#292, #293, #294, plus #279 re-opened and re-closed). **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree — do **NOT** run repo-wide `cargo fmt`, and note that even `cargo fmt -- src/app.rs` (with a file argument!) reformatted all 59 files this session; hand-format changed hunks, always. See the session-47 note.
+
+### Session 56 — the real EOCD root cause (#305)
+
+The user's installed **v0.5.2 → v0.5.3** in-app update failed *instantly*
+with `Extract failed: extract archive: ZipError: invalid zip archive:
+Could not find EOCD` — the same message sessions 51c and 54 chased.
+
+**Root cause.** `ReleaseInfo::archive_url` is GitHub's **API** asset URL
+(`api.github.com/repos/…/releases/assets/{id}`): `self_update`'s GitHub
+backend reads `asset["url"]`, *not* `browser_download_url`
+(`self_update-0.41.0/src/backends/github.rs:24` →
+`core/src/update_check.rs:146`). That URL serves the archive only when
+the request carries `Accept: application/octet-stream` —
+`self_update`'s own downloader sets it
+(`self_update-0.41.0/src/update.rs:234`). #249 replaced that downloader
+with a hand-rolled reqwest stream to drive byte-progress and **dropped
+the header**. GitHub then answers the bare GET with **200 +
+`application/json`, 1,651 bytes of asset metadata**. Reproduced with
+curl against the live v0.5.3 asset:
+
+```
+only User-Agent        → 200 application/json         1651 bytes  {"url":"https://api.github.com/…
++ Accept: octet-stream → 200 application/octet-stream 5922247     PK\x03\x04
+```
+
+Every symptom follows: 1.6 KB arrives **instantly**;
+`error_for_status` sees 200; `verify_complete` sees `received ==
+Content-Length` so **no retry fires**; the extractor is the first thing
+to notice, and reports EOCD.
+
+**Why it survived two fixes.** RELEASE-VALIDATION §6/§6b both drive the
+installer through `CODESCOPE_DEV_UPDATE_URL` at a localhost file
+server, which structurally cannot exercise the API URL. So the dev loop
+always passed and production always failed — the Windows in-app update
+has plausibly **never** worked against a real release.
+
+**Fix (#305).** One header in `download_once`, plus two guards so this
+class of failure can't hide again:
+- `verify_archive_magic` — second gate after `verify_complete`: a
+  *complete* download of the wrong content (JSON, HTML block page) now
+  fails as "Downloaded file is not a zip archive (starts with …)"
+  instead of reaching the extractor. Closes the `total: None` hole in
+  `verify_complete`, which accepts anything when there's no
+  Content-Length.
+- `download_asks_github_for_the_raw_asset_bytes` — a `TcpListener`
+  server that mimics GitHub (raw bytes with the header, metadata JSON
+  without). Verified to fail when the header is removed.
+- RELEASE-VALIDATION **§6c** (mandatory): fetch the real API asset URL
+  of the freshly-published release with the header and assert
+  `application/octet-stream` + `PK`. Explicitly forbids substituting
+  the `releases/download/…` browser URL, which works *without* the
+  header and would re-open the blind spot.
+
+**Loose end (not fixed here):** the `sha256.sum` release asset is **1
+byte** (just `\n`) on both v0.5.2 and v0.5.3 — a broken pipeline step.
+Harmless for the updater (it fetches the `-windows.zip` directly), but
+worth its own issue.
 
 ### Session 55 — release notes credit the issue reporters
 

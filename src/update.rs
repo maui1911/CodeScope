@@ -244,6 +244,36 @@ fn verify_complete(received: u64, total: Option<u64>) -> Result<(), String> {
     }
 }
 
+/// Second gate on a finished download: does the file actually *look*
+/// like the archive we asked for? `verify_complete` only proves we
+/// received every byte the server promised — a complete download of
+/// the *wrong content* (a JSON error body, an HTML block page) passes
+/// it and then dies in the extractor as "Could not find EOCD", which
+/// tells the user nothing. Pure so the rule is unit-testable.
+#[cfg(not(target_os = "macos"))]
+fn verify_archive_magic(archive_path: &std::path::Path, head: &[u8]) -> Result<(), String> {
+    let (magic, kind): (&[u8], &str) = match archive_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+    {
+        "zip" => (b"PK\x03\x04", "zip"),
+        // `.tar.gz` — `Path::extension` gives us the `gz` half.
+        "gz" => (&[0x1f, 0x8b], "gzip"),
+        // Unrecognised suffix: we have no expectation to check, and
+        // `self_update`'s extractor rejects it on its own terms.
+        _ => return Ok(()),
+    };
+    if head.starts_with(magic) {
+        return Ok(());
+    }
+    Err(format!(
+        "Downloaded file is not a {kind} archive (starts with {head:02x?}) — \
+         the server returned something other than the release asset. Retry; \
+         if it persists, report this with update.log."
+    ))
+}
+
 /// Download `url` into `archive_path`, streaming byte-progress into
 /// `state`, with completeness verification and a small retry budget.
 /// Returns the user-facing failure message on the final failure.
@@ -290,8 +320,19 @@ fn download_once(
         format!("Could not create archive file {}: {err:#}", archive_path.display())
     })?;
 
+    // `Accept: application/octet-stream` is MANDATORY, not decoration.
+    // `ReleaseInfo::archive_url` is GitHub's *API* asset URL
+    // (`api.github.com/repos/…/releases/assets/{id}`) — `self_update`'s
+    // GitHub backend reads `asset["url"]`, not `browser_download_url`.
+    // Without this header that URL answers 200 with ~1.6 KB of asset
+    // *metadata JSON*, which sails past `error_for_status` and
+    // `verify_complete` (received == Content-Length) and only blows up
+    // in the extractor as "Could not find EOCD". `self_update`'s own
+    // downloader sets the same header; we lost it when we replaced it
+    // with this hand-rolled stream to drive byte-progress.
     let mut response = client
         .get(url)
+        .header(reqwest::header::ACCEPT, "application/octet-stream")
         .send()
         .map_err(|err| format!("Download request failed: {err:#}"))?;
     response
@@ -318,7 +359,17 @@ fn download_once(
         .map_err(|err| format!("Flush error: {err:#}"))?;
     drop(archive_file); // close before Extract reads it
 
-    verify_complete(received, total)
+    verify_complete(received, total)?;
+
+    // Read the header back rather than tracking it through the stream
+    // loop — one 4-byte read of a file we just wrote, against a 6 MB
+    // download. A short read on a regular file would fail the magic
+    // check below, which is the honest outcome anyway.
+    let mut head = [0u8; 4];
+    let read = std::fs::File::open(archive_path)
+        .and_then(|mut file| std::io::Read::read(&mut file, &mut head))
+        .map_err(|err| format!("Could not re-read the downloaded archive: {err:#}"))?;
+    verify_archive_magic(archive_path, &head[..read])
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -494,7 +545,8 @@ pub fn open_releases_page() -> anyhow::Result<()> {
 
 #[cfg(all(test, not(target_os = "macos")))]
 mod tests {
-    use super::verify_complete;
+    use super::{download_once, new_state, verify_archive_magic, verify_complete};
+    use std::path::Path;
 
     #[test]
     fn full_download_is_complete() {
@@ -524,5 +576,103 @@ mod tests {
         let err = verify_complete(6_000_000, Some(5_717_213)).unwrap_err();
         assert!(err.contains("size mismatch"), "{err}");
         assert!(!err.to_lowercase().contains("incomplete"), "{err}");
+    }
+
+    #[test]
+    fn zip_magic_is_accepted() {
+        let path = Path::new("CodeScope-v1.2.3-windows.zip");
+        assert!(verify_archive_magic(path, b"PK\x03\x04").is_ok());
+    }
+
+    #[test]
+    fn gzip_magic_is_accepted() {
+        let path = Path::new("codescope-x86_64-unknown-linux-gnu.tar.gz");
+        assert!(verify_archive_magic(path, &[0x1f, 0x8b, 0x08, 0x00]).is_ok());
+    }
+
+    #[test]
+    fn github_asset_metadata_json_is_rejected_before_extract() {
+        // The regression this whole guard exists for: GitHub's API
+        // asset URL answers a header-less GET with 200 + metadata JSON.
+        // That body is *complete*, so `verify_complete` passes it —
+        // this must catch it and say something true, not leave the
+        // extractor to report "Could not find EOCD".
+        let path = Path::new("CodeScope-v1.2.3-windows.zip");
+        let err = verify_archive_magic(path, br#"{"ur"#).unwrap_err();
+        assert!(err.contains("not a zip archive"), "{err}");
+    }
+
+    #[test]
+    fn unknown_extension_is_not_second_guessed() {
+        assert!(verify_archive_magic(Path::new("payload.bin"), b"junk").is_ok());
+    }
+
+    /// Body a GitHub asset URL returns for a GET that does *not* ask
+    /// for the raw bytes — trimmed, but byte-for-byte in shape.
+    const ASSET_METADATA_JSON: &[u8] =
+        br#"{"url":"https://api.github.com/repos/o/r/releases/assets/1","id":1}"#;
+    /// Stand-in for the real archive. `download_once` only inspects the
+    /// magic, so four bytes plus filler is a faithful enough zip here.
+    const ARCHIVE_BYTES: &[u8] = b"PK\x03\x04and then some payload";
+
+    /// One-shot HTTP server that mimics GitHub's asset endpoint: raw
+    /// bytes when the request carries `Accept: application/octet-stream`,
+    /// asset metadata JSON when it doesn't. Returns the URL to GET.
+    fn spawn_github_like_asset_server() -> String {
+        use std::io::{BufRead as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let url = format!("http://{}/assets/1", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+            let mut wants_raw_bytes = false;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                let line = line.to_ascii_lowercase();
+                if line.starts_with("accept:") && line.contains("application/octet-stream") {
+                    wants_raw_bytes = true;
+                }
+            }
+            let (content_type, body) = if wants_raw_bytes {
+                ("application/octet-stream", ARCHIVE_BYTES)
+            } else {
+                ("application/json", ASSET_METADATA_JSON)
+            };
+            let mut stream = stream;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(body);
+            let _ = stream.flush();
+        });
+        url
+    }
+
+    #[test]
+    fn download_asks_github_for_the_raw_asset_bytes() {
+        // End-to-end regression guard for the "Could not find EOCD"
+        // reports: drop the `Accept: application/octet-stream` header
+        // from `download_once` and this server hands back metadata
+        // JSON instead of the archive, failing the assertions below —
+        // which is exactly what shipped in v0.5.0 through v0.5.3.
+        let url = spawn_github_like_asset_server();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let archive_path = dir.path().join("CodeScope-v99.0.0-windows.zip");
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("build client");
+
+        download_once(&client, &url, &archive_path, &new_state()).expect("download succeeds");
+
+        let written = std::fs::read(&archive_path).expect("read archive");
+        assert_eq!(written, ARCHIVE_BYTES, "server served the metadata JSON path");
     }
 }

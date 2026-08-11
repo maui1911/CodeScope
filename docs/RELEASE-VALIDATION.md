@@ -183,8 +183,50 @@ python dist/truncating_server.py dist/CodeScope-v99.0.0-windows.zip `
 > truncated / over-read / unknown-length wording; this manual pass
 > proves the wiring end-to-end against a real socket.
 
+### 6c. Real GitHub asset URL (MANDATORY)
+
+Why this exists: §6 and §6b both drive the installer through
+`CODESCOPE_DEV_UPDATE_URL`, which points it at a plain localhost file
+server. That **structurally bypasses the URL the shipped app actually
+downloads from** — `ReleaseInfo::archive_url` is GitHub's *API* asset
+URL (`api.github.com/repos/…/releases/assets/{id}`, from
+`self_update`'s `asset["url"]`, not `browser_download_url`). That URL
+serves the archive only when the request carries
+`Accept: application/octet-stream`; without it, it answers **200 with
+~1.6 KB of asset metadata JSON**. The hand-rolled downloader added in
+#249 never sent the header, so every in-app update on a real release
+downloaded JSON and died at extract with "Could not find EOCD" — the
+symptom that was twice misdiagnosed (as middlebox truncation in #275,
+as a timeout in #301) precisely because these localhost-only checks
+could never reproduce it. Fixed in #305.
+
+`download_asks_github_for_the_raw_asset_bytes` in `src/update.rs`
+pins the header against a server that mimics GitHub's behaviour, but
+run this one-liner against the **real** freshly-published asset too —
+GitHub's API contract is theirs to change, not ours:
+
+```pwsh
+# Grab the API asset URL for this release's Windows zip …
+$asset = (gh release view $TAG --repo maui1911/CodeScope --json assets `
+  | ConvertFrom-Json).assets | Where-Object name -like '*-windows.zip'
+$url = "https://api.github.com/repos/maui1911/CodeScope/releases/assets/$($asset.id)"
+
+# … and fetch it the way the app does.
+curl.exe -sL -H "Accept: application/octet-stream" -o $env:TEMP\rv.zip `
+  -w "%{http_code} %{size_download} %{content_type}`n" $url
+```
+
+- [ ] The output is `200 <size> application/octet-stream` with `<size>`
+      equal to the asset's published size — **not**
+      `application/json`. The first two bytes of `$env:TEMP\rv.zip`
+      are `PK`.
+
+> Do not substitute the `github.com/…/releases/download/…` browser URL
+> here: it works without the header and would re-create exactly the
+> blind spot this check exists to close.
+
 ### Sign-off
 
-When all checks (1-6b) pass, the release is OK to announce. Push the
+When all checks (1-6c) pass, the release is OK to announce. Push the
 release notes to the GitHub release body, mention any breaking
 changes, and link relevant PRs.
