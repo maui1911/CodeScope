@@ -75,6 +75,9 @@ pub fn transcript_path(projects_root: &Path, working_directory: &str, session_id
 /// character for character: space, `.`, `:` and `\` all map to `-`,
 /// alphanumerics and `-` map to themselves.
 ///
+/// Note the regex carries **no `u` flag**, so it matches per UTF-16
+/// code unit — a non-BMP character becomes *two* dashes. See the body.
+///
 /// **Known gap:** the `BZ = 200` truncate-and-append-hash branch is not
 /// implemented — `VNg` is a base36 string hash we'd have to reproduce
 /// bit-exactly to be useful, and guessing it wrong is worse than not
@@ -83,9 +86,24 @@ pub fn transcript_path(projects_root: &Path, working_directory: &str, session_id
 /// latent, not live; a directory scan comparing each candidate's
 /// `cwd` would be the robust fix if it ever bites.
 pub fn encode_cwd(path: &str) -> String {
-    path.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect()
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else {
+            // One dash per UTF-16 code unit, not per code point. JS
+            // strings are UTF-16 and the regex carries no `u` flag, so
+            // the negated class matches each half of a surrogate pair
+            // separately: `"🚀".replace(/[^a-zA-Z0-9]/g,"-")` is `"--"`.
+            // A `chars()`-shaped one-dash-per-char version silently
+            // under-counts for any non-BMP character and lands us back
+            // on a directory Claude never wrote.
+            for _ in 0..c.len_utf16() {
+                out.push('-');
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -776,6 +794,27 @@ mod tests {
         assert_eq!(encode_cwd("/tmp/café"), "-tmp-caf-");
         // Hyphens and digits are preserved verbatim.
         assert_eq!(encode_cwd(r"D:\Dev\online.worktrees\worktree-2"), "D--Dev-online-worktrees-worktree-2");
+    }
+
+    #[test]
+    fn encode_cwd_counts_utf16_code_units_not_code_points() {
+        // Claude's regex has no `u` flag, so it matches per UTF-16 code
+        // unit and a surrogate pair yields *two* dashes. Every vector
+        // here was produced by running the real encoder under node:
+        //
+        //   s.replace(/[^a-zA-Z0-9]/g, "-")
+        //
+        //   "🚀"        -> "--"
+        //   "a🚀b"      -> "a--b"
+        //   "café"      -> "caf-"
+        //   "𝔘nicode"   -> "--nicode"
+        assert_eq!(encode_cwd("🚀"), "--");
+        assert_eq!(encode_cwd("a🚀b"), "a--b");
+        assert_eq!(encode_cwd("𝔘nicode"), "--nicode");
+        // BMP non-ASCII is a single code unit, so a single dash — the
+        // distinction only bites above U+FFFF.
+        assert_eq!(encode_cwd("café"), "caf-");
+        assert_eq!(encode_cwd(r"D:\x\🚀 dir"), "D--x----dir");
     }
 
     // --- parse_iso8601 ---
