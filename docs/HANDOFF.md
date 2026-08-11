@@ -26,7 +26,7 @@
 > triggers on plain `v*` tags.
 
 **Last updated:** 2026-08-11 (session 55 — release notes now credit the people who reported the issues a release fixes)
-**Branch:** `claude/release-issue-credits-q2k3sw` (session 55, pushed, **no PR opened yet**). Session-54 PRs all merged.
+**Branch:** `claude/release-issue-credits-q2k3sw` (session 55, pushed to origin, **no PR opened yet**). Session-54 PRs all merged.
 **Head:** `main` at `265589a`. Session-54 merges: #295 monitor-swap grace window, #296 badge repaint after display change, #297 `GIT_OPTIONAL_LOCKS=0`, #298 explorer backslashes, #299 AskUserQuestion → Idle. Issues #279 (re-opened for the burst race), #292, #293, #294 all closed. Session 53 merged #285 adoption claims + #286 dangling-transcript prune (details below). Session 52 merged #280 modifier encoding + faint rendering, #281 `[dev]` window title / titlebar badge. Earlier: #287–#291 (sessions 53b/54a window+telemetry), #275–#277 (v0.5.1), #262–#274 (v0.5.0).
 **Release:** **`v0.5.1` is published** (pipeline run 27406124661). It's a patch over v0.5.0 carrying the in-app updater robustness fix. **`v0.5.0` is also still up** but its updater can mis-handle a truncated download — see below.
 **The v0.5.0 update bug (root-caused + fixed this session):** the user's installed v0.4.0 → v0.5.0 in-app update failed (twice) with `Extract failed: … ZipError: invalid Zip archive: Could not find EOCD`. EOCD-missing = the downloaded zip was **truncated**. The published v0.5.0 artifact is **fine** (verified end-to-end: full GitHub download, valid `PK\x03\x04`, extracts cleanly with identical code + dep pins). Root cause was in `src/update.rs`'s downloader: the read loop broke on the first `Ok(0)` EOF and proceeded to extract **without checking `received == Content-Length`**, so a TLS-inspecting proxy / AV middlebox clipping the HTTPS download (a *clean* early EOF) silently produced a short zip. Fix (#275): `verify_complete` (pure, unit-tested) + `download_once` + `download_archive` (3 attempts, linear backoff). A short download now fails as honest "Download incomplete: received N of M bytes" and self-heals on retry. #276 added `dist/truncating_server.py` + RELEASE-VALIDATION §6b to guard it (§6 served from localhost, which never truncates — that's why the bug shipped).
@@ -34,7 +34,7 @@
 **Diagnostic logging gap (open):** the installer writes update failures only to a transient toast (auto-dismissed) and the temp dir (`tempfile::tempdir()` under `%TEMP%`, auto-deleted on return) — nothing persists to disk, so "do you have logs?" came up empty. Worth a follow-up: log the update flow + full error chain to `%LOCALAPPDATA%\CodeScope\update.log`. Not yet filed.
 **Build status:** ✅ workspace builds clean; suite green on `main` — 53 in `codescope-terminal`, 501 in `codescope-core` (+5 this session), 147 in `codescope` (+11 across sessions 53b–54). Clippy: 0 errors, only the pre-existing warnings (`app.rs` `map_or` / `spawn_tab_in` arg count / large enum variant, `core` `from_str` / `sort_by_key`, `taskbar_badge.rs` `gy` loop indexing, `opencode` arg count).
 **Uncommitted work:** none.
-**⚠ Manual step still outstanding:** the published **v0.5.3 notes do not credit @maxim12358**, who reported #292, #293 and #294 (fixed by #298, #299, #297). The new automation only runs on future releases — v0.5.3 has to be edited by hand on the release page. #279 was self-filed, so it correctly gets no credit; the taskbar-badge (#296) and updater (#301) fixes came from informal reports with no issue, so there is nobody to credit for them.
+**⚠ Manual step still outstanding:** the published **v0.5.3 notes credit nobody**. Running the credit logic over the real v0.5.2..v0.5.3 range gives four lines, all @maxim12358: #289←#284, #297←#294, #298←#292, #299←#293. Note **#289←#284 (subagents keep a session busy) is not in the release bullets at all** — it merged after v0.5.2 and shipped in v0.5.3, which is very likely the missing seventh of "Seven fixes". #279 was self-filed so it correctly drops out; the taskbar-badge (#296) and updater (#301) fixes came from informal reports with no issue, so there is nobody to credit. The automation only runs on future releases, so v0.5.3 needs a hand edit — and **release editing is blocked from cloud sessions** (`Creating, editing, or deleting releases is not permitted for this session type`), so it cannot be done from a web session at all. Paste-ready body was handed to the user.
 **Open issues:** none — all four open issues were closed this session (#292, #293, #294, plus #279 re-opened and re-closed). **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree — do **NOT** run repo-wide `cargo fmt`, and note that even `cargo fmt -- src/app.rs` (with a file argument!) reformatted all 59 files this session; hand-format changed hunks, always. See the session-47 note.
 
 ### Session 55 — release notes credit the issue reporters
@@ -61,11 +61,21 @@ failure never fails an otherwise-good release. The top-level
 naming a permissions block zeroes every scope not listed, so the
 GraphQL walk would 403 without them.
 
-Verified offline against real repo data: PR extraction over the
-v0.5.2..v0.5.3 range yields exactly 295–302, the awkward
+Verified offline against real repo data: the awkward
 `… (#262–#266) (#267)` subject resolves to #267 alone, and the
-marker-strip/dedupe/ordering logic round-trips. **Not yet exercised
-against a live release** — the first real proof is the next tag push.
+marker-strip/dedupe/ordering logic round-trips. Then re-run against
+the live API: the v0.5.2..v0.5.3 range is PRs #285–#302 (not just the
+#295–#301 the notes mention), #297/#298/#299 do carry `Fixes #294.` /
+`Fixes #292.` / `Fixes #293.` in their bodies, so
+`closingIssuesReferences` will resolve them, and the filter correctly
+drops the self-filed #279. **Still not exercised end-to-end** — the
+first real proof is the next tag push.
+
+**Caveat for local dry-runs:** the GraphQL step cannot be validated
+from a cloud/web session — `api.github.com/graphql` there answers
+`This GraphQL query is not enabled for this session`. That is a
+sandbox restriction, not a script bug; `gh api graphql` in Actions
+hits real GitHub. Dry-run from a normal local terminal instead.
 
 Local run to preview or backfill a release:
 `GITHUB_REPOSITORY=maui1911/CodeScope .github/scripts/issue-credits.sh v0.5.3 --dry-run`
