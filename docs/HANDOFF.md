@@ -39,7 +39,7 @@
 
 ### Session 55 — release notes credit the issue reporters
 
-v0.5.3 shipped three fixes for issues filed by @maxim12358 and thanked
+v0.5.3 shipped four fixes for issues filed by @maxim12358 and thanked
 nobody. Rather than only patching that release by hand, the credit is
 now generated as part of the release pipeline.
 

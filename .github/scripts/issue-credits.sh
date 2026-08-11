@@ -123,6 +123,11 @@ fi
 
 # --- 6. build the section ----------------------------------------------------
 
+# Numeric on both keys so a PR closing #9 and #10 lists them in that order, and
+# `-u` on (pr, issue) rather than the whole line: an issue has exactly one
+# author, so that pair is already the identity of a credit line.
+sort -u -t$'\t' -k1,1n -k2,2n "$work/credits" > "$work/credits-sorted"
+
 {
     echo "$MARKER_START"
     echo
@@ -130,12 +135,9 @@ fi
     echo
     echo "This release fixes issues reported by the community — thank you:"
     echo
-    # Dedupe whole lines first (-u on a keyed sort would collapse two issues
-    # closed by the same PR), then order by PR number, stably.
-    sort -u "$work/credits" | sort -t$'\t' -k1,1n -s \
-    | while IFS=$'\t' read -r pr issue author; do
+    while IFS=$'\t' read -r pr issue author; do
         echo "- #$pr — thanks @$author for reporting #$issue"
-    done
+    done < "$work/credits-sorted"
     echo
     echo "$MARKER_END"
 } > "$work/section"
@@ -153,12 +155,25 @@ fi
 
 gh release view "$TAG" --repo "$REPO" --json body --jq '.body' > "$work/body"
 
-# Drop a previous block so re-runs replace instead of stacking.
-awk -v s="$MARKER_START" -v e="$MARKER_END" '
-    $0 == s { skip = 1 }
-    !skip   { print }
-    $0 == e { skip = 0 }
-' "$work/body" > "$work/body-clean"
+# Drop a previous block so re-runs replace instead of stacking — but only when
+# both markers are there to bound it. With a start marker and no end marker
+# (someone hand-edited the notes and clipped it), the strip would run to EOF
+# and silently truncate the published release notes, so leave the body alone
+# and let the operator sort out the stray marker.
+if grep -qF "$MARKER_START" "$work/body" && grep -qF "$MARKER_END" "$work/body"; then
+    awk -v s="$MARKER_START" -v e="$MARKER_END" '
+        $0 == s { skip = 1 }
+        !skip   { print }
+        $0 == e { skip = 0 }
+    ' "$work/body" > "$work/body-clean"
+elif grep -qF "$MARKER_START" "$work/body"; then
+    echo "warning: '$MARKER_START' present without its end marker — appending" >&2
+    echo "         a fresh block instead of stripping, to avoid truncating the" >&2
+    echo "         notes. Remove the stray marker by hand." >&2
+    cp "$work/body" "$work/body-clean"
+else
+    cp "$work/body" "$work/body-clean"
+fi
 
 {
     # Command substitution strips trailing newlines, so stripping a previous
@@ -168,4 +183,4 @@ awk -v s="$MARKER_START" -v e="$MARKER_END" '
 } > "$work/body-new"
 
 gh release edit "$TAG" --repo "$REPO" --notes-file "$work/body-new"
-echo "release notes for $TAG updated with $(sort -u "$work/credits" | wc -l) credit line(s)"
+echo "release notes for $TAG updated with $(wc -l < "$work/credits-sorted") credit line(s)"
