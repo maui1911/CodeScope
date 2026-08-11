@@ -16,6 +16,12 @@
 name: Release
 permissions:
   "contents": "write"
+  # Read-only, for the issue-credits step in `host`: it walks each merged PR's
+  # `closingIssuesReferences` to find who reported the bug it fixed. Naming a
+  # `permissions` block at all zeroes every scope not listed, so these two have
+  # to be spelled out.
+  "pull-requests": "read"
+  "issues": "read"
 
 # This task will run whenever you push a git tag that looks like a version
 # like "1.0.0", "v0.1.0-prerelease.1", "my-app/0.1.0", "releases/v1.0.0", etc.
@@ -474,6 +480,17 @@ jobs:
           printf '%s' "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/notes.txt"
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+      # Thank the people who reported the bugs this release fixes. Runs after
+      # the release exists because it edits the published notes in place; a
+      # failure here must not fail an otherwise-good release, hence
+      # `continue-on-error` — the notes can be fixed up by hand.
+      - name: "Credit issue reporters"
+        continue-on-error: true
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          chmod +x .github/scripts/issue-credits.sh
+          .github/scripts/issue-credits.sh "${{ needs.plan.outputs.tag }}"
 
   announce:
     needs:
