@@ -25,8 +25,10 @@
 #   4. issue author, minus the repo owner and bots -> the credit lines
 #
 # Each block is delimited by HTML markers and replaced in place on a re-run,
-# so hand-polish *outside* the markers survives. Text you write inside them is
-# overwritten — move anything you want to keep above the summary block.
+# so hand-polish *outside* the markers survives; text written *inside* them is
+# overwritten. Note where surviving text ends up: the summary block is always
+# written at the very top, so hand-written prose lands below it, above the
+# download table. Nothing can be kept above the summary.
 #
 # Usage:
 #   release-notes.sh <tag> [--dry-run]
@@ -85,9 +87,11 @@ strip_block() {
         ' "$file"
     else
         if grep -qF "$start" "$file"; then
-            echo "warning: '$start' present without its end marker — appending a" >&2
-            echo "         fresh block instead of stripping, to avoid truncating" >&2
-            echo "         the notes. Remove the stray marker by hand." >&2
+            # One clause per line: CI timestamps each line separately, so a
+            # sentence broken mid-phrase is hard to read back.
+            echo "warning: '$start' found without its end marker." >&2
+            echo "warning: appending a fresh block instead of stripping, so the notes are not truncated." >&2
+            echo "warning: remove the stray marker by hand." >&2
         fi
         cat "$file"
     fi
