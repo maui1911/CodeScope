@@ -43,8 +43,16 @@ set -euo pipefail
 
 SUMMARY_START='<!-- release-summary:start -->'
 SUMMARY_END='<!-- release-summary:end -->'
+DOWNLOAD_START='<!-- download-table:start -->'
+DOWNLOAD_END='<!-- download-table:end -->'
 CREDITS_START='<!-- issue-credits:start -->'
 CREDITS_END='<!-- issue-credits:end -->'
+
+# Assets that are built and attached but deliberately kept out of the download
+# table. The file stays on the release under Assets for anyone who needs it.
+TABLE_EXCLUDE=(
+    "codescope-x86_64-apple-darwin.tar.gz"   # Intel macOS: shipped, not advertised
+)
 
 TAG="${1:-}"
 DRY_RUN=false
@@ -180,6 +188,92 @@ done < "$work/subjects"
     echo "$SUMMARY_END"
 } > "$work/summary"
 
+# --- 3b. the download table ---------------------------------------------------
+
+# cargo-dist builds its own table from `targets` in dist-workspace.toml, which
+# lists only the three unix targets — the Windows installer and zip come from
+# the separate `windows-package` job (Inno Setup) and are invisible to it. So
+# the generated table left the single most important file for a Windows-first
+# app unlisted. Build the table from what is actually attached to the release
+# instead, Windows first.
+gh api "repos/$REPO/releases/tags/$TAG" --jq '.assets[].name' > "$work/assets"
+
+# A row per asset we advertise, in the order a reader most likely wants them.
+# Anything not named here is skipped — logged below so it is never silent.
+label_for() {
+    case "$1" in
+        *-setup.exe)                        echo "Windows installer" ;;
+        *-windows.zip)                      echo "Windows portable (zip)" ;;
+        *aarch64-apple-darwin.tar.gz)       echo "Apple Silicon macOS" ;;
+        *x86_64-unknown-linux-gnu.tar.gz)   echo "x64 Linux" ;;
+        *)                                  echo "" ;;
+    esac
+}
+
+rank_for() {
+    case "$1" in
+        *-setup.exe)                        echo 1 ;;
+        *-windows.zip)                      echo 2 ;;
+        *aarch64-apple-darwin.tar.gz)       echo 3 ;;
+        *x86_64-unknown-linux-gnu.tar.gz)   echo 4 ;;
+        *)                                  echo 9 ;;
+    esac
+}
+
+asset_url() { echo "https://github.com/$REPO/releases/download/$TAG/$1"; }
+
+: > "$work/rows"
+while IFS= read -r asset; do
+    [[ -z "$asset" ]] && continue
+    # Checksums are rendered as a column on their owner's row, not as rows.
+    [[ "$asset" == *.sha256 ]] && continue
+
+    skip=false
+    for excluded in "${TABLE_EXCLUDE[@]}"; do
+        if [[ "$asset" == "$excluded" ]]; then
+            echo "  excluding $asset from the table (still attached to the release)" >&2
+            skip=true
+            break
+        fi
+    done
+    [[ "$skip" == true ]] && continue
+
+    label="$(label_for "$asset")"
+    if [[ -z "$label" ]]; then
+        echo "  not advertised in the table: $asset" >&2
+        continue
+    fi
+
+    # Only the cargo-dist archives carry a per-file .sha256; the Inno Setup
+    # output does not, so that column is an em dash rather than a dead link.
+    if grep -qxF "$asset.sha256" "$work/assets"; then
+        checksum="[checksum]($(asset_url "$asset.sha256"))"
+    else
+        checksum="—"
+    fi
+
+    printf '%s\t| [%s](%s) | %s | %s |\n' \
+        "$(rank_for "$asset")" "$asset" "$(asset_url "$asset")" "$label" "$checksum" \
+        >> "$work/rows"
+done < "$work/assets"
+
+: > "$work/download"
+if [[ -s "$work/rows" ]]; then
+    {
+        echo "$DOWNLOAD_START"
+        echo
+        echo "## Download codescope ${TAG#v}"
+        echo
+        echo "|  File  | Platform | Checksum |"
+        echo "|--------|----------|----------|"
+        sort -t$'\t' -k1,1n "$work/rows" | cut -f2-
+        echo
+        echo "$DOWNLOAD_END"
+    } > "$work/download"
+else
+    echo "warning: no advertisable assets found — leaving the existing table alone" >&2
+fi
+
 # --- 4. PR -> closed issues -> reporters --------------------------------------
 
 : > "$work/credits"
@@ -252,18 +346,32 @@ fi
 gh release view "$TAG" --repo "$REPO" --json body --jq '.body' > "$work/body"
 
 strip_block "$work/body" "$SUMMARY_START" "$SUMMARY_END" > "$work/body-1"
-strip_block "$work/body-1" "$CREDITS_START" "$CREDITS_END" > "$work/body-clean"
+strip_block "$work/body-1" "$DOWNLOAD_START" "$DOWNLOAD_END" > "$work/body-2"
+strip_block "$work/body-2" "$CREDITS_START" "$CREDITS_END" > "$work/body-3"
 
-# The summary goes above the download table cargo-dist wrote, the credits below
-# it — the shape the hand-written v0.5.3 notes settled on. Command substitution
-# strips trailing newlines, so a re-run never grows a pile of blank lines.
+# On the first run the body still holds cargo-dist's own unmarked table. Drop
+# it so the generated one replaces it instead of appearing alongside — but only
+# when there is a replacement to put back.
+if [[ -s "$work/download" ]]; then
+    awk '
+        /^## Download codescope / { skip = 1; next }
+        skip && (/^## / || /^<!--/) { skip = 0 }
+        !skip { print }
+    ' "$work/body-3" > "$work/body-clean"
+else
+    cp "$work/body-3" "$work/body-clean"
+fi
+
+# Summary, then whatever prose was written by hand, then the download table,
+# then the credits — the shape the hand-written v0.5.3 notes settled on.
 {
     printf '%s\n\n' "$(cat "$work/summary")"
-    # `sed '/./,$!d'` drops the blank lines the strip leaves at the top;
+    # `sed '/./,$!d'` drops the blank lines the strips leave at the top;
     # command substitution drops the trailing ones. Without both, every re-run
-    # adds another blank line above the download table.
+    # adds another blank line.
     body="$(sed -e '/./,$!d' "$work/body-clean")"
     [[ -n "$body" ]] && printf '%s\n\n' "$body"
+    [[ -s "$work/download" ]] && printf '%s\n\n' "$(cat "$work/download")"
     [[ -s "$work/thanks" ]] && cat "$work/thanks"
 } > "$work/body-new"
 

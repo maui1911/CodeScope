@@ -53,12 +53,29 @@ mv, credit logic unchanged) and writes two marked blocks in one pass:
   extra API calls: a squash-merge subject is exactly
   `<pr title> (#<n>)`, so the `compare` response already has both. The
   version-bump PR is excluded and the exclusion is logged.
+- `<!-- download-table:start/end -->` — the download table, rebuilt
+  from the assets actually attached to the release. **cargo-dist's own
+  table never listed Windows at all**: it builds from `targets` in
+  `dist-workspace.toml`, which holds only the three unix targets,
+  while the installer and zip come from the separate `windows-package`
+  job (Inno Setup) and are invisible to it. So the single most
+  important file for a Windows-first app was missing from every
+  release page. Windows installer / Windows zip / Apple Silicon /
+  Linux, in that order. `TABLE_EXCLUDE` keeps
+  `codescope-x86_64-apple-darwin.tar.gz` (Intel macOS) out of the
+  table — deliberately still built and still attached under Assets,
+  just not advertised. Assets with no per-file `.sha256` (the Inno
+  Setup output) get an em dash rather than a dead link, and anything
+  unrecognised is logged, never silently dropped. On the first run
+  cargo-dist's unmarked `## Download codescope …` section is removed
+  so the generated table replaces it instead of sitting next to it.
 - `<!-- issue-credits:start/end -->` — the Thanks block, as before.
 
-Summary above the download table, credits below — the shape the
-hand-written v0.5.3 notes settled on. It is a **starting point to
-polish, not a replacement for prose**: text inside the markers is
-overwritten on a re-run, text outside survives.
+Order: summary, then any hand-written prose, then the download table,
+then the credits — the shape the hand-written v0.5.3 notes settled on.
+It is a **starting point to polish, not a replacement for prose**:
+text inside the markers is overwritten on a re-run, text outside
+survives (verified with a fixture).
 
 Two bugs found while testing, both fixed: bash cannot parse `(`/`|`
 inside an inline `[[ =~ ]]` pattern (regexes now live in variables),
