@@ -25,8 +25,8 @@
 > `.github/workflows/release.yml` (was `rs--release.yml`) and now
 > triggers on plain `v*` tags.
 
-**Last updated:** 2026-08-11 (session 55 — release notes now credit the people who reported the issues a release fixes)
-**Branch:** `claude/release-issue-credits-q2k3sw` (session 55, pushed to origin, **no PR opened yet**). Session-54 PRs all merged.
+**Last updated:** 2026-08-12 (session 57 — release notes are now generated end to end: per-PR summary above the download table, reporter credits below)
+**Branch:** `claude/release-issue-credits-q2k3sw` (session 57, restarted from `main` after #303 merged). Session-55/56 work shipped in v0.5.4.
 **Head:** `main` at `265589a`. Session-54 merges: #295 monitor-swap grace window, #296 badge repaint after display change, #297 `GIT_OPTIONAL_LOCKS=0`, #298 explorer backslashes, #299 AskUserQuestion → Idle. Issues #279 (re-opened for the burst race), #292, #293, #294 all closed. Session 53 merged #285 adoption claims + #286 dangling-transcript prune (details below). Session 52 merged #280 modifier encoding + faint rendering, #281 `[dev]` window title / titlebar badge. Earlier: #287–#291 (sessions 53b/54a window+telemetry), #275–#277 (v0.5.1), #262–#274 (v0.5.0).
 **Release:** **`v0.5.1` is published** (pipeline run 27406124661). It's a patch over v0.5.0 carrying the in-app updater robustness fix. **`v0.5.0` is also still up** but its updater can mis-handle a truncated download — see below.
 **⚠ The "Could not find EOCD" update bug was MISDIAGNOSED TWICE — real root cause found in session 56 (#305).** It is **not** truncation and **not** a timeout: the updater was downloading GitHub's *API asset URL* without `Accept: application/octet-stream`, so it wrote ~1.6 KB of asset **metadata JSON** to disk and handed that to the zip extractor. See the session-56 entry below. The earlier theories are kept here only so nobody re-derives them: #275 (truncation → `verify_complete` + retries) and #301 (timeouts) are both real hardening and stay, but neither was the cause. **The user is NOT behind a truncating network** — that claim, carried in this file since session 51c, was wrong; their machine downloads the release asset cleanly (verified: 200, exact byte count, valid zip, no proxy, stock Defender).
@@ -35,6 +35,55 @@
 **Uncommitted work:** none.
 **⚠ Manual step still outstanding:** the published **v0.5.3 notes credit nobody**. Running the credit logic over the real v0.5.2..v0.5.3 range gives four lines, all @maxim12358: #289←#284, #297←#294, #298←#292, #299←#293. Note **#289←#284 (subagents keep a session busy) is not in the release bullets at all** — it merged after v0.5.2 and shipped in v0.5.3, which is very likely the missing seventh of "Seven fixes". #279 was self-filed so it correctly drops out; the taskbar-badge (#296) and updater (#301) fixes came from informal reports with no issue, so there is nobody to credit. The automation only runs on future releases, so v0.5.3 needs a hand edit — and **release editing is blocked from cloud sessions** (`Creating, editing, or deleting releases is not permitted for this session type`), so it cannot be done from a web session at all. Paste-ready body was handed to the user.
 **Open issues:** none — all four open issues were closed this session (#292, #293, #294, plus #279 re-opened and re-closed). **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree — do **NOT** run repo-wide `cargo fmt`, and note that even `cargo fmt -- src/app.rs` (with a file argument!) reformatted all 59 files this session; hand-format changed hunks, always. See the session-47 note.
+
+### Session 57 — generate the release-notes prose too
+
+**v0.5.4 shipped with no notes at all** — just the cargo-dist download
+table. The pattern: v0.4.0, v0.5.0, v0.5.1, v0.5.2 and v0.5.4 all have
+a body of exactly 957 bytes (the bare table). Only v0.5.3 (2346) and
+v0.3.0 (1563) ever got hand-written prose. Writing that prose was
+always a manual step, so skipping it ships an empty release.
+
+`issue-credits.sh` is now **`.github/scripts/release-notes.sh`** (git
+mv, credit logic unchanged) and writes two marked blocks in one pass:
+
+- `<!-- release-summary:start/end -->` — "What's changed", one bullet
+  per merged PR, grouped Fixed / Added / Other by conventional-commit
+  type, scope carrying the bullet (`- **update**: … (#305)`). Costs no
+  extra API calls: a squash-merge subject is exactly
+  `<pr title> (#<n>)`, so the `compare` response already has both. The
+  version-bump PR is excluded and the exclusion is logged.
+- `<!-- issue-credits:start/end -->` — the Thanks block, as before.
+
+Summary above the download table, credits below — the shape the
+hand-written v0.5.3 notes settled on. It is a **starting point to
+polish, not a replacement for prose**: text inside the markers is
+overwritten on a re-run, text outside survives.
+
+Two bugs found while testing, both fixed: bash cannot parse `(`/`|`
+inside an inline `[[ =~ ]]` pattern (regexes now live in variables),
+and the strip left a leading blank line that `$(cat)` does not touch,
+so every re-run added another blank line above the table — now
+`sed '/./,$!d'` trims the top. Verified idempotent over three runs with
+the download table intact, and the grouping checked against the real
+v0.5.2..v0.5.4 subjects.
+
+**First live run of the credits half (v0.5.4) worked**, from the job
+log: `PRs in range: 303 304 305 307` → `no externally-filed issues
+closed in this release — nothing to credit`. Correct: none of those
+close an issue. Near miss worth knowing — #303's body quotes
+`Fixes #294` / `Fixes #292` / `Fixes #293` verbatim, and had GitHub
+read those as closing keywords the same reporter would have been
+thanked twice. It did not, because they sit inside backticks and
+GitHub ignores code spans. Do not rely on that: keep closing keywords
+out of PR prose that merely *discusses* them.
+
+**Still outstanding:** v0.5.3 and v0.5.4 both need their notes pasted
+in by hand (drafts handed to the user). Release editing is blocked
+from Claude cloud sessions
+(`Creating, editing, or deleting releases is not permitted for this
+session type`), as is `api.github.com/graphql`, so the script's
+GraphQL half can only be dry-run from a normal local terminal.
 
 ### Session 56 — the real EOCD root cause (#305)
 
