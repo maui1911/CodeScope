@@ -61,7 +61,7 @@ plus updates to two exact-JSON round-trip tests in `core/src/layout.rs`,
 for behaviour nobody asked for. `SPLITTER_HIT_WIDTH` /
 `DIVIDER_VISUAL_WIDTH` went `pub(crate)` for reuse.
 
-### Session 58b — release checksums that verify nothing (#313)
+### Session 58b — release checksums that verified nothing, now fixed (#313)
 
 Issue #306. `sha256.sum` shipped as a single `\n` on v0.5.0–v0.5.4, so
 `sha256sum -c` passed while checking nothing. Root cause is upstream:
