@@ -494,7 +494,7 @@ jobs:
           fi
           # `--binary` gives `<hex> *<name>`, the form cargo-dist
           # already uses for the per-tarball siblings.
-          echo "$payloads" | xargs -d '\n' sha256sum --binary > sha256.sum
+          printf '%s\n' "$payloads" | xargs -d '\n' sha256sum --binary -- > sha256.sum
 
           # Per-artifact siblings for the Windows pair, which had no
           # digest at all. Missing files are a packaging failure, not
@@ -504,14 +504,14 @@ jobs:
               echo "::error::expected Windows artifact missing: $f"
               exit 1
             fi
-            sha256sum --binary "$f" > "$f.sha256"
+            sha256sum --binary -- "$f" > "$f.sha256"
           done
 
           # Fail the release rather than publish a checksum file that
           # verifies nothing: the digests must check out, and the file
           # must list every payload — no silent omissions.
-          sha256sum -c sha256.sum
-          diff <(echo "$payloads") <(sed 's/^[0-9a-f]\{64\} \*//' sha256.sum | sort)
+          sha256sum -c -- sha256.sum
+          diff <(printf '%s\n' "$payloads") <(sed 's/^[0-9a-f]\{64\} \*//' sha256.sum | sort)
           echo "sha256.sum:"
           cat sha256.sum
       - name: Create GitHub Release
