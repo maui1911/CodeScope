@@ -25,16 +25,69 @@
 > `.github/workflows/release.yml` (was `rs--release.yml`) and now
 > triggers on plain `v*` tags.
 
-**Last updated:** 2026-08-12 (session 57 — release notes are now generated end to end: per-PR summary above the download table, reporter credits below)
-**Branch:** `claude/release-issue-credits-q2k3sw` (session 57, restarted from `main` after #303 merged). Session-55/56 work shipped in v0.5.4.
-**Head:** `main` at `265589a`. Session-54 merges: #295 monitor-swap grace window, #296 badge repaint after display change, #297 `GIT_OPTIONAL_LOCKS=0`, #298 explorer backslashes, #299 AskUserQuestion → Idle. Issues #279 (re-opened for the burst race), #292, #293, #294 all closed. Session 53 merged #285 adoption claims + #286 dangling-transcript prune (details below). Session 52 merged #280 modifier encoding + faint rendering, #281 `[dev]` window title / titlebar badge. Earlier: #287–#291 (sessions 53b/54a window+telemetry), #275–#277 (v0.5.1), #262–#274 (v0.5.0).
-**Release:** **`v0.5.1` is published** (pipeline run 27406124661). It's a patch over v0.5.0 carrying the in-app updater robustness fix. **`v0.5.0` is also still up** but its updater can mis-handle a truncated download — see below.
+**Last updated:** 2026-08-15 (session 58 — ctrl+click on a URL opened the browser twice; the TUI got the orphaned mouse-release)
+**Branch:** `main`. Session-58 work merged as #311; session-57 as #310. Session-55/56 work shipped in v0.5.4.
+**Head:** `main` at `02b05ba` (#311 ctrl+click double-open), on top of `5671c83` (#310 generated release notes). Session-54 merges: #295 monitor-swap grace window, #296 badge repaint after display change, #297 `GIT_OPTIONAL_LOCKS=0`, #298 explorer backslashes, #299 AskUserQuestion → Idle. Issues #279 (re-opened for the burst race), #292, #293, #294 all closed. Session 53 merged #285 adoption claims + #286 dangling-transcript prune (details below). Session 52 merged #280 modifier encoding + faint rendering, #281 `[dev]` window title / titlebar badge. Earlier: #287–#291 (sessions 53b/54a window+telemetry), #275–#277 (v0.5.1), #262–#274 (v0.5.0).
+**Release:** **`v0.5.4` is the latest** (2026-08-11), shipped with an empty body — that gap is what #310 automates for future tags. The #311 ctrl+click fix is on `main` and unreleased. Earlier tags are all still up; anything **before `v0.5.3`** carries the updater that mis-handles the asset-metadata download (see the EOCD note below), so a manual installer run is the way off them.
 **⚠ The "Could not find EOCD" update bug was MISDIAGNOSED TWICE — real root cause found in session 56 (#305).** It is **not** truncation and **not** a timeout: the updater was downloading GitHub's *API asset URL* without `Accept: application/octet-stream`, so it wrote ~1.6 KB of asset **metadata JSON** to disk and handed that to the zip extractor. See the session-56 entry below. The earlier theories are kept here only so nobody re-derives them: #275 (truncation → `verify_complete` + retries) and #301 (timeouts) are both real hardening and stay, but neither was the cause. **The user is NOT behind a truncating network** — that claim, carried in this file since session 51c, was wrong; their machine downloads the release asset cleanly (verified: 200, exact byte count, valid zip, no proxy, stock Defender).
 **Diagnostic logging (closed in #301):** the installer now appends to `%LOCALAPPDATA%\CodeScope\update.log`. Note it only ships from **v0.5.3**, which is why the failing v0.5.2 install left zero evidence behind.
 **Build status:** ✅ workspace builds clean; suite green on `main` — 53 in `codescope-terminal`, 501 in `codescope-core` (+5 this session), 147 in `codescope` (+11 across sessions 53b–54). Clippy: 0 errors, only the pre-existing warnings (`app.rs` `map_or` / `spawn_tab_in` arg count / large enum variant, `core` `from_str` / `sort_by_key`, `taskbar_badge.rs` `gy` loop indexing, `opencode` arg count).
-**Uncommitted work:** none.
+**Uncommitted work:** none tracked. Two untracked leftovers from earlier updater testing sit in `dist/` (`CodeScope-v99.0.0-windows.zip`, `fake/`) — deletable.
 **⚠ Manual step still outstanding:** the published **v0.5.3 notes credit nobody**. Running the credit logic over the real v0.5.2..v0.5.3 range gives four lines, all @maxim12358: #289←#284, #297←#294, #298←#292, #299←#293. Note **#289←#284 (subagents keep a session busy) is not in the release bullets at all** — it merged after v0.5.2 and shipped in v0.5.3, which is very likely the missing seventh of "Seven fixes". #279 was self-filed so it correctly drops out; the taskbar-badge (#296) and updater (#301) fixes came from informal reports with no issue, so there is nobody to credit. The automation only runs on future releases, so v0.5.3 needs a hand edit — and **release editing is blocked from cloud sessions** (`Creating, editing, or deleting releases is not permitted for this session type`), so it cannot be done from a web session at all. Paste-ready body was handed to the user.
 **Open issues:** none — all four open issues were closed this session (#292, #293, #294, plus #279 re-opened and re-closed). **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree — do **NOT** run repo-wide `cargo fmt`, and note that even `cargo fmt -- src/app.rs` (with a file argument!) reformatted all 59 files this session; hand-format changed hunks, always. See the session-47 note.
+
+### Session 58 — ctrl+click on a URL opened the browser twice (#311)
+
+User report: ctrl+clicking a URL inside a `claude-code` tab opened two
+browser tabs. File-path links were fine — that asymmetry is the whole
+clue.
+
+`TerminalView::on_mouse_down` short-circuits a ctrl/cmd-click on a
+hyperlink: it opens the URI and returns *without* forwarding the press
+to the TUI. `on_mouse_up` had no matching short-circuit, so it still
+ran `try_report_mouse(Release, …)`. **`claude-code` runs with mouse
+reporting on** (measured, `mouse_mode=true` — the binary only contains
+one literal `?1000h` and it belongs to an unrelated bundled picker, so
+grepping the bundle says the opposite of the truth; don't trust it).
+It receives the orphaned release, reads it as its own click on the
+link, and opens the URL a second time through its own opener. File
+paths never doubled because the TUI doesn't linkify those.
+
+Fix is 16 lines in `terminal/src/view.rs`: a `link_click_consumed`
+flag set when the press is consumed, and swallowed by the matching
+release. Copilot caught a real hole in the first cut — an unrelated
+right/middle release could take the flag and let the real Left release
+through — so the swallow is gated on `MouseButton::Left`. Not
+`claude-code`-specific: no mouse-mode app should ever see half a click.
+
+**Repro technique worth reusing.** GPUI has no automation surface for
+terminal cells (gpui-driver clicks ids, and cells have none), but the
+loop below closes fully without the user:
+
+1. `eprintln!` diagnostics in the handler + `cargo build --bin
+   codescope`, launched with `CODESCOPE_DEV=1` via a **background Bash
+   task** — the task's output file *is* the stderr log.
+2. `window-capture` skill to see the window (needs
+   `-ExecutionPolicy Bypass`; `-Title "CodeScope [dev]"` matches, or
+   `-ProcessName codescope -Index 1` when the installed build is also
+   up). The capture is framed on DWM extended bounds, and for a
+   maximized window those start at screen `(0,0)` — so image pixel ==
+   screen pixel, which is what makes coordinate clicking possible.
+3. Synthetic ctrl+click at those coordinates from PowerShell:
+   `SetCursorPos`, then `keybd_event(VK_CONTROL=0x11, down)` →
+   `mouse_event(LEFTDOWN=0x0002)` → `mouse_event(LEFTUP=0x0004)` →
+   `keybd_event(0x11, KEYEVENTF_KEYUP=2)`, with ~100 ms between the
+   modifier and the button so GPUI samples Ctrl as held. A plain click
+   doesn't exercise the bug.
+4. Count the result (`Shell.Application.Windows()` for Explorer, a
+   Firefox screenshot for browser tabs).
+
+⚠ `SetForegroundWindow` **fails silently** under Windows' foreground
+lock and the keystrokes then land in whatever window is actually
+focused — this hit the user's live session mid-turn. Any synthetic
+typing must verify `GetForegroundWindow() == hwnd` and abort if not.
+Also prefer `SendInput` with `KEYEVENTF_UNICODE` over `SendKeys`, which
+eats `!`/`+`/`^` as modifier prefixes.
 
 ### Session 57 — generate the release-notes prose too
 
