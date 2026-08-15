@@ -496,8 +496,10 @@ impl TerminalView {
         _cx: &mut Context<Self>,
     ) {
         // The press opened a hyperlink and never reached the TUI —
-        // don't hand it the orphaned release either.
-        if std::mem::take(&mut self.link_click_consumed) {
+        // don't hand it the orphaned release either. Gated on Left so
+        // a right/middle release mid-drag can't eat the flag and let
+        // the real release through.
+        if event.button == MouseButton::Left && std::mem::take(&mut self.link_click_consumed) {
             self.selecting = false;
             return;
         }
