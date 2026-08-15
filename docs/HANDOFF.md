@@ -28,7 +28,7 @@
 **Last updated:** 2026-08-15 (session 58 — ctrl+click on a URL opened the browser twice; the TUI got the orphaned mouse-release)
 **Branch:** `main`. Session-58 work merged as #311; session-57 as #310. Session-55/56 work shipped in v0.5.4.
 **Head:** `main` at `02b05ba` (#311 ctrl+click double-open), on top of `5671c83` (#310 generated release notes). Session-54 merges: #295 monitor-swap grace window, #296 badge repaint after display change, #297 `GIT_OPTIONAL_LOCKS=0`, #298 explorer backslashes, #299 AskUserQuestion → Idle. Issues #279 (re-opened for the burst race), #292, #293, #294 all closed. Session 53 merged #285 adoption claims + #286 dangling-transcript prune (details below). Session 52 merged #280 modifier encoding + faint rendering, #281 `[dev]` window title / titlebar badge. Earlier: #287–#291 (sessions 53b/54a window+telemetry), #275–#277 (v0.5.1), #262–#274 (v0.5.0).
-**Release:** **`v0.5.1` is published** (pipeline run 27406124661). It's a patch over v0.5.0 carrying the in-app updater robustness fix. **`v0.5.0` is also still up** but its updater can mis-handle a truncated download — see below.
+**Release:** **`v0.5.4` is the latest** (2026-08-11), shipped with an empty body — that gap is what #310 automates for future tags. The #311 ctrl+click fix is on `main` and unreleased. Earlier tags are all still up; anything **before `v0.5.3`** carries the updater that mis-handles the asset-metadata download (see the EOCD note below), so a manual installer run is the way off them.
 **⚠ The "Could not find EOCD" update bug was MISDIAGNOSED TWICE — real root cause found in session 56 (#305).** It is **not** truncation and **not** a timeout: the updater was downloading GitHub's *API asset URL* without `Accept: application/octet-stream`, so it wrote ~1.6 KB of asset **metadata JSON** to disk and handed that to the zip extractor. See the session-56 entry below. The earlier theories are kept here only so nobody re-derives them: #275 (truncation → `verify_complete` + retries) and #301 (timeouts) are both real hardening and stay, but neither was the cause. **The user is NOT behind a truncating network** — that claim, carried in this file since session 51c, was wrong; their machine downloads the release asset cleanly (verified: 200, exact byte count, valid zip, no proxy, stock Defender).
 **Diagnostic logging (closed in #301):** the installer now appends to `%LOCALAPPDATA%\CodeScope\update.log`. Note it only ships from **v0.5.3**, which is why the failing v0.5.2 install left zero evidence behind.
 **Build status:** ✅ workspace builds clean; suite green on `main` — 53 in `codescope-terminal`, 501 in `codescope-core` (+5 this session), 147 in `codescope` (+11 across sessions 53b–54). Clippy: 0 errors, only the pre-existing warnings (`app.rs` `map_or` / `spawn_tab_in` arg count / large enum variant, `core` `from_str` / `sort_by_key`, `taskbar_badge.rs` `gy` loop indexing, `opencode` arg count).
@@ -73,8 +73,12 @@ loop below closes fully without the user:
    up). The capture is framed on DWM extended bounds, and for a
    maximized window those start at screen `(0,0)` — so image pixel ==
    screen pixel, which is what makes coordinate clicking possible.
-3. Synthetic ctrl+click at those coordinates with `SetCursorPos` +
-   `mouse_event` from PowerShell.
+3. Synthetic ctrl+click at those coordinates from PowerShell:
+   `SetCursorPos`, then `keybd_event(VK_CONTROL=0x11, down)` →
+   `mouse_event(LEFTDOWN=0x0002)` → `mouse_event(LEFTUP=0x0004)` →
+   `keybd_event(0x11, KEYEVENTF_KEYUP=2)`, with ~100 ms between the
+   modifier and the button so GPUI samples Ctrl as held. A plain click
+   doesn't exercise the bug.
 4. Count the result (`Shell.Application.Windows()` for Explorer, a
    Firefox screenshot for browser tabs).
 
