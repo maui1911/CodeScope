@@ -139,6 +139,12 @@ pub struct TerminalView {
     /// mouse-move; we only `cx.notify()` when the value flips so
     /// motion across non-hyperlink cells doesn't repaint the world.
     hovered_link: Option<Arc<str>>,
+    /// Set when a Ctrl/Cmd-click opened a hyperlink, cleared by the
+    /// matching mouse-up. Without it we swallow the press but still
+    /// report the *release* to a TUI in mouse-reporting mode — and
+    /// `claude-code` treats that lone release as its own click, so
+    /// the URL opens a second time in the browser.
+    link_click_consumed: bool,
 }
 
 impl TerminalView {
@@ -256,6 +262,7 @@ impl TerminalView {
             selecting: false,
             blink_phase,
             hovered_link: None,
+            link_click_consumed: false,
         }
     }
 
@@ -414,6 +421,7 @@ impl TerminalView {
             && let Some((row, col)) = self.visible_rc(event.position)
                 && let Some(uri) = self.snapshot.hyperlink_at(row, col) {
                     let _ = open::that_detached(uri.as_ref());
+                    self.link_click_consumed = true;
                     return;
                 }
 
@@ -487,6 +495,12 @@ impl TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
+        // The press opened a hyperlink and never reached the TUI —
+        // don't hand it the orphaned release either.
+        if std::mem::take(&mut self.link_click_consumed) {
+            self.selecting = false;
+            return;
+        }
         if let Some(button) = to_mouse_button(event.button)
             && self.try_report_mouse(
                 MouseEventKind::Release,
