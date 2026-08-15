@@ -443,7 +443,7 @@ fn normalise_group_weights(weights: &mut [f32]) {
 /// itself uses `DIVIDER_VISUAL_WIDTH`; the extra width comes from
 /// an absolute-positioned overlay centered on the visible line that
 /// extends `(HIT - VISUAL) / 2` pixels into each adjacent pane.
-const SPLITTER_HIT_WIDTH: f32 = 6.0;
+pub(crate) const SPLITTER_HIT_WIDTH: f32 = 6.0;
 
 /// Visible width of the splitter / sidebar-handle / strip-divider
 /// line. Kept at 1 px for a clean, single-pixel rule between panes;
@@ -456,7 +456,14 @@ const SPLITTER_HIT_WIDTH: f32 = 6.0;
 /// pane splitters, `begin_splitter_drag`'s sidebar-pixels subtraction)
 /// uses *this* width so both rows divide the same horizontal extent
 /// by the same `weight` factor.
-const DIVIDER_VISUAL_WIDTH: f32 = 1.0;
+pub(crate) const DIVIDER_VISUAL_WIDTH: f32 = 1.0;
+
+/// Diff viewer file-list width: starting value and drag clamps. The
+/// floor keeps a path fragment plus its badge readable; the ceiling
+/// stops the list from crowding out the diff it exists to navigate.
+const DIFF_LIST_DEFAULT_WIDTH: f32 = 300.0;
+const DIFF_LIST_MIN_WIDTH: f32 = 180.0;
+const DIFF_LIST_MAX_WIDTH: f32 = 720.0;
 
 /// Width of the right-side caption-controls cluster in the title
 /// bar (split + min + max + close, each 46 px). The rightmost
@@ -731,6 +738,15 @@ pub struct AppShell {
     /// In-flight sidebar drag, if any. Same shape as `splitter_drag`
     /// but specific to the sidebar's right edge.
     sidebar_drag: Option<SidebarDrag>,
+    /// Width of the diff viewer's file list (its "sidebar"). Kept on
+    /// the shell rather than in `DiffViewerState` so a resize survives
+    /// closing and re-opening the panel. Deliberately *not* persisted
+    /// to `layout.json` — it resets to the default on restart, which
+    /// nobody has asked to change.
+    pub(crate) diff_list_width: f32,
+    /// In-flight diff-viewer file-list drag. Same shape and lifecycle
+    /// as `sidebar_drag`.
+    diff_list_drag: Option<SidebarDrag>,
     /// Open tab right-click menu, if any.
     tab_menu: Option<TabMenu>,
     /// In-flight tab drag-hover state. `Some` between an `on_drag_move`
@@ -1592,6 +1608,8 @@ impl AppShell {
             sidebar_width,
             sidebar_visible,
             sidebar_drag: None,
+            diff_list_width: DIFF_LIST_DEFAULT_WIDTH,
+            diff_list_drag: None,
             tab_menu: None,
             tab_drag_hover: None,
             tab_rects: HashMap::new(),
@@ -4079,6 +4097,35 @@ impl AppShell {
     fn end_sidebar_drag(&mut self, cx: &mut Context<Self>) {
         if self.sidebar_drag.take().is_some() {
             self.save_layout();
+            cx.notify();
+        }
+    }
+
+    /// Begin a diff-viewer file-list resize from the mouse-down on the
+    /// handle between the list and the detail pane.
+    pub(crate) fn begin_diff_list_drag(&mut self, cursor_x: gpui::Pixels) {
+        self.diff_list_drag = Some(SidebarDrag {
+            start_x: cursor_x,
+            start_width: self.diff_list_width,
+        });
+    }
+
+    /// Update the file-list width during an in-flight drag, clamped
+    /// between [`DIFF_LIST_MIN_WIDTH`] and [`DIFF_LIST_MAX_WIDTH`].
+    fn update_diff_list_drag(&mut self, cursor_x: gpui::Pixels, cx: &mut Context<Self>) {
+        let Some(drag) = self.diff_list_drag.as_ref() else { return };
+        let dx: f32 = (cursor_x - drag.start_x).into();
+        let new_width = (drag.start_width + dx).clamp(DIFF_LIST_MIN_WIDTH, DIFF_LIST_MAX_WIDTH);
+        if (new_width - self.diff_list_width).abs() > 0.1 {
+            self.diff_list_width = new_width;
+            cx.notify();
+        }
+    }
+
+    /// Nothing to persist — the width is session-scoped — so this only
+    /// clears the in-flight drag.
+    fn end_diff_list_drag(&mut self, cx: &mut Context<Self>) {
+        if self.diff_list_drag.take().is_some() {
             cx.notify();
         }
     }
@@ -7423,6 +7470,9 @@ impl Render for AppShell {
                 if this.sidebar_drag.is_some() {
                     this.update_sidebar_drag(event.position.x, cx);
                 }
+                if this.diff_list_drag.is_some() {
+                    this.update_diff_list_drag(event.position.x, cx);
+                }
                 if this.titlebar_press.is_some() {
                     this.update_titlebar_drag(event, window, cx);
                 }
@@ -7432,6 +7482,7 @@ impl Render for AppShell {
                 cx.listener(|this, _, _, cx| {
                     this.end_splitter_drag(cx);
                     this.end_sidebar_drag(cx);
+                    this.end_diff_list_drag(cx);
                     this.titlebar_press = None;
                 }),
             )

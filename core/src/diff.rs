@@ -17,7 +17,7 @@
 //! viewer that drops one exotic header is useful, one that errors on
 //! it is not.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 
@@ -485,6 +485,19 @@ pub fn worktree_diff(worktree: &Path) -> Result<Vec<DiffFile>> {
         Vec::new()
     };
 
+    // Every path git reports is relative to the *repo root*, not to
+    // the directory we ran it in — and `worktree` is a session's
+    // working directory, which can be any subfolder the user added as
+    // a project. Resolve untracked reads against the root or they all
+    // fail to open and get mis-flagged binary. Falls back to
+    // `worktree` when git can't answer (already-degraded case; the
+    // status call below would have failed too).
+    let root = run_git(worktree, &["rev-parse", "--show-toplevel"])
+        .ok()
+        .map(|out| PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string()))
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| worktree.to_path_buf());
+
     // `-z`: NUL-terminated entries with RAW paths — no C-style
     // quoting/escaping to undo, so names with spaces, quotes, or
     // backslash escapes resolve on disk exactly as git reported them.
@@ -509,7 +522,7 @@ pub fn worktree_diff(worktree: &Path) -> Result<Vec<DiffFile>> {
             let _ = fields.next();
         }
         if code == "?? " {
-            untracked.push(untracked_file_entry(worktree, path));
+            untracked.push(untracked_file_entry(&root, path));
         }
     }
     untracked.sort_by(|a, b| a.path.cmp(&b.path));
@@ -520,7 +533,7 @@ pub fn worktree_diff(worktree: &Path) -> Result<Vec<DiffFile>> {
 /// Build the synthetic all-added [`DiffFile`] for an untracked path.
 /// Reads from disk with byte/line caps; a read failure or NUL byte in
 /// the prefix marks the entry binary instead of erroring the diff.
-fn untracked_file_entry(worktree: &Path, rel_path: &str) -> DiffFile {
+fn untracked_file_entry(repo_root: &Path, rel_path: &str) -> DiffFile {
     let mut entry = DiffFile {
         path: rel_path.to_string(),
         old_path: None,
@@ -535,7 +548,7 @@ fn untracked_file_entry(worktree: &Path, rel_path: &str) -> DiffFile {
     // Bounded read: pull at most cap+1 bytes off disk (the +1 tells
     // truncation apart from an exactly-cap-sized file) so a multi-GB
     // untracked artifact never lands in memory just to be previewed.
-    let abs = worktree.join(rel_path);
+    let abs = repo_root.join(rel_path);
     let bytes = {
         use std::io::Read as _;
         let Ok(file) = std::fs::File::open(&abs) else {
@@ -868,6 +881,32 @@ Binary files a/img.png and b/img.png differ
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, name);
         assert_eq!(files[0].status, FileStatus::Modified);
+        assert_eq!(files[0].added, 1);
+    }
+
+    /// A session's working directory can be a *subdirectory* of the
+    /// repo (any folder can be added as a project). `git status
+    /// --porcelain` always reports paths relative to the repo root,
+    /// so joining them onto the session directory looks for
+    /// `sub/sub/notes.md`, the open fails, and every untracked file
+    /// gets mis-flagged binary.
+    #[test]
+    fn untracked_paths_resolve_from_a_subdirectory() {
+        let Some((_guard, repo)) = init_repo() else { return };
+        std::fs::write(repo.join("seed.txt"), "a\n").unwrap();
+        run(&repo, &["add", "-A"]);
+        run(&repo, &["commit", "-m", "seed", "-q"]);
+        let sub = repo.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("notes.md"), "# hi\n").unwrap();
+
+        let files = worktree_diff(&sub).expect("diff succeeds");
+        assert_eq!(files.len(), 1, "got: {files:#?}");
+        assert_eq!(files[0].path, "sub/notes.md");
+        assert!(
+            !files[0].binary,
+            "untracked path resolved against the session dir, not the repo root"
+        );
         assert_eq!(files[0].added, 1);
     }
 
