@@ -25,16 +25,62 @@
 > `.github/workflows/release.yml` (was `rs--release.yml`) and now
 > triggers on plain `v*` tags.
 
-**Last updated:** 2026-08-15 (session 58 — ctrl+click on a URL opened the browser twice; the TUI got the orphaned mouse-release)
-**Branch:** `main`. Session-58 work merged as #311; session-57 as #310. Session-55/56 work shipped in v0.5.4.
-**Head:** `main` at `02b05ba` (#311 ctrl+click double-open), on top of `5671c83` (#310 generated release notes). Session-54 merges: #295 monitor-swap grace window, #296 badge repaint after display change, #297 `GIT_OPTIONAL_LOCKS=0`, #298 explorer backslashes, #299 AskUserQuestion → Idle. Issues #279 (re-opened for the burst race), #292, #293, #294 all closed. Session 53 merged #285 adoption claims + #286 dangling-transcript prune (details below). Session 52 merged #280 modifier encoding + faint rendering, #281 `[dev]` window title / titlebar badge. Earlier: #287–#291 (sessions 53b/54a window+telemetry), #275–#277 (v0.5.1), #262–#274 (v0.5.0).
-**Release:** **`v0.5.4` is the latest** (2026-08-11), shipped with an empty body — that gap is what #310 automates for future tags. The #311 ctrl+click fix is on `main` and unreleased. Earlier tags are all still up; anything **before `v0.5.3`** carries the updater that mis-handles the asset-metadata download (see the EOCD note below), so a manual installer run is the way off them.
+**Last updated:** 2026-08-15 (session 58 — ctrl+click double-open, release checksums, diff viewer; every open issue closed)
+**Branch:** `main`. Session-58 work merged as #311, #313, #314 (+ handoff #312); session-57 as #310. Session-55/56 work shipped in v0.5.4.
+**Head:** `main` at `c85d9e3` (#314 diff viewer), over #313 release checksums and #311 ctrl+click double-open. Session-54 merges: #295 monitor-swap grace window, #296 badge repaint after display change, #297 `GIT_OPTIONAL_LOCKS=0`, #298 explorer backslashes, #299 AskUserQuestion → Idle. Issues #279 (re-opened for the burst race), #292, #293, #294 all closed. Session 53 merged #285 adoption claims + #286 dangling-transcript prune (details below). Session 52 merged #280 modifier encoding + faint rendering, #281 `[dev]` window title / titlebar badge. Earlier: #287–#291 (sessions 53b/54a window+telemetry), #275–#277 (v0.5.1), #262–#274 (v0.5.0).
+**Release:** **`v0.5.4` is the latest** (2026-08-11), shipped with an empty body — that gap is what #310 automates for future tags. The #311 / #313 / #314 fixes are on `main` and unreleased — **#313 rewrites the release pipeline's checksum step, so the next tag is its first real run**. Earlier tags are all still up; anything **before `v0.5.3`** carries the updater that mis-handles the asset-metadata download (see the EOCD note below), so a manual installer run is the way off them.
 **⚠ The "Could not find EOCD" update bug was MISDIAGNOSED TWICE — real root cause found in session 56 (#305).** It is **not** truncation and **not** a timeout: the updater was downloading GitHub's *API asset URL* without `Accept: application/octet-stream`, so it wrote ~1.6 KB of asset **metadata JSON** to disk and handed that to the zip extractor. See the session-56 entry below. The earlier theories are kept here only so nobody re-derives them: #275 (truncation → `verify_complete` + retries) and #301 (timeouts) are both real hardening and stay, but neither was the cause. **The user is NOT behind a truncating network** — that claim, carried in this file since session 51c, was wrong; their machine downloads the release asset cleanly (verified: 200, exact byte count, valid zip, no proxy, stock Defender).
 **Diagnostic logging (closed in #301):** the installer now appends to `%LOCALAPPDATA%\CodeScope\update.log`. Note it only ships from **v0.5.3**, which is why the failing v0.5.2 install left zero evidence behind.
-**Build status:** ✅ workspace builds clean; suite green on `main` — 53 in `codescope-terminal`, 501 in `codescope-core` (+5 this session), 147 in `codescope` (+11 across sessions 53b–54). Clippy: 0 errors, only the pre-existing warnings (`app.rs` `map_or` / `spawn_tab_in` arg count / large enum variant, `core` `from_str` / `sort_by_key`, `taskbar_badge.rs` `gy` loop indexing, `opencode` arg count).
+**Build status:** ✅ workspace builds clean; suite green on `main` — 53 in `codescope-terminal`, 505 in `codescope-core` (+1 in session 58), 152 in `codescope` (+11 across sessions 53b–54). Clippy: 0 errors, only the pre-existing warnings (`app.rs` `map_or` / `spawn_tab_in` arg count / large enum variant, `core` `from_str` / `sort_by_key`, `taskbar_badge.rs` `gy` loop indexing, `opencode` arg count).
 **Uncommitted work:** none tracked. Two untracked leftovers from earlier updater testing sit in `dist/` (`CodeScope-v99.0.0-windows.zip`, `fake/`) — deletable.
 **⚠ Manual step still outstanding:** the published **v0.5.3 notes credit nobody**. Running the credit logic over the real v0.5.2..v0.5.3 range gives four lines, all @maxim12358: #289←#284, #297←#294, #298←#292, #299←#293. Note **#289←#284 (subagents keep a session busy) is not in the release bullets at all** — it merged after v0.5.2 and shipped in v0.5.3, which is very likely the missing seventh of "Seven fixes". #279 was self-filed so it correctly drops out; the taskbar-badge (#296) and updater (#301) fixes came from informal reports with no issue, so there is nobody to credit. The automation only runs on future releases, so v0.5.3 needs a hand edit — and **release editing is blocked from cloud sessions** (`Creating, editing, or deleting releases is not permitted for this session type`), so it cannot be done from a web session at all. Paste-ready body was handed to the user.
-**Open issues:** none — all four open issues were closed this session (#292, #293, #294, plus #279 re-opened and re-closed). **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree — do **NOT** run repo-wide `cargo fmt`, and note that even `cargo fmt -- src/app.rs` (with a file argument!) reformatted all 59 files this session; hand-format changed hunks, always. See the session-47 note.
+**Open issues:** none — #306, #308 and #309 were all closed in session 58. **⚠ Heads-up:** the local rustfmt (1.9.0-stable) reformats the *entire* tree — do **NOT** run repo-wide `cargo fmt`, and note that even `cargo fmt -- src/app.rs` (with a file argument!) reformatted all 59 files this session; hand-format changed hunks, always. See the session-47 note.
+
+### Session 58c — diff viewer: resizable list, new files no longer "binary" (#314)
+
+Issue #308, both halves.
+
+**Every untracked file rendered as "Binary file — no preview."** Not
+extension-related (the report guessed `.md` / `.sql`): `git status
+--porcelain` reports paths relative to the **repo root**, but
+`untracked_file_entry` resolved them against the *session's working
+directory*. Point a project at a subfolder of a repo and it looks for
+`sub/sub/notes.md`, `File::open` fails, and the read-failure branch
+flags the entry binary. Now resolved against `git rev-parse
+--show-toplevel`, falling back to the session dir. Test written first
+(`untracked_paths_resolve_from_a_subdirectory`) and it failed on the
+old code with exactly the reported symptom.
+
+**File list didn't resize** — hard-coded `w(px(300.0))` +
+`flex_shrink_0()`, no handle. Mirrors the main sidebar's splitter now
+(1 px line, 6 px hit target, `cursor_col_resize`, drag state on the
+shell), clamped 180–720 px, replacing the list's old right border.
+Width lives on `AppShell` so it survives close/reopen of the panel;
+**not** persisted to `layout.json` — that needs a new serialized field
+plus updates to two exact-JSON round-trip tests in `core/src/layout.rs`,
+for behaviour nobody asked for. `SPLITTER_HIT_WIDTH` /
+`DIVIDER_VISUAL_WIDTH` went `pub(crate)` for reuse.
+
+### Session 58b — release checksums that verified nothing, now fixed (#313)
+
+Issue #306. `sha256.sum` shipped as a single `\n` on v0.5.0–v0.5.4, so
+`sha256sum -c` passed while checking nothing. Root cause is upstream:
+`dist build --artifacts=global` runs without the local artifacts'
+digests, so every global artifact derived from them is emitted blank —
+[cargo-dist#1672](https://github.com/axodotdev/cargo-dist/issues/1672),
+open since v0.27. Fixing it upstream still wouldn't cover the Windows
+zip + installer: they come from `windows-package`, outside cargo-dist's
+matrix, and `build-global-artifacts` doesn't even depend on that job.
+
+So the aggregate is rebuilt in a new `Checksums` step in `host`, after
+the flatten, over exactly the files about to be released, plus
+`.sha256` siblings for the Windows pair. Three guards fail the release
+rather than publish a file that verifies nothing: `sha256sum -c`, a
+set-diff proving every payload is listed, and an existence check on
+both Windows artifacts. All four paths (happy, missing artifact,
+tampered payload, omitted entry) were exercised against a mock
+`artifacts/` tree — **the pipeline itself is unproven until a tag is
+cut**, so watch that step on the next release.
 
 ### Session 58 — ctrl+click on a URL opened the browser twice (#311)
 
