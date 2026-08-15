@@ -369,16 +369,44 @@ impl AppShell {
         }
         let mut file_list = div()
             .id("diff-file-list")
-            .w(px(300.0))
+            .w(px(self.diff_list_width))
             .flex_shrink_0()
             .flex()
             .flex_col()
             .overflow_y_scroll()
-            .border_r_1()
-            .border_color(divider)
             .py(px(6.0))
             .children(file_rows);
         file_list.style().min_size.height = Some(gpui::Length::Definite(px(0.0).into()));
+
+        // Resize handle between list and detail — same 1 px line with
+        // a wider absolute-positioned hit-target as the main sidebar's
+        // handle (see `sidebar_handle` in `app.rs`). It replaces the
+        // list's old right border, so there's still exactly one line.
+        let hit_overhang = (crate::app::SPLITTER_HIT_WIDTH - crate::app::DIVIDER_VISUAL_WIDTH) / 2.0;
+        let list_handle = div()
+            .id("diff-list-resize-handle")
+            .relative()
+            .w(px(crate::app::DIVIDER_VISUAL_WIDTH))
+            .flex_shrink_0()
+            .h_full()
+            .bg(divider)
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(px(-hit_overhang))
+                    .w(px(crate::app::SPLITTER_HIT_WIDTH))
+                    .h_full()
+                    .cursor_col_resize()
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.begin_diff_list_drag(event.position.x);
+                            cx.notify();
+                        }),
+                    ),
+            );
 
         // ── Detail pane ──────────────────────────────────────────
         let mut detail = div()
@@ -395,6 +423,7 @@ impl AppShell {
             .flex_row()
             .flex_grow()
             .child(file_list)
+            .child(list_handle)
             .child(detail);
         body.style().min_size.height = Some(gpui::Length::Definite(px(0.0).into()));
 
