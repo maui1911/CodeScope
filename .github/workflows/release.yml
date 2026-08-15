@@ -465,6 +465,55 @@ jobs:
           rm -f artifacts/*-dist-manifest.json
           echo "After flatten:"
           find artifacts -type f | sort
+      # Rebuild the checksums over what is actually about to be
+      # released. Two reasons cargo-dist's own `sha256.sum` can't be
+      # trusted here:
+      #
+      #   * It ships EMPTY (one `\n`) on every release so far —
+      #     `dist build --artifacts=global` has no access to the local
+      #     artifacts' digests, so every global artifact derived from
+      #     them comes out blank. Upstream bug, open since v0.27:
+      #     https://github.com/axodotdev/cargo-dist/issues/1672.
+      #     A `sha256sum -c` against it trivially "passes" while
+      #     verifying nothing, which is worse than shipping no file.
+      #   * Even fixed it would be incomplete: the Windows zip and
+      #     installer come from the `windows-package` job, outside
+      #     cargo-dist's matrix, and `build-global-artifacts` doesn't
+      #     even depend on that job.
+      #
+      # This step runs after the flatten, so every asset is on disk.
+      - name: Checksums
+        working-directory: artifacts
+        run: |
+          rm -f sha256.sum
+          # Everything that isn't itself a checksum file.
+          payloads=$(find . -maxdepth 1 -type f ! -name '*.sha256' ! -name 'sha256.sum' -printf '%P\n' | sort)
+          if [ -z "$payloads" ]; then
+            echo "::error::no release payloads found to checksum"
+            exit 1
+          fi
+          # `--binary` gives `<hex> *<name>`, the form cargo-dist
+          # already uses for the per-tarball siblings.
+          printf '%s\n' "$payloads" | xargs -d '\n' sha256sum --binary -- > sha256.sum
+
+          # Per-artifact siblings for the Windows pair, which had no
+          # digest at all. Missing files are a packaging failure, not
+          # something to skip past.
+          for f in CodeScope-v*-windows.zip CodeScope-v*-setup.exe; do
+            if [ ! -f "$f" ]; then
+              echo "::error::expected Windows artifact missing: $f"
+              exit 1
+            fi
+            sha256sum --binary -- "$f" > "$f.sha256"
+          done
+
+          # Fail the release rather than publish a checksum file that
+          # verifies nothing: the digests must check out, and the file
+          # must list every payload — no silent omissions.
+          sha256sum -c -- sha256.sum
+          diff <(printf '%s\n' "$payloads") <(sed 's/^[0-9a-f]\{64\} \*//' sha256.sum | sort)
+          echo "sha256.sum:"
+          cat sha256.sum
       - name: Create GitHub Release
         env:
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
