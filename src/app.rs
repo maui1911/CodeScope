@@ -6630,8 +6630,7 @@ impl AppShell {
         // because its hosted terminal swallows everything, but the
         // Rust port routes terminal-bound keys back to the PTY, so
         // the agent-shell conflicts surfaced. The Ctrl+Shift remap
-        // is a Rust-port-only adjustment documented in
-        // `docs/HANDOFF.md` (Keyboard chords).
+        // is a Rust-port-only adjustment.
         match key {
             // Ctrl+Shift+P — command palette toggle.
             "p" if mods.shift => {

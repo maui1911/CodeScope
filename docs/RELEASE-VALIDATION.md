@@ -2,7 +2,7 @@
 
 Run this before announcing any `vX.Y.Z` tag. The auto-update path
 was previously responsible for three release-cycle crashes (rc.10 /
-rc.12 / rc.14 — see HANDOFF session 44); the unit tests alone never
+rc.12 / rc.14, which is what retired Velopack in #244); the unit tests alone never
 caught the crashes that mattered, so this manual end-to-end pass is
 mandatory.
 

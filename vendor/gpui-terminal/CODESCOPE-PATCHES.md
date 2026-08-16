@@ -33,6 +33,6 @@ writer (already owned by `TerminalView`) into `GpuiEventProxy`. In
 proxy is built. Test helper `sink_writer()` added to keep `event.rs`'s
 unit tests compiling. ~30-line diff total.
 
-This _does not_ fix the conhost-vs-grid scroll-sync issue (Bug #2 in
-`docs/HANDOFF.md`); that requires architectural changes outside this
-crate's surface and is out of scope for the spike.
+This _does not_ fix the conhost-vs-grid scroll-sync issue; that
+requires architectural changes outside this crate's surface and is out
+of scope for the spike.

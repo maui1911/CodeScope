@@ -15,7 +15,9 @@
 //! `SessionManager` therefore operates against a `&mut ProjectsConfig`
 //! rather than introducing a second persistence root: a single source
 //! of truth keeps round-trip with the C# binary intact and avoids the
-//! data-loss footgun documented in `docs/HANDOFF.md` session 33.
+//! data-loss footgun a second persistence root would reintroduce: a
+//! store that fails to deserialize silently defaults to empty, and the
+//! next mutation writes that emptiness over the user's real config.
 //!
 //! ## C# → Rust field mapping
 //!

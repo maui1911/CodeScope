@@ -129,7 +129,7 @@ vendor/          Vendored upstream crates
 docs/
   DESIGN.md      Design tokens
   DECISIONS.md   ADRs
-  HANDOFF.md     Rolling cursor between working sessions
+  RELEASE-VALIDATION.md  Manual checklist before announcing a tag
   MIGRATION-csharp-to-rust.md  Historical note on the 2026-05-14 cutover
   screenshots/   README imagery
 Cargo.toml       Workspace root + the `codescope` binary crate
@@ -146,7 +146,7 @@ Cargo.toml       Workspace root + the `codescope` binary crate
 
 Pre-1.0. The core session / worktree / PR workflows are stable and used daily. The C# implementation was retired in `v0.3.0`; see `docs/MIGRATION-csharp-to-rust.md`.
 
-See `docs/HANDOFF.md` for the live status cursor and `docs/DECISIONS.md` for the architectural record.
+See `docs/DECISIONS.md` for the architectural record, and the [merged pull requests](https://github.com/maui1911/CodeScope/pulls?q=is%3Apr+is%3Amerged) for what changed and why.
 
 ### Code health
 

@@ -36,7 +36,14 @@ intentional deviations in `docs/DECISIONS.md`.
 ## Style
 
 - Idiomatic Rust 2024 (workspace pins `edition = "2024"` — needs
-  Rust 1.85+). Run `cargo fmt` before committing
+  Rust 1.85+)
+- **Do not run `cargo fmt`.** The local rustfmt (1.9.0-stable)
+  disagrees with whatever formatted this tree and rewrites all 59
+  files — and it does that even when given a single file argument
+  (`cargo fmt -- src/app.rs`). There is no CI fmt gate, so the only
+  cost of skipping it is nothing; the cost of running it is a
+  thousand-line diff nobody asked for. Hand-format the hunks you
+  touch to match their surroundings
 - `cargo clippy --workspace --all-targets` clean on changed files
 - Prefer `?` over `match`/`unwrap` for error propagation; reserve
   `unwrap` for proven invariants with a one-line `// SAFETY:` style
@@ -96,10 +103,11 @@ dev-mode separation keeps working.
 
 ## Workflow
 
-- **First, on any fresh session, read `docs/HANDOFF.md`** — it holds
-  the cursor (what we were doing), current build/test status, roadmap
-  state, open rough edges, and suggested next entry points. It is
-  updated at the end of each session.
+- To pick up where the last session left off, read `git log` and the
+  merged PR bodies — they carry the reasoning, the verification, and
+  the review round. (There used to be a `docs/HANDOFF.md` narrating
+  every session; it grew to 3600 lines, nobody read it, and updating
+  it cost a PR per session. Removed 2026-08-16 — `git log` has it.)
 - Read `docs/DECISIONS.md` before proposing architecture changes
 - Write the test first for `codescope-core` services (TDD for logic,
   not UI). Tests live next to the code they cover, behind
@@ -108,7 +116,8 @@ dev-mode separation keeps working.
 - Never commit new work directly to `main` — always create a feature
   branch and open a PR (even for small changes). `main` is protected;
   pushing to it bypasses review
-- At the **end** of every working session, update `docs/HANDOFF.md`
-  with the new cursor, commit SHAs, and anything a fresh session would
-  need
+- Write the PR body as the durable record: what broke, the root cause,
+  how it was verified, and anything left unproven. That body is what a
+  future session reads instead of a handoff file, so it has to stand on
+  its own
 - Never leave `TODO` / `FIXME` without a linked issue number
