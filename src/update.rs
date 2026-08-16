@@ -199,8 +199,8 @@ const DOWNLOAD_ATTEMPTS: u32 = 3;
 /// (`%LOCALAPPDATA%\CodeScope\` on Windows). Update failures used to
 /// surface only in a transient toast and a temp dir that
 /// `tempfile::tempdir()` deletes on return — two user-reported
-/// failures in a row came back with "no logs" (HANDOFF sessions
-/// 53/54). Best-effort: a failure to log must never fail the update.
+/// failures in a row came back with "no logs". Best-effort: a failure
+/// to log must never fail the update.
 fn log_update(msg: &str) {
     use std::io::Write as _;
     // Detect once and make sure the state dir exists — `AppPaths` is
