@@ -1,10 +1,9 @@
 # Release validation checklist
 
 Run this before announcing any `vX.Y.Z` tag. The auto-update path
-was previously responsible for three release-cycle crashes (rc.10 /
-rc.12 / rc.14, which is what retired Velopack in #244); the unit tests alone never
-caught the crashes that mattered, so this manual end-to-end pass is
-mandatory.
+crashed three release cycles in a row — rc.10, rc.12 and rc.14 — and
+that is what retired Velopack in #244. The unit tests caught none of
+them, so this manual end-to-end pass is mandatory.
 
 ## Per release
 
