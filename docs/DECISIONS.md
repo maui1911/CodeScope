@@ -602,7 +602,9 @@ record:
   session 33 after PR #56 invented a non-existent UX) is retired
   together with the C# code. Future deviations from the v0.2.6
   behavior are normal product work, not parity violations.
-* `docs/PARITY-AUDIT.md` is closed-stamped historical.
+* `docs/PARITY-AUDIT.md` was closed-stamped historical, then deleted
+  on 2026-08-16 once every gap it listed had shipped — it survives in
+  git history.
 * The last commit where the C# source tree builds is tagged
   `legacy/v0.2.6-final` on the cutover-1 merge commit. The C# code is
   fully removed in cutover-2; the workspace is flattened and the
