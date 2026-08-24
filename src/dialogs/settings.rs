@@ -191,13 +191,17 @@ impl SettingsDialogState {
 
     /// Common post-edit bookkeeping: clear a stale validation error
     /// and, when the font popup's filter just changed, snap its
-    /// highlight back to the first match so Enter always picks a
-    /// visible row.
+    /// highlight to the first *match* (visible index 1 — index 0 is
+    /// the pinned "(built-in default)" row) so typing + Enter picks
+    /// what the user filtered for, not the default. An emptied filter
+    /// falls back to the pinned row.
     fn after_edit(&mut self, changed: bool) {
         if changed {
             self.error = None;
             if self.font_popup_open {
-                self.font_selected_idx = 0;
+                let has_query = !self.font_query.text().trim().is_empty();
+                self.font_selected_idx =
+                    if has_query && !self.filtered_fonts().is_empty() { 1 } else { 0 };
             }
         }
     }
@@ -251,7 +255,9 @@ impl SettingsDialogState {
 /// the currently-configured family is prepended when the OS doesn't
 /// report it so the active selection is always present and pickable
 /// again after browsing. An empty `current` (= "use the built-in
-/// default chain") adds nothing. Pulled out as a free function so
+/// default chain") adds nothing — the popup offers the default via a
+/// pinned "(built-in default)" row rendered above this list, never as
+/// an empty-string entry inside it. Pulled out as a free function so
 /// the unit tests can exercise it without a gpui `FocusHandle`.
 fn build_font_options(installed: Vec<String>, current: &str) -> Vec<String> {
     let mut options = installed;
@@ -263,9 +269,13 @@ fn build_font_options(installed: Vec<String>, current: &str) -> Vec<String> {
 
 /// Case-insensitive substring filter over the font option list.
 /// Mirrors `new_worktree::filter_branches` — an empty / whitespace
-/// query matches everything. Free function for the same
-/// testability-without-FocusHandle reason as [`build_font_options`].
-pub fn filter_fonts<'a>(options: &'a [String], query: &str) -> Vec<&'a String> {
+/// query matches everything. The pinned "(built-in default)" row is
+/// not part of the option list; the popup renders it above these
+/// matches unconditionally so the user can always clear back to the
+/// default without emptying the filter first. Free function for the
+/// same testability-without-FocusHandle reason as
+/// [`build_font_options`].
+fn filter_fonts<'a>(options: &'a [String], query: &str) -> Vec<&'a String> {
     let q = query.trim().to_lowercase();
     options
         .iter()
@@ -489,8 +499,9 @@ impl AppShell {
 
     /// Open / close the FONT FAMILY dropdown. Opening clears the
     /// filter and highlights the currently-configured family so
-    /// Enter with no typing is a no-op-shaped confirm. Mirrors
-    /// `Sidebar::toggle_base_popup`.
+    /// Enter with no typing is a no-op-shaped confirm — the pinned
+    /// "(built-in default)" row sits at visible index 0, so option
+    /// rows are offset by one. Mirrors `Sidebar::toggle_base_popup`.
     pub fn settings_toggle_font_popup(&mut self, cx: &mut Context<Self>) {
         if let Some(state) = self.settings_dialog.as_mut() {
             state.font_popup_open = !state.font_popup_open;
@@ -500,14 +511,17 @@ impl AppShell {
                     .font_options
                     .iter()
                     .position(|name| *name == state.draft.font.family)
+                    .map(|pos| pos + 1)
                     .unwrap_or(0);
             }
             cx.notify();
         }
     }
 
-    /// Pick a font family and close the popup. The choice lands in
-    /// the draft only — Save persists it, Cancel discards it.
+    /// Pick a font family and close the popup. An empty string means
+    /// "use the built-in default chain" (the pinned top row). The
+    /// choice lands in the draft only — Save persists it, Cancel
+    /// discards it.
     pub fn settings_select_font(&mut self, family: String, cx: &mut Context<Self>) {
         if let Some(state) = self.settings_dialog.as_mut() {
             state.draft.font.family = family;
@@ -518,29 +532,31 @@ impl AppShell {
         }
     }
 
-    /// Move the font popup highlight up/down, clamped to the
-    /// filtered list.
+    /// Move the font popup highlight up/down, clamped to the visible
+    /// rows (the pinned "(built-in default)" row at index 0 plus the
+    /// filtered options).
     pub fn settings_move_font_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
         let Some(state) = self.settings_dialog.as_mut() else { return };
-        let len = state.filtered_fonts().len();
-        if len == 0 {
-            return;
-        }
-        let next = (state.font_selected_idx as isize + delta).clamp(0, len as isize - 1);
+        let max = state.filtered_fonts().len() as isize; // pinned row makes len + 1 rows
+        let next = (state.font_selected_idx as isize + delta).clamp(0, max);
         state.font_selected_idx = next as usize;
         cx.notify();
     }
 
     /// Resolve the highlighted popup row into a selection (Enter).
+    /// Index 0 is the pinned "(built-in default)" row → empty family;
+    /// indices 1.. point into the filtered list.
     pub fn settings_confirm_font_selection(&mut self, cx: &mut Context<Self>) {
         let Some(state) = self.settings_dialog.as_mut() else { return };
         if !state.font_popup_open {
             return;
         }
-        let chosen = state
-            .filtered_fonts()
-            .get(state.font_selected_idx)
-            .map(|name| (*name).clone());
+        let idx = state.font_selected_idx;
+        let chosen = if idx == 0 {
+            Some(String::new())
+        } else {
+            state.filtered_fonts().get(idx - 1).map(|name| (*name).clone())
+        };
         if let Some(family) = chosen {
             self.settings_select_font(family, cx);
         }
@@ -1099,9 +1115,42 @@ impl AppShell {
             ));
 
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        // Index 0: pinned "(built-in default)" row — always visible
+        // regardless of filter (the C#-era `(HEAD)` pin idiom from
+        // the base-branch popup) so the user can clear back to the
+        // default chain without emptying the query first. Selecting
+        // it stores an empty family.
+        {
+            let is_current = current_family.is_empty();
+            let active = selected_idx == 0;
+            rows.push(
+                div()
+                    .id("settings-font-row-default")
+                    .h(px(28.0))
+                    .px_3()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(12.0))
+                    .text_color(if is_current { accent } else { ink_muted })
+                    .bg(if active { frost } else { gpui::transparent_black() })
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.settings_select_font(String::new(), cx);
+                        }),
+                    )
+                    .child(div().flex_grow().truncate().child("(built-in default)"))
+                    .into_any_element(),
+            );
+        }
         for (idx, name) in filtered.iter().enumerate() {
             let is_current = **name == current_family;
-            let active = idx == selected_idx;
+            // Visible index is offset by the pinned row above.
+            let active = idx + 1 == selected_idx;
             let bg = if active { frost } else { gpui::transparent_black() };
             let name_for_handler = (*name).clone();
             let label: SharedString = (*name).clone().into();
@@ -1141,7 +1190,7 @@ impl AppShell {
                     .into_any_element(),
             );
         }
-        if rows.is_empty() {
+        if filtered.is_empty() {
             rows.push(
                 div()
                     .px_3()
@@ -1196,7 +1245,32 @@ impl AppShell {
         let position = trigger
             .map(|b| point(b.left(), b.bottom() + px(4.0)))
             .unwrap_or_else(|| point(px(((viewport_w - popup_w) / 2.0).max(8.0)), px(80.0)));
-        deferred(
+
+        // Transparent full-window click-catcher between the dialog
+        // backdrop (priority 10) and the popup (priority 20). A click
+        // outside the popup lands here and just dismisses the popup —
+        // without it the click would fall through to the backdrop and
+        // cancel the whole dialog, discarding the user's edits. The
+        // popup's own mouse-down handler stops propagation, so clicks
+        // inside it never reach this layer.
+        let click_catcher = deferred(
+            anchored().position(point(px(0.0), px(0.0))).child(
+                div()
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.settings_toggle_font_popup(cx);
+                        }),
+                    ),
+            ),
+        )
+        .with_priority(15)
+        .into_any_element();
+
+        let popup_layer = deferred(
             anchored()
                 .position(position)
                 // Keep the popup inside the window when the dialog
@@ -1205,7 +1279,11 @@ impl AppShell {
                 .child(popup),
         )
         .with_priority(20)
-        .into_any_element()
+        .into_any_element();
+
+        div()
+            .children([click_catcher, popup_layer])
+            .into_any_element()
     }
 }
 
