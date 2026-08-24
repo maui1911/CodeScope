@@ -44,17 +44,25 @@ use crate::theme;
 pub enum DialogMode {
     Existing,
     Clone,
+    /// Save a command line (typically `ssh host -t claude`) as a
+    /// sidebar project with no local path — see
+    /// [`codescope_core::ProjectKind::RemoteShell`] (#323). Not in
+    /// the C# build.
+    RemoteShell,
 }
 
 /// Which input field the dialog routes typed characters into. The
 /// "Existing folder" path field is read-only (Browse-only) and is
 /// therefore not represented here. Mirrors the focus semantics of the
-/// C# `Url`/`Parent`/`Name` text boxes.
+/// C# `Url`/`Parent`/`Name` text boxes; `RemoteName` / `RemoteCommand`
+/// belong to the remote-shell mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DialogField {
     Url,
     Parent,
     Name,
+    RemoteName,
+    RemoteCommand,
 }
 
 /// Live state of an open dialog. Created by
@@ -78,6 +86,11 @@ pub struct NewProjectDialogState {
     /// folder name. Once they edit it, BRANCH→NAME re-derive stops.
     /// Mirrors the C# `NameBox.Tag == NameBox.Text` heuristic.
     pub name_auto: bool,
+    /// Remote-shell-mode fields: the sidebar label and the command
+    /// line to run. Both are plain text; the command is handed to
+    /// `pwsh -Command "& { … }"` verbatim at spawn time.
+    pub remote_name: TextField,
+    pub remote_command: TextField,
     /// `true` while a `git clone` task is in flight.
     pub busy: bool,
     /// "Cloning <name>…" caption while busy.
@@ -98,6 +111,8 @@ impl NewProjectDialogState {
             parent: TextField::with_text(default_clone_parent),
             name: TextField::new(),
             name_auto: true,
+            remote_name: TextField::new(),
+            remote_command: TextField::new(),
             busy: false,
             busy_text: None,
             error: None,
@@ -130,6 +145,10 @@ impl NewProjectDialogState {
                 }
                 !name.is_empty() && !contains_invalid_filename_chars(name)
             }
+            DialogMode::RemoteShell => {
+                !self.remote_name.text().trim().is_empty()
+                    && codescope_core::is_valid_remote_shell_command(self.remote_command.text())
+            }
         }
     }
 
@@ -144,6 +163,8 @@ impl NewProjectDialogState {
             DialogField::Url => &mut self.url,
             DialogField::Parent => &mut self.parent,
             DialogField::Name => &mut self.name,
+            DialogField::RemoteName => &mut self.remote_name,
+            DialogField::RemoteCommand => &mut self.remote_command,
         }
     }
 
@@ -162,11 +183,24 @@ impl NewProjectDialogState {
             // `IsReadOnly="True"` on the path TextBox.
             return None;
         }
-        Some(match self.focused_field {
-            DialogField::Url => &mut self.url,
-            DialogField::Parent => &mut self.parent,
-            DialogField::Name => &mut self.name,
-        })
+        // A field that doesn't belong to the active mode can't be
+        // typed into — `set_new_project_mode` re-seats focus on every
+        // switch, so this only guards against a stale enum value.
+        let field = self.focused_field;
+        let belongs = match self.mode {
+            DialogMode::Existing => false,
+            DialogMode::Clone => matches!(
+                field,
+                DialogField::Url | DialogField::Parent | DialogField::Name
+            ),
+            DialogMode::RemoteShell => {
+                matches!(field, DialogField::RemoteName | DialogField::RemoteCommand)
+            }
+        };
+        if !belongs {
+            return None;
+        }
+        Some(self.field_mut_by(field))
     }
 
     /// Insert a typed character at the focused field's caret. Honours
@@ -189,6 +223,12 @@ impl NewProjectDialogState {
             DialogField::Name => {
                 self.name_auto = false;
                 self.name.insert_char(ch);
+            }
+            DialogField::RemoteName => {
+                self.remote_name.insert_char(ch);
+            }
+            DialogField::RemoteCommand => {
+                self.remote_command.insert_char(ch);
             }
         }
         self.error = None;
@@ -218,6 +258,8 @@ impl NewProjectDialogState {
                 }
                 c
             }
+            DialogField::RemoteName => self.remote_name.insert_str(s),
+            DialogField::RemoteCommand => self.remote_command.insert_str(s),
         };
         if changed {
             self.error = None;
@@ -246,6 +288,8 @@ impl NewProjectDialogState {
                 }
                 c
             }
+            DialogField::RemoteName => self.remote_name.backspace(),
+            DialogField::RemoteCommand => self.remote_command.backspace(),
         };
         if changed {
             self.error = None;
@@ -274,6 +318,8 @@ impl NewProjectDialogState {
                 }
                 c
             }
+            DialogField::RemoteName => self.remote_name.delete_forward(),
+            DialogField::RemoteCommand => self.remote_command.delete_forward(),
         };
         if changed {
             self.error = None;
@@ -457,6 +503,7 @@ impl Sidebar {
             state.focused_field = match mode {
                 DialogMode::Existing => DialogField::Url,
                 DialogMode::Clone => DialogField::Url,
+                DialogMode::RemoteShell => DialogField::RemoteName,
             };
             state.error = None;
             cx.notify();
@@ -621,6 +668,28 @@ impl Sidebar {
                 })
                 .detach();
             }
+            DialogMode::RemoteShell => {
+                let name = state.remote_name.text().trim().to_string();
+                let command = state.remote_command.text().trim().to_string();
+                // Same name twice is almost certainly a mistake (the
+                // sidebar would show two identical rows); surface it
+                // inline like the duplicate-path guard above rather
+                // than silently adding a twin.
+                let duplicate = self
+                    .projects()
+                    .projects
+                    .iter()
+                    .any(|p| p.is_remote_shell() && p.name.eq_ignore_ascii_case(&name));
+                if duplicate {
+                    if let Some(state) = self.new_project_dialog_mut() {
+                        state.error = Some(format!("Remote shell already added: {name}"));
+                    }
+                    cx.notify();
+                    return;
+                }
+                self.cancel_new_project_dialog(cx);
+                self.add_remote_shell_project(name, command, cx);
+            }
         }
     }
 
@@ -679,7 +748,7 @@ impl Sidebar {
                 div()
                     .text_size(px(12.0))
                     .text_color(ink_muted)
-                    .child("Bring a folder in, or clone a repo straight in."),
+                    .child("Bring a folder in, clone a repo, or save a remote shell command."),
             );
 
         // Segmented mode toggle.
@@ -722,7 +791,8 @@ impl Sidebar {
                     .bg(canvas)
                     .rounded(px(6.0))
                     .child(seg("np-mode-existing", "Existing folder", DialogMode::Existing))
-                    .child(seg("np-mode-clone", "Clone from URL", DialogMode::Clone)),
+                    .child(seg("np-mode-clone", "Clone from URL", DialogMode::Clone))
+                    .child(seg("np-mode-remote", "Remote shell", DialogMode::RemoteShell)),
             );
 
         // Reusable label + chrome.
@@ -797,7 +867,7 @@ impl Sidebar {
                        placeholder: &'static str,
                        this_field: DialogField|
          -> gpui::Stateful<gpui::Div> {
-            let is_focused = state.focused_field == this_field && mode == DialogMode::Clone;
+            let is_focused = state.focused_field == this_field && mode != DialogMode::Existing;
             let mut style = focused_caret_style(theme, blink_phase);
             // Suppress the caret entirely on unfocused fields; only
             // the field receiving keystrokes should advertise itself
@@ -886,6 +956,39 @@ impl Sidebar {
                     .child(name_field)
                     .into_any_element()
             }
+            DialogMode::RemoteShell => {
+                let name_field = textbox(
+                    "np-remote-name",
+                    &state.remote_name,
+                    "devbox",
+                    DialogField::RemoteName,
+                );
+                let command_field = textbox(
+                    "np-remote-command",
+                    &state.remote_command,
+                    "ssh user@host -t claude",
+                    DialogField::RemoteCommand,
+                );
+                div()
+                    .px_5()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(field_label("NAME"))
+                    .child(name_field)
+                    .child(field_label("COMMAND"))
+                    .child(command_field)
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(ink_ghost)
+                            .child(
+                                "Runs in a fresh local shell. No git, worktrees or agent \
+                                 status for this project — just the tab.",
+                            ),
+                    )
+                    .into_any_element()
+            }
         };
 
         let error_block = error_msg.map(|msg| {
@@ -923,6 +1026,11 @@ impl Sidebar {
                         state.name.text().trim().to_string()
                     };
                     format!("git clone · {url} → {name}").into()
+                }
+                DialogMode::RemoteShell => {
+                    let command = state.remote_command.text().trim();
+                    let command = if command.is_empty() { "…" } else { command };
+                    format!("remote shell · {command}").into()
                 }
             }
         };
@@ -1105,13 +1213,15 @@ fn handle_key_down(
             return;
         }
         "tab" => {
-            if mode == DialogMode::Clone
+            if mode != DialogMode::Existing
                 && let Some(state) = sidebar.new_project_dialog_mut()
             {
                 state.focused_field = match state.focused_field {
                     DialogField::Url => DialogField::Parent,
                     DialogField::Parent => DialogField::Name,
                     DialogField::Name => DialogField::Url,
+                    DialogField::RemoteName => DialogField::RemoteCommand,
+                    DialogField::RemoteCommand => DialogField::RemoteName,
                 };
                 cx.notify();
             }

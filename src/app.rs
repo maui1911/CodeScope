@@ -220,8 +220,25 @@ fn monitor_changed(prev: &WindowPlacement, now: &WindowPlacement) -> bool {
 const MONITOR_CHANGE_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// One tab = one terminal session.
+/// Spawn parameters for a tab that belongs to a
+/// [`codescope_core::ProjectKind::RemoteShell`] project (#323): no
+/// working directory, no agent — just `command` run through
+/// `pwsh -NoExit -Command "& { … }"`. The session row is persisted
+/// under `project_id` so the tab rehydrates on the next launch.
+#[derive(Debug, Clone)]
+struct RemoteShellLaunch {
+    project_id: String,
+    command: String,
+}
+
 struct Tab {
     id: u64,
+    /// `Some(project id)` when this tab was spawned for a remote-shell
+    /// project. Used to focus-or-open from the sidebar row, to light
+    /// the row's live indicator, and to hard-remove (not soft-close)
+    /// the session row on close — there is nothing to resume, so a
+    /// history entry would be dead weight.
+    remote_project_id: Option<String>,
     /// The CodeScope session id — the stable identifier persisted in
     /// `projects.json` under the owning project's `sessions[]`.
     /// Allocated at spawn via [`SessionManager::open`] (or restored
@@ -1211,9 +1228,13 @@ impl AppShell {
                         effective_auto_type,
                         effective_agent_id,
                         None,
+                        None,
                         window,
                         cx,
                     );
+                }
+                SidebarEvent::OpenRemoteShell { project_id, force_new } => {
+                    this.open_remote_shell(project_id, *force_new, window, cx);
                 }
                 SidebarEvent::Toast { kind, title, detail } => {
                     let kind = match kind {
@@ -2439,6 +2460,9 @@ impl AppShell {
             agent_session_id: Option<String>,
             project_name: String,
             branch: Option<String>,
+            /// `Some` for a remote-shell session (#323) — carries the
+            /// project id + command so the tab respawns without a cwd.
+            remote: Option<RemoteShellLaunch>,
         }
         let entries: Vec<RehydrateEntry> = self
             .projects
@@ -2446,6 +2470,11 @@ impl AppShell {
             .iter()
             .flat_map(|p| {
                 let project_name = p.name.clone();
+                // Resolve the remote-shell launch once per project —
+                // cloned into each of its live sessions below. `None`
+                // for local projects.
+                let remote_command = p.remote_shell_command().map(str::to_owned);
+                let project_id = p.id.clone();
                 p.sessions.iter().filter_map(move |s| {
                     if s.closed_at.is_some() {
                         return None;
@@ -2456,6 +2485,10 @@ impl AppShell {
                             .find(|w| Some(&w.id) == s.worktree_id.as_ref())
                             .and_then(|w| w.branch.clone())
                     });
+                    let remote = remote_command.as_ref().map(|command| RemoteShellLaunch {
+                        project_id: project_id.clone(),
+                        command: command.clone(),
+                    });
                     Some(RehydrateEntry {
                         session_id: s.id.clone(),
                         worktree_path: s.worktree_path.clone(),
@@ -2463,6 +2496,7 @@ impl AppShell {
                         agent_session_id: s.agent_session_id.clone(),
                         project_name: project_name.clone(),
                         branch,
+                        remote,
                     })
                 })
             })
@@ -2508,6 +2542,35 @@ impl AppShell {
         self.suppress_layout_save = true;
 
         for entry in entries {
+            // Remote-shell sessions (#323) have no path on disk to
+            // check — they respawn by running their command. Handle
+            // them up front and skip the path-shaped rest of the loop.
+            if let Some(remote) = entry.remote.clone() {
+                let placement = placements.get(&entry.session_id);
+                let group_idx = placement
+                    .map(|p| p.group_index)
+                    .unwrap_or(0)
+                    .min(group_count.saturating_sub(1));
+                let active_in_group = placement.map(|p| p.active_in_group).unwrap_or(false);
+                self.focused_group = group_idx;
+                let title = SharedString::from(entry.project_name.clone());
+                self.spawn_tab_in(
+                    None,
+                    Some(title),
+                    None,
+                    None,
+                    Some(entry.session_id.clone()),
+                    Some(remote),
+                    window,
+                    cx,
+                );
+                spawned_any = true;
+                if active_in_group {
+                    let new_idx = self.groups[group_idx].tabs.len() - 1;
+                    active_by_group[group_idx] = Some(new_idx);
+                }
+                continue;
+            }
             let path = std::path::PathBuf::from(&entry.worktree_path);
             if !path.exists() {
                 eprintln!(
@@ -2614,6 +2677,7 @@ impl AppShell {
                 // through the `pending_backfills` flush below.
                 resolved_agent_id.clone().map(SharedString::from),
                 Some(entry.session_id.clone()),
+                entry.remote.clone(),
                 window,
                 cx,
             );
@@ -2841,11 +2905,45 @@ impl AppShell {
         working_directory: Option<&std::path::Path>,
         persist_agent_id: Option<String>,
         restore_session_id: Option<String>,
+        // `Some(project id)` for remote-shell tabs (#323): the row is
+        // persisted under that project with an empty `worktree_path`
+        // — there is no path to route by.
+        remote_project_id: Option<&str>,
     ) -> String {
         if let Some(id) = restore_session_id {
             return id;
         }
         let new_id = uuid::Uuid::new_v4().to_string();
+        if let Some(project_id) = remote_project_id {
+            match ProjectsConfig::load(&self.paths) {
+                Ok(cfg) => self.projects = cfg,
+                Err(err) => {
+                    eprintln!("warning: failed to reload projects.json before SessionManager::open: {err:#}");
+                }
+            }
+            let session = Session {
+                id: new_id.clone(),
+                worktree_path: String::new(),
+                branch: None,
+                agent_id: None,
+                display_name: None,
+                worktree_id: None,
+                last_opened: None,
+                agent_session_id: None,
+                closed_at: None,
+            };
+            match SessionManager::open(&mut self.projects, project_id, session, &now_iso8601()) {
+                Ok(_) => {
+                    if let Err(err) = self.projects.save(&self.paths) {
+                        eprintln!("warning: failed to persist session open: {err:#}");
+                    }
+                }
+                Err(err) => {
+                    eprintln!("warning: SessionManager::open rejected new session: {err:#}");
+                }
+            }
+            return new_id;
+        }
         let Some(wd) = working_directory else {
             return new_id;
         };
@@ -2968,6 +3066,36 @@ impl AppShell {
                 // silently — mirrors C#'s "session id not found is
                 // ok" branch in `CloseTabAsync` where `storedForTab`
                 // is null.
+            }
+        }
+    }
+
+    /// Permanently drop `session_id` from `projects.json` and mirror
+    /// the change into the sidebar. Used by `close_tab` for
+    /// remote-shell tabs (#323), which have no resumable transcript so
+    /// keeping a closed-history row would be dead weight. Same
+    /// reload-mutate-save-mirror discipline as
+    /// [`Self::soft_close_session`]; a missing id is a silent no-op.
+    fn hard_remove_session(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        match ProjectsConfig::load(&self.paths) {
+            Ok(cfg) => self.projects = cfg,
+            Err(err) => {
+                eprintln!("warning: failed to reload projects.json before hard_remove: {err:#}");
+            }
+        }
+        match SessionManager::hard_remove(&mut self.projects, session_id) {
+            Ok(()) => {
+                if let Err(err) = self.projects.save(&self.paths) {
+                    eprintln!("warning: failed to persist session hard-remove: {err:#}");
+                }
+                let projects_for_sidebar = self.projects.clone();
+                self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.replace_projects(projects_for_sidebar);
+                    cx.notify();
+                });
+            }
+            Err(_) => {
+                // Row already gone — nothing to do.
             }
         }
     }
@@ -3255,6 +3383,7 @@ impl AppShell {
             auto_type,
             resolved_agent_id.map(SharedString::from),
             Some(restored.id),
+            None,
             window,
             cx,
         );
@@ -3473,6 +3602,57 @@ impl AppShell {
     /// to a plain shell when the active project context is missing
     /// (no folder for the agent to operate in) or when no default
     /// agent is configured.
+    /// Open (or focus) a tab for a remote-shell project (#323). Looks
+    /// the project up by id, resolves its saved command, and spawns a
+    /// tab running it. `force_new: false` focuses an existing live tab
+    /// for the same project instead of stacking a duplicate.
+    fn open_remote_shell(
+        &mut self,
+        project_id: &str,
+        force_new: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !force_new {
+            // Tier 1: focus an already-open tab for this project.
+            for (g_idx, group) in self.groups.iter().enumerate() {
+                for (t_idx, tab) in group.tabs.iter().enumerate() {
+                    if tab.remote_project_id.as_deref() == Some(project_id) {
+                        self.activate_tab(g_idx, t_idx, window, cx);
+                        return;
+                    }
+                }
+            }
+        }
+        // Resolve the command from the sidebar's live project list.
+        let launch = self
+            .sidebar
+            .read(cx)
+            .projects()
+            .projects
+            .iter()
+            .find(|p| p.id == project_id)
+            .and_then(|p| {
+                p.remote_shell_command().map(|command| RemoteShellLaunch {
+                    project_id: p.id.clone(),
+                    command: command.to_owned(),
+                })
+            });
+        let Some(launch) = launch else {
+            eprintln!("warning: OpenRemoteShell for unknown / non-remote project {project_id}");
+            return;
+        };
+        let title = self
+            .sidebar
+            .read(cx)
+            .projects()
+            .projects
+            .iter()
+            .find(|p| p.id == project_id)
+            .map(|p| SharedString::from(p.name.clone()));
+        self.spawn_tab_in(None, title, None, None, None, Some(launch), window, cx);
+    }
+
     fn spawn_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Only auto-type the default agent when we actually have a
         // working directory to land the agent in — a plain shell
@@ -3486,9 +3666,14 @@ impl AppShell {
         } else {
             (None, None)
         };
-        self.spawn_tab_in(None, None, auto_type, agent_id, None, window, cx);
+        self.spawn_tab_in(None, None, auto_type, agent_id, None, None, window, cx);
     }
 
+    // Spawn parameters legitimately vary along many independent axes
+    // (cwd, title, agent auto-type, persisted agent id, restore id,
+    // remote launch); bundling them into a struct would only move the
+    // noise around. Local exception to the 7-arg lint.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_tab_in(
         &mut self,
         working_directory: Option<std::path::PathBuf>,
@@ -3519,6 +3704,11 @@ impl AppShell {
         // (sidebar click, dialog spawn, Ctrl+T) — those allocate a
         // fresh id and persist via `SessionManager::open`.
         restore_session_id: Option<String>,
+        // `Some` for remote-shell projects (#323): overrides the shell
+        // argv (saved command, no `-WorkingDirectory`), suppresses the
+        // active-project cwd fallback, and routes session persistence
+        // by project id instead of by path. `None` everywhere else.
+        remote: Option<RemoteShellLaunch>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -3536,11 +3726,20 @@ impl AppShell {
             .read(cx)
             .active_project()
             .map(|p| (p.path.clone(), p.name.clone()));
-        let working_directory = working_directory.or_else(|| {
-            active_project
-                .as_ref()
-                .map(|(path, _)| std::path::PathBuf::from(path))
-        });
+        // A remote-shell tab never gets a cwd: the command carries its
+        // own (`ssh` lands wherever the remote login does), and the
+        // owning project's `path` is empty anyway. Local projects with
+        // an empty path (malformed rows) are likewise not a usable cwd.
+        let working_directory = if remote.is_some() {
+            None
+        } else {
+            working_directory.or_else(|| {
+                active_project
+                    .as_ref()
+                    .filter(|(path, _)| !path.is_empty())
+                    .map(|(path, _)| std::path::PathBuf::from(path))
+            })
+        };
 
         // Resolve the shell + argv. When `auto_type` is set and we
         // have a working directory to land in *and* the default pwsh
@@ -3561,6 +3760,16 @@ impl AppShell {
         // Plain shell tabs (`auto_type = None`) and agent tabs with no
         // working directory (no project context, nothing for the agent
         // to operate against) keep the previous bare-shell shape.
+        //
+        // Remote-shell tabs (#323) take the same `-Command` route with
+        // the saved command and no `-WorkingDirectory`; on the
+        // fallback paths the command is auto-typed exactly like an
+        // agent launch would be. `auto_type` is rebound so the
+        // fallback below has a single source for "what to type".
+        let auto_type: Option<SharedString> = match remote.as_ref() {
+            Some(r) => Some(SharedString::from(r.command.clone())),
+            None => auto_type,
+        };
         let mut agent_launched_via_args = false;
         let shell = std::env::var("CODESCOPE_SHELL")
             .ok()
@@ -3568,8 +3777,13 @@ impl AppShell {
             .or_else(|| {
                 if cfg!(windows) {
                     let program = "pwsh.exe".to_string();
-                    match (auto_type.as_ref(), working_directory.as_ref()) {
-                        (Some(cmd), Some(wd)) => {
+                    match (remote.as_ref(), auto_type.as_ref(), working_directory.as_ref()) {
+                        (Some(r), _, _) => {
+                            let args = codescope_core::build_remote_shell_args(&r.command);
+                            agent_launched_via_args = true;
+                            Some(Shell::new(program, args))
+                        }
+                        (None, Some(cmd), Some(wd)) => {
                             let args = codescope_core::build_agent_shell_args(
                                 cmd.as_ref(),
                                 &wd.to_string_lossy(),
@@ -3647,6 +3861,7 @@ impl AppShell {
             working_directory_for_tab.as_deref(),
             persist_agent_id.as_ref().map(|s| s.to_string()),
             restore_session_id,
+            remote.as_ref().map(|r| r.project_id.as_str()),
         );
         // Claim the persisted transcript from the first discovery tick
         // on the restore paths (launch rehydrate / reopen from history):
@@ -3678,9 +3893,16 @@ impl AppShell {
         // write to it without re-borrowing `self.groups` after the
         // await point.
         let terminal_for_autotype = terminal.clone();
-        let agent_id = codescope_core::agent_id_from_auto_type(
-            auto_type.as_ref().map(|s| s.as_ref()),
-        );
+        // Remote-shell tabs carry no agent: the command may well start
+        // `claude` on the far end, but its transcripts live on that
+        // machine, so there is nothing for discovery / telemetry to
+        // tail here. `None` keeps the tab out of the discovery poll.
+        let agent_id = if remote.is_some() {
+            None
+        } else {
+            codescope_core::agent_id_from_auto_type(auto_type.as_ref().map(|s| s.as_ref()))
+        };
+        let remote_project_id = remote.as_ref().map(|r| r.project_id.clone());
         // `auto_type` is kept on the Tab as metadata (agent
         // detection via `agent_id_from_auto_type` + layout persistence
         // so a restart can rebuild the command). On the Windows + pwsh
@@ -3692,6 +3914,7 @@ impl AppShell {
         // post-spawn auto-type below is still the launch mechanism.
         group.tabs.push(Tab {
             id,
+            remote_project_id,
             session_id,
             title,
             terminal,
@@ -3756,21 +3979,35 @@ impl AppShell {
         // holding `&mut group` across the call. The CodeScope session
         // id we soft-close in `SessionManager` is a separate value
         // (always present, allocated at spawn) — read it here too.
-        let (adopted, codescope_session_id) = self
+        let (adopted, codescope_session_id, is_remote) = self
             .groups
             .get(group_idx)
             .and_then(|g| g.tabs.get(tab_idx))
-            .map(|t| (t.adopted_session_id.clone(), t.session_id.clone()))
+            .map(|t| {
+                (
+                    t.adopted_session_id.clone(),
+                    t.session_id.clone(),
+                    t.remote_project_id.is_some(),
+                )
+            })
             .unwrap_or_default();
         if let Some(sid) = adopted {
             self.unregister_telemetry(&sid);
         }
-        // Mark the session row as closed in `projects.json` (mirrors
-        // C# `SessionStore.SoftCloseSessionAsync`). Best-effort —
-        // failure logs and proceeds; the in-memory tab state is the
-        // source of truth for what's on screen.
+        // Persist the close in `projects.json`. A remote-shell session
+        // (#323) has nothing to resume — its transcript lives on the
+        // far end — so a soft-close would only pile up dead history
+        // rows under the project. Hard-remove it instead; local
+        // sessions soft-close as before (mirrors C#
+        // `SessionStore.SoftCloseSessionAsync`). Best-effort — failure
+        // logs and proceeds; the in-memory tab state is the source of
+        // truth for what's on screen.
         if !codescope_session_id.is_empty() {
-            self.soft_close_session(&codescope_session_id, cx);
+            if is_remote {
+                self.hard_remove_session(&codescope_session_id, cx);
+            } else {
+                self.soft_close_session(&codescope_session_id, cx);
+            }
         }
         let Some(group) = self.groups.get_mut(group_idx) else { return };
         if tab_idx >= group.tabs.len() {
@@ -5676,8 +5913,18 @@ impl AppShell {
                     }
             }
         }
+        // Remote-shell projects (#323) have no path, so they can't ride
+        // the path-keyed `active` set — collect the project ids of live
+        // remote tabs separately for the sidebar's command-row dot.
+        let remote_live: HashSet<String> = self
+            .groups
+            .iter()
+            .flat_map(|g| g.tabs.iter())
+            .filter_map(|t| t.remote_project_id.clone())
+            .collect();
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.set_session_paths(busy, active, cx);
+            sidebar.set_remote_live_project_ids(remote_live, cx);
         });
     }
 
@@ -7928,6 +8175,7 @@ impl AppShell {
             effective_auto_type,
             effective_agent_id,
             None,
+            None,
             window,
             cx,
         );
@@ -7960,6 +8208,7 @@ impl AppShell {
             Some(title),
             Some(auto_type),
             Some(agent_id),
+            None,
             None,
             window,
             cx,

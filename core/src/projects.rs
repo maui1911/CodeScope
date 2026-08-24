@@ -25,7 +25,23 @@ use crate::paths::AppPaths;
 /// stay at the same version.
 pub const CURRENT_VERSION: u32 = 1;
 
-/// One git repository as it appears in the sidebar.
+/// What a sidebar project *is*. Almost everything is a `Local` git
+/// checkout; `RemoteShell` is the escape hatch for "I work on a box
+/// over SSH and just want a tab that runs `ssh host -t claude`" —
+/// no path, no worktrees, no git pollers, no telemetry (#323).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProjectKind {
+    /// A local directory (normally a git repository).
+    #[default]
+    Local,
+    /// A saved command line, run in a fresh local shell with no
+    /// working directory. The `Project::command` field carries it.
+    RemoteShell,
+}
+
+/// One git repository (or remote-shell command) as it appears in the
+/// sidebar.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Project {
@@ -33,8 +49,17 @@ pub struct Project {
     pub id: String,
     /// Display name in the sidebar. Usually the folder leaf.
     pub name: String,
-    /// Absolute path to the primary working tree.
+    /// Absolute path to the primary working tree. Empty for
+    /// [`ProjectKind::RemoteShell`] projects.
     pub path: String,
+    /// See [`ProjectKind`]. Missing in files written before #323 —
+    /// those are all `Local`.
+    #[serde(default)]
+    pub kind: ProjectKind,
+    /// Command line to run for [`ProjectKind::RemoteShell`] projects
+    /// (e.g. `ssh dev@box -t claude`). `None` for local projects.
+    #[serde(default)]
+    pub command: Option<String>,
     /// Default branch — used as the base when creating new worktrees.
     #[serde(default = "default_branch", alias = "default_branch")]
     pub default_branch: String,
@@ -88,6 +113,8 @@ impl Project {
             id: uuid::Uuid::new_v4().to_string(),
             name,
             path,
+            kind: ProjectKind::Local,
+            command: None,
             default_branch: default_branch(),
             worktree_root: None,
             default_agent_id: None,
@@ -96,6 +123,56 @@ impl Project {
         }
     }
 
+    /// Build a [`ProjectKind::RemoteShell`] project: a named command
+    /// line with no path and no worktrees. Both arguments are
+    /// trimmed; the caller is expected to have rejected empty values
+    /// already (see [`is_valid_remote_shell_command`]).
+    pub fn new_remote_shell(name: String, command: String) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.trim().to_string(),
+            path: String::new(),
+            kind: ProjectKind::RemoteShell,
+            command: Some(command.trim().to_string()),
+            default_branch: default_branch(),
+            worktree_root: None,
+            default_agent_id: None,
+            sessions: Vec::new(),
+            worktrees: Vec::new(),
+        }
+    }
+
+    /// `true` for [`ProjectKind::RemoteShell`] projects. Callers use
+    /// this to skip every path-shaped feature (git pollers, worktree
+    /// menus, reveal-in-explorer, telemetry) — the only thing such a
+    /// project can do is open a tab running its command.
+    pub fn is_remote_shell(&self) -> bool {
+        self.kind == ProjectKind::RemoteShell
+    }
+
+    /// The saved command for a remote-shell project, if it has one.
+    /// `None` for local projects and for malformed rows (kind says
+    /// remote but the command is missing or blank).
+    pub fn remote_shell_command(&self) -> Option<&str> {
+        if !self.is_remote_shell() {
+            return None;
+        }
+        self.command
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+    }
+}
+
+/// Validation for the Add-project dialog's remote-shell mode: the
+/// command must be non-blank and single-line. Anything else is the
+/// user's business — we hand the string to `pwsh -Command` verbatim.
+pub fn is_valid_remote_shell_command(command: &str) -> bool {
+    let trimmed = command.trim();
+    !trimmed.is_empty() && !trimmed.contains(['\n', '\r'])
+}
+
+impl Project {
     /// Effective worktree root for this project. Mirrors the C# rule
     /// in `NewWorktreeDialog`: explicit `worktree_root` wins, otherwise
     /// fall back to `"{path}.worktrees"` next to the primary tree.
@@ -121,6 +198,9 @@ impl Project {
     /// skipped — `Project::new` already seeded that row; the branch
     /// backfill is the `WorktreeStatusPoller`'s job, not ours.
     pub fn adopt_existing_worktrees(&mut self) {
+        if self.is_remote_shell() {
+            return;
+        }
         let Ok(found) = crate::git::list_worktrees(Path::new(&self.path)) else {
             return;
         };
@@ -449,6 +529,8 @@ mod tests {
                 path: "C:\\repos\\repo".into(),
                 default_branch: "main".into(),
                 worktree_root: Some("C:\\repos\\repo.worktrees".into()),
+                kind: ProjectKind::Local,
+                command: None,
                 default_agent_id: Some("claude-code".into()),
                 sessions: vec![Session {
                     id: "s1".into(),
@@ -587,6 +669,8 @@ mod tests {
                 path: String::new(),
                 default_branch: "main".into(),
                 worktree_root: None,
+                kind: ProjectKind::Local,
+                command: None,
                 default_agent_id: None,
                 sessions: Vec::new(),
                 worktrees: Vec::new(),
@@ -594,6 +678,111 @@ mod tests {
         };
         cfg.migrate();
         assert!(cfg.projects[0].worktrees.is_empty());
+    }
+
+    #[test]
+    fn remote_shell_project_has_no_path_and_no_worktrees() {
+        let p = Project::new_remote_shell("  devbox ".into(), " ssh dev@box -t claude ".into());
+        assert_eq!(p.name, "devbox");
+        assert_eq!(p.path, "");
+        assert_eq!(p.kind, ProjectKind::RemoteShell);
+        assert!(p.is_remote_shell());
+        assert_eq!(p.remote_shell_command(), Some("ssh dev@box -t claude"));
+        assert!(p.worktrees.is_empty());
+        assert!(p.sessions.is_empty());
+    }
+
+    #[test]
+    fn local_project_never_reports_a_remote_shell_command() {
+        let mut p = Project::new("C:/repo".into());
+        assert!(!p.is_remote_shell());
+        assert_eq!(p.remote_shell_command(), None);
+        // Even a stray `command` on a local row is ignored — `kind`
+        // is the discriminator, not the presence of the string.
+        p.command = Some("ssh somewhere".into());
+        assert_eq!(p.remote_shell_command(), None);
+    }
+
+    #[test]
+    fn remote_shell_with_blank_command_is_treated_as_missing() {
+        let mut p = Project::new_remote_shell("x".into(), "ssh box".into());
+        p.command = Some("   ".into());
+        assert_eq!(p.remote_shell_command(), None);
+        p.command = None;
+        assert_eq!(p.remote_shell_command(), None);
+    }
+
+    #[test]
+    fn remote_shell_command_validation() {
+        assert!(is_valid_remote_shell_command("ssh dev@box -t claude"));
+        assert!(is_valid_remote_shell_command("  wsl.exe -d Ubuntu  "));
+        assert!(!is_valid_remote_shell_command(""));
+        assert!(!is_valid_remote_shell_command("   \t "));
+        assert!(!is_valid_remote_shell_command("ssh box\nrm -rf /"));
+        assert!(!is_valid_remote_shell_command("ssh box\r\nclaude"));
+    }
+
+    #[test]
+    fn migrate_leaves_remote_shell_projects_without_a_primary() {
+        // A remote-shell project has an empty path, so `migrate`
+        // must not synthesise a primary worktree for it — that row
+        // would point at "" and the pollers would shell out to git
+        // against it every tick.
+        let mut cfg = ProjectsConfig {
+            version: CURRENT_VERSION,
+            agents: Vec::new(),
+            projects: vec![Project::new_remote_shell("box".into(), "ssh box".into())],
+        };
+        cfg.migrate();
+        assert!(cfg.projects[0].worktrees.is_empty());
+        assert!(cfg.projects[0].is_remote_shell());
+    }
+
+    #[test]
+    fn adopt_existing_worktrees_is_a_no_op_for_remote_shell() {
+        let mut p = Project::new_remote_shell("box".into(), "ssh box".into());
+        p.adopt_existing_worktrees();
+        assert!(p.worktrees.is_empty());
+    }
+
+    #[test]
+    fn remote_shell_project_round_trips_with_camelcase_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.json");
+        let cfg = ProjectsConfig {
+            version: CURRENT_VERSION,
+            agents: Vec::new(),
+            projects: vec![Project::new_remote_shell("box".into(), "ssh box -t claude".into())],
+        };
+        cfg.save_to(&path).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("\"kind\": \"remoteShell\""), "{written}");
+        assert!(written.contains("\"command\": \"ssh box -t claude\""), "{written}");
+
+        let loaded = ProjectsConfig::load_from(&path).unwrap();
+        let p = &loaded.projects[0];
+        assert_eq!(p.kind, ProjectKind::RemoteShell);
+        assert_eq!(p.remote_shell_command(), Some("ssh box -t claude"));
+        assert!(p.worktrees.is_empty(), "migrate must not add a primary");
+    }
+
+    #[test]
+    fn project_without_kind_field_loads_as_local() {
+        // Every projects.json written before #323 lacks `kind`; those
+        // rows are all local checkouts and must keep behaving as such.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"projects":[{"id":"p1","name":"Repo","path":"C:/repo"}]}"#,
+        )
+        .unwrap();
+        let loaded = ProjectsConfig::load_from(&path).unwrap();
+        let p = &loaded.projects[0];
+        assert_eq!(p.kind, ProjectKind::Local);
+        assert_eq!(p.command, None);
+        assert!(!p.is_remote_shell());
+        assert!(p.worktrees.iter().any(|wt| wt.is_primary), "migrate still seeds the primary");
     }
 
     #[test]
@@ -692,6 +881,8 @@ mod tests {
                 path: "C:\\repo".into(),
                 default_branch: "main".into(),
                 worktree_root: Some("C:\\repo.worktrees".into()),
+                kind: ProjectKind::Local,
+                command: None,
                 default_agent_id: Some("claude".into()),
                 sessions: vec![Session {
                     id: "s1".into(),

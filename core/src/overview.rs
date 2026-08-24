@@ -204,7 +204,7 @@ fn cmp_desc_with_none_last(a: Option<f64>, b: Option<f64>) -> std::cmp::Ordering
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::projects::{Project, Session, Worktree};
+    use crate::projects::{Project, ProjectKind, Session, Worktree};
 
     fn mk_project(id: &str, name: &str, sessions: Vec<Session>) -> Project {
         Project {
@@ -213,6 +213,8 @@ mod tests {
             path: format!("C:\\dev\\{name}"),
             default_branch: "main".into(),
             worktree_root: None,
+            kind: ProjectKind::Local,
+            command: None,
             default_agent_id: None,
             sessions,
             worktrees: vec![Worktree {

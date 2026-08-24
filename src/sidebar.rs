@@ -334,6 +334,13 @@ pub enum SidebarEvent {
     /// `MainViewModel.RefreshTabTitlesForWorktree` (driven by the
     /// `SessionStoreChange.WorktreeStatusUpdated` event).
     WorktreeBranchChanged { path: PathBuf, branch: String },
+    /// Open a tab for a [`codescope_core::ProjectKind::RemoteShell`]
+    /// project (#323). The host looks the project up by id, runs its
+    /// saved command in a fresh local shell with no working directory,
+    /// and persists the session under that project. `force_new: false`
+    /// is focus-or-open (double-click on the row); `true` always
+    /// spawns another tab (the context menu's "New session" row).
+    OpenRemoteShell { project_id: String, force_new: bool },
 }
 
 /// What `SidebarEvent::OpenConfirmDialog` is asking to do after the
@@ -510,6 +517,11 @@ pub struct Sidebar {
     /// to each worktree row. Mirrors the C# build's
     /// `WorktreePoller` cache.
     dirty_state: HashMap<String, bool>,
+    /// Ids of remote-shell projects (#323) that currently have at
+    /// least one live tab. Drives the accent rail + green dot on the
+    /// command row — the path-keyed `active_paths` set can't carry
+    /// them because those tabs have no working directory.
+    remote_live_project_ids: HashSet<String>,
     /// Rich per-worktree git status: branch, numstat diff, and
     /// ahead/behind counts. Keyed by absolute path, populated by
     /// `start_git_status_poll` (also every 5 s). `None` while the
@@ -657,6 +669,7 @@ impl Sidebar {
             dialog: None,
             new_project_dialog: None,
             dirty_state: HashMap::new(),
+            remote_live_project_ids: HashSet::new(),
             git_status: HashMap::new(),
             pr_urls: HashMap::new(),
             collapsed_projects,
@@ -759,6 +772,17 @@ impl Sidebar {
         }
         self.busy_paths = busy;
         self.active_paths = active;
+        cx.notify();
+    }
+
+    /// Set which remote-shell projects (#323) currently have a live
+    /// tab. No-op + no notify when unchanged, same as
+    /// [`Self::set_session_paths`].
+    pub fn set_remote_live_project_ids(&mut self, ids: HashSet<String>, cx: &mut Context<Self>) {
+        if ids == self.remote_live_project_ids {
+            return;
+        }
+        self.remote_live_project_ids = ids;
         cx.notify();
     }
 
@@ -866,10 +890,13 @@ impl Sidebar {
                             // only renders non-primary worktrees, but
                             // we still want the dirty-state cache
                             // populated for the project row's
-                            // worktree.
-                            std::iter::once(p.path.clone()).chain(
-                                p.worktrees.iter().map(|wt| wt.path.clone()),
-                            )
+                            // worktree. Remote-shell projects have an
+                            // empty path and no worktrees — the
+                            // `is_empty` filter keeps them out so we
+                            // never shell out to git against "".
+                            std::iter::once(p.path.clone())
+                                .chain(p.worktrees.iter().map(|wt| wt.path.clone()))
+                                .filter(|path| !path.is_empty())
                         })
                         .collect()
                 }) {
@@ -944,15 +971,16 @@ impl Sidebar {
                     break;
                 }
                 // Snapshot every worktree path into a de-duplicated set
-                // (same de-dup rationale as start_dirty_poll).
+                // (same de-dup + empty-path rationale as
+                // start_dirty_poll).
                 let paths: HashSet<String> = match this.update(cx, |this, _| {
                     this.projects
                         .projects
                         .iter()
                         .flat_map(|p| {
-                            std::iter::once(p.path.clone()).chain(
-                                p.worktrees.iter().map(|wt| wt.path.clone()),
-                            )
+                            std::iter::once(p.path.clone())
+                                .chain(p.worktrees.iter().map(|wt| wt.path.clone()))
+                                .filter(|path| !path.is_empty())
                         })
                         .collect()
                 }) {
@@ -1077,6 +1105,11 @@ impl Sidebar {
                         let mut seen: HashSet<String> = HashSet::new();
                         let mut out: Vec<(String, String)> = Vec::new();
                         for project in &this.projects.projects {
+                            // No path, no branch, no PR — skip
+                            // remote-shell projects outright.
+                            if project.is_remote_shell() {
+                                continue;
+                            }
                             let entries = std::iter::once((
                                 project.path.clone(),
                                 None::<String>,
@@ -2473,6 +2506,32 @@ impl Sidebar {
         self.save_layout();
         cx.notify();
     }
+
+    /// Add a [`codescope_core::ProjectKind::RemoteShell`] project
+    /// (#323). Same clone-then-save discipline as [`Self::add_project`];
+    /// no path dedup because there is no path — the dialog rejects a
+    /// duplicate *name* before it gets here.
+    pub fn add_remote_shell_project(
+        &mut self,
+        name: String,
+        command: String,
+        cx: &mut Context<Self>,
+    ) {
+        let project = Project::new_remote_shell(name, command);
+        let new_id = project.id.clone();
+        let mut next = self.projects.clone();
+        next.projects.push(project);
+        if let Err(err) = next.save(&self.paths) {
+            eprintln!("warning: failed to save projects.json: {err:#}");
+            return;
+        }
+        self.projects = next;
+        let new_idx = self.projects.projects.len() - 1;
+        self.selected = Some(new_idx);
+        self.layout.selected_project_id = Some(new_id);
+        self.save_layout();
+        cx.notify();
+    }
 }
 
 impl EventEmitter<SidebarEvent> for Sidebar {}
@@ -2878,6 +2937,86 @@ impl Render for Sidebar {
             // under an expanded project with empty `Worktrees`. Single
             // dim row, indented to align with the worktree children
             // that *would* live here.
+            // Remote-shell projects (#323) have no worktrees by
+            // construction. Instead of the "(no worktrees)" placeholder
+            // they get a single child row showing the saved command;
+            // double-click opens (or focuses) the tab, right-click
+            // opens the trimmed project menu. Same row geometry as a
+            // worktree row so the tree reads consistently.
+            let remote_command: Option<String> = self
+                .projects
+                .projects
+                .get(idx)
+                .and_then(|p| p.remote_shell_command().map(str::to_owned));
+            if let Some(command) = remote_command {
+                let frost_hover = theme::surface_elev(&theme);
+                let ink_hover = theme::ink(&theme);
+                let project_id_for_open = id.clone();
+                let project_idx_for_menu = idx;
+                let has_live_tab = self.remote_live_project_ids.contains(&id);
+                let rail_color = if has_live_tab {
+                    theme::accent(&theme)
+                } else {
+                    gpui::transparent_black()
+                };
+                let dot_color = if has_live_tab {
+                    theme::signal_ok()
+                } else {
+                    theme::ink_ghost(&theme)
+                };
+                let command_label: SharedString = command.into();
+                let remote_row = div()
+                    .id(("remote-shell", id_hash(&id)))
+                    .h(px(28.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .border_l_2()
+                    .border_color(rail_color)
+                    .pl(px(32.0))
+                    .pr_3()
+                    .gap_2()
+                    .text_color(theme::ink_muted(&theme))
+                    .text_size(px(11.5))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(frost_hover).text_color(ink_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            if is_double_click(event.click_count) {
+                                cx.emit(SidebarEvent::OpenRemoteShell {
+                                    project_id: project_id_for_open.clone(),
+                                    force_new: false,
+                                });
+                            } else {
+                                this.select(project_idx_for_menu, cx);
+                            }
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.open_project_menu(project_idx_for_menu, event.position, cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w(px(6.0))
+                            .h(px(6.0))
+                            .rounded_full()
+                            .bg(dot_color),
+                    )
+                    .child(
+                        div()
+                            .flex_grow()
+                            .truncate()
+                            .font(theme::font_mono())
+                            .child(command_label),
+                    );
+                project_and_worktree_rows.push(remote_row.into_any_element());
+                continue;
+            }
             if worktrees.is_empty() {
                 // Stable id keyed off the project id (same hash
                 // strategy `project_row` and `wt_row` use) so gpui
@@ -3658,9 +3797,13 @@ impl Render for Sidebar {
                 if let Some(project) = self.projects.projects.get(*project_idx).cloned() {
                     let project_path = project.path.clone();
                     let project_name: SharedString = project.name.clone().into();
-                    let overlay = self
-                        .render_project_menu(*project_idx, project_pos, &project, &theme, cx)
-                        .into_any_element();
+                    let overlay = if project.is_remote_shell() {
+                        self.render_remote_project_menu(*project_idx, project_pos, &project, &theme, cx)
+                            .into_any_element()
+                    } else {
+                        self.render_project_menu(*project_idx, project_pos, &project, &theme, cx)
+                            .into_any_element()
+                    };
                     root = root.child(overlay);
                     if let Some(sub) = self.open_submenu.as_ref()
                         && sub.kind == SubmenuKind::NewSession
@@ -4152,6 +4295,161 @@ impl Sidebar {
     /// the chrome instead of being clipped by the sidebar's bounds.
     /// Click outside (anywhere in the window) dismisses via
     /// `on_mouse_down_out`.
+    /// Context menu for a remote-shell project (#323). Deliberately a
+    /// separate, much shorter menu than [`Self::render_project_menu`]:
+    /// every git / worktree / path row would be a no-op here, so we
+    /// only offer Open session, New session, Copy command, Rename and
+    /// Remove. Same chrome as the regular project menu.
+    fn render_remote_project_menu(
+        &self,
+        idx: usize,
+        position: Point<Pixels>,
+        project: &Project,
+        theme: &Arc<Theme>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let header_label: SharedString = project.name.clone().into();
+        let elevated = theme::elevated(theme);
+        let divider = theme::divider(theme);
+        let ink = theme::ink(theme);
+        let ink_dim = theme::ink_dim(theme);
+        let ink_ghost = theme::ink_ghost(theme);
+        let frost = theme::frost_10(theme);
+        let danger = theme::danger();
+
+        let item = |id: &'static str,
+                    label: &'static str,
+                    danger_row: bool,
+                    on_click: MenuItemAction|
+         -> gpui::Stateful<gpui::Div> {
+            let base_color = if danger_row { danger } else { ink_dim };
+            let hover_color = if danger_row { danger } else { ink };
+            let frost_hover = frost;
+            div()
+                .id(id)
+                .h(px(28.0))
+                .px_3()
+                .flex()
+                .flex_row()
+                .items_center()
+                .text_size(px(12.5))
+                .text_color(base_color)
+                .cursor_pointer()
+                .hover(move |s| s.bg(frost_hover).text_color(hover_color))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        on_click(this, window, cx);
+                    }),
+                )
+                .child(label)
+        };
+
+        let project_id_open = project.id.clone();
+        let project_id_new = project.id.clone();
+        let command_for_copy = project.remote_shell_command().unwrap_or_default().to_string();
+        let project_id_rename = project.id.clone();
+        let current_name = project.name.clone();
+
+        let menu_body = div()
+            .flex()
+            .flex_col()
+            .py_1()
+            .min_w(px(220.0))
+            .bg(elevated)
+            .border_1()
+            .border_color(divider)
+            .rounded_md()
+            .shadow_lg()
+            .font(theme::font_sans())
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(10.0))
+                    .text_color(ink_ghost)
+                    .child(
+                        div()
+                            .text_color(ink)
+                            .font(theme::font_mono())
+                            .text_size(px(11.0))
+                            .truncate()
+                            .child(header_label),
+                    )
+                    .child(div().child("remote shell")),
+            )
+            .child(div().h_px().bg(divider).my_1())
+            .child(item(
+                "remote-menu-open",
+                "Open session",
+                false,
+                Box::new(move |this, _window, cx| {
+                    cx.emit(SidebarEvent::OpenRemoteShell {
+                        project_id: project_id_open.clone(),
+                        force_new: false,
+                    });
+                    this.close_menu(cx);
+                }),
+            ))
+            .child(item(
+                "remote-menu-new",
+                "New session",
+                false,
+                Box::new(move |this, _window, cx| {
+                    cx.emit(SidebarEvent::OpenRemoteShell {
+                        project_id: project_id_new.clone(),
+                        force_new: true,
+                    });
+                    this.close_menu(cx);
+                }),
+            ))
+            .child(div().h_px().bg(divider).my_1())
+            .child(item(
+                "remote-menu-copy-command",
+                "Copy command",
+                false,
+                Box::new(move |this, _window, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(command_for_copy.clone()));
+                    this.close_menu(cx);
+                }),
+            ))
+            .child(div().h_px().bg(divider).my_1())
+            .child(item(
+                "remote-menu-rename",
+                "Rename project…",
+                false,
+                Box::new(move |this, _window, cx| {
+                    cx.emit(SidebarEvent::OpenRenameDialog {
+                        target: RenameRequest::Project {
+                            project_id: project_id_rename.clone(),
+                        },
+                        current_name: current_name.clone(),
+                    });
+                    this.close_menu(cx);
+                }),
+            ))
+            .child(item(
+                "remote-menu-remove",
+                "Remove project",
+                true,
+                Box::new(move |this, _window, cx| this.request_remove_project(idx, cx)),
+            ))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_menu(cx)));
+
+        deferred(
+            anchored()
+                .position(point(position.x, position.y))
+                .anchor(Corner::TopLeft)
+                .snap_to_window_with_margin(px(8.0))
+                .child(menu_body),
+        )
+    }
+
     fn render_project_menu(
         &self,
         idx: usize,
