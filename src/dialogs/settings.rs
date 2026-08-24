@@ -106,10 +106,17 @@ impl SettingsDialogState {
         installed_fonts: Vec<String>,
         focus_handle: FocusHandle,
     ) -> Self {
+        // Normalise the family up front: the font-config builder in
+        // `app.rs` (`push_non_empty_font_candidate`) treats a
+        // whitespace-only family as "cleared", so the dialog must
+        // too — otherwise a hand-edited `"  "` renders a blank-
+        // looking trigger label and survives a Save round-trip.
+        let mut draft = settings.clone();
+        draft.font.family = draft.font.family.trim().to_string();
         Self {
             focus_handle,
             focused_field: SettingsField::FontSize,
-            font_options: build_font_options(installed_fonts, &settings.font.family),
+            font_options: build_font_options(installed_fonts, &draft.font.family),
             font_popup_open: false,
             font_query: TextField::new(),
             font_selected_idx: 0,
@@ -117,7 +124,7 @@ impl SettingsDialogState {
             font_size_field: TextField::with_text(format_f32(settings.font.size)),
             line_height_field: TextField::with_text(format_f32(settings.font.line_height_multiplier)),
             scrollback_field: TextField::with_text(settings.scrollback.to_string()),
-            draft: settings.clone(),
+            draft,
             original_settings: settings.clone(),
             error: None,
         }
@@ -260,6 +267,10 @@ impl SettingsDialogState {
 /// an empty-string entry inside it. Pulled out as a free function so
 /// the unit tests can exercise it without a gpui `FocusHandle`.
 fn build_font_options(installed: Vec<String>, current: &str) -> Vec<String> {
+    // Whitespace-only counts as empty — mirrors
+    // `app::push_non_empty_font_candidate`, which is what actually
+    // consumes the family at font-config time.
+    let current = current.trim();
     let mut options = installed;
     if !current.is_empty() && !options.iter().any(|n| n == current) {
         options.insert(0, current.to_string());
@@ -1586,6 +1597,16 @@ mod tests {
         // dropdown must not grow a blank row for it.
         let installed = vec!["Consolas".to_string()];
         let options = build_font_options(installed, "");
+        assert_eq!(options, vec!["Consolas".to_string()]);
+    }
+
+    #[test]
+    fn build_font_options_treats_whitespace_only_current_as_empty() {
+        // A hand-edited `"  "` family means "cleared" to the font-
+        // config builder (`push_non_empty_font_candidate` trims), so
+        // it must not surface as a blank-looking option here either.
+        let installed = vec!["Consolas".to_string()];
+        let options = build_font_options(installed, "   ");
         assert_eq!(options, vec!["Consolas".to_string()]);
     }
 
