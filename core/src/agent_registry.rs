@@ -403,7 +403,10 @@ mod tests {
             "ssh dev".into(),
             Some("claude".into()),
         );
-        assert_eq!(reg.assemble_remote_command(&p), "ssh dev -t claude");
+        assert_eq!(
+            reg.assemble_remote_command(&p),
+            "ssh dev -t '$SHELL -lic \"claude\"'"
+        );
     }
 
     #[test]

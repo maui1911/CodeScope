@@ -191,16 +191,31 @@ pub fn is_valid_remote_shell_command(command: &str) -> bool {
 /// is the agent's own invocation on the far end (e.g. `claude`), or
 /// `None` for a bare remote shell.
 ///
-/// When an agent is present it is appended as `<command> -t <agent>`:
-/// `-t` forces a pty so the interactive CLI renders, and everything
-/// after the host is run as the remote command by `ssh`. This is
-/// deliberately ssh-shaped — the agent field only makes sense for an
+/// When an agent is present the result is
+/// `<command> -t '$SHELL -lic "<agent>"'`. Three things matter here:
+///
+/// - `-t` forces a pty so the interactive CLI renders.
+/// - `$SHELL -lic` runs the agent through the remote user's **login +
+///   interactive** shell. A bare `ssh host -t claude` runs `claude`
+///   in ssh's non-login command shell, whose `PATH` is the stock
+///   `/usr/bin:/bin` — agents installed under `~/.local/bin`, nvm,
+///   Homebrew, etc. (the common case) are not found and the launch
+///   silently fails. Sourcing the login + rc files fixes the `PATH`.
+///   `$SHELL` (not a hard-coded `bash`) generalises to zsh on macOS.
+/// - The single-quote wrapper keeps `$SHELL` from being expanded
+///   locally: it survives both the Windows `pwsh -Command "& { … }"`
+///   boot and the macOS/Linux auto-type-into-login-shell path
+///   unchanged, and only expands on the far end. The agent is
+///   double-quoted inside so an agent invocation with args stays one
+///   `-c` string.
+///
+/// Deliberately ssh-shaped — the agent field only makes sense for an
 /// ssh (or ssh-like) base command, which is the whole point of a
 /// remote-shell project. A blank `agent_launch` is treated as absent.
 pub fn remote_command_with_agent(command: &str, agent_launch: Option<&str>) -> String {
     let base = command.trim();
     match agent_launch.map(str::trim).filter(|a| !a.is_empty()) {
-        Some(agent) => format!("{base} -t {agent}"),
+        Some(agent) => format!("{base} -t '$SHELL -lic \"{agent}\"'"),
         None => base.to_string(),
     }
 }
@@ -748,15 +763,29 @@ mod tests {
     }
 
     #[test]
-    fn remote_command_with_agent_appends_dash_t() {
+    fn remote_command_with_agent_wraps_in_login_shell() {
+        // The agent runs through the remote login+interactive shell so
+        // it inherits the user's real PATH (`~/.local/bin`, nvm, …) —
+        // a bare `-t claude` would miss it. See the fn doc for why.
         assert_eq!(
             remote_command_with_agent("ssh dev", Some("claude")),
-            "ssh dev -t claude"
+            "ssh dev -t '$SHELL -lic \"claude\"'"
         );
         // Trims both sides before joining.
         assert_eq!(
             remote_command_with_agent("  ssh dev  ", Some("  claude  ")),
-            "ssh dev -t claude"
+            "ssh dev -t '$SHELL -lic \"claude\"'"
+        );
+    }
+
+    #[test]
+    fn remote_command_with_agent_keeps_agent_args_in_one_c_string() {
+        // Double-quoting the agent inside keeps a multi-token launch
+        // (`claude --resume x`) as a single `-c` argument on the far
+        // end rather than splitting into positional params.
+        assert_eq!(
+            remote_command_with_agent("ssh dev", Some("claude --resume x")),
+            "ssh dev -t '$SHELL -lic \"claude --resume x\"'"
         );
     }
 
