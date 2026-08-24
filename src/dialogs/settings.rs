@@ -18,13 +18,15 @@
 //! divider-bordered, 6 px corner radius, accent colour for the primary
 //! action button, ink-dim labels in uppercase.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use codescope_core::{AgentRegistry, Settings, Theme, theme::builtin};
 use gpui::{
-    Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window,
-    anchored, deferred, div, point, px,
+    Bounds, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled,
+    Window, anchored, deferred, div, point, px,
 };
 
 use crate::app::AppShell;
@@ -73,6 +75,15 @@ pub struct SettingsDialogState {
     pub font_query: TextField,
     /// Currently-highlighted row in the font popup (post-filter index).
     pub font_selected_idx: usize,
+    /// Screen-space bounds of the FONT FAMILY trigger pill, recorded
+    /// by a paint-phase `canvas` child each frame the dialog is up.
+    /// The popup reads the previous frame's value to anchor itself
+    /// directly under the pill — element construction happens before
+    /// any painting, so same-frame bounds don't exist yet, but the
+    /// pill paints every frame the dialog is open, so by the first
+    /// popup render this is always populated. `Rc<Cell>` because the
+    /// paint closure outlives the borrow of `self` that render holds.
+    pub font_trigger_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     pub font_size_field: TextField,
     pub line_height_field: TextField,
     pub scrollback_field: TextField,
@@ -102,6 +113,7 @@ impl SettingsDialogState {
             font_popup_open: false,
             font_query: TextField::new(),
             font_selected_idx: 0,
+            font_trigger_bounds: Rc::new(Cell::new(None)),
             font_size_field: TextField::with_text(format_f32(settings.font.size)),
             line_height_field: TextField::with_text(format_f32(settings.font.line_height_multiplier)),
             scrollback_field: TextField::with_text(settings.scrollback.to_string()),
@@ -739,7 +751,22 @@ impl AppShell {
                 }),
             )
             .child(div().flex_grow().truncate().child(font_trigger_label))
-            .child(div().text_color(ink_ghost).child("▾"));
+            .child(div().text_color(ink_ghost).child("▾"))
+            .child({
+                // Invisible full-size overlay that records the pill's
+                // screen-space bounds at paint time so the popup can
+                // anchor itself under the pill next frame (see the
+                // `font_trigger_bounds` field docs).
+                // `gpui::canvas` written out — the `canvas` binding
+                // in this scope is the theme colour.
+                let bounds_cell = state.font_trigger_bounds.clone();
+                gpui::canvas(
+                    move |bounds, _, _| bounds_cell.set(Some(bounds)),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full()
+            });
         let font_size_input = textbox(
             "settings-font-size",
             &state.font_size_field,
@@ -1007,11 +1034,10 @@ impl AppShell {
             )
             .child(card);
 
-        // Optional font popup, layered above the dialog. Mirrors the
-        // base-branch popup in `new_worktree.rs`: a separate
-        // `deferred` at higher priority, centred horizontally near
-        // the top of the viewport (we don't have the trigger's
-        // screen-space rect here without a hitbox round-trip).
+        // Optional font popup, layered above the dialog as a separate
+        // `deferred` at higher priority (the idiom of the base-branch
+        // popup in `new_worktree.rs`), anchored under the trigger
+        // pill via the bounds its canvas overlay recorded last frame.
         let popup = font_popup_open
             .then(|| self.render_font_popup(state, theme, viewport, cx));
 
@@ -1099,7 +1125,19 @@ impl AppShell {
                             this.settings_select_font(name_for_handler.clone(), cx);
                         }),
                     )
-                    .child(div().flex_grow().truncate().child(label))
+                    .child(
+                        // The name renders in its own family so the
+                        // list doubles as a live preview — gpui falls
+                        // back per-glyph for faces that fail to load,
+                        // so a stale entry still reads fine. Shaped
+                        // lines are cached across frames, so the cost
+                        // is a first-open shape per visible row.
+                        div()
+                            .flex_grow()
+                            .truncate()
+                            .font_family((*name).clone())
+                            .child(label),
+                    )
                     .into_any_element(),
             );
         }
@@ -1115,8 +1153,16 @@ impl AppShell {
             );
         }
 
+        // Anchor under the trigger pill using the bounds its canvas
+        // overlay recorded last frame; match the pill's width so the
+        // popup reads as an extension of it. First-ever frame (cell
+        // still empty) falls back to a centred position — in practice
+        // unreachable, since the pill paints before the popup can be
+        // opened.
+        let trigger = state.font_trigger_bounds.get();
+        let popup_w = trigger.map(|b| f32::from(b.size.width)).unwrap_or(360.0);
         let popup = div()
-            .w(px(360.0))
+            .w(px(popup_w))
             .max_h(px(320.0))
             .bg(elevated)
             .border_1()
@@ -1147,10 +1193,15 @@ impl AppShell {
             );
 
         let viewport_w: f32 = viewport.width.into();
-        let popup_x = (viewport_w - 360.0) / 2.0;
+        let position = trigger
+            .map(|b| point(b.left(), b.bottom() + px(4.0)))
+            .unwrap_or_else(|| point(px(((viewport_w - popup_w) / 2.0).max(8.0)), px(80.0)));
         deferred(
             anchored()
-                .position(point(px(popup_x.max(8.0)), px(80.0)))
+                .position(position)
+                // Keep the popup inside the window when the dialog
+                // sits low — gpui shifts (or flips) it as needed.
+                .snap_to_window_with_margin(px(8.0))
                 .child(popup),
         )
         .with_priority(20)
