@@ -157,6 +157,20 @@ pub fn build_agent_shell_args(agent_command: &str, working_directory: &str) -> V
     ]
 }
 
+/// Sibling of [`build_agent_shell_args`] for remote-shell projects
+/// (#323): same `-NoExit -NoLogo -Command "& { <command> }"` shape,
+/// but **no** `-WorkingDirectory` — the command (typically `ssh …`)
+/// carries its own notion of where it runs, and the project has no
+/// local path to offer anyway. pwsh starts in its default location.
+pub fn build_remote_shell_args(command: &str) -> Vec<String> {
+    vec![
+        "-NoExit".into(),
+        "-NoLogo".into(),
+        "-Command".into(),
+        format!("& {{ {command} }}"),
+    ]
+}
+
 /// Format a closed-session timestamp as a short relative string —
 /// `just now` / `Nm ago` / `Nh ago` / `yesterday` / `Nd ago` / `MMM d`
 /// (older). Mirrors C# `SessionTabViewModel.ClosedAtRelative`.
@@ -757,7 +771,7 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::projects::{Project, Session, Worktree};
+    use crate::projects::{Project, ProjectKind, Session, Worktree};
     use crate::time::iso8601_from_unix_secs;
 
     fn fixed_now() -> &'static str { "2026-05-10T12:00:00Z" }
@@ -775,6 +789,9 @@ mod tests {
             path: "C:\\repo".into(),
             default_branch: "main".into(),
             worktree_root: None,
+            kind: ProjectKind::Local,
+            command: None,
+            remote_agent_id: None,
             default_agent_id: None,
             sessions: Vec::new(),
             worktrees: vec![Worktree {
@@ -1189,6 +1206,24 @@ mod tests {
         assert_eq!(args[1], "-NoLogo");
         assert_eq!(args[2], "-WorkingDirectory");
         assert_eq!(args[4], "-Command");
+    }
+
+    #[test]
+    fn build_remote_shell_args_has_no_working_directory() {
+        // Remote-shell projects (#323) have no local path: the argv
+        // is the agent layout minus the `-WorkingDirectory <wd>` pair.
+        let args = build_remote_shell_args("ssh dev@box -t claude");
+        assert_eq!(
+            args,
+            vec!["-NoExit", "-NoLogo", "-Command", "& { ssh dev@box -t claude }"]
+        );
+        assert!(!args.iter().any(|a| a == "-WorkingDirectory"));
+    }
+
+    #[test]
+    fn build_remote_shell_args_preserves_command_verbatim() {
+        let args = build_remote_shell_args("ssh -p 2222 'dev user'@box -t \"claude --resume\"");
+        assert_eq!(args[3], "& { ssh -p 2222 'dev user'@box -t \"claude --resume\" }");
     }
 
     #[test]

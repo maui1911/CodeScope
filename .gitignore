@@ -51,3 +51,6 @@ scratch/
 # Tool-state directories surfaced by AI / automation runners
 .claude/
 .playwright-cli/
+
+# Dev build output (separate target dir used for side-by-side dev runs)
+/target-dev/
