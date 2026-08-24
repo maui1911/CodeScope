@@ -170,6 +170,28 @@ impl AgentRegistry {
             .iter()
             .find(|a| a.id.eq_ignore_ascii_case(id))
     }
+
+    /// Assemble the command a remote-shell project (#323) actually
+    /// runs. Returns the project's base command as-is, unless the
+    /// project names an agent — then the agent's new-session
+    /// invocation is appended via
+    /// [`crate::projects::remote_command_with_agent`] (`<command> -t
+    /// <agent>`) so the tab lands straight in the agent on the far
+    /// end. Platform-neutral: the same string is used whether the tab
+    /// boots through `pwsh -Command` (Windows) or is auto-typed into
+    /// the login shell (macOS / Linux).
+    ///
+    /// An unknown / removed agent id, or an agent whose `command` is
+    /// blank, degrades to the raw command — never to a broken launch.
+    pub fn assemble_remote_command(&self, project: &crate::projects::Project) -> String {
+        let base = project.remote_shell_command().unwrap_or_default();
+        let agent_launch = project
+            .remote_agent_id
+            .as_deref()
+            .and_then(|id| self.get_by_id(id))
+            .and_then(build_new_session_auto_type);
+        crate::projects::remote_command_with_agent(base, agent_launch.as_deref())
+    }
 }
 
 /// Built-in profiles shipped with the app. Mirrors the C#
@@ -372,6 +394,35 @@ pub fn build_new_session_auto_type(profile: &AgentProfile) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assemble_remote_command_appends_selected_agent() {
+        let reg = AgentRegistry::with_built_ins();
+        let p = crate::projects::Project::new_remote_shell(
+            "dev".into(),
+            "ssh dev".into(),
+            Some("claude".into()),
+        );
+        assert_eq!(reg.assemble_remote_command(&p), "ssh dev -t claude");
+    }
+
+    #[test]
+    fn assemble_remote_command_without_agent_is_raw() {
+        let reg = AgentRegistry::with_built_ins();
+        let p = crate::projects::Project::new_remote_shell("dev".into(), "ssh dev".into(), None);
+        assert_eq!(reg.assemble_remote_command(&p), "ssh dev");
+    }
+
+    #[test]
+    fn assemble_remote_command_unknown_agent_degrades_to_raw() {
+        let reg = AgentRegistry::with_built_ins();
+        let p = crate::projects::Project::new_remote_shell(
+            "dev".into(),
+            "ssh dev".into(),
+            Some("no-such-agent".into()),
+        );
+        assert_eq!(reg.assemble_remote_command(&p), "ssh dev");
+    }
 
     #[test]
     fn built_in_defaults_cover_all_five_agents() {

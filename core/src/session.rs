@@ -791,6 +791,7 @@ mod tests {
             worktree_root: None,
             kind: ProjectKind::Local,
             command: None,
+            remote_agent_id: None,
             default_agent_id: None,
             sessions: Vec::new(),
             worktrees: vec![Worktree {

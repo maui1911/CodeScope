@@ -62,6 +62,7 @@ pub use overview::{
 pub use paths::AppPaths;
 pub use projects::{
     Project, ProjectKind, ProjectsConfig, Session, Worktree, is_valid_remote_shell_command,
+    remote_command_with_agent,
 };
 pub use session::{
     RetentionPolicy, SessionDescriptor, SessionManager, build_agent_shell_args,

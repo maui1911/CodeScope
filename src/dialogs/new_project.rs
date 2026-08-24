@@ -91,6 +91,10 @@ pub struct NewProjectDialogState {
     /// `pwsh -Command "& { … }"` verbatim at spawn time.
     pub remote_name: TextField,
     pub remote_command: TextField,
+    /// Agent to launch on the remote (#323). `None` = run the command
+    /// as a bare shell. Seeded to the global default agent when the
+    /// dialog opens; the user can switch it or pick "No agent".
+    pub remote_agent_id: Option<String>,
     /// `true` while a `git clone` task is in flight.
     pub busy: bool,
     /// "Cloning <name>…" caption while busy.
@@ -113,6 +117,7 @@ impl NewProjectDialogState {
             name_auto: true,
             remote_name: TextField::new(),
             remote_command: TextField::new(),
+            remote_agent_id: None,
             busy: false,
             busy_text: None,
             error: None,
@@ -475,7 +480,11 @@ impl Sidebar {
         // keystrokes routed to AppShell's chord-only handler. Same
         // primitive `activate_tab` uses (see `src/app.rs`).
         window.prevent_default();
-        let state = NewProjectDialogState::new(parent, focus_handle);
+        let mut state = NewProjectDialogState::new(parent, focus_handle);
+        // Seed the remote-shell agent picker with the global default
+        // agent so "Remote shell" mode lands you in Claude Code out of
+        // the box (#323).
+        state.remote_agent_id = self.agent_registry().get_default().map(|p| p.id.clone());
         self.set_new_project_dialog(Some(state));
         self.close_menu_no_notify();
         cx.notify();
@@ -505,6 +514,19 @@ impl Sidebar {
                 DialogMode::Clone => DialogField::Url,
                 DialogMode::RemoteShell => DialogField::RemoteName,
             };
+            state.error = None;
+            cx.notify();
+        }
+    }
+
+    /// Set the remote-shell agent selection (`None` = no agent /
+    /// bare shell). Clears any inline error so the picker feels live.
+    pub fn set_new_project_remote_agent(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        if let Some(state) = self.new_project_dialog_mut() {
+            if state.busy {
+                return;
+            }
+            state.remote_agent_id = id;
             state.error = None;
             cx.notify();
         }
@@ -687,8 +709,9 @@ impl Sidebar {
                     cx.notify();
                     return;
                 }
+                let agent_id = state.remote_agent_id.clone();
                 self.cancel_new_project_dialog(cx);
-                self.add_remote_shell_project(name, command, cx);
+                self.add_remote_shell_project(name, command, agent_id, cx);
             }
         }
     }
@@ -969,6 +992,56 @@ impl Sidebar {
                     "ssh user@host -t claude",
                     DialogField::RemoteCommand,
                 );
+                // Agent picker: "No agent" + one row per registered
+                // agent. Selecting one makes CodeScope run
+                // `<command> -t <agent>` so the tab lands straight in
+                // the agent on the remote (#323).
+                let selected_agent = state.remote_agent_id.clone();
+                let agent_row = |id: Option<String>, label: SharedString| {
+                    let is_sel = selected_agent.as_deref() == id.as_deref();
+                    let dot = if is_sel { accent } else { gpui::transparent_black() };
+                    let row_id = match id.as_deref() {
+                        Some(a) => format!("np-remote-agent-{a}"),
+                        None => "np-remote-agent-none".to_string(),
+                    };
+                    div()
+                        .id(SharedString::from(row_id))
+                        .h(px(30.0))
+                        .px_2()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .rounded(px(4.0))
+                        .text_size(px(12.5))
+                        .text_color(if is_sel { ink } else { ink_muted })
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(frost))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                this.set_new_project_remote_agent(id.clone(), cx);
+                            }),
+                        )
+                        .child(
+                            div()
+                                .w(px(6.0))
+                                .h(px(6.0))
+                                .rounded_full()
+                                .bg(dot),
+                        )
+                        .child(label)
+                };
+                let mut agent_list = div().flex().flex_col().gap_1();
+                agent_list = agent_list.child(agent_row(None, "No agent (bare shell)".into()));
+                for profile in self.agent_registry().get_all() {
+                    agent_list = agent_list.child(agent_row(
+                        Some(profile.id.clone()),
+                        profile.display_name.clone().into(),
+                    ));
+                }
                 div()
                     .px_5()
                     .flex()
@@ -978,6 +1051,8 @@ impl Sidebar {
                     .child(name_field)
                     .child(field_label("COMMAND"))
                     .child(command_field)
+                    .child(field_label("LAUNCH AGENT ON REMOTE"))
+                    .child(agent_list)
                     .child(
                         div()
                             .text_size(px(11.0))

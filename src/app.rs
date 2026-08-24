@@ -2464,6 +2464,10 @@ impl AppShell {
             /// project id + command so the tab respawns without a cwd.
             remote: Option<RemoteShellLaunch>,
         }
+        // Borrow the registry once, disjoint from the `self.projects`
+        // iteration below, so the closure can assemble remote commands
+        // without capturing `self`.
+        let registry = &self.agent_registry;
         let entries: Vec<RehydrateEntry> = self
             .projects
             .projects
@@ -2472,9 +2476,12 @@ impl AppShell {
                 let project_name = p.name.clone();
                 // Resolve the remote-shell launch once per project —
                 // cloned into each of its live sessions below. `None`
-                // for local projects.
-                let remote_command = p.remote_shell_command().map(str::to_owned);
-                let project_id = p.id.clone();
+                // for local projects. The command is assembled with
+                // the selected agent (`ssh dev -t claude`).
+                let remote_launch = p.remote_shell_command().is_some().then(|| RemoteShellLaunch {
+                    project_id: p.id.clone(),
+                    command: registry.assemble_remote_command(p),
+                });
                 p.sessions.iter().filter_map(move |s| {
                     if s.closed_at.is_some() {
                         return None;
@@ -2485,10 +2492,7 @@ impl AppShell {
                             .find(|w| Some(&w.id) == s.worktree_id.as_ref())
                             .and_then(|w| w.branch.clone())
                     });
-                    let remote = remote_command.as_ref().map(|command| RemoteShellLaunch {
-                        project_id: project_id.clone(),
-                        command: command.clone(),
-                    });
+                    let remote = remote_launch.clone();
                     Some(RehydrateEntry {
                         session_id: s.id.clone(),
                         worktree_path: s.worktree_path.clone(),
@@ -3625,6 +3629,7 @@ impl AppShell {
             }
         }
         // Resolve the command from the sidebar's live project list.
+        let registry = &self.agent_registry;
         let launch = self
             .sidebar
             .read(cx)
@@ -3632,11 +3637,13 @@ impl AppShell {
             .projects
             .iter()
             .find(|p| p.id == project_id)
-            .and_then(|p| {
-                p.remote_shell_command().map(|command| RemoteShellLaunch {
-                    project_id: p.id.clone(),
-                    command: command.to_owned(),
-                })
+            .filter(|p| p.remote_shell_command().is_some())
+            .map(|p| RemoteShellLaunch {
+                project_id: p.id.clone(),
+                // Assemble the base command with the selected agent's
+                // launch (`ssh dev` + claude → `ssh dev -t claude`) so
+                // the tab lands straight in the agent (#323).
+                command: registry.assemble_remote_command(p),
             });
         let Some(launch) = launch else {
             eprintln!("warning: OpenRemoteShell for unknown / non-remote project {project_id}");

@@ -57,9 +57,19 @@ pub struct Project {
     #[serde(default)]
     pub kind: ProjectKind,
     /// Command line to run for [`ProjectKind::RemoteShell`] projects
-    /// (e.g. `ssh dev@box -t claude`). `None` for local projects.
+    /// (e.g. `ssh dev`). `None` for local projects. When
+    /// [`Self::remote_agent_id`] is set, the agent's launch command is
+    /// appended as `<command> -t <agent>` so the tab lands straight in
+    /// the agent on the far end.
     #[serde(default)]
     pub command: Option<String>,
+    /// Agent profile id to launch on the remote for a
+    /// [`ProjectKind::RemoteShell`] project (#323). `None` = run the
+    /// command as-is (a bare remote shell). The id is resolved against
+    /// the live `AgentRegistry` at spawn time, so an id whose profile
+    /// no longer exists degrades gracefully to the raw command.
+    #[serde(default)]
+    pub remote_agent_id: Option<String>,
     /// Default branch — used as the base when creating new worktrees.
     #[serde(default = "default_branch", alias = "default_branch")]
     pub default_branch: String,
@@ -115,6 +125,7 @@ impl Project {
             path,
             kind: ProjectKind::Local,
             command: None,
+            remote_agent_id: None,
             default_branch: default_branch(),
             worktree_root: None,
             default_agent_id: None,
@@ -124,16 +135,19 @@ impl Project {
     }
 
     /// Build a [`ProjectKind::RemoteShell`] project: a named command
-    /// line with no path and no worktrees. Both arguments are
-    /// trimmed; the caller is expected to have rejected empty values
-    /// already (see [`is_valid_remote_shell_command`]).
-    pub fn new_remote_shell(name: String, command: String) -> Self {
+    /// line with no path and no worktrees, optionally launching
+    /// `agent_id` on the far end. `name`/`command` are trimmed; the
+    /// caller is expected to have rejected empty values already (see
+    /// [`is_valid_remote_shell_command`]). `agent_id` `None` runs the
+    /// command as a bare remote shell.
+    pub fn new_remote_shell(name: String, command: String, agent_id: Option<String>) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             name: name.trim().to_string(),
             path: String::new(),
             kind: ProjectKind::RemoteShell,
             command: Some(command.trim().to_string()),
+            remote_agent_id: agent_id.filter(|s| !s.trim().is_empty()),
             default_branch: default_branch(),
             worktree_root: None,
             default_agent_id: None,
@@ -170,6 +184,25 @@ impl Project {
 pub fn is_valid_remote_shell_command(command: &str) -> bool {
     let trimmed = command.trim();
     !trimmed.is_empty() && !trimmed.contains(['\n', '\r'])
+}
+
+/// Assemble the command a remote-shell tab actually runs (#323).
+/// `command` is the user's base line (e.g. `ssh dev`); `agent_launch`
+/// is the agent's own invocation on the far end (e.g. `claude`), or
+/// `None` for a bare remote shell.
+///
+/// When an agent is present it is appended as `<command> -t <agent>`:
+/// `-t` forces a pty so the interactive CLI renders, and everything
+/// after the host is run as the remote command by `ssh`. This is
+/// deliberately ssh-shaped — the agent field only makes sense for an
+/// ssh (or ssh-like) base command, which is the whole point of a
+/// remote-shell project. A blank `agent_launch` is treated as absent.
+pub fn remote_command_with_agent(command: &str, agent_launch: Option<&str>) -> String {
+    let base = command.trim();
+    match agent_launch.map(str::trim).filter(|a| !a.is_empty()) {
+        Some(agent) => format!("{base} -t {agent}"),
+        None => base.to_string(),
+    }
 }
 
 impl Project {
@@ -531,6 +564,7 @@ mod tests {
                 worktree_root: Some("C:\\repos\\repo.worktrees".into()),
                 kind: ProjectKind::Local,
                 command: None,
+                remote_agent_id: None,
                 default_agent_id: Some("claude-code".into()),
                 sessions: vec![Session {
                     id: "s1".into(),
@@ -671,6 +705,7 @@ mod tests {
                 worktree_root: None,
                 kind: ProjectKind::Local,
                 command: None,
+                remote_agent_id: None,
                 default_agent_id: None,
                 sessions: Vec::new(),
                 worktrees: Vec::new(),
@@ -682,7 +717,7 @@ mod tests {
 
     #[test]
     fn remote_shell_project_has_no_path_and_no_worktrees() {
-        let p = Project::new_remote_shell("  devbox ".into(), " ssh dev@box -t claude ".into());
+        let p = Project::new_remote_shell("  devbox ".into(), " ssh dev@box -t claude ".into(), None);
         assert_eq!(p.name, "devbox");
         assert_eq!(p.path, "");
         assert_eq!(p.kind, ProjectKind::RemoteShell);
@@ -705,11 +740,39 @@ mod tests {
 
     #[test]
     fn remote_shell_with_blank_command_is_treated_as_missing() {
-        let mut p = Project::new_remote_shell("x".into(), "ssh box".into());
+        let mut p = Project::new_remote_shell("x".into(), "ssh box".into(), None);
         p.command = Some("   ".into());
         assert_eq!(p.remote_shell_command(), None);
         p.command = None;
         assert_eq!(p.remote_shell_command(), None);
+    }
+
+    #[test]
+    fn remote_command_with_agent_appends_dash_t() {
+        assert_eq!(
+            remote_command_with_agent("ssh dev", Some("claude")),
+            "ssh dev -t claude"
+        );
+        // Trims both sides before joining.
+        assert_eq!(
+            remote_command_with_agent("  ssh dev  ", Some("  claude  ")),
+            "ssh dev -t claude"
+        );
+    }
+
+    #[test]
+    fn remote_command_with_agent_no_agent_is_verbatim_trimmed() {
+        assert_eq!(remote_command_with_agent("ssh dev", None), "ssh dev");
+        assert_eq!(remote_command_with_agent("ssh dev", Some("   ")), "ssh dev");
+        assert_eq!(remote_command_with_agent("  ssh dev ", None), "ssh dev");
+    }
+
+    #[test]
+    fn new_remote_shell_stores_and_blank_agent_becomes_none() {
+        let p = Project::new_remote_shell("dev".into(), "ssh dev".into(), Some("claude".into()));
+        assert_eq!(p.remote_agent_id.as_deref(), Some("claude"));
+        let p2 = Project::new_remote_shell("dev".into(), "ssh dev".into(), Some("  ".into()));
+        assert_eq!(p2.remote_agent_id, None);
     }
 
     #[test]
@@ -731,7 +794,7 @@ mod tests {
         let mut cfg = ProjectsConfig {
             version: CURRENT_VERSION,
             agents: Vec::new(),
-            projects: vec![Project::new_remote_shell("box".into(), "ssh box".into())],
+            projects: vec![Project::new_remote_shell("box".into(), "ssh box".into(), None)],
         };
         cfg.migrate();
         assert!(cfg.projects[0].worktrees.is_empty());
@@ -740,7 +803,7 @@ mod tests {
 
     #[test]
     fn adopt_existing_worktrees_is_a_no_op_for_remote_shell() {
-        let mut p = Project::new_remote_shell("box".into(), "ssh box".into());
+        let mut p = Project::new_remote_shell("box".into(), "ssh box".into(), None);
         p.adopt_existing_worktrees();
         assert!(p.worktrees.is_empty());
     }
@@ -752,7 +815,7 @@ mod tests {
         let cfg = ProjectsConfig {
             version: CURRENT_VERSION,
             agents: Vec::new(),
-            projects: vec![Project::new_remote_shell("box".into(), "ssh box -t claude".into())],
+            projects: vec![Project::new_remote_shell("box".into(), "ssh box -t claude".into(), None)],
         };
         cfg.save_to(&path).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
@@ -883,6 +946,7 @@ mod tests {
                 worktree_root: Some("C:\\repo.worktrees".into()),
                 kind: ProjectKind::Local,
                 command: None,
+                remote_agent_id: None,
                 default_agent_id: Some("claude".into()),
                 sessions: vec![Session {
                     id: "s1".into(),

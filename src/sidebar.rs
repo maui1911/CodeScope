@@ -1343,6 +1343,12 @@ impl Sidebar {
         &self.projects
     }
 
+    /// The cached agent registry — used by the Add-project dialog's
+    /// remote-shell agent picker (#323).
+    pub(crate) fn agent_registry(&self) -> &AgentRegistry {
+        &self.agent_registry
+    }
+
     /// Same as [`Self::projects`] for the path bundle. Used by the
     /// dialog to persist `projects.json` after a successful create.
     pub(crate) fn paths_ref(&self) -> &AppPaths {
@@ -2515,9 +2521,10 @@ impl Sidebar {
         &mut self,
         name: String,
         command: String,
+        agent_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let project = Project::new_remote_shell(name, command);
+        let project = Project::new_remote_shell(name, command, agent_id);
         let new_id = project.id.clone();
         let mut next = self.projects.clone();
         next.projects.push(project);
@@ -2947,7 +2954,8 @@ impl Render for Sidebar {
                 .projects
                 .projects
                 .get(idx)
-                .and_then(|p| p.remote_shell_command().map(str::to_owned));
+                .filter(|p| p.remote_shell_command().is_some())
+                .map(|p| self.agent_registry.assemble_remote_command(p));
             if let Some(command) = remote_command {
                 let frost_hover = theme::surface_elev(&theme);
                 let ink_hover = theme::ink(&theme);
@@ -4348,7 +4356,7 @@ impl Sidebar {
 
         let project_id_open = project.id.clone();
         let project_id_new = project.id.clone();
-        let command_for_copy = project.remote_shell_command().unwrap_or_default().to_string();
+        let command_for_copy = self.agent_registry.assemble_remote_command(project);
         let project_id_rename = project.id.clone();
         let current_name = project.name.clone();
 
