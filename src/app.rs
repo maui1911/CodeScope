@@ -3662,9 +3662,17 @@ impl AppShell {
 
     fn spawn_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Only auto-type the default agent when we actually have a
-        // working directory to land the agent in — a plain shell
-        // fallback keeps the empty / no-project state usable.
-        let has_project_context = self.sidebar.read(cx).active_project().is_some();
+        // local working directory to land the agent in — a plain shell
+        // fallback keeps the empty / no-project state usable. A
+        // remote-shell project (#323) has no local path, so Ctrl+Shift+T
+        // with one selected must NOT fire the default agent locally (it
+        // would run `claude` on this machine); the remote project is
+        // opened through its own row / menu instead.
+        let has_project_context = self
+            .sidebar
+            .read(cx)
+            .active_project()
+            .is_some_and(|p| !p.is_remote_shell() && !p.path.is_empty());
         let (agent_id, auto_type) = if has_project_context {
             match default_agent_launch_for(&self.settings) {
                 Some((id, at)) => (Some(id), at),
@@ -3740,12 +3748,18 @@ impl AppShell {
         let working_directory = if remote.is_some() {
             None
         } else {
-            working_directory.or_else(|| {
-                active_project
-                    .as_ref()
-                    .filter(|(path, _)| !path.is_empty())
-                    .map(|(path, _)| std::path::PathBuf::from(path))
-            })
+            // Drop an explicitly-supplied empty path defensively: a
+            // caller that derived cwd from a remote / path-less
+            // project could hand us `Some("")`, which would otherwise
+            // reach `-WorkingDirectory ""` and fail the spawn (#323).
+            working_directory
+                .filter(|p| !p.as_os_str().is_empty())
+                .or_else(|| {
+                    active_project
+                        .as_ref()
+                        .filter(|(path, _)| !path.is_empty())
+                        .map(|(path, _)| std::path::PathBuf::from(path))
+                })
         };
 
         // Resolve the shell + argv. When `auto_type` is set and we
@@ -8224,13 +8238,17 @@ impl AppShell {
 
     /// Active project's working directory, if any. Used by the agent
     /// action to pick `cwd` for the spawn. Returns `None` when no
-    /// project is selected — the spawn falls back to the default cwd
-    /// (whatever `spawn_tab_in` resolves from settings).
+    /// project is selected, or when it's a remote-shell project (#323)
+    /// / has an empty path — those carry no local cwd, so the palette
+    /// agent launch falls back to the default cwd instead of passing
+    /// `Some("")` (which would reach `-WorkingDirectory ""` and fail).
     fn active_project_path(&self, cx: &Context<Self>) -> Option<String> {
         self.sidebar
             .read(cx)
             .active_project()
+            .filter(|p| !p.is_remote_shell())
             .map(|p| p.path.clone())
+            .filter(|path| !path.is_empty())
     }
 
     /// Active tab's working directory as a `String`. Used by the

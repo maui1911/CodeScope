@@ -1371,9 +1371,17 @@ impl Sidebar {
         let mut paths: HashSet<&str> =
             HashSet::new();
         for project in &self.projects.projects {
-            paths.insert(project.path.as_str());
+            // Skip empty paths — remote-shell projects (#323) have
+            // `path == ""` and no worktrees; counting "" would report
+            // a phantom worktree in the status bar. Same non-empty
+            // filter the dirty / git-status pollers apply.
+            if !project.path.is_empty() {
+                paths.insert(project.path.as_str());
+            }
             for wt in &project.worktrees {
-                paths.insert(wt.path.as_str());
+                if !wt.path.is_empty() {
+                    paths.insert(wt.path.as_str());
+                }
             }
         }
         let total = paths.len();
