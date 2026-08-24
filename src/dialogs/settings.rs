@@ -18,13 +18,15 @@
 //! divider-bordered, 6 px corner radius, accent colour for the primary
 //! action button, ink-dim labels in uppercase.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use codescope_core::{AgentRegistry, Settings, Theme, theme::builtin};
 use gpui::{
-    Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, ParentElement, SharedString, Styled, Window, anchored, deferred, div, point,
-    px,
+    Bounds, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled,
+    Window, anchored, deferred, div, point, px,
 };
 
 use crate::app::AppShell;
@@ -33,10 +35,12 @@ use crate::theme;
 
 /// Which text-input field currently receives typed keystrokes. The
 /// numeric stepper fields use plain text input so a user can paste
-/// values; we validate on Save.
+/// values; we validate on Save. The font family is picked from a
+/// dropdown (see [`SettingsDialogState::font_popup_open`]) — while
+/// that popup is open, typed keystrokes are routed to its filter
+/// input instead of whichever field is nominally focused here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsField {
-    FontFamily,
     FontSize,
     LineHeight,
     Scrollback,
@@ -54,12 +58,32 @@ pub struct SettingsDialogState {
     /// the struct directly so the user can type freely (incl. invalid
     /// intermediate states like "" or "1.").
     pub draft: Settings,
-    /// Editable text buffer for the font family. Mirrors
-    /// `draft.font.family` and is flushed back to it at Save time —
-    /// keeping a [`TextField`] separately lets the caret track an
-    /// internal position even though `Settings.font.family` is a plain
-    /// `String` shared with core.
-    pub font_family_field: TextField,
+    /// Installed font families offered by the FONT FAMILY dropdown.
+    /// Snapshotted once at dialog open from
+    /// `cx.text_system().all_font_names()` (already sorted + deduped
+    /// by gpui); the currently-configured family is spliced in when
+    /// the OS doesn't report it (e.g. a hand-edited `settings.json`
+    /// naming a font that was since uninstalled) so the selection
+    /// never silently vanishes from the list.
+    pub font_options: Vec<String>,
+    /// FONT FAMILY dropdown popover open? While open, typed keys are
+    /// routed to [`Self::font_query`] and Up/Down/Enter drive
+    /// [`Self::font_selected_idx`] — mirrors the base-branch popup in
+    /// `new_worktree.rs`.
+    pub font_popup_open: bool,
+    /// Filter text typed into the font popup search.
+    pub font_query: TextField,
+    /// Currently-highlighted row in the font popup (post-filter index).
+    pub font_selected_idx: usize,
+    /// Screen-space bounds of the FONT FAMILY trigger pill, recorded
+    /// by a paint-phase `canvas` child each frame the dialog is up.
+    /// The popup reads the previous frame's value to anchor itself
+    /// directly under the pill — element construction happens before
+    /// any painting, so same-frame bounds don't exist yet, but the
+    /// pill paints every frame the dialog is open, so by the first
+    /// popup render this is always populated. `Rc<Cell>` because the
+    /// paint closure outlives the borrow of `self` that render holds.
+    pub font_trigger_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     pub font_size_field: TextField,
     pub line_height_field: TextField,
     pub scrollback_field: TextField,
@@ -77,15 +101,30 @@ pub struct SettingsDialogState {
 }
 
 impl SettingsDialogState {
-    pub fn new(settings: &Settings, focus_handle: FocusHandle) -> Self {
+    pub fn new(
+        settings: &Settings,
+        installed_fonts: Vec<String>,
+        focus_handle: FocusHandle,
+    ) -> Self {
+        // Normalise the family up front: the font-config builder in
+        // `app.rs` (`push_non_empty_font_candidate`) treats a
+        // whitespace-only family as "cleared", so the dialog must
+        // too — otherwise a hand-edited `"  "` renders a blank-
+        // looking trigger label and survives a Save round-trip.
+        let mut draft = settings.clone();
+        draft.font.family = draft.font.family.trim().to_string();
         Self {
             focus_handle,
-            focused_field: SettingsField::FontFamily,
-            font_family_field: TextField::with_text(settings.font.family.clone()),
+            focused_field: SettingsField::FontSize,
+            font_options: build_font_options(installed_fonts, &draft.font.family),
+            font_popup_open: false,
+            font_query: TextField::new(),
+            font_selected_idx: 0,
+            font_trigger_bounds: Rc::new(Cell::new(None)),
             font_size_field: TextField::with_text(format_f32(settings.font.size)),
             line_height_field: TextField::with_text(format_f32(settings.font.line_height_multiplier)),
             scrollback_field: TextField::with_text(settings.scrollback.to_string()),
-            draft: settings.clone(),
+            draft,
             original_settings: settings.clone(),
             error: None,
         }
@@ -103,7 +142,6 @@ impl SettingsDialogState {
             self.line_height_field.text(),
             self.scrollback_field.text(),
         )?;
-        self.draft.font.family = self.font_family_field.text().to_string();
         self.draft.font.size = size;
         self.draft.font.line_height_multiplier = line;
         self.draft.scrollback = scrollback;
@@ -111,12 +149,21 @@ impl SettingsDialogState {
     }
 
     fn focused_field_mut(&mut self) -> &mut TextField {
+        // An open font popup steals typed input for its filter — the
+        // nominally-focused numeric field resumes when it closes.
+        if self.font_popup_open {
+            return &mut self.font_query;
+        }
         match self.focused_field {
-            SettingsField::FontFamily => &mut self.font_family_field,
             SettingsField::FontSize => &mut self.font_size_field,
             SettingsField::LineHeight => &mut self.line_height_field,
             SettingsField::Scrollback => &mut self.scrollback_field,
         }
+    }
+
+    /// Font options that match the popup's current filter text.
+    pub fn filtered_fonts(&self) -> Vec<&String> {
+        filter_fonts(&self.font_options, self.font_query.text())
     }
 
     /// Insert + edit + caret-move helpers. The caret-movement /
@@ -125,7 +172,7 @@ impl SettingsDialogState {
     /// `false` and the caller skips the redraw.
     pub fn insert_char(&mut self, ch: char) -> bool {
         self.focused_field_mut().insert_char(ch);
-        self.error = None;
+        self.after_edit(true);
         true
     }
 
@@ -133,26 +180,37 @@ impl SettingsDialogState {
     /// `TextField::insert_str`).
     pub fn insert_str(&mut self, s: &str) -> bool {
         let changed = self.focused_field_mut().insert_str(s);
-        if changed {
-            self.error = None;
-        }
+        self.after_edit(changed);
         changed
     }
 
     pub fn backspace(&mut self) -> bool {
         let changed = self.focused_field_mut().backspace();
-        if changed {
-            self.error = None;
-        }
+        self.after_edit(changed);
         changed
     }
 
     pub fn delete_forward(&mut self) -> bool {
         let changed = self.focused_field_mut().delete_forward();
+        self.after_edit(changed);
+        changed
+    }
+
+    /// Common post-edit bookkeeping: clear a stale validation error
+    /// and, when the font popup's filter just changed, snap its
+    /// highlight to the first *match* (visible index 1 — index 0 is
+    /// the pinned "(built-in default)" row) so typing + Enter picks
+    /// what the user filtered for, not the default. An emptied filter
+    /// falls back to the pinned row.
+    fn after_edit(&mut self, changed: bool) {
         if changed {
             self.error = None;
+            if self.font_popup_open {
+                let has_query = !self.font_query.text().trim().is_empty();
+                self.font_selected_idx =
+                    if has_query && !self.filtered_fonts().is_empty() { 1 } else { 0 };
+            }
         }
-        changed
     }
 
     pub fn move_caret_left(&mut self) -> bool {
@@ -171,13 +229,12 @@ impl SettingsDialogState {
         self.focused_field_mut().move_end()
     }
 
-    /// Mutable accessor for one of the four text-input fields. Used
-    /// by the mouse-down hit-test path so a click on an unfocused
-    /// field shifts focus AND drops the caret at the click position
-    /// in one step.
+    /// Mutable accessor for one of the numeric text-input fields.
+    /// Used by the mouse-down hit-test path so a click on an
+    /// unfocused field shifts focus AND drops the caret at the click
+    /// position in one step.
     pub fn field_mut_by(&mut self, field: SettingsField) -> &mut TextField {
         match field {
-            SettingsField::FontFamily => &mut self.font_family_field,
             SettingsField::FontSize => &mut self.font_size_field,
             SettingsField::LineHeight => &mut self.line_height_field,
             SettingsField::Scrollback => &mut self.scrollback_field,
@@ -186,7 +243,6 @@ impl SettingsDialogState {
 
     fn cycle_field(&mut self, forward: bool) {
         let order = [
-            SettingsField::FontFamily,
             SettingsField::FontSize,
             SettingsField::LineHeight,
             SettingsField::Scrollback,
@@ -199,6 +255,43 @@ impl SettingsDialogState {
         };
         self.focused_field = order[next];
     }
+}
+
+/// Build the FONT FAMILY dropdown's option list. `installed` comes
+/// from `TextSystem::all_font_names()` (sorted + deduped by gpui);
+/// the currently-configured family is prepended when the OS doesn't
+/// report it so the active selection is always present and pickable
+/// again after browsing. An empty `current` (= "use the built-in
+/// default chain") adds nothing — the popup offers the default via a
+/// pinned "(built-in default)" row rendered above this list, never as
+/// an empty-string entry inside it. Pulled out as a free function so
+/// the unit tests can exercise it without a gpui `FocusHandle`.
+fn build_font_options(installed: Vec<String>, current: &str) -> Vec<String> {
+    // Whitespace-only counts as empty — mirrors
+    // `app::push_non_empty_font_candidate`, which is what actually
+    // consumes the family at font-config time.
+    let current = current.trim();
+    let mut options = installed;
+    if !current.is_empty() && !options.iter().any(|n| n == current) {
+        options.insert(0, current.to_string());
+    }
+    options
+}
+
+/// Case-insensitive substring filter over the font option list.
+/// Mirrors `new_worktree::filter_branches` — an empty / whitespace
+/// query matches everything. The pinned "(built-in default)" row is
+/// not part of the option list; the popup renders it above these
+/// matches unconditionally so the user can always clear back to the
+/// default without emptying the filter first. Free function for the
+/// same testability-without-FocusHandle reason as
+/// [`build_font_options`].
+fn filter_fonts<'a>(options: &'a [String], query: &str) -> Vec<&'a String> {
+    let q = query.trim().to_lowercase();
+    options
+        .iter()
+        .filter(|name| q.is_empty() || name.to_lowercase().contains(&q))
+        .collect()
 }
 
 /// Pure validation helper for the three numeric input buffers
@@ -299,7 +392,12 @@ impl AppShell {
         }
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
-        let state = SettingsDialogState::new(self.settings_ref().as_ref(), focus_handle);
+        let installed_fonts = cx.text_system().all_font_names();
+        let state = SettingsDialogState::new(
+            self.settings_ref().as_ref(),
+            installed_fonts,
+            focus_handle,
+        );
         self.settings_dialog = Some(state);
         cx.notify();
     }
@@ -399,11 +497,79 @@ impl AppShell {
         }
     }
 
-    /// Move keyboard focus between the typed-input fields.
+    /// Move keyboard focus between the typed-input fields. Clicking
+    /// into a numeric field also dismisses an open font popup so the
+    /// two input targets can't both claim the keyboard.
     pub fn settings_focus_field(&mut self, field: SettingsField, cx: &mut Context<Self>) {
         if let Some(state) = self.settings_dialog.as_mut() {
             state.focused_field = field;
+            state.font_popup_open = false;
             cx.notify();
+        }
+    }
+
+    /// Open / close the FONT FAMILY dropdown. Opening clears the
+    /// filter and highlights the currently-configured family so
+    /// Enter with no typing is a no-op-shaped confirm — the pinned
+    /// "(built-in default)" row sits at visible index 0, so option
+    /// rows are offset by one. Mirrors `Sidebar::toggle_base_popup`.
+    pub fn settings_toggle_font_popup(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = self.settings_dialog.as_mut() {
+            state.font_popup_open = !state.font_popup_open;
+            if state.font_popup_open {
+                state.font_query.set_text("");
+                state.font_selected_idx = state
+                    .font_options
+                    .iter()
+                    .position(|name| *name == state.draft.font.family)
+                    .map(|pos| pos + 1)
+                    .unwrap_or(0);
+            }
+            cx.notify();
+        }
+    }
+
+    /// Pick a font family and close the popup. An empty string means
+    /// "use the built-in default chain" (the pinned top row). The
+    /// choice lands in the draft only — Save persists it, Cancel
+    /// discards it.
+    pub fn settings_select_font(&mut self, family: String, cx: &mut Context<Self>) {
+        if let Some(state) = self.settings_dialog.as_mut() {
+            state.draft.font.family = family;
+            state.font_popup_open = false;
+            state.font_query.set_text("");
+            state.error = None;
+            cx.notify();
+        }
+    }
+
+    /// Move the font popup highlight up/down, clamped to the visible
+    /// rows (the pinned "(built-in default)" row at index 0 plus the
+    /// filtered options).
+    pub fn settings_move_font_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(state) = self.settings_dialog.as_mut() else { return };
+        let max = state.filtered_fonts().len() as isize; // pinned row makes len + 1 rows
+        let next = (state.font_selected_idx as isize + delta).clamp(0, max);
+        state.font_selected_idx = next as usize;
+        cx.notify();
+    }
+
+    /// Resolve the highlighted popup row into a selection (Enter).
+    /// Index 0 is the pinned "(built-in default)" row → empty family;
+    /// indices 1.. point into the filtered list.
+    pub fn settings_confirm_font_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.settings_dialog.as_mut() else { return };
+        if !state.font_popup_open {
+            return;
+        }
+        let idx = state.font_selected_idx;
+        let chosen = if idx == 0 {
+            Some(String::new())
+        } else {
+            state.filtered_fonts().get(idx - 1).map(|name| (*name).clone())
+        };
+        if let Some(family) = chosen {
+            self.settings_select_font(family, cx);
         }
     }
 
@@ -433,6 +599,7 @@ impl AppShell {
         let focus_handle = state.focus_handle.clone();
         let draft = state.draft.clone();
         let focused_field = state.focused_field;
+        let font_popup_open = state.font_popup_open;
         let error_msg: Option<SharedString> = state.error.clone().map(Into::into);
         let blink_phase = self.text_blink_phase;
 
@@ -539,7 +706,9 @@ impl AppShell {
                        placeholder: &'static str,
                        this_field: SettingsField|
          -> gpui::Stateful<gpui::Div> {
-            let is_focused = focused_field == this_field;
+            // The open font popup owns the keyboard, so no numeric
+            // field shows a focus ring / caret while it's up.
+            let is_focused = focused_field == this_field && !font_popup_open;
             let mut style = focused_caret_style(theme, blink_phase);
             style.show_caret = is_focused && blink_phase;
             div()
@@ -577,12 +746,54 @@ impl AppShell {
                 ))
         };
 
-        let font_family_input = textbox(
-            "settings-font-family",
-            &state.font_family_field,
-            "FiraCode Nerd Font",
-            SettingsField::FontFamily,
-        );
+        // FONT FAMILY — clickable pill that toggles the dropdown
+        // popup. The current selection renders inline; a chevron
+        // hints that it's a dropdown. Mirrors `nw-base-trigger` in
+        // `new_worktree.rs`.
+        let font_trigger_label: SharedString = if draft.font.family.is_empty() {
+            "(built-in default)".into()
+        } else {
+            draft.font.family.clone().into()
+        };
+        let font_trigger = div()
+            .id("settings-font-family")
+            .px_3()
+            .h(px(32.0))
+            .bg(canvas)
+            .border_1()
+            .border_color(if font_popup_open { accent } else { divider })
+            .rounded(px(6.0))
+            .text_size(px(13.0))
+            .text_color(ink)
+            .cursor_pointer()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.settings_toggle_font_popup(cx);
+                }),
+            )
+            .child(div().flex_grow().truncate().child(font_trigger_label))
+            .child(div().text_color(ink_ghost).child("▾"))
+            .child({
+                // Invisible full-size overlay that records the pill's
+                // screen-space bounds at paint time so the popup can
+                // anchor itself under the pill next frame (see the
+                // `font_trigger_bounds` field docs).
+                // `gpui::canvas` written out — the `canvas` binding
+                // in this scope is the theme colour.
+                let bounds_cell = state.font_trigger_bounds.clone();
+                gpui::canvas(
+                    move |bounds, _, _| bounds_cell.set(Some(bounds)),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full()
+            });
         let font_size_input = textbox(
             "settings-font-size",
             &state.font_size_field,
@@ -715,7 +926,7 @@ impl AppShell {
             .gap_2()
             .flex_grow()
             .child(field_label("FONT FAMILY"))
-            .child(font_family_input)
+            .child(font_trigger)
             .child(hint(fallbacks_hint))
             .child(
                 div()
@@ -850,11 +1061,240 @@ impl AppShell {
             )
             .child(card);
 
-        Some(
+        // Optional font popup, layered above the dialog as a separate
+        // `deferred` at higher priority (the idiom of the base-branch
+        // popup in `new_worktree.rs`), anchored under the trigger
+        // pill via the bounds its canvas overlay recorded last frame.
+        let popup = font_popup_open
+            .then(|| self.render_font_popup(state, theme, viewport, cx));
+
+        let mut layers: Vec<gpui::AnyElement> = Vec::new();
+        layers.push(
             deferred(anchored().position(point(px(0.0), px(0.0))).child(backdrop))
                 .with_priority(10)
                 .into_any_element(),
+        );
+        if let Some(p) = popup {
+            layers.push(p);
+        }
+
+        Some(div().children(layers).into_any_element())
+    }
+
+    /// Build the FONT FAMILY dropdown popover: a type-to-filter
+    /// search row on top of a scrollable list of every installed
+    /// font family. The keyboard-highlighted row gets a frost
+    /// backdrop; the currently-configured family is tinted accent so
+    /// the user can find "what do I have now" while browsing.
+    fn render_font_popup(
+        &self,
+        state: &SettingsDialogState,
+        theme: &Arc<Theme>,
+        viewport: gpui::Size<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let elevated = theme::elevated(theme);
+        let divider = theme::divider(theme);
+        let ink = theme::ink(theme);
+        let ink_muted = theme::ink_muted(theme);
+        let frost = theme::frost_10(theme);
+        let accent = theme::accent(theme);
+        let canvas = theme::canvas(theme);
+
+        let filtered = state.filtered_fonts();
+        let selected_idx = state.font_selected_idx;
+        let current_family = state.draft.font.family.clone();
+
+        // Search row — same caret discipline as the numeric inputs.
+        let mut search_style = focused_caret_style(theme, self.text_blink_phase);
+        search_style.show_caret = self.text_blink_phase;
+        let search = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .h(px(32.0))
+            .border_b_1()
+            .border_color(divider)
+            .bg(canvas)
+            .text_size(px(12.0))
+            .child(render_input_content(
+                &state.font_query,
+                SharedString::from("Filter fonts…"),
+                search_style,
+            ));
+
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        // Index 0: pinned "(built-in default)" row — always visible
+        // regardless of filter (the C#-era `(HEAD)` pin idiom from
+        // the base-branch popup) so the user can clear back to the
+        // default chain without emptying the query first. Selecting
+        // it stores an empty family.
+        {
+            let is_current = current_family.is_empty();
+            let active = selected_idx == 0;
+            rows.push(
+                div()
+                    .id("settings-font-row-default")
+                    .h(px(28.0))
+                    .px_3()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(12.0))
+                    .text_color(if is_current { accent } else { ink_muted })
+                    .bg(if active { frost } else { gpui::transparent_black() })
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.settings_select_font(String::new(), cx);
+                        }),
+                    )
+                    .child(div().flex_grow().truncate().child("(built-in default)"))
+                    .into_any_element(),
+            );
+        }
+        for (idx, name) in filtered.iter().enumerate() {
+            let is_current = **name == current_family;
+            // Visible index is offset by the pinned row above.
+            let active = idx + 1 == selected_idx;
+            let bg = if active { frost } else { gpui::transparent_black() };
+            let name_for_handler = (*name).clone();
+            let label: SharedString = (*name).clone().into();
+            rows.push(
+                div()
+                    .id(("settings-font-row", id_hash(name)))
+                    .h(px(28.0))
+                    .px_3()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(12.0))
+                    .text_color(if is_current { accent } else { ink })
+                    .bg(bg)
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.settings_select_font(name_for_handler.clone(), cx);
+                        }),
+                    )
+                    .child(
+                        // The name renders in its own family so the
+                        // list doubles as a live preview — gpui falls
+                        // back per-glyph for faces that fail to load,
+                        // so a stale entry still reads fine. Shaped
+                        // lines are cached across frames, so the cost
+                        // is a first-open shape per visible row.
+                        div()
+                            .flex_grow()
+                            .truncate()
+                            .font_family((*name).clone())
+                            .child(label),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if filtered.is_empty() {
+            rows.push(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(12.0))
+                    .text_color(ink_muted)
+                    .child("No fonts match the filter.")
+                    .into_any_element(),
+            );
+        }
+
+        // Anchor under the trigger pill using the bounds its canvas
+        // overlay recorded last frame; match the pill's width so the
+        // popup reads as an extension of it. First-ever frame (cell
+        // still empty) falls back to a centred position — in practice
+        // unreachable, since the pill paints before the popup can be
+        // opened.
+        let trigger = state.font_trigger_bounds.get();
+        let popup_w = trigger.map(|b| f32::from(b.size.width)).unwrap_or(360.0);
+        let popup = div()
+            .w(px(popup_w))
+            .max_h(px(320.0))
+            .bg(elevated)
+            .border_1()
+            .border_color(divider)
+            .rounded_md()
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .child(search)
+            .child(
+                // Stateful + `overflow_y_scroll` so an OS with more
+                // fonts than fit in `max_h(320)` still lets the user
+                // reach every row by mouse. Stable id so gpui can
+                // persist the scroll offset across renders.
+                div()
+                    .id("settings-font-popup-rows")
+                    .flex_grow()
+                    .flex()
+                    .flex_col()
+                    .py_1()
+                    .overflow_y_scroll()
+                    .children(rows),
+            );
+
+        let viewport_w: f32 = viewport.width.into();
+        let position = trigger
+            .map(|b| point(b.left(), b.bottom() + px(4.0)))
+            .unwrap_or_else(|| point(px(((viewport_w - popup_w) / 2.0).max(8.0)), px(80.0)));
+
+        // Transparent full-window click-catcher between the dialog
+        // backdrop (priority 10) and the popup (priority 20). A click
+        // outside the popup lands here and just dismisses the popup —
+        // without it the click would fall through to the backdrop and
+        // cancel the whole dialog, discarding the user's edits. The
+        // popup's own mouse-down handler stops propagation, so clicks
+        // inside it never reach this layer.
+        let click_catcher = deferred(
+            anchored().position(point(px(0.0), px(0.0))).child(
+                div()
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.settings_toggle_font_popup(cx);
+                        }),
+                    ),
+            ),
         )
+        .with_priority(15)
+        .into_any_element();
+
+        let popup_layer = deferred(
+            anchored()
+                .position(position)
+                // Keep the popup inside the window when the dialog
+                // sits low — gpui shifts (or flips) it as needed.
+                .snap_to_window_with_margin(px(8.0))
+                .child(popup),
+        )
+        .with_priority(20)
+        .into_any_element();
+
+        div()
+            .children([click_catcher, popup_layer])
+            .into_any_element()
     }
 }
 
@@ -868,6 +1308,15 @@ fn handle_key_down(
 ) {
     let key = event.keystroke.key.as_str();
     cx.stop_propagation();
+
+    // Snapshot popup state up front — the font popup has its own
+    // keyboard model (Up/Down/Enter/Escape) layered over the
+    // dialog's, mirroring the base-branch popup in `new_worktree.rs`.
+    let popup_open = shell
+        .settings_dialog
+        .as_ref()
+        .map(|s| s.font_popup_open)
+        .unwrap_or(false);
 
     if crate::text_field::is_paste_chord(&event.keystroke) {
         let pasted = cx.read_from_clipboard().and_then(|item| item.text());
@@ -883,15 +1332,36 @@ fn handle_key_down(
 
     match key {
         "escape" => {
-            shell.cancel_settings_dialog(cx);
+            // Escape inside an open popup just closes the popup;
+            // otherwise it cancels the whole dialog.
+            if popup_open {
+                shell.settings_toggle_font_popup(cx);
+            } else {
+                shell.cancel_settings_dialog(cx);
+            }
             return;
         }
         "enter" => {
-            shell.submit_settings_dialog(cx);
+            if popup_open {
+                shell.settings_confirm_font_selection(cx);
+            } else {
+                shell.submit_settings_dialog(cx);
+            }
+            return;
+        }
+        "up" if popup_open => {
+            shell.settings_move_font_selection(-1, cx);
+            return;
+        }
+        "down" if popup_open => {
+            shell.settings_move_font_selection(1, cx);
             return;
         }
         "tab" => {
-            if let Some(state) = shell.settings_dialog.as_mut() {
+            // Skip when the popup is open — it owns the keyboard.
+            if !popup_open
+                && let Some(state) = shell.settings_dialog.as_mut()
+            {
                 let forward = !event.keystroke.modifiers.shift;
                 state.cycle_field(forward);
                 cx.notify();
@@ -1104,6 +1574,66 @@ mod tests {
         let three = vec!["A".to_string(), "B".to_string(), "C".to_string()];
         let hint = format_fallbacks_hint(&three);
         assert!(!hint.contains("more"), "{hint}");
+    }
+
+    #[test]
+    fn build_font_options_keeps_installed_list_when_current_present() {
+        let installed = vec!["Consolas".to_string(), "FiraCode Nerd Font".to_string()];
+        let options = build_font_options(installed.clone(), "Consolas");
+        assert_eq!(options, installed);
+    }
+
+    #[test]
+    fn build_font_options_prepends_missing_current_family() {
+        let installed = vec!["Consolas".to_string()];
+        let options = build_font_options(installed, "Uninstalled Font");
+        assert_eq!(options[0], "Uninstalled Font");
+        assert_eq!(options.len(), 2);
+    }
+
+    #[test]
+    fn build_font_options_ignores_empty_current_family() {
+        // Empty family = "use the built-in default chain"; the
+        // dropdown must not grow a blank row for it.
+        let installed = vec!["Consolas".to_string()];
+        let options = build_font_options(installed, "");
+        assert_eq!(options, vec!["Consolas".to_string()]);
+    }
+
+    #[test]
+    fn build_font_options_treats_whitespace_only_current_as_empty() {
+        // A hand-edited `"  "` family means "cleared" to the font-
+        // config builder (`push_non_empty_font_candidate` trims), so
+        // it must not surface as a blank-looking option here either.
+        let installed = vec!["Consolas".to_string()];
+        let options = build_font_options(installed, "   ");
+        assert_eq!(options, vec!["Consolas".to_string()]);
+    }
+
+    #[test]
+    fn filter_fonts_is_case_insensitive_substring() {
+        let options = vec![
+            "Cascadia Mono".to_string(),
+            "Consolas".to_string(),
+            "FiraCode Nerd Font".to_string(),
+        ];
+        let hits = filter_fonts(&options, "cas");
+        assert_eq!(hits, vec![&options[0]]);
+        let hits = filter_fonts(&options, "NERD");
+        assert_eq!(hits, vec![&options[2]]);
+    }
+
+    #[test]
+    fn filter_fonts_blank_query_matches_everything() {
+        let options = vec!["A".to_string(), "B".to_string()];
+        assert_eq!(filter_fonts(&options, "").len(), 2);
+        assert_eq!(filter_fonts(&options, "   ").len(), 2);
+    }
+
+    #[test]
+    fn filter_fonts_no_match_yields_empty() {
+        let options = vec!["Consolas".to_string()];
+        assert!(filter_fonts(&options, "zzz").is_empty());
     }
 
     #[test]
