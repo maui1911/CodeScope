@@ -300,6 +300,42 @@ pub fn rename_project(
     Ok(true)
 }
 
+/// Update a remote-shell project's stored base command (#327). Trims
+/// whitespace, validates through [`is_valid_remote_shell_command`]
+/// (non-empty, single-line), and refuses non-remote-shell projects —
+/// a local project's `command` slot is meaningless and writing it
+/// would only confuse a later migration. Returns `Ok(true)` when the
+/// command actually changed (callers should persist), `Ok(false)` for
+/// a no-op, and `Err` for an unknown id, invalid command, or a
+/// project of the wrong kind.
+///
+/// Tabs already running keep their old command — the edit applies to
+/// the next session opened from the sidebar row, same as editing the
+/// command by remove + re-add did before this existed.
+pub fn set_remote_shell_command(
+    cfg: &mut ProjectsConfig,
+    project_id: &str,
+    new_command: &str,
+) -> Result<bool> {
+    let trimmed = new_command.trim();
+    if !is_valid_remote_shell_command(trimmed) {
+        anyhow::bail!("command cannot be empty");
+    }
+    let project = cfg
+        .projects
+        .iter_mut()
+        .find(|p| p.id == project_id)
+        .ok_or_else(|| anyhow::anyhow!("project '{project_id}' not found"))?;
+    if !project.is_remote_shell() {
+        anyhow::bail!("project '{project_id}' is not a remote-shell project");
+    }
+    if project.command.as_deref() == Some(trimmed) {
+        return Ok(false);
+    }
+    project.command = Some(trimmed.to_string());
+    Ok(true)
+}
+
 /// One git worktree under a [`Project`]. Every project carries an
 /// explicit primary row (`is_primary: true`) pointing at
 /// `Project::path` plus zero or more additional worktrees with
@@ -760,6 +796,36 @@ mod tests {
         assert_eq!(p.remote_shell_command(), None);
         p.command = None;
         assert_eq!(p.remote_shell_command(), None);
+    }
+
+    #[test]
+    fn set_remote_shell_command_updates_and_reports_change() {
+        let p = Project::new_remote_shell("dev".into(), "ssh old".into(), None);
+        let id = p.id.clone();
+        let mut cfg = ProjectsConfig { version: 1, agents: vec![], projects: vec![p] };
+
+        assert!(set_remote_shell_command(&mut cfg, &id, "  ssh new-box  ").expect("update"));
+        assert_eq!(cfg.projects[0].remote_shell_command(), Some("ssh new-box"));
+        // Same trimmed value again → no-op.
+        assert!(!set_remote_shell_command(&mut cfg, &id, "ssh new-box").expect("no-op"));
+    }
+
+    #[test]
+    fn set_remote_shell_command_rejects_empty_unknown_and_local() {
+        let remote = Project::new_remote_shell("dev".into(), "ssh box".into(), None);
+        let remote_id = remote.id.clone();
+        let local = Project::new("C:\\repo".into());
+        let local_id = local.id.clone();
+        let mut cfg =
+            ProjectsConfig { version: 1, agents: vec![], projects: vec![remote, local] };
+
+        assert!(set_remote_shell_command(&mut cfg, &remote_id, "   ").is_err());
+        assert!(set_remote_shell_command(&mut cfg, &remote_id, "ssh a\nssh b").is_err());
+        assert!(set_remote_shell_command(&mut cfg, "nope", "ssh x").is_err());
+        assert!(set_remote_shell_command(&mut cfg, &local_id, "ssh x").is_err());
+        // Nothing was mutated by the failed calls.
+        assert_eq!(cfg.projects[0].remote_shell_command(), Some("ssh box"));
+        assert_eq!(cfg.projects[1].command, None);
     }
 
     #[test]

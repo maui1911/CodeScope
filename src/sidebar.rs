@@ -388,6 +388,10 @@ pub enum RenameRequest {
     /// Rename a session's display-name override (live or closed).
     /// Mirrors C# `RenameSessionCommand`.
     Session { session_id: String },
+    /// Edit a remote-shell project's stored base command (#327).
+    /// Reuses the rename dialog as the single-input editor; submit
+    /// goes through `codescope_core::projects::set_remote_shell_command`.
+    RemoteCommand { project_id: String },
 }
 
 /// Toast severity emitted by the sidebar. AppShell maps these to its
@@ -4367,6 +4371,14 @@ impl Sidebar {
         let command_for_copy = self.agent_registry.assemble_remote_command(project);
         let project_id_rename = project.id.clone();
         let current_name = project.name.clone();
+        // Edit pre-fills with the stored *base* command (`ssh dev`),
+        // not the assembled one with the agent wrapper — the wrapper
+        // is derived and would get double-applied if saved back.
+        let project_id_edit = project.id.clone();
+        let current_command = project
+            .remote_shell_command()
+            .unwrap_or_default()
+            .to_string();
 
         let menu_body = div()
             .flex()
@@ -4427,6 +4439,24 @@ impl Sidebar {
                 false,
                 Box::new(move |this, _window, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(command_for_copy.clone()));
+                    this.close_menu(cx);
+                }),
+            ))
+            // "Edit command…" — change the stored base command without
+            // remove + re-add (#327). Reuses the rename dialog as the
+            // single-input editor; running tabs keep their old
+            // command, the next opened session uses the new one.
+            .child(item(
+                "remote-menu-edit-command",
+                "Edit command…",
+                false,
+                Box::new(move |this, _window, cx| {
+                    cx.emit(SidebarEvent::OpenRenameDialog {
+                        target: RenameRequest::RemoteCommand {
+                            project_id: project_id_edit.clone(),
+                        },
+                        current_name: current_command.clone(),
+                    });
                     this.close_menu(cx);
                 }),
             ))
