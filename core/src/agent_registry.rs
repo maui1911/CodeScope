@@ -103,9 +103,10 @@ impl AgentRegistry {
     }
 
     /// Construct the registry with the shipped built-in defaults
-    /// (claude / codex / opencode / copilot / pi / gemini).
-    /// Equivalent to the C# parameterless `new AgentRegistry()`
-    /// constructor.
+    /// (claude / codex / opencode / copilot / pi / gemini). Matches
+    /// the C# parameterless `new AgentRegistry()` constructor for
+    /// the five legacy agents; `gemini` is a Rust-port addition
+    /// (#324) with no C# counterpart.
     pub fn with_built_ins() -> Self {
         Self::new(built_in_defaults())
     }
