@@ -73,6 +73,7 @@ impl RenameDialogState {
         let title: SharedString = match &target {
             RenameRequest::Project { .. } => "Rename project".into(),
             RenameRequest::Session { .. } => "Rename session".into(),
+            RenameRequest::RemoteCommand { .. } => "Edit remote command".into(),
         };
         Self {
             focus_handle,
@@ -84,7 +85,12 @@ impl RenameDialogState {
         }
     }
 
-    /// Rename is allowed when the trimmed name is non-empty. The
+    /// Rename is allowed when the trimmed name is non-empty; the
+    /// remote-command target additionally validates the buffer
+    /// through `is_valid_remote_shell_command` (single-line) — the
+    /// same rule the Add-project dialog applies, so the Save button
+    /// can't claim a multi-line paste is fine only for submit to
+    /// reject it. The
     /// "no-op when unchanged" rule mirrors the C# build's
     /// `string.Equals(newLeaf, currentLeaf, StringComparison.Ordinal)`
     /// guard — handled at submit time so the button stays enabled
@@ -93,7 +99,34 @@ impl RenameDialogState {
     /// in returning `bool` rather than `Result` so the render path
     /// stays branch-free.
     pub fn is_valid(&self) -> bool {
-        !self.name.text().trim().is_empty()
+        match &self.target {
+            RenameRequest::RemoteCommand { .. } => {
+                codescope_core::projects::is_valid_remote_shell_command(self.name.text())
+            }
+            _ => !self.name.text().trim().is_empty(),
+        }
+    }
+
+    /// Per-target chrome strings — (eyebrow, hint, field label, OK
+    /// button). The dialog started as a rename primitive; the
+    /// remote-command editor (#327) reuses its skeleton with editing
+    /// vocabulary so the header doesn't claim a "rename".
+    fn chrome(&self) -> (&'static str, &'static str, &'static str, &'static str) {
+        match &self.target {
+            RenameRequest::RemoteCommand { .. } => (
+                "EDIT",
+                "Change the command this project runs (e.g. `ssh dev`). \
+                 Open tabs keep the old command; the next session uses the new one.",
+                "COMMAND",
+                "Save",
+            ),
+            _ => (
+                "RENAME",
+                "Enter a new name. Press Enter to confirm.",
+                "NEW NAME",
+                "Rename",
+            ),
+        }
     }
 }
 
@@ -140,7 +173,10 @@ impl AppShell {
         let trimmed = state.name.text().trim().to_string();
         if trimmed.is_empty() {
             if let Some(state) = self.rename_dialog.as_mut() {
-                state.error = Some("Name cannot be empty".into());
+                state.error = Some(match &state.target {
+                    RenameRequest::RemoteCommand { .. } => "Command cannot be empty".into(),
+                    _ => "Name cannot be empty".into(),
+                });
             }
             cx.notify();
             return;
@@ -179,6 +215,34 @@ impl AppShell {
                 };
                 if !changed {
                     // No-op — close silently. Matches the C# guard.
+                    self.rename_dialog = None;
+                    cx.notify();
+                    return;
+                }
+                if let Err(err) = self.projects.save(self.paths_ref().as_ref()) {
+                    if let Some(state) = self.rename_dialog.as_mut() {
+                        state.error = Some(format!("Failed to save: {err:#}"));
+                    }
+                    cx.notify();
+                    return;
+                }
+            }
+            RenameRequest::RemoteCommand { project_id } => {
+                let changed = match codescope_core::projects::set_remote_shell_command(
+                    &mut self.projects,
+                    &project_id,
+                    &trimmed,
+                ) {
+                    Ok(changed) => changed,
+                    Err(err) => {
+                        if let Some(state) = self.rename_dialog.as_mut() {
+                            state.error = Some(format!("{err:#}"));
+                        }
+                        cx.notify();
+                        return;
+                    }
+                };
+                if !changed {
                     self.rename_dialog = None;
                     cx.notify();
                     return;
@@ -249,6 +313,7 @@ impl AppShell {
 
         let focus_handle = state.focus_handle.clone();
         let title = state.title.clone();
+        let (eyebrow, hint, field_label_text, ok_label) = state.chrome();
         let valid = state.is_valid();
         let error_msg: Option<SharedString> = state.error.clone().map(Into::into);
         let blink_phase = self.text_blink_phase;
@@ -264,20 +329,20 @@ impl AppShell {
                 div()
                     .text_size(px(11.0))
                     .text_color(accent)
-                    .child("RENAME"),
+                    .child(eyebrow),
             )
             .child(div().text_size(px(20.0)).text_color(ink).child(title))
             .child(
                 div()
                     .text_size(px(12.0))
                     .text_color(ink_muted)
-                    .child("Enter a new name. Press Enter to confirm."),
+                    .child(hint),
             );
 
         let field_label = div()
             .text_size(px(11.0))
             .text_color(ink_ghost)
-            .child("NEW NAME");
+            .child(field_label_text);
 
         // Single-line text input. Always focused (only one field), so
         // the caret is always painted — blink phase still flips it on
@@ -369,7 +434,7 @@ impl AppShell {
                     }),
                 );
             }
-            btn.child("Rename")
+            btn.child(ok_label)
         };
 
         let footer_buttons = div()
