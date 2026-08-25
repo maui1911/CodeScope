@@ -311,10 +311,14 @@ while read -r pr; do
     done < "$work/issues"
 done < "$work/prs"
 
-# Numeric on both keys so a PR closing #9 and #10 lists them in that order, and
-# `-u` on (pr, issue) rather than the whole line: an issue has exactly one
-# author, so that pair is already the identity of a credit line.
-sort -u -t$'\t' -k1,1n -k2,2n "$work/credits" > "$work/credits-sorted"
+# One line per issue, not per (pr, issue): the release-bump PR repeats the
+# whole changelog in its body, so every issue in the release gets closed a
+# second time by that PR and would be thanked twice. Keep the lowest PR per
+# issue — the fix always merges before the bump. Numeric keys so a PR closing
+# #9 and #10 lists them in that order.
+sort -t$'\t' -k2,2n -k1,1n "$work/credits" \
+    | awk -F'\t' '!seen[$2]++' \
+    | sort -t$'\t' -k1,1n -k2,2n > "$work/credits-sorted"
 
 : > "$work/thanks"
 if [[ -s "$work/credits-sorted" ]]; then
