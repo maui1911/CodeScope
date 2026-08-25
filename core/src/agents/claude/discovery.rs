@@ -132,14 +132,24 @@ pub enum TranscriptOrigin {
 /// multi-megabyte file on every 350 ms poll.
 const ORIGIN_PEEK_LINES: usize = 64;
 
+/// Bytes to inspect before giving up. `BufRead::lines` buffers a whole
+/// line, so without a byte ceiling a corrupt or hostile transcript with
+/// no newline in it would be read into memory in full on every poll.
+/// The decisive line is the *first* `user` turn, and for SDK reviews
+/// that line carries the entire diff under review — the largest one in
+/// the reporting store is ~380 KiB — so the cap sits an order of
+/// magnitude above that. A transcript whose decisive line straddles
+/// the cap classifies as `Unknown` (torn JSON), i.e. adoptable.
+const ORIGIN_PEEK_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Classify a transcript by the first `entrypoint` field within its
 /// head. See [`TranscriptOrigin`] for what each variant means.
 pub fn transcript_origin(path: &Path) -> TranscriptOrigin {
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Read};
     let Ok(file) = std::fs::File::open(path) else {
         return TranscriptOrigin::Unknown;
     };
-    let reader = BufReader::new(file);
+    let reader = BufReader::new(file.take(ORIGIN_PEEK_BYTES));
     for line in reader.lines().take(ORIGIN_PEEK_LINES) {
         // A read error (or invalid UTF-8) ends the peek; whatever we
         // saw before it wasn't decisive, so fall through to Unknown.
@@ -418,6 +428,33 @@ mod tests {
         body.push_str(SDK_HEAD);
         let path = write_transcript(tmp.path(), SID_A, &body);
         assert_eq!(transcript_origin(&path), TranscriptOrigin::Unknown);
+    }
+
+    #[test]
+    fn origin_gives_up_after_byte_cap() {
+        let tmp = TempDir::new().unwrap();
+        // One newline-free line past the cap, followed by a decisive
+        // SDK head we must never reach. Buffered `lines()` would
+        // otherwise slurp the whole thing.
+        let mut body = "{\"type\":\"mode\",\"pad\":\"".to_owned();
+        body.push_str(&"x".repeat(ORIGIN_PEEK_BYTES as usize + 1));
+        body.push_str("\"}\n");
+        body.push_str(SDK_HEAD);
+        let path = write_transcript(tmp.path(), SID_A, &body);
+        assert_eq!(transcript_origin(&path), TranscriptOrigin::Unknown);
+    }
+
+    #[test]
+    fn origin_classifies_large_sdk_first_turn_under_cap() {
+        let tmp = TempDir::new().unwrap();
+        // A review of a big diff: ~1 MiB user line, well inside the
+        // cap, with `entrypoint` after the payload as Claude writes it.
+        let body = format!(
+            "{{\"type\":\"user\",\"message\":{{\"content\":\"{}\"}},\"entrypoint\":\"sdk-py\"}}\n",
+            "d".repeat(1024 * 1024)
+        );
+        let path = write_transcript(tmp.path(), SID_A, &body);
+        assert_eq!(transcript_origin(&path), TranscriptOrigin::Sdk);
     }
 
     #[test]
