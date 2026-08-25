@@ -422,22 +422,51 @@ impl GitStatus {
 /// Typical total under 30 ms on local repos.
 pub fn git_status(repo: &Path) -> Result<Option<GitStatus>> {
     // ── 0. Early repo probe ────────────────────────────────────────
-    // `rev-parse --is-inside-work-tree` exits 0 / prints "true" only
-    // inside an actual worktree. We want three outcomes here:
-    //   * Ok(None)  — git ran, but this path isn't inside a worktree
-    //                  (covers "not a repo", "missing dir", and the
-    //                  default-status "false" case).
-    //   * Err       — git itself failed to start (binary missing).
-    //   * Ok(Some)  — happy path, fall through.
-    // We can't go through `run_git` because it wraps non-zero exit as
-    // `Err`, which would collapse "not a worktree" into the I/O bucket.
-    //
-    // Both "git missing" and "cwd doesn't exist" can surface as
-    // `ErrorKind::NotFound` from `Command::output()` — pre-checking
-    // the directory disambiguates them so we don't misclassify a
-    // missing repo path as a missing git binary.
-    if !repo.is_dir() {
+    // Gates the three follow-up queries; see `is_work_tree` for the
+    // outcome mapping. `Ok(false)` becomes `Ok(None)` here so callers
+    // keep one "nothing to show" shape.
+    if !is_work_tree(repo)? {
         return Ok(None);
+    }
+
+    // ── 1. Current branch ──────────────────────────────────────────
+    let (branch, detached) = current_branch(repo);
+
+    // ── 2. numstat diff against HEAD ───────────────────────────────
+    let (added, removed, has_changes) = numstat_summary(repo);
+
+    // ── 3. Ahead / behind upstream ─────────────────────────────────
+    let (ahead, behind, has_upstream) = ahead_behind(repo);
+
+    Ok(Some(GitStatus { branch, detached, added, removed, has_changes, ahead, behind, has_upstream }))
+}
+
+/// `git rev-parse --is-inside-work-tree` — is `repo` inside a git
+/// working tree at all?
+///
+/// Three outcomes:
+/// * `Ok(true)` — git ran and printed `true`.
+/// * `Ok(false)` — git ran but this path isn't inside a worktree
+///   (covers "not a repo", a missing directory, and the `false` git
+///   prints inside a bare `.git`), or git couldn't look at the path
+///   (permissions).
+/// * `Err` — git itself failed to start (binary missing).
+///
+/// We can't go through `run_git` because it wraps non-zero exit as
+/// `Err`, which would collapse "not a worktree" into the I/O bucket.
+/// Both "git missing" and "cwd doesn't exist" can surface as
+/// `ErrorKind::NotFound` from `Command::output()` — pre-checking the
+/// directory disambiguates them so a missing repo path isn't
+/// misclassified as a missing git binary.
+///
+/// The sidebar runs this once when a project is added and the
+/// git-status poller re-runs it on a slow cadence, so a project that
+/// is a plain folder — a home directory, a sync folder with repos
+/// nested one level down — stops being polled and loses its git-only
+/// UI (#338).
+pub fn is_work_tree(repo: &Path) -> Result<bool> {
+    if !repo.is_dir() {
+        return Ok(false);
     }
     let probe = match no_window_command("git")
         .args(["rev-parse", "--is-inside-work-tree"])
@@ -452,26 +481,12 @@ pub fn git_status(repo: &Path) -> Result<Option<GitStatus>> {
         // Other spawn errors (PermissionDenied, etc) are also "git
         // can't look at this path" — caller treats that the same as
         // "not a worktree" and retries on the next poll tick.
-        Err(_) => return Ok(None),
+        Err(_) => return Ok(false),
     };
     if !probe.status.success() {
-        return Ok(None);
+        return Ok(false);
     }
-    let probe_stdout = String::from_utf8_lossy(&probe.stdout);
-    if probe_stdout.trim() != "true" {
-        return Ok(None);
-    }
-
-    // ── 1. Current branch ──────────────────────────────────────────
-    let (branch, detached) = current_branch(repo);
-
-    // ── 2. numstat diff against HEAD ───────────────────────────────
-    let (added, removed, has_changes) = numstat_summary(repo);
-
-    // ── 3. Ahead / behind upstream ─────────────────────────────────
-    let (ahead, behind, has_upstream) = ahead_behind(repo);
-
-    Ok(Some(GitStatus { branch, detached, added, removed, has_changes, ahead, behind, has_upstream }))
+    Ok(String::from_utf8_lossy(&probe.stdout).trim() == "true")
 }
 
 /// `git symbolic-ref --short HEAD` → `(short branch name, false)`.
@@ -822,6 +837,26 @@ some-future-field foo bar\n";
     /// Returns the tempdir guard (drop = cleanup), the absolute repo
     /// path, and the absolute worktrees-root path (already created so
     /// `git worktree add` doesn't have to).
+    /// A plain folder is not a worktree; a freshly initialised repo
+    /// is; a path that doesn't exist is reported as "not a worktree"
+    /// rather than as a git failure (#338).
+    #[test]
+    fn is_work_tree_distinguishes_folder_repo_and_missing() {
+        let Some((dir, repo, _)) = init_repo() else { return };
+        assert!(is_work_tree(&repo).unwrap());
+        let plain = dir.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(!is_work_tree(&plain).unwrap());
+        assert!(!is_work_tree(&dir.path().join("missing")).unwrap());
+        // Nested one level below a plain folder doesn't make the
+        // parent a worktree — git only walks *upwards*.
+        let parent = dir.path().join("parent");
+        std::fs::create_dir_all(parent.join("nested")).unwrap();
+        run(&parent.join("nested"), &["init", "-q"]);
+        assert!(!is_work_tree(&parent).unwrap());
+        assert!(is_work_tree(&parent.join("nested")).unwrap());
+    }
+
     fn init_repo() -> Option<(TempDir, std::path::PathBuf, std::path::PathBuf)> {
         if no_window_command("git").arg("--version").output().is_err() {
             eprintln!("skipping: `git` not on PATH");
