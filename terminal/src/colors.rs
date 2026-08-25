@@ -309,9 +309,11 @@ pub fn ensure_min_contrast(fg: Hsla, bg: Hsla, min_ratio: f32) -> Hsla {
             lo = mid;
         }
     }
-    // `hi` is the last blend known to clear the ratio — or 1.0 (the
-    // pole itself) when even full white/black can't reach it, which
-    // is still the best available answer.
+    // `hi` converges on the smallest blend found to clear the ratio
+    // (each clearing candidate lowers it). If no candidate cleared,
+    // `hi` stays 1.0 — the pole itself, which even then may fall
+    // short of an unreachable `min_ratio`, but is the closest
+    // available answer.
     Hsla::from(blend(hi))
 }
 
