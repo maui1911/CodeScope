@@ -3509,8 +3509,10 @@ impl AppShell {
     /// settings and theme `Arc`s, and forwards the new theme to the
     /// sidebar so its chrome repaints in the same frame. Running
     /// terminals get the new palette pushed via
-    /// `push_palette_to_terminals` so the grid recolours live too;
-    /// font changes still take effect on next spawn only.
+    /// `push_palette_to_terminals` so the grid recolours live too,
+    /// and a changed font is pushed via `push_font_to_terminals` so
+    /// the grids restyle in place; scrollback still applies to new
+    /// tabs only.
     pub(crate) fn apply_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
         let theme = Arc::new(codescope_core::theme::builtin::by_name(&settings.theme));
         // Rebuild the AgentRegistry from the new settings so the

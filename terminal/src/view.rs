@@ -300,7 +300,7 @@ impl TerminalView {
         self.refresh_snapshot(cx);
     }
 
-    /// Swap the font config on a running terminal. The palette
+    /// Swap the font config on a running terminal. The font
     /// counterpart of [`Self::set_palette`] — the app shell calls
     /// this for every open tab when the user saves a font change in
     /// Settings, so the grids re-render in the new face immediately
