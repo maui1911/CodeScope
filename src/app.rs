@@ -2194,13 +2194,13 @@ impl AppShell {
                             let Some(ref wd) = tab.working_directory else { continue };
                             // Codex / Gemini have no discovery wired
                             // in the Rust port yet — skip before
-                            // flipping `any_active`, otherwise an
-                            // all-Codex workspace would pin the poll
-                            // at the 350 ms active rate while the
-                            // loop does no work. Drop them through
-                            // with the same "no agent" handling so
-                            // the cadence relaxes to the 5 s idle
-                            // interval.
+                            // flipping `any_active`, otherwise a
+                            // workspace of only Codex/Gemini tabs
+                            // would pin the poll at the 350 ms active
+                            // rate while the loop does no work. Drop
+                            // them through with the same "no agent"
+                            // handling so the cadence relaxes to the
+                            // 5 s idle interval.
                             if matches!(
                                 agent_id,
                                 codescope_core::AgentId::Codex | codescope_core::AgentId::Gemini
@@ -2271,10 +2271,11 @@ impl AppShell {
                                 | codescope_core::AgentId::Gemini => {
                                     // Unreachable: short-circuited
                                     // above so the active-poll rate
-                                    // doesn't stay pinned for an
-                                    // all-Codex workspace. Kept as a
-                                    // belt-and-braces fallback in case
-                                    // someone removes the early skip.
+                                    // doesn't stay pinned for a
+                                    // Codex/Gemini-only workspace.
+                                    // Kept as a belt-and-braces
+                                    // fallback in case someone
+                                    // removes the early skip.
                                     continue;
                                 }
                             };

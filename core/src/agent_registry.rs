@@ -12,10 +12,13 @@
 //! `claude`, `codex`, `opencode`, `copilot`, `pi` — plus `gemini`,
 //! added in the Rust port (#324).
 //!
-//! Built defaults intentionally match the C# arrays — argv, session-id
-//! flags, resume-by-id args, icons, and context-window tokens — byte
-//! for byte so on-disk session records stay round-trippable between
-//! the C# build and the Rust port.
+//! For the five agents the C# build shipped, the built defaults
+//! intentionally match its arrays — argv, session-id flags,
+//! resume-by-id args, icons, and context-window tokens — byte for
+//! byte so on-disk session records stay round-trippable between the
+//! C# build and the Rust port. `gemini` is Rust-port-only (#324) and
+//! has no C# counterpart to match; a C# build reading a config that
+//! references it simply won't resolve the id.
 
 use serde::{Deserialize, Serialize};
 
