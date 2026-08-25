@@ -261,6 +261,74 @@ fn build_extended_with_fallback(
     out
 }
 
+/// Minimum WCAG contrast ratio enforced between a cell's resolved
+/// foreground and background. 4.5:1 is the WCAG AA threshold for
+/// normal text and the value VS Code ships as its terminal default
+/// (`terminal.integrated.minimumContrastRatio`). TUI themes that
+/// assume the opposite background polarity — e.g. claude-code's
+/// "Light mode (ANSI colors only)" inside a dark terminal — paint
+/// near-invisible text without this floor (#320).
+pub const MIN_CONTRAST_RATIO: f32 = 4.5;
+
+/// Nudge `fg` toward black or white (whichever clears faster) until
+/// it reaches `min_ratio` WCAG contrast against `bg`. Colours that
+/// already clear the ratio come back untouched, and `fg == bg` is
+/// left alone too — that's how TUIs conceal text on purpose, so
+/// "fixing" it would reveal content the app hid. Mirrors xterm.js's
+/// `minimumContrastRatio` behaviour: the hue survives where it can
+/// (a small blend), and only hopeless colours land on plain
+/// black/white.
+pub fn ensure_min_contrast(fg: Hsla, bg: Hsla, min_ratio: f32) -> Hsla {
+    let fg_rgba = fg.to_rgb();
+    let bg_rgba = bg.to_rgb();
+    if (fg_rgba.r, fg_rgba.g, fg_rgba.b) == (bg_rgba.r, bg_rgba.g, bg_rgba.b) {
+        return fg;
+    }
+    let bg_lum = relative_luminance(&bg_rgba);
+    if contrast_ratio(relative_luminance(&fg_rgba), bg_lum) >= min_ratio {
+        return fg;
+    }
+    // Pick the pole with the most headroom against this background.
+    let white_ratio = contrast_ratio(1.0, bg_lum);
+    let black_ratio = contrast_ratio(0.0, bg_lum);
+    let target = if white_ratio >= black_ratio { 1.0 } else { 0.0 };
+    // Binary-search the smallest blend toward the pole that clears
+    // the ratio; 8 steps ≈ 0.4% precision, plenty for 8-bit channels.
+    let blend = |t: f32| gpui::Rgba {
+        r: fg_rgba.r + (target - fg_rgba.r) * t,
+        g: fg_rgba.g + (target - fg_rgba.g) * t,
+        b: fg_rgba.b + (target - fg_rgba.b) * t,
+        a: fg_rgba.a,
+    };
+    let (mut lo, mut hi) = (0.0_f32, 1.0_f32);
+    for _ in 0..8 {
+        let mid = (lo + hi) / 2.0;
+        if contrast_ratio(relative_luminance(&blend(mid)), bg_lum) >= min_ratio {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    // `hi` is the last blend known to clear the ratio — or 1.0 (the
+    // pole itself) when even full white/black can't reach it, which
+    // is still the best available answer.
+    Hsla::from(blend(hi))
+}
+
+/// WCAG relative luminance of an sRGB colour (channels 0..1).
+fn relative_luminance(c: &gpui::Rgba) -> f32 {
+    let lin = |ch: f32| {
+        if ch <= 0.03928 { ch / 12.92 } else { ((ch + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
+}
+
+/// WCAG contrast ratio between two relative luminances (≥ 1.0).
+fn contrast_ratio(l1: f32, l2: f32) -> f32 {
+    let (hi, lo) = if l1 >= l2 { (l1, l2) } else { (l2, l1) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
 /// Multiplier applied to a faint (SGR 2) cell's foreground —
 /// alacritty's `DIM_FACTOR`. Applied to the RGB components, which is
 /// what alacritty means by it; see [`ColorPalette::resolve_faint`] for
@@ -326,6 +394,71 @@ mod tests {
             (rgba.g * 255.0).round() as u8,
             (rgba.b * 255.0).round() as u8,
         )
+    }
+
+    fn ratio(fg: Hsla, bg: Hsla) -> f32 {
+        contrast_ratio(
+            relative_luminance(&fg.to_rgb()),
+            relative_luminance(&bg.to_rgb()),
+        )
+    }
+
+    fn hsla_of(r: u8, g: u8, b: u8) -> Hsla {
+        rgb_to_hsla(Rgb { r, g, b })
+    }
+
+    #[test]
+    fn min_contrast_lifts_dark_on_dark_text() {
+        // claude-code's ANSI light theme paints blue-on-dark; ANSI
+        // blue #2472c8 on the default #1e1e1e background is ~2:1.
+        let bg = hsla_of(0x1e, 0x1e, 0x1e);
+        let fg = hsla_of(0x24, 0x72, 0xc8);
+        assert!(ratio(fg, bg) < MIN_CONTRAST_RATIO, "precondition");
+
+        let fixed = ensure_min_contrast(fg, bg, MIN_CONTRAST_RATIO);
+        assert!(ratio(fixed, bg) >= MIN_CONTRAST_RATIO, "must clear the floor");
+        // Still recognisably blue — the blend must not overshoot to
+        // plain white.
+        let rgba = fixed.to_rgb();
+        assert!(rgba.b > rgba.r, "hue should survive the nudge");
+    }
+
+    #[test]
+    fn min_contrast_darkens_light_on_light_text() {
+        let bg = hsla_of(0xf5, 0xf5, 0xf5);
+        let fg = hsla_of(0xe5, 0xe5, 0x10); // ANSI yellow on white
+        assert!(ratio(fg, bg) < MIN_CONTRAST_RATIO, "precondition");
+
+        let fixed = ensure_min_contrast(fg, bg, MIN_CONTRAST_RATIO);
+        assert!(ratio(fixed, bg) >= MIN_CONTRAST_RATIO);
+    }
+
+    #[test]
+    fn min_contrast_leaves_readable_text_untouched() {
+        let bg = hsla_of(0x1e, 0x1e, 0x1e);
+        let fg = hsla_of(0xcc, 0xcc, 0xcc);
+        let fixed = ensure_min_contrast(fg, bg, MIN_CONTRAST_RATIO);
+        assert_eq!(rgb8(fixed), rgb8(fg), "already-contrasty colours pass through");
+    }
+
+    #[test]
+    fn min_contrast_respects_deliberate_concealment() {
+        // fg == bg is how TUIs hide text; the floor must not reveal it.
+        let bg = hsla_of(0x1e, 0x1e, 0x1e);
+        let fixed = ensure_min_contrast(bg, bg, MIN_CONTRAST_RATIO);
+        assert_eq!(rgb8(fixed), rgb8(bg));
+    }
+
+    #[test]
+    fn min_contrast_black_on_black_variants_go_light() {
+        // ANSI black (#000) on the default dark background — the
+        // classic unreadable case from #320's screenshots.
+        let bg = hsla_of(0x1e, 0x1e, 0x1e);
+        let fg = hsla_of(0x00, 0x00, 0x00);
+        let fixed = ensure_min_contrast(fg, bg, MIN_CONTRAST_RATIO);
+        assert!(ratio(fixed, bg) >= MIN_CONTRAST_RATIO);
+        let rgba = fixed.to_rgb();
+        assert!(rgba.r > 0.3, "black text must lighten on a dark bg");
     }
 
     #[test]

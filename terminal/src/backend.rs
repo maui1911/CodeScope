@@ -429,6 +429,18 @@ impl Backend {
                 // any background. We don't bake the cursor's inversion
                 // here — it's painted on top by the renderer.
                 let (fg, bg) = if selected { (bg, fg) } else { (fg, bg) };
+                // Contrast floor — a TUI theme tuned for the opposite
+                // background polarity (claude-code's "Light mode (ANSI
+                // colors only)" on our dark default, #320) otherwise
+                // paints text indistinguishable from its background.
+                // Runs after the inverse/selection swaps so the ratio
+                // is measured on what actually gets painted; fg == bg
+                // (deliberate concealment) passes through untouched.
+                let fg = crate::colors::ensure_min_contrast(
+                    fg,
+                    bg,
+                    crate::colors::MIN_CONTRAST_RATIO,
+                );
 
                 let is_cursor_cell = cursor_visible
                     && row == cursor_row
