@@ -87,15 +87,17 @@ impl AppShell {
             );
             return;
         };
-        // A plain-folder project has nothing to diff — say so instead
-        // of rendering the raw `fatal: not a git repository` in the
-        // panel (#338).
+        // A path git doesn't recognise as a working tree has nothing
+        // to diff — say so instead of rendering the raw `fatal: not a
+        // git repository` in the panel (#338). The verdict also covers
+        // a missing or unreadable directory, so the copy states the
+        // observable outcome rather than guessing at the cause.
         if self.path_is_non_repo(&worktree, cx) {
             self.push_toast(
                 ToastKind::Info,
                 SharedString::new_static("Not a git repository"),
                 Some(SharedString::from(format!(
-                    "{} is a plain folder; there are no changes to show.",
+                    "{} is not inside a git working tree; there are no changes to show.",
                     worktree.display()
                 ))),
                 cx,
