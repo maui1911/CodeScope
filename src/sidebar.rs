@@ -2606,17 +2606,22 @@ impl Sidebar {
         // a non-git folder, missing `git` binary, or a permission
         // hiccup just lands the project with its primary row alone,
         // matching the pre-existing behaviour.
-        project.adopt_existing_worktrees();
-        let new_id = project.id.clone();
         // Probe once, synchronously, so the new row renders with its
         // `no git` slug and trimmed menu immediately instead of after
         // the poller's next tick. One `rev-parse`, a few ms; an
         // `Err` (git missing) leaves the verdict to the poller (#338).
+        // Runs before the worktree adoption below so a plain folder
+        // doesn't also pay for a `git worktree list` that can only
+        // fail.
         let non_repo_path = matches!(
             codescope_core::git::is_work_tree(std::path::Path::new(&project.path)),
             Ok(false)
         )
         .then(|| project.path.clone());
+        if non_repo_path.is_none() {
+            project.adopt_existing_worktrees();
+        }
+        let new_id = project.id.clone();
         // Clone-then-save: failure leaves `self.projects` untouched.
         let mut next = self.projects.clone();
         next.projects.push(project);
