@@ -318,8 +318,14 @@ pub fn set_remote_shell_command(
     new_command: &str,
 ) -> Result<bool> {
     let trimmed = new_command.trim();
-    if !is_valid_remote_shell_command(trimmed) {
+    // Split the two `is_valid_remote_shell_command` conditions so the
+    // surfaced error names the actual problem — a multi-line paste
+    // shouldn't be told it's "empty".
+    if trimmed.is_empty() {
         anyhow::bail!("command cannot be empty");
+    }
+    if !is_valid_remote_shell_command(trimmed) {
+        anyhow::bail!("command must be a single line");
     }
     let project = cfg
         .projects
@@ -819,8 +825,17 @@ mod tests {
         let mut cfg =
             ProjectsConfig { version: 1, agents: vec![], projects: vec![remote, local] };
 
-        assert!(set_remote_shell_command(&mut cfg, &remote_id, "   ").is_err());
-        assert!(set_remote_shell_command(&mut cfg, &remote_id, "ssh a\nssh b").is_err());
+        // Each rejection names its actual cause — a multi-line paste
+        // must not be reported as "empty".
+        let empty_err = set_remote_shell_command(&mut cfg, &remote_id, "   ")
+            .expect_err("blank command must be rejected");
+        assert!(format!("{empty_err:#}").contains("empty"), "{empty_err:#}");
+        let multiline_err = set_remote_shell_command(&mut cfg, &remote_id, "ssh a\nssh b")
+            .expect_err("multi-line command must be rejected");
+        assert!(
+            format!("{multiline_err:#}").contains("single line"),
+            "{multiline_err:#}"
+        );
         assert!(set_remote_shell_command(&mut cfg, "nope", "ssh x").is_err());
         assert!(set_remote_shell_command(&mut cfg, &local_id, "ssh x").is_err());
         // Nothing was mutated by the failed calls.

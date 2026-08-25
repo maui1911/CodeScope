@@ -85,7 +85,11 @@ impl RenameDialogState {
         }
     }
 
-    /// Rename is allowed when the trimmed name is non-empty. The
+    /// Rename is allowed when the trimmed name is non-empty; the
+    /// remote-command target additionally holds the buffer to
+    /// `is_valid_remote_shell_command` (single-line) — the same rule
+    /// the Add-project dialog applies, so the Save button can't claim
+    /// a multi-line paste is fine only for submit to reject it. The
     /// "no-op when unchanged" rule mirrors the C# build's
     /// `string.Equals(newLeaf, currentLeaf, StringComparison.Ordinal)`
     /// guard — handled at submit time so the button stays enabled
@@ -94,7 +98,12 @@ impl RenameDialogState {
     /// in returning `bool` rather than `Result` so the render path
     /// stays branch-free.
     pub fn is_valid(&self) -> bool {
-        !self.name.text().trim().is_empty()
+        match &self.target {
+            RenameRequest::RemoteCommand { .. } => {
+                codescope_core::projects::is_valid_remote_shell_command(self.name.text())
+            }
+            _ => !self.name.text().trim().is_empty(),
+        }
     }
 
     /// Per-target chrome strings — (eyebrow, hint, field label, OK
