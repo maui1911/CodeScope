@@ -3332,9 +3332,12 @@ impl AppShell {
                 .iter()
                 .find(|p| p.sessions.iter().any(|s| s.id == restored.id))
                 .map(|p| p.name.clone());
+            // `branch_name()` so a detached-HEAD worktree falls back
+            // to the persisted branch instead of titling the tab with
+            // the short-SHA stand-in (#319).
             let branch_label = sidebar
                 .git_status_for(&descriptor.working_directory)
-                .map(|g| g.branch.clone())
+                .and_then(|g| g.branch_name().map(str::to_string))
                 .or_else(|| restored.branch.clone());
             match (project_name, branch_label) {
                 (Some(p), Some(b)) => format!("{p} · {b}").into(),
@@ -5402,8 +5405,12 @@ impl AppShell {
         // worktree's `DisplayBranch` when available; otherwise we fall
         // back to the tab title, exactly like the C# `StatusBranch`.
         let session_cluster = active_tab.map(|_| {
-            let branch_text: SharedString = match (git.as_ref(), active_title.clone()) {
-                (Some(g), _) => g.branch.clone().into(),
+            // Detached HEAD has no branch name (`branch_name()` is
+            // `None`) — fall back to the tab title rather than the
+            // short-SHA stand-in (#319).
+            let live_branch = git.as_ref().and_then(|g| g.branch_name());
+            let branch_text: SharedString = match (live_branch, active_title.clone()) {
+                (Some(b), _) => b.to_string().into(),
                 (None, Some(t)) => t,
                 (None, None) => SharedString::from(""),
             };

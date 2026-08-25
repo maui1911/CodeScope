@@ -371,6 +371,13 @@ pub struct GitStatus {
     /// Detached-HEAD worktrees get the 7-char short SHA instead
     /// (e.g. `"abc1234"`), matching the C# build's fallback.
     pub branch: String,
+    /// `true` when HEAD is detached — `branch` then carries the
+    /// short-SHA stand-in, not a real ref name. Display code that
+    /// wants "a branch name or nothing" should go through
+    /// [`GitStatus::branch_name`] so a detached worktree falls back
+    /// to its persisted branch / folder leaf instead of showing a
+    /// random-looking hex string (#319).
+    pub detached: bool,
     /// Lines added relative to HEAD across all modified files
     /// (sum of the first column from `git diff --numstat HEAD`).
     pub added: u32,
@@ -388,6 +395,16 @@ pub struct GitStatus {
     /// ahead/behind segment should be hidden rather than showing
     /// `0 / 0`.
     pub has_upstream: bool,
+}
+
+impl GitStatus {
+    /// The live branch name, or `None` on a detached HEAD (where
+    /// [`Self::branch`] holds the short-SHA stand-in). Label code
+    /// should prefer this over reading `branch` directly so hex
+    /// stand-ins never become user-facing worktree names.
+    pub fn branch_name(&self) -> Option<&str> {
+        if self.detached { None } else { Some(&self.branch) }
+    }
 }
 
 /// Collect the three git status signals for a single worktree at
@@ -446,7 +463,7 @@ pub fn git_status(repo: &Path) -> Result<Option<GitStatus>> {
     }
 
     // ── 1. Current branch ──────────────────────────────────────────
-    let branch = current_branch(repo);
+    let (branch, detached) = current_branch(repo);
 
     // ── 2. numstat diff against HEAD ───────────────────────────────
     let (added, removed, has_changes) = numstat_summary(repo);
@@ -454,28 +471,29 @@ pub fn git_status(repo: &Path) -> Result<Option<GitStatus>> {
     // ── 3. Ahead / behind upstream ─────────────────────────────────
     let (ahead, behind, has_upstream) = ahead_behind(repo);
 
-    Ok(Some(GitStatus { branch, added, removed, has_changes, ahead, behind, has_upstream }))
+    Ok(Some(GitStatus { branch, detached, added, removed, has_changes, ahead, behind, has_upstream }))
 }
 
-/// `git symbolic-ref --short HEAD` → short branch name.
-/// Falls back to the 7-char short SHA on detached HEAD.
-/// Returns `"?"` only if both git calls fail (not a repo, etc.).
-fn current_branch(repo: &Path) -> String {
+/// `git symbolic-ref --short HEAD` → `(short branch name, false)`.
+/// Falls back to `(7-char short SHA, true)` on detached HEAD.
+/// Returns `("?", true)` only if both git calls fail (not a repo,
+/// etc.) — "?" is no more a branch name than a SHA is.
+fn current_branch(repo: &Path) -> (String, bool) {
     // Happy path: attached HEAD.
     if let Ok(out) = run_git(repo, &["symbolic-ref", "--short", "HEAD"]) {
         let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !name.is_empty() {
-            return name;
+            return (name, false);
         }
     }
     // Detached HEAD: fall back to short SHA.
     if let Ok(out) = run_git(repo, &["rev-parse", "--short", "HEAD"]) {
         let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !sha.is_empty() {
-            return sha;
+            return (sha, true);
         }
     }
-    "?".to_string()
+    ("?".to_string(), true)
 }
 
 /// `git diff --numstat HEAD` → `(added, removed, has_changes)`.
@@ -1148,6 +1166,24 @@ some-future-field foo bar\n";
         assert!(!status.has_upstream, "has_upstream without upstream");
         assert_eq!(status.ahead, 0);
         assert_eq!(status.behind, 0);
+        assert!(!status.detached, "attached HEAD must not report detached");
+        assert_eq!(status.branch_name(), Some("main"));
+    }
+
+    #[test]
+    fn git_status_detached_head_sets_detached_and_hides_branch_name() {
+        let Some((_guard, repo, _wts)) = init_repo() else { return };
+        // Detach HEAD at the current commit — `branch` degrades to the
+        // short SHA, and `branch_name()` must hide it so worktree
+        // labels don't turn into random-looking hex (#319).
+        run(&repo, &["checkout", "--detach", "-q"]);
+
+        let status = git_status(&repo).expect("git invocation").expect("Some");
+
+        assert!(status.detached, "detached HEAD must be flagged");
+        assert_eq!(status.branch_name(), None, "no branch name when detached");
+        assert!(!status.branch.is_empty(), "short SHA stand-in still recorded");
+        assert_ne!(status.branch, "main");
     }
 
     #[test]
@@ -1230,6 +1266,7 @@ some-future-field foo bar\n";
     ) -> GitStatus {
         GitStatus {
             branch: "main".into(),
+            detached: false,
             added,
             removed,
             has_changes,

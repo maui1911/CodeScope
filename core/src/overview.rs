@@ -45,8 +45,12 @@ pub struct OverviewRow {
     /// Display name for the project that owns the session. Mirrors
     /// C# `OverviewCardViewModel.ProjectName`.
     pub project_name: String,
-    /// Branch label — falls back to the worktree id when `branch` is
-    /// `None`. Matches C# `WorktreeViewModel.DisplayBranch`'s shape.
+    /// Branch label — when the session's `branch` is `None` this
+    /// falls back to the owning worktree's branch, then the worktree
+    /// folder leaf, and only then the raw worktree id. Sessions are
+    /// persisted with `branch: None` until the first git poll lands,
+    /// so an id-first fallback rendered UUID hex as the "worktree
+    /// name" in the Overview (#319).
     pub branch_label: String,
     /// Absolute path the session was opened in. Used by the renderer
     /// to look up the matching live tab (group + tab index).
@@ -66,9 +70,19 @@ pub struct OverviewRow {
 
 impl OverviewRow {
     fn from_session(project: &Project, session: &Session) -> Self {
+        // Resolve a human-readable label: session branch → owning
+        // worktree's branch → worktree folder leaf → session path
+        // leaf → raw worktree id (last resort; a UUID, so only when
+        // every path/branch slot is empty).
+        let worktree = session.worktree_id.as_deref().and_then(|id| {
+            project.worktrees.iter().find(|wt| wt.id == id)
+        });
         let branch_label = session
             .branch
             .clone()
+            .or_else(|| worktree.and_then(|wt| wt.branch.clone()))
+            .or_else(|| worktree.and_then(|wt| path_leaf(&wt.path)))
+            .or_else(|| path_leaf(&session.worktree_path))
             .or_else(|| session.worktree_id.clone())
             .unwrap_or_default();
         let lifecycle = if session.closed_at.is_some() {
@@ -87,6 +101,19 @@ impl OverviewRow {
             lifecycle,
         }
     }
+}
+
+/// Last path component of `path`, splitting on both `/` and `\` so
+/// Windows-written `projects.json` entries resolve on every platform
+/// (mirrors the tab-title logic's tolerance for foreign separators).
+/// `None` for an empty result so callers can keep falling back.
+fn path_leaf(path: &str) -> Option<String> {
+    let leaf = path
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default();
+    if leaf.is_empty() { None } else { Some(leaf.to_string()) }
 }
 
 /// Build the flat row list from a [`ProjectsConfig`] snapshot —
@@ -322,9 +349,54 @@ mod tests {
     }
 
     #[test]
-    fn branch_label_falls_back_to_worktree_id() {
+    fn branch_label_falls_back_to_worktree_folder_leaf_not_id() {
+        // Sessions are persisted with `branch: None` until the first
+        // git poll backfills it — the label must resolve through the
+        // owning worktree's path, never the raw worktree id (#319).
         let mut s = mk_session("s1", None, None);
         s.branch = None;
+        s.worktree_id = Some("3f9a1c2e-77aa-4bd0-9c55-0d6f2b8e4a11".into());
+        let mut p = mk_project("p1", "alpha", vec![]);
+        p.worktrees.push(Worktree {
+            id: "3f9a1c2e-77aa-4bd0-9c55-0d6f2b8e4a11".into(),
+            path: "C:\\dev\\alpha.worktrees\\profit-wt-1".into(),
+            branch: None,
+            is_primary: false,
+        });
+        p.sessions = vec![s];
+        let cfg = ProjectsConfig { version: 1, agents: vec![], projects: vec![p] };
+
+        let rows = build_rows(&cfg);
+        assert_eq!(rows[0].branch_label, "profit-wt-1");
+    }
+
+    #[test]
+    fn branch_label_prefers_owning_worktree_branch_over_paths() {
+        let mut s = mk_session("s1", None, None);
+        s.branch = None;
+        s.worktree_id = Some("wt1".into());
+        let mut p = mk_project("p1", "alpha", vec![]);
+        p.worktrees.push(Worktree {
+            id: "wt1".into(),
+            path: "/home/u/alpha.worktrees/feat-x-dir".into(),
+            branch: Some("feat/x".into()),
+            is_primary: false,
+        });
+        p.sessions = vec![s];
+        let cfg = ProjectsConfig { version: 1, agents: vec![], projects: vec![p] };
+
+        let rows = build_rows(&cfg);
+        assert_eq!(rows[0].branch_label, "feat/x");
+    }
+
+    #[test]
+    fn branch_label_unknown_worktree_uses_session_path_leaf() {
+        // Worktree id points at nothing (stale record) — the session's
+        // own working directory still beats showing the UUID.
+        let mut s = mk_session("s1", None, None);
+        s.branch = None;
+        s.worktree_id = Some("gone-uuid".into());
+        s.worktree_path = "/home/u/alpha.worktrees/focus-wt-2".into();
         let cfg = ProjectsConfig {
             version: 1,
             agents: vec![],
@@ -332,7 +404,16 @@ mod tests {
         };
 
         let rows = build_rows(&cfg);
-        assert_eq!(rows[0].branch_label, "primary");
+        assert_eq!(rows[0].branch_label, "focus-wt-2");
+    }
+
+    #[test]
+    fn path_leaf_handles_both_separators_and_empty() {
+        assert_eq!(path_leaf("C:\\a\\b\\leaf"), Some("leaf".into()));
+        assert_eq!(path_leaf("/a/b/leaf"), Some("leaf".into()));
+        assert_eq!(path_leaf("/a/b/leaf/"), Some("leaf".into()));
+        assert_eq!(path_leaf(""), None);
+        assert_eq!(path_leaf("///"), None);
     }
 
     #[test]

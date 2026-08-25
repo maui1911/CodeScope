@@ -21,7 +21,6 @@
 //! newest-first by `last_opened`. Live-row decoration is folded in
 //! here by joining on `session_id` against `self.groups`.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use codescope_core::{
@@ -615,19 +614,22 @@ fn format_duration(d: std::time::Duration) -> String {
 /// disambiguate worktrees (`codescope.worktrees/feature-x` reads
 /// better than just `feature-x`).
 fn short_path(path: &str) -> String {
-    let buf = PathBuf::from(path);
-    let comps: Vec<String> = buf
-        .components()
-        .filter_map(|c| match c {
-            std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
-            _ => None,
-        })
+    // Split on both separators (a Windows-written projects.json can
+    // surface on any platform) and echo the path's own separator back
+    // so `/home/u/wt` shortens to `…/u/wt`, not `…\u\wt`. The old
+    // `PathBuf::components()` version split on the *host* separator
+    // only, so foreign paths never shortened and the label always
+    // used `\`.
+    let sep = if path.contains('/') { '/' } else { '\\' };
+    let comps: Vec<&str> = path
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty() && !s.ends_with(':'))
         .collect();
     if comps.len() <= 2 {
         return path.to_string();
     }
     let tail = &comps[comps.len() - 2..];
-    format!("…\\{}\\{}", tail[0], tail[1])
+    format!("…{sep}{}{sep}{}", tail[0], tail[1])
 }
 
 #[cfg(test)]
@@ -675,5 +677,8 @@ mod tests {
         assert_eq!(short_path("C:\\dev\\foo\\bar"), "…\\foo\\bar");
         assert_eq!(short_path("foo\\bar"), "foo\\bar");
         assert_eq!(short_path("foo"), "foo");
+        // Unix-style paths shorten with their own separator.
+        assert_eq!(short_path("/home/u/proj/wt"), "…/proj/wt");
+        assert_eq!(short_path("/home/u"), "/home/u");
     }
 }
