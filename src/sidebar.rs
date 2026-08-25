@@ -1039,11 +1039,18 @@ impl Sidebar {
                             // spawned with a spawn-time branch hint
                             // gets confirmed / corrected on the first
                             // poll.
-                            let prev_branch = prev.as_ref().map(|s| s.branch.as_str());
-                            if prev_branch != Some(status.branch.as_str())
-                                && !status.branch.is_empty()
+                            // `branch_name()` (not the raw `branch`
+                            // field) so a detached HEAD — whose slot
+                            // holds the short-SHA stand-in — never
+                            // retitles tabs to a hex string (#319);
+                            // the tab keeps its last real title until
+                            // a branch is checked out again.
+                            let prev_branch = prev.as_ref().and_then(|s| s.branch_name());
+                            if let Some(name) = status.branch_name()
+                                && prev_branch != Some(name)
+                                && !name.is_empty()
                             {
-                                branch_changes.push((path.clone(), status.branch.clone()));
+                                branch_changes.push((path.clone(), name.to_string()));
                             }
                             if prev.as_ref() != Some(&status) {
                                 changed = true;
@@ -1126,7 +1133,7 @@ impl Sidebar {
                                 let branch = this
                                     .git_status
                                     .get(&path)
-                                    .map(|s| s.branch.clone())
+                                    .and_then(|s| s.branch_name().map(str::to_string))
                                     .or(persisted_branch);
                                 if let Some(branch) = branch
                                     && !branch.is_empty()
@@ -1181,7 +1188,7 @@ impl Sidebar {
                             let live_branch = this
                                 .git_status
                                 .get(&path)
-                                .map(|s| s.branch.clone())
+                                .and_then(|s| s.branch_name().map(str::to_string))
                                 .or_else(|| {
                                     this.projects
                                         .projects
@@ -1261,7 +1268,7 @@ impl Sidebar {
         let live = self
             .git_status
             .get(path)
-            .map(|s| s.branch.clone())
+            .and_then(|s| s.branch_name().map(str::to_string))
             .or_else(|| {
                 self.projects
                     .projects
@@ -1583,7 +1590,7 @@ impl Sidebar {
         let live_branch = self
             .git_status
             .get(&worktree.path)
-            .map(|s| s.branch.clone())
+            .and_then(|s| s.branch_name().map(str::to_string))
             .or_else(|| worktree.branch.clone());
 
         // Kick off a one-shot `gh pr list` lookup the first time we
@@ -3066,10 +3073,14 @@ impl Render for Sidebar {
                 // seconds of launch. Falling back to the persisted
                 // branch then to the folder leaf keeps the row
                 // useful while the first poll is still in flight.
+                // `branch_name()` skips the detached-HEAD short-SHA
+                // stand-in — a detached worktree falls through to the
+                // persisted branch / folder leaf instead of rendering
+                // a random-looking hex label (#319).
                 let wt_label: SharedString = self
                     .git_status
                     .get(&wt.path)
-                    .map(|g| g.branch.clone())
+                    .and_then(|g| g.branch_name().map(str::to_string))
                     .or_else(|| wt.branch.clone())
                     .unwrap_or_else(|| {
                         std::path::Path::new(&wt.path)
@@ -3337,7 +3348,7 @@ impl Render for Sidebar {
                     let live_branch = self
                         .git_status
                         .get(&wt.path)
-                        .map(|s| s.branch.clone())
+                        .and_then(|s| s.branch_name().map(str::to_string))
                         .or_else(|| wt.branch.clone());
                     match (live_branch.as_ref(), self.pr_urls.get(&wt.path)) {
                         (
