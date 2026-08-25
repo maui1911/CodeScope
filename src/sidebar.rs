@@ -454,7 +454,7 @@ fn history_agent_display_name(agent_id: &str) -> Option<&'static str> {
     let profile = registry.get_by_id(first_token)?;
     // Match the agent id back to a `&'static str` literal so the
     // closed-row label can stay a non-allocating return type — the
-    // five built-in defaults are stable strings, and any custom
+    // built-in defaults are stable strings, and any custom
     // override would arrive via a different code path.
     Some(match profile.id.as_str() {
         "claude" => "Claude Code",
@@ -462,6 +462,7 @@ fn history_agent_display_name(agent_id: &str) -> Option<&'static str> {
         "opencode" => "OpenCode",
         "pi" => "Pi",
         "codex" => "Codex",
+        "gemini" => "Gemini CLI",
         _ => return None,
     })
 }
@@ -5687,8 +5688,13 @@ mod tests {
     #[test]
     fn history_agent_label_unknown_returns_none() {
         assert_eq!(history_agent_display_name(""), None);
-        assert_eq!(history_agent_display_name("gemini"), None);
+        assert_eq!(history_agent_display_name("bard"), None);
         assert_eq!(history_agent_display_name("-"), None);
+    }
+
+    #[test]
+    fn history_agent_label_gemini_resolves() {
+        assert_eq!(history_agent_display_name("gemini"), Some("Gemini CLI"));
     }
 
     #[test]

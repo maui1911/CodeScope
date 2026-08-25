@@ -234,7 +234,7 @@ pub fn format_closed_at_relative(closed_at_iso: Option<&str>, now_iso: &str) -> 
 ///   exist. For Claude that directory is derived from the worktree
 ///   path, so a moved or renamed worktree lands here and keeps its
 ///   rows instead of losing them;
-/// * the agent is Pi, OpenCode or Codex. Pi and OpenCode can only be
+/// * the agent is Pi, OpenCode, Codex or Gemini. Pi and OpenCode can only be
 ///   located by walking their trees (Pi matches `*_<sid>.jsonl`
 ///   recursively; OpenCode's `storage/` slug is derived from the
 ///   project path and not predictable), and Codex has no layout wired
@@ -293,7 +293,10 @@ pub(crate) fn transcript_presence(session: &Session) -> Option<bool> {
                 |m| m.is_dir(),
             )
         }
-        crate::AgentId::Pi | crate::AgentId::OpenCode | crate::AgentId::Codex => None,
+        crate::AgentId::Pi
+        | crate::AgentId::OpenCode
+        | crate::AgentId::Codex
+        | crate::AgentId::Gemini => None,
     }
 }
 
@@ -918,7 +921,7 @@ mod tests {
 
     #[test]
     fn presence_is_undecidable_for_agents_without_a_predictable_layout() {
-        for agent in ["pi", "opencode", "codex"] {
+        for agent in ["pi", "opencode", "codex", "gemini"] {
             let mut s = closed_agent_session("s1", "sid");
             s.agent_id = Some(agent.to_string());
             assert_eq!(transcript_presence(&s), None, "agent {agent}");

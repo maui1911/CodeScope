@@ -17,13 +17,14 @@
 //! Anything else (plain `pwsh`, no auto-type, an unknown agent) maps
 //! to `None`, leaving the tab telemetry-less just like a shell tab.
 
-/// One of the five supported agent backends. Names match the
+/// One of the six supported agent backends. Names match the
 /// `agentId` strings the C# `MainViewModel` branches on; keep them
 /// stable so on-disk session records (which carry `AgentId` as a
 /// plain string) round-trip cleanly between builds. Codex was added
 /// alongside the [`crate::agent_registry::AgentRegistry`] port — the
 /// telemetry/discovery layer for it is a follow-up, but the id needs
-/// to round-trip now so registry consumers can use it.
+/// to round-trip now so registry consumers can use it. Gemini
+/// (#324) ships in the same registry-first state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AgentId {
     Claude,
@@ -31,6 +32,7 @@ pub enum AgentId {
     Copilot,
     OpenCode,
     Pi,
+    Gemini,
 }
 
 impl AgentId {
@@ -43,6 +45,7 @@ impl AgentId {
             AgentId::Copilot => "copilot",
             AgentId::OpenCode => "opencode",
             AgentId::Pi => "pi",
+            AgentId::Gemini => "gemini",
         }
     }
 
@@ -73,6 +76,8 @@ impl AgentId {
             Some(AgentId::OpenCode)
         } else if s.eq_ignore_ascii_case("pi") {
             Some(AgentId::Pi)
+        } else if s.eq_ignore_ascii_case("gemini") {
+            Some(AgentId::Gemini)
         } else {
             None
         }
@@ -109,6 +114,7 @@ mod tests {
             AgentId::Copilot,
             AgentId::OpenCode,
             AgentId::Pi,
+            AgentId::Gemini,
         ] {
             assert_eq!(AgentId::from_str(id.as_str()), Some(id));
         }
@@ -121,14 +127,18 @@ mod tests {
         assert_eq!(AgentId::from_str("Copilot"), Some(AgentId::Copilot));
         assert_eq!(AgentId::from_str("OPENCODE"), Some(AgentId::OpenCode));
         assert_eq!(AgentId::from_str("Pi"), Some(AgentId::Pi));
+        assert_eq!(AgentId::from_str("GEMINI"), Some(AgentId::Gemini));
     }
 
     #[test]
     fn from_str_rejects_unknown() {
         assert_eq!(AgentId::from_str(""), None);
-        assert_eq!(AgentId::from_str("gemini"), None);
+        assert_eq!(AgentId::from_str("bard"), None);
         assert_eq!(AgentId::from_str("pwsh"), None);
         assert_eq!(AgentId::from_str("claudeflare"), None);
+        // `geminipro` must NOT match Gemini — same anti-substring
+        // rule the claude/claudeflare pair pins.
+        assert_eq!(AgentId::from_str("geminipro"), None);
     }
 
     #[test]
@@ -146,6 +156,7 @@ mod tests {
         assert_eq!(agent_id_from_auto_type(Some("copilot")), Some(AgentId::Copilot));
         assert_eq!(agent_id_from_auto_type(Some("opencode")), Some(AgentId::OpenCode));
         assert_eq!(agent_id_from_auto_type(Some("pi")), Some(AgentId::Pi));
+        assert_eq!(agent_id_from_auto_type(Some("gemini")), Some(AgentId::Gemini));
     }
 
     #[test]
@@ -162,6 +173,10 @@ mod tests {
             agent_id_from_auto_type(Some("\tcopilot --workspace .")),
             Some(AgentId::Copilot),
         );
+        assert_eq!(
+            agent_id_from_auto_type(Some("gemini --foo")),
+            Some(AgentId::Gemini),
+        );
     }
 
     #[test]
@@ -173,7 +188,7 @@ mod tests {
     #[test]
     fn auto_type_rejects_unknown_binaries() {
         assert_eq!(agent_id_from_auto_type(Some("pwsh")), None);
-        assert_eq!(agent_id_from_auto_type(Some("gemini --foo")), None);
+        assert_eq!(agent_id_from_auto_type(Some("bard --foo")), None);
         assert_eq!(agent_id_from_auto_type(Some("notclaude")), None);
         // `claudeflare` must NOT match Claude — same anti-substring rule
         // `is_claude_auto_type` enforced.
