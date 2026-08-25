@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use codescope_core::{
     AgentProfile, AgentRegistry, AppPaths, LayoutState, Project, ProjectsConfig, Theme,
@@ -54,6 +54,14 @@ use crate::theme;
 /// thousand-file repos. Mirrors the C# build's
 /// `WorktreePoller.Interval`.
 const DIRTY_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a "not a git working tree" verdict in
+/// `Sidebar::non_repo_paths` stands before the git-status poller
+/// probes the path again. Long enough that a plain folder costs one
+/// `rev-parse` a minute instead of two `git` spawns every 5 s; short
+/// enough that a `git init` in that folder shows up without a
+/// restart (#338).
+const NON_REPO_REPROBE: Duration = Duration::from_secs(60);
 
 /// How often the PR-status poller wakes up. 60 s matches the C# build's
 /// `PullRequestStatusPoller.Interval` baseline (the C# build then layers
@@ -536,6 +544,15 @@ pub struct Sidebar {
     /// C# build's `WorktreePoller` but adds the richer data the
     /// status bar needs.
     git_status: HashMap<String, GitStatus>,
+    /// Worktree paths git has told us are *not* inside a working
+    /// tree, with the time of that verdict. A project added on a home
+    /// directory or a sync folder (repos nested a level down, or none
+    /// at all) has nothing for the git pollers, the worktree menus,
+    /// or the branch labels to work with — this map gates all of
+    /// them. Runtime only, never persisted: the user can `git init`
+    /// later, so the git-status poller re-probes entries older than
+    /// [`NON_REPO_REPROBE`] and drops them once git says yes (#338).
+    non_repo_paths: HashMap<String, Instant>,
     /// Cached "open PR URL for this worktree" lookup, keyed by the
     /// worktree's absolute path. The value tracks both the branch
     /// the lookup ran against (so a branch switch invalidates the
@@ -676,6 +693,7 @@ impl Sidebar {
             dirty_state: HashMap::new(),
             remote_live_project_ids: HashSet::new(),
             git_status: HashMap::new(),
+            non_repo_paths: HashMap::new(),
             pr_urls: HashMap::new(),
             collapsed_projects,
             expanded_worktrees: HashSet::new(),
@@ -899,9 +917,14 @@ impl Sidebar {
                             // empty path and no worktrees — the
                             // `is_empty` filter keeps them out so we
                             // never shell out to git against "".
+                            // Paths git has already ruled out as
+                            // working trees are skipped too — the
+                            // git-status poller owns the slow
+                            // re-probe (#338).
                             std::iter::once(p.path.clone())
                                 .chain(p.worktrees.iter().map(|wt| wt.path.clone()))
                                 .filter(|path| !path.is_empty())
+                                .filter(|path| !this.non_repo_paths.contains_key(path))
                         })
                         .collect()
                 }) {
@@ -970,39 +993,66 @@ impl Sidebar {
     /// coordinating with each other.
     pub fn start_git_status_poll(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
+            // The first tick runs without waiting so a freshly
+            // launched window learns which projects aren't
+            // repositories (and every branch label) right away
+            // instead of after a 5 s blank; later ticks keep the
+            // shared cadence.
+            let mut first_tick = true;
             loop {
-                cx.background_executor().timer(DIRTY_POLL_INTERVAL).await;
+                if !first_tick {
+                    cx.background_executor().timer(DIRTY_POLL_INTERVAL).await;
+                }
+                first_tick = false;
                 if this.upgrade().is_none() {
                     break;
                 }
                 // Snapshot every worktree path into a de-duplicated set
                 // (same de-dup + empty-path rationale as
-                // start_dirty_poll).
-                let paths: HashSet<String> = match this.update(cx, |this, _| {
-                    this.projects
-                        .projects
-                        .iter()
-                        .flat_map(|p| {
-                            std::iter::once(p.path.clone())
-                                .chain(p.worktrees.iter().map(|wt| wt.path.clone()))
-                                .filter(|path| !path.is_empty())
-                        })
-                        .collect()
-                }) {
-                    Ok(p) => p,
-                    Err(_) => break,
-                };
-                let known: HashSet<String> = paths.clone();
-                let updates: Vec<(String, GitStatus)> = cx
+                // start_dirty_poll). `known` is the full set — it
+                // prunes the caches — while `paths` drops non-repo
+                // verdicts younger than `NON_REPO_REPROBE` so a plain
+                // folder costs one probe a minute, not one per tick.
+                let (known, paths): (HashSet<String>, HashSet<String>) =
+                    match this.update(cx, |this, _| {
+                        let now = Instant::now();
+                        let known: HashSet<String> = this
+                            .projects
+                            .projects
+                            .iter()
+                            .flat_map(|p| {
+                                std::iter::once(p.path.clone())
+                                    .chain(p.worktrees.iter().map(|wt| wt.path.clone()))
+                                    .filter(|path| !path.is_empty())
+                            })
+                            .collect();
+                        let paths: HashSet<String> = known
+                            .iter()
+                            .filter(|path| {
+                                this.non_repo_paths.get(*path).is_none_or(|probed| {
+                                    now.duration_since(*probed) >= NON_REPO_REPROBE
+                                })
+                            })
+                            .cloned()
+                            .collect();
+                        (known, paths)
+                    }) {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    };
+                let updates: Vec<(String, Option<GitStatus>)> = cx
                     .background_spawn(async move {
                         paths
                             .into_iter()
                             .filter_map(|p| {
-                                // Fail-soft: I/O errors and "not a worktree" both
-                                // skip the entry; the next poll tick will retry.
+                                // Fail-soft on I/O errors (git binary
+                                // missing): skip the entry, the next
+                                // tick retries. `Ok(None)` — "not a
+                                // worktree" — is a real answer and is
+                                // carried through so the path lands in
+                                // `non_repo_paths` (#338).
                                 codescope_core::git::git_status(std::path::Path::new(&p))
                                     .ok()
-                                    .flatten()
                                     .map(|s| (p, s))
                             })
                             .collect()
@@ -1025,7 +1075,33 @@ impl Sidebar {
                         if this.git_status.len() != prev_len {
                             changed = true;
                         }
+                        let prev_len = this.non_repo_paths.len();
+                        this.non_repo_paths.retain(|path, _| known.contains(path));
+                        if this.non_repo_paths.len() != prev_len {
+                            changed = true;
+                        }
                         for (path, status) in updates {
+                            let Some(status) = status else {
+                                // Not a working tree. Record (or
+                                // refresh) the verdict and drop any
+                                // status a previous life of this path
+                                // left behind — `git init` undone, a
+                                // `.git` moved away.
+                                let fresh = this
+                                    .non_repo_paths
+                                    .insert(path.clone(), Instant::now())
+                                    .is_none();
+                                if fresh || this.git_status.remove(&path).is_some() {
+                                    changed = true;
+                                }
+                                continue;
+                            };
+                            // A path git now recognises again — the
+                            // user ran `git init` since the last
+                            // verdict — leaves the non-repo set.
+                            if this.non_repo_paths.remove(&path).is_some() {
+                                changed = true;
+                            }
                             // Single hash lookup: `insert` returns the
                             // prior value (if any), which we both
                             // compare for change-detection and read
@@ -1256,6 +1332,15 @@ impl Sidebar {
         self.git_status.get(path)
     }
 
+    /// `true` when git has told us `path` is not inside a working
+    /// tree — a project added on a plain folder. Callers use it to
+    /// drop git-only UI (branch suffixes, diff viewer) for that path;
+    /// the sidebar's own menus and pollers read the map directly.
+    /// `false` while the verdict is still unknown (#338).
+    pub(crate) fn is_non_repo(&self, path: &str) -> bool {
+        self.non_repo_paths.contains_key(path)
+    }
+
     /// Resolve the cached "open PR URL" for the worktree rooted at
     /// `path`. Returns `Some(url)` only when the cached `gh pr list`
     /// lookup landed on a `Resolved { info: Some(_) }` whose branch
@@ -1318,6 +1403,10 @@ impl Sidebar {
         path: String,
         cx: &mut Context<Self>,
     ) {
+        if self.non_repo_paths.contains_key(&path) {
+            // Plain folder: there is no `origin` to resolve (#338).
+            return;
+        }
         let project_path = self
             .projects
             .projects
@@ -1396,6 +1485,8 @@ impl Sidebar {
                 }
             }
         }
+        // A plain folder isn't a worktree either (#338).
+        paths.retain(|p| !self.non_repo_paths.contains_key(*p));
         let total = paths.len();
         let dirty = paths
             .iter()
@@ -2517,6 +2608,15 @@ impl Sidebar {
         // matching the pre-existing behaviour.
         project.adopt_existing_worktrees();
         let new_id = project.id.clone();
+        // Probe once, synchronously, so the new row renders with its
+        // `no git` slug and trimmed menu immediately instead of after
+        // the poller's next tick. One `rev-parse`, a few ms; an
+        // `Err` (git missing) leaves the verdict to the poller (#338).
+        let non_repo_path = matches!(
+            codescope_core::git::is_work_tree(std::path::Path::new(&project.path)),
+            Ok(false)
+        )
+        .then(|| project.path.clone());
         // Clone-then-save: failure leaves `self.projects` untouched.
         let mut next = self.projects.clone();
         next.projects.push(project);
@@ -2526,6 +2626,9 @@ impl Sidebar {
         }
         // Disk is committed; now mirror the change in memory.
         self.projects = next;
+        if let Some(path) = non_repo_path {
+            self.non_repo_paths.insert(path, Instant::now());
+        }
         let new_idx = self.projects.projects.len() - 1;
         self.selected = Some(new_idx);
         self.layout.selected_project_id = Some(new_id);
@@ -3373,13 +3476,19 @@ impl Render for Sidebar {
                 // `Fig.Font.Mono` at 10 pt with a dim `ink_ghost`
                 // foreground. `busy` (active agent) is still TODO —
                 // the Rust port has no per-tab session model yet.
-                let status_slug = self
-                    .git_status
-                    .get(&wt.path)
-                    .map(|s| {
-                        codescope_core::git::worktree_status_label_with_ci(s, ci_status)
-                    })
-                    .unwrap_or_default();
+                // A plain folder gets a `no git` slug in the same slot
+                // — the one visible cue that this project has no
+                // branch, diff, or worktrees to offer (#338).
+                let status_slug = if self.non_repo_paths.contains_key(&wt.path) {
+                    "no git".to_string()
+                } else {
+                    self.git_status
+                        .get(&wt.path)
+                        .map(|s| {
+                            codescope_core::git::worktree_status_label_with_ci(s, ci_status)
+                        })
+                        .unwrap_or_default()
+                };
                 let wt_row = if status_slug.is_empty() {
                     wt_row
                 } else {
@@ -4524,6 +4633,7 @@ impl Sidebar {
         let ink_ghost = theme::ink_ghost(theme);
         let frost = theme::frost_10(theme);
         let danger = theme::danger();
+        let is_repo = !self.non_repo_paths.contains_key(&project.path);
 
         // Precompute the "New session ▸" parent row before the menu
         // chain — the `item` closure below holds an immutable borrow
@@ -4606,34 +4716,38 @@ impl Sidebar {
             // project scope. Clicking the parent fires the default
             // agent on the project's primary worktree path.
             .child(new_session_parent_row)
-            .child(div().h_px().bg(divider).my_1())
-            .child(item(
-                "menu-new-worktree",
-                "New worktree from branch…",
-                false,
-                Box::new(move |this, window, cx| {
-                    this.open_new_worktree_dialog(idx, window, cx);
-                }),
-            ))
-            // ── Git ─────────────────────────────────────────────
-            // Fetch + Open remote. Mirrors C# BuildProjectMenu
-            // Git section. "Set default agent" submenu lands when
-            // we have a submenu primitive.
-            .child(div().h_px().bg(divider).my_1())
-            .child(item(
-                "menu-fetch-all",
-                "Fetch all (prune)",
-                false,
-                Box::new(move |this, _window, cx| this.fetch_all_for_project(idx, cx)),
-            ))
-            .child(item(
-                "menu-open-remote",
-                "Open remote in browser",
-                false,
-                Box::new(move |this, _window, cx| {
-                    this.open_project_remote_in_browser(idx, cx);
-                }),
-            ))
+            // Worktree + Git rows only make sense on a repository; a
+            // plain-folder project (#338) goes straight to Reveal.
+            .when(is_repo, |menu| {
+                menu.child(div().h_px().bg(divider).my_1())
+                    .child(item(
+                        "menu-new-worktree",
+                        "New worktree from branch…",
+                        false,
+                        Box::new(move |this, window, cx| {
+                            this.open_new_worktree_dialog(idx, window, cx);
+                        }),
+                    ))
+                    // ── Git ─────────────────────────────────────
+                    // Fetch + Open remote. Mirrors C# BuildProjectMenu
+                    // Git section. "Set default agent" submenu lands
+                    // when we have a submenu primitive.
+                    .child(div().h_px().bg(divider).my_1())
+                    .child(item(
+                        "menu-fetch-all",
+                        "Fetch all (prune)",
+                        false,
+                        Box::new(move |this, _window, cx| this.fetch_all_for_project(idx, cx)),
+                    ))
+                    .child(item(
+                        "menu-open-remote",
+                        "Open remote in browser",
+                        false,
+                        Box::new(move |this, _window, cx| {
+                            this.open_project_remote_in_browser(idx, cx);
+                        }),
+                    ))
+            })
             // ── Reveal ──────────────────────────────────────────
             .child(div().h_px().bg(divider).my_1())
             .child(item(
@@ -4768,6 +4882,7 @@ impl Sidebar {
             project.name, branch_label
         ));
         let is_primary = worktree.is_primary;
+        let is_repo = !self.non_repo_paths.contains_key(&worktree.path);
 
         // Precompute the "New session ▸" parent row up-front so we
         // don't try to re-borrow `cx` mutably inside the menu_body
@@ -4907,31 +5022,37 @@ impl Sidebar {
             // browser. The dirty-state aware Rebase + Discard rows
             // from the C# build land when the worktree polling infra
             // does; these are stateless enough to ship now.
-            .child(div().h_px().bg(divider).my_1())
-            .child({
-                let path_for_diff = PathBuf::from(&worktree.path);
-                item(
-                    "wt-menu-view-changes",
-                    "View changes",
-                    false,
-                    Box::new(move |this, _window, cx| {
-                        cx.emit(SidebarEvent::OpenDiff {
-                            worktree_path: path_for_diff.clone(),
-                        });
-                        this.close_menu(cx);
-                    }),
-                )
-            })
-            .child({
-                let id_for_pull = worktree_id.clone();
-                item(
-                    "wt-menu-pull",
-                    "Pull (fast-forward)",
-                    false,
-                    Box::new(move |this, _window, cx| {
-                        this.pull_worktree(project_idx, &id_for_pull, cx);
-                    }),
-                )
+            // Every row in this section is hidden for a plain-folder
+            // project (#338) — the branch-gated ones fall out on
+            // their own (no branch), these two need the explicit
+            // `is_repo` gate.
+            .when(is_repo, |menu| {
+                menu.child(div().h_px().bg(divider).my_1())
+                    .child({
+                        let path_for_diff = PathBuf::from(&worktree.path);
+                        item(
+                            "wt-menu-view-changes",
+                            "View changes",
+                            false,
+                            Box::new(move |this, _window, cx| {
+                                cx.emit(SidebarEvent::OpenDiff {
+                                    worktree_path: path_for_diff.clone(),
+                                });
+                                this.close_menu(cx);
+                            }),
+                        )
+                    })
+                    .child({
+                        let id_for_pull = worktree_id.clone();
+                        item(
+                            "wt-menu-pull",
+                            "Pull (fast-forward)",
+                            false,
+                            Box::new(move |this, _window, cx| {
+                                this.pull_worktree(project_idx, &id_for_pull, cx);
+                            }),
+                        )
+                    })
             })
             // "Rebase onto origin/<default>" — mirrors the C#
             // `RebaseOntoDefaultCommand` row. Visible only when the
@@ -5063,16 +5184,16 @@ impl Sidebar {
                 }
                 rows
             })
-            .child({
+            .when(is_repo, |menu| {
                 let id_for_remote = worktree_id.clone();
-                item(
+                menu.child(item(
                     "wt-menu-open-remote",
                     "Open remote in browser",
                     false,
                     Box::new(move |this, _window, cx| {
                         this.open_worktree_remote_in_browser(project_idx, &id_for_remote, cx);
                     }),
-                )
+                ))
             })
             // "Discard changes…" — only surface when the dirty
             // poller has flagged this worktree as having changes;

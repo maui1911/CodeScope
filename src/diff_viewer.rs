@@ -87,6 +87,21 @@ impl AppShell {
             );
             return;
         };
+        // A plain-folder project has nothing to diff — say so instead
+        // of rendering the raw `fatal: not a git repository` in the
+        // panel (#338).
+        if self.path_is_non_repo(&worktree, cx) {
+            self.push_toast(
+                ToastKind::Info,
+                SharedString::new_static("Not a git repository"),
+                Some(SharedString::from(format!(
+                    "{} is a plain folder; there are no changes to show.",
+                    worktree.display()
+                ))),
+                cx,
+            );
+            return;
+        }
 
         // The diff viewer and the Overview occupy the same work-area
         // slot; opening one dismisses the other.

@@ -8177,14 +8177,22 @@ impl AppShell {
                     .branch
                     .clone()
                     .unwrap_or_else(|| project.default_branch.clone());
+                // A plain-folder project has no branch to show; the
+                // `default_branch` fallback would title it `name ·
+                // main` and invent a branch that doesn't exist (#338).
+                let title: SharedString = if sidebar.is_non_repo(&wt.path) {
+                    project.name.clone().into()
+                } else {
+                    format!("{} · {}", project.name, branch).into()
+                };
                 out.push(PaletteAction {
                     kind: PaletteActionKind::Worktree {
                         working_directory: std::path::PathBuf::from(&wt.path),
-                        title: format!("{} · {}", project.name, branch).into(),
+                        title: title.clone(),
                         branch: branch.clone(),
                         project_name: project.name.clone(),
                     },
-                    title: format!("Open: {} · {}", project.name, branch).into(),
+                    title: format!("Open: {title}").into(),
                     subtitle: Some(wt.path.clone().into()),
                     group: PaletteGroup::Worktrees,
                 });
@@ -8291,6 +8299,14 @@ impl AppShell {
             .filter(|p| !p.is_remote_shell())
             .map(|p| p.path.clone())
             .filter(|path| !path.is_empty())
+    }
+
+    /// `true` when the sidebar's git-status poller has ruled `path`
+    /// out as a git working tree (a plain-folder project, #338).
+    /// Thin accessor so sibling modules (`diff_viewer`) can ask
+    /// without reaching into the private `sidebar` entity.
+    pub(crate) fn path_is_non_repo(&self, path: &std::path::Path, cx: &App) -> bool {
+        self.sidebar.read(cx).is_non_repo(&path.to_string_lossy())
     }
 
     /// Active tab's working directory as a `String`. Used by the
