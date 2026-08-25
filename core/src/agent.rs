@@ -173,6 +173,10 @@ mod tests {
             agent_id_from_auto_type(Some("\tcopilot --workspace .")),
             Some(AgentId::Copilot),
         );
+        assert_eq!(
+            agent_id_from_auto_type(Some("gemini --foo")),
+            Some(AgentId::Gemini),
+        );
     }
 
     #[test]

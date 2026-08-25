@@ -601,6 +601,19 @@ mod tests {
     }
 
     #[test]
+    fn from_settings_default_agent_gemini_promotes_the_new_built_in() {
+        // `"defaultAgent": "gemini"` must promote the Rust-port-only
+        // built-in and demote Claude, same as any C#-era agent id.
+        let mut settings = Settings::default();
+        settings.default_agent = "gemini".into();
+        let reg = AgentRegistry::from_settings(&settings);
+        let def = reg.get_default().expect("default present");
+        assert_eq!(def.id, "gemini");
+        assert!(def.is_default);
+        assert!(!reg.get_by_id("claude").unwrap().is_default);
+    }
+
+    #[test]
     fn gemini_new_session_and_resume_are_bare_command() {
         // No resume verbs are baked yet (see the profile comment) —
         // both shapes must come out as plain `gemini` so a relaunch
