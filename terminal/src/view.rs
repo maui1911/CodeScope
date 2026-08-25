@@ -300,6 +300,27 @@ impl TerminalView {
         self.refresh_snapshot(cx);
     }
 
+    /// Swap the font config on a running terminal. The font
+    /// counterpart of [`Self::set_palette`] — the app shell calls
+    /// this for every open tab when the user saves a font change in
+    /// Settings, so the grids re-render in the new face immediately
+    /// instead of keeping their spawn-time font until the tab is
+    /// reopened.
+    ///
+    /// No re-measure happens here: the canvas layout pass shapes the
+    /// probe glyph with `self.font` on every frame anyway, so the
+    /// next render picks up the new face, recomputes cell metrics,
+    /// and stages a PTY grid resize through the existing debounce.
+    /// Zeroing `last_size` forces that pass to see a dimension diff
+    /// even when the new font's metrics land on the same cols × rows,
+    /// so the measured `cell_width` / `line_height` written back into
+    /// `self.font` (used by mouse hit-testing) never go stale.
+    pub fn set_font(&mut self, font: FontConfig, cx: &mut Context<Self>) {
+        self.font = font;
+        *self.last_size.lock() = (0, 0);
+        cx.notify();
+    }
+
     /// Snap the cursor to its visible phase. Called whenever the user
     /// types so the cursor never disappears mid-keystroke.
     fn show_cursor_now(&self) {

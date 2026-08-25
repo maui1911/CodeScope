@@ -441,11 +441,12 @@ impl AppShell {
         }
         self.settings_dialog = None;
         // Reuse the existing live-reload pathway so theme + chrome
-        // swap atomically and the sidebar repaints. Terminals that
-        // are already running keep their baked-in palette / font /
-        // scrollback — only new tabs pick up font + scrollback
-        // changes. Theme + cursor take effect for chrome on the next
-        // frame; cursor-style changes apply to freshly-spawned tabs.
+        // swap atomically and the sidebar repaints. Palette and font
+        // changes are pushed into running terminals in place
+        // (`push_palette_to_terminals` / `push_font_to_terminals`);
+        // scrollback still applies to new tabs only. Theme + cursor
+        // take effect for chrome on the next frame; cursor-style
+        // changes apply to freshly-spawned tabs.
         self.apply_settings(new_settings, cx);
     }
 

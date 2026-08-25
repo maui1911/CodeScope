@@ -3509,8 +3509,10 @@ impl AppShell {
     /// settings and theme `Arc`s, and forwards the new theme to the
     /// sidebar so its chrome repaints in the same frame. Running
     /// terminals get the new palette pushed via
-    /// `push_palette_to_terminals` so the grid recolours live too;
-    /// font changes still take effect on next spawn only.
+    /// `push_palette_to_terminals` so the grid recolours live too,
+    /// and a changed font is pushed via `push_font_to_terminals` so
+    /// the grids restyle in place; scrollback still applies to new
+    /// tabs only.
     pub(crate) fn apply_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
         let theme = Arc::new(codescope_core::theme::builtin::by_name(&settings.theme));
         // Rebuild the AgentRegistry from the new settings so the
@@ -3520,6 +3522,11 @@ impl AppShell {
         // the Settings dialog appears to do nothing for agent choice.
         let agent_registry =
             codescope_core::AgentRegistry::from_settings(&settings);
+        // Compare before the swap: a font edit should reach running
+        // terminals (see `push_font_to_terminals`), but pushing on
+        // every apply would stage a pointless re-measure + PTY resize
+        // per tab for theme-only changes and live previews.
+        let font_changed = self.settings.font != settings.font;
         self.settings = Arc::new(settings);
         self.theme = theme.clone();
         self.sidebar.update(cx, |sidebar, cx| {
@@ -3527,6 +3534,9 @@ impl AppShell {
             sidebar.apply_agent_registry(agent_registry, cx);
         });
         self.push_palette_to_terminals(cx);
+        if font_changed {
+            self.push_font_to_terminals(cx);
+        }
         cx.notify();
     }
 
@@ -3560,6 +3570,24 @@ impl AppShell {
                 let palette = palette.clone();
                 tab.terminal.update(cx, |view, cx| {
                     view.set_palette(palette, cx);
+                });
+            }
+        }
+    }
+
+    /// Rebuild the terminal font config from the live settings and
+    /// push it into every open tab's `TerminalView` — the font
+    /// counterpart of [`Self::push_palette_to_terminals`]. Each view
+    /// re-measures and stages a grid resize on its next frame, so a
+    /// Save in the Settings dialog restyles running terminals in
+    /// place instead of only affecting freshly-spawned tabs.
+    fn push_font_to_terminals(&mut self, cx: &mut Context<Self>) {
+        let font = build_font_config(&self.settings);
+        for group in &self.groups {
+            for tab in &group.tabs {
+                let font = font.clone();
+                tab.terminal.update(cx, |view, cx| {
+                    view.set_font(font, cx);
                 });
             }
         }
