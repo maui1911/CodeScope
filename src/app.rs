@@ -1897,14 +1897,15 @@ impl AppShell {
                     session_id.clone(),
                 ))
             }
-            codescope_core::AgentId::Codex => {
-                // Codex telemetry isn't wired in the Rust port yet (the
-                // AgentRegistry entry exists ahead of the discovery
-                // layer); skip registration so the rest of the agent
-                // surface keeps working until the dedicated Codex
-                // discovery / telemetry modules land.
+            codescope_core::AgentId::Codex | codescope_core::AgentId::Gemini => {
+                // Codex / Gemini telemetry isn't wired in the Rust
+                // port yet (the AgentRegistry entries exist ahead of
+                // the discovery layer); skip registration so the rest
+                // of the agent surface keeps working until the
+                // dedicated discovery / telemetry modules land.
                 eprintln!(
-                    "[telemetry] codex telemetry not yet wired — skipping registration for {session_id}"
+                    "[telemetry] {} telemetry not yet wired — skipping registration for {session_id}",
+                    agent_id.as_str()
                 );
                 return;
             }
@@ -2191,15 +2192,19 @@ impl AppShell {
                         for (t_idx, tab) in group.tabs.iter().enumerate() {
                             let Some(agent_id) = tab.agent_id else { continue };
                             let Some(ref wd) = tab.working_directory else { continue };
-                            // Codex has no discovery wired in the Rust
-                            // port yet — skip before flipping
-                            // `any_active`, otherwise an all-Codex
-                            // workspace would pin the poll at the
-                            // 350 ms active rate while the loop does
-                            // no work. Drop it through with the same
-                            // "no agent" handling so the cadence
-                            // relaxes to the 5 s idle interval.
-                            if matches!(agent_id, codescope_core::AgentId::Codex) {
+                            // Codex / Gemini have no discovery wired
+                            // in the Rust port yet — skip before
+                            // flipping `any_active`, otherwise an
+                            // all-Codex workspace would pin the poll
+                            // at the 350 ms active rate while the
+                            // loop does no work. Drop them through
+                            // with the same "no agent" handling so
+                            // the cadence relaxes to the 5 s idle
+                            // interval.
+                            if matches!(
+                                agent_id,
+                                codescope_core::AgentId::Codex | codescope_core::AgentId::Gemini
+                            ) {
                                 continue;
                             }
                             any_active = true;
@@ -2262,7 +2267,8 @@ impl AppShell {
                                     .map(|c| (c.session_id, c.session_dir))
                                     .collect()
                                 }
-                                codescope_core::AgentId::Codex => {
+                                codescope_core::AgentId::Codex
+                                | codescope_core::AgentId::Gemini => {
                                     // Unreachable: short-circuited
                                     // above so the active-poll rate
                                     // doesn't stay pinned for an

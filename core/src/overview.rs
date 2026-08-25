@@ -52,7 +52,7 @@ pub struct OverviewRow {
     /// to look up the matching live tab (group + tab index).
     pub working_directory: String,
     /// The persisted `agent_id` ("claude", "codex", "copilot",
-    /// "opencode", "pi") or `None` for plain shell sessions.
+    /// "opencode", "pi", "gemini") or `None` for plain shell sessions.
     pub agent_id: Option<String>,
     /// `closed_at` raw ISO 8601 string. `None` for live rows; the
     /// renderer formats this via

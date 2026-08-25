@@ -37,8 +37,8 @@ use gpui::{
 use crate::app::AppShell;
 use crate::theme;
 
-/// Display name for one of the five supported agent ids. Mirrors
-/// `OverviewViewModel.ResolveAgentDisplay`. The five built-in agent
+/// Display name for one of the built-in agent ids. Mirrors
+/// `OverviewViewModel.ResolveAgentDisplay`. The built-in agent
 /// ids are stable so a small lookup is enough for parity with the
 /// C# build's `AgentRegistry`-threaded label resolution.
 fn agent_display(agent_id: Option<&str>) -> SharedString {
@@ -48,6 +48,7 @@ fn agent_display(agent_id: Option<&str>) -> SharedString {
         Some("copilot") => SharedString::new_static("Copilot CLI"),
         Some("opencode") => SharedString::new_static("OpenCode"),
         Some("pi") => SharedString::new_static("Pi"),
+        Some("gemini") => SharedString::new_static("Gemini CLI"),
         Some(other) if !other.is_empty() => SharedString::from(other.to_string()),
         _ => SharedString::new_static("shell"),
     }
@@ -655,7 +656,9 @@ mod tests {
         // Unknown ids round-trip verbatim so a future agent id without
         // a built-in label still reads as something instead of just
         // "shell".
-        assert_eq!(agent_display(Some("gemini")), "gemini");
+        assert_eq!(agent_display(Some("gemini")), "Gemini CLI");
+        // Unknown ids still round-trip verbatim.
+        assert_eq!(agent_display(Some("bard")), "bard");
     }
 
     #[test]

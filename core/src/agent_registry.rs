@@ -8,8 +8,9 @@
 //! Rust sidebar / new-session menu can consume it 1:1.
 //!
 //! The registry is read-only after construction. Built-in defaults
-//! cover the five agents shipped in the C# build:
-//! `claude`, `codex`, `opencode`, `copilot`, `pi`.
+//! cover the five agents shipped in the C# build —
+//! `claude`, `codex`, `opencode`, `copilot`, `pi` — plus `gemini`,
+//! added in the Rust port (#324).
 //!
 //! Built defaults intentionally match the C# arrays — argv, session-id
 //! flags, resume-by-id args, icons, and context-window tokens — byte
@@ -99,8 +100,9 @@ impl AgentRegistry {
     }
 
     /// Construct the registry with the shipped built-in defaults
-    /// (claude / codex / opencode / copilot / pi). Equivalent to the
-    /// C# parameterless `new AgentRegistry()` constructor.
+    /// (claude / codex / opencode / copilot / pi / gemini).
+    /// Equivalent to the C# parameterless `new AgentRegistry()`
+    /// constructor.
     pub fn with_built_ins() -> Self {
         Self::new(built_in_defaults())
     }
@@ -291,6 +293,28 @@ pub fn built_in_defaults() -> Vec<AgentProfile> {
             icon: Some("π".into()),
             context_window_tokens: 0,
         },
+        AgentProfile {
+            id: "gemini".into(),
+            display_name: "Gemini CLI".into(),
+            command: "gemini".into(),
+            // Fresh launches: bare `gemini` (#324). Resume args stay
+            // empty for now — the CLI's session-resume surface
+            // (`/chat resume` inside the REPL) has no stable
+            // command-line shape we can bake without risking a broken
+            // launch; a wrong flag here would fail every relaunch.
+            // Like Codex, discovery/telemetry is a follow-up — the
+            // registry entry gives the new-session menu, settings
+            // default-agent picker, and session records the id today.
+            resume_args: vec![],
+            new_session_args: vec![],
+            session_id_flag: None,
+            resume_by_id_args: vec![],
+            is_default: false,
+            icon: Some("✦".into()),
+            // Gemini CLI defaults to Gemini 2.5 Pro, whose standard
+            // context window is 1M tokens.
+            context_window_tokens: 1_000_000,
+        },
     ]
 }
 
@@ -428,10 +452,10 @@ mod tests {
     }
 
     #[test]
-    fn built_in_defaults_cover_all_five_agents() {
+    fn built_in_defaults_cover_all_built_in_agents() {
         let defaults = built_in_defaults();
         let ids: Vec<&str> = defaults.iter().map(|a| a.id.as_str()).collect();
-        assert_eq!(ids, vec!["claude", "codex", "opencode", "copilot", "pi"]);
+        assert_eq!(ids, vec!["claude", "codex", "opencode", "copilot", "pi", "gemini"]);
     }
 
     #[test]
@@ -486,7 +510,8 @@ mod tests {
         assert_eq!(reg.get_by_id("CLAUDE").unwrap().id, "claude");
         assert_eq!(reg.get_by_id("Codex").unwrap().id, "codex");
         assert_eq!(reg.get_by_id("PI").unwrap().id, "pi");
-        assert!(reg.get_by_id("gemini").is_none());
+        assert_eq!(reg.get_by_id("Gemini").unwrap().id, "gemini");
+        assert!(reg.get_by_id("bard").is_none());
     }
 
     #[test]
@@ -567,9 +592,24 @@ mod tests {
         // user should still get Claude back when they fat-finger an
         // unknown id.
         let mut settings = Settings::default();
-        settings.default_agent = "gemini".into();
+        settings.default_agent = "bard".into();
         let reg = AgentRegistry::from_settings(&settings);
         assert_eq!(reg.get_default().unwrap().id, "claude");
+    }
+
+    #[test]
+    fn gemini_new_session_and_resume_are_bare_command() {
+        // No resume verbs are baked yet (see the profile comment) —
+        // both shapes must come out as plain `gemini` so a relaunch
+        // never types a flag the CLI might reject.
+        let profile = registry_profile("gemini");
+        assert_eq!(build_new_session_auto_type(&profile), Some("gemini".into()));
+        assert_eq!(build_resume_auto_type(&profile, None), Some("gemini".into()));
+        assert_eq!(
+            build_resume_auto_type(&profile, Some("some-id")),
+            Some("gemini".into()),
+            "an adopted id must not invent a resume flag"
+        );
     }
 
     #[test]
