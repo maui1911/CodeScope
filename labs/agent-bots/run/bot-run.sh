@@ -528,6 +528,8 @@ AGENT_MODEL_FLAG="$(field_at_base model_flag "$PROFILE_REL")"
 AGENT_INSTRUCTION_FILES="$(field_at_base instruction_files "$PROFILE_REL")"
 AGENT_VERIFIED="$(field_at_base verified "$PROFILE_REL")"
 AGENT_SHELL="$(field_at_base shell "$PROFILE_REL")"
+AGENT_PROMPT_VIA="$(field_at_base prompt "$PROFILE_REL")"
+AGENT_PROMPT_VIA="${AGENT_PROMPT_VIA:-argv}"
 AGENT_SHELL="${AGENT_SHELL:-posix}"
 
 [ -n "$AGENT_CMD" ] || die "profile '$AGENT_ID' declares no command"
@@ -578,6 +580,17 @@ case "$AGENT_SHELL" in
     posix|native) ;;
     *) die "profile '$AGENT_ID' declares shell '$AGENT_SHELL'; expected posix or native" ;;
 esac
+
+# How the prompt reaches the agent. `argv` substitutes {prompt} as one
+# argument; `stdin` feeds it on standard input and leaves argv short.
+# Short matters: cmd.exe truncates a command line at 8191 characters,
+# and a prompt carrying a whole task file goes past that - silently,
+# taking the trailing flags with it. See F-27.
+case "$AGENT_PROMPT_VIA" in
+    argv|stdin) ;;
+    *) die "profile '$AGENT_ID' declares prompt '$AGENT_PROMPT_VIA'; expected argv or stdin" ;;
+esac
+[ "$AGENT_OVERRIDDEN" -eq 0 ] || AGENT_PROMPT_VIA="argv"
 
 # A stub is a bash script. Taking bash away from one would test the
 # PATH surgery and nothing else.
@@ -871,6 +884,20 @@ valid outcome; guessing is not."
 
 GIT_COMMON_DIR="$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
 [ -n "$GIT_COMMON_DIR" ] || GIT_COMMON_DIR="$REPO/.git"
+
+case "$AGENT_HEADLESS" in
+    *"{prompt}"*)
+        [ "$AGENT_PROMPT_VIA" = "argv" ] || die \
+"profile '$AGENT_ID' says prompt: stdin and still has {prompt} in its
+headless template. Those are two different places to put the same
+thing; pick one."
+        ;;
+    *)
+        [ "$AGENT_PROMPT_VIA" = "stdin" ] || [ "$AGENT_OVERRIDDEN" -eq 1 ] || die \
+"profile '$AGENT_ID' has no {prompt} in its headless template and does
+not say prompt: stdin, so the agent would be started with no task."
+        ;;
+esac
 
 AGENT_ARGV=()
 AGENT_ARGV_DISPLAY=()
@@ -1201,16 +1228,26 @@ trap release_locks EXIT
 # Agent
 # --------------------------------------------------------------------
 
+# The prompt as sent, byte for byte. It is the one input to the run
+# that was never written down anywhere: the log holds whatever the
+# agent chose to echo back, which is not the same thing.
+PROMPT_FILE="${RUN_LOG%.log}-prompt.txt"
+printf '%s\n' "$PROMPT" > "$PROMPT_FILE"
+
+AGENT_STDIN="/dev/null"
+[ "$AGENT_PROMPT_VIA" = "argv" ] || AGENT_STDIN="$PROMPT_FILE"
+
 step "Agent"
 if [ "$SKIP_AGENT" -eq 1 ]; then
     say "  skipped (--skip-agent)"
     board "agent-skipped"
 else
     say "  $AGENT_INVOCATION (output -> $RUN_LOG)"
-    # stdin is closed on purpose: a headless agent that decides to
-    # prompt would otherwise inherit the runner's terminal and hang.
+    # stdin is the prompt file or nothing at all - never the runner's
+    # terminal. A headless agent that decides to ask a question would
+    # otherwise inherit it and hang, and either of these ends in EOF.
     ( cd "$WT" && PATH="$AGENT_PATH" "$AGENT_CMD" "${AGENT_ARGV[@]}" ) \
-        </dev/null >>"$RUN_LOG" 2>&1 || AGENT_EXIT=$?
+        <"$AGENT_STDIN" >>"$RUN_LOG" 2>&1 || AGENT_EXIT=$?
     say "  exit $AGENT_EXIT"
     board "agent-ran" "exit $AGENT_EXIT"
 fi
@@ -2118,7 +2155,8 @@ $(if [ "$TREE_BROKEN" -eq 0 ] && [ "$COMMITS" -gt 0 ]; then git -C "$WT" log --f
     rebase:   $REBASE_STATE
     touched:
 $(if [ -n "$TOUCHED" ]; then printf '%s\n' "$TOUCHED" | sed 's/^/      /'; else echo "      (none)"; fi)
-    log:      $RUN_LOG$REVIEW_EVIDENCE
+    log:      $RUN_LOG
+    prompt:   $PROMPT_FILE (via $AGENT_PROMPT_VIA)$REVIEW_EVIDENCE
 
 # Status
 

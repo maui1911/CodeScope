@@ -2,7 +2,8 @@
 id: codex
 display_name: Codex CLI
 command: codex
-headless: exec {prompt}
+headless: exec
+prompt: stdin
 autonomy: -s workspace-write --add-dir {git_dir}
 shell: native
 model_flag: -m
