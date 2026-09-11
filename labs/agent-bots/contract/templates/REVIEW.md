@@ -14,12 +14,30 @@ can tell them.
 
 - core/src/example.rs:142 — the claim, in one sentence. What is wrong,
   not what to do about it.
+  > let span = info_span!("example", id = %id);
 - core/src/example.rs:301 — second finding.
+  > if buffer.len() > CAP {
+  >     buffer.clear();
 
 Ranked by what would actually break, hardest first. Every line starts
 with a real `path:line` inside the task's `touches:`. The runner reads
 the blob at the commit under review and refuses the run if the path is
 not a file there, or if the line is past its end.
+
+**Every finding quotes what it is about**, on `> ` lines under its
+bullet, and the runner checks the quote against that blob. One line, or
+several for consecutive lines starting at the one you cited. The match
+is a substring after whitespace is normalised — quote a fragment of a
+long line if that is the honest part, and re-indent it if you like;
+what you may not do is quote something that is not there. Fewer than
+eight characters of content is refused, because a quote that short
+matches half the file and identifies nothing.
+
+Why the quote: a citation that resolves proves a file was opened. A
+quote that matches proves the line was read. The gap between those two
+is the whole failure mode — a review whose paths, line numbers and
+frontmatter all check out, describing something that is not in the
+code.
 
 These citations are also the scope of whatever comes next: when the
 task declares `on_changes_requested:`, this list is what the derived

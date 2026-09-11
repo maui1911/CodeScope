@@ -10,6 +10,10 @@
 set -e
 
 SHA="$(git rev-parse HEAD)"
+# Read out of the tree rather than written down here. The verifier
+# checks the quote against the blob, so a stub that hardcodes a line
+# would be a fixture that goes stale the next time that line moves.
+CITED_LINE="$(git show "$SHA:core/src/telemetry.rs" | sed -n '1p')"
 
 cat > .bot-review.md <<REVIEW
 ---
@@ -28,6 +32,7 @@ real observations.
 
 - core/src/telemetry.rs:1 — placeholder finding, cited at a line that
   exists so the handoff can be exercised end to end.
+  > $CITED_LINE
 
 # What I could not check
 

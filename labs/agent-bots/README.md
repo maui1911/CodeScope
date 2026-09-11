@@ -309,7 +309,7 @@ detects that it happened.
 
 | | |
 |---|---|
-| Covered | plain-folder projects as well as git ones; the file contract; **two bots** (`fixer`, `reviewer`), two deliverables (`produces: commit`, `produces: report`), the handoff between them and a scheduler that reads the board; contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the report channel (`artifact:`, `shape:`, harvested into `.state/artifacts/`); verifier, in a clean checkout of the branch tip; evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup; rebase onto a base that moved, re-verified there |
+| Covered | plain-folder projects as well as git ones; the file contract; **two bots** (`fixer`, `reviewer`), two deliverables (`produces: commit`, `produces: report`), the handoff between them and a scheduler that reads the board; contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the report channel (`artifact:`, `shape:`, harvested into `.state/artifacts/`) with citations *and* quotes checked against the blob; verifier, in a clean checkout of the branch tip; evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup; rebase onto a base that moved, re-verified there |
 | **Not** covered | the approval inbox, per-bot memory, re-verifying a branch that is *waiting* rather than running, resume after a crash, any trigger other than "someone ran a tick", pushing, opening PRs, any GPUI surface |
 
 Two deliberate omissions:
@@ -418,10 +418,19 @@ labs/agent-bots/run/bot-run.sh   --task labs/agent-bots/examples/T-0005-review-o
 ```
 
 Its verifier is `run/review-shape.sh`, which checks the review against
-the tree it claims to be about — including that every cited `path:line`
-is a real file and a real line at that commit, and falls inside
-`touches:`. What it cannot check is whether the review is *right*; see
-F-19 for where that ceiling sits.
+the tree it claims to be about: every cited `path:line` is a real file
+and a real line at that commit and falls inside `touches:`, **and every
+finding quotes that line, with the quote matched against the blob**.
+Substring after whitespace is normalised, at least eight characters of
+content, and a multi-line quote has to match consecutive lines from the
+one cited.
+
+That last part is the difference between a reviewer that opened the
+file and one that read the file listing. A citation resolving proves
+somebody knew a path; only the quote proves they were looking at the
+line. What none of it can check is whether the review is *right* — see
+F-19 for where that ceiling sits, and F-33 for why it moved as far as
+it did.
 
 A review task that also declares `on_changes_requested:` and
 `derived_verify:` hands its verdict on. `changes-requested` then makes
@@ -2435,3 +2444,77 @@ What generalises: **count the exceptions before believing the type.**
 One `if` for a special case is a special case. Twenty of them, all
 saying *unless*, are the shape of the thing you should have modelled,
 and every future role arrives as one more exception until you do.
+
+---
+
+### F-33 · A resolving citation is not a read line
+
+*2026-09-11, the claim verifier.*
+
+`review-shape.sh` checked that every finding cited a path that is a
+file at the reviewed commit, at a line that file has, inside
+`touches:`. That is a real check and it catches the obvious fabricator
+— F-19's `fabulist.sh` invents a filename and the run goes red.
+
+It also leaves the more convincing failure completely unguarded. A
+reviewer that lists real paths, real line numbers, correct frontmatter
+and a filled-in blind-spot section, and describes code that is not on
+those lines, passes every check. Everything mechanical about it is
+right. It is the shape a model produces when it is summarising what a
+file like that usually contains instead of reading the one in front of
+it, and it is *more* dangerous than the invented path, because nothing
+about it looks wrong.
+
+So a finding now quotes the code it is about, and the runner reads the
+blob and checks the quote:
+
+```
+- core/src/telemetry.rs:142 — the span is opened and never closed.
+  > let span = info_span!("emit", id = %id);
+```
+
+The rules that mattered, and why each one is where it is:
+
+- **Substring, not equality.** Quoting a fragment of a 120-character
+  line is the honest way to cite one. A fragment cannot be guessed
+  either, so nothing is lost.
+- **Whitespace normalised on both sides.** Re-indenting a quote is not
+  inventing one, and refusing a review over two spaces would teach
+  exactly the wrong lesson about what the check is for.
+- **At least eight characters of content, whitespace excluded.** `{`
+  occurs on half the lines of any Rust file. A quote that matches
+  everything identifies nothing, and a minimum is the only thing
+  standing between "quote the line" and "quote a brace".
+- **A multi-line quote is consecutive lines from the one cited.** It
+  lets a finding be about a paragraph rather than a line, and it makes
+  the cited coordinate load-bearing instead of decorative: the quote
+  has to start where the citation says it does.
+
+What this does *not* do is move F-19's ceiling. Nothing here can tell
+you whether the finding is correct — only that the reviewer was looking
+at the line it says it was looking at. The gap between "cited" and
+"read" was the one that could be closed mechanically, so it was worth
+closing; the gap between "read" and "right" still needs a human.
+
+### The second thing this exposed
+
+The verifier could not be tested from the branch that changes it.
+`verify:` runs inside the verify checkout, which is a checkout at the
+task's `base:` — so a full run exercises the copy of `review-shape.sh`
+sitting at base, never the one being edited. Every check of it went
+through three stubs and a whole dispatch, and all of them were checking
+last week's verifier.
+
+`review-shape.sh` is a pure function of (review, commit, touches).
+Nothing about testing it needs a runner, a surface or a task. Ten
+direct checks now call the working-tree copy with the environment set
+by hand — one per property, including the three failure modes the
+quoting introduced — and they are the only part of this that could be
+proven before the merge.
+
+The general form, and it is the same one as #348: **a script that is
+read from the tree under test can only be tested as a unit.** Anything
+that reaches it through the full loop is testing whatever is at base.
+That is contract-read-at-base doing its job, not a defect — but it
+means "the sweep is green" answers a narrower question than it looks
+like it does, and it is worth knowing which of the two it answered.

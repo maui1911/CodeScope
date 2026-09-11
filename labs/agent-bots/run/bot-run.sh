@@ -1106,7 +1106,10 @@ Rules for this run:
   - The frontmatter names this task ($TASK_ID) and the commit the
     report is about, which is $BASE_SHA - the one you are on.
   - Every claim must cite a real path:line inside $TASK_TOUCHES
-    that exists at that commit. A made-up path fails the run.
+    that exists at that commit, and quote what is on that line. A
+    made-up path fails the run, and so does a quote that is not
+    there - a citation proves a file was opened, a quote proves the
+    line was read.
   - Having nothing to report is a complete report. Do not pad.
   - Leave nothing else behind: no scratch files, no notes, no commit.
   - Do NOT push, do NOT open a PR, do NOT edit anything under

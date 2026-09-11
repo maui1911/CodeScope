@@ -72,9 +72,17 @@ plane — the same way it handles `.bot-blocked`. You do not write the
 handoff; the runner does.
 
 Every finding must carry a real `path:line` that exists in the commit
-you were given and falls inside the task's `touches:`. A finding
-against a file you were not asked to review is out of scope no matter
-how right it is; note it under "What I could not check" instead.
+you were given and falls inside the task's `touches:`, **and quote the
+code it is about** on `> ` lines under the bullet. The runner reads the
+blob and refuses the run if the quote is not there. A finding against a
+file you were not asked to review is out of scope no matter how right
+it is; note it under "What I could not check" instead.
+
+That check is not paperwork and it is not aimed at you specifically. A
+citation that resolves proves a file was opened; only the quote proves
+the line was read, and the review that gets everything else right while
+describing code that does not exist is the one a reader has no defence
+against.
 
 ## Acceptance
 
@@ -84,8 +92,9 @@ A run is successful when **all** of these hold:
 2. `verdict` is one of `approve`, `changes-requested`, `blocked`.
 3. `reviewed` is the commit the runner actually gave you.
 4. Every finding names a path that exists at that commit, inside
-   `touches:`.
-5. No commit was made and nothing else was left in the worktree.
+   `touches:`, at a line that file has.
+5. Every finding quotes that line, and the quote is really there.
+6. No commit was made and nothing else was left in the worktree.
 
 ## Your verdict may become someone else's task
 
