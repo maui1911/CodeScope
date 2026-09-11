@@ -36,9 +36,18 @@ Field reference:
 
   id       stable, unique. Used for the branch name and the log.
   owner    which bot in contract/bots/ runs this.
-  status   todo | dispatched | verified | blocked | done
-           Single writer: the runner for this task. Nobody else.
+  status   todo | dispatched | blocked | needs-review | done
+           On the repo copy this is always `todo` - it is a definition.
+           The live copy under .state/tasks/ is what the runner reads
+           and writes, and it is the single writer. Same vocabulary as
+           the handoff, minus `todo`/`dispatched` which only a task has.
   base     ref the worktree branches from. Recorded as a SHA at dispatch.
-  touches  comma-separated globs. The diff must be a subset of these.
+  touches  comma-separated globs, matched as shell `case` patterns -
+           NOT gitignore or pathspec syntax. `*` crosses `/`, so
+           `core/*.rs` matches `core/src/telemetry.rs` and scopes the
+           whole crate. Name files explicitly when you mean them.
   verify   the executable verifier. Must exit 0. No verifier, no dispatch.
+           It must be a predicate the owner can satisfy inside its own
+           `touches:` - a whole-crate gate blocks every run on debt the
+           bot may not fix. See README F-1.
 -->

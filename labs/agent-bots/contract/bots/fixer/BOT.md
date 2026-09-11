@@ -62,10 +62,19 @@ also fixed something nearby".
 
 ## Escalation
 
-Stop and write a handoff with `status: blocked` when: the verifier was
-already failing before any edit; the fix genuinely needs a file outside
-`touches:`; the task is ambiguous enough that two reasonable readings
-give different code. Blocked is a good outcome. Guessing is not.
+Stop when: the verifier was already failing before any edit; the fix
+genuinely needs a file outside `touches:`; the task is ambiguous enough
+that two reasonable readings give different code. Blocked is a good
+outcome. Guessing is not.
+
+To escalate, write one line saying why to `.bot-blocked` in the
+worktree root, make no other changes, and stop. That file is the only
+channel back — the runner reads it, deletes it before it can reach a
+commit, and turns it into a `blocked` handoff. Prose in the transcript
+does not reach a human; neither does an exit code on its own.
+
+The report is a *claim*, not evidence. The runner still reads the tree
+and still runs the verifier, and the handoff carries both.
 
 ## Memory
 

@@ -30,7 +30,11 @@
 #   --skip-agent         Full loop, but stub the agent call. Smoke-tests
 #                        worktree + verifier + handoff on their own.
 #   --keep               Keep the worktree even on a clean no-op run.
+#   --reset              Discard the live task under state and start over.
+#                        Needed to re-run a task that already finished.
 #   -h, --help           This text.
+#
+# Exit codes: 0 done, 1 blocked, 2 needs-review.
 #
 # Environment:
 #   BOT_AGENT_CMD    Agent executable.        Default: claude
@@ -53,6 +57,13 @@ WORKTREE_ROOT=""
 DRY_RUN=0
 SKIP_AGENT=0
 KEEP=0
+RESET=0
+AGENT_EXIT=0
+
+# Repo-relative, and deliberately a single variable: the prompt points
+# the agent at these paths and the base check below proves they exist.
+# Two copies of the same string would be free to drift.
+CONTRACT_DIR="labs/agent-bots/contract"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAB_DIR="$(dirname "$SCRIPT_DIR")"
@@ -72,6 +83,7 @@ while [ $# -gt 0 ]; do
         --dry-run)       DRY_RUN=1; shift ;;
         --skip-agent)    SKIP_AGENT=1; shift ;;
         --keep)          KEEP=1; shift ;;
+        --reset)         RESET=1; shift ;;
         -h|--help)       usage; exit 0 ;;
         *)               die "unknown argument: $1 (try --help)" ;;
     esac
@@ -126,17 +138,76 @@ done
 case "$TASK_BRANCH" in
     main|master|HEAD) die "refusing to run on branch '$TASK_BRANCH'" ;;
 esac
-[ "$TASK_STATUS" = "todo" ] \
-    || die "task status is '$TASK_STATUS', expected 'todo' (reset it to re-run)"
 
+# Owner sanity. This name is spliced into filesystem paths below, so it
+# has to be a plain identifier - not a traversal.
+case "$TASK_OWNER" in
+    *[!a-zA-Z0-9_-]*|"") die "owner must be [a-zA-Z0-9_-]+, got '$TASK_OWNER'" ;;
+esac
+case "$TASK_ID" in
+    *[!a-zA-Z0-9_-]*|"") die "task id must be [a-zA-Z0-9_-]+, got '$TASK_ID'" ;;
+esac
+
+# The runner's own checkout, used only for a friendly "unknown owner"
+# error. The charter that actually governs the run is the one at the
+# base commit, checked below - these are different trees.
 BOT_DIR="$LAB_DIR/contract/bots/$TASK_OWNER"
 [ -f "$BOT_DIR/BOT.md" ] || die "no charter for owner '$TASK_OWNER' at $BOT_DIR/BOT.md"
 
 BASE_SHA="$(git -C "$REPO" rev-parse --verify "$TASK_BASE^{commit}" 2>/dev/null)" \
     || die "cannot resolve base ref '$TASK_BASE' (fetch first?)"
 
+# F-3: the agent reads the contract from *its* checkout, which is the
+# base commit - never from the runner's working tree. A contract that
+# is not on the base means the prompt points at files that do not
+# exist. Fail here, before a worktree and an agent run are spent on it.
+# Same shape as F-1: prove the precondition at base, not halfway.
+for rel in "bots/$TASK_OWNER/BOT.md" \
+           "context/CONVENTIONS.md" \
+           "context/ARCHITECTURE.md" \
+           "context/GLOSSARY.md"; do
+    git -C "$REPO" cat-file -e "$BASE_SHA:$CONTRACT_DIR/$rel" 2>/dev/null || die \
+"contract file missing at base '$TASK_BASE': $CONTRACT_DIR/$rel
+
+The agent reads its contract from the base commit, not from this
+checkout. Commit the contract, then point the task's 'base:' at a ref
+that contains it."
+done
+
 WT_LEAF="$(printf '%s' "$TASK_BRANCH" | tr '/' '-')"
 WT="$WORKTREE_ROOT/$WT_LEAF"
+
+# --------------------------------------------------------------------
+# Live task
+#
+# The repo copy is a *definition*; this is the live task. Status is read
+# from here when it exists, so a re-run cannot be waved through by a
+# definition that still says todo (which is what the first version did -
+# it read the definition and then overwrote the live copy on top).
+# --------------------------------------------------------------------
+
+LIVE_TASK="$STATE/tasks/$TASK_ID.md"
+
+if [ "$RESET" -eq 1 ] && [ -f "$LIVE_TASK" ]; then
+    rm -f "$LIVE_TASK"
+    say "reset: discarded live task $TASK_ID"
+fi
+
+EFFECTIVE_STATUS="$TASK_STATUS"
+if [ -f "$LIVE_TASK" ]; then
+    EFFECTIVE_STATUS="$(sed -n 's/^status:[[:space:]]*//p' "$LIVE_TASK" | head -n1)"
+fi
+
+case "$EFFECTIVE_STATUS" in
+    todo) ;;
+    dispatched)
+        die "task $TASK_ID is already in flight (live status: dispatched).
+A previous run died before writing a handoff. Inspect $WT, then re-run
+with --reset once the worktree and branch are gone." ;;
+    *)
+        die "task $TASK_ID is '$EFFECTIVE_STATUS', expected 'todo'.
+Re-run it with --reset to start over." ;;
+esac
 
 # --------------------------------------------------------------------
 # The prompt
@@ -150,10 +221,10 @@ WT="$WORKTREE_ROOT/$WT_LEAF"
 PROMPT="You are the bot '$TASK_OWNER' working in a git worktree.
 
 Read these first, in order:
-  1. labs/agent-bots/contract/bots/$TASK_OWNER/BOT.md - your charter
-  2. labs/agent-bots/contract/context/CONVENTIONS.md - hard rules
-  3. labs/agent-bots/contract/context/ARCHITECTURE.md
-  4. labs/agent-bots/contract/context/GLOSSARY.md
+  1. $CONTRACT_DIR/bots/$TASK_OWNER/BOT.md - your charter
+  2. $CONTRACT_DIR/context/CONVENTIONS.md - hard rules
+  3. $CONTRACT_DIR/context/ARCHITECTURE.md
+  4. $CONTRACT_DIR/context/GLOSSARY.md
 
 Your task, verbatim:
 ---
@@ -165,13 +236,16 @@ Rules for this run:
   - Edit only files matching: $TASK_TOUCHES
   - The verifier is: $TASK_VERIFY
     It must exit 0. Run it before you edit anything, and again after.
-  - Commit your work to this branch. One commit, message in English.
+  - Commit your work to this branch. Exactly one commit, message in English.
   - Do NOT push, do NOT open a PR, do NOT run cargo fmt.
-  - Do NOT edit anything under labs/agent-bots/contract/.
+  - Do NOT edit anything under $CONTRACT_DIR/.
   - Do NOT write a handoff or a report file. The runner does that.
 
-If the task cannot be completed inside those limits, make no changes
-and say why. Stopping is a valid outcome; guessing is not."
+If you cannot complete the task inside those limits, write one line
+saying why to the file '.bot-blocked' in the worktree root, make no
+other changes, and stop. That is your only channel back: the runner
+reads it, and nothing else you say reaches the handoff. Stopping is a
+valid outcome; guessing is not."
 
 # --------------------------------------------------------------------
 # Plan
@@ -213,7 +287,6 @@ DAY="${TS%%T*}"
 
 mkdir -p "$STATE/tasks" "$STATE/handoffs" "$STATE/runs/$DAY" "$STATE/bots/$TASK_OWNER"
 
-LIVE_TASK="$STATE/tasks/$TASK_ID.md"
 RUN_LOG="$STATE/runs/$DAY/$TASK_ID-$TS.log"
 BOARD="$STATE/board.md"
 
@@ -229,9 +302,13 @@ if [ ! -f "$BOARD" ]; then
     } > "$BOARD"
 fi
 
-board() { printf '| %s | %s | %s | %s |\n' "$TS" "$TASK_ID" "$1" "${2:--}" >> "$BOARD"; }
+# Each row carries its own clock. Stamping every row of a run with the
+# run's start time made the log unsortable the moment two runs overlap.
+board() {
+    printf '| %s | %s | %s | %s |\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TASK_ID" "$1" "${2:--}" >> "$BOARD"
+}
 
-cp "$TASK" "$LIVE_TASK"
 set_status() {
     sed -i "0,/^status:.*$/s//status: $1/" "$LIVE_TASK"
 }
@@ -241,13 +318,23 @@ set_status() {
 # --------------------------------------------------------------------
 
 step "Worktree"
-[ -e "$WT" ] && die "worktree path already exists: $WT (remove it, or bump the task id)"
+if [ -e "$WT" ]; then
+    die "worktree path already exists: $WT
+
+Clear both halves before re-running - removing only the directory
+leaves the branch behind, and 'worktree add -b' then fails too:
+    git -C $REPO worktree remove --force $WT
+    git -C $REPO branch -D $TASK_BRANCH"
+fi
 
 mkdir -p "$WORKTREE_ROOT"
 git -C "$REPO" worktree add "$WT" -b "$TASK_BRANCH" "$BASE_SHA" >>"$RUN_LOG" 2>&1 \
     || { board "dispatch-failed" "$TASK_BRANCH"; die "git worktree add failed; see $RUN_LOG"; }
 say "  created $WT"
 
+# Only now, with a worktree that actually exists, does the live task
+# come into being. A dispatch that fails must not leave one behind.
+cp "$TASK" "$LIVE_TASK"
 set_status dispatched
 board "dispatched" "$TASK_BRANCH @ ${BASE_SHA:0:12}"
 
@@ -261,10 +348,11 @@ if [ "$SKIP_AGENT" -eq 1 ]; then
     board "agent-skipped"
 else
     say "  $BOT_AGENT_CMD (output -> $RUN_LOG)"
-    AGENT_EXIT=0
+    # stdin is closed on purpose: a headless agent that decides to
+    # prompt would otherwise inherit the runner's terminal and hang.
     # shellcheck disable=SC2086  # BOT_AGENT_ARGS is word-split on purpose
     ( cd "$WT" && "$BOT_AGENT_CMD" -p "$PROMPT" $BOT_AGENT_ARGS ) \
-        >>"$RUN_LOG" 2>&1 || AGENT_EXIT=$?
+        </dev/null >>"$RUN_LOG" 2>&1 || AGENT_EXIT=$?
     say "  exit $AGENT_EXIT"
     board "agent-ran" "exit $AGENT_EXIT"
 fi
@@ -275,12 +363,41 @@ fi
 
 step "Evidence"
 
-HEAD_SHA="$(git -C "$WT" rev-parse HEAD)"
-COMMITS="$(git -C "$WT" rev-list --count "$BASE_SHA..HEAD")"
-DIRTY="$(git -C "$WT" status --porcelain | wc -l | tr -d ' ')"
-TOUCHED="$(git -C "$WT" diff --name-only "$BASE_SHA..HEAD")"
-NUMSTAT="$(git -C "$WT" diff --shortstat "$BASE_SHA..HEAD" | sed 's/^ *//')"
-[ -n "$NUMSTAT" ] || NUMSTAT="no committed changes"
+# The agent's one channel back. Read it, then delete it before anything
+# else looks at the tree - it must never reach a commit or inflate the
+# uncommitted-file count. It is a *claim*: it explains a verdict, it
+# never substitutes for one.
+AGENT_BLOCKED=""
+if [ -f "$WT/.bot-blocked" ]; then
+    AGENT_BLOCKED="$(tr -d '\r' < "$WT/.bot-blocked" | head -c 2000)"
+    rm -f "$WT/.bot-blocked"
+    [ -n "$AGENT_BLOCKED" ] || AGENT_BLOCKED="(agent wrote .bot-blocked but left it empty)"
+    say "  agent reported blocked"
+fi
+
+# A worktree the agent wrecked must still produce a handoff, so none of
+# these may take the script down under `set -e`.
+HEAD_SHA="$(git -C "$WT" rev-parse HEAD 2>/dev/null)" || HEAD_SHA=""
+if [ -z "$HEAD_SHA" ]; then
+    HEAD_SHA="(unreadable)"
+    COMMITS=0
+    DIRTY=0
+    TOUCHED=""
+    NUMSTAT="worktree unreadable"
+    TREE_BROKEN=1
+else
+    TREE_BROKEN=0
+    COMMITS="$(git -C "$WT" rev-list --count "$BASE_SHA..HEAD")"
+    DIRTY="$(git -C "$WT" status --porcelain | wc -l | tr -d ' ')"
+    # quotepath=off keeps non-ASCII paths unquoted, so the scope check
+    # compares the real name instead of "core/src/\303\244.rs".
+    # --no-renames makes a rename show up as both the deleted source and
+    # the added destination, so moving an out-of-scope file into scope
+    # cannot delete it invisibly.
+    TOUCHED="$(git -C "$WT" -c core.quotepath=off diff --name-only --no-renames "$BASE_SHA..HEAD")"
+    NUMSTAT="$(git -C "$WT" diff --shortstat "$BASE_SHA..HEAD" | sed 's/^ *//')"
+    [ -n "$NUMSTAT" ] || NUMSTAT="no committed changes"
+fi
 
 say "  head      ${HEAD_SHA:0:12}"
 say "  commits   $COMMITS"
@@ -309,19 +426,41 @@ fi
 # --------------------------------------------------------------------
 
 step "Verifier"
-say "  $TASK_VERIFY"
 VERIFY_EXIT=0
-( cd "$WT" && eval "$TASK_VERIFY" ) >>"$RUN_LOG" 2>&1 || VERIFY_EXIT=$?
-say "  exit $VERIFY_EXIT"
-board "verified" "exit $VERIFY_EXIT"
+if [ "$TREE_BROKEN" -eq 1 ]; then
+    say "  skipped - worktree unreadable"
+    VERIFY_EXIT=-1
+    board "verify-skipped" "worktree unreadable"
+else
+    say "  $TASK_VERIFY"
+    # NOTE: this runs on the working tree, not on HEAD, so an
+    # uncommitted edit can be what makes it pass. The handoff says so.
+    ( cd "$WT" && eval "$TASK_VERIFY" ) </dev/null >>"$RUN_LOG" 2>&1 || VERIFY_EXIT=$?
+    say "  exit $VERIFY_EXIT"
+    board "verified" "exit $VERIFY_EXIT"
+fi
 
 # --------------------------------------------------------------------
 # Verdict
 # --------------------------------------------------------------------
 
+# Ordered by root cause, not by severity: a crashed agent and a failing
+# verifier both end the run, but only one of them explains the other.
+# The first version of this block read neither the agent's exit code nor
+# its report, so a crash arrived as a green no-op and the cleanup path
+# then deleted the branch. See F-4.
 BLOCKERS="none"
 NOOP=0
-if [ "$VERIFY_EXIT" -ne 0 ]; then
+if [ "$TREE_BROKEN" -eq 1 ]; then
+    STATUS="blocked"
+    BLOCKERS="worktree is unreadable - git could not resolve HEAD in $WT"
+elif [ -n "$AGENT_BLOCKED" ]; then
+    STATUS="blocked"
+    BLOCKERS="agent reported blocked: $AGENT_BLOCKED"
+elif [ "$AGENT_EXIT" -ne 0 ]; then
+    STATUS="blocked"
+    BLOCKERS="agent exited $AGENT_EXIT without reporting - see $RUN_LOG"
+elif [ "$VERIFY_EXIT" -ne 0 ]; then
     STATUS="blocked"
     BLOCKERS="verifier exited $VERIFY_EXIT - see $RUN_LOG"
 elif [ -n "$SCOPE_VIOLATIONS" ]; then
@@ -330,6 +469,11 @@ elif [ -n "$SCOPE_VIOLATIONS" ]; then
 elif [ "$DIRTY" -ne 0 ]; then
     STATUS="needs-review"
     BLOCKERS="$DIRTY uncommitted file(s) left in the worktree"
+elif [ "$COMMITS" -gt 1 ]; then
+    # BOT.md acceptance criterion 3. The work may well be fine; a human
+    # decides whether to squash.
+    STATUS="needs-review"
+    BLOCKERS="$COMMITS commits, charter asks for exactly one"
 elif [ "$COMMITS" -eq 0 ]; then
     STATUS="done"
     NOOP=1
@@ -342,6 +486,8 @@ fi
 # a worktree that is about to be deleted would be a lie.
 if [ "$STATUS" = "blocked" ]; then
     NEXT="Human triages the blocker above. Task stays open; worktree kept at $WT."
+elif [ "$STATUS" = "needs-review" ]; then
+    NEXT="Human resolves the blocker above in $WT, then pushes and opens a PR."
 elif [ "${NOOP:-0}" -eq 1 ]; then
     NEXT="Nothing to review - the verifier already passed at base. Give this bot a task with real work in it."
 else
@@ -378,7 +524,10 @@ $TASK_TITLE
     commits:  $COMMITS
     numstat:  $NUMSTAT
     uncommit: $DIRTY file(s)
+    agent:    exit $AGENT_EXIT$([ "$SKIP_AGENT" -eq 1 ] && printf ' (skipped)')
     verify:   $TASK_VERIFY -> exit $VERIFY_EXIT
+              (run on the working tree, not on head - an uncommitted
+               edit can be what makes it pass)
     touched:
 $(if [ -n "$TOUCHED" ]; then printf '%s\n' "$TOUCHED" | sed 's/^/      /'; else echo "      (none)"; fi)
     log:      $RUN_LOG
@@ -418,5 +567,9 @@ say "  handoff  $HANDOFF"
 say "  board    $BOARD"
 say "  log      $RUN_LOG"
 
-[ "$STATUS" = "blocked" ] && exit 1
-exit 0
+# Distinct codes so a caller can branch without parsing the handoff.
+case "$STATUS" in
+    blocked)      exit 1 ;;
+    needs-review) exit 2 ;;
+    *)            exit 0 ;;
+esac

@@ -131,8 +131,12 @@ So state is split by lifetime and by writer:
 | Plane | Where | Written by | Contents |
 |---|---|---|---|
 | **Contract** | in git, on `main` | humans only, via PR | `context/`, `skills/`, `bots/*/BOT.md` |
-| **Control** | outside git | the runner | board, tasks, handoffs, inbox, runs, per-bot memory |
+| **Control** | outside git | the runner | board, tasks, handoffs, runs *(inbox and per-bot memory: designed, not built)* |
 | **Work** | worktrees + branches | one bot per branch | the actual code |
+
+"Humans only" on the contract plane is a convention, not something the
+code can enforce — the runner only catches a bot that *commits* an edit
+there, and only because `touches:` happens to exclude `labs/`.
 
 The contract plane belongs in git because changing a bot charter or a
 project convention *is* a reviewable act. The control plane must stay
@@ -175,14 +179,22 @@ give you stop. Git gives you undo.**
 
 ### 3.4 The loop
 
+This is the **design**. What the prototype actually implements is in
+section 4; the lines marked *(designed)* have no code behind them yet.
+
 ```
-dispatch  ->  add_worktree(path, "bot/<owner>/<task>", base = origin/main)
-              record the base SHA on the task file
+dispatch  ->  assert the contract exists at the base commit, or refuse
+              add_worktree(path, "bot/<owner>/<task>", base)
+              record the base SHA                          (designed:
+                                                    on the task file;
+                                          today it goes to the board
+                                                     and the handoff)
 work      ->  launch the agent in that worktree with a deterministic prompt
+              the agent may write .bot-blocked to report a refusal
 verify    ->  run the task's own verifier command on that tree, exit 0
               and the diff touches only the task's declared `touches:` globs
 gate      ->  push + PR  (never straight to main - a hard invariant in code,
-                          not an instruction in a prompt)
+                          not an instruction in a prompt)     (designed)
 done      ->  merge -> remove worktree, delete branch, task Done
 ```
 
@@ -197,13 +209,18 @@ agent summary; it reads the tree.
 form — stronger, because a ref is verifiable and cannot silently go
 stale.
 
-**Concurrency control without locks.** Each task declares `touches:`
-globs. The runner refuses to dispatch two tasks with overlapping globs
-from the same base. If it happens anyway: rebase, re-verify; if the
-rebase fails, the task goes to the inbox for a human.
+**Concurrency control without locks** *(designed, not built)*. Each
+task declares `touches:` globs; the runner should refuse to dispatch two
+tasks with overlapping globs from the same base, and on a collision
+rebase, re-verify, and route a failed rebase to a human. None of that
+exists yet — today nothing reads another task's `touches:`.
 
-As a side effect, crash recovery is free. Nothing lives in memory — on
-restart you read the task files and re-derive each phase from git.
+Crash recovery is *cheap*, not free. Nothing lives in memory, so the
+state is all on disk — but there is no resume path: a run that dies
+mid-flight leaves the live task at `dispatched`, and the runner refuses
+to start again until the worktree and branch are gone and you pass
+`--reset`. Re-deriving the phase from git is the design; the code only
+detects that it happened.
 
 ### 3.5 Where it gets messy
 
@@ -222,6 +239,13 @@ restart you read the task files and re-derive each phase from git.
   find instructions in it. `context/` and the task file are the only
   instruction sources; everything fetched is data. Anything
   irreversible goes behind the gate.
+- **The task file is a host-execution surface.** `verify:` is run with
+  `eval` on the *runner's* machine, outside the worktree and outside
+  any agent permission model. Task definitions are repo content, so
+  whoever can land a commit in `examples/` controls a shell command
+  with your privileges. That is acceptable while the task files are
+  your own; it becomes a hard gate the moment a task could arrive from
+  a pull request. See F-6.
 - **Secrets.** Gate before the push, not after. A key in a pushed
   commit has already been seen.
 
@@ -231,8 +255,8 @@ restart you read the task files and re-derive each phase from git.
 
 | | |
 |---|---|
-| Covered | the file contract; one bot; one task; worktree create; agent run; verifier; evidence capture; handoff write; append-only board |
-| **Not** covered | scheduling/routines, multi-bot handoff, the approval inbox, pushing, opening PRs, any GPUI surface |
+| Covered | the file contract; one bot; one task; contract-exists-at-base check; worktree create; agent run; the `.bot-blocked` refusal channel; verifier; evidence capture incl. scope check; handoff write; append-only board; no-op cleanup |
+| **Not** covered | scheduling/routines, multi-bot handoff, the approval inbox, per-bot memory, cross-task `touches:` overlap checks, rebase-on-collision, resume after a crash, pushing, opening PRs, any GPUI surface |
 
 Two deliberate omissions:
 
@@ -265,9 +289,20 @@ labs/agent-bots/run/bot-run.sh \
 Work through those in order on the first run — step 2 is where a wrong
 path or a broken verifier shows up, and it costs no tokens.
 
+A task that already finished will not re-run; pass `--reset` to discard
+the live task and start over. Exit codes are `0` done, `1` blocked,
+`2` needs-review.
+
 `BOT_AGENT_CMD` and `BOT_AGENT_ARGS` select the agent; the defaults
 target Claude Code headless mode. Check them against your installed CLI
 version first. See the script header for the full flag list.
+
+**`base:` must be a ref that contains the contract.** The agent reads
+its charter and context from its own checkout — the base commit — not
+from your working tree. While this branch is unmerged that means
+`base: labs/agent-bots`, not `origin/main`; the runner refuses up front
+otherwise. It also means contract edits only reach the agent once they
+are committed.
 
 ### Where things land
 
@@ -290,6 +325,9 @@ worktree and branch.
    and was wrong. If that never happens, the verifier is not verifying.
 3. A handoff between two bots survives a rebase.
 4. Worktree cleanup works on Windows with a build running.
+5. `verify:` no longer runs through `eval` on the host, or task files
+   are provably trusted input. A product feature cannot ship a shell
+   command sourced from repo content. See F-6.
 
 Until then it stays in `labs/`.
 
@@ -343,3 +381,103 @@ The verifier created `target/` inside the worktree. Plain
 chains the two, which is why this cost nothing — but it confirms that
 the product port must inherit `sidebar.rs`'s existing two-step remove
 rather than reinventing it.
+
+### F-3 · The contract must exist at the *base commit*, not in your checkout
+
+*2026-09-11, adversarial review of the first commit.*
+
+The design says the contract plane lives in git so it travels with the
+branch. The prototype then pointed the agent at
+`labs/agent-bots/contract/...` while creating the worktree from
+`origin/main` — where `labs/` does not exist at all
+(`git ls-tree origin/main labs/` returns nothing). The first real run
+would have launched an agent into a tree with no charter, no
+conventions and no glossary, and the runner would have had no idea.
+
+Nothing about the *design* was wrong. The runner just never checked a
+precondition it depends on.
+
+**Rule:** assert the contract exists at the base commit before spending
+a worktree and an agent run on it. Implemented; a bad base now fails in
+under a second with the ref named.
+
+This is F-1 again in a different costume — prove the precondition at
+base, not halfway through. Two instances of the same class in two runs
+suggests the general rule for the product port: **everything the run
+depends on gets checked against the base commit at dispatch.** The base
+is the only tree that exists before the work starts, so it is the only
+place a cheap check can live.
+
+A corollary worth stating: contract edits reach the agent only once
+committed. Editing `BOT.md` in your working tree changes nothing about
+the next run. That is correct — a versioned contract is the point — but
+it surprises you the first time.
+
+### F-4 · A crashed agent reported `done`, and the cleanup deleted the evidence
+
+*Same review.*
+
+The runner captured the agent's exit code, logged it to the board, and
+then never read it again. The verdict looked only at the verifier, the
+scope check, the dirty count and the commit count. So a wrong CLI flag,
+a missing binary or an auth failure produced: no commits → verifier
+passes at base → `done` → *no-op* → worktree and branch deleted →
+exit 0. The script header claimed a wrong flag "fails loudly". It
+failed as a green no-op.
+
+Worse, this was the failure mode most likely to happen on the very
+first real run, because `--permission-mode` friction in headless mode
+produces exactly that shape: an agent that cannot commit.
+
+Two fixes, and the second is the interesting one:
+
+1. The exit code now enters the verdict, ahead of the verifier — a
+   crashed agent explains a failing verifier, not the other way round.
+2. **The agent had no channel to report a refusal at all.** The charter
+   told it to escalate with `status: blocked`; the prompt forbade it
+   from writing a handoff (rightly — self-reported evidence is not
+   evidence); and nothing read its prose or its exit code. A bot told
+   to stop had no way to say so. It now writes one line to
+   `.bot-blocked` in the worktree, which the runner reads, deletes
+   before anything counts the dirty files, and turns into a `blocked`
+   handoff.
+
+The general shape: *forbidding self-reported evidence is right, but it
+obliges you to provide a channel for self-reported **intent**.* Those
+are different things, and the first design collapsed them.
+
+Verified with two stub agents: one writing `.bot-blocked` and exiting
+0, one exiting 3 silently. Both now land on `blocked` with the worktree
+kept; both were `done` with the branch deleted before the fix.
+
+### F-5 · The scope check trusted `git diff --name-only` too much
+
+*Same review.* Three ways the subset check could be wrong:
+
+- Non-ASCII paths came back quoted (`"core/src/\303\244.rs"`), so any
+  such file looked like a violation. Fixed with `core.quotepath=off`.
+- Rename detection listed only the destination, so an agent could move
+  an out-of-scope file *into* scope and delete it invisibly. Fixed with
+  `--no-renames`, which reports the source deletion too.
+- `touches:` globs are shell `case` patterns, so `*` crosses `/`:
+  `core/*.rs` silently scopes the entire crate. Not a code change —
+  documented in `templates/TASK.md`, because the fix is for task
+  authors to name files.
+
+### F-6 · The verifier is host execution sourced from repo content
+
+*Same review. Open — not fixed.*
+
+`verify:` runs through `eval` on the runner's machine, outside the
+worktree and outside any agent permission model. The task file that
+supplies it is repo content. Today that is fine: the task files are
+yours, and the runner is a script you invoke by hand.
+
+It stops being fine the moment a task file could arrive from a pull
+request, which is exactly what "CodeScope dispatches bots from tasks in
+the repo" would mean. Logged as graduation criterion 5 rather than
+patched, because the honest fix is an allowlist of verifier commands or
+a sandbox, and that is a design decision, not a one-line change.
+
+Same run also hardened `owner:` and `id:`, which were being spliced
+into filesystem paths unsanitised.

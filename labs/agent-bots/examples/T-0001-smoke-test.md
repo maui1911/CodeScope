@@ -3,7 +3,7 @@ id: T-0001
 title: Loop smoke test - core/src/telemetry.rs
 owner: fixer
 status: todo
-base: origin/main
+base: labs/agent-bots
 branch: bot/fixer/T-0001
 touches: core/src/telemetry.rs
 verify: cargo test -p codescope-core --lib
@@ -36,6 +36,13 @@ them, so prefer the narrowest possible fix and treat any signature
 change as out of scope.
 
 # Notes
+
+`base:` is the `labs/agent-bots` branch, not `origin/main`, and it has
+to be: the agent reads its charter and context from *its own* checkout,
+which is the base commit. `labs/` does not exist on `origin/main` yet,
+so basing there would point the agent at four files that are not there.
+The runner now refuses that up front — see F-3. Switch this back to
+`origin/main` once the branch merges.
 
 The verifier here is deliberately **tests, not clippy**. The first
 version of this task used
