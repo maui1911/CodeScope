@@ -32,6 +32,8 @@
 #   --keep               Keep the worktree even on a clean no-op run.
 #   --reset              Discard the live task under state and start over.
 #                        Needed to re-run a task that already finished.
+#   --allow-overlap      Dispatch even though another in-flight task
+#                        declares files this one also touches.
 #   -h, --help           This text.
 #
 # Exit codes: 0 done, 1 blocked, 2 needs-review.
@@ -71,6 +73,7 @@ DRY_RUN=0
 SKIP_AGENT=0
 KEEP=0
 RESET=0
+ALLOW_OVERLAP=0
 AGENT_EXIT=0
 
 # Repo-relative, and deliberately a single variable: the prompt points
@@ -97,6 +100,7 @@ while [ $# -gt 0 ]; do
         --skip-agent)    SKIP_AGENT=1; shift ;;
         --keep)          KEEP=1; shift ;;
         --reset)         RESET=1; shift ;;
+        --allow-overlap) ALLOW_OVERLAP=1; shift ;;
         -h|--help)       usage; exit 0 ;;
         *)               die "unknown argument: $1 (try --help)" ;;
     esac
@@ -301,13 +305,22 @@ VERIFY_WT="$WT-verify"
 
 LIVE_TASK="$STATE/tasks/$TASK_ID.md"
 
+RESET_PENDING=0
 if [ "$RESET" -eq 1 ] && [ -f "$LIVE_TASK" ]; then
-    rm -f "$LIVE_TASK"
-    say "reset: discarded live task $TASK_ID"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        # --dry-run says it changes nothing on disk, and deleting the
+        # live task is a change. Report it and read the status as if it
+        # had happened, so the plan describes the run you would get.
+        RESET_PENDING=1
+        say "reset: would discard live task $TASK_ID (dry run - left alone)"
+    else
+        rm -f "$LIVE_TASK"
+        say "reset: discarded live task $TASK_ID"
+    fi
 fi
 
 EFFECTIVE_STATUS="$TASK_STATUS"
-if [ -f "$LIVE_TASK" ]; then
+if [ -f "$LIVE_TASK" ] && [ "$RESET_PENDING" -eq 0 ]; then
     EFFECTIVE_STATUS="$(sed -n 's/^status:[[:space:]]*//p' "$LIVE_TASK" | head -n1)"
 fi
 
@@ -321,6 +334,120 @@ with --reset once the worktree and branch are gone." ;;
         die "task $TASK_ID is '$EFFECTIVE_STATUS', expected 'todo'.
 Re-run it with --reset to start over." ;;
 esac
+
+# --------------------------------------------------------------------
+# Overlap
+#
+# Two bots editing one file on separate branches do not conflict while
+# they work. They conflict at merge - after both runs have reported
+# success, and after both handoffs have gone out saying so. The only
+# cheap place to catch that is before the second dispatch.
+#
+# Overlap is decided by expanding both tasks' globs against the base
+# tree and intersecting the results, not by comparing the patterns:
+# whether two arbitrary shell globs *can* match a common string has no
+# cheap honest answer, and the tree is right there. F-16 covers what
+# that misses.
+# --------------------------------------------------------------------
+
+# split_globs <comma-separated> - fills GLOBS_OUT, trimmed, no blanks.
+GLOBS_OUT=()
+split_globs() {
+    local raw=() g
+    GLOBS_OUT=()
+    IFS=',' read -ra raw <<< "$1"
+    for g in "${raw[@]}"; do
+        g="${g#"${g%%[![:space:]]*}"}"
+        g="${g%"${g##*[![:space:]]}"}"
+        [ -n "$g" ] && GLOBS_OUT+=("$g")
+    done
+}
+
+BASE_FILES="$(git -C "$REPO" ls-tree -r --name-only "$BASE_SHA")"
+
+# expand_globs <comma-separated> - the paths at base those globs match.
+expand_globs() {
+    local file g
+    local -a globs
+    split_globs "$1"
+    globs=("${GLOBS_OUT[@]}")
+    [ "${#globs[@]}" -gt 0 ] || return 0
+    while IFS= read -r file; do
+        for g in "${globs[@]}"; do
+            # shellcheck disable=SC2254  # a glob, on purpose
+            case "$file" in $g) printf '%s\n' "$file"; break ;; esac
+        done
+    done <<< "$BASE_FILES"
+}
+
+MY_FILES="$(expand_globs "$TASK_TOUCHES" | sort -u)"
+split_globs "$TASK_TOUCHES"
+MY_GLOBS=("${GLOBS_OUT[@]}")
+
+OVERLAP_REPORT=""
+OVERLAP_IDS=""
+STALE_DISPATCH=""
+
+if [ -d "$STATE/tasks" ]; then
+    for live in "$STATE"/tasks/*.md; do
+        [ -f "$live" ] || continue
+
+        other_id="$(field id "$live")"
+        [ -n "$other_id" ] || continue
+        [ "$other_id" != "$TASK_ID" ] || continue
+        [ "$(field status "$live")" = "dispatched" ] || continue
+
+        other_branch="$(field branch "$live")"
+        other_wt="$WORKTREE_ROOT/$(printf '%s' "$other_branch" | tr '/' '-')"
+        if [ ! -d "$other_wt" ]; then
+            # Status says in flight; the filesystem says the run is
+            # over. A dispatch that died is not holding anything, and
+            # blocking every later task on a ghost would be worse than
+            # saying so out loud.
+            STALE_DISPATCH="$STALE_DISPATCH $other_id"
+            continue
+        fi
+
+        other_touches="$(field touches "$live")"
+        other_files="$(expand_globs "$other_touches" | sort -u)"
+
+        shared=""
+        if [ -n "$MY_FILES" ] && [ -n "$other_files" ]; then
+            shared="$(comm -12 <(printf '%s\n' "$MY_FILES") \
+                              <(printf '%s\n' "$other_files") || true)"
+        fi
+
+        # A glob naming a path that does not exist at base expands to
+        # nothing, so the patterns get compared too: two tasks that both
+        # declare `core/src/new_thing.rs` collide just as hard over a
+        # file neither has created yet.
+        split_globs "$other_touches"
+        for g in "${GLOBS_OUT[@]}"; do
+            for mine in "${MY_GLOBS[@]}"; do
+                if [ "$g" = "$mine" ]; then
+                    shared="$shared"$'\n'"$g  (declared by both, absent at base)"
+                fi
+            done
+        done
+
+        shared="$(printf '%s\n' "$shared" | sed '/^[[:space:]]*$/d' | sort -u)"
+        [ -n "$shared" ] || continue
+
+        OVERLAP_IDS="$OVERLAP_IDS $other_id"
+        OVERLAP_REPORT="$OVERLAP_REPORT  $other_id on $other_branch:"$'\n'
+        OVERLAP_REPORT="$OVERLAP_REPORT$(printf '%s\n' "$shared" | sed 's/^/      /')"$'\n'
+    done
+fi
+
+if [ -n "$OVERLAP_IDS" ]; then
+    if [ "$ALLOW_OVERLAP" -eq 1 ]; then
+        OVERLAP_SUMMARY="${OVERLAP_IDS# } - allowed by --allow-overlap"
+    else
+        OVERLAP_SUMMARY="${OVERLAP_IDS# } - dispatch will be refused"
+    fi
+else
+    OVERLAP_SUMMARY="none"
+fi
 
 # --------------------------------------------------------------------
 # The prompt
@@ -404,6 +531,7 @@ cat <<PLAN
   branch    $TASK_BRANCH
   worktree  $WT
   touches   $TASK_TOUCHES
+  overlap   $OVERLAP_SUMMARY
   verify    $TASK_VERIFY
   state     $STATE
   agent     $AGENT_ID, profile verified $AGENT_VERIFIED
@@ -411,6 +539,16 @@ cat <<PLAN
   argv      $AGENT_INVOCATION
   reads     ${AGENT_INSTRUCTION_FILES:-(none declared)}
 PLAN
+
+if [ -n "$STALE_DISPATCH" ]; then
+    say "  stale     dispatched with no worktree, ignored:$STALE_DISPATCH"
+fi
+
+if [ -n "$OVERLAP_REPORT" ]; then
+    say ""
+    say "  overlapping paths:"
+    printf '%s' "$OVERLAP_REPORT"
+fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
     step "Prompt (dry run - nothing was changed)"
@@ -491,6 +629,25 @@ set_status() {
         { print }
     ' "$LIVE_TASK" > "$LIVE_TASK.tmp" && mv "$LIVE_TASK.tmp" "$LIVE_TASK"
 }
+
+# Enforced here rather than where it was computed, so that the refusal
+# lands on the board. A dispatch that was refused is an event worth
+# keeping - it is the record of two tasks that were written to collide.
+if [ -n "$OVERLAP_IDS" ]; then
+    if [ "$ALLOW_OVERLAP" -eq 1 ]; then
+        board "overlap-allowed" "${OVERLAP_IDS# }"
+    else
+        board "dispatch-refused" "overlaps ${OVERLAP_IDS# }"
+        die "another in-flight task already claims files this one touches.
+
+$OVERLAP_REPORT
+Two branches editing one file do not conflict now; they conflict at
+merge, once both runs have reported success and both handoffs have gone
+out saying so. Wait for the other task to land, narrow one of the two
+'touches:' lists, or pass --allow-overlap if this is a collision you
+mean to resolve by hand."
+    fi
+fi
 
 # --------------------------------------------------------------------
 # Worktree

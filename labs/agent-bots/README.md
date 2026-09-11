@@ -219,11 +219,21 @@ agent summary; it reads the tree.
 form — stronger, because a ref is verifiable and cannot silently go
 stale.
 
-**Concurrency control without locks** *(designed, not built)*. Each
-task declares `touches:` globs; the runner should refuse to dispatch two
-tasks with overlapping globs from the same base, and on a collision
-rebase, re-verify, and route a failed rebase to a human. None of that
-exists yet — today nothing reads another task's `touches:`.
+**Concurrency control without locks.** Each task declares `touches:`
+globs, and the runner refuses to dispatch a task whose files another
+in-flight task already claims. Both sides are expanded against the base
+tree and intersected, so the answer is a list of real paths rather than
+an opinion about two patterns; `--allow-overlap` is the escape hatch
+for a collision you mean to resolve by hand. A refusal costs nothing —
+it happens before the worktree exists — and it lands on the board,
+because two tasks written to collide is worth a row.
+
+"In flight" means status `dispatched` **and** a worktree still on disk.
+Believing the status field alone would wedge every later task behind a
+run that crashed; a dispatch with no worktree is reported as stale and
+ignored. What is still missing is the other half: rebase-on-collision
+and re-verify when the base moves under a finished branch. See F-16 for
+what the check cannot see.
 
 Crash recovery is *cheap*, not free. Nothing lives in memory, so the
 state is all on disk — but there is no resume path: a run that dies
@@ -265,8 +275,8 @@ detects that it happened.
 
 | | |
 |---|---|
-| Covered | the file contract; one bot; one task; contract-read-at-base (existence *and* argv); worktree create; agent run; the `.bot-blocked` refusal channel; verifier, in a clean checkout of the branch tip; evidence capture incl. scope check; handoff write; append-only board; no-op cleanup |
-| **Not** covered | scheduling/routines, multi-bot handoff, the approval inbox, per-bot memory, cross-task `touches:` overlap checks, rebase-on-collision, resume after a crash, pushing, opening PRs, any GPUI surface |
+| Covered | the file contract; one bot; one task; contract-read-at-base (existence *and* argv); cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; verifier, in a clean checkout of the branch tip; evidence capture incl. scope check; handoff write; append-only board; no-op cleanup |
+| **Not** covered | scheduling/routines, multi-bot handoff, the approval inbox, per-bot memory, rebase-on-collision, resume after a crash, pushing, opening PRs, any GPUI surface |
 
 Two deliberate omissions:
 
@@ -302,6 +312,11 @@ path or a broken verifier shows up, and it costs no tokens.
 A task that already finished will not re-run; pass `--reset` to discard
 the live task and start over. Exit codes are `0` done, `1` blocked,
 `2` needs-review.
+
+A task whose files another in-flight task already claims is refused
+before it costs a worktree; the plan prints the overlapping paths, and
+`--allow-overlap` overrides it. `examples/T-0004-overlap-fixture.md`
+reproduces both that refusal and the stale-dispatch case by hand.
 
 **Which CLI runs is data.** The task's `agent:` wins, otherwise the
 charter's; the profile lives in `contract/agents/<id>.agent.md`. There is no
@@ -502,9 +517,11 @@ than single-bot polish:
    identical by construction. If differentiated roles are the value
    proposition, F-7 attacks it directly. §7.3 is the fix.
 2. **The `touches:` overlap check and rebase-on-collision stop being
-   optional.** Two bots working one repo *will* collide. Today nothing
-   reads another task's `touches:` (§3.4), which is survivable with one
-   bot and not with four.
+   optional.** Two bots working one repo *will* collide. The overlap
+   refusal is now built (§3.4) — the half that is not is what happens
+   when the base moves under a branch that already passed: rebase,
+   re-verify, and route a failed rebase to a human. With one bot that
+   is a rare annoyance; with four it is the normal case.
 
 And the board stops being a maybe. It was designed append-only from the
 start (§3.2) precisely so it would survive concurrent writers, so the
@@ -1053,3 +1070,50 @@ code in the script, because it is what runs once everything else has
 already gone wrong.** Anything clever there — a GNU-only flag, a
 pipeline that can be cut short — turns a reportable failure into a
 silent one.
+
+---
+
+### F-16 · Two globs have no cheap answer, so the tree answers instead
+
+*2026-09-11, building the overlap check.*
+
+The obvious implementation compares the patterns: does `core/src/*.rs`
+overlap `core/src/telemetry.rs`? For two arbitrary shell globs, "can
+these match a common string" is decidable and not cheap, and every
+shortcut is wrong in a direction you only discover later.
+Literal-against-literal is easy, literal-against-pattern is one `case`,
+pattern-against-pattern is where it turns silly — and a checker that
+has to answer "maybe" must refuse, which makes the ordinary case
+unusable.
+
+So it does not compare patterns. It expands both sides against the base
+tree and intersects the results. The question becomes "name a file both
+tasks may edit", the answer is a list of real paths a human can read in
+the refusal, and the matcher is the same `case` loop the scope check
+already uses — so the overlap check is exactly as correct as the rule
+it is protecting, with no second set of semantics to learn.
+
+Two things that costs.
+
+**A glob only overlaps if a file already exists to overlap on.** Two
+tasks that will both create `core/src/new_thing.rs` expand to nothing
+and sail past each other. Comparing the declared patterns for string
+equality patches the narrow case — identical declarations do collide —
+but `core/src/*.rs` against `core/src/new_thing.rs` does not, because
+the file is not in the base tree. The honest fix is the pattern
+comparison this finding opens by avoiding, and it is only worth
+building once a bot is allowed to create files. Today's tasks are not.
+
+**It is a check at dispatch, not a lock.** It answers "are these two in
+flight together", not "will these two merge cleanly". A task can be
+dispatched, finish, and be merged after a second task has already gone
+out from the same base; nothing here notices. That is the
+rebase-on-collision half, still unbuilt, and it is the piece that
+actually matters once tasks outlive a single sitting.
+
+One thing the implementation had to get right on the first try: **"in
+flight" means status `dispatched` *and* a worktree still on disk.** A
+crashed run leaves its live task saying `dispatched` forever, so a
+check that trusted the status field alone would wedge every later
+overlapping task behind a ghost — and the failure would look like the
+overlap check working. It reports the stale dispatch and proceeds.
