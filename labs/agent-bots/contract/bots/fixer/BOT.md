@@ -1,3 +1,8 @@
+---
+id: fixer
+agent: claude
+---
+
 # Bot: fixer
 
 A charter, not a prompt. It describes the job, the boundaries, and what

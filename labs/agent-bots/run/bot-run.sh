@@ -36,22 +36,26 @@
 #
 # Exit codes: 0 done, 1 blocked, 2 needs-review.
 #
-# Environment:
-#   BOT_AGENT_CMD    Agent executable.        Default: claude
-#   BOT_AGENT_ARGS   Extra args, word-split.  Default: --permission-mode auto
+# Which agent runs is data, not code. The task's `agent:` wins, else
+# the charter's; the profile lives in contract/agents/<id>.md and
+# carries the invocation, the flag that lets it work unattended, and
+# the instruction files it reads. Nothing here assumes Claude Code -
+# Codex alone rules that out, since its headless mode is a subcommand
+# rather than a flag. See F-10.
 #
-# The default args target Claude Code headless mode; check them against
-# your installed CLI version. `auto` and not `acceptEdits`: the prompt
-# asks the agent to run the verifier and to commit, which are Bash
-# calls, and acceptEdits covers edits only. An unattended run under
-# acceptEdits cannot do its job - it produces no commit, which is
-# exactly the shape F-4 describes.
+# Environment overrides, for the stubs in run/stubs/:
+#   BOT_AGENT_CMD    Replaces the profile's command.
+#   BOT_AGENT_ARGS   Replaces the whole argv, prompt included. Counts
+#                    as set even when empty, which is how a stub gets
+#                    invoked bare.
 #
-# Be honest about what that buys: the worktree bounds what the agent is
-# *meant* to touch, not what it *can*. It is a work surface, not a
-# security boundary - the same thing this design criticises Grok Bot
-# for. What actually contains the blast radius is that the branch is
-# throwaway and nothing here ever pushes.
+# On autonomy flags generally - be honest about what they buy: the
+# worktree bounds what the agent is *meant* to touch, not what it
+# *can*. It is a work surface, not a security boundary, which is the
+# same thing this design criticises Grok Bot for. What contains the
+# blast radius is that the branch is throwaway and nothing here ever
+# pushes. Codex is the exception: it sandboxes model-generated shell
+# commands itself.
 
 set -euo pipefail
 
@@ -123,8 +127,11 @@ BOT_AGENT_ARGS="${BOT_AGENT_ARGS:---permission-mode auto}"
 # the plot; `touches` is comma-separated for the same reason.
 # --------------------------------------------------------------------
 
+# field <key> [file] - reads a frontmatter value. Defaults to the task,
+# but the same parser reads a charter and an agent profile, which is
+# the point of keeping the format this dull.
 field() {
-    sed -n '/^---$/,/^---$/p' "$TASK" \
+    sed -n '/^---$/,/^---$/p' "${2:-$TASK}" \
         | sed -n "s/^$1:[[:space:]]*//p" \
         | head -n1
 }
@@ -166,12 +173,71 @@ BOT_DIR="$LAB_DIR/contract/bots/$TASK_OWNER"
 BASE_SHA="$(git -C "$REPO" rev-parse --verify "$TASK_BASE^{commit}" 2>/dev/null)" \
     || die "cannot resolve base ref '$TASK_BASE' (fetch first?)"
 
+# --------------------------------------------------------------------
+# Agent profile
+#
+# Nothing here may assume Claude Code. CodeScope is CLI-agnostic and so
+# is this: the invocation is data, held in contract/agents/<id>.md.
+# Codex alone proves why it has to be - its headless mode is a
+# subcommand (`codex exec <prompt>`), not a `-p` flag, so there is no
+# single argv shape to hard-code. See F-10.
+#
+# Precedence: the task may override, otherwise the charter decides.
+# There is no built-in default; a bot says what it runs on.
+# --------------------------------------------------------------------
+
+TASK_AGENT="$(field agent)"
+TASK_MODEL="$(field model)"
+CHARTER_AGENT="$(field agent "$BOT_DIR/BOT.md")"
+AGENT_ID="${TASK_AGENT:-$CHARTER_AGENT}"
+
+[ -n "$AGENT_ID" ] || die "no agent declared - set 'agent:' on the task or in $BOT_DIR/BOT.md"
+case "$AGENT_ID" in
+    *[!a-zA-Z0-9_-]*) die "agent id must be [a-zA-Z0-9_-]+, got '$AGENT_ID'" ;;
+esac
+
+PROFILE="$LAB_DIR/contract/agents/$AGENT_ID.md"
+[ -f "$PROFILE" ] || die "no agent profile at $PROFILE"
+
+AGENT_CMD="$(field command "$PROFILE")"
+AGENT_HEADLESS="$(field headless "$PROFILE")"
+AGENT_AUTONOMY="$(field autonomy "$PROFILE")"
+AGENT_MODEL_FLAG="$(field model_flag "$PROFILE")"
+AGENT_INSTRUCTION_FILES="$(field instruction_files "$PROFILE")"
+AGENT_VERIFIED="$(field verified "$PROFILE")"
+
+[ -n "$AGENT_CMD" ] || die "profile '$AGENT_ID' declares no command"
+
+# The stubs in run/stubs/ are injected here. BOT_AGENT_ARGS counts as
+# set even when empty, which is how a stub gets invoked bare.
+AGENT_OVERRIDDEN=0
+if [ -n "${BOT_AGENT_CMD:-}" ]; then
+    AGENT_CMD="$BOT_AGENT_CMD"; AGENT_OVERRIDDEN=1
+fi
+if [ "${BOT_AGENT_ARGS+set}" = set ]; then
+    AGENT_HEADLESS="$BOT_AGENT_ARGS"; AGENT_AUTONOMY=""; AGENT_OVERRIDDEN=1
+fi
+
+if [ "$AGENT_OVERRIDDEN" -eq 0 ] && [ -z "$AGENT_HEADLESS" ]; then
+    die "profile '$AGENT_ID' has an empty 'headless' template.
+
+That marks an unverified stub, not a default. Fill in the invocation
+against the real CLI and set 'verified' before dispatching with it -
+a guessed flag fails inside the agent run, after a worktree has
+already been spent on it."
+fi
+
+if [ -n "$TASK_MODEL" ] && [ -z "$AGENT_MODEL_FLAG" ]; then
+    die "task pins model '$TASK_MODEL' but profile '$AGENT_ID' has no model_flag"
+fi
+
 # F-3: the agent reads the contract from *its* checkout, which is the
 # base commit - never from the runner's working tree. A contract that
 # is not on the base means the prompt points at files that do not
 # exist. Fail here, before a worktree and an agent run are spent on it.
 # Same shape as F-1: prove the precondition at base, not halfway.
 for rel in "bots/$TASK_OWNER/BOT.md" \
+           "agents/$AGENT_ID.md" \
            "context/CONVENTIONS.md" \
            "context/ARCHITECTURE.md" \
            "context/GLOSSARY.md"; do
@@ -257,6 +323,37 @@ reads it, and nothing else you say reaches the handoff. Stopping is a
 valid outcome; guessing is not."
 
 # --------------------------------------------------------------------
+# Resolved argv
+#
+# `{prompt}` is substituted as a single argument wherever the profile
+# puts it - leading for Claude Code and Gemini, trailing after a
+# subcommand for Codex. Everything else is word-split, which is what
+# lets a profile carry an opaque fragment like `-s workspace-write`
+# without the runner knowing what it means.
+#
+# The display copy exists so the plan and the evidence can name the
+# invocation without reprinting the whole prompt.
+# --------------------------------------------------------------------
+
+AGENT_ARGV=()
+AGENT_ARGV_DISPLAY=()
+for tok in $AGENT_HEADLESS; do
+    if [ "$tok" = "{prompt}" ]; then
+        AGENT_ARGV+=("$PROMPT"); AGENT_ARGV_DISPLAY+=("<prompt>")
+    else
+        AGENT_ARGV+=("$tok"); AGENT_ARGV_DISPLAY+=("$tok")
+    fi
+done
+for tok in $AGENT_AUTONOMY; do
+    AGENT_ARGV+=("$tok"); AGENT_ARGV_DISPLAY+=("$tok")
+done
+if [ -n "$TASK_MODEL" ]; then
+    AGENT_ARGV+=("$AGENT_MODEL_FLAG" "$TASK_MODEL")
+    AGENT_ARGV_DISPLAY+=("$AGENT_MODEL_FLAG" "$TASK_MODEL")
+fi
+AGENT_INVOCATION="$AGENT_CMD ${AGENT_ARGV_DISPLAY[*]}"
+
+# --------------------------------------------------------------------
 # Plan
 # --------------------------------------------------------------------
 
@@ -271,7 +368,9 @@ cat <<PLAN
   touches   $TASK_TOUCHES
   verify    $TASK_VERIFY
   state     $STATE
-  agent     $BOT_AGENT_CMD $BOT_AGENT_ARGS
+  agent     $AGENT_ID, profile verified $AGENT_VERIFIED
+  argv      $AGENT_INVOCATION
+  reads     ${AGENT_INSTRUCTION_FILES:-(none declared)}
 PLAN
 
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -356,11 +455,10 @@ if [ "$SKIP_AGENT" -eq 1 ]; then
     say "  skipped (--skip-agent)"
     board "agent-skipped"
 else
-    say "  $BOT_AGENT_CMD (output -> $RUN_LOG)"
+    say "  $AGENT_INVOCATION (output -> $RUN_LOG)"
     # stdin is closed on purpose: a headless agent that decides to
     # prompt would otherwise inherit the runner's terminal and hang.
-    # shellcheck disable=SC2086  # BOT_AGENT_ARGS is word-split on purpose
-    ( cd "$WT" && "$BOT_AGENT_CMD" -p "$PROMPT" $BOT_AGENT_ARGS ) \
+    ( cd "$WT" && "$AGENT_CMD" "${AGENT_ARGV[@]}" ) \
         </dev/null >>"$RUN_LOG" 2>&1 || AGENT_EXIT=$?
     say "  exit $AGENT_EXIT"
     board "agent-ran" "exit $AGENT_EXIT"
@@ -376,6 +474,29 @@ step "Evidence"
 # else looks at the tree - it must never reach a commit or inflate the
 # uncommitted-file count. It is a *claim*: it explains a verdict, it
 # never substitutes for one.
+# Which of the agent's declared instruction files were actually there.
+# A MISSING here means the bot never saw the project conventions and
+# every judgement it made was worse-informed than it looked. Partial
+# answer to F-7: the runner cannot control what the host loads, but it
+# can record what was in reach.
+INSTR_STATUS=""
+if [ -n "$AGENT_INSTRUCTION_FILES" ]; then
+    IFS=',' read -ra instr_list <<< "$AGENT_INSTRUCTION_FILES"
+    for f in "${instr_list[@]}"; do
+        f="$(printf '%s' "$f" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [ -n "$f" ] || continue
+        if [ -f "$WT/$f" ]; then
+            INSTR_STATUS="$INSTR_STATUS $f=present"
+        else
+            INSTR_STATUS="$INSTR_STATUS $f=MISSING"
+            say "  warning: $f not in the worktree - agent ran without it"
+        fi
+    done
+    INSTR_STATUS="${INSTR_STATUS# }"
+else
+    INSTR_STATUS="(none declared)"
+fi
+
 AGENT_BLOCKED=""
 if [ -f "$WT/.bot-blocked" ]; then
     AGENT_BLOCKED="$(tr -d '\r' < "$WT/.bot-blocked" | head -c 2000)"
@@ -533,7 +654,10 @@ $TASK_TITLE
     commits:  $COMMITS
     numstat:  $NUMSTAT
     uncommit: $DIRTY file(s)
-    agent:    exit $AGENT_EXIT$([ "$SKIP_AGENT" -eq 1 ] && printf ' (skipped)')
+    agent:    $AGENT_ID -> exit $AGENT_EXIT$([ "$SKIP_AGENT" -eq 1 ] && printf ' (skipped)')
+    argv:     $AGENT_INVOCATION
+    model:    ${TASK_MODEL:-(not pinned - whatever the CLI defaulted to)}
+    reads:    $INSTR_STATUS
     verify:   $TASK_VERIFY -> exit $VERIFY_EXIT
               (run on the working tree, not on head - an uncommitted
                edit can be what makes it pass)
