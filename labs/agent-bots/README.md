@@ -2288,3 +2288,75 @@ it, `mover.sh` had it, and now the real agent. The surface sets
 `user.name` and `user.email` at creation, so it holds whoever ends up
 committing — the bot as author, the runner as committer when the runner
 does it, which is what git's split is for.
+
+---
+
+### F-31 · Replacing a mechanism hands back its guarantees, silently
+
+*2026-09-11, four review rounds on the work surface.*
+
+Sixteen findings across four rounds, all real. Most of them are one
+thing said in different places, and it is a thing worth naming: **git
+was enforcing rules nobody had written down, and swapping the mechanism
+returned them without returning the checks.**
+
+The work surface used to be a linked worktree. That came with
+guarantees that were load-bearing and invisible:
+
+- `git worktree remove` refuses to delete anything that is not a
+  worktree. `rm -rf` refuses nothing — so the sweep's allowlist, which
+  protects *branch names*, was suddenly guarding a path, and a stale
+  directory named after an allowed branch would have been deleted. The
+  runner had a marker file for exactly this; the sweep did not check
+  it, and neither did the removal of the verify checkout.
+- `git worktree add -b` creates a branch and hands you a checkout of
+  it. A clone comes with an `origin` that lives in `.git/config` —
+  which the agent can write, since the sandbox is granted that
+  directory. `git remote set-url origin` would have redirected the
+  runner's post-verification push anywhere. It pushes to the path now,
+  which is a variable that has never been inside the worktree.
+- `git worktree list` made every leftover visible from the project. A
+  clone is registered nowhere, so the sweep's leftover check would have
+  passed by construction — *and* nothing removed a surface after a
+  successful push, so every finished task left a full clone behind
+  while the handoff called it throwaway.
+
+The same shape twice more, away from worktrees. A folder's
+`info/exclude` is overridden by a `.gitignore` negation, so the secret
+list needed a second layer that does not care how a path got into the
+index — and a third, in the verdict, because neither binds an agent
+that commits by itself. And `git clone` does not copy `info/exclude`,
+so the surface had no protection at all against a secret the agent
+*created*.
+
+Then a cluster where the evidence and the artifact could describe
+different trees:
+
+- Nothing checked that HEAD was still on the task branch. Every number
+  in the handoff is read from HEAD and the push names the branch; an
+  agent that switched would have produced a green handoff for a branch
+  still sitting at the base. The charter forbade switching and nothing
+  enforced it — F-18's shape, again.
+- `reattach move` recorded its failure and the evidence was overwritten
+  anyway, so a failed `checkout -B` produced a handoff about the
+  rebased tree while the epilogue said the branch had not moved. The
+  order was wrong: move first, believe second.
+- The scope check ran on the pre-rebase diff and was never re-run on
+  the replayed one. A rename-aware replay can land a patch on a path
+  the original never touched, so "green" was being read as permission
+  to move the branch when scope had not been asked.
+- And a verify *checkout* that could not be created was reported as
+  `rebase-red` — "does not verify" about a tree nothing had measured.
+
+Plus one honest race: snapshotting a folder moves a shared ref, and two
+folder runners could read the same parent and overwrite each other. It
+takes a lock now, held across the snapshot only — it is not the
+dispatch claim.
+
+What to take from it. Every one of these was invisible while the
+mechanism underneath was doing the work, and every one became a gap the
+moment the mechanism changed. The question that would have found them
+in one pass is not "is the new thing correct" but **"what was the old
+thing quietly guaranteeing?"** A worktree guaranteed ownership,
+identity and visibility. A clone guarantees none of the three, and a
+checklist would have said so faster than four rounds of review did.

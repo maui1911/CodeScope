@@ -96,6 +96,58 @@ AGENT_EXIT=0
 # Two copies of the same string would be free to drift.
 CONTRACT_DIR="labs/agent-bots/contract"
 
+# Paths no run commits, whatever the project's .gitignore says about
+# them. They are excluded three times over, because each layer has a
+# hole the next one covers: `info/exclude` is overridden by a
+# .gitignore negation, a pathspec only binds the `git add` this script
+# runs, and neither of them constrains an agent that commits by itself.
+# The last line of defence is the verdict - a committed diff carrying
+# one of these is a blocked run.
+PROTECTED_EXCLUDE_FILE=".env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+id_rsa*
+id_ed25519*
+.npmrc
+.netrc"
+
+is_protected() {   # is_protected <path> - by basename, which is how these are named
+    case "${1##*/}" in
+        .env|.env.*|*.pem|*.key|*.p12|*.pfx|*.keystore|id_rsa*|id_ed25519*|.npmrc|.netrc)
+            return 0 ;;
+    esac
+    return 1
+}
+
+# strip_protected - drop protected paths from the index that has just
+# been built. `$@` is the git invocation prefix, because the snapshot
+# builds its index with --git-dir and a temporary GIT_INDEX_FILE while
+# the surface does neither.
+#
+# After the fact rather than as a pathspec on the `add`, for two
+# reasons. git refuses an `add` whose pathspec set names a file its
+# ignore rules already exclude, so the two mechanisms fight; and this
+# one does not care how a path got into the index, which is the point -
+# a .gitignore negation re-including a secret is exactly the case
+# info/exclude cannot hold.
+strip_protected() {
+    local f staged
+    staged="$(git "$@" ls-files 2>/dev/null || true)"
+    [ -n "$staged" ] || return 0
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        if is_protected "$f"; then
+            git "$@" rm --cached -q --ignore-unmatch -- "$f" >/dev/null 2>&1 || true
+            say "  held back $f - a protected path"
+        fi
+    done <<< "$staged"
+    return 0
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAB_DIR="$(dirname "$SCRIPT_DIR")"
 
@@ -494,6 +546,14 @@ snapshot_folder() {   # snapshot the folder into $ORIGIN_REPO as refs/heads/fold
     local idx cidx tree ctree parent commit count
     local -a parentarg=()
 
+    # Serialised, because refs/heads/folder is shared between every run
+    # against this project and this function moves it. Two runners
+    # reading the same parent and racing their update-ref would have one
+    # snapshot silently replace the other, and the drift check downstream
+    # would then be comparing against a tree nobody is standing on. Held
+    # only across the snapshot itself - it is not the dispatch claim.
+    take_lock "$STATE/snapshot.lock" "snapshot"
+
     [ -d "$ORIGIN_REPO" ] || git init --bare --quiet "$ORIGIN_REPO" \
         || die "could not create the snapshot repository at $ORIGIN_REPO"
 
@@ -508,7 +568,7 @@ snapshot_folder() {   # snapshot the folder into $ORIGIN_REPO as refs/heads/fold
     # It goes in the snapshot repo's info/exclude rather than in the
     # user's folder, because it is this runner's opinion and the folder
     # is not this runner's to write to.
-    cat > "$ORIGIN_REPO/info/exclude" <<'EXCLUDE'
+    { cat <<'EXCLUDE'
 .git/
 node_modules/
 target/
@@ -522,14 +582,9 @@ __pycache__/
 .nuxt/
 .gradle/
 vendor/
-.env
-.env.*
-*.pem
-*.key
-id_rsa*
-.npmrc
-.netrc
 EXCLUDE
+      printf '%s\n' "$PROTECTED_EXCLUDE_FILE"
+    } > "$ORIGIN_REPO/info/exclude"
 
     mkdir -p "$STATE/tmp"
     idx="$STATE/tmp/import-$$.idx"
@@ -551,6 +606,9 @@ EXCLUDE
         git -c core.bare=false --git-dir="$ORIGIN_REPO" --work-tree="$LAB_DIR/contract" \
             add -A -- . ) >>"$IMPORT_LOG" 2>&1 \
         || { rm -f "$idx" "$cidx"; die "could not import the contract; see $IMPORT_LOG"; }
+    GIT_INDEX_FILE="$idx" strip_protected -c core.bare=false \
+        --git-dir="$ORIGIN_REPO" --work-tree="$REPO"
+
     ctree="$(GIT_INDEX_FILE="$cidx" git --git-dir="$ORIGIN_REPO" write-tree)"
     rm -f "$cidx"
     GIT_INDEX_FILE="$idx" git -c core.bare=false --git-dir="$ORIGIN_REPO" \
@@ -568,6 +626,7 @@ EXCLUDE
         # a base - which is what lets the overlap check tell that they
         # are talking about the same tree.
         IMPORT_REPORT="unchanged since ${parent:0:12}"
+        drop_lock "$STATE/snapshot.lock"
         return 0
     fi
 
@@ -583,6 +642,7 @@ EXCLUDE
         || die "could not move refs/heads/folder; see $IMPORT_LOG"
     count="$(git --git-dir="$ORIGIN_REPO" ls-tree -r --name-only "$commit" | wc -l | tr -d ' ')"
     IMPORT_REPORT="$count file(s) at ${commit:0:12}${parent:+, was ${parent:0:12}}"
+    drop_lock "$STATE/snapshot.lock"
     return 0
 }
 
@@ -1356,7 +1416,15 @@ if git clone --shared --no-checkout --quiet "$ORIGIN_REPO" "$WT" >>"$RUN_LOG" 2>
         && SURFACE_OK=1
 fi
 if [ "$SURFACE_OK" -eq 0 ]; then
-    rm -rf "$WT"
+    # Only if the clone actually got as far as making one. The
+    # existing-path guard ran earlier, so between then and here a
+    # directory could have appeared that is not ours - and an `rm -rf`
+    # on a computed path is not the place to assume otherwise.
+    if [ -e "$WT/.git" ]; then
+        rm -rf "$WT"
+    elif [ -d "$WT" ]; then
+        rmdir "$WT" 2>/dev/null || say "  left $WT alone - it is not a clone this run made"
+    fi
     board "dispatch-failed" "$TASK_BRANCH"
     die "could not create the work surface at $WT; see $RUN_LOG"
 fi
@@ -1367,6 +1435,7 @@ fi
 # eating something else. See F-24 - a harness that can destroy your
 # work is worse than no harness.
 printf 'bot-run surface for %s\n' "$TASK_ID" > "$WT/.git/bot-surface"
+printf '%s\n' "$PROTECTED_EXCLUDE_FILE" >> "$WT/.git/info/exclude"
 
 # Whose commit this is, set on the surface rather than on the commit, so
 # that it holds whoever ends up making it. Codex committed its own work
@@ -1391,8 +1460,20 @@ say "  created $WT (clone of $ORIGIN_REPO)"
 # else. The marker written at creation is the whole check: a path this
 # script computed is not by itself a reason to delete a directory tree.
 drop_surface() {
+    # Two separate paths, two separate proofs. $VERIFY_WT is a sibling
+    # directory name this script computed, and a linked worktree always
+    # has a `.git` *file* pointing back at its parent - so that file
+    # both identifies it and says whose it is.
+    if [ -e "$VERIFY_WT" ]; then
+        if [ -f "$VERIFY_WT/.git" ] \
+           && grep -q "$(printf '%s' "$WT_LEAF")" "$VERIFY_WT/.git" 2>/dev/null; then
+            rm -rf "$VERIFY_WT"
+        else
+            say "  refusing to remove $VERIFY_WT - not a verify checkout this run made"
+            return 1
+        fi
+    fi
     [ -f "$WT/.git/bot-surface" ] || { say "  refusing to remove $WT - not a surface this run made"; return 1; }
-    rm -rf "$VERIFY_WT"
     rm -rf "$WT"
     [ ! -e "$WT" ]
 }
@@ -1604,6 +1685,7 @@ if [ "$TASK_KIND" != "review" ] && [ -z "$AGENT_BLOCKED" ] && [ "$AGENT_EXIT" -e
         # split is for, and it is the honest reading: the bot did the
         # work, this script recorded it.
         if git -C "$WT" add -A >>"$RUN_LOG" 2>&1 \
+            && strip_protected -C "$WT" \
             && GIT_COMMITTER_NAME=bot-run GIT_COMMITTER_EMAIL=bot-run@invalid \
                git -C "$WT" \
                  -c "user.name=$TASK_OWNER (via $AGENT_ID)" \
@@ -1627,6 +1709,7 @@ fi
 HEAD_SHA="$(git -C "$WT" rev-parse HEAD 2>/dev/null)" || HEAD_SHA=""
 if [ -z "$HEAD_SHA" ]; then
     HEAD_SHA="(unreadable)"
+    HEAD_BRANCH="(unreadable)"
     COMMITS=0
     DIRTY=0
     TOUCHED=""
@@ -1636,6 +1719,12 @@ if [ -z "$HEAD_SHA" ]; then
     TREE_BROKEN=1
 else
     TREE_BROKEN=0
+    # Which branch the evidence is about. The charter says not to switch
+    # branches; nothing checked, and the push below names $TASK_BRANCH
+    # while every number here comes from wherever HEAD happens to be. An
+    # agent that switched would produce a green handoff for a branch
+    # still sitting at the base.
+    HEAD_BRANCH="$(git -C "$WT" symbolic-ref --quiet --short HEAD 2>/dev/null || printf '(detached)')"
     # `BASE_SHA..HEAD` counts commits reachable from HEAD and not from
     # base, which is zero both when nothing happened and when the branch
     # was reset onto the base or behind it. Those are opposite outcomes,
@@ -1665,6 +1754,19 @@ say "  head      ${HEAD_SHA:0:12}"
 say "  commits   $COMMITS"
 say "  uncommit  $DIRTY file(s)"
 say "  diff      $NUMSTAT"
+
+# Whatever is in the diff, whoever put it there. The pathspecs keep
+# these out of the runner's own commits; this is the check that also
+# covers a commit the agent made for itself.
+PROTECTED_IN_DIFF=""
+if [ -n "$TOUCHED" ]; then
+    while IFS= read -r pfile; do
+        [ -n "$pfile" ] || continue
+        if is_protected "$pfile"; then
+            PROTECTED_IN_DIFF="$PROTECTED_IN_DIFF    $pfile"$'\n'
+        fi
+    done <<< "$TOUCHED"
+fi
 
 # Scope check: every committed file must match a declared glob.
 SCOPE_VIOLATIONS=""
@@ -1837,6 +1939,12 @@ elif [ "$BASE_IS_ANCESTOR" -eq 0 ]; then
     BLOCKERS="the branch no longer descends from the commit it was dispatched at.
 base $BASE_SHA is not an ancestor of head $HEAD_SHA, so the commit count
 below describes nothing and any work that was done has been discarded."
+elif [ "$HEAD_BRANCH" != "$TASK_BRANCH" ]; then
+    STATUS="blocked"
+    BLOCKERS="the worktree is not on '$TASK_BRANCH' any more - HEAD is $HEAD_BRANCH.
+Every number below was read from HEAD, and the result would have been
+pushed from '$TASK_BRANCH', so they would describe two different trees.
+The charter says not to switch branches; this is what that rule is for."
 elif [ -n "$AGENT_BLOCKED" ]; then
     STATUS="blocked"
     BLOCKERS="agent reported blocked: $AGENT_BLOCKED"
@@ -1857,6 +1965,12 @@ elif [ "$VERIFY_EXIT" -ne 0 ]; then
     BLOCKERS="verifier exited $VERIFY_EXIT${VERIFY_TAIL:+:
 $VERIFY_TAIL}
 Full output: $RUN_LOG"
+elif [ -n "$PROTECTED_IN_DIFF" ]; then
+    STATUS="blocked"
+    BLOCKERS="this commit carries files that never travel:"$'\n'"$PROTECTED_IN_DIFF
+They are excluded from every `git add` this runner performs and from
+the surface's exclude file, so one reaching a commit means an agent put
+it there deliberately. Nothing is pushed."
 elif [ -n "$SCOPE_VIOLATIONS" ]; then
     STATUS="blocked"
     BLOCKERS="files changed outside touches:"$'\n'"$SCOPE_VIOLATIONS"
@@ -2052,11 +2166,37 @@ $RUN_LOG for what git said."
         # if that ever stops being true, a rebase that quietly pockets
         # the uncommitted files and puts them back afterwards is the
         # last thing this script should be doing with evidence.
+        # updateRefs off explicitly. Detaching stops `rebase` from moving
+        # the branch it is standing on; it does not stop
+        # `rebase.updateRefs=true`, which force-updates any ref pointing
+        # into the range being replayed - and $TASK_BRANCH points at
+        # exactly that. A user's config would otherwise undo the whole
+        # point of detaching, silently, on somebody else's machine.
         REBASE_EXIT=0
-        git -C "$WT" -c rebase.autoStash=false -c core.quotepath=off \
+        git -C "$WT" -c rebase.autoStash=false -c rebase.updateRefs=false \
+            -c core.quotepath=off \
             rebase --onto "$NEW_BASE_SHA" "$BASE_SHA" >>"$RUN_LOG" 2>&1 || REBASE_EXIT=$?
 
-        if [ "$REBASE_EXIT" -ne 0 ]; then
+        # And then check rather than trust: the branch is supposed to be
+        # exactly where it was.
+        BRANCH_MOVED=""
+        BRANCH_NOW="$(git -C "$WT" rev-parse --verify -q "refs/heads/$TASK_BRANCH" 2>/dev/null || true)"
+        [ "$BRANCH_NOW" = "$PRE_REBASE_HEAD" ] || BRANCH_MOVED="${BRANCH_NOW:-(gone)}"
+
+        if [ -n "$BRANCH_MOVED" ]; then
+            git -C "$WT" rebase --abort >>"$RUN_LOG" 2>&1 || true
+            git -C "$WT" update-ref "refs/heads/$TASK_BRANCH" "$PRE_REBASE_HEAD" \
+                >>"$RUN_LOG" 2>&1 || true
+            reattach keep
+            REBASE_STATE="the branch moved during a detached replay - put back"
+            say "  $REBASE_STATE"
+            board "rebase-stuck" "branch moved under a detached replay"
+            STATUS="blocked"
+            BLOCKERS="$TASK_BRANCH was replayed on a detached head precisely so that it
+could not move, and it moved anyway: ${PRE_REBASE_HEAD:0:12} ->
+$BRANCH_MOVED. It has been put back, and this run is not reporting a
+verdict built on a tree something else was editing. See $RUN_LOG."
+        elif [ "$REBASE_EXIT" -ne 0 ]; then
             REBASE_CONFLICTS="$(git -C "$WT" -c core.quotepath=off \
                 diff --name-only --diff-filter=U 2>/dev/null | sort -u || true)"
             [ -n "$REBASE_CONFLICTS" ] \
@@ -2124,70 +2264,61 @@ decision, not a cleanup rule."
                 REVERIFY_EXIT="$VERIFY_EXIT"
                 REVERIFY_TAIL="$VERIFY_TAIL"
 
-                if [ -n "$VERIFY_WT_LEFTOVER" ]; then
+                # Scope, against the tree that is about to become the
+                # answer. A replay is not a copy: a rename-aware merge
+                # can land a patch on a path the original diff never
+                # touched, so the check that ran on the old diff has not
+                # been run on this one.
+                REBASED_TOUCHED="$(git -C "$WT" -c core.quotepath=off \
+                    diff --name-only --no-renames "$NEW_BASE_SHA..$REBASED_HEAD" 2>/dev/null || true)"
+                REBASED_SCOPE=""
+                if [ -n "$REBASED_TOUCHED" ]; then
+                    while IFS= read -r rfile; do
+                        [ -n "$rfile" ] || continue
+                        rok=0
+                        for g in ${MY_GLOBS[@]+"${MY_GLOBS[@]}"}; do
+                            # shellcheck disable=SC2254  # a glob, on purpose
+                            case "$rfile" in $g) rok=1; break ;; esac
+                        done
+                        [ "$rok" -eq 1 ] || REBASED_SCOPE="$REBASED_SCOPE$rfile"$'\n'
+                    done <<< "$REBASED_TOUCHED"
+                fi
+
+                # Everything below restores the first verifier's result
+                # unless the branch actually moves, because that result
+                # is what describes the branch as it then stands.
+                REBASE_KEPT_REASON=""
+                if [ "$REVERIFY_EXIT" -lt 0 ]; then
+                    # The verifier never ran; the checkout could not be
+                    # made. "does not verify" would be a claim about a
+                    # tree nothing measured, which is the one sentence
+                    # this runner exists not to write.
+                    REBASE_STATE="could not verify the rebased tree - branch not moved"
+                    board "rebase-unverified" "${NEW_BASE_SHA:0:12}"
+                    STATUS="needs-review"
+                    REBASE_KEPT_REASON="the work replayed cleanly onto ${NEW_BASE_SHA:0:12} and then could
+not be verified there at all: $VERIFY_WHERE. Nothing is known about the
+rebased tree, so $TASK_BRANCH was left on ${PRE_REBASE_HEAD:0:12}, which
+did verify against ${BASE_SHA:0:12}. See $RUN_LOG."
+                elif [ -n "$VERIFY_WT_LEFTOVER" ]; then
                     # Its own outcome, and not `rebase-red`: the rebased
                     # tree may be perfectly good. What is wrong is that
                     # the next run for this task cannot start. Folding it
                     # in with a failing verifier would put "does not
                     # verify" on the board next to an exit code of 0.
-                    reattach keep
                     REBASE_STATE="re-verify checkout could not be removed - branch not moved"
-                    say "  $REBASE_STATE"
                     board "rebase-stuck" "verify checkout left over"
                     STATUS="needs-review"
-                    BLOCKERS="the re-verify checkout could not be removed: $VERIFY_WT_LEFTOVER
+                    REBASE_KEPT_REASON="the re-verify checkout could not be removed: $VERIFY_WT_LEFTOVER
 It exited $REVERIFY_EXIT, so the rebased tree may well be fine - but the
 branch was left on ${PRE_REBASE_HEAD:0:12} rather than moved onto a
 result this run could not finish measuring. Remove it before re-running:
     rm -rf $VERIFY_WT_LEFTOVER"
-                    VERIFY_EXIT="$FIRST_VERIFY_EXIT"
-                    VERIFY_WHERE="$FIRST_VERIFY_WHERE"
-                    VERIFY_TAIL="$FIRST_VERIFY_TAIL"
-                    TREE_MUTATED=""
-                elif [ "$REVERIFY_EXIT" -eq 0 ] && [ -z "$TREE_MUTATED" ]; then
-                    # The one path that moves the branch. Every number in
-                    # the handoff below is re-read, because they all
-                    # describe the old base and a reader has no way to
-                    # tell which of them moved.
-                    reattach move
-                    BASE_SHA="$NEW_BASE_SHA"
-                    HEAD_SHA="$REBASED_HEAD"
-                    COMMITS="$REBASED_COMMITS"
-                    TOUCHED="$(git -C "$WT" -c core.quotepath=off \
-                        diff --name-only --no-renames "$BASE_SHA..HEAD")"
-                    NUMSTAT="$(git -C "$WT" diff --shortstat "$BASE_SHA..HEAD" \
-                        | sed 's/^ *//')"
-                    [ -n "$NUMSTAT" ] || NUMSTAT="no committed changes"
-                    # The live task records the base its worktree stands
-                    # on, and the overlap scan expands other tasks' globs
-                    # against it. Leaving the dispatch-time value there
-                    # would have the next runner compare this branch's
-                    # files against a tree it no longer sits on.
-                    set_field base_sha "$BASE_SHA"
-                    REBASED=1
-                    REBASE_STATE="clean, re-verified on ${NEW_BASE_SHA:0:12}"
-                    board "rebased" "${PRE_REBASE_HEAD:0:12} -> ${HEAD_SHA:0:12}"
-
-                    # One more look at the ref. This step narrows the
-                    # window between "verified" and "merged"; it cannot
-                    # close it, and a runner that re-read until the base
-                    # held still would never finish in a busy repo. So
-                    # the honest thing is to notice and say so: the
-                    # handoff's claim is about a commit, not about a tip.
-                    LATE_BASE_SHA="$(git -C "$ORIGIN_REPO" rev-parse --verify \
-                        "$TASK_BASE^{commit}" 2>/dev/null || true)"
-                    if [ -n "$LATE_BASE_SHA" ] && [ "$LATE_BASE_SHA" != "$NEW_BASE_SHA" ]; then
-                        REBASE_STATE="$REBASE_STATE - and $TASK_BASE moved on again to ${LATE_BASE_SHA:0:12} while that ran"
-                        board "base-moved-again" "${LATE_BASE_SHA:0:12}"
-                    fi
-                    say "  $REBASE_STATE"
-                else
-                    reattach keep
+                elif [ -n "$TREE_MUTATED" ] || [ "$REVERIFY_EXIT" -ne 0 ]; then
                     REBASE_STATE="clean, but red on ${NEW_BASE_SHA:0:12} - branch not moved"
-                    say "  $REBASE_STATE"
                     board "rebase-red" "verify exit $REVERIFY_EXIT"
                     STATUS="needs-review"
-                    BLOCKERS="this work verifies on ${BASE_SHA:0:12} and does not verify on
+                    REBASE_KEPT_REASON="this work verifies on ${BASE_SHA:0:12} and does not verify on
 ${NEW_BASE_SHA:0:12}, which is where $TASK_BASE now points. It rebased
 without a single conflict, so no file here is contested: something on
 the new base disagrees with this change in a way no merge could have
@@ -2198,8 +2329,69 @@ The replay ran on a detached head, so $TASK_BRANCH never left
 ${PRE_REBASE_HEAD:0:12} - the tree that passed - and the evidence
 recorded below is still true of it.${TREE_MUTATED:+
 The re-verify also changed the worktree: $TREE_MUTATED}"
-                    # Put the first verifier's result back: it is the one
-                    # that describes the branch as it now stands.
+                elif [ -n "$REBASED_SCOPE" ]; then
+                    # Green, and out of bounds. A verifier has no opinion
+                    # about scope, so a passing re-verify is not on its
+                    # own permission to move the branch.
+                    REBASE_STATE="clean and green on ${NEW_BASE_SHA:0:12}, and out of scope there"
+                    board "rebase-out-of-scope" "${NEW_BASE_SHA:0:12}"
+                    STATUS="blocked"
+                    REBASE_KEPT_REASON="replaying this onto ${NEW_BASE_SHA:0:12} put changes outside
+touches:
+$(printf '%s' "$REBASED_SCOPE" | sed 's/^/    /')
+It verified there, and a verifier has no opinion about scope. The branch
+was left on ${PRE_REBASE_HEAD:0:12}, where the diff was in bounds."
+                else
+                    # Move the branch, and only then believe it. These
+                    # lines used to run before the reattach was checked,
+                    # so a failed `checkout -B` produced a handoff
+                    # describing a tree the branch did not point at.
+                    reattach move
+                    if [ -n "$REATTACH_FAILED" ]; then
+                        REBASE_STATE="re-verified, but the branch could not be moved onto it"
+                        REBASE_KEPT_REASON=""
+                    else
+                        BASE_SHA="$NEW_BASE_SHA"
+                        HEAD_SHA="$REBASED_HEAD"
+                        COMMITS="$REBASED_COMMITS"
+                        TOUCHED="$REBASED_TOUCHED"
+                        NUMSTAT="$(git -C "$WT" diff --shortstat "$BASE_SHA..HEAD" \
+                            | sed 's/^ *//')"
+                        [ -n "$NUMSTAT" ] || NUMSTAT="no committed changes"
+                        # The live task records the base its worktree
+                        # stands on, and the overlap scan expands other
+                        # tasks' globs against it. Leaving the
+                        # dispatch-time value there would have the next
+                        # runner compare this branch's files against a
+                        # tree it no longer sits on.
+                        set_field base_sha "$BASE_SHA"
+                        REBASED=1
+                        REBASE_STATE="clean, re-verified on ${NEW_BASE_SHA:0:12}"
+                        board "rebased" "${PRE_REBASE_HEAD:0:12} -> ${HEAD_SHA:0:12}"
+
+                        # One more look at the ref. This step narrows the
+                        # window between "verified" and "merged"; it
+                        # cannot close it, and a runner that re-read
+                        # until the base held still would never finish in
+                        # a busy repo. So the honest thing is to notice
+                        # and say so: the handoff's claim is about a
+                        # commit, not about a tip.
+                        LATE_BASE_SHA="$(git -C "$ORIGIN_REPO" rev-parse --verify \
+                            "$TASK_BASE^{commit}" 2>/dev/null || true)"
+                        if [ -n "$LATE_BASE_SHA" ] && [ "$LATE_BASE_SHA" != "$NEW_BASE_SHA" ]; then
+                            REBASE_STATE="$REBASE_STATE - and $TASK_BASE moved on again to ${LATE_BASE_SHA:0:12} while that ran"
+                            board "base-moved-again" "${LATE_BASE_SHA:0:12}"
+                        fi
+                    fi
+                fi
+
+                say "  $REBASE_STATE"
+                if [ -n "$REBASE_KEPT_REASON" ]; then
+                    # One place, one set of restores. Four branches each
+                    # putting the first verifier's result back by hand is
+                    # four chances to forget one.
+                    reattach keep
+                    BLOCKERS="$REBASE_KEPT_REASON"
                     VERIFY_EXIT="$FIRST_VERIFY_EXIT"
                     VERIFY_WHERE="$FIRST_VERIFY_WHERE"
                     VERIFY_TAIL="$FIRST_VERIFY_TAIL"
@@ -2253,7 +2445,12 @@ PUSH_FAILED=""
 PATCH_FILE=""
 if [ "$TREE_BROKEN" -eq 0 ] && [ "$COMMITS" -gt 0 ]; then
     step "Result branch"
-    if git -C "$WT" push --quiet origin \
+    # The path, not the remote name. `origin` lives in the surface's
+    # own .git/config, which the agent can write - Codex is explicitly
+    # granted that directory - so `git remote set-url` would redirect
+    # this push wherever it liked. $ORIGIN_REPO is the runner's own
+    # variable and has never been inside the worktree.
+    if git -C "$WT" push --quiet "$ORIGIN_REPO" \
         "refs/heads/$TASK_BRANCH:refs/heads/$TASK_BRANCH" >>"$RUN_LOG" 2>&1; then
         PUSHED="$TASK_BRANCH"
         say "  $TASK_BRANCH -> $ORIGIN_REPO"
@@ -2275,6 +2472,19 @@ if [ "$TREE_BROKEN" -eq 0 ] && [ "$COMMITS" -gt 0 ]; then
                 rm -f "$PATCH_FILE"
                 PATCH_FILE=""
                 say "  could not write the patch"
+                board "patch-failed" "$TASK_ID"
+                # The branch is in the snapshot and the folder cannot
+                # pull from it, so without the patch there is nothing a
+                # human can act on - which is not a `done`.
+                [ "$STATUS" != "done" ] || STATUS="needs-review"
+                [ "$BLOCKERS" != "none" ] || BLOCKERS=""
+                BLOCKERS="${BLOCKERS:+$BLOCKERS
+
+}the work is committed and verified, and the patch could not be
+written. $REPO is a plain folder, so a branch in $ORIGIN_REPO is not
+something it can pull from; the patch was the artifact. Read it out by
+hand before anything removes the surface:
+    git -C $WT format-patch --stdout $BASE_SHA..$TASK_BRANCH"
             fi
         fi
     else
@@ -2559,9 +2769,24 @@ board "handoff" "$STATUS"
 # Cleanup
 # --------------------------------------------------------------------
 
-if [ "$STATUS" = "done" ] && [ "$COMMITS" -eq 0 ] && [ "$DIRTY" -eq 0 ] && [ "$KEEP" -eq 0 ]; then
+# Two ways a surface stops being needed: a no-op left nothing on it,
+# or the result is out and safe somewhere else. Anything else - blocked,
+# needs-review, a push that failed - keeps it, because then the surface
+# is the evidence and in one case the only copy.
+CLEAN_WHY=""
+if [ "$KEEP" -eq 1 ]; then
+    CLEAN_WHY=""
+elif [ "$STATUS" = "done" ] && [ "$COMMITS" -eq 0 ] && [ "$DIRTY" -eq 0 ]; then
+    CLEAN_WHY="no-op run"
+elif [ "$STATUS" = "done" ] && [ -n "$PUSHED" ]; then
+    # Otherwise every successful task leaves a full clone under
+    # .worktrees for ever, while the handoff calls it throwaway.
+    CLEAN_WHY="result pushed to $ORIGIN_REPO"
+fi
+
+if [ -n "$CLEAN_WHY" ]; then
     step "Cleanup"
-    say "  no-op run, removing the work surface"
+    say "  $CLEAN_WHY, removing the work surface"
     CLEAN_FAILED=""
     drop_surface >>"$RUN_LOG" 2>&1 || CLEAN_FAILED="work surface $WT"
 
@@ -2577,7 +2802,7 @@ if [ "$STATUS" = "done" ] && [ "$COMMITS" -eq 0 ] && [ "$DIRTY" -eq 0 ] && [ "$K
         set_status "$STATUS"
         {
             printf '\n# Cleanup failed\n\n'
-            printf 'The run itself was a clean no-op, but %s could not be\n' "$CLEAN_FAILED"
+            printf 'The run finished (%s), but %s could not be\n' "$CLEAN_WHY" "$CLEAN_FAILED"
             printf 'removed. Remove it before re-running this task:\n\n'
             printf '    rm -rf %s\n' "$WT"
         } >> "$HANDOFF"

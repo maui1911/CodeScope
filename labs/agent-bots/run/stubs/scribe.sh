@@ -18,7 +18,12 @@ set -eu
 
 FILE="${BOT_SCRIBE_FILE:-notes.md}"
 printf '%s\n' "${BOT_SCRIBE_BODY:-Written by a bot.}" > "$FILE"
-git add -- "$FILE"
+# -f on purpose. Point BOT_SCRIBE_FILE at something the surface's
+# exclude file holds back and this stub commits it anyway, which is the
+# only way to exercise the last guard: the runner strips protected paths
+# from its own `add`, so one can only reach a commit if an agent put it
+# there deliberately.
+git add -f -- "$FILE"
 git -c user.name=scribe -c user.email=scribe@example.invalid \
     commit -q -m "Add ${FILE}"
 

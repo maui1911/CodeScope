@@ -70,10 +70,28 @@ cleanup() {   # cleanup <branch> - only ever a branch from SWEEP_BRANCHES
     esac
     leaf="$(printf '%s' "$1" | tr '/' '-')"
     # A work surface is a standalone clone now, not a linked worktree,
-    # so there is no registration to remove - only a directory. The
-    # branch is still deleted here because a run with commits pushes it
-    # back into the project.
-    rm -rf "$WT_ROOT/$leaf" "$WT_ROOT/$leaf-verify"
+    # so there is no registration to remove - only a directory. Which
+    # means the allowlist above is not enough on its own: it protects
+    # branch *names*, and this is about to `rm -rf` a path. The runner
+    # writes a marker into every surface it makes; nothing without one
+    # gets deleted here, exactly as in bot-run.sh.
+    if [ -e "$WT_ROOT/$leaf" ]; then
+        if [ -f "$WT_ROOT/$leaf/.git/bot-surface" ]; then
+            rm -rf "$WT_ROOT/$leaf"
+        else
+            printf 'sweep: refusing to remove %s - no bot-surface marker\n' "$WT_ROOT/$leaf"
+        fi
+    fi
+    # A linked worktree has a `.git` file rather than a directory, which
+    # is both what identifies the verify checkout and what says it
+    # belongs to this surface.
+    if [ -e "$WT_ROOT/$leaf-verify" ]; then
+        if [ -f "$WT_ROOT/$leaf-verify/.git" ]; then
+            rm -rf "$WT_ROOT/$leaf-verify"
+        else
+            printf 'sweep: refusing to remove %s - not a verify checkout\n' "$WT_ROOT/$leaf-verify"
+        fi
+    fi
     git -C "$REPO" branch -D "$1" >/dev/null 2>&1
     return 0
 }
@@ -274,16 +292,22 @@ run_mover() {   # run_mover <label> <exit> <event> <id> <mine> <body> <theirs> <
     # and on nothing else - could regress while the sweep stayed green.
     newbase="$(git -C "$REPO" rev-parse --verify "refs/heads/$SWEEP_BASE" 2>/dev/null || printf '')"
     tip="$(git -C "$REPO" rev-parse --verify "refs/heads/bot/fixer/$id" 2>/dev/null || printf '')"
+    # Ancestry *and* content. Ancestry alone would pass for a branch
+    # moved to any descendant of the right commit - including one with
+    # the bot's patch dropped, which is precisely the regression the
+    # "moves on success and on nothing else" invariant is about.
     if [ "$want" = moved ]; then
-        desc="branch sits on the moved base"
+        desc="branch sits on the moved base, carrying the work"
         [ -n "$tip" ] && [ -n "$newbase" ] \
             && git -C "$REPO" merge-base --is-ancestor "$newbase" "$tip" 2>/dev/null \
+            && git -C "$REPO" cat-file -e "$tip:$5" 2>/dev/null \
             && ok=1
     else
-        desc="branch never left the old base"
+        desc="branch never left the old base, still carrying the work"
         [ -n "$tip" ] && [ -n "$newbase" ] \
             && git -C "$REPO" merge-base --is-ancestor "$SWEEP_BASE_COMMIT" "$tip" 2>/dev/null \
             && ! git -C "$REPO" merge-base --is-ancestor "$newbase" "$tip" 2>/dev/null \
+            && git -C "$REPO" cat-file -e "$tip:$5" 2>/dev/null \
             && ok=1
     fi
     if [ "$ok" = 1 ]; then
@@ -379,7 +403,8 @@ run_folder() {   # run_folder <label> <exit> <event-or-empty> [disturb] [body] [
     folder_fixture
     BOT_AGENT_CMD="$STUBS/${6:-scribe.sh}" BOT_AGENT_ARGS="" \
         BOT_SCRIBE_DISTURB="${4:-}" BOT_SCRIBE_DISTURB_BODY="${5:-}" \
-        BOT_HANDLESS_MSG="${7:-}" \
+        BOT_HANDLESS_MSG="${7:-}" BOT_HANDLESS_FILE="${8:-}" \
+        BOT_SCRIBE_FILE="${8:-}" \
         bash "$RUN" --task "$FOLDER_ROOT/T-992.md" --reset --repo "$FPROJ" --state "$FSTATE" >/dev/null 2>&1 || rc=$?
     check "$label" "$expect" "$rc"
     if [ -n "$event" ]; then
@@ -442,6 +467,12 @@ Written by the agent, committed by the runner."
 # because work that cannot be measured cannot be judged - but a change
 # whose reason is recorded nowhere does not get called done.
 run_folder "handless, no message"  2 runner-committed "" "" handless.sh
+
+# A secret an agent commits on purpose. The runner strips protected
+# paths from its own `add` and the surface carries an exclude file, so
+# this can only happen deliberately - and it is the guard that has to
+# hold when the other two are gone.
+run_folder "secret in the commit"  1 "" "" "" scribe.sh "" .env
 
 rm -rf "$FOLDER_ROOT" "$FPROJ.worktrees"
 
