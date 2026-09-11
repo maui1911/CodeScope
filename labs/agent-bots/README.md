@@ -254,9 +254,16 @@ runs before the claim is advice (F-17).
 "In flight" means status `dispatched` **and** a worktree still on disk.
 Believing the status field alone would wedge every later task behind a
 run that crashed; a dispatch with no worktree is reported as stale and
-ignored. What is still missing is the other half: rebase-on-collision
-and re-verify when the base moves under a finished branch. See F-16 for
-what the check cannot see.
+ignored.
+
+The other half is the base moving. A branch is cut from one commit and
+merged against another, so once the work is done the base ref is read
+again; if it moved, the commits are replayed onto the new tip and
+verified there. Only a clean rebase that is still green keeps its
+`done` — a conflict, a verifier that now fails, or a branch the new
+base has emptied all go to a human with the branch put back exactly
+where it was. `--no-rebase` turns it off. See F-25, and F-16 for what
+the dispatch-time check cannot see.
 
 Crash recovery is *cheap*, not free. Nothing lives in memory, so the
 state is all on disk — but there is no resume path: a run that dies
@@ -298,8 +305,8 @@ detects that it happened.
 
 | | |
 |---|---|
-| Covered | the file contract; **two bots** (`fixer`, `reviewer`), two task kinds (`change`, `review`), the handoff between them and a scheduler that reads the board; contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the `.bot-review.md` output channel; verifier, in a clean checkout of the branch tip; evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup |
-| **Not** covered | the approval inbox, per-bot memory, rebase-on-collision, resume after a crash, any trigger other than "someone ran a tick", pushing, opening PRs, any GPUI surface |
+| Covered | the file contract; **two bots** (`fixer`, `reviewer`), two task kinds (`change`, `review`), the handoff between them and a scheduler that reads the board; contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the `.bot-review.md` output channel; verifier, in a clean checkout of the branch tip; evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup; rebase onto a base that moved, re-verified there |
+| **Not** covered | the approval inbox, per-bot memory, re-verifying a branch that is *waiting* rather than running, resume after a crash, any trigger other than "someone ran a tick", pushing, opening PRs, any GPUI surface |
 
 Two deliberate omissions:
 
@@ -467,7 +474,10 @@ worktree and branch.
    this repo.
 2. The verifier catches at least one agent run that *claimed* success
    and was wrong. If that never happens, the verifier is not verifying.
-3. A handoff between two bots survives a rebase.
+3. A handoff between two bots survives a rebase. *(Half done: a
+   branch is now rebased onto a base that moved during the run and
+   re-verified there — F-25. A branch that is merely waiting is not
+   re-checked, and that window is the longer one.)*
 4. Worktree cleanup works on Windows with a build running.
 5. `verify:` no longer runs through `eval` on the host, or task files
    are provably trusted input. A product feature cannot ship a shell
@@ -650,11 +660,13 @@ than single-bot polish:
    identical by construction. If differentiated roles are the value
    proposition, F-7 attacks it directly. §7.3 is the fix.
 2. **The `touches:` overlap check and rebase-on-collision stop being
-   optional.** Two bots working one repo *will* collide. The overlap
-   refusal is now built (§3.4) — the half that is not is what happens
-   when the base moves under a branch that already passed: rebase,
-   re-verify, and route a failed rebase to a human. With one bot that
-   is a rare annoyance; with four it is the normal case.
+   optional.** Two bots working one repo *will* collide. Both halves
+   are built now: the dispatch refusal (§3.4), and the rebase onto a
+   base that moved during the run, re-verified there, with anything
+   short of clean-and-green routed to a human (F-25). With one bot that
+   was a rare annoyance; with four it is the normal case — and the
+   collision worth having built it for is the one with no file in
+   common, which no merge would ever have shown.
 
 The second bot now exists — `reviewer`, which reads and judges and
 commits nothing — and the first thing it did was find four open races
@@ -1267,8 +1279,8 @@ building once a bot is allowed to create files. Today's tasks are not.
 flight together", not "will these two merge cleanly". A task can be
 dispatched, finish, and be merged after a second task has already gone
 out from the same base; nothing here notices. That is the
-rebase-on-collision half, still unbuilt, and it is the piece that
-actually matters once tasks outlive a single sitting.
+rebase-on-collision half — built since, as F-25 — and it is the piece
+that actually matters once tasks outlive a single sitting.
 
 One thing the implementation had to get right on the first try: **"in
 flight" means status `dispatched` *and* a worktree still on disk.** A
@@ -1739,3 +1751,93 @@ findings the failure modes here are a short list — *self-reported
 evidence, a check that runs before the thing it guards, a criterion
 nobody evaluates, a log asked what is true* — and the remaining work is
 recognising them in one more place, not discovering another one.
+
+---
+
+### F-25 · A clean merge and a working merge are not the same claim
+
+*2026-09-11, building the other half of F-16.*
+
+Every handoff until now ended on the same sentence: the verifier passed,
+here is the branch. It was true, and it was a claim about a commit that
+had already stopped being the tip. The branch was cut from base *X*, the
+verifier ran against base *X*, and by the time a human read the handoff
+the base was *Y* — usually because the very task this one was told to
+wait for had landed. Nothing in the loop noticed. Nothing was *wrong*,
+either: every individual step was honest. The word "verified" was just
+attached to a world that no longer existed.
+
+So the base is read a second time, after the work is done, and if it
+moved the commits are replayed onto the new tip and verified *there*.
+Only "clean rebase, still green" keeps the `done`.
+
+The interesting part is what the four outcomes turn out to be, because
+one of them is not a merge problem at all.
+
+**Conflict.** The work no longer applies. Git names the paths, the
+rebase is aborted, and the branch is left exactly where it was — still
+the tree that passed. `needs-review`, because choosing between two
+changes is a judgement, and the one thing a runner must never do is make
+one up.
+
+**Emptied.** The rebase succeeds and nothing is left: every patch was
+already upstream. Somebody else did this work. Git's default is to drop
+such a commit silently, which is right for a human at a keyboard and
+wrong here — afterwards, "already fixed" and "silently lost" are the
+same picture. It is reported rather than cleaned up.
+
+**Red.** The rebase is clean — *no file is contested* — and the
+verifier now fails. This is the one the overlap check cannot see by
+construction. The overlap check asks whether two tasks name a file in
+common; here they name none, and they still disagree: a rename on one
+side and a caller on the other, a signature changed under a passing
+test, an invariant one side relied on and the other removed. Two tasks
+that pass every gate the loop has, merge without a conflict marker, and
+produce a broken tree. Git has no opinion about this and never will,
+because it is not a text problem. Only running the verifier on the
+merged result finds it, and that is the whole reason this step exists.
+
+**Clean and green.** The branch moves, and every number in the handoff
+is re-read from the rebased tree — base, head, commit count, numstat,
+touched paths — because they all described the old base and a reader has
+no way to tell which of them moved.
+
+Three decisions worth keeping.
+
+**The branch only ever moves on success.** On conflict, on red, on
+emptied, it is put back precisely where it was. That keeps an invariant
+a reader can rely on without qualification: *the branch named in a
+handoff is a tree that verified*. What did not work is in the handoff as
+prose, not as a tip somebody has to bisect for. It also means the
+verifier's own result has to be saved and restored around the second
+run, or the handoff would describe the branch using a measurement of a
+tree that was thrown away — F-13's mistake, re-committed one layer up.
+
+**It is gated on the verdict, not on a copy of the verdict's
+conditions.** The rebase runs only when the run would otherwise be
+handed off as `done`. The first draft re-tested the eight conditions
+that lead there, which is two lists free to disagree about what "done"
+means — and the failure mode is a rebase burying a reason that was
+already established.
+
+**No fetch.** The base ref is re-read locally, so `origin/main` moves
+only because something else fetched it. A runner that reached the
+network in order to measure would be changing the world it is
+describing, and the same task would get different answers depending on
+when it ran. What the runner promises is narrow and checkable: *this
+verified against the base as this machine currently understands it*.
+
+`run/stubs/mover.sh` is the regression — an agent that does its work and
+moves the base out from under itself while it is at it, driven by four
+environment variables so the same stub produces all four outcomes. It
+builds the competing commit with plumbing (`read-tree`, `commit-tree`,
+`update-ref`) rather than a second checkout, because the runner is
+holding the only worktree it knows about and a test that needs its own
+is a test that leaks one.
+
+What is still missing: the *other* other half. This catches a base that
+moved before the handoff was written. It does nothing about a base that
+moves afterwards, while the branch sits waiting for a human — and that
+window is longer than the run by a wide margin. Answering it means
+re-verifying on a trigger rather than at the end of a run, which is the
+scheduler's job and not this one's.

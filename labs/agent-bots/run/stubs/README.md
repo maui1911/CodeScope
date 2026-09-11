@@ -5,7 +5,7 @@ can be exercised without spending tokens, and — more to the point —
 without waiting for a real agent to misbehave.
 
 Each one is a failure mode the runner used to get wrong. They are the
-regression tests for F-4 and F-8.
+regression tests for F-4, F-8 and F-25.
 
 | Stub | Simulates | Expected verdict |
 |---|---|---|
@@ -18,6 +18,7 @@ regression tests for F-4 and F-8.
 | `stumped.sh` | a reviewer that completes the paperwork and reports `verdict: blocked` — its own escalation | `blocked`, pointing at the review's blind-spots section |
 | `critic.sh` | a reviewer whose findings are well-formed and real: the positive case for the bot-to-bot handoff | `done`, a task derived for the next bot and the handoff addressed to it |
 | `refusenik.sh` | an agent that answers with an **empty commit** carrying its reasoning | `needs-review`, the commit subject quoted |
+| `mover.sh` | an agent that does its work and **moves the base ref out from under itself** while doing it | one of four, by configuration: `done` after a clean rebase, or `needs-review` for a conflict, a verifier that is now red, or a branch the new base has emptied |
 
 Before F-4 was fixed, the first two both landed on `done` as a no-op,
 and the cleanup path then deleted the branch — the evidence went with
@@ -53,6 +54,16 @@ One thing to know when chaining with a stub: the child inherits
 how the harvest bug in F-21 was found — a fixer behaving like a
 reviewer — but it does mean a stubbed chain is not two different
 bots.
+
+`mover.sh` is the only one driven entirely by the environment, because
+its four outcomes differ in exactly one thing — what lands on the base
+while the bot is working. Same path with different content conflicts;
+same path with the same content empties the branch; different paths
+rebase cleanly, and whether that is a `done` is then up to the verifier.
+`sweep.sh` runs all four against a throwaway `bot-sweep/base` ref, and
+they are the only cases that check the board event as well as the exit
+code: three of the four are `needs-review` for three different reasons,
+and a runner that reported the wrong one would still score 2.
 
 `liar.sh` appends to `core/src/telemetry.rs`, so point it at a task
 whose `touches:` covers that file, or it will trip the scope check
