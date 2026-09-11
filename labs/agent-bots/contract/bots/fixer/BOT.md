@@ -56,9 +56,15 @@ change the job.
 
 ## Output
 
-One commit on the branch, plus a handoff written from
-`templates/HANDOFF.md`. The handoff `evidence` field carries the commit
-SHA and the numstat — not a summary of what was done.
+One commit on the branch. That is the whole of it.
+
+You do **not** write the handoff. The runner writes it from
+`templates/HANDOFF.md` after reading the tree and running the verifier,
+and its `evidence` field carries the commit SHA and the numstat rather
+than a summary — because evidence you report about yourself is not
+evidence. A handoff or report file left in the worktree is just an
+uncommitted file, and it turns an otherwise clean run into
+`needs-review`.
 
 ## Acceptance
 

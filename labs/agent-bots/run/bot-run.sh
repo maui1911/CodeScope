@@ -125,13 +125,42 @@ WORKTREE_ROOT="${WORKTREE_ROOT:-${REPO}.worktrees}"
 # the plot; `touches` is comma-separated for the same reason.
 # --------------------------------------------------------------------
 
-# field <key> [file] - reads a frontmatter value. Defaults to the task,
-# but the same parser reads a charter and an agent profile, which is
-# the point of keeping the format this dull.
+# field_from <key> <text> - the actual parser. awk reads its input to
+# the end rather than quitting on the first hit: under `set -o pipefail`
+# an early exit SIGPIPEs the writer, and that 141 would take the runner
+# down on a file whose only crime was being long.
+field_from() {
+    printf '%s\n' "$2" | awk -v key="$1" '
+        /^---[[:space:]]*$/ { fence++; next }
+        fence == 1 && !found && index($0, key ":") == 1 {
+            value = substr($0, length(key) + 2)
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            print value
+            found = 1
+        }
+    '
+}
+
+# field <key> [file] - reads a frontmatter value off disk. Defaults to
+# the task, but the same parser reads a charter and an agent profile,
+# which is the point of keeping the format this dull.
 field() {
-    sed -n '/^---$/,/^---$/p' "${2:-$TASK}" \
-        | sed -n "s/^$1:[[:space:]]*//p" \
-        | head -n1
+    field_from "$1" "$(cat "${2:-$TASK}")"
+}
+
+# field_at_base <key> <contract-relative-path> - the same read, but out
+# of the base commit. The agent sees the contract as it is *there*, so
+# anything the runner decides from the contract has to be read from
+# there too, or the two halves of one dispatch disagree. See F-12.
+field_at_base() {
+    field_from "$1" "$(git -C "$REPO" show "$BASE_SHA:$CONTRACT_DIR/$2" 2>/dev/null || true)"
+}
+
+# base_has <contract-relative-path> - does the contract file exist at
+# the base commit at all.
+base_has() {
+    git -C "$REPO" cat-file -e "$BASE_SHA:$CONTRACT_DIR/$1" 2>/dev/null
 }
 
 TASK_ID="$(field id)"
@@ -184,9 +213,29 @@ BASE_SHA="$(git -C "$REPO" rev-parse --verify "$TASK_BASE^{commit}" 2>/dev/null)
 # There is no built-in default; a bot says what it runs on.
 # --------------------------------------------------------------------
 
+missing_at_base() {
+    die "contract file missing at base '$TASK_BASE': $CONTRACT_DIR/$1
+
+The agent reads its contract from the base commit, not from this
+checkout. Commit the contract, then point the task's 'base:' at a ref
+that contains it."
+}
+
+# F-3: the agent reads the contract from *its* checkout, which is the
+# base commit - never from the runner's working tree. A contract that
+# is not on the base means the prompt points at files that do not
+# exist. Fail here, before a worktree and an agent run are spent on it.
+# Same shape as F-1: prove the precondition at base, not halfway.
+for rel in "bots/$TASK_OWNER/BOT.md" \
+           "context/CONVENTIONS.md" \
+           "context/ARCHITECTURE.md" \
+           "context/GLOSSARY.md"; do
+    base_has "$rel" || missing_at_base "$rel"
+done
+
 TASK_AGENT="$(field agent)"
 TASK_MODEL="$(field model)"
-CHARTER_AGENT="$(field agent "$BOT_DIR/BOT.md")"
+CHARTER_AGENT="$(field_at_base agent "bots/$TASK_OWNER/BOT.md")"
 AGENT_ID="${TASK_AGENT:-$CHARTER_AGENT}"
 
 [ -n "$AGENT_ID" ] || die "no agent declared - set 'agent:' on the task or in $BOT_DIR/BOT.md"
@@ -194,15 +243,21 @@ case "$AGENT_ID" in
     *[!a-zA-Z0-9_-]*) die "agent id must be [a-zA-Z0-9_-]+, got '$AGENT_ID'" ;;
 esac
 
-PROFILE="$LAB_DIR/contract/agents/$AGENT_ID.agent.md"
-[ -f "$PROFILE" ] || die "no agent profile at $PROFILE"
+# F-12: read from the base commit, not from this checkout. Proving the
+# profile *exists* at base and then reading argv out of the working
+# tree pins half a contract: an uncommitted edit here, or a branch the
+# runner happens to be sitting on, would send one CLI to a worktree
+# built from another. The display name says which tree answered.
+PROFILE_REL="agents/$AGENT_ID.agent.md"
+base_has "$PROFILE_REL" || missing_at_base "$PROFILE_REL"
+PROFILE="$TASK_BASE:$CONTRACT_DIR/$PROFILE_REL"
 
-AGENT_CMD="$(field command "$PROFILE")"
-AGENT_HEADLESS="$(field headless "$PROFILE")"
-AGENT_AUTONOMY="$(field autonomy "$PROFILE")"
-AGENT_MODEL_FLAG="$(field model_flag "$PROFILE")"
-AGENT_INSTRUCTION_FILES="$(field instruction_files "$PROFILE")"
-AGENT_VERIFIED="$(field verified "$PROFILE")"
+AGENT_CMD="$(field_at_base command "$PROFILE_REL")"
+AGENT_HEADLESS="$(field_at_base headless "$PROFILE_REL")"
+AGENT_AUTONOMY="$(field_at_base autonomy "$PROFILE_REL")"
+AGENT_MODEL_FLAG="$(field_at_base model_flag "$PROFILE_REL")"
+AGENT_INSTRUCTION_FILES="$(field_at_base instruction_files "$PROFILE_REL")"
+AGENT_VERIFIED="$(field_at_base verified "$PROFILE_REL")"
 
 [ -n "$AGENT_CMD" ] || die "profile '$AGENT_ID' declares no command"
 
@@ -229,26 +284,11 @@ if [ -n "$TASK_MODEL" ] && [ -z "$AGENT_MODEL_FLAG" ]; then
     die "task pins model '$TASK_MODEL' but profile '$AGENT_ID' has no model_flag"
 fi
 
-# F-3: the agent reads the contract from *its* checkout, which is the
-# base commit - never from the runner's working tree. A contract that
-# is not on the base means the prompt points at files that do not
-# exist. Fail here, before a worktree and an agent run are spent on it.
-# Same shape as F-1: prove the precondition at base, not halfway.
-for rel in "bots/$TASK_OWNER/BOT.md" \
-           "agents/$AGENT_ID.agent.md" \
-           "context/CONVENTIONS.md" \
-           "context/ARCHITECTURE.md" \
-           "context/GLOSSARY.md"; do
-    git -C "$REPO" cat-file -e "$BASE_SHA:$CONTRACT_DIR/$rel" 2>/dev/null || die \
-"contract file missing at base '$TASK_BASE': $CONTRACT_DIR/$rel
-
-The agent reads its contract from the base commit, not from this
-checkout. Commit the contract, then point the task's 'base:' at a ref
-that contains it."
-done
-
 WT_LEAF="$(printf '%s' "$TASK_BRANCH" | tr '/' '-')"
 WT="$WORKTREE_ROOT/$WT_LEAF"
+# Throwaway second checkout, detached at the branch tip, used only to
+# run the verifier. See the Verifier section for why it exists.
+VERIFY_WT="$WT-verify"
 
 # --------------------------------------------------------------------
 # Live task
@@ -367,6 +407,7 @@ cat <<PLAN
   verify    $TASK_VERIFY
   state     $STATE
   agent     $AGENT_ID, profile verified $AGENT_VERIFIED
+  profile   $PROFILE
   argv      $AGENT_INVOCATION
   reads     ${AGENT_INSTRUCTION_FILES:-(none declared)}
 PLAN
@@ -396,27 +437,59 @@ mkdir -p "$STATE/tasks" "$STATE/handoffs" "$STATE/runs/$DAY" "$STATE/bots/$TASK_
 RUN_LOG="$STATE/runs/$DAY/$TASK_ID-$TS.log"
 BOARD="$STATE/board.md"
 
+# F-14: "append-only" is a rule about intent, not a guarantee about
+# concurrency. Two runs starting together both saw no board and both
+# truncated it with `>`, so the later header wiped the earlier run's
+# rows - an audit trail that loses evidence exactly when two bots are
+# running, which is the only time it matters. mkdir is the portable
+# atomic primitive: exactly one process creates the lock, and the
+# re-test inside it stops the loser rewriting a board that now exists.
 if [ ! -f "$BOARD" ]; then
-    {
-        echo "# Board"
-        echo
-        echo "Append-only event log. Never edit a line that is already here -"
-        echo "task status lives on the task file, this is the audit trail."
-        echo
-        echo "| when | task | event | ref |"
-        echo "|---|---|---|---|"
-    } > "$BOARD"
+    if mkdir "$BOARD.lock" 2>/dev/null; then
+        if [ ! -f "$BOARD" ]; then
+            {
+                echo "# Board"
+                echo
+                echo "Append-only event log. Never edit a line that is already here -"
+                echo "task status lives on the task file, this is the audit trail."
+                echo
+                echo "| when | task | event | ref |"
+                echo "|---|---|---|---|"
+            } > "$BOARD"
+        fi
+        rmdir "$BOARD.lock"
+    else
+        # Another run is writing the header right now. Wait for it
+        # rather than racing it; a board that never appears is a bug
+        # worth hanging on, not one worth papering over.
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            [ -f "$BOARD" ] && break
+            sleep 0.2
+        done
+        [ -f "$BOARD" ] || die "board never appeared; stale lock at $BOARD.lock?"
+    fi
 fi
 
 # Each row carries its own clock. Stamping every row of a run with the
 # run's start time made the log unsortable the moment two runs overlap.
+#
+# The append itself needs no lock: one short line through `>>` is an
+# O_APPEND write well under PIPE_BUF, so concurrent rows interleave but
+# never tear. Only creating the file was ever the race.
 board() {
     printf '| %s | %s | %s | %s |\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TASK_ID" "$1" "${2:--}" >> "$BOARD"
 }
 
+# Rewrite-and-rename, not `sed -i`. GNU sed takes `-i` with no argument
+# and understands the `0,/re/` address; BSD sed - macOS, which this
+# project ships - does neither, and would fail here *after* the handoff
+# was written, leaving the live task stuck on `dispatched` forever.
 set_status() {
-    sed -i "0,/^status:.*$/s//status: $1/" "$LIVE_TASK"
+    awk -v s="$1" '
+        !done && index($0, "status:") == 1 { print "status: " s; done = 1; next }
+        { print }
+    ' "$LIVE_TASK" > "$LIVE_TASK.tmp" && mv "$LIVE_TASK.tmp" "$LIVE_TASK"
 }
 
 # --------------------------------------------------------------------
@@ -431,6 +504,11 @@ Clear both halves before re-running - removing only the directory
 leaves the branch behind, and 'worktree add -b' then fails too:
     git -C $REPO worktree remove --force $WT
     git -C $REPO branch -D $TASK_BRANCH"
+fi
+if [ -e "$VERIFY_WT" ]; then
+    die "verify checkout left over from an earlier run: $VERIFY_WT
+
+    git -C $REPO worktree remove --force $VERIFY_WT"
 fi
 
 mkdir -p "$WORKTREE_ROOT"
@@ -497,7 +575,12 @@ fi
 
 AGENT_BLOCKED=""
 if [ -f "$WT/.bot-blocked" ]; then
-    AGENT_BLOCKED="$(tr -d '\r' < "$WT/.bot-blocked" | head -c 2000)"
+    # head first, tr second: the other order hands `tr` a file it is
+    # still reading when `head` closes the pipe, and under pipefail
+    # that SIGPIPE aborts the runner - so a refusal longer than 2000
+    # bytes would be the one case that never produces the blocked
+    # handoff it promises.
+    AGENT_BLOCKED="$(head -c 2000 "$WT/.bot-blocked" | tr -d '\r')"
     rm -f "$WT/.bot-blocked"
     [ -n "$AGENT_BLOCKED" ] || AGENT_BLOCKED="(agent wrote .bot-blocked but left it empty)"
     say "  agent reported blocked"
@@ -553,19 +636,54 @@ fi
 # Verifier
 # --------------------------------------------------------------------
 
+# F-13: verify the tree you are handing off, not the one next to it.
+# This used to run in the agent's worktree, which is the wrong subject
+# twice over. An uncommitted edit could be the thing that made it pass,
+# so a green verifier said nothing about the branch a human would pull.
+# And `verify:` is arbitrary code (F-6): anything it committed or wrote
+# landed *after* the evidence above was read, so the handoff could
+# describe a tree that no longer existed.
+#
+# A detached checkout of HEAD answers both. The verifier now sees
+# exactly the commits the branch carries, and it has no path to the
+# agent's worktree - which the post-run comparison then proves rather
+# than assumes.
 step "Verifier"
 VERIFY_EXIT=0
+VERIFY_WHERE="(not run)"
+TREE_MUTATED=""
 if [ "$TREE_BROKEN" -eq 1 ]; then
     say "  skipped - worktree unreadable"
     VERIFY_EXIT=-1
     board "verify-skipped" "worktree unreadable"
+elif ! git -C "$REPO" worktree add --detach "$VERIFY_WT" "$HEAD_SHA" >>"$RUN_LOG" 2>&1; then
+    say "  skipped - could not create the verify checkout at $VERIFY_WT"
+    VERIFY_EXIT=-1
+    VERIFY_WHERE="(verify checkout failed)"
+    board "verify-skipped" "verify checkout failed"
 else
+    VERIFY_WHERE="clean checkout of ${HEAD_SHA:0:12}"
     say "  $TASK_VERIFY"
-    # NOTE: this runs on the working tree, not on HEAD, so an
-    # uncommitted edit can be what makes it pass. The handoff says so.
-    ( cd "$WT" && eval "$TASK_VERIFY" ) </dev/null >>"$RUN_LOG" 2>&1 || VERIFY_EXIT=$?
+    say "  in $VERIFY_WT"
+    # The one tool-specific line in the runner, and it is a cost
+    # decision, not a semantic one: a fresh checkout would otherwise
+    # rebuild every dependency per run. The cache lives under state, so
+    # it belongs to the runner - an agent cannot seed it from its own
+    # worktree - and cargo's own lock serialises concurrent runs.
+    ( cd "$VERIFY_WT" \
+        && export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$STATE/cache/target}" \
+        && eval "$TASK_VERIFY" ) </dev/null >>"$RUN_LOG" 2>&1 || VERIFY_EXIT=$?
     say "  exit $VERIFY_EXIT"
     board "verified" "exit $VERIFY_EXIT"
+
+    git -C "$REPO" worktree remove --force "$VERIFY_WT" >>"$RUN_LOG" 2>&1 \
+        || say "  could not remove $VERIFY_WT - remove it by hand"
+
+    POST_HEAD="$(git -C "$WT" rev-parse HEAD 2>/dev/null)" || POST_HEAD="(unreadable)"
+    POST_DIRTY="$(git -C "$WT" status --porcelain | wc -l | tr -d ' ')"
+    if [ "$POST_HEAD" != "$HEAD_SHA" ] || [ "$POST_DIRTY" != "$DIRTY" ]; then
+        TREE_MUTATED="verifier changed the tree it was measuring: head $HEAD_SHA -> $POST_HEAD, uncommitted $DIRTY -> $POST_DIRTY file(s)"
+    fi
 fi
 
 # --------------------------------------------------------------------
@@ -582,6 +700,12 @@ NOOP=0
 if [ "$TREE_BROKEN" -eq 1 ]; then
     STATUS="blocked"
     BLOCKERS="worktree is unreadable - git could not resolve HEAD in $WT"
+elif [ -n "$TREE_MUTATED" ]; then
+    # Ahead of everything else, including a passing verifier: if the
+    # evidence no longer describes the tree, no verdict built on it is
+    # worth reporting.
+    STATUS="blocked"
+    BLOCKERS="$TREE_MUTATED"
 elif [ -n "$AGENT_BLOCKED" ]; then
     STATUS="blocked"
     BLOCKERS="agent reported blocked: $AGENT_BLOCKED"
@@ -657,8 +781,8 @@ $TASK_TITLE
     model:    ${TASK_MODEL:-(not pinned - whatever the CLI defaulted to)}
     reads:    $INSTR_STATUS
     verify:   $TASK_VERIFY -> exit $VERIFY_EXIT
-              (run on the working tree, not on head - an uncommitted
-               edit can be what makes it pass)
+              (ran in a $VERIFY_WHERE, so this is evidence about the
+               branch and not about the agent's leftovers)
     touched:
 $(if [ -n "$TOUCHED" ]; then printf '%s\n' "$TOUCHED" | sed 's/^/      /'; else echo "      (none)"; fi)
     log:      $RUN_LOG

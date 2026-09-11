@@ -168,6 +168,10 @@ that one writer owns, this design splits it in two:
 Same guarantee, no central mutable document, and the log doubles as the
 audit trail.
 
+Append-only is a property of the *writes*, though, not of the file —
+creating it is still a race, and the first version lost rows to it.
+See F-14.
+
 ### 3.3 What git gives you for free
 
 | Grok Bot had to build | git already has | CodeScope already wraps it |
@@ -261,7 +265,7 @@ detects that it happened.
 
 | | |
 |---|---|
-| Covered | the file contract; one bot; one task; contract-exists-at-base check; worktree create; agent run; the `.bot-blocked` refusal channel; verifier; evidence capture incl. scope check; handoff write; append-only board; no-op cleanup |
+| Covered | the file contract; one bot; one task; contract-read-at-base (existence *and* argv); worktree create; agent run; the `.bot-blocked` refusal channel; verifier, in a clean checkout of the branch tip; evidence capture incl. scope check; handoff write; append-only board; no-op cleanup |
 | **Not** covered | scheduling/routines, multi-bot handoff, the approval inbox, per-bot memory, cross-task `touches:` overlap checks, rebase-on-collision, resume after a crash, pushing, opening PRs, any GPUI surface |
 
 Two deliberate omissions:
@@ -655,6 +659,13 @@ a sandbox, and that is a design decision, not a one-line change.
 
 Same run also hardened `owner:` and `id:`, which were being spliced
 into filesystem paths unsanitised.
+
+**Re-raised in the review on #346, and the answer is unchanged.** One
+thing did narrow, via F-13: the verifier now runs in a detached
+checkout of the branch tip rather than in the agent's worktree, so it
+can no longer quietly rewrite the tree the handoff describes. That is a
+smaller surface, not a closed one — it is still arbitrary repo-sourced
+code running with the runner's privileges, and it stays criterion 5.
 ### F-7 · The charter is not the agent's only instruction source
 
 *2026-09-11, first real agent run.*
@@ -910,3 +921,135 @@ would have been invoked with no prompt at all. Caught by reading the
 resolved argv in the plan output, which is precisely why the plan
 prints it.
 
+
+### F-12 · Pinning half a contract is not pinning
+
+*2026-09-11, from the review on #346.*
+
+F-3 made the runner prove that the charter, the profile and `context/`
+all exist at the base commit before dispatching. It then read the
+profile out of the runner's own working tree to build the argv.
+
+So the check and the use disagreed about which tree the contract lived
+in. An uncommitted edit to `claude.agent.md` — or simply running the
+script from a branch holding a newer profile than `base:` — sends one
+CLI, with one set of autonomy flags and one set of `instruction_files`,
+into a worktree built from a commit that describes a different one.
+Nothing errors. The plan output even looks right, because it prints
+what the runner resolved, and the runner is the half that is wrong.
+
+Existence was the easy half to check and the useless half to have.
+Every value the runner takes from the contract now comes out of
+`BASE_SHA` through `git show`, and the plan prints the profile as
+`<base>:<path>` so the tree that answered is visible.
+
+The rule F-3 stated and the code then quietly broke: **the contract is
+whatever the agent can see.** Read it from anywhere else and the two of
+you are working from different documents.
+
+---
+
+### F-13 · The verifier was measuring the wrong tree
+
+*2026-09-11, from the review on #346.*
+
+The verifier ran in the agent's worktree. Two things follow from that,
+and neither is visible in a green run.
+
+An uncommitted edit can be the thing that makes it pass. The handoff
+then reports `verify: … -> exit 0` about a branch the verifier was
+never run against. The runner did disclose this — the evidence block
+carried a parenthetical saying the run was on the working tree — which
+is honest and useless: it hands the problem to the one person who is
+reading the handoff *because* they did not watch the run.
+
+And `verify:` is arbitrary code (F-6). Every piece of evidence — HEAD,
+commit count, dirty count, touched paths, numstat — was read *before*
+it ran. A verifier that commits, or writes a file, changes the tree the
+handoff claims to describe after the description was taken. A run could
+report one clean in-scope commit and hand over something else.
+
+Both collapse into one fix: verify a detached checkout of `HEAD` in a
+throwaway worktree. The verifier sees exactly the commits the branch
+carries — nothing uncommitted, nothing left ignored by the agent's run
+— and it has no path to the tree the evidence describes. The runner
+then re-reads HEAD and the dirty count afterwards and blocks the run if
+either moved, because "it cannot reach that tree" is a claim, and this
+file is about not trusting those.
+
+The cost is a second checkout per run. `CARGO_TARGET_DIR` points at a
+runner-owned cache under `.state/`, so dependencies build once instead
+of per run; that is the only tool-specific line in the runner, and it
+is a cost decision rather than a semantic one. It lives in state rather
+than in the agent's worktree so that a bot cannot seed the cache that
+judges it.
+
+What this does not fix: the verifier is still host execution sourced
+from repo content (F-6). It is now execution against a clean tree,
+which is a smaller surface, not a closed one.
+
+---
+
+### F-14 · Append-only is a rule about intent, not a guarantee
+
+*2026-09-11, from the review on #346.*
+
+The board was designed append-only precisely so that concurrent bots
+could not lose each other's writes (§3.2). It was created like this:
+
+```sh
+if [ ! -f "$BOARD" ]; then
+    { …header… } > "$BOARD"
+fi
+```
+
+Two runs starting together both see no board, both build the header,
+and the second `>` truncates the first one's rows. The audit trail
+loses evidence in exactly the case it exists for — a single bot never
+hits it, and a single bot was all that had ever been run.
+
+Creation is now guarded by `mkdir`, the portable atomic primitive:
+exactly one process creates the directory, the loser waits for the file
+instead of racing it, and the winner re-tests before writing. The
+appends need no lock — one short line through `>>` is an `O_APPEND`
+write well under `PIPE_BUF`, so rows interleave but never tear.
+
+The lesson generalises past this file. "Append-only" describes what the
+writers promise and says nothing about the file's lifecycle: creation,
+rotation and truncation are each a separate race, and each one can
+discard exactly the history the format exists to keep. Before the first
+genuinely concurrent run — which is where this design is headed — every
+state file needs that question asked of it individually, not answered
+once by the word *append-only*.
+
+---
+
+### F-15 · The parts that report failure were the parts that failed
+
+*2026-09-11, from the review on #346.*
+
+Two unrelated bugs, both sitting in the path whose entire job is to
+report a bad run:
+
+- `set_status` used `sed -i` with no argument and the GNU-only `0,/re/`
+  address. On BSD sed — macOS, which this project ships — it fails, and
+  it fails *after* the handoff is written, so `set -e` ends the run
+  with the live task still saying `dispatched`. The next run then
+  refuses to start a task that had in fact finished.
+- Reading `.bot-blocked` as `tr -d '\r' < file | head -c 2000` SIGPIPEs
+  `tr` once the file passes 2000 bytes. Under `pipefail` that is exit
+  141 with `set -e`: an agent whose refusal ran long is precisely the
+  case where the promised `blocked` handoff never gets written. The
+  same shape sat in the frontmatter parser, whose `| head -n1` survived
+  only because the inputs are short.
+
+Both are now written to survive their own failure mode: an `awk`
+rewrite-and-rename for the status, `head` before `tr`, and a parser
+that reads its input to the end rather than quitting early.
+
+F-4 and F-8 were about the runner reaching a verdict honestly. These
+are the layer under that: **the verdict path has to be the most boring
+code in the script, because it is what runs once everything else has
+already gone wrong.** Anything clever there — a GNU-only flag, a
+pipeline that can be cut short — turns a reportable failure into a
+silent one.
