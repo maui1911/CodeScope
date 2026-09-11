@@ -25,8 +25,15 @@
 #   --repo <dir>         Repo root. Default: the task file's repo.
 #   --state <dir>        Control plane. Default: <labs>/agent-bots/.state
 #   --worktree-root <d>  Where work surfaces go. Default: <repo>.worktrees
-#   --dry-run            Print the resolved plan and the prompt. Change
-#                        nothing on disk.
+#   --dry-run            Print the resolved plan and the prompt, and
+#                        stop before the dispatch claim: no live task,
+#                        no work surface, no branch, no handoff, and no
+#                        repository stamp on the state directory.
+#                        Not "changes nothing on disk": the state
+#                        directory is created, and a plain-folder
+#                        project is snapshotted, because until that
+#                        exists there is no base commit to plan
+#                        against. Both are idempotent.
 #   --skip-agent         Full loop, but stub the agent call. Smoke-tests
 #                        worktree + verifier + handoff on their own.
 #   --keep               Keep the work surface even on a clean no-op run.
@@ -153,7 +160,18 @@ PROTECTED_HELD=""
 strip_protected() {
     local base="$1" f staged entry mode sha
     shift
-    staged="$(git "$@" ls-files 2>/dev/null || true)"
+    # What this `add` actually changed, not what the index holds. Two
+    # bugs in one line otherwise: on a base that already tracks a
+    # protected path, `ls-files` names it on every single run, so every
+    # commit is reported as having held a secret back that nobody
+    # touched; and a *deletion* the agent staged has no index entry at
+    # all, so it is never seen and never restored - the fallback commit
+    # removes the file. The cached diff carries both.
+    if [ -n "$base" ]; then
+        staged="$(git "$@" diff --cached --name-only "$base" 2>/dev/null || true)"
+    else
+        staged="$(git "$@" ls-files 2>/dev/null || true)"
+    fi
     [ -n "$staged" ] || return 0
     while IFS= read -r f; do
         [ -n "$f" ] || continue
@@ -266,7 +284,7 @@ take_lock() {   # take_lock <dir> <what>
         # version skipped both on the stale path, so a lock it could not
         # remove spun forever at full speed.
         waited=$((waited + 1))
-        [ "$waited" -le 300 ] || die "timed out waiting for the $what lock at $dir
+        [ "$waited" -le 300 ] || refuse "timed out waiting for the $what lock at $dir
 Another run is holding it, or it was left behind. Remove it by hand if
 no other run is in flight:
     rm -rf $dir$([ "${FIND_AGE_OK:-1}" -eq 1 ] || printf '%s' "
@@ -373,10 +391,33 @@ abspath() {   # abspath <path> - works on a path that does not exist yet
 # snapshot repository itself into the work surface, hand them to the
 # agent, and then snapshot them again next time. It compounds, and the
 # first sign of it is a surface that grows every run.
+#
+# Compared as the filesystem sees them, not as they were typed. A
+# directory that does not exist yet cannot be resolved, but its deepest
+# existing ancestor can - and that ancestor is where a symlink would be.
+# Without it, `--worktree-root /tmp/link` where `link -> $REPO/wt`
+# passes a string comparison against $REPO and the surface is created
+# inside the project after all, which is the whole thing this refuses.
+canon_dir() {   # canon_dir <path>
+    local p="$1" tail="" parent
+    while [ ! -d "$p" ]; do
+        parent="$(dirname "$p")"
+        # A root is its own parent. Without this the loop never ends on
+        # a path whose top component does not exist.
+        [ "$parent" != "$p" ] || { printf '%s\n' "$1"; return 0; }
+        tail="/$(basename "$p")$tail"
+        p="$parent"
+    done
+    printf '%s\n' "$(cd "$p" && pwd -P)$tail"
+}
+
 refuse_inside_repo() {   # refuse_inside_repo <flag> <path>
     [ "$SURFACE" = "import" ] || return 0
-    case "$2" in
-        "$REPO"|"$REPO"/*) ;;
+    local repo_p path_p
+    repo_p="$(cd "$REPO" 2>/dev/null && pwd -P)" || repo_p="$REPO"
+    path_p="$(canon_dir "$2")"
+    case "$path_p" in
+        "$repo_p"|"$repo_p"/*) ;;
         *) return 0 ;;
     esac
     die "$2 is inside $REPO, which is a plain folder.
@@ -389,10 +430,9 @@ else:
     $1 <a directory outside $REPO>"
 }
 
-# Before the mkdir, so a refused dispatch creates nothing. Checked on
-# the non-canonical spelling here and again after canonicalisation
-# below, because `$REPO/../proj/.state` is inside the project by any
-# honest reading and is not a prefix of it by string comparison.
+# Before the mkdir, so a refused dispatch creates nothing at all.
+# Checked again after the directory exists, because the first call can
+# only resolve as far as what was already there.
 STATE="$(abspath "$STATE")"
 WORKTREE_ROOT="$(abspath "$WORKTREE_ROOT")"
 refuse_inside_repo --state "$STATE"
@@ -432,7 +472,7 @@ this repo its own:
 Linked worktrees of one repository are not two repositories, and do
 not trip this: they share a common git directory, which is what is
 compared here."
-else
+elif [ "$DRY_RUN" -eq 0 ]; then
     printf '%s\n' "$REPO_IDENTITY" > "$STATE/REPO"
 fi
 
@@ -981,7 +1021,7 @@ fi
 case "$EFFECTIVE_STATUS" in
     todo) ;;
     dispatched)
-        die "task $TASK_ID is already in flight (live status: dispatched).
+        refuse "task $TASK_ID is already in flight (live status: dispatched).
 A previous run died before writing a handoff. Inspect $WT, then re-run
 with --reset once the worktree and branch are gone." ;;
     *)
@@ -1290,7 +1330,13 @@ if [ -n "$TASK_MODEL" ]; then
     AGENT_ARGV+=("$AGENT_MODEL_FLAG" "$TASK_MODEL")
     AGENT_ARGV_DISPLAY+=("$AGENT_MODEL_FLAG" "$TASK_MODEL")
 fi
-AGENT_INVOCATION="$AGENT_CMD ${AGENT_ARGV_DISPLAY[*]}"
+
+# The `${a[@]+...}` guard, here and at the invocation itself, like every
+# other array in this file: on bash before 4.4 - which is what macOS
+# ships - `set -u` treats an empty array expansion as an unbound
+# variable and kills the script. Every stub run in sweep.sh passes
+# BOT_AGENT_ARGS="", so an empty argv is not a hypothetical spelling.
+AGENT_INVOCATION="$AGENT_CMD ${AGENT_ARGV_DISPLAY[@]+${AGENT_ARGV_DISPLAY[*]}}"
 
 # --------------------------------------------------------------------
 # The agent's PATH
@@ -1337,7 +1383,7 @@ if [ "$AGENT_SHELL" = "native" ] && [ "$IS_WINDOWS" -eq 1 ]; then
                 ;;
         esac
     fi
-    AGENT_INVOCATION="$AGENT_CMD ${AGENT_ARGV_DISPLAY[*]}"
+    AGENT_INVOCATION="$AGENT_CMD ${AGENT_ARGV_DISPLAY[@]+${AGENT_ARGV_DISPLAY[*]}}"
     AGENT_SHELL_NOTE="native (no POSIX shell on the agent's PATH)"
 fi
 
@@ -1537,7 +1583,7 @@ fi
 
 step "Worktree"
 if [ -e "$WT" ]; then
-    die "worktree path already exists: $WT
+    refuse "worktree path already exists: $WT
 
 Clear both halves before re-running - removing only the directory
 leaves the branch behind, and 'worktree add -b' then fails too:
@@ -1554,7 +1600,7 @@ if git -C "$ORIGIN_REPO" rev-parse --verify --quiet "refs/heads/$TASK_BRANCH" >/
     # A branch of this name already in the project is either an earlier
     # run nobody cleaned up or somebody's work, and the push would be
     # the thing that told you.
-    die "branch '$TASK_BRANCH' already exists in $ORIGIN_REPO
+    refuse "branch '$TASK_BRANCH' already exists in $ORIGIN_REPO
 
 That is where this run's result gets pushed, so it has to be free:
     git -C $ORIGIN_REPO branch -D $TASK_BRANCH"
@@ -1588,6 +1634,19 @@ if [ "$SURFACE_OK" -eq 0 ]; then
     board "dispatch-failed" "$TASK_BRANCH"
     die "could not create the work surface at $WT; see $RUN_LOG"
 fi
+
+# A clone comes with a remote, and that remote points at the user's
+# project with write access. Nothing in this loop needs it: the base
+# objects arrive through alternates, and the result is pushed back by
+# path at the end. What it does offer is `git push origin HEAD:develop`
+# to any agent acting on habit - a fast-forward into a branch nobody
+# asked about, or a `--delete` on one - with no --force and no refusal.
+#
+# Removing it is a guardrail, not a sandbox: the path is still readable
+# in .git/objects/info/alternates and an agent that wants a remote back
+# can add one. It removes the accident, which is the case that actually
+# happens, and it makes the claim in the header true by default.
+git -C "$WT" remote remove origin >>"$RUN_LOG" 2>&1 || true
 
 # Proof that this directory is ours before anything ever removes it.
 # Cleanup is `rm -rf` now rather than `git worktree remove`, and an
@@ -1721,10 +1780,92 @@ else
     # stdin is the prompt file or nothing at all - never the runner's
     # terminal. A headless agent that decides to ask a question would
     # otherwise inherit it and hang, and either of these ends in EOF.
-    ( cd "$WT" && PATH="$AGENT_PATH" "$AGENT_CMD" "${AGENT_ARGV[@]}" ) \
+    ( cd "$WT" && PATH="$AGENT_PATH" "$AGENT_CMD" ${AGENT_ARGV[@]+"${AGENT_ARGV[@]}"} ) \
         <"$AGENT_STDIN" >>"$RUN_LOG" 2>&1 || AGENT_EXIT=$?
     say "  exit $AGENT_EXIT"
     board "agent-ran" "exit $AGENT_EXIT"
+fi
+
+# --------------------------------------------------------------------
+# Disarming the surface
+#
+# The agent is granted its own `.git` on purpose - a sandbox that denies
+# it cannot commit, which is F-28 - and `.git` is where git keeps the
+# names of programs it runs. A hook, `core.hooksPath`, `core.fsmonitor`,
+# a `filter.*.clean`, `diff.external`: every one of them is a string in
+# a file the agent may write, and every runner git call from here down
+# executes it. Outside the sandbox, as the runner, with the control
+# plane and the real project in reach.
+#
+# So the agent's turn ends here, and the tools stop trusting anything it
+# left behind about *how to run*. Three layers, because each has a hole
+# the next covers:
+#
+#   1. The hook directory is emptied and pointed at a runner-owned
+#      empty directory through GIT_CONFIG_*, which behaves like `-c`
+#      and so outranks anything in the surface's config.
+#   2. Local config keys that name a command are enumerated from what
+#      is actually there and unset. Enumerating beats a deny-list of
+#      guesses: `--name-only` reports the keys the agent really wrote.
+#   3. The exported GIT_CONFIG_* pairs apply to every git invocation
+#      for the rest of the run, including the ones in $ORIGIN_REPO.
+#
+# `url.<x>.insteadOf` is on that list for a reason worth stating: it
+# rewrites the *argument* to `git push`, not just a remote name. Pushing
+# by path rather than by remote is therefore not the boundary it reads
+# like - one config line redirects `git push /path/to/project` at an
+# attacker's URL, the push reports success, and the handoff says a
+# branch landed in a project that never received it. The push is read
+# back from $ORIGIN_REPO afterwards as well; see "Result branch".
+#
+# What this does not close: a content filter needs a `filter.<n>.clean`
+# *and* a `.gitattributes` naming it, and the second is tracked content
+# rather than config - it arrives through the diff, where the scope
+# check sees it. Named in #349 rather than left implied.
+# --------------------------------------------------------------------
+
+if [ "$SKIP_AGENT" -eq 0 ]; then
+    step "Disarm"
+
+    EMPTY_HOOKS="$STATE/empty-hooks"
+    mkdir -p "$EMPTY_HOOKS"
+
+    # The hooks the clone was born with are git's own samples and inert
+    # (`.sample` suffix); anything else in there after the agent ran is
+    # the agent's. Removing the directory outright is simpler than
+    # deciding which is which.
+    rm -rf "$WT/.git/hooks"
+    mkdir -p "$WT/.git/hooks"
+
+    DISARMED=""
+    # while-read, not a `for` over `$(...)`: a subsection name may
+    # contain a space (`filter.my driver.clean` is a legal key) and word
+    # splitting would hand `config --unset` two halves of one name.
+    CONFIG_KEYS="$(git -C "$WT" config --local --list --name-only 2>/dev/null || true)"
+    while IFS= read -r key; do
+        [ -n "$key" ] || continue
+        case "$key" in
+            core.hookspath|core.fsmonitor|core.sshcommand|core.pager|core.editor             |core.askpass|core.gitproxy|diff.external|alias.*|*.textconv             |filter.*.clean|filter.*.smudge|filter.*.process             |*.helper|uploadpack.*|receivepack.*|*.sshcommand|*.proxy \
+            |url.*.insteadof|url.*.pushinsteadof|remote.*.pushurl|remote.*.url)
+                git -C "$WT" config --local --unset-all "$key" >/dev/null 2>&1 || true
+                DISARMED="${DISARMED:+$DISARMED, }$key" ;;
+        esac
+    done <<< "$CONFIG_KEYS"
+
+    # Highest precedence, and for every git call from here on rather
+    # than per call site - a disarm that has to be remembered at thirty
+    # call sites is one that will be forgotten at the thirty-first.
+    export GIT_CONFIG_COUNT=2
+    export GIT_CONFIG_KEY_0="core.hooksPath"
+    export GIT_CONFIG_VALUE_0="$EMPTY_HOOKS"
+    export GIT_CONFIG_KEY_1="core.fsmonitor"
+    export GIT_CONFIG_VALUE_1="false"
+
+    say "  hooks emptied, core.hooksPath -> $EMPTY_HOOKS"
+    [ -z "$DISARMED" ] || {
+        say "  unset in the surface's config: $DISARMED"
+        board "config-disarmed" "$DISARMED"
+    }
 fi
 
 # --------------------------------------------------------------------
@@ -1774,13 +1915,29 @@ CHANNEL_SYMLINK=""
 # task name `../../somewhere` and have this loop `rm -f` a symlink well
 # outside the surface. A guard that reaches further than the thing it
 # guards is not a guard.
-CHANNELS=".bot-blocked .bot-commit-msg"
-[ "$TASK_PRODUCES" != "report" ] || CHANNELS="$CHANNELS $TASK_ARTIFACT"
-for chan in $CHANNELS; do
+# An array, because a filename is allowed to contain a space and a
+# space-delimited string would split `.bot-my report.md` into two
+# channels - skipping the guard here while the `-f` test further down
+# still found the file and moved it.
+CHANNELS=(".bot-blocked" ".bot-commit-msg")
+[ "$TASK_PRODUCES" != "report" ] || CHANNELS+=("$TASK_ARTIFACT")
+for chan in "${CHANNELS[@]}"; do
+    chan_bad=""
     if [ -L "$WT/$chan" ]; then
-        CHANNEL_SYMLINK="${CHANNEL_SYMLINK:+$CHANNEL_SYMLINK, }$chan"
+        chan_bad="a symlink"
+    elif [ -f "$WT/$chan" ] \
+        && [ -n "$(find "$WT/$chan" -maxdepth 0 -links +1 2>/dev/null)" ]; then
+        # A hard link is the same trick with nothing to see: `-L` is
+        # false, `-f` is true, and the file *is* the host's file - same
+        # inode, same content - so `mv` publishes it just as well. More
+        # than one link to a file an agent created a moment ago inside a
+        # throwaway clone has no innocent reading.
+        chan_bad="a hard link to something outside this surface"
+    fi
+    if [ -n "$chan_bad" ]; then
+        CHANNEL_SYMLINK="${CHANNEL_SYMLINK:+$CHANNEL_SYMLINK, }$chan ($chan_bad)"
         rm -f "$WT/$chan"
-        say "  removed $chan - a symlink, not a channel"
+        say "  removed $chan - $chan_bad, not a channel"
     fi
 done
 
@@ -1932,14 +2089,24 @@ else
     # and the second one reaches the no-op path that deletes the branch.
     BASE_IS_ANCESTOR=1
     git -C "$WT" merge-base --is-ancestor "$BASE_SHA" HEAD 2>/dev/null || BASE_IS_ANCESTOR=0
-    COMMITS="$(git -C "$WT" rev-list --count "$BASE_SHA..HEAD")"
-    DIRTY="$(git -C "$WT" status --porcelain | wc -l | tr -d ' ')"
+    # Each of these can fatal on a surface whose object store the agent
+    # damaged - removing `objects/info/alternates` leaves HEAD resolvable
+    # and the base unreachable, so the check above says nothing about
+    # them. Unguarded under `set -e` that exits the script right here:
+    # no handoff, no status write, and the live task stuck on
+    # `dispatched` until a human runs --reset. A run that cannot read
+    # its own tree still has to reach a verdict.
+    COMMITS="$(git -C "$WT" rev-list --count "$BASE_SHA..HEAD" 2>/dev/null)" \
+        || { COMMITS=0; TREE_BROKEN=1; }
+    DIRTY="$(git -C "$WT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')" \
+        || { DIRTY=0; TREE_BROKEN=1; }
     # quotepath=off keeps non-ASCII paths unquoted, so the scope check
     # compares the real name instead of "core/src/\303\244.rs".
     # --no-renames makes a rename show up as both the deleted source and
     # the added destination, so moving an out-of-scope file into scope
     # cannot delete it invisibly.
-    TOUCHED="$(git -C "$WT" -c core.quotepath=off diff --name-only --no-renames "$BASE_SHA..HEAD")"
+    TOUCHED="$(git -C "$WT" -c core.quotepath=off diff --name-only --no-renames "$BASE_SHA..HEAD" 2>/dev/null)" \
+        || { TOUCHED=""; TREE_BROKEN=1; }
     NUMSTAT="$(git -C "$WT" diff --shortstat "$BASE_SHA..HEAD" | sed 's/^ *//')"
     [ -n "$NUMSTAT" ] || NUMSTAT="no committed changes"
 
@@ -2180,9 +2347,9 @@ elif [ -n "$CHANNEL_SYMLINK" ]; then
     # could be is a symlinked '.bot-blocked' - a refusal the runner
     # would otherwise quote out of a file the agent never wrote.
     STATUS="blocked"
-    BLOCKERS="a channel between agent and runner was a symlink: $CHANNEL_SYMLINK
-The runner does not follow those - a link can point anywhere on this
-machine, and following one would put a host file into the control plane
+    BLOCKERS="a channel between agent and runner was a link, not a file: $CHANNEL_SYMLINK
+The runner does not follow those - a link can name anything on this
+machine, and carrying one would put a host file into the control plane
 as this run's evidence. They were removed unread."
 elif [ "$HEAD_BRANCH" != "$TASK_BRANCH" ]; then
     STATUS="blocked"
@@ -2229,6 +2396,19 @@ elif [ -n "$VERIFY_WT_LEFTOVER" ]; then
     BLOCKERS="the verify checkout could not be removed: $VERIFY_WT_LEFTOVER
 Remove it before re-running:
     rm -rf $VERIFY_WT_LEFTOVER"
+elif [ -n "$PROTECTED_HELD" ]; then
+    # Above the uncommitted-files branch, not below it. Holding a
+    # tracked path back leaves the agent's version on disk by design, so
+    # `DIRTY` is never zero afterwards - and the generic "N uncommitted
+    # file(s)" would fire first and bury the only sentence that explains
+    # why one of them is there.
+    STATUS="needs-review"
+    BLOCKERS="the agent changed files that never travel, and this run did not carry them:
+$PROTECTED_HELD
+The commit has them exactly as $TASK_BASE does. The agent's version is
+still on disk in $WT - which is why the worktree is not clean - and was
+pushed nowhere. Whether the edit was meant (a rotated key, a formatter,
+an install that rewrote .npmrc) is not something a verifier answers."
 elif [ "$DIRTY" -ne 0 ]; then
     STATUS="needs-review"
     BLOCKERS="$DIRTY uncommitted file(s) left in the worktree"
@@ -2265,18 +2445,6 @@ elif [ "$COMMITS" -gt 1 ]; then
     # decides whether to squash.
     STATUS="needs-review"
     BLOCKERS="$COMMITS commits, charter asks for exactly one"
-elif [ -n "$PROTECTED_HELD" ]; then
-    # Not `blocked`: the work is committed and verified, and nothing
-    # that never travels went anywhere. But an agent rewrote one of
-    # them, and a run that says `done` about that has decided something
-    # only a human gets to decide.
-    STATUS="needs-review"
-    BLOCKERS="the agent changed files that never travel, and this run did not carry them:
-$PROTECTED_HELD
-The commit has them exactly as $TASK_BASE does. The agent's version is
-still on disk in $WT and was pushed nowhere. Whether the edit was meant
-- a rotated key, a formatter, an install that rewrote .npmrc - is not
-something a verifier can answer."
 elif [ "$TASK_PRODUCES" = "report" ] && [ "$ARTIFACT_VERDICT" = "blocked" ]; then
     # The bot's own escalation. A shape template defines `blocked` as
     # work that could not be completed, and a run that hands one back as
@@ -2749,8 +2917,19 @@ if [ "$TREE_BROKEN" -eq 0 ] && [ "$COMMITS" -gt 0 ] && [ -z "$PUBLISH_REFUSED" ]
     # granted that directory - so `git remote set-url` would redirect
     # this push wherever it liked. $ORIGIN_REPO is the runner's own
     # variable and has never been inside the worktree.
+    LANDED=""
     if git -C "$WT" push --quiet "$ORIGIN_REPO" \
         "refs/heads/$TASK_BRANCH:refs/heads/$TASK_BRANCH" >>"$RUN_LOG" 2>&1; then
+        # Exit 0 says the push succeeded, not that it went here. The
+        # disarm unsets `url.*.insteadOf`, but a push is the one place
+        # where the cost of being wrong is the work leaving the machine,
+        # so the answer comes from the destination rather than from the
+        # command: read the ref back out of $ORIGIN_REPO and require it
+        # to be the commit this handoff is about.
+        LANDED="$(git -C "$ORIGIN_REPO" rev-parse --verify --quiet \
+            "refs/heads/$TASK_BRANCH" 2>/dev/null || true)"
+    fi
+    if [ -n "$LANDED" ] && [ "$LANDED" = "$HEAD_SHA" ]; then
         PUSHED="$TASK_BRANCH"
         say "  $TASK_BRANCH -> $ORIGIN_REPO"
         board "pushed" "$TASK_BRANCH @ ${HEAD_SHA:0:12}"
@@ -2786,6 +2965,13 @@ hand before anything removes the surface:
     git -C $WT format-patch --stdout $BASE_SHA..$TASK_BRANCH"
             fi
         fi
+    elif [ -n "$LANDED" ]; then
+        # Pushed somewhere, and not here. Treated as a failed push
+        # rather than a success, because from this project's point of
+        # view that is exactly what it is.
+        PUSH_FAILED="$TASK_BRANCH"
+        say "  $TASK_BRANCH in $ORIGIN_REPO is ${LANDED:0:12}, not ${HEAD_SHA:0:12}"
+        board "push-landed-elsewhere" "${LANDED:0:12} != ${HEAD_SHA:0:12}"
     else
         PUSH_FAILED="$TASK_BRANCH"
         say "  could not push $TASK_BRANCH into $REPO"
@@ -2814,6 +3000,11 @@ fi
 #
 # So every field comes from somewhere that is not the review's prose:
 #
+#   base           the commit that was reviewed - except on a folder,
+#                  where `base:` is the literal word `folder` and a SHA
+#                  is refused at dispatch. A derived task carrying one
+#                  could never be run, which is a handoff that names a
+#                  next step nobody can take.
 #   owner, verify  from the review *task*, which is contract
 #   touches        from the cited paths, re-checked against the tree
 #   base           from the commit the worktree was actually at
@@ -2833,8 +3024,21 @@ if [ "$TASK_PRODUCES" = "report" ] && [ "$STATUS" = "done" ] \
     if [ -z "$TASK_ON_CHANGES" ]; then
         DERIVED_WHY="the task declares no on_changes_requested:, so this review stops with a human"
     else
-        CITED="$(sed -n 's/^-[[:space:]]\{1,\}\([^[:space:]]\{1,\}\):[0-9]\{1,\}.*/\1/p' \
-            "$ARTIFACT_FILE" | sort -u)"
+        # The findings section, and nothing else. review-shape.sh
+        # validates citations only there, so scraping the whole file
+        # picks up bullets from "What I could not check" - where the
+        # charter explicitly tells the bot to record observations about
+        # files it was *not* asked to review. Those paths are out of
+        # scope by definition, the scope re-check below then marks them
+        # unusable, and a reviewer doing exactly what its charter says
+        # kills the handoff it was supposed to produce.
+        CITED="$(awk '
+            /^# Findings/ { inside = 1; next }
+            inside && /^# / { exit }
+            inside { print }
+        ' "$ARTIFACT_FILE" \
+            | sed -n 's/^-[[:space:]]\{1,\}\([^[:space:]]\{1,\}\):[0-9]\{1,\}.*/\1/p' \
+            | sort -u)"
 
         # Re-checked here even though review-shape.sh already checked
         # them: `verify:` is data, a task is free to name a different
@@ -2884,7 +3088,7 @@ produces: commit
 title: Address the findings from $TASK_ID
 owner: $TASK_ON_CHANGES
 status: todo
-base: $HEAD_SHA
+base: $(if [ "$SURFACE" = "import" ]; then printf 'folder'; else printf '%s' "$HEAD_SHA"; fi)
 branch: bot/$TASK_ON_CHANGES/$DERIVED_ID
 touches: $DERIVED_TOUCHES
 verify: $TASK_DERIVED_VERIFY

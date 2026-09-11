@@ -2649,3 +2649,103 @@ not move" means nothing until you say which tree, and the answer is not
 "the one I had a variable for" — it is wherever the thing being checked
 actually happens. Three of these four were guards pointed one directory
 away from the code they were guarding.
+
+---
+
+### F-36 · The sandbox ends where the runner's tools begin
+
+*2026-09-11, a second reviewer on the whole stack.*
+
+A different model was pointed at the same branch, told what the lab
+claims and what was already known, and asked for defects with a failure
+scenario attached. Thirteen, ten of them new. Two of those changed what
+this prototype is.
+
+**The agent writes `.git`. `.git` is where git keeps the names of
+programs it runs.**
+
+The surface hands the agent its own `.git` on purpose — a sandbox that
+denies it cannot commit, which is F-28. What follows from that had not
+been thought through: a hook in `.git/hooks`, or `core.hooksPath`, or
+`core.fsmonitor`, or `diff.external`, or a `filter.*.clean`, is a
+string in a file the agent may write, and *every runner git call after
+the agent's turn executes it*. Outside the sandbox, as the runner, with
+the control plane and the real project in reach. `git status` is
+enough; it does not need the commit.
+
+The whole design rests on the agent being contained and the runner
+being the one that measures. The measuring instruments were inside the
+containment.
+
+The agent's turn now ends with a disarm: the hook directory is emptied,
+`core.hooksPath` is forced to a runner-owned empty directory through
+`GIT_CONFIG_*` (which behaves like `-c` and outranks the surface's
+config), and local config keys that name a command are enumerated from
+what is actually there and unset — enumerating beats a deny-list of
+guesses. `saboteur.sh` drops a `pre-commit` and the sweep checks the
+marker file it would have written. With the disarm switched off, that
+marker appears: the check is real, and so was the hole.
+
+**The prose about the push was a guess about git.**
+
+Two rounds ago the push moved from `origin` to a path, on the argument
+that `origin` lives in a config the agent can write. `url.<x>.insteadOf`
+rewrites the *argument* to `git push`, so one config line redirects
+`git push /path/to/project` at an attacker's URL, the push reports
+success, and the handoff says a branch landed in a project that never
+received it. The key is unset by the disarm, and the ref is now read
+back out of `$ORIGIN_REPO` afterwards — a push is believed because the
+destination has it, not because the command exited 0.
+
+And the clone still had `origin`: live, writable, pointing at the
+user's repository. Checked against a throwaway pair rather than
+reasoned about — a `--shared` clone can create a branch in its origin
+*and delete an existing one*, no `--force`, no refusal. The remote is
+removed at creation now. It is a guardrail and not a sandbox (the path
+is still in `objects/info/alternates`), but the accident is the case
+that happens, and "nothing here ever pushes" is true by default instead
+of by hope.
+
+Eight more, each a real scenario:
+
+- `strip_protected` walked the whole index instead of the staged
+  change, so a project with a committed `.npmrc` — registry config,
+  entirely ordinary — would have every single run report a secret held
+  back that nobody touched, and never reach `done`. A staged *deletion*
+  had no index entry at all, so it was never restored.
+- The verdict for a held path sat below the generic "N uncommitted
+  file(s)" branch, which fires first by construction: holding a tracked
+  file back is what leaves the worktree dirty.
+- `rev-list`, `status` and `diff` ran unguarded after the broken-tree
+  check under `set -e`. An agent that removes `objects/info/alternates`
+  leaves HEAD resolvable and the base unreachable — the script exits
+  128 with no handoff and the live task stuck on `dispatched`.
+- `"${AGENT_ARGV[@]}"` without the `${a[@]+…}` guard: on bash before
+  4.4, which is what macOS ships, `set -u` kills the script on an empty
+  array. Every stub run in the sweep passes an empty argv.
+- The sweep cleared *every* live task in the control plane, not its own
+  — taking a real in-flight run's task file out from under it.
+- The derived task scraped citations from the whole review, including
+  "What I could not check", where the charter explicitly tells the bot
+  to record observations about files it was not asked to review. Doing
+  what the charter says killed the handoff.
+- A derived task on a folder project carried `base: <sha>`, which
+  dispatch refuses — a handoff naming a next step nobody can take.
+- Four "nothing ran" outcomes exited 1, which `bot-tick.sh` counts as
+  `blocked` and feeds to `--give-up`. Exit 3 exists for exactly this.
+- `--dry-run` said "changes nothing on disk" while stamping the state
+  directory with a repository identity.
+- `review-shape.sh` counted lines with `wc -l`, so a file whose last
+  line has no newline came back one short and a finding citing that
+  line was refused as past the end.
+
+What generalises, and it is not "review harder": **a second reader with
+a different prior finds a different class of thing.** Ten rounds of
+review had produced order-of-operations bugs, guards that proved too
+little, and prose that disagreed with code — all real, all the same
+family. The first question from somewhere else was *what does the
+attacker do with what you handed them*, and that question had never
+been asked here, because the threat model in the README stops at "an
+agent might be sloppy or wrong". It does not say "an agent's output is
+an input to my tools", and that sentence is the one this finding is
+about.

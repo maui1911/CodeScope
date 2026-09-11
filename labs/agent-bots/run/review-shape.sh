@@ -210,7 +210,12 @@ check_finding() {
     [ "$(git cat-file -t "$BOT_REVIEWED_SHA:$path" 2>/dev/null)" = "blob" ] \
         || fail "finding cites '$path', which is not a file at $BOT_REVIEWED_SHA"
 
-    lines="$(git cat-file blob "$BOT_REVIEWED_SHA:$path" | wc -l | tr -d ' ')"
+    # awk, not `wc -l`: wc counts newlines, so a file whose last line
+    # has none - generated config, a hand-edited fixture - comes back one
+    # short, and a finding citing that last line is refused as past the
+    # end of a file it is inside. awk counts records, and an unterminated
+    # final line is a record.
+    lines="$(git cat-file blob "$BOT_REVIEWED_SHA:$path" | awk 'END { print NR }')"
     if [ "$line" -lt 1 ] || [ "$line" -gt "$lines" ]; then
         fail "finding cites '$path:$line', but that file has $lines lines at $BOT_REVIEWED_SHA"
     fi
