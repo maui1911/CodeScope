@@ -138,7 +138,7 @@ So state is split by lifetime and by writer:
 |---|---|---|---|
 | **Contract** | in git, on `main` | humans only, via PR | `context/`, `skills/`, `bots/*/BOT.md` |
 | **Control** | outside git | the runner | board, tasks, handoffs, runs *(inbox and per-bot memory: designed, not built)* |
-| **Work** | worktrees + branches | one bot per branch | the actual code |
+| **Work** | a repository per task + branches | one bot per branch | the actual code |
 
 "Humans only" on the contract plane is a convention, not something the
 code can enforce — the runner only catches a bot that *commits* an edit
@@ -178,7 +178,7 @@ atomically, or a waiter appends into a half-written header (F-17).
 
 | Grok Bot had to build | git already has | CodeScope already wraps it |
 |---|---|---|
-| per-bot isolation | worktree + branch | `git::add_worktree(repo, path, branch, base)` |
+| per-bot isolation | a clone + branch | `git::add_worktree(repo, path, branch, base)` |
 | approval gate | pull request | `pr::fetch_for_branch` + `CiStatus` |
 | audit log *("coming")* | `git log`, reflog | `diff.rs`, `git::git_status` |
 | rollback | delete the branch | `git::remove_worktree(.., force)` |
@@ -274,14 +274,18 @@ detects that it happened.
 
 ### 3.5 Where it gets messy
 
-- **Worktree sprawl.** One worktree per task is gigabytes fast. Cap
-  concurrency low (4, not 50), prune on merge, sweep `git worktree prune`
-  at startup. The `session.rs` `RetentionPolicy` (TTL + cap per
-  worktree) already has the right shape.
-- **Windows path length and file locks.** Deep worktree paths plus
-  rust-analyzer and `target/` holding handles make `worktree remove`
-  fail. `sidebar.rs` already has the force-fallback; the bot layer must
-  inherit it rather than reinvent it.
+- **Surface sprawl.** One checkout per task is gigabytes fast, and a
+  `--shared` clone is no cheaper than a worktree was — the objects are
+  shared, the working tree is not. Cap concurrency low (4, not 50) and
+  remove a surface as soon as its result is pushed back. The
+  `session.rs` `RetentionPolicy` (TTL + cap per worktree) already has
+  the right shape.
+- **Windows path length and file locks.** Deep surface paths plus
+  rust-analyzer and `target/` holding handles make removal fail.
+  `sidebar.rs` already has the force-fallback; the bot layer must
+  inherit it rather than reinvent it. Removal is `rm -rf` now, which
+  refuses nothing — hence the marker file the removal helper checks
+  for. See F-28.
 - **Contract drift per branch.** A bot editing `CONVENTIONS.md` changes
   the truth for nobody until merge. Hence: bots never write to the
   contract plane.
@@ -446,11 +450,14 @@ contains the blast radius here is that the branch is throwaway and
 nothing in this loop ever pushes.
 
 Codex is the one agent that sandboxes its own shell calls, and the
-first run under it proved that this buys less than it sounds: a linked
-worktree's git directory is outside the worktree, so the sandbox has to
-be handed the whole object store and every ref before the agent can
-make a single commit. Worktrees isolate the *checkout*, never the
-repository. See F-26.
+first run under it proved that this buys less than it sounds. A linked
+worktree's git directory is outside the worktree, so worktrees isolate
+the *checkout* and never the repository (F-26) — the work surface is a
+standalone clone now, for that reason and because a plain folder has no
+worktree to add (F-28). It did not rescue Codex: it denies the model
+writes to `.git` wherever `.git` is, so the assumption that has to give
+is not where the git directory lives but that the *agent* makes the
+commit.
 
 **`base:` must be a ref that contains the contract.** The agent reads
 its charter and context from its own checkout — the base commit — not
@@ -470,7 +477,7 @@ are committed.
 | `.state/proposed/<id>.md` | a task one bot's run wrote for another |
 | `.state/REPO` | which repository this control plane belongs to |
 | `.state/runs/<day>/<id>-<ts>.log` | agent + verifier output |
-| `<repo>.worktrees/bot-<owner>-<id>/` | the work |
+| `<repo>.worktrees/bot-<owner>-<id>/` | the work surface — a clone, with its own `.git` |
 
 `.state/` is git-ignored, and a clean no-op run removes its own
 worktree and branch.
@@ -2044,3 +2051,86 @@ here, and an agent with no POSIX shell cannot run one — `cargo test …`
 is shell-neutral, `test -f …` is not. The prompt now says what was
 always true instead: the runner runs the verifier afterwards, in a
 clean checkout, and that is the result that counts.
+
+---
+
+### F-28 · The work surface stopped being a worktree, and Codex still could not commit
+
+*2026-09-11, rebuilding the isolation.*
+
+Two unrelated-looking problems turned out to have one shape.
+
+F-26: a linked worktree's git directory lives under the *main*
+repository, so an agent that sandboxes itself by directory can edit
+every file it was given and cannot write a commit.
+
+And: a project need not be a git repository at all. CodeScope opens
+plain folders — `core/src/git.rs` has `is_work_tree()` precisely so the
+UI can drop the git surface for them — and there is no worktree to add
+to a folder. Everything in this runner is built on `git worktree add`,
+so the honest answer for half the projects the product supports was
+"no bots for you".
+
+Give the work surface **its own `.git`, inside it** and both answers are
+the same answer. The surface is a standalone repository now: a
+`--shared` clone of the project when the project is a repo, and (next)
+a snapshot imported from the folder when it is not. `--shared` keeps the
+objects in the project's store and reads them through alternates, so a
+clone per task costs a checkout and not a copy of the history — the same
+price a worktree charged. The alternates are live rather than a
+snapshot, which is what still lets the rebase step replay onto a base
+that landed after the clone was made.
+
+Three things fell out of it that were not the point and are worth
+keeping:
+
+**The result has to be pushed back.** A clone under `.worktrees` is not
+where anybody looks for a branch, so the branch is pushed into the
+project at the end. That is not the push this loop refuses to make — the
+refused one goes to a *remote*, where work becomes visible to other
+people and hard to take back. This one moves a ref inside the repository
+the task already named, and it is the only way a result outlives the
+surface, because cleanup deletes the clone. A push that fails downgrades
+a `done` to `needs-review`: a result nobody can reach from the project
+is not a result yet, however green the verifier was.
+
+**Cleanup became `rm -rf`.** `git worktree remove` refuses to delete
+something that is not a worktree; `rm -rf` refuses nothing. So the
+surface gets a marker file written into its `.git` at creation, and the
+removal helper checks for it first. A path this script computed is not
+by itself a reason to delete a directory tree — F-24's regression suite,
+one layer down.
+
+**The leftover check had been measuring the wrong thing.** `sweep.sh`
+counted bot worktrees with `git worktree list`. A clone is not
+registered anywhere, so that check would have passed by construction
+forever. It counts directories now.
+
+**And the part that did not work.** The whole detour began with Codex
+being unable to write `index.lock`. With the git directory now *inside*
+the workspace the sandbox grants, it still cannot:
+
+    Cannot commit because Git cannot create
+    C:/...worktrees/bot-fixer-T-0008/.git/index.lock: Permission denied
+
+Same run, same sandbox, same message, different path. Codex denies
+writes to `.git` wherever it finds it — the binary carries a permissions
+table with `/.git` in it next to `read`, `write` and `deny` — so this
+is a deliberate carve-out and no arrangement of directories gets around
+it. `--add-dir` does not, and the clone does not.
+
+That is worth having learned, because it kills a whole family of fixes
+at once and points at the one that is left. The assumption that breaks
+is not *where the git directory is*. It is **that the agent makes the
+commit**. A sandboxed agent can write files and not history; the runner
+can write history and should not be inventing the reasoning that goes
+in the message. So the next thing to try is the agent writing its commit
+message to a file — which it can — and the runner doing the commit,
+which is also the arrangement this project already argues for
+everywhere else: the runner writes the handoff, the runner runs the
+verifier, the runner reads the evidence. Nothing about "the agent
+commits" was ever load-bearing except habit.
+
+The clone stands on its own regardless. It is what makes a plain folder
+possible at all, and it removes an isolation model that was only ever
+isolating the checkout.

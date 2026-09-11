@@ -69,8 +69,11 @@ cleanup() {   # cleanup <branch> - only ever a branch from SWEEP_BRANCHES
         *) printf 'sweep: refusing to clean up unowned branch %s\n' "$1"; return 0 ;;
     esac
     leaf="$(printf '%s' "$1" | tr '/' '-')"
-    git -C "$REPO" worktree remove --force "$WT_ROOT/$leaf" >/dev/null 2>&1
-    git -C "$REPO" worktree remove --force "$WT_ROOT/$leaf-verify" >/dev/null 2>&1
+    # A work surface is a standalone clone now, not a linked worktree,
+    # so there is no registration to remove - only a directory. The
+    # branch is still deleted here because a run with commits pushes it
+    # back into the project.
+    rm -rf "$WT_ROOT/$leaf" "$WT_ROOT/$leaf-verify"
     git -C "$REPO" branch -D "$1" >/dev/null 2>&1
     return 0
 }
@@ -327,8 +330,10 @@ rm -f "$STATE"/tasks/T-991*.md 2>/dev/null
 rm -rf "$MOVE_TASKS"
 
 # Anything left behind is a finding in its own right: the runner is
-# supposed to clean up after every one of these.
-LEFT_WT="$(git -C "$REPO" worktree list | grep -c "$(basename "$WT_ROOT")/bot-" || true)"
+# supposed to clean up after every one of these. Counted off the
+# filesystem rather than `git worktree list`, because a surface is a
+# clone and the project has never heard of it.
+LEFT_WT="$(ls -d "$WT_ROOT"/bot-* 2>/dev/null | wc -l | tr -d ' ')"
 LEFT_LOCKS="$(ls -d "$STATE"/*.lock 2>/dev/null | wc -l | tr -d ' ')"
 printf '\nbot worktrees left: %s\nlocks left:         %s\n' "$LEFT_WT" "$LEFT_LOCKS"
 [ "$LEFT_WT" -eq 0 ] || FAILURES=$((FAILURES + 1))

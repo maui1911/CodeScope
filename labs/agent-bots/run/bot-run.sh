@@ -24,12 +24,12 @@
 #   --task <file>        Task definition to run. Required.
 #   --repo <dir>         Repo root. Default: the task file's repo.
 #   --state <dir>        Control plane. Default: <labs>/agent-bots/.state
-#   --worktree-root <d>  Where worktrees go. Default: <repo>.worktrees
+#   --worktree-root <d>  Where work surfaces go. Default: <repo>.worktrees
 #   --dry-run            Print the resolved plan and the prompt. Change
 #                        nothing on disk.
 #   --skip-agent         Full loop, but stub the agent call. Smoke-tests
 #                        worktree + verifier + handoff on their own.
-#   --keep               Keep the worktree even on a clean no-op run.
+#   --keep               Keep the work surface even on a clean no-op run.
 #   --reset              Discard the live task under state and start over.
 #                        Needed to re-run a task that already finished.
 #   --allow-overlap      Dispatch even though another in-flight task
@@ -235,12 +235,42 @@ if [ -z "$REPO" ]; then
     REPO="$(git -C "$(dirname "$TASK")" rev-parse --show-toplevel)" \
         || die "could not resolve a repo from the task file; pass --repo"
 fi
-[ -d "$REPO/.git" ] || git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 \
-    || die "not a git repo: $REPO"
+# --------------------------------------------------------------------
+# The work surface
+#
+# Always a standalone repository with its own .git inside it, never a
+# linked worktree. Two things forced that, and they turned out to be
+# one thing:
+#
+#   - A linked worktree's git directory lives under the *main* repo, so
+#     an agent that sandboxes itself by directory can edit every file it
+#     was given and cannot write a commit. F-26.
+#   - A project need not be a git repo at all. CodeScope opens plain
+#     folders, and there is no worktree to add to a folder.
+#
+# Give the work surface its own .git and both answers are the same
+# answer: the git directory sits inside the one directory the agent is
+# allowed to write, and how that directory got filled - cloned from a
+# repo, or imported from a folder - is a detail below this line.
+#
+# `is_work_tree` is the same question the product asks in
+# core/src/git.rs before it shows any git UI.
+# --------------------------------------------------------------------
 
-# Canonical, so that "the same repo" is one string rather than three
-# spellings of one path. The state directory is keyed on it below.
-REPO="$(git -C "$REPO" rev-parse --show-toplevel)"
+SURFACE="clone"
+if git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    # Canonical, so that "the same project" is one string rather than
+    # three spellings of one path. The state directory is keyed on it.
+    REPO="$(git -C "$REPO" rev-parse --show-toplevel)"
+else
+    SURFACE="import"
+    [ -d "$REPO" ] || die "not a directory, and not a git repo: $REPO"
+    REPO="$(cd "$REPO" && pwd)"
+    die "$REPO is a plain folder, not a git work tree.
+
+The work surface for a folder is imported rather than cloned, and that
+half is not built yet. Point --repo at a git work tree."
+fi
 
 STATE="${STATE:-$LAB_DIR/.state}"
 WORKTREE_ROOT="${WORKTREE_ROOT:-${REPO}.worktrees}"
@@ -990,7 +1020,7 @@ cat <<PLAN
   repo      $REPO
   base      $BASE_PLAN
   branch    $TASK_BRANCH
-  worktree  $WT
+  surface   $WT ($SURFACE)
   touches   $TASK_TOUCHES
   overlap   $OVERLAP_SUMMARY
   verify    $TASK_VERIFY
@@ -1161,13 +1191,48 @@ fi
 if [ -e "$VERIFY_WT" ]; then
     die "verify checkout left over from an earlier run: $VERIFY_WT
 
-    git -C $REPO worktree remove --force $VERIFY_WT"
+    rm -rf $VERIFY_WT"
+fi
+if git -C "$REPO" rev-parse --verify --quiet "refs/heads/$TASK_BRANCH" >/dev/null 2>&1; then
+    # The work happens on a clone and is pushed back here at the end.
+    # A branch of this name already in the project is either an earlier
+    # run nobody cleaned up or somebody's work, and the push would be
+    # the thing that told you.
+    die "branch '$TASK_BRANCH' already exists in $REPO
+
+That is where this run's result gets pushed, so it has to be free:
+    git -C $REPO branch -D $TASK_BRANCH"
 fi
 
 mkdir -p "$WORKTREE_ROOT"
-git -C "$REPO" worktree add "$WT" -b "$TASK_BRANCH" "$BASE_SHA" >>"$RUN_LOG" 2>&1 \
-    || { board "dispatch-failed" "$TASK_BRANCH"; die "git worktree add failed; see $RUN_LOG"; }
-say "  created $WT"
+# --shared keeps the objects in the project's store and reads them
+# through alternates, so a clone per task costs a checkout and not a
+# copy of the history - the same price a worktree charged. --no-checkout
+# because the branch to check out does not exist yet, and checking out
+# the default branch first would be a second full materialisation.
+#
+# Alternates are live, not a snapshot: a commit that lands in the
+# project after this clone is still readable here, which is what lets
+# the rebase step replay onto a base that moved.
+SURFACE_OK=0
+if git clone --shared --no-checkout --quiet "$REPO" "$WT" >>"$RUN_LOG" 2>&1; then
+    git -C "$WT" checkout --quiet -b "$TASK_BRANCH" "$BASE_SHA" >>"$RUN_LOG" 2>&1 \
+        && SURFACE_OK=1
+fi
+if [ "$SURFACE_OK" -eq 0 ]; then
+    rm -rf "$WT"
+    board "dispatch-failed" "$TASK_BRANCH"
+    die "could not create the work surface at $WT; see $RUN_LOG"
+fi
+
+# Proof that this directory is ours before anything ever removes it.
+# Cleanup is `rm -rf` now rather than `git worktree remove`, and an
+# `rm -rf` that trusts a computed path is one bad variable away from
+# eating something else. See F-24 - a harness that can destroy your
+# work is worse than no harness.
+printf 'bot-run surface for %s\n' "$TASK_ID" > "$WT/.git/bot-surface"
+
+say "  created $WT (clone of $REPO)"
 
 # Only now, with a worktree that actually exists, does the live task
 # come into being. A dispatch that fails must not leave one behind.
@@ -1176,14 +1241,23 @@ say "  created $WT"
 # a permission - would leave a branch and a worktree that no live task
 # claims, and the next attempt would stop at the existing-path guard
 # needing hands. Undo the half-dispatch instead.
+# drop_surface - remove a work surface, and refuse to remove anything
+# else. The marker written at creation is the whole check: a path this
+# script computed is not by itself a reason to delete a directory tree.
+drop_surface() {
+    [ -f "$WT/.git/bot-surface" ] || { say "  refusing to remove $WT - not a surface this run made"; return 1; }
+    rm -rf "$VERIFY_WT"
+    rm -rf "$WT"
+    [ ! -e "$WT" ]
+}
+
 rollback_dispatch() {
     local rc=$?
     [ "$rc" -eq 0 ] && return 0
     say ""
-    say "dispatch failed after the worktree was created - rolling it back"
+    say "dispatch failed after the work surface was created - rolling it back"
     rm -f "$LIVE_TASK" "$LIVE_TASK.tmp"
-    git -C "$REPO" worktree remove --force "$WT" >/dev/null 2>&1 || true
-    git -C "$REPO" branch -D "$TASK_BRANCH" >/dev/null 2>&1 || true
+    drop_surface >/dev/null 2>&1 || true
     board "dispatch-failed" "rolled back"
     release_locks
     exit "$rc"
@@ -1447,7 +1521,7 @@ run_verify() {
         board "verify-skipped" "checkout left over"
         return 0
     fi
-    if ! git -C "$REPO" worktree add --detach "$VERIFY_WT" "$sha" >>"$RUN_LOG" 2>&1; then
+    if ! git -C "$WT" worktree add --detach "$VERIFY_WT" "$sha" >>"$RUN_LOG" 2>&1; then
         say "  skipped - could not create the verify checkout at $VERIFY_WT"
         VERIFY_EXIT=-1
         VERIFY_WHERE="(verify checkout failed)"
@@ -1489,7 +1563,7 @@ run_verify() {
     # A checkout that will not go away is not cosmetic: the next run for
     # this task hits the leftover guard and refuses to start. It has to
     # reach the verdict, not just the console.
-    if ! git -C "$REPO" worktree remove --force "$VERIFY_WT" >>"$RUN_LOG" 2>&1; then
+    if ! git -C "$WT" worktree remove --force "$VERIFY_WT" >>"$RUN_LOG" 2>&1; then
         VERIFY_WT_LEFTOVER="$VERIFY_WT"
         say "  could not remove $VERIFY_WT"
     fi
@@ -1569,7 +1643,7 @@ elif [ -n "$VERIFY_WT_LEFTOVER" ]; then
     STATUS="needs-review"
     BLOCKERS="the verify checkout could not be removed: $VERIFY_WT_LEFTOVER
 Remove it before re-running:
-    git -C $REPO worktree remove --force $VERIFY_WT_LEFTOVER"
+    rm -rf $VERIFY_WT_LEFTOVER"
 elif [ "$DIRTY" -ne 0 ]; then
     STATUS="needs-review"
     BLOCKERS="$DIRTY uncommitted file(s) left in the worktree"
@@ -1826,7 +1900,7 @@ decision, not a cleanup rule."
 It exited $REVERIFY_EXIT, so the rebased tree may well be fine - but the
 branch was left on ${PRE_REBASE_HEAD:0:12} rather than moved onto a
 result this run could not finish measuring. Remove it before re-running:
-    git -C $REPO worktree remove --force $VERIFY_WT_LEFTOVER"
+    rm -rf $VERIFY_WT_LEFTOVER"
                     VERIFY_EXIT="$FIRST_VERIFY_EXIT"
                     VERIFY_WHERE="$FIRST_VERIFY_WHERE"
                     VERIFY_TAIL="$FIRST_VERIFY_TAIL"
@@ -1918,6 +1992,46 @@ See $RUN_LOG for what git said."
 Note: $WT is left detached - 'git -C $WT checkout $TASK_BRANCH' failed.
 $TASK_BRANCH itself points where this handoff says it does."
         fi
+    fi
+fi
+
+# --------------------------------------------------------------------
+# Getting the result out
+#
+# The work is on a clone, and a clone under .worktrees is not where
+# anybody looks for a branch. So the branch is pushed back into the
+# project it came from.
+#
+# That is not the push this loop refuses to make. The refused one goes
+# to a remote, where the work becomes visible to other people and hard
+# to take back; this one moves a ref inside the repository the task
+# already named. It is also the only way a result outlives the surface
+# it was made on, because cleanup removes the clone.
+# --------------------------------------------------------------------
+
+PUSHED=""
+PUSH_FAILED=""
+if [ "$TREE_BROKEN" -eq 0 ] && [ "$COMMITS" -gt 0 ]; then
+    step "Result branch"
+    if git -C "$WT" push --quiet origin \
+        "refs/heads/$TASK_BRANCH:refs/heads/$TASK_BRANCH" >>"$RUN_LOG" 2>&1; then
+        PUSHED="$TASK_BRANCH"
+        say "  $TASK_BRANCH -> $REPO"
+        board "pushed" "$TASK_BRANCH @ ${HEAD_SHA:0:12}"
+    else
+        PUSH_FAILED="$TASK_BRANCH"
+        say "  could not push $TASK_BRANCH into $REPO"
+        board "push-failed" "$TASK_BRANCH"
+        # A result nobody can reach from the project is not a result
+        # yet, however green the verifier was.
+        [ "$STATUS" != "done" ] || STATUS="needs-review"
+        [ "$BLOCKERS" != "none" ] || BLOCKERS=""
+        BLOCKERS="${BLOCKERS:+$BLOCKERS
+
+}the branch could not be pushed back into $REPO, so it exists only on
+the work surface:
+    git -C $WT log --oneline $BASE_SHA..$TASK_BRANCH
+Move it by hand before anything removes $WT. See $RUN_LOG."
     fi
 fi
 
@@ -2078,7 +2192,11 @@ No task was derived: $DERIVED_WHY.}"
 elif [ "${NOOP:-0}" -eq 1 ]; then
     NEXT="Nothing to review - the verifier already passed at base. Give this bot a task with real work in it."
 else
-    NEXT="Human reviews $WT, then pushes and opens a PR."
+    if [ -n "$PUSHED" ]; then
+        NEXT="Human reviews 'git -C $REPO log --patch $TASK_BASE..$TASK_BRANCH', then opens a PR. $WT is a throwaway clone and can go."
+    else
+        NEXT="Human reviews $WT. Nothing was pushed back into $REPO, so the surface is the only copy."
+    fi
 fi
 
 # --------------------------------------------------------------------
@@ -2109,8 +2227,8 @@ if [ "$TASK_KIND" = "review" ]; then
     ARTIFACT="    review:   ${REVIEW_FILE:-(none written)}${DERIVED_TASK:+
     task:     $DERIVED_TASK}"
 else
-    ARTIFACT="    branch:   $TASK_BRANCH
-    worktree: $WT"
+    ARTIFACT="    branch:   $TASK_BRANCH${PUSHED:+ (pushed into $REPO)}${PUSH_FAILED:+ (ON THE SURFACE ONLY - the push failed)}
+    surface:  $WT"
 fi
 
 HANDOFF_TO="human"
@@ -2180,15 +2298,9 @@ board "handoff" "$STATUS"
 
 if [ "$STATUS" = "done" ] && [ "$COMMITS" -eq 0 ] && [ "$DIRTY" -eq 0 ] && [ "$KEEP" -eq 0 ]; then
     step "Cleanup"
-    say "  no-op run, removing worktree"
+    say "  no-op run, removing the work surface"
     CLEAN_FAILED=""
-    git -C "$REPO" worktree remove "$WT" >>"$RUN_LOG" 2>&1 \
-        || git -C "$REPO" worktree remove --force "$WT" >>"$RUN_LOG" 2>&1 \
-        || CLEAN_FAILED="worktree $WT"
-    if [ -z "$CLEAN_FAILED" ]; then
-        git -C "$REPO" branch -D "$TASK_BRANCH" >>"$RUN_LOG" 2>&1 \
-            || CLEAN_FAILED="branch $TASK_BRANCH"
-    fi
+    drop_surface >>"$RUN_LOG" 2>&1 || CLEAN_FAILED="work surface $WT"
 
     if [ -n "$CLEAN_FAILED" ]; then
         # The handoff has already been written saying `done`, and it was
@@ -2204,8 +2316,7 @@ if [ "$STATUS" = "done" ] && [ "$COMMITS" -eq 0 ] && [ "$DIRTY" -eq 0 ] && [ "$K
             printf '\n# Cleanup failed\n\n'
             printf 'The run itself was a clean no-op, but %s could not be\n' "$CLEAN_FAILED"
             printf 'removed. Remove it before re-running this task:\n\n'
-            printf '    git -C %s worktree remove --force %s\n' "$REPO" "$WT"
-            printf '    git -C %s branch -D %s\n' "$REPO" "$TASK_BRANCH"
+            printf '    rm -rf %s\n' "$WT"
         } >> "$HANDOFF"
     else
         board "cleaned"
