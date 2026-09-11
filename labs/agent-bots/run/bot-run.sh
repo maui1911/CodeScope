@@ -366,10 +366,6 @@ abspath() {   # abspath <path> - works on a path that does not exist yet
         *) printf '%s\n' "$PWD/$1" ;;
     esac
 }
-mkdir -p "$STATE"
-STATE="$(cd "$STATE" && pwd)"
-WORKTREE_ROOT="$(abspath "$WORKTREE_ROOT")"
-
 # Nothing the runner writes may live inside a folder project. A git
 # project is safe by accident - the control plane is either outside it
 # or ignored by it - but an import walks the whole folder, so state
@@ -377,22 +373,34 @@ WORKTREE_ROOT="$(abspath "$WORKTREE_ROOT")"
 # snapshot repository itself into the work surface, hand them to the
 # agent, and then snapshot them again next time. It compounds, and the
 # first sign of it is a surface that grows every run.
-if [ "$SURFACE" = "import" ]; then
-    for d in "$STATE" "$WORKTREE_ROOT"; do
-        case "$d" in
-            "$REPO"|"$REPO"/*) die \
-"$d is inside $REPO, which is a plain folder.
+refuse_inside_repo() {   # refuse_inside_repo <flag> <path>
+    [ "$SURFACE" = "import" ] || return 0
+    case "$2" in
+        "$REPO"|"$REPO"/*) ;;
+        *) return 0 ;;
+    esac
+    die "$2 is inside $REPO, which is a plain folder.
 
 A folder project is imported whole, so anything the runner keeps in
 there becomes part of the snapshot and part of what the agent can read
 - including the snapshot itself, on the next run. Put it somewhere
 else:
 
-    --state <a directory outside $REPO>
-    --worktree-root <a directory outside $REPO>" ;;
-        esac
-    done
-fi
+    $1 <a directory outside $REPO>"
+}
+
+# Before the mkdir, so a refused dispatch creates nothing. Checked on
+# the non-canonical spelling here and again after canonicalisation
+# below, because `$REPO/../proj/.state` is inside the project by any
+# honest reading and is not a prefix of it by string comparison.
+STATE="$(abspath "$STATE")"
+WORKTREE_ROOT="$(abspath "$WORKTREE_ROOT")"
+refuse_inside_repo --state "$STATE"
+refuse_inside_repo --worktree-root "$WORKTREE_ROOT"
+
+mkdir -p "$STATE"
+STATE="$(cd "$STATE" && pwd)"
+refuse_inside_repo --state "$STATE"
 
 # A control plane belongs to one repository. Live tasks and locks are
 # keyed by task id alone, so pointing the default state at a second repo
@@ -1760,7 +1768,15 @@ fi
 # than followed, and the run is blocked below - an agent that did this
 # was not answering the task.
 CHANNEL_SYMLINK=""
-for chan in ".bot-blocked" ".bot-commit-msg" "$TASK_ARTIFACT"; do
+# The artifact only where it has been through the checks at the top of
+# this script: `artifact:` is validated for a report task and ignored
+# for a commit one, so including it unconditionally would let a commit
+# task name `../../somewhere` and have this loop `rm -f` a symlink well
+# outside the surface. A guard that reaches further than the thing it
+# guards is not a guard.
+CHANNELS=".bot-blocked .bot-commit-msg"
+[ "$TASK_PRODUCES" != "report" ] || CHANNELS="$CHANNELS $TASK_ARTIFACT"
+for chan in $CHANNELS; do
     if [ -L "$WT/$chan" ]; then
         CHANNEL_SYMLINK="${CHANNEL_SYMLINK:+$CHANNEL_SYMLINK, }$chan"
         rm -f "$WT/$chan"
@@ -1992,11 +2008,23 @@ fi
 # another, leaves both numbers identical. `git diff HEAD` puts the
 # tracked content in the hash; porcelain covers what is untracked.
 # Untracked *content* is still outside it, which is the residual.
-tree_state() {
+#
+# Takes the directory, because there are two trees to watch and only one
+# of them is the agent's. `verify:` runs *inside the verify checkout*,
+# so a verifier that rewrites the source it is about to test never went
+# near $WT and would have passed this check by not being where it was
+# looking.
+#
+# The second argument drops the untracked half of the hash. In the
+# verify checkout untracked files are ordinary - a test writes a
+# fixture, a tool leaves a cache - and calling that meddling would fail
+# honest verifiers. Rewriting *tracked* content there is the thing with
+# no innocent reading, and `git diff HEAD` is exactly that.
+tree_state() {   # tree_state <dir> [tracked-only]
     {
-        git -C "$WT" rev-parse HEAD
-        git -C "$WT" -c core.quotepath=off status --porcelain
-        git -C "$WT" diff HEAD
+        git -C "$1" rev-parse HEAD
+        [ -n "${2:-}" ] || git -C "$1" -c core.quotepath=off status --porcelain
+        git -C "$1" diff HEAD
     } 2>/dev/null | git hash-object --stdin
 }
 
@@ -2013,6 +2041,7 @@ tree_state() {
 run_verify() {
     local sha="$1" label="${2:-}" event="${3:-verified}"
     local pre_state post_state post_head post_dirty log_mark
+    local pre_verify post_verify
     VERIFY_EXIT=0
     VERIFY_WHERE="(not run)"
     VERIFY_TAIL=""
@@ -2043,7 +2072,8 @@ run_verify() {
     fi
 
     VERIFY_WHERE="clean checkout of ${sha:0:12}$label"
-    pre_state="$(tree_state)"
+    pre_state="$(tree_state "$WT")"
+    pre_verify="$(tree_state "$VERIFY_WT" tracked)"
     # Where the verifier's output starts, so its last words can go in
     # the handoff. "See the log" is the least useful sentence a handoff
     # can contain: the reader is reading it *because* they were not
@@ -2082,6 +2112,9 @@ run_verify() {
     fi
 
     # A checkout that will not go away is not cosmetic: the next run for
+    # Read before the removal, for the obvious reason.
+    post_verify="$(tree_state "$VERIFY_WT" tracked)"
+
     # this task hits the leftover guard and refuses to start. It has to
     # reach the verdict, not just the console.
     if ! git -C "$WT" worktree remove --force "$VERIFY_WT" >>"$RUN_LOG" 2>&1; then
@@ -2089,11 +2122,21 @@ run_verify() {
         say "  could not remove $VERIFY_WT"
     fi
 
-    post_state="$(tree_state)"
+    if [ "$post_verify" != "$pre_verify" ]; then
+        TREE_MUTATED="verifier changed the tree it was measuring.
+    $VERIFY_WHERE had its tracked content rewritten while the verifier
+    ran, so 'exit $VERIFY_EXIT' is a statement about a tree that is not
+    ${sha:0:12} any more. Untracked files there are not counted - a test
+    fixture or a cache is ordinary - so this is source, changed in
+    place."
+    fi
+
+    post_state="$(tree_state "$WT")"
     if [ "$post_state" != "$pre_state" ]; then
         post_head="$(git -C "$WT" rev-parse HEAD 2>/dev/null)" || post_head="(unreadable)"
         post_dirty="$(git -C "$WT" status --porcelain | wc -l | tr -d ' ')"
-        TREE_MUTATED="verifier changed the tree it was measuring.
+        TREE_MUTATED="${TREE_MUTATED:+$TREE_MUTATED
+}verifier changed the tree it was measuring.
     head        $sha -> $post_head
     uncommitted $DIRTY -> $post_dirty file(s)
     state       ${pre_state:0:12} -> ${post_state:0:12}
@@ -2683,11 +2726,23 @@ PATCH_FILE=""
 # the patch as well - a folder run would otherwise write the secret into
 # .state/patches/ instead, which is the same publication by a different
 # door.
-if [ -n "$PROTECTED_IN_DIFF" ]; then
+PUBLISH_REFUSED=""
+[ -z "$PROTECTED_IN_DIFF" ] \
+    || PUBLISH_REFUSED="the diff carries paths that never travel"
+# `blocked` is the verdict for a run whose result cannot be trusted: a
+# red verifier, a tree that moved under the measurement, a scope
+# violation. Publishing it puts an unverified branch in the project
+# under a name the next dispatch will then refuse as "already exists",
+# and the handoff points a reader at it. `needs-review` still publishes
+# - that verdict means the work verified and something *else* needs a
+# human - which is the distinction this gate is made of.
+[ "$STATUS" != "blocked" ] \
+    || PUBLISH_REFUSED="${PUBLISH_REFUSED:-the run is blocked, so nothing here has been proven}"
+if [ -n "$PUBLISH_REFUSED" ]; then
     say ""
-    say "Result branch: not pushed - the diff carries paths that never travel."
+    say "Result branch: not pushed - $PUBLISH_REFUSED."
 fi
-if [ "$TREE_BROKEN" -eq 0 ] && [ "$COMMITS" -gt 0 ] && [ -z "$PROTECTED_IN_DIFF" ]; then
+if [ "$TREE_BROKEN" -eq 0 ] && [ "$COMMITS" -gt 0 ] && [ -z "$PUBLISH_REFUSED" ]; then
     step "Result branch"
     # The path, not the remote name. `origin` lives in the surface's
     # own .git/config, which the agent can write - Codex is explicitly

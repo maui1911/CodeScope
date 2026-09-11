@@ -2591,3 +2591,61 @@ addition in one repository is a deletion in another; the branch name
 that is free in the project is taken in a sibling clone; the file that
 is a file is a link. Every one of these was correct in the case that
 was in front of me while writing it.
+
+---
+
+### F-35 · The check was not where the code ran
+
+*2026-09-11, the round after F-34.*
+
+The runner has had a meddling-verifier check since F-6: `verify:` is
+arbitrary code, so after it runs the runner re-hashes the tree and
+blocks the run if anything moved. `meddler.sh` is the regression test —
+a verifier that reaches sideways into the agent's worktree and commits
+there, then exits 0.
+
+The hash was taken of `$WT`. The verifier runs in `$VERIFY_WT`.
+
+So the one thing a verifier can do without reaching anywhere at all —
+rewrite the source in the clean checkout it was handed, then pass —
+went unwatched, because the check was standing in the tree the attack
+does not need to visit. `meddler.sh` had to reach for the sibling
+worktree to be caught; a verifier that stays home never triggered it.
+The test proved the check worked against the attack the test performed.
+
+Fixed by hashing both, with one distinction that had to be got right:
+in the verify checkout, *untracked* files are ordinary. A test writes a
+fixture, a tool leaves a cache. Calling that meddling would fail honest
+verifiers, so only tracked content counts there — `git diff HEAD`, no
+porcelain. Rewriting source in place has no innocent reading;
+scribbling a cache does. `selfmeddler.sh` is the other half of the pair
+now.
+
+Three smaller ones from the same round, each a variant of *the guard
+and the thing it guards are in different places*:
+
+- **`mkdir -p "$STATE"` ran before the check that refuses a state
+  directory inside a folder project.** The invariant is "the runner
+  writes nothing inside a plain folder"; the implementation created the
+  directory and then declined to use it. Now checked before the mkdir,
+  and again after canonicalisation — `$REPO/../proj/.state` is inside
+  the project by any honest reading and is not a prefix of it by string
+  comparison.
+- **The symlink guard covered `$TASK_ARTIFACT` on every task.**
+  `artifact:` is validated for a report task and ignored for a commit
+  one, so a commit task could name `../../somewhere` and have the guard
+  itself `rm -f` a symlink outside the surface. A guard that reaches
+  further than the thing it guards is not a guard.
+- **The push was not gated on the verdict.** `blocked` means the result
+  cannot be trusted — a red verifier, a tree that moved, a scope
+  violation — and the branch was pushed into the project anyway, under
+  a name the next dispatch then refuses as "already exists". It was
+  gated on a broken tree, on the commit count, and (since F-34) on
+  protected paths: three specific reasons, where the general one was
+  sitting in `$STATUS` the whole time.
+
+What generalises: **a check is a claim about a place.** "The tree did
+not move" means nothing until you say which tree, and the answer is not
+"the one I had a variable for" — it is wherever the thing being checked
+actually happens. Three of these four were guards pointed one directory
+away from the code they were guarding.
