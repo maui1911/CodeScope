@@ -14,10 +14,11 @@ behaviour and without reformatting anything.
 
 1. Run the `verify:` command first, before editing anything. Capture
    the output.
-   - Exits 0 already? Stop. Write the handoff with `status: done` and
-     note that it was a no-op. A no-op run is a success.
-   - Fails for a reason unrelated to the files in `touches:`? Stop,
-     `status: blocked`. It was broken before you arrived.
+   - Exits 0 already? Stop, change nothing, commit nothing. A no-op run
+     is a success, and the runner will record it as one.
+   - Fails for a reason unrelated to the files in `touches:`? Stop and
+     escalate through `.bot-blocked` — it was broken before you
+     arrived. See the escalation section of your charter.
 2. Group the remaining warnings by lint name. Fix them one lint at a
    time, smallest change first.
 3. Re-run the verifier after each group, not once at the end. A lint

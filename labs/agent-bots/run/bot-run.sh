@@ -38,11 +38,20 @@
 #
 # Environment:
 #   BOT_AGENT_CMD    Agent executable.        Default: claude
-#   BOT_AGENT_ARGS   Extra args, word-split.  Default: --permission-mode acceptEdits
+#   BOT_AGENT_ARGS   Extra args, word-split.  Default: --permission-mode auto
 #
-# The default args target Claude Code headless mode. Check them against
-# your installed CLI version before the first real run - a wrong flag
-# here fails loudly, but it fails after the worktree is created.
+# The default args target Claude Code headless mode; check them against
+# your installed CLI version. `auto` and not `acceptEdits`: the prompt
+# asks the agent to run the verifier and to commit, which are Bash
+# calls, and acceptEdits covers edits only. An unattended run under
+# acceptEdits cannot do its job - it produces no commit, which is
+# exactly the shape F-4 describes.
+#
+# Be honest about what that buys: the worktree bounds what the agent is
+# *meant* to touch, not what it *can*. It is a work surface, not a
+# security boundary - the same thing this design criticises Grok Bot
+# for. What actually contains the blast radius is that the branch is
+# throwaway and nothing here ever pushes.
 
 set -euo pipefail
 
@@ -104,7 +113,7 @@ STATE="${STATE:-$LAB_DIR/.state}"
 WORKTREE_ROOT="${WORKTREE_ROOT:-${REPO}.worktrees}"
 
 BOT_AGENT_CMD="${BOT_AGENT_CMD:-claude}"
-BOT_AGENT_ARGS="${BOT_AGENT_ARGS:---permission-mode acceptEdits}"
+BOT_AGENT_ARGS="${BOT_AGENT_ARGS:---permission-mode auto}"
 
 # --------------------------------------------------------------------
 # Task frontmatter

@@ -297,6 +297,17 @@ the live task and start over. Exit codes are `0` done, `1` blocked,
 target Claude Code headless mode. Check them against your installed CLI
 version first. See the script header for the full flag list.
 
+**The agent runs under `--permission-mode auto`, not `acceptEdits`.**
+The prompt asks it to run the verifier and to commit; both are Bash
+calls, and `acceptEdits` covers edits only. An unattended run under
+`acceptEdits` cannot finish its job — it makes no commit, which is
+precisely the shape F-4 describes. Worth being blunt about what that
+costs: the worktree bounds what the agent is *meant* to touch, not what
+it *can*. It is a work surface, not a security boundary — the same
+criticism this document levels at Grok Bot in section 1. What actually
+contains the blast radius here is that the branch is throwaway and
+nothing in this loop ever pushes.
+
 **`base:` must be a ref that contains the contract.** The agent reads
 its charter and context from its own checkout — the base commit — not
 from your working tree. While this branch is unmerged that means
