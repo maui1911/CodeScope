@@ -808,6 +808,8 @@ Rules for this run:
   - The verifier is: $TASK_VERIFY
     It must exit 0. Run it before you edit anything, and again after.
   - Commit your work to this branch. Exactly one commit, message in English.
+  - If nothing needs changing, commit nothing and say so. A no-op is a
+    result, not a failure - do not manufacture a commit to have one.
   - No new TODO or FIXME without a linked issue number.
   - Do NOT push, do NOT open a PR, do NOT run cargo fmt.
   - Do NOT edit anything under $CONTRACT_DIR/.
@@ -830,22 +832,40 @@ valid outcome; guessing is not."
 # lets a profile carry an opaque fragment like `-s workspace-write`
 # without the runner knowing what it means.
 #
+# `{git_dir}` is the second substitution, and it exists because of what
+# a linked worktree is: the checkout is at $WT, and its git directory is
+# not - it lives under the main repo. An agent that sandboxes itself by
+# directory can therefore edit every file it was given and cannot write
+# a single commit. See F-26. A profile that needs to hand its sandbox
+# that path says so here, and only the runner knows what the path is.
+#
 # The display copy exists so the plan and the evidence can name the
 # invocation without reprinting the whole prompt.
 # --------------------------------------------------------------------
 
+GIT_COMMON_DIR="$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+[ -n "$GIT_COMMON_DIR" ] || GIT_COMMON_DIR="$REPO/.git"
+
 AGENT_ARGV=()
 AGENT_ARGV_DISPLAY=()
+# Globbing off for both loops. These are argv fragments, not patterns:
+# a profile carrying `-c roots=["..."]` would otherwise be read as a
+# character class and matched against the runner's working directory,
+# and the failure would be an agent invoked with a mangled flag.
+set -f
 for tok in $AGENT_HEADLESS; do
     if [ "$tok" = "{prompt}" ]; then
         AGENT_ARGV+=("$PROMPT"); AGENT_ARGV_DISPLAY+=("<prompt>")
     else
+        tok="${tok//\{git_dir\}/$GIT_COMMON_DIR}"
         AGENT_ARGV+=("$tok"); AGENT_ARGV_DISPLAY+=("$tok")
     fi
 done
 for tok in $AGENT_AUTONOMY; do
+    tok="${tok//\{git_dir\}/$GIT_COMMON_DIR}"
     AGENT_ARGV+=("$tok"); AGENT_ARGV_DISPLAY+=("$tok")
 done
+set +f
 if [ -n "$TASK_MODEL" ]; then
     AGENT_ARGV+=("$AGENT_MODEL_FLAG" "$TASK_MODEL")
     AGENT_ARGV_DISPLAY+=("$AGENT_MODEL_FLAG" "$TASK_MODEL")
