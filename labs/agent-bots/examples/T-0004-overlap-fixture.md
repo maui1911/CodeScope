@@ -38,8 +38,12 @@ To reproduce the check by hand, from the repo root:
     cp labs/agent-bots/examples/T-0004-overlap-fixture.md \
        labs/agent-bots/.state/tasks/T-0004.md
     # then change `status: todo` to `status: dispatched` in that copy
-    git worktree add ../codescope-public.worktrees/bot-fixer-T-0004 \
-       -b bot/fixer/T-0004 HEAD
+
+    # the worktree root the runner actually looks in - derive it, do not
+    # type it: the default is "<repo path>.worktrees", which depends on
+    # what this checkout is called on your disk
+    WTROOT="$(git rev-parse --show-toplevel).worktrees"
+    git worktree add "$WTROOT/bot-fixer-T-0004" -b bot/fixer/T-0004 HEAD
 
     # 2. any overlapping task is now refused before it costs a worktree
     labs/agent-bots/run/bot-run.sh \
@@ -47,7 +51,7 @@ To reproduce the check by hand, from the repo root:
 
     # 3. delete the worktree but leave the live task at `dispatched`,
     #    and the same run reports a stale dispatch and proceeds
-    git worktree remove --force ../codescope-public.worktrees/bot-fixer-T-0004
+    git worktree remove --force "$WTROOT/bot-fixer-T-0004"
 
     # 4. clean up
     git branch -D bot/fixer/T-0004

@@ -169,8 +169,10 @@ Same guarantee, no central mutable document, and the log doubles as the
 audit trail.
 
 Append-only is a property of the *writes*, though, not of the file —
-creating it is still a race, and the first version lost rows to it.
-See F-14.
+creating it is still a race, and the first version lost rows to it
+(F-14). The lock that fixed that then needed a release path of its own,
+and the file has to *appear* atomically as well as be created
+atomically, or a waiter appends into a half-written header (F-17).
 
 ### 3.3 What git gives you for free
 
@@ -227,6 +229,11 @@ an opinion about two patterns; `--allow-overlap` is the escape hatch
 for a collision you mean to resolve by hand. A refusal costs nothing —
 it happens before the worktree exists — and it lands on the board,
 because two tasks written to collide is worth a row.
+
+The check and the claim are one step, not two: a `mkdir` lock is held
+from the last read of the control plane until this run is visible in
+it, and the scan inside that lock is the one that counts. A check that
+runs before the claim is advice (F-17).
 
 "In flight" means status `dispatched` **and** a worktree still on disk.
 Believing the status field alone would wedge every later task behind a
@@ -1117,3 +1124,87 @@ crashed run leaves its live task saying `dispatched` forever, so a
 check that trusted the status field alone would wedge every later
 overlapping task behind a ghost — and the failure would look like the
 overlap check working. It reports the stale dispatch and proceeds.
+
+---
+
+### F-17 · A check that runs before the claim is advice, not a rule
+
+*2026-09-11, from the second review on #346.*
+
+The overlap check (F-16) read the control plane, decided nothing
+collided, and then went off to create a worktree and a live task. In
+between those two steps there is nothing. Two runners started together
+both see no in-flight neighbour, both pass, and both dispatch — and the
+refusal that exists specifically for the concurrent case is the one
+thing that does not survive it.
+
+This is F-14 again in a different costume. The design was written for
+concurrency; the implementation was written as though the runner were
+the only process on the machine, which it was, right up until the
+feature whose entire premise is that it is not.
+
+The claim is now serialised. One `mkdir` lock is held from the last
+read of the state to the moment this run is visible in it: inside it,
+the task's own status is re-read and the overlap scan runs again, then
+the worktree and the live task are created, then the lock drops. The
+scan outside the lock still runs, because the plan has to print
+something before the human decides — it is a preview, and only the
+locked pass is the answer. The lock does not span the agent run;
+serialising the bots themselves would defeat the point.
+
+Two more instances of the same shape came out of the same review, both
+in guards that looked finished:
+
+- **The F-14 board lock had no release path.** A run killed between
+  `mkdir` and `rmdir` leaves the lock behind forever, and every later
+  run then waits and dies — one crash wedging the whole control plane,
+  which is worse than the race it was added to fix. Now: an `EXIT` trap
+  releases whatever is held, and a lock older than ten minutes is
+  treated as a crash and broken.
+- **The board's creation was atomic; its *appearance* was not.** `>`
+  creates an empty file and then fills it, so a waiter that checks
+  `-f "$BOARD"` can start appending rows into a half-written header.
+  The header is now written to a temporary file and renamed.
+- **The post-verify tree guard (F-13) compared head plus a file
+  count.** A verifier that rewrites an already-modified file, or swaps
+  one dirty path for another, leaves both numbers identical and slips
+  through the check that exists to catch exactly that. It now compares
+  a hash over head, `status --porcelain` and `git diff HEAD`. Untracked
+  *content* is still outside it.
+
+The question worth asking of every guard in this runner, and the one
+that was not asked: **what can happen between reading this and acting
+on it?** Where the answer is "another run", the check is a comment.
+
+---
+
+### F-18 · A criterion the runner cannot check is decoration
+
+*2026-09-11, from the second review on #346.*
+
+`fixer/BOT.md` listed four things that make a run successful. The
+runner checked three. The fourth — no new `TODO`/`FIXME` without a
+linked issue number, which is a hard rule in this repo's `CLAUDE.md` —
+existed only as prose, so a bot that satisfied the verifier, stayed in
+scope and made exactly one commit came back `done` with an unlinked
+`TODO` in it.
+
+This is F-1 seen from the other end. F-1 was a verifier *wider* than
+the task, which blocked work the bot was not allowed to do. This is an
+acceptance criterion *narrower* than the code, which passed work the
+charter says is a failed run. Both are the same gap: the distance
+between what the contract says "done" means and what the loop can
+actually prove.
+
+The check is now in the runner — added lines only, since pre-existing
+debt in a file the bot had to touch is not the bot's to answer for —
+and `run/stubs/sloppy.sh` is the regression: a stub that does the job
+correctly, passes the verifier, stays in scope, and leaves one unlinked
+`TODO` behind. All four of the fixer's criteria are now evaluated.
+
+The rule that comes out of it: **every line in an acceptance section is
+either executable by the runner or deleted.** A charter is not
+documentation that happens to sit near the code; it is the
+specification the verdict is derived from. A criterion nobody evaluates
+is worse than a missing one, because it teaches the reader that the
+ones beside it are checked.

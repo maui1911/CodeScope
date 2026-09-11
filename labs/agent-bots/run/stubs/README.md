@@ -12,6 +12,7 @@ regression tests for F-4 and F-8.
 | `blocked.sh` | an agent that refuses through the contract channel: writes `.bot-blocked`, exits 0 | `blocked`, reason quoted in the handoff, worktree kept |
 | `crash.sh` | an agent that dies silently: exits 3, writes nothing | `blocked`, "agent exited 3 without reporting", worktree kept |
 | `liar.sh` | an agent that **claims success and is wrong**: commits a deliberately failing test, prints a confident summary, exits 0 | `blocked`, verifier exit 101, worktree kept |
+| `sloppy.sh` | an agent that does the job correctly and leaves an unlinked `TODO` behind | `blocked`, the offending added line quoted |
 | `meddler.sh` | not an agent — a **verifier** that passes while committing into the worktree it was judging | `blocked`, "verifier changed the tree it was measuring" |
 
 Before F-4 was fixed, the first two both landed on `done` as a no-op,

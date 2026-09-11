@@ -90,6 +90,58 @@ step() { printf '\n== %s\n' "$*"; }
 
 usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//;$d'; }
 
+# --------------------------------------------------------------------
+# Locks
+#
+# mkdir is the portable atomic primitive: exactly one process creates
+# the directory. The two things that make a mkdir lock dangerous are
+# both handled here, because a lock nobody releases is worse than no
+# lock at all - it wedges every later run rather than one.
+#
+#   - the holder dies: the EXIT trap releases whatever is still held,
+#     and anything older than ten minutes is treated as a crash and
+#     broken by the next run.
+#   - the waiter gives up: it dies with the path in the message rather
+#     than proceeding unlocked.
+# --------------------------------------------------------------------
+
+LOCKS_HELD=()
+
+release_locks() {
+    local d
+    [ "${#LOCKS_HELD[@]}" -gt 0 ] || return 0
+    for d in "${LOCKS_HELD[@]}"; do rmdir "$d" 2>/dev/null || true; done
+    LOCKS_HELD=()
+}
+trap release_locks EXIT
+
+take_lock() {   # take_lock <dir> <what>
+    local dir="$1" what="$2" waited=0
+    while ! mkdir "$dir" 2>/dev/null; do
+        if [ -n "$(find "$dir" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then
+            say "  breaking a stale $what lock at $dir"
+            rmdir "$dir" 2>/dev/null || true
+            continue
+        fi
+        waited=$((waited + 1))
+        [ "$waited" -le 300 ] || die "timed out waiting for the $what lock at $dir
+Another run is holding it, or it was left behind. Remove it by hand if
+no other run is in flight:
+    rmdir $dir"
+        sleep 0.2
+    done
+    LOCKS_HELD+=("$dir")
+}
+
+drop_lock() {   # drop_lock <dir>
+    local dir="$1" d kept=()
+    rmdir "$dir" 2>/dev/null || true
+    if [ "${#LOCKS_HELD[@]}" -gt 0 ]; then
+        for d in "${LOCKS_HELD[@]}"; do [ "$d" = "$dir" ] || kept+=("$d"); done
+    fi
+    LOCKS_HELD=("${kept[@]}")
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --task)          TASK="${2:-}"; shift 2 ;;
@@ -195,11 +247,11 @@ case "$TASK_ID" in
     *[!a-zA-Z0-9_-]*|"") die "task id must be [a-zA-Z0-9_-]+, got '$TASK_ID'" ;;
 esac
 
-# The runner's own checkout, used only for a friendly "unknown owner"
-# error. The charter that actually governs the run is the one at the
-# base commit, checked below - these are different trees.
+# Display only. The charter that governs the run is the one at the base
+# commit, and that is the only one worth gating on - a second existence
+# test against the runner's checkout would reject a perfectly good run
+# launched from an older tree. See F-12.
 BOT_DIR="$LAB_DIR/contract/bots/$TASK_OWNER"
-[ -f "$BOT_DIR/BOT.md" ] || die "no charter for owner '$TASK_OWNER' at $BOT_DIR/BOT.md"
 
 BASE_SHA="$(git -C "$REPO" rev-parse --verify "$TASK_BASE^{commit}" 2>/dev/null)" \
     || die "cannot resolve base ref '$TASK_BASE' (fetch first?)"
@@ -305,17 +357,19 @@ VERIFY_WT="$WT-verify"
 
 LIVE_TASK="$STATE/tasks/$TASK_ID.md"
 
+# The discard itself happens inside the dispatch lock, once the
+# worktree exists. Deleting it here instead would hand the preflight a
+# way to abandon a live worktree: the runner dies on "worktree path
+# already exists", and the control plane has already forgotten the run
+# that owns it. --dry-run then needs no special case, because nothing
+# has been written yet either way.
 RESET_PENDING=0
 if [ "$RESET" -eq 1 ] && [ -f "$LIVE_TASK" ]; then
+    RESET_PENDING=1
     if [ "$DRY_RUN" -eq 1 ]; then
-        # --dry-run says it changes nothing on disk, and deleting the
-        # live task is a change. Report it and read the status as if it
-        # had happened, so the plan describes the run you would get.
-        RESET_PENDING=1
         say "reset: would discard live task $TASK_ID (dry run - left alone)"
     else
-        rm -f "$LIVE_TASK"
-        say "reset: discarded live task $TASK_ID"
+        say "reset: live task $TASK_ID will be discarded once the worktree exists"
     fi
 fi
 
@@ -388,6 +442,13 @@ OVERLAP_REPORT=""
 OVERLAP_IDS=""
 STALE_DISPATCH=""
 
+# A function because it has to run twice: once before the plan, so a
+# human (and --dry-run) can see the collision, and once again inside the
+# dispatch lock, where it is the answer that actually counts. See F-17.
+scan_overlaps() {
+OVERLAP_REPORT=""
+OVERLAP_IDS=""
+STALE_DISPATCH=""
 if [ -d "$STATE/tasks" ]; then
     for live in "$STATE"/tasks/*.md; do
         [ -f "$live" ] || continue
@@ -438,6 +499,9 @@ if [ -d "$STATE/tasks" ]; then
         OVERLAP_REPORT="$OVERLAP_REPORT$(printf '%s\n' "$shared" | sed 's/^/      /')"$'\n'
     done
 fi
+}
+
+scan_overlaps
 
 if [ -n "$OVERLAP_IDS" ]; then
     if [ "$ALLOW_OVERLAP" -eq 1 ]; then
@@ -579,33 +643,28 @@ BOARD="$STATE/board.md"
 # concurrency. Two runs starting together both saw no board and both
 # truncated it with `>`, so the later header wiped the earlier run's
 # rows - an audit trail that loses evidence exactly when two bots are
-# running, which is the only time it matters. mkdir is the portable
-# atomic primitive: exactly one process creates the lock, and the
-# re-test inside it stops the loser rewriting a board that now exists.
+# running, which is the only time it matters.
+#
+# Two things are needed, not one. The lock serialises creation; the
+# write-then-rename makes the file's *appearance* atomic, because `>`
+# creates an empty file before the header lands in it and a waiter that
+# only checks `-f` would start appending rows into a half-written
+# header.
 if [ ! -f "$BOARD" ]; then
-    if mkdir "$BOARD.lock" 2>/dev/null; then
-        if [ ! -f "$BOARD" ]; then
-            {
-                echo "# Board"
-                echo
-                echo "Append-only event log. Never edit a line that is already here -"
-                echo "task status lives on the task file, this is the audit trail."
-                echo
-                echo "| when | task | event | ref |"
-                echo "|---|---|---|---|"
-            } > "$BOARD"
-        fi
-        rmdir "$BOARD.lock"
-    else
-        # Another run is writing the header right now. Wait for it
-        # rather than racing it; a board that never appears is a bug
-        # worth hanging on, not one worth papering over.
-        for _ in 1 2 3 4 5 6 7 8 9 10; do
-            [ -f "$BOARD" ] && break
-            sleep 0.2
-        done
-        [ -f "$BOARD" ] || die "board never appeared; stale lock at $BOARD.lock?"
+    take_lock "$BOARD.lock" "board"
+    if [ ! -f "$BOARD" ]; then
+        {
+            echo "# Board"
+            echo
+            echo "Append-only event log. Never edit a line that is already here -"
+            echo "task status lives on the task file, this is the audit trail."
+            echo
+            echo "| when | task | event | ref |"
+            echo "|---|---|---|---|"
+        } > "$BOARD.tmp.$$"
+        mv "$BOARD.tmp.$$" "$BOARD"
     fi
+    drop_lock "$BOARD.lock"
 fi
 
 # Each row carries its own clock. Stamping every row of a run with the
@@ -630,9 +689,35 @@ set_status() {
     ' "$LIVE_TASK" > "$LIVE_TASK.tmp" && mv "$LIVE_TASK.tmp" "$LIVE_TASK"
 }
 
-# Enforced here rather than where it was computed, so that the refusal
-# lands on the board. A dispatch that was refused is an event worth
-# keeping - it is the record of two tasks that were written to collide.
+# --------------------------------------------------------------------
+# Claim
+#
+# F-17: everything above this line is an observation. Two runners could
+# both read "no in-flight task claims these files", both find the path
+# free, and both dispatch - the overlap check would be advice that
+# happened to be true when it was read.
+#
+# So the claim is serialised: one lock, held from the last look at the
+# state to the moment this run is visible in it. Inside it the status
+# and the overlap scan are re-read, because the first pass ran outside
+# the lock and is only good enough to print.
+#
+# The refusal lands on the board before the die - a dispatch that was
+# refused is the record of two tasks written to collide, and that is
+# worth keeping.
+# --------------------------------------------------------------------
+
+take_lock "$STATE/dispatch.lock" "dispatch"
+
+if [ -f "$LIVE_TASK" ] && [ "$RESET_PENDING" -eq 0 ]; then
+    LOCKED_STATUS="$(field status "$LIVE_TASK")"
+    [ "$LOCKED_STATUS" = "todo" ] || die \
+        "task $TASK_ID became '$LOCKED_STATUS' while this run was starting.
+Another runner claimed it first."
+fi
+
+scan_overlaps
+
 if [ -n "$OVERLAP_IDS" ]; then
     if [ "$ALLOW_OVERLAP" -eq 1 ]; then
         board "overlap-allowed" "${OVERLAP_IDS# }"
@@ -675,9 +760,18 @@ say "  created $WT"
 
 # Only now, with a worktree that actually exists, does the live task
 # come into being. A dispatch that fails must not leave one behind.
+if [ "$RESET_PENDING" -eq 1 ]; then
+    rm -f "$LIVE_TASK"
+    say "  reset: discarded the previous live task"
+fi
 cp "$TASK" "$LIVE_TASK"
 set_status dispatched
 board "dispatched" "$TASK_BRANCH @ ${BASE_SHA:0:12}"
+
+# The claim is now visible to every other runner, so the lock has done
+# its job. Holding it through the agent run would serialise the bots
+# themselves, which is the opposite of the point.
+drop_lock "$STATE/dispatch.lock"
 
 # --------------------------------------------------------------------
 # Agent
@@ -752,6 +846,7 @@ if [ -z "$HEAD_SHA" ]; then
     DIRTY=0
     TOUCHED=""
     NUMSTAT="worktree unreadable"
+    TODO_VIOLATIONS=""
     TREE_BROKEN=1
 else
     TREE_BROKEN=0
@@ -765,6 +860,13 @@ else
     TOUCHED="$(git -C "$WT" -c core.quotepath=off diff --name-only --no-renames "$BASE_SHA..HEAD")"
     NUMSTAT="$(git -C "$WT" diff --shortstat "$BASE_SHA..HEAD" | sed 's/^ *//')"
     [ -n "$NUMSTAT" ] || NUMSTAT="no committed changes"
+
+    # CLAUDE.md, and the charter's acceptance criterion 4. It was in the
+    # charter and nowhere in the code, which made it a suggestion - see
+    # F-18. Added lines only: pre-existing debt is not this bot's.
+    TODO_VIOLATIONS="$(git -C "$WT" diff -U0 "$BASE_SHA..HEAD" \
+        | grep -E '^\+' | grep -Ev '^\+\+\+' \
+        | grep -E 'TODO|FIXME' | grep -Ev '#[0-9]+' || true)"
 fi
 
 say "  head      ${HEAD_SHA:0:12}"
@@ -805,9 +907,24 @@ fi
 # exactly the commits the branch carries, and it has no path to the
 # agent's worktree - which the post-run comparison then proves rather
 # than assumes.
+# A content hash, not a count. Comparing head plus the number of
+# porcelain lines missed the case that matters most: a verifier that
+# rewrites an already-modified file, or swaps one dirty path for
+# another, leaves both numbers identical. `git diff HEAD` puts the
+# tracked content in the hash; porcelain covers what is untracked.
+# Untracked *content* is still outside it, which is the residual.
+tree_state() {
+    {
+        git -C "$WT" rev-parse HEAD
+        git -C "$WT" -c core.quotepath=off status --porcelain
+        git -C "$WT" diff HEAD
+    } 2>/dev/null | git hash-object --stdin
+}
+
 step "Verifier"
 VERIFY_EXIT=0
 VERIFY_WHERE="(not run)"
+VERIFY_WT_LEFTOVER=""
 TREE_MUTATED=""
 if [ "$TREE_BROKEN" -eq 1 ]; then
     say "  skipped - worktree unreadable"
@@ -820,6 +937,7 @@ elif ! git -C "$REPO" worktree add --detach "$VERIFY_WT" "$HEAD_SHA" >>"$RUN_LOG
     board "verify-skipped" "verify checkout failed"
 else
     VERIFY_WHERE="clean checkout of ${HEAD_SHA:0:12}"
+    PRE_STATE="$(tree_state)"
     say "  $TASK_VERIFY"
     say "  in $VERIFY_WT"
     # The one tool-specific line in the runner, and it is a cost
@@ -833,13 +951,24 @@ else
     say "  exit $VERIFY_EXIT"
     board "verified" "exit $VERIFY_EXIT"
 
-    git -C "$REPO" worktree remove --force "$VERIFY_WT" >>"$RUN_LOG" 2>&1 \
-        || say "  could not remove $VERIFY_WT - remove it by hand"
+    # A checkout that will not go away is not cosmetic: the next run for
+    # this task hits the leftover guard and refuses to start. It has to
+    # reach the verdict, not just the console.
+    if ! git -C "$REPO" worktree remove --force "$VERIFY_WT" >>"$RUN_LOG" 2>&1; then
+        VERIFY_WT_LEFTOVER="$VERIFY_WT"
+        say "  could not remove $VERIFY_WT"
+    fi
 
-    POST_HEAD="$(git -C "$WT" rev-parse HEAD 2>/dev/null)" || POST_HEAD="(unreadable)"
-    POST_DIRTY="$(git -C "$WT" status --porcelain | wc -l | tr -d ' ')"
-    if [ "$POST_HEAD" != "$HEAD_SHA" ] || [ "$POST_DIRTY" != "$DIRTY" ]; then
-        TREE_MUTATED="verifier changed the tree it was measuring: head $HEAD_SHA -> $POST_HEAD, uncommitted $DIRTY -> $POST_DIRTY file(s)"
+    POST_STATE="$(tree_state)"
+    if [ "$POST_STATE" != "$PRE_STATE" ]; then
+        POST_HEAD="$(git -C "$WT" rev-parse HEAD 2>/dev/null)" || POST_HEAD="(unreadable)"
+        POST_DIRTY="$(git -C "$WT" status --porcelain | wc -l | tr -d ' ')"
+        TREE_MUTATED="verifier changed the tree it was measuring.
+    head        $HEAD_SHA -> $POST_HEAD
+    uncommitted $DIRTY -> $POST_DIRTY file(s)
+    state       ${PRE_STATE:0:12} -> ${POST_STATE:0:12}
+Head and the file count can both be unchanged and the contents still
+differ; the state hash is what caught it."
     fi
 fi
 
@@ -875,6 +1004,16 @@ elif [ "$VERIFY_EXIT" -ne 0 ]; then
 elif [ -n "$SCOPE_VIOLATIONS" ]; then
     STATUS="blocked"
     BLOCKERS="files changed outside touches:"$'\n'"$SCOPE_VIOLATIONS"
+elif [ -n "$TODO_VIOLATIONS" ]; then
+    STATUS="blocked"
+    BLOCKERS="new TODO/FIXME without a linked issue number:"$'\n'"$TODO_VIOLATIONS"
+elif [ -n "$VERIFY_WT_LEFTOVER" ]; then
+    # Not the work's fault, and still not something to hand over
+    # quietly: the next run for this task cannot start until it is gone.
+    STATUS="needs-review"
+    BLOCKERS="the verify checkout could not be removed: $VERIFY_WT_LEFTOVER
+Remove it before re-running:
+    git -C $REPO worktree remove --force $VERIFY_WT_LEFTOVER"
 elif [ "$DIRTY" -ne 0 ]; then
     STATUS="needs-review"
     BLOCKERS="$DIRTY uncommitted file(s) left in the worktree"

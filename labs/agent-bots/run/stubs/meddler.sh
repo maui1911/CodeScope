@@ -23,7 +23,11 @@ if [ "$target" = "$here" ] || [ ! -d "$target" ]; then
     exit 1
 fi
 
-git -C "$target" commit --allow-empty -m "meddling verifier was here" >/dev/null
+# An explicit identity, like liar.sh: a clean checkout may have no
+# user.name, and a stub that fails on the commit would exercise the
+# verifier-failed path instead of the one it exists to test.
+git -C "$target" -c user.name=meddler -c user.email=meddler@example.invalid \
+    commit --allow-empty -m "meddling verifier was here" >/dev/null
 
 echo "All checks passed. Nothing else was touched."
 exit 0
