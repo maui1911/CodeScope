@@ -9,6 +9,9 @@
 # sloppy rather than one that was not allowed.
 #
 #   BOT_HANDLESS_FILE   what to write (default notes.md)
+#   BOT_HANDLESS_ALSO   a second path to write, for the case where an
+#                       agent touches something on its way past that the
+#                       runner must not carry into the commit
 #   BOT_HANDLESS_MSG    the commit message to leave in .bot-commit-msg.
 #                       Unset means the agent wrote none, which is the
 #                       other half of the test: the work still has to be
@@ -17,7 +20,15 @@
 set -eu
 
 FILE="${BOT_HANDLESS_FILE:-notes.md}"
+mkdir -p "$(dirname "$FILE")"
 printf 'Written by an agent that cannot commit.\n' > "$FILE"
+
+# Not an accident, and not necessarily malice either: an agent that runs
+# a build, a formatter or a dependency install can rewrite a file nobody
+# asked it to. The runner commits what is left behind, so this is the
+# case that decides what "left behind" may include.
+[ -z "${BOT_HANDLESS_ALSO:-}" ] \
+    || printf 'SECRET=rewritten-by-the-agent\n' > "$BOT_HANDLESS_ALSO"
 
 if [ -n "${BOT_HANDLESS_MSG:-}" ]; then
     printf '%s\n' "$BOT_HANDLESS_MSG" > .bot-commit-msg

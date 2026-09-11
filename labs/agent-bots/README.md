@@ -2518,3 +2518,76 @@ that reaches it through the full loop is testing whatever is at base.
 That is contract-read-at-base doing its job, not a defect — but it
 means "the sweep is green" answers a narrower question than it looks
 like it does, and it is worth knowing which of the two it answered.
+
+---
+
+### F-34 · The same command, protective or destructive, depending on state nobody checked
+
+*2026-09-11, two review rounds on `produces:` and the surface.*
+
+Seven findings, and the one worth keeping is four characters long.
+
+`strip_protected` holds secrets back by running `git rm --cached` on
+every protected path in the index. On a path the agent just created
+that unstages it, which is the whole intent. On a path the project
+committed years ago — some repositories do have a `.env` in their
+history — the same command stages a **deletion**, and the runner's
+fallback commit records the removal of a file nobody asked it to touch.
+The protective operation is the destructive one, and which of the two
+it is depends on a fact the function never looked up.
+
+Nothing about it reads as dangerous. "Drop the protected paths from the
+index" is exactly what it does. It is the index that has two meanings —
+*staged addition* and *staged difference from HEAD* — and the code was
+written against the first while running against both.
+
+Its twin, one screen further down: the blocker for a protected path in
+a commit ends with the sentence **"Nothing is pushed."** That sentence
+was not true. The push was gated on a broken tree and on the commit
+count, never on `PROTECTED_IN_DIFF`, so a run could print the promise
+and publish the branch in the same breath — and a folder run would
+write the secret into `.state/patches/` instead, which is the same
+publication through a different door. The prose was the specification
+and nobody had run it.
+
+So: anything the base already carries is put back exactly as the base
+has it, only genuinely new paths are dropped, and a run that held
+something back says so and comes back `needs-review` rather than
+`done`. A rewritten `.env` is not necessarily malice — a formatter, an
+install, a rotated key — but it is not a verifier's call either.
+
+The other five, briefly, because each is a smaller version of something
+already written down here:
+
+- **The control plane inside a folder project.** An import walks the
+  whole folder, so `--state` under `$REPO` puts this run's logs,
+  prompts and the snapshot repository itself into the surface, hands
+  them to the agent, and snapshots them again next run. It compounds.
+  Refused at dispatch now. A git project was safe only by accident.
+- **`PROTECTED_IN_DIFF` was not recomputed after a rebase**, exactly as
+  the scope check was not one round earlier. A base-side rename can
+  land a patch at a path the original diff never had. Fixing the same
+  shape twice means the lesson was "re-run the scope check", when it
+  should have been "re-run *every* diff-derived check".
+- **A branch name is not a reservation.** The dispatch check asks the
+  project whether `refs/heads/<branch>` exists — but a surface is a
+  standalone clone, so the ref only appears there at the push. Two task
+  ids naming one branch both pass, both do all the work, and the loser
+  finds out last. `touches:` does not catch it: the collision is in the
+  name, not in the files.
+- **A channel is a file the agent wrote, never a link to one.** `[ -f ]`
+  is true through a symlink and `mv` moves the link, so
+  `.bot-review.md` could be a link to anything on the host — stored as
+  this run's evidence, read by the verifier through the link. Removed
+  unread now.
+- **`--shared` means the base objects live in the origin.** A surface
+  kept as evidence borrows them, and the base ref is free to move or be
+  deleted while it waits. The commit is pinned at `refs/bot-base/<id>`
+  for as long as the surface exists.
+
+What generalises: **ask what a command does in the state you did not
+test, not in the state you had in mind.** The index entry that is an
+addition in one repository is a deletion in another; the branch name
+that is free in the project is taken in a sibling clone; the file that
+is a file is a link. Every one of these was correct in the case that
+was in front of me while writing it.

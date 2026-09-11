@@ -123,10 +123,11 @@ is_protected() {   # is_protected <path> - by basename, which is how these are n
     return 1
 }
 
-# strip_protected - drop protected paths from the index that has just
-# been built. `$@` is the git invocation prefix, because the snapshot
-# builds its index with --git-dir and a temporary GIT_INDEX_FILE while
-# the surface does neither.
+# strip_protected <base-commit-or-empty> [git args...] - drop protected
+# paths from the index that has just been built. The trailing arguments
+# are the git invocation prefix, because the snapshot builds its index
+# with --git-dir and a temporary GIT_INDEX_FILE while the surface does
+# neither.
 #
 # After the fact rather than as a pathspec on the `add`, for two
 # reasons. git refuses an `add` whose pathspec set names a file its
@@ -134,16 +135,43 @@ is_protected() {   # is_protected <path> - by basename, which is how these are n
 # one does not care how a path got into the index, which is the point -
 # a .gitignore negation re-including a secret is exactly the case
 # info/exclude cannot hold.
+#
+# The base commit is what makes "hold it back" mean the same thing for
+# a path that is already in the history. `rm --cached` on one of those
+# does not unstage the agent's edit, it stages a *deletion* - so a
+# project that committed its .env years ago would have this runner
+# quietly remove it, and the protected-diff check downstream would only
+# notice after the commit existed. Anything the base already carries is
+# put back exactly as the base has it; only genuinely new paths are
+# dropped.
+# What the last call held back, for the verdict to read. Collected here
+# rather than inferred later, because by then the index is clean and
+# there is nothing left to notice: the whole point of this function is
+# that it makes the evidence stop mentioning these paths.
+PROTECTED_HELD=""
+
 strip_protected() {
-    local f staged
+    local base="$1" f staged entry mode sha
+    shift
     staged="$(git "$@" ls-files 2>/dev/null || true)"
     [ -n "$staged" ] || return 0
     while IFS= read -r f; do
         [ -n "$f" ] || continue
-        if is_protected "$f"; then
-            git "$@" rm --cached -q --ignore-unmatch -- "$f" >/dev/null 2>&1 || true
-            say "  held back $f - a protected path"
+        is_protected "$f" || continue
+        if [ -n "$base" ] && git "$@" cat-file -e "$base:$f" 2>/dev/null; then
+            entry="$(git "$@" ls-tree "$base" -- "$f" 2>/dev/null || true)"
+            mode="${entry%% *}"
+            sha="$(printf '%s' "$entry" | awk '{print $3}')"
+            if [ -n "$mode" ] && [ -n "$sha" ] \
+                && git "$@" update-index --cacheinfo "$mode,$sha,$f" >/dev/null 2>&1; then
+                say "  held back $f - a protected path, left as $base has it"
+                PROTECTED_HELD="$PROTECTED_HELD    $f"$'\n'
+                continue
+            fi
         fi
+        git "$@" rm --cached -q --ignore-unmatch -- "$f" >/dev/null 2>&1 || true
+        say "  held back $f - a protected path"
+        PROTECTED_HELD="$PROTECTED_HELD    $f"$'\n'
     done <<< "$staged"
     return 0
 }
@@ -341,6 +369,30 @@ abspath() {   # abspath <path> - works on a path that does not exist yet
 mkdir -p "$STATE"
 STATE="$(cd "$STATE" && pwd)"
 WORKTREE_ROOT="$(abspath "$WORKTREE_ROOT")"
+
+# Nothing the runner writes may live inside a folder project. A git
+# project is safe by accident - the control plane is either outside it
+# or ignored by it - but an import walks the whole folder, so state
+# under $REPO would put this run's logs, prompts, handoffs and the
+# snapshot repository itself into the work surface, hand them to the
+# agent, and then snapshot them again next time. It compounds, and the
+# first sign of it is a surface that grows every run.
+if [ "$SURFACE" = "import" ]; then
+    for d in "$STATE" "$WORKTREE_ROOT"; do
+        case "$d" in
+            "$REPO"|"$REPO"/*) die \
+"$d is inside $REPO, which is a plain folder.
+
+A folder project is imported whole, so anything the runner keeps in
+there becomes part of the snapshot and part of what the agent can read
+- including the snapshot itself, on the next run. Put it somewhere
+else:
+
+    --state <a directory outside $REPO>
+    --worktree-root <a directory outside $REPO>" ;;
+        esac
+    done
+fi
 
 # A control plane belongs to one repository. Live tasks and locks are
 # keyed by task id alone, so pointing the default state at a second repo
@@ -595,6 +647,11 @@ snapshot_folder() {   # snapshot the folder into $ORIGIN_REPO as refs/heads/fold
     [ -d "$ORIGIN_REPO" ] || git init --bare --quiet "$ORIGIN_REPO" \
         || die "could not create the snapshot repository at $ORIGIN_REPO"
 
+    # Read before the index is built rather than after: it is both the
+    # commit this snapshot descends from and the answer to "was this
+    # protected path already in here", which strip_protected needs.
+    parent="$(git --git-dir="$ORIGIN_REPO" rev-parse -q --verify refs/heads/folder 2>/dev/null || true)"
+
     # What never gets imported. A folder has no .gitignore discipline by
     # definition - that is most of what makes it a folder - so without
     # this the first snapshot of a node project is node_modules and the
@@ -644,7 +701,7 @@ EXCLUDE
         git -c core.bare=false --git-dir="$ORIGIN_REPO" --work-tree="$LAB_DIR/contract" \
             add -A -- . ) >>"$IMPORT_LOG" 2>&1 \
         || { rm -f "$idx" "$cidx"; die "could not import the contract; see $IMPORT_LOG"; }
-    GIT_INDEX_FILE="$idx" strip_protected -c core.bare=false \
+    GIT_INDEX_FILE="$idx" strip_protected "$parent" -c core.bare=false \
         --git-dir="$ORIGIN_REPO" --work-tree="$REPO"
 
     ctree="$(GIT_INDEX_FILE="$cidx" git --git-dir="$ORIGIN_REPO" write-tree)"
@@ -656,7 +713,6 @@ EXCLUDE
     tree="$(GIT_INDEX_FILE="$idx" git --git-dir="$ORIGIN_REPO" write-tree)"
     rm -f "$idx"
 
-    parent="$(git --git-dir="$ORIGIN_REPO" rev-parse -q --verify refs/heads/folder 2>/dev/null || true)"
     if [ -n "$parent" ] \
        && [ "$(git --git-dir="$ORIGIN_REPO" rev-parse "$parent^{tree}")" = "$tree" ]; then
         # Nothing has changed. Reuse the commit rather than making an
@@ -989,6 +1045,7 @@ MY_FILES="$(expand_globs "$TASK_TOUCHES" | sort -u)"
 OVERLAP_REPORT=""
 OVERLAP_IDS=""
 STALE_DISPATCH=""
+BRANCH_TAKEN=""
 
 # A function because it has to run twice: once before the plan, so a
 # human (and --dry-run) can see the collision, and once again inside the
@@ -997,6 +1054,7 @@ scan_overlaps() {
 OVERLAP_REPORT=""
 OVERLAP_IDS=""
 STALE_DISPATCH=""
+BRANCH_TAKEN=""
 if [ -d "$STATE/tasks" ]; then
     for live in "$STATE"/tasks/*.md; do
         [ -f "$live" ] || continue
@@ -1005,6 +1063,18 @@ if [ -d "$STATE/tasks" ]; then
         [ -n "$other_id" ] || continue
         [ "$other_id" != "$TASK_ID" ] || continue
         [ "$(field status "$live")" = "dispatched" ] || continue
+
+        # Before the `produces:` skip, because a report gets a branch
+        # too. The origin-ref check at dispatch cannot see this one: a
+        # standalone clone creates refs/heads/<branch> in the *clone*,
+        # and the project only learns the name exists at the push right
+        # at the end. So two task ids naming one branch both pass, both
+        # do all their work, and the loser finds out as a push failure.
+        # `touches:` does not catch it either - the collision is in the
+        # name, not in the files.
+        [ "$(field branch "$live")" != "$TASK_BRANCH" ] \
+            || BRANCH_TAKEN="$other_id"
+
         # A report claims nothing: it cannot conflict at merge, which
         # is the only reason this check exists.
         [ "$(field produces "$live")" != "report" ] || continue
@@ -1284,7 +1354,8 @@ cat <<PLAN
   branch    $TASK_BRANCH
   surface   $WT ($SURFACE${IMPORT_REPORT:+ - $IMPORT_REPORT})
   origin    $ORIGIN_REPO
-  touches   $TASK_TOUCHES
+  touches   $TASK_TOUCHES${BRANCH_TAKEN:+
+  conflict  $BRANCH_TAKEN already claims branch $TASK_BRANCH}
   overlap   $OVERLAP_SUMMARY
   verify    $TASK_VERIFY
   state     $STATE
@@ -1416,6 +1487,20 @@ fi
 
 scan_overlaps
 
+if [ -n "$BRANCH_TAKEN" ]; then
+    board "dispatch-refused" "branch $TASK_BRANCH claimed by $BRANCH_TAKEN"
+    refuse "task $BRANCH_TAKEN is in flight on branch '$TASK_BRANCH', which this
+task also declares.
+
+One branch cannot hold two tasks' work. The project's ref is free right
+now - a surface is a standalone clone, so the branch only appears in
+$ORIGIN_REPO at the push - which is why this is checked here and not
+against git: both runs would pass that check, both would do all their
+work, and the second would find out as a failed push.
+
+Give one of them a branch of its own, or wait for $BRANCH_TAKEN."
+fi
+
 if [ -n "$OVERLAP_IDS" ]; then
     if [ "$TASK_PRODUCES" = "report" ]; then
         # Not a refusal, and not nothing either: the report is about the
@@ -1502,6 +1587,16 @@ fi
 # eating something else. See F-24 - a harness that can destroy your
 # work is worse than no harness.
 printf 'bot-run surface for %s\n' "$TASK_ID" > "$WT/.git/bot-surface"
+
+# --shared means the base objects are read out of $ORIGIN_REPO through
+# alternates rather than copied here. A surface kept as evidence - a
+# conflict, a red re-verify, a push that failed - therefore depends on
+# the origin still being able to reach them, and the base ref is free to
+# move, be deleted or be force-pushed while it waits. Then the evidence
+# is a directory git cannot read. Pin the commit for as long as the
+# surface exists; drop_surface drops it.
+git -C "$ORIGIN_REPO" update-ref "refs/bot-base/$TASK_ID" "$BASE_SHA" >>"$RUN_LOG" 2>&1 \
+    || say "  note: could not pin $BASE_SHA in $ORIGIN_REPO - see $RUN_LOG"
 printf '%s\n' "$PROTECTED_EXCLUDE_FILE" >> "$WT/.git/info/exclude"
 
 # Whose commit this is, set on the surface rather than on the commit, so
@@ -1542,7 +1637,11 @@ drop_surface() {
     fi
     [ -f "$WT/.git/bot-surface" ] || { say "  refusing to remove $WT - not a surface this run made"; return 1; }
     rm -rf "$WT"
-    [ ! -e "$WT" ]
+    [ ! -e "$WT" ] || return 1
+    # Nothing borrows the base objects any more. Last, so that a removal
+    # that refused above still leaves the pin in place.
+    git -C "$ORIGIN_REPO" update-ref -d "refs/bot-base/$TASK_ID" >/dev/null 2>&1 || true
+    return 0
 }
 
 rollback_dispatch() {
@@ -1653,6 +1752,22 @@ else
     INSTR_STATUS="(none declared)"
 fi
 
+# `-f` is true through a symlink and `mv` moves the link rather than
+# what it points at, so an artifact could be a link to any file on the
+# host: stored as this run's evidence, read by the verifier through the
+# link, and published into the control plane. Nothing outside the
+# surface is this run's to carry out of it. The link is removed rather
+# than followed, and the run is blocked below - an agent that did this
+# was not answering the task.
+CHANNEL_SYMLINK=""
+for chan in ".bot-blocked" ".bot-commit-msg" "$TASK_ARTIFACT"; do
+    if [ -L "$WT/$chan" ]; then
+        CHANNEL_SYMLINK="${CHANNEL_SYMLINK:+$CHANNEL_SYMLINK, }$chan"
+        rm -f "$WT/$chan"
+        say "  removed $chan - a symlink, not a channel"
+    fi
+done
+
 AGENT_BLOCKED=""
 if [ -f "$WT/.bot-blocked" ]; then
     # head first, tr second: the other order hands `tr` a file it is
@@ -1753,8 +1868,9 @@ if [ "$TASK_PRODUCES" = "commit" ] && [ -z "$AGENT_BLOCKED" ] && [ "$AGENT_EXIT"
         # Author is the bot, committer is the runner. That is what the
         # split is for, and it is the honest reading: the bot did the
         # work, this script recorded it.
+        PROTECTED_HELD=""
         if git -C "$WT" add -A >>"$RUN_LOG" 2>&1 \
-            && strip_protected -C "$WT" \
+            && strip_protected HEAD -C "$WT" \
             && GIT_COMMITTER_NAME=bot-run GIT_COMMITTER_EMAIL=bot-run@invalid \
                git -C "$WT" \
                  -c "user.name=$TASK_OWNER (via $AGENT_ID)" \
@@ -2016,6 +2132,15 @@ elif [ "$BASE_IS_ANCESTOR" -eq 0 ]; then
     BLOCKERS="the branch no longer descends from the commit it was dispatched at.
 base $BASE_SHA is not an ancestor of head $HEAD_SHA, so the commit count
 below describes nothing and any work that was done has been discarded."
+elif [ -n "$CHANNEL_SYMLINK" ]; then
+    # Above the agent's own channels, because one of the things this
+    # could be is a symlinked '.bot-blocked' - a refusal the runner
+    # would otherwise quote out of a file the agent never wrote.
+    STATUS="blocked"
+    BLOCKERS="a channel between agent and runner was a symlink: $CHANNEL_SYMLINK
+The runner does not follow those - a link can point anywhere on this
+machine, and following one would put a host file into the control plane
+as this run's evidence. They were removed unread."
 elif [ "$HEAD_BRANCH" != "$TASK_BRANCH" ]; then
     STATUS="blocked"
     BLOCKERS="the worktree is not on '$TASK_BRANCH' any more - HEAD is $HEAD_BRANCH.
@@ -2097,6 +2222,18 @@ elif [ "$COMMITS" -gt 1 ]; then
     # decides whether to squash.
     STATUS="needs-review"
     BLOCKERS="$COMMITS commits, charter asks for exactly one"
+elif [ -n "$PROTECTED_HELD" ]; then
+    # Not `blocked`: the work is committed and verified, and nothing
+    # that never travels went anywhere. But an agent rewrote one of
+    # them, and a run that says `done` about that has decided something
+    # only a human gets to decide.
+    STATUS="needs-review"
+    BLOCKERS="the agent changed files that never travel, and this run did not carry them:
+$PROTECTED_HELD
+The commit has them exactly as $TASK_BASE does. The agent's version is
+still on disk in $WT and was pushed nowhere. Whether the edit was meant
+- a rotated key, a formatter, an install that rewrote .npmrc - is not
+something a verifier can answer."
 elif [ "$TASK_PRODUCES" = "report" ] && [ "$ARTIFACT_VERDICT" = "blocked" ]; then
     # The bot's own escalation. A shape template defines `blocked` as
     # work that could not be completed, and a run that hands one back as
@@ -2349,6 +2486,7 @@ decision, not a cleanup rule."
                 REBASED_TOUCHED="$(git -C "$WT" -c core.quotepath=off \
                     diff --name-only --no-renames "$NEW_BASE_SHA..$REBASED_HEAD" 2>/dev/null || true)"
                 REBASED_SCOPE=""
+                REBASED_PROTECTED=""
                 if [ -n "$REBASED_TOUCHED" ]; then
                     while IFS= read -r rfile; do
                         [ -n "$rfile" ] || continue
@@ -2358,6 +2496,14 @@ decision, not a cleanup rule."
                             case "$rfile" in $g) rok=1; break ;; esac
                         done
                         [ "$rok" -eq 1 ] || REBASED_SCOPE="$REBASED_SCOPE$rfile"$'\n'
+                        # Same argument as the scope check one line up,
+                        # and a worse outcome if it is skipped: a
+                        # rename on the base side can land this patch
+                        # at a path the original diff never had, and
+                        # PROTECTED_IN_DIFF describes the diff before
+                        # the replay.
+                        ! is_protected "$rfile" \
+                            || REBASED_PROTECTED="$REBASED_PROTECTED    $rfile"$'\n'
                     done <<< "$REBASED_TOUCHED"
                 fi
 
@@ -2406,6 +2552,18 @@ The replay ran on a detached head, so $TASK_BRANCH never left
 ${PRE_REBASE_HEAD:0:12} - the tree that passed - and the evidence
 recorded below is still true of it.${TREE_MUTATED:+
 The re-verify also changed the worktree: $TREE_MUTATED}"
+                elif [ -n "$REBASED_PROTECTED" ]; then
+                    # Ahead of scope: one of these is a file in the
+                    # wrong place, the other is a secret.
+                    REBASE_STATE="clean and green on ${NEW_BASE_SHA:0:12}, carrying files that never travel"
+                    board "rebase-protected" "${NEW_BASE_SHA:0:12}"
+                    STATUS="blocked"
+                    REBASE_KEPT_REASON="replaying this onto ${NEW_BASE_SHA:0:12} put paths that never
+travel into the diff:
+$(printf '%s' "$REBASED_PROTECTED")
+It verified there, and a verifier has no opinion about what a path is
+called. The branch was left on ${PRE_REBASE_HEAD:0:12}, where the diff
+carried none of them, and nothing was pushed."
                 elif [ -n "$REBASED_SCOPE" ]; then
                     # Green, and out of bounds. A verifier has no opinion
                     # about scope, so a passing re-verify is not on its
@@ -2520,7 +2678,16 @@ fi
 PUSHED=""
 PUSH_FAILED=""
 PATCH_FILE=""
-if [ "$TREE_BROKEN" -eq 0 ] && [ "$COMMITS" -gt 0 ]; then
+# PROTECTED_IN_DIFF gates this as hard as a broken tree does. The
+# blocker it writes says "Nothing is pushed", and that has to be true of
+# the patch as well - a folder run would otherwise write the secret into
+# .state/patches/ instead, which is the same publication by a different
+# door.
+if [ -n "$PROTECTED_IN_DIFF" ]; then
+    say ""
+    say "Result branch: not pushed - the diff carries paths that never travel."
+fi
+if [ "$TREE_BROKEN" -eq 0 ] && [ "$COMMITS" -gt 0 ] && [ -z "$PROTECTED_IN_DIFF" ]; then
     step "Result branch"
     # The path, not the remote name. `origin` lives in the surface's
     # own .git/config, which the agent can write - Codex is explicitly
