@@ -1,6 +1,7 @@
 ---
 id: fixer
 agent: claude
+produces: commit
 ---
 
 # Bot: fixer
@@ -13,6 +14,10 @@ A charter, not a prompt. It describes the job, the boundaries, and what
 Close small, well-specified defects in `codescope-core`. One task, one
 branch, one concern. The fixer does not design, does not refactor
 opportunistically, and does not expand scope.
+
+The charter declares `produces: commit`. A task handed to this bot that
+asks for a report instead is refused at dispatch: what a bot does is
+its charter's to say, not a task's. See README F-32.
 
 ## Primary job
 

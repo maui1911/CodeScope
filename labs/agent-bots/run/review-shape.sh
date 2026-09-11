@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 #
-# review-shape.sh - the verifier for a `kind: review` task.
+# review-shape.sh - the verifier for the reviewer's report.
+#
+# One shape among several: `produces: report` says a task leaves a file
+# beside the tree, and `shape:` says which template that file has to
+# match. This is the verifier for templates/REVIEW.md. Another report
+# role brings its own template and its own checker; the runner hands
+# every one of them the same three facts.
 #
 # "No verifier, no dispatch" is the rule, and a review has no cargo
 # command that can prove it. What it does have is a shape, and a set of
@@ -20,8 +26,13 @@
 #
 # The runner exports what it needs; there are no arguments.
 #
-#   BOT_REVIEW        path to the harvested review
+#   BOT_REVIEW        path to the harvested report
 #   BOT_REVIEWED_SHA  the commit the worktree was checked out at
+#
+# Named for the reviewer rather than for the role, because the
+# runner exporting them lives at base while this script is read from
+# the checkout under test - so the pair can only be renamed once
+# both halves are already merged. See #348.
 #   BOT_TOUCHES       the task's touches: globs, comma-separated
 #   BOT_TASK_ID       the task this review is supposed to answer
 #
@@ -31,7 +42,7 @@ set -euo pipefail
 
 fail() { printf 'review-shape: %s\n' "$*" >&2; exit 1; }
 
-[ -n "${BOT_REVIEW:-}" ] || fail "BOT_REVIEW is not set - this verifier is for kind: review tasks"
+[ -n "${BOT_REVIEW:-}" ] || fail "BOT_REVIEW is not set - this verifier is for produces: report tasks"
 [ -f "$BOT_REVIEW" ] || fail "no review at $BOT_REVIEW"
 
 field() {

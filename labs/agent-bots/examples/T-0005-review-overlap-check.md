@@ -1,6 +1,6 @@
 ---
 id: T-0005
-kind: review
+produces: report
 title: Review the dispatch claim and the overlap check
 owner: reviewer
 status: todo
@@ -53,7 +53,7 @@ This is the first task for a second bot, so it is as much a test of the
 loop as of the code. The runner's own acceptance rules invert here: zero
 commits is the success shape, and a commit is a failed run.
 
-The review is harvested into `.state/reviews/` and the worktree is
+The review is harvested into `.state/artifacts/` and the worktree is
 removed afterwards — the artifact is the review file, not a branch.
 
 Out of scope: the contract Markdown, the stubs, and the README prose.

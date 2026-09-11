@@ -35,14 +35,27 @@ Known traps, prior attempts, things deliberately out of scope.
 Field reference:
 
   id       stable, unique. Used for the branch name and the log.
-  kind     change (default) | review
-           A `review` task inverts the acceptance rules: it must make
-           NO commit, its bot writes `.bot-review.md` in the worktree
-           root, and the runner harvests that file into the control
-           plane. A commit from a reviewer is a failed run. Review
-           tasks are exempt from the overlap check in both directions,
-           because a bot that writes nothing cannot conflict at merge.
-           See README F-19.
+  produces commit (default) | report
+           What this task puts into the world. `commit` lands in the
+           tree and gets the branch, the verifier and the rebase.
+           `report` lands beside it: the bot makes NO commit, writes
+           one file in the worktree root, and the runner harvests that
+           into the control plane. A commit from a report task is a
+           failed run. Report tasks are exempt from the overlap check
+           in both directions, because a bot that writes nothing into
+           the tree cannot conflict at merge. It has to match the
+           `produces:` on the owner's charter — the charter is the job
+           description, and a task does not get to change it.
+           See README F-19 and F-32.
+  artifact report tasks only. The file the bot writes, default
+           `.bot-review.md`. A plain filename in the worktree root
+           beginning with `.bot-`, the namespace reserved for channels
+           between agent and runner. `.bot-blocked` and
+           `.bot-commit-msg` are taken.
+  shape    report tasks only. The template the artifact has to match,
+           default `templates/REVIEW.md`. Read at base like every other
+           contract file, and named in the prompt as the contract for
+           what the bot produces.
   schedule manual (default) | auto
            Whether bot-tick.sh may dispatch this on its own. Opt-in,
            because a scheduler that runs every file it can see will run
@@ -55,7 +68,7 @@ Field reference:
            unattended by definition. Recurrence is decided by the clock,
            not by the status - see README F-23.
   on_changes_requested
-           review tasks only, optional. The bot that receives the
+           report tasks only, optional. The bot that receives the
            follow-up when the verdict is `changes-requested`. The
            runner writes that task itself, scoped to the paths the
            findings cite, based on the commit that was reviewed, and
@@ -87,8 +100,11 @@ Field reference:
            It must be a predicate the owner can satisfy inside its own
            `touches:` - a whole-crate gate blocks every run on debt the
            bot may not fix. See README F-1.
-           On a `kind: review` task the subject changes but the rule
-           does not: run/review-shape.sh checks the review against the
-           tree it claims to be about. The runner exports BOT_REVIEW,
-           BOT_REVIEWED_SHA and BOT_TOUCHES for it.
+           On a `produces: report` task the subject changes but the
+           rule does not: run/review-shape.sh checks the reviewer's
+           report against the tree it claims to be about, and another
+           report role brings its own checker. The runner exports
+           BOT_REVIEW, BOT_REVIEWED_SHA, BOT_TOUCHES and BOT_TASK_ID
+           for it — the first two still named for the reviewer, which
+           issue #348 is about.
 -->

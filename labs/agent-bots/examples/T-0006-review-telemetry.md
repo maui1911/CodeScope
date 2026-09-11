@@ -1,6 +1,6 @@
 ---
 id: T-0006
-kind: review
+produces: report
 title: Review core/src/telemetry.rs against the conventions
 owner: reviewer
 status: todo

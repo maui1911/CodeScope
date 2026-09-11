@@ -1,6 +1,7 @@
 ---
 id: reviewer
 agent: claude
+produces: report
 ---
 
 # Bot: reviewer
@@ -14,6 +15,12 @@ Read code and judge it. The reviewer produces an opinion backed by file
 and line references, and produces nothing else. It does not fix what it
 finds — that is a task for the fixer, written by a human who read the
 review.
+
+The charter declares `produces: report`, and that is not a formality:
+a task that asks this bot for a commit is refused at dispatch, before a
+work surface exists. `artifact:` and `shape:` default to
+`.bot-review.md` and `templates/REVIEW.md` — the reviewer's pair, not
+the mechanism's. See README F-32.
 
 ## Primary job
 

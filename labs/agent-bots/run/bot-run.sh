@@ -463,17 +463,55 @@ TASK_BRANCH="$(field branch)"
 TASK_TOUCHES="$(field touches)"
 TASK_VERIFY="$(field verify)"
 
-# Two kinds of task, because a reviewer breaks half the acceptance
-# rules a change task lives by: it must produce no commit, and its
-# output is a file the runner harvests rather than a diff. Everything
-# else - worktree, evidence, verifier, handoff - is identical, which is
-# the claim this second kind exists to test. See F-19.
-TASK_KIND="$(field kind)"
-TASK_KIND="${TASK_KIND:-change}"
-case "$TASK_KIND" in
-    change|review) ;;
-    *) die "kind '$TASK_KIND' is not one of: change, review" ;;
+# What this task puts into the world, which is the axis the runner
+# actually branches on. `commit` lands in the tree and gets the whole
+# branch/verify/rebase machinery; `report` lands beside it - one file
+# the runner harvests into the control plane, and a commit is a failed
+# run. Everything else - surface, evidence, verifier, handoff - is
+# identical, which is the claim the second value exists to test.
+#
+# It was `kind: change | review` until the roster stopped being all
+# code writers. Same axis, named after the deliverable rather than
+# after the one role that first had it: `review` was spelled into
+# every branch in this file, so every future bot that reads instead of
+# writing would have arrived as another exception to the writing one.
+# See F-19 and F-32.
+TASK_PRODUCES="$(field produces)"
+TASK_PRODUCES="${TASK_PRODUCES:-commit}"
+case "$TASK_PRODUCES" in
+    commit|report) ;;
+    *) die "produces '$TASK_PRODUCES' is not one of: commit, report" ;;
 esac
+
+# A report task names the file it leaves behind and the template that
+# file has to match. Both default to the reviewer's, because that is
+# the role that got here first - but neither is hardcoded any more,
+# which is the point of the rename rather than a side effect of it.
+TASK_ARTIFACT="$(field artifact)"
+TASK_ARTIFACT="${TASK_ARTIFACT:-.bot-review.md}"
+TASK_SHAPE="$(field shape)"
+TASK_SHAPE="${TASK_SHAPE:-templates/REVIEW.md}"
+if [ "$TASK_PRODUCES" = "report" ]; then
+    # A plain filename in the surface root, inside the runner's own
+    # `.bot-` namespace. That namespace is reserved for the channels
+    # between agent and runner, so an artifact can never collide with a
+    # file the project owns, and it is the one name a report bot is
+    # allowed to create - anything else it writes shows up as a dirty
+    # tree or a commit, both of which already fail the run.
+    case "$TASK_ARTIFACT" in
+        */*|*..*) die "artifact '$TASK_ARTIFACT' must be a plain filename in the surface root" ;;
+    esac
+    case "$TASK_ARTIFACT" in
+        .bot-commit-msg) die "artifact '.bot-commit-msg' is the commit-message channel - pick another name" ;;
+        .bot-blocked)    die "artifact '.bot-blocked' is the refusal channel - pick another name" ;;
+        .bot-?*)         ;;
+        *) die "artifact '$TASK_ARTIFACT' must start with '.bot-'" ;;
+    esac
+    case "$TASK_SHAPE" in
+        templates/?*.md) ;;
+        *) die "shape '$TASK_SHAPE' must name a template under the contract, e.g. templates/REVIEW.md" ;;
+    esac
+fi
 
 # What a `changes-requested` verdict turns into. Both come from the
 # task, which is contract - never from the review, which is a claim.
@@ -695,10 +733,31 @@ for rel in "bots/$TASK_OWNER/BOT.md" \
     base_has "$rel" || missing_at_base "$rel"
 done
 
-# A review task is pointed at the template as well, so it is part of
-# that task's contract and gets the same treatment.
-if [ "$TASK_KIND" = "review" ]; then
-    base_has "templates/REVIEW.md" || missing_at_base "templates/REVIEW.md"
+# The charter is what a bot *is*; a task only says what this run of it
+# does. A fixer handed a report task, or a reviewer handed a commit
+# task, is a dispatch error - and not something to find out from the
+# evidence afterwards, which is how it was found the first time: a
+# chain run where the child inherited the parent's stub override and
+# the fixer behaved like a reviewer.
+#
+# Silence is not a claim. A charter that does not declare `produces:`
+# constrains nothing, exactly as an undeclared `agent:` falls through
+# to the task's - and for the same reason: the contract is read at
+# base, so reading an absent field as `commit` would refuse every
+# report task in the world until a charter it does not own had been
+# through a PR. Declaring it is what binds it.
+CHARTER_PRODUCES="$(field_at_base produces "bots/$TASK_OWNER/BOT.md")"
+if [ -n "$CHARTER_PRODUCES" ] && [ "$CHARTER_PRODUCES" != "$TASK_PRODUCES" ]; then
+    die "this task produces '$TASK_PRODUCES' and bot '$TASK_OWNER' produces '$CHARTER_PRODUCES'.
+
+The charter is the job description; a task does not get to change it.
+Give this task to a bot that produces '$TASK_PRODUCES', or write one."
+fi
+
+# A report task is pointed at its shape template as well, so that is
+# part of the task's contract and gets the same treatment.
+if [ "$TASK_PRODUCES" = "report" ]; then
+    base_has "$TASK_SHAPE" || missing_at_base "$TASK_SHAPE"
 
     # Checked now, not after the review is written: the moment to find
     # out that a handoff cannot be delivered is before the run that
@@ -946,9 +1005,9 @@ if [ -d "$STATE/tasks" ]; then
         [ -n "$other_id" ] || continue
         [ "$other_id" != "$TASK_ID" ] || continue
         [ "$(field status "$live")" = "dispatched" ] || continue
-        # A reviewer claims nothing: it cannot conflict at merge, which
+        # A report claims nothing: it cannot conflict at merge, which
         # is the only reason this check exists.
-        [ "$(field kind "$live")" != "review" ] || continue
+        [ "$(field produces "$live")" != "report" ] || continue
 
         other_branch="$(field branch "$live")"
         # The path that run recorded for itself, not one recomputed from
@@ -1004,8 +1063,8 @@ fi
 scan_overlaps
 
 if [ -n "$OVERLAP_IDS" ]; then
-    if [ "$TASK_KIND" = "review" ]; then
-        OVERLAP_SUMMARY="${OVERLAP_IDS# } - a review writes nothing, so it proceeds"
+    if [ "$TASK_PRODUCES" = "report" ]; then
+        OVERLAP_SUMMARY="${OVERLAP_IDS# } - a report writes nothing into the tree, so it proceeds"
     elif [ "$ALLOW_OVERLAP" -eq 1 ]; then
         OVERLAP_SUMMARY="${OVERLAP_IDS# } - allowed by --allow-overlap"
     else
@@ -1037,21 +1096,23 @@ Your task, verbatim:
 $(cat "$TASK")
 ---
 
-$(if [ "$TASK_KIND" = "review" ]; then cat <<REVIEW_RULES
+$(if [ "$TASK_PRODUCES" = "report" ]; then cat <<REPORT_RULES
 Rules for this run:
-  - You are reviewing, not changing. Commit NOTHING.
-  - Read only. The files under review are: $TASK_TOUCHES
-  - Write exactly one file: '.bot-review.md' in the worktree root,
-    in the shape of $CONTRACT_DIR/templates/REVIEW.md.
-  - Its 'reviewed:' field must be $BASE_SHA - the commit you are on.
-  - Every finding must cite a real path:line inside $TASK_TOUCHES
+  - You are reporting, not changing. Commit NOTHING.
+  - Read only. The files in scope are: $TASK_TOUCHES
+  - Write exactly one file: '$TASK_ARTIFACT' in the worktree root,
+    in the shape of $CONTRACT_DIR/$TASK_SHAPE. That template is the
+    contract for what you produce - follow it, frontmatter included.
+  - The frontmatter names this task ($TASK_ID) and the commit the
+    report is about, which is $BASE_SHA - the one you are on.
+  - Every claim must cite a real path:line inside $TASK_TOUCHES
     that exists at that commit. A made-up path fails the run.
-  - 'No findings.' is a complete review. Do not pad.
+  - Having nothing to report is a complete report. Do not pad.
   - Leave nothing else behind: no scratch files, no notes, no commit.
   - Do NOT push, do NOT open a PR, do NOT edit anything under
     $CONTRACT_DIR/.
   - Do NOT write a handoff. The runner does that.
-REVIEW_RULES
+REPORT_RULES
 else cat <<CHANGE_RULES
 Rules for this run:
   - You are already on branch '$TASK_BRANCH'. Do not switch branches.
@@ -1208,9 +1269,12 @@ step "Plan"
 # the end to land it on - so the plan says which of the two this is.
 BASE_PLAN="$TASK_BASE @ ${BASE_SHA:0:12}, re-read after the run"
 [ "$NO_REBASE" -eq 0 ] || BASE_PLAN="$TASK_BASE @ ${BASE_SHA:0:12} (fixed: --no-rebase)"
+PRODUCES_PLAN="$TASK_PRODUCES"
+[ "$TASK_PRODUCES" != "report" ] \
+    || PRODUCES_PLAN="$TASK_PRODUCES  $TASK_ARTIFACT, shaped by $TASK_SHAPE"
 cat <<PLAN
   task      $TASK_ID  $TASK_TITLE
-  kind      $TASK_KIND
+  produces  $PRODUCES_PLAN
   owner     $TASK_OWNER
   repo      $REPO
   base      $BASE_PLAN
@@ -1350,12 +1414,12 @@ fi
 scan_overlaps
 
 if [ -n "$OVERLAP_IDS" ]; then
-    if [ "$TASK_KIND" = "review" ]; then
-        # Not a refusal, and not nothing either: the review is about the
+    if [ "$TASK_PRODUCES" = "report" ]; then
+        # Not a refusal, and not nothing either: the report is about the
         # base commit, and someone is editing those files right now, so
         # it will be describing a tree that has already moved.
-        board "review-of-moving-target" "${OVERLAP_IDS# }"
-        say "  note: ${OVERLAP_IDS# } is editing files under review - this review describes ${BASE_SHA:0:12}, not their branches"
+        board "report-on-moving-target" "${OVERLAP_IDS# }"
+        say "  note: ${OVERLAP_IDS# } is editing files in scope - this report describes ${BASE_SHA:0:12}, not their branches"
     elif [ "$ALLOW_OVERLAP" -eq 1 ]; then
         board "overlap-allowed" "${OVERLAP_IDS# }"
     else
@@ -1599,28 +1663,30 @@ if [ -f "$WT/.bot-blocked" ]; then
     say "  agent reported blocked"
 fi
 
-# The reviewer's output channel, harvested the same way and for the
-# same reason: it is the artifact, so it belongs in the control plane,
-# and it must be out of the worktree before the evidence is read or it
-# would count as an uncommitted file the bot left behind.
+# The report channel, harvested the same way and for the same reason:
+# it is the artifact, so it belongs in the control plane, and it must
+# be out of the worktree before the evidence is read or it would count
+# as an uncommitted file the bot left behind.
 #
-# Only for a review task. Harvesting it unconditionally meant a change
+# Only for a report task. Harvesting it unconditionally meant a commit
 # task that wrote one had the file quietly moved out of its worktree -
 # so it never counted as an uncommitted file, and a run that produced a
-# review instead of a commit came back `done`. Found by a chain run
+# report instead of a commit came back `done`. Found by a chain run
 # where the child inherited the parent's stub override and the fixer
-# behaved like a reviewer.
-REVIEW_FILE=""
-REVIEW_VERDICT=""
-if [ "$TASK_KIND" = "review" ] && [ -f "$WT/.bot-review.md" ]; then
-    mkdir -p "$STATE/reviews"
-    REVIEW_FILE="$STATE/reviews/${TS}_${TASK_OWNER}_${TASK_ID}.md"
-    mv "$WT/.bot-review.md" "$REVIEW_FILE"
-    REVIEW_VERDICT="$(field verdict "$REVIEW_FILE")"
-    say "  review    $REVIEW_FILE (${REVIEW_VERDICT:-no verdict})"
-    board "review-written" "${REVIEW_VERDICT:-no verdict}"
-elif [ "$TASK_KIND" = "review" ]; then
-    say "  review    none written"
+# behaved like a reviewer. `produces:` on the charter now refuses that
+# pairing at dispatch; this stays anyway, because a guard that was once
+# needed does not get dropped just because a second one showed up.
+ARTIFACT_FILE=""
+ARTIFACT_VERDICT=""
+if [ "$TASK_PRODUCES" = "report" ] && [ -f "$WT/$TASK_ARTIFACT" ]; then
+    mkdir -p "$STATE/artifacts"
+    ARTIFACT_FILE="$STATE/artifacts/${TS}_${TASK_OWNER}_${TASK_ID}_${TASK_ARTIFACT#.bot-}"
+    mv "$WT/$TASK_ARTIFACT" "$ARTIFACT_FILE"
+    ARTIFACT_VERDICT="$(field verdict "$ARTIFACT_FILE")"
+    say "  report    $ARTIFACT_FILE (${ARTIFACT_VERDICT:-no verdict})"
+    board "report-written" "${ARTIFACT_VERDICT:-no verdict}"
+elif [ "$TASK_PRODUCES" = "report" ]; then
+    say "  report    none written"
 fi
 
 # The third channel out of the worktree, harvested like the other two.
@@ -1628,16 +1694,16 @@ fi
 # what it did, and a message is the only part of a commit that is not
 # mechanical.
 #
-# Only for a change task. A reviewer writing a commit message is out of
-# contract, and harvesting it would quietly tidy away the evidence of
-# that - which is the bug F-21 caught in the review channel, one file
-# over.
+# Only for a commit task. A report bot writing a commit message is out
+# of contract, and harvesting it would quietly tidy away the evidence
+# of that - which is the bug F-21 caught in the report channel, one
+# file over.
 COMMIT_MSG_FILE=""
-if [ "$TASK_KIND" != "review" ] && [ -s "$WT/.bot-commit-msg" ]; then
+if [ "$TASK_PRODUCES" = "commit" ] && [ -s "$WT/.bot-commit-msg" ]; then
     COMMIT_MSG_FILE="${RUN_LOG%.log}-commit-msg.txt"
     mv "$WT/.bot-commit-msg" "$COMMIT_MSG_FILE"
     say "  message   $COMMIT_MSG_FILE"
-elif [ "$TASK_KIND" != "review" ] && [ -f "$WT/.bot-commit-msg" ]; then
+elif [ "$TASK_PRODUCES" = "commit" ] && [ -f "$WT/.bot-commit-msg" ]; then
     rm -f "$WT/.bot-commit-msg"
 fi
 
@@ -1657,14 +1723,14 @@ fi
 # thing the agent contributes is the message, and a message was never
 # evidence.
 #
-# Not for a review, which must leave the tree alone, and not after a
+# Not for a report, which must leave the tree alone, and not after a
 # blocked or crashed run - committing a half-finished tree would turn a
 # refusal into a result.
 # --------------------------------------------------------------------
 
 COMMITTED_BY="agent"
 RUNNER_COMMIT_NOTE=""
-if [ "$TASK_KIND" != "review" ] && [ -z "$AGENT_BLOCKED" ] && [ "$AGENT_EXIT" -eq 0 ]; then
+if [ "$TASK_PRODUCES" = "commit" ] && [ -z "$AGENT_BLOCKED" ] && [ "$AGENT_EXIT" -eq 0 ]; then
     LEFTOVER="$(git -C "$WT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
     if [ "${LEFTOVER:-0}" -gt 0 ]; then
         step "Commit"
@@ -1871,12 +1937,20 @@ run_verify() {
     # rebuild every dependency per run. The cache lives under state, so
     # it belongs to the runner - an agent cannot seed it from its own
     # worktree - and cargo's own lock serialises concurrent runs.
-    # A review task's verifier is given the review instead of a build:
-    # the subject changes with the kind, the contract ("an executable
-    # that must exit 0") does not. See F-19.
+    # A report task's verifier is given the report instead of a build:
+    # the subject changes with what the task produces, the contract
+    # ("an executable that must exit 0") does not. See F-19.
+    #
+    # These two names are the last place "review" survives in the
+    # runner, and they are the one part that could not be renamed
+    # with the rest: `verify:` runs inside the verify checkout, so
+    # the script that reads them is the copy at base, not the one in
+    # the working tree. Renaming either side alone turns the sweep
+    # red, and renaming both can only be proven after the merge.
+    # BOT_ARTIFACT / BOT_SUBJECT_SHA once this is at base - #348.
     ( cd "$VERIFY_WT" \
         && export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$STATE/cache/target}" \
-        && export BOT_REVIEW="$REVIEW_FILE" \
+        && export BOT_REVIEW="$ARTIFACT_FILE" \
         && export BOT_REVIEWED_SHA="$sha" \
         && export BOT_TOUCHES="$TASK_TOUCHES" \
         && export BOT_TASK_ID="$TASK_ID" \
@@ -1951,15 +2025,15 @@ elif [ -n "$AGENT_BLOCKED" ]; then
 elif [ "$AGENT_EXIT" -ne 0 ]; then
     STATUS="blocked"
     BLOCKERS="agent exited $AGENT_EXIT without reporting - see $RUN_LOG"
-elif [ "$TASK_KIND" = "review" ] && [ "$COMMITS" -ne 0 ]; then
-    # The reviewer's one hard boundary. A commit from a reviewer is a
-    # failed run even when the change is an improvement: the whole
-    # value of a second bot is that it has no stake in the diff.
+elif [ "$TASK_PRODUCES" = "report" ] && [ "$COMMITS" -ne 0 ]; then
+    # The one hard boundary for a bot that does not write code. A commit
+    # from it is a failed run even when the change is an improvement:
+    # the whole value of the role is that it has no stake in the diff.
     STATUS="blocked"
-    BLOCKERS="a reviewer must not commit, and this run made $COMMITS commit(s)"
-elif [ "$TASK_KIND" = "review" ] && [ -z "$REVIEW_FILE" ]; then
+    BLOCKERS="a bot that produces a report must not commit, and this run made $COMMITS commit(s)"
+elif [ "$TASK_PRODUCES" = "report" ] && [ -z "$ARTIFACT_FILE" ]; then
     STATUS="blocked"
-    BLOCKERS="no .bot-review.md was written - the run produced nothing to read"
+    BLOCKERS="no $TASK_ARTIFACT was written - the run produced nothing to read"
 elif [ "$VERIFY_EXIT" -ne 0 ]; then
     STATUS="blocked"
     BLOCKERS="verifier exited $VERIFY_EXIT${VERIFY_TAIL:+:
@@ -2020,21 +2094,21 @@ elif [ "$COMMITS" -gt 1 ]; then
     # decides whether to squash.
     STATUS="needs-review"
     BLOCKERS="$COMMITS commits, charter asks for exactly one"
-elif [ "$TASK_KIND" = "review" ] && [ "$REVIEW_VERDICT" = "blocked" ]; then
-    # The reviewer's own escalation. REVIEW.md defines `blocked` as a
-    # review that could not be completed, and a run that reports one as
+elif [ "$TASK_PRODUCES" = "report" ] && [ "$ARTIFACT_VERDICT" = "blocked" ]; then
+    # The bot's own escalation. A shape template defines `blocked` as
+    # work that could not be completed, and a run that hands one back as
     # `done` buries it: the task goes terminal, the scheduler never
     # comes back to it, and the only record of the refusal is inside a
     # file nobody was told to open.
     STATUS="blocked"
-    BLOCKERS="the reviewer could not complete this review. Its reasons are
-under 'What I could not check' in $REVIEW_FILE"
+    BLOCKERS="$TASK_OWNER could not complete this report. Its reasons are
+in $ARTIFACT_FILE"
 elif [ "$COMMITS" -eq 0 ]; then
     STATUS="done"
     NOOP=1
-    if [ "$TASK_KIND" = "review" ]; then
+    if [ "$TASK_PRODUCES" = "report" ]; then
         # Zero commits is the *success* shape here, not an empty run.
-        BLOCKERS="none - review delivered, verdict ${REVIEW_VERDICT:-(none)}"
+        BLOCKERS="none - report delivered, verdict ${ARTIFACT_VERDICT:-(none)}"
     else
         BLOCKERS="none - no-op run, nothing needed changing"
     fi
@@ -2109,8 +2183,8 @@ elif [ "$STATUS" != "done" ] || [ "$NOOP" -eq 1 ]; then
     # run that is not being handed off as done already has a reason, and
     # a rebase on top of it would bury that reason under a newer one.
     REBASE_STATE="not attempted - the run is '$STATUS'"
-elif [ "$TASK_KIND" = "review" ]; then
-    REBASE_STATE="not applicable - a review has nothing to replay"
+elif [ "$TASK_PRODUCES" = "report" ]; then
+    REBASE_STATE="not applicable - a report has nothing to replay"
 else
     step "Rebase"
     # For a folder, "has the base moved" is "has the folder changed",
@@ -2529,13 +2603,13 @@ DERIVED_TASK=""
 DERIVED_ID=""
 DERIVED_WHY=""
 
-if [ "$TASK_KIND" = "review" ] && [ "$STATUS" = "done" ] \
-   && [ "$REVIEW_VERDICT" = "changes-requested" ]; then
+if [ "$TASK_PRODUCES" = "report" ] && [ "$STATUS" = "done" ] \
+   && [ "$ARTIFACT_VERDICT" = "changes-requested" ]; then
     if [ -z "$TASK_ON_CHANGES" ]; then
         DERIVED_WHY="the task declares no on_changes_requested:, so this review stops with a human"
     else
         CITED="$(sed -n 's/^-[[:space:]]\{1,\}\([^[:space:]]\{1,\}\):[0-9]\{1,\}.*/\1/p' \
-            "$REVIEW_FILE" | sort -u)"
+            "$ARTIFACT_FILE" | sort -u)"
 
         # Re-checked here even though review-shape.sh already checked
         # them: `verify:` is data, a task is free to name a different
@@ -2581,7 +2655,7 @@ if [ "$TASK_KIND" = "review" ] && [ "$STATUS" = "done" ] \
             cat > "$DERIVED_TASK" <<DERIVED_END
 ---
 id: $DERIVED_ID
-kind: change
+produces: commit
 title: Address the findings from $TASK_ID
 owner: $TASK_ON_CHANGES
 status: todo
@@ -2596,7 +2670,7 @@ schedule: $TASK_SCHEDULE
 
 Answer the findings in the review at:
 
-    $REVIEW_FILE
+    $ARTIFACT_FILE
 
 Read that file. It is the task. Each finding names a path and a line
 and states one claim; answer every one of them, either by changing the
@@ -2615,7 +2689,7 @@ next reader cannot tell the difference between "fixed" and "missed".
 # Context
 
 Written by the runner from the review above: verdict
-\`$REVIEW_VERDICT\`, about commit $HEAD_SHA, by \`$TASK_OWNER\`.
+\`$ARTIFACT_VERDICT\`, about commit $HEAD_SHA, by \`$TASK_OWNER\`.
 
 Nothing in this file came from the reviewer's prose. \`owner:\` and
 \`verify:\` are from $TASK_ID's own frontmatter, which is contract.
@@ -2647,16 +2721,16 @@ if [ "$STATUS" = "blocked" ]; then
     NEXT="Human triages the blocker above. Task stays open; worktree kept at $WT."
 elif [ "$STATUS" = "needs-review" ]; then
     NEXT="Human resolves the blocker above in $WT, then pushes and opens a PR."
-elif [ "$TASK_KIND" = "review" ] && [ -n "$DERIVED_TASK" ]; then
-    NEXT="Read $REVIEW_FILE, then hand it on:
+elif [ "$TASK_PRODUCES" = "report" ] && [ -n "$DERIVED_TASK" ]; then
+    NEXT="Read $ARTIFACT_FILE, then hand it on:
 
     labs/agent-bots/run/bot-run.sh --task $DERIVED_TASK
 
 That task is scoped to the paths the findings cite and is based on the
 commit that was reviewed. Running it is the acceptance - nothing is in
 flight until a human (or --chain) starts it."
-elif [ "$TASK_KIND" = "review" ]; then
-    NEXT="Read $REVIEW_FILE - verdict ${REVIEW_VERDICT:-(none)}. Nothing was changed and nothing can be merged from this run; acting on a finding is a new task for a bot that commits.${DERIVED_WHY:+
+elif [ "$TASK_PRODUCES" = "report" ]; then
+    NEXT="Read $ARTIFACT_FILE - verdict ${ARTIFACT_VERDICT:-(none)}. Nothing was changed and nothing can be merged from this run; acting on a finding is a new task for a bot that commits.${DERIVED_WHY:+
 No task was derived: $DERIVED_WHY.}"
 elif [ "${NOOP:-0}" -eq 1 ]; then
     NEXT="Nothing to review - the verifier already passed at base. Give this bot a task with real work in it."
@@ -2675,14 +2749,14 @@ fi
 # --------------------------------------------------------------------
 
 # Appended to the last evidence line rather than given a line of its
-# own, so a change task does not carry a blank gap where a review would
+# own, so a commit task does not carry a blank gap where a report would
 # have been.
-REVIEW_EVIDENCE=""
-if [ "$TASK_KIND" = "review" ]; then
-    REVIEW_EVIDENCE="
-    review:   ${REVIEW_FILE:-(none written)}
-    verdict:  ${REVIEW_VERDICT:-(none)}
-    reviewed: $HEAD_SHA${DERIVED_TASK:+
+REPORT_EVIDENCE=""
+if [ "$TASK_PRODUCES" = "report" ]; then
+    REPORT_EVIDENCE="
+    report:   ${ARTIFACT_FILE:-(none written)}
+    verdict:  ${ARTIFACT_VERDICT:-(none)}
+    subject:  $HEAD_SHA${DERIVED_TASK:+
     derived:  $DERIVED_ID -> $TASK_ON_CHANGES
               $DERIVED_TASK}"
 fi
@@ -2691,11 +2765,11 @@ fi
 # because there was nobody else to say. A derived task changes that: the
 # handoff names the bot that gets it, and the artifact is the path to
 # the task rather than a branch. The message carries a path.
-# What this run actually produced. A review's branch is thrown away at
+# What this run actually produced. A report's branch is thrown away at
 # cleanup, so naming it here would point the reader at something that
 # is about to stop existing.
-if [ "$TASK_KIND" = "review" ]; then
-    ARTIFACT="    review:   ${REVIEW_FILE:-(none written)}${DERIVED_TASK:+
+if [ "$TASK_PRODUCES" = "report" ]; then
+    ARTIFACT="    report:   ${ARTIFACT_FILE:-(none written)}${DERIVED_TASK:+
     task:     $DERIVED_TASK}"
 else
     ARTIFACT="    branch:   $TASK_BRANCH${PUSHED:+ (pushed into $ORIGIN_REPO)}${PUSH_FAILED:+ (ON THE SURFACE ONLY - the push failed)}
@@ -2710,7 +2784,7 @@ HANDOFF="$STATE/handoffs/${TS}_${TASK_OWNER}__to__${HANDOFF_TO}__${TASK_ID}.md"
 cat > "$HANDOFF" <<HANDOFF_END
 ---
 task: $TASK_ID
-kind: $TASK_KIND
+produces: $TASK_PRODUCES
 from: $TASK_OWNER
 to: $HANDOFF_TO
 at: $TS_ISO
@@ -2747,7 +2821,7 @@ $(if [ "$TREE_BROKEN" -eq 0 ] && [ "$COMMITS" -gt 0 ]; then git -C "$WT" log --f
     touched:
 $(if [ -n "$TOUCHED" ]; then printf '%s\n' "$TOUCHED" | sed 's/^/      /'; else echo "      (none)"; fi)
     log:      $RUN_LOG
-    prompt:   $PROMPT_FILE (via $AGENT_PROMPT_VIA)$REVIEW_EVIDENCE
+    prompt:   $PROMPT_FILE (via $AGENT_PROMPT_VIA)$REPORT_EVIDENCE
 
 # Status
 
@@ -2776,6 +2850,10 @@ board "handoff" "$STATUS"
 CLEAN_WHY=""
 if [ "$KEEP" -eq 1 ]; then
     CLEAN_WHY=""
+elif [ "$STATUS" = "done" ] && [ "$TASK_PRODUCES" = "report" ] && [ "$DIRTY" -eq 0 ]; then
+    # Zero commits is this task's success shape, so "no-op run" would be
+    # the wrong words for the one line a reader is given about it.
+    CLEAN_WHY="report harvested"
 elif [ "$STATUS" = "done" ] && [ "$COMMITS" -eq 0 ] && [ "$DIRTY" -eq 0 ]; then
     CLEAN_WHY="no-op run"
 elif [ "$STATUS" = "done" ] && [ -n "$PUSHED" ]; then
@@ -2826,7 +2904,7 @@ say "  log      $RUN_LOG"
 # is where the approval inbox goes. Here it is a flag, so the chain can
 # be demonstrated without pretending the gate does not matter.
 #
-# A derived task is always `kind: change`, and a change task never
+# A derived task always `produces: commit`, and a commit task never
 # derives anything, so the chain is one link long by construction. The
 # depth counter is belt and braces against that stopping being true.
 # --------------------------------------------------------------------

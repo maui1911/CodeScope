@@ -309,7 +309,7 @@ detects that it happened.
 
 | | |
 |---|---|
-| Covered | plain-folder projects as well as git ones; the file contract; **two bots** (`fixer`, `reviewer`), two task kinds (`change`, `review`), the handoff between them and a scheduler that reads the board; contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the `.bot-review.md` output channel; verifier, in a clean checkout of the branch tip; evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup; rebase onto a base that moved, re-verified there |
+| Covered | plain-folder projects as well as git ones; the file contract; **two bots** (`fixer`, `reviewer`), two deliverables (`produces: commit`, `produces: report`), the handoff between them and a scheduler that reads the board; contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the report channel (`artifact:`, `shape:`, harvested into `.state/artifacts/`); verifier, in a clean checkout of the branch tip; evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup; rebase onto a base that moved, re-verified there |
 | **Not** covered | the approval inbox, per-bot memory, re-verifying a branch that is *waiting* rather than running, resume after a crash, any trigger other than "someone ran a tick", pushing, opening PRs, any GPUI surface |
 
 Two deliberate omissions:
@@ -398,10 +398,19 @@ before it costs a worktree; the plan prints the overlapping paths, and
 `--allow-overlap` overrides it. `examples/T-0004-overlap-fixture.md`
 reproduces both that refusal and the stale-dispatch case by hand.
 
-**Two kinds of task.** `kind: change` is the default and is what T-0001
-and T-0002 are. `kind: review` runs the `reviewer` charter instead: it
-must commit nothing, it writes `.bot-review.md`, and the runner
-harvests that into `.state/reviews/` and points the handoff at it.
+**Two things a task can produce.** `produces: commit` is the default
+and is what T-0001 and T-0002 are: the work lands in the tree and gets
+the branch, the verifier and the rebase. `produces: report` lands
+beside it — the bot commits nothing, writes one file named by
+`artifact:` in the shape of the template named by `shape:`, and the
+runner harvests that into `.state/artifacts/` and points the handoff at
+it. A commit from a report task is a failed run.
+
+The reviewer is the first role to use it, not the definition of it: its
+defaults are `.bot-review.md` and `templates/REVIEW.md`, and a second
+reading role brings its own pair. The owner's charter declares the same
+field, and a task that disagrees with it is refused at dispatch — a bot
+is what its charter says it is, and a task does not get to reassign it.
 
 ```bash
 # a review run - the reviewer reads, judges, and commits nothing
@@ -479,7 +488,7 @@ F-29 — including what the snapshot deliberately leaves behind.
 | `.state/board.md` | append-only event log |
 | `.state/tasks/<id>.md` | the live task — the repo copy is only a definition |
 | `.state/handoffs/<ts>_<bot>__to__human__<id>.md` | the handoff |
-| `.state/reviews/<ts>_<bot>_<id>.md` | a review, harvested off the worktree |
+| `.state/artifacts/<ts>_<bot>_<id>_<name>` | a report, harvested off the worktree |
 | `.state/proposed/<id>.md` | a task one bot's run wrote for another |
 | `.state/REPO` | which repository this control plane belongs to |
 | `.state/runs/<day>/<id>-<ts>.log` | agent + verifier output |
@@ -2360,3 +2369,69 @@ in one pass is not "is the new thing correct" but **"what was the old
 thing quietly guaranteeing?"** A worktree guaranteed ownership,
 identity and visibility. A clone guarantees none of the three, and a
 checklist would have said so faster than four rounds of review did.
+
+---
+
+### F-32 · The exception tells you the abstraction is wrong
+
+*2026-09-11, on the observation that the bots should not all be code
+writers.*
+
+There were two kinds of task, `change` and `review`, and the second was
+spelled into twenty-odd branches of the runner. Every one of them said
+some version of *unless this is a review*: skip the overlap check, do
+not harvest the commit message, do not commit what was left behind, do
+not rebase, a commit is a failure here, zero commits is success here,
+name a file instead of a branch in the handoff.
+
+Twenty-odd exceptions is not a special case. It is an abstraction
+being wrong in one place and paid for in twenty-odd.
+
+What the runner actually branches on is **where the result lands**, and
+that has nothing to do with reviewing. A commit lands in the tree and
+needs the branch, the verifier and the replay. A report lands beside
+it: one file, harvested into the control plane, and a commit is a
+failed run. So the field is `produces: commit | report`, and the
+reviewer becomes an instance of the second — `artifact:` names the file
+and `shape:` names the template it must match, both defaulting to the
+reviewer's because that is the role that got here first.
+
+The test of whether a rename is real is whether the word survives
+anywhere load-bearing. `.bot-review.md` is now a default, not a
+constant. `templates/REVIEW.md` is now a default, not a path in the
+prompt. `.state/reviews/` is `.state/artifacts/`. `run/review-shape.sh`
+kept its name because it is genuinely the reviewer's verifier — one
+shape among several, and the next reading role writes its own.
+
+Three things came out of it that were not the point.
+
+**A charter's silence is not a claim.** The obvious enforcement is that
+the bot's charter declares `produces:` too, and a task that disagrees
+is refused — a fixer cannot be handed a report. But charters are read
+*at base*, so an absent declaration read as `commit` would refuse every
+report task in the world until an unrelated PR landed. Silence has to
+mean *no claim*, exactly as an undeclared `agent:` already falls
+through to the task's. Declaring it is what binds it.
+
+**A contract change and a runner change cannot be verified together on
+a branch.** The verifier runs inside the verify checkout, so the script
+that reads the runner's environment is the copy at base, not the copy
+being edited. Renaming `BOT_REVIEW` to `BOT_ARTIFACT` turned the sweep
+red for three checks — not because either side was wrong, but because
+they were at different commits. That is contract-read-at-base working
+exactly as designed, and it means the last review-shaped names in the
+runner can only move once both halves are merged. Left alone, with the
+reason written down, as #348. The alternative was exporting both names:
+green today, dead code the day it lands.
+
+**The reserved namespace was already there and unnamed.** `artifact:`
+had to be validated — it is a filename the runner will `mv` out of a
+worktree — and writing the rule down surfaced that `.bot-` had been a
+namespace all along, with `.bot-blocked` and `.bot-commit-msg` in it.
+An artifact must live there, which makes collision with a project file
+impossible rather than unlikely.
+
+What generalises: **count the exceptions before believing the type.**
+One `if` for a special case is a special case. Twenty of them, all
+saying *unless*, are the shape of the thing you should have modelled,
+and every future role arrives as one more exception until you do.
