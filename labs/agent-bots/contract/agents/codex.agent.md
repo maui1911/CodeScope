@@ -3,7 +3,7 @@ id: codex
 display_name: Codex CLI
 command: codex
 headless: exec {prompt}
-autonomy: -s workspace-write -c sandbox_workspace_write.writable_roots=["{git_dir}"]
+autonomy: -s workspace-write --add-dir {git_dir}
 model_flag: -m
 instruction_files: AGENTS.md
 verified: 2026-09-11
@@ -30,7 +30,7 @@ file it had been given and could not write `index.lock`. It said so
 through `.bot-blocked` and stopped, which is the correct behaviour and
 a completely useless outcome.
 
-`writable_roots` fixes it, and the honest description of the fix is
+`--add-dir` fixes that much, and the honest description of the fix is
 that it hands the sandbox the whole object store and every ref in the
 repository. There is no narrower grant: objects and `refs/heads/*` live
 in the common directory for a linked worktree, so "let this agent
@@ -42,6 +42,17 @@ end crosses the boundary. See F-26.
 
 `{git_dir}` is substituted by the runner, because the path is
 per-machine and a contract file is not.
+
+It is not enough on Windows. With the git directory granted, the next
+thing the run hit was `CreateFileMapping Win32 error 5` — Git Bash's
+fork emulation needs shared memory the sandbox denies, so Codex could
+not run the verifier it had been told to run before editing. The
+sandbox is per-OS and the profile is one file for every machine, which
+is a gap in this contract rather than a detail: `autonomy:` is the only
+field here whose correct value depends on the host. Unresolved. On this
+machine the loop gets as far as "agent reports blocked, honestly, with
+a reason a human can act on" — which is the runner working and the
+agent not.
 
 Reads `AGENTS.md`, not `CLAUDE.md`. A bot contract that names its
 conventions in the wrong file is invisible to this agent — which makes

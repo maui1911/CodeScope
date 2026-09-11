@@ -445,6 +445,13 @@ criticism this document levels at Grok Bot in section 1. What actually
 contains the blast radius here is that the branch is throwaway and
 nothing in this loop ever pushes.
 
+Codex is the one agent that sandboxes its own shell calls, and the
+first run under it proved that this buys less than it sounds: a linked
+worktree's git directory is outside the worktree, so the sandbox has to
+be handed the whole object store and every ref before the agent can
+make a single commit. Worktrees isolate the *checkout*, never the
+repository. See F-26.
+
 **`base:` must be a ref that contains the contract.** The agent reads
 its charter and context from its own checkout — the base commit — not
 from your working tree. While this branch is unmerged that means
@@ -471,7 +478,8 @@ worktree and branch.
 ## 6. What would have to be true to graduate this
 
 1. The loop runs unattended and green three times on a real issue in
-   this repo.
+   this repo. *(Claude Code only. Codex has now run the loop and cannot
+   finish it on Windows — see F-26.)*
 2. The verifier catches at least one agent run that *claimed* success
    and was wrong. If that never happens, the verifier is not verifying.
 3. A handoff between two bots survives a rebase. *(Half done: a
@@ -1841,3 +1849,82 @@ moves afterwards, while the branch sits waiting for a human — and that
 window is longer than the run by a wide margin. Answering it means
 re-verifying on a trigger rather than at the end of a run, which is the
 scheduler's job and not this one's.
+
+---
+
+### F-26 · The sandbox that made Codex the safe choice is what stops it working
+
+*2026-09-11, the first run under a second CLI.*
+
+The Codex profile had been written, checked against `codex exec --help`,
+and never run. §7.2 called Codex "the one agent here that bounds its own
+blast radius rather than relying on the worktree being throwaway" — and
+that sentence is exactly why its first real run produced nothing.
+
+    sandbox denies writing
+    .git/worktrees/bot-fixer-T-0007/index.lock;
+    baseline verifier passed all 542 tests and no source files
+    were changed
+
+**A linked worktree's git directory is not inside the worktree.** Under
+`-s workspace-write` the writable roots are the working directory,
+`/tmp` and `$TMPDIR`. The checkout is at `$WT`; its git directory lives
+under the *main* repository. So an agent that sandboxes itself by
+directory can read every file it was given, edit every file it was
+given, and not write a single commit. The runner reads its evidence off
+commits — so a correct, careful, honest run produces, by the runner's
+own rules, nothing at all.
+
+It is worth being precise about how nearly this went unnoticed. The task
+was the smoke test, which needs no change; the tree was clean either
+way, and a runner that only counted commits would have called it a
+green no-op. What made the difference is that Codex used
+`.bot-blocked` — the refusal channel — and said *why*. F-4 built that
+channel for an agent that crashes. Its first real user was an agent that
+worked perfectly and could not finish.
+
+**The fix is wider than it looks.** `--add-dir <git dir>` lets the
+commit through, and what it grants is the whole object store and every
+ref in the repository. There is no narrower grant: for a linked
+worktree, objects and `refs/heads/*` are in the common directory, so
+"let this agent commit on its own branch" and "let this agent rewrite
+`main`" are the same permission. That is not a Codex flaw. It is what a
+linked worktree *is*, and it means the isolation this prototype claims
+from worktrees is isolation of the *checkout*, never of the repository.
+The narrower answer is a per-task `git clone --shared`, where the git
+directory is inside the sandbox and only a push at the end crosses the
+boundary — a design change, not a flag, and the first real argument
+against worktrees this project has produced.
+
+**And on Windows it is still not enough.** With the git directory
+granted, the run got one step further and stopped on
+`CreateFileMapping Win32 error 5`: Git Bash's fork emulation needs
+shared memory the sandbox denies, so Codex could not run the verifier it
+had been told to run before editing anything. The sandbox policy is
+per-OS; `autonomy:` is one line in one file shared by every machine that
+checks out this repo. That is a gap in the contract, not a detail — it
+is the only field here whose correct value depends on the host.
+
+Two smaller things from the same run, both worth keeping:
+
+**`AGENTS.md` is not in this repo, and Codex reads `AGENTS.md`.** The
+runner warned and ran anyway, which is right — an agent without the
+house conventions is degraded, not unsafe. But it means the second bot
+was working from the task and its charter alone while the first works
+from those *plus* `CLAUDE.md`. F-7 said the two bots would be identical
+because they share host instructions. The truth is worse and more
+interesting: they differ, and not in any way anybody chose.
+
+**The prompt said "exactly one commit" with no exception.** The runner
+has always treated zero commits as a legitimate no-op; the prompt told
+the agent to produce one regardless, and Codex — reading the rule as
+written on a task that needed no change — tried to. Two statements of
+the same rule, in two places, disagreeing. The prompt now says a no-op
+is a result.
+
+What this run did *not* do is complete. Criterion 1 in §6 is still
+unmet for any agent but Claude Code, and the reason is a Windows
+sandbox rather than anything in the file contract. The contract itself
+came out of this intact: a different CLI, a different argv shape, a
+different instruction file, one refusal channel, and a handoff a human
+can act on without reading a log.
