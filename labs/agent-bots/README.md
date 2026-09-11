@@ -478,8 +478,10 @@ worktree and branch.
 ## 6. What would have to be true to graduate this
 
 1. The loop runs unattended and green three times on a real issue in
-   this repo. *(Claude Code only. Codex has now run the loop and cannot
-   finish it on Windows — see F-26.)*
+   this repo. *(Claude Code only. Codex now reads the contract, runs
+   its own commands and does the work; it cannot commit, because a
+   linked worktree's git directory is outside anything its sandbox will
+   make writable. See F-26 and F-27.)*
 2. The verifier catches at least one agent run that *claimed* success
    and was wrong. If that never happens, the verifier is not verifying.
 3. A handoff between two bots survives a rebase. *(Half done: a
@@ -1952,3 +1954,93 @@ sandbox rather than anything in the file contract. The contract itself
 came out of this intact: a different CLI, a different argv shape, a
 different instruction file, one refusal channel, and a handoff a human
 can act on without reading a log.
+
+---
+
+### F-27 · Three walls behind the first one, and each one looked like the agent failing
+
+*2026-09-11, making Codex actually run.*
+
+F-26 ended on "the sandbox kills Git Bash, unresolved". Working through
+that turned out to be four separate problems wearing the same coat, and
+the useful part is not any one of them — it is that all four produced
+the same symptom: *the agent did nothing and did not say why*.
+
+The first move was to stop guessing. `codex sandbox` runs a command
+inside the same Windows restricted-token sandbox with no model call at
+all, which turns an expensive question into a free one:
+
+    cmd          starts
+    powershell   hello-from-ps
+    git          git version 2.52.0.windows.1
+    bash         *** fatal error - CreateFileMapping ... Win32 error 5
+
+So git is fine under the sandbox, and PowerShell is fine. The only
+casualty is Git Bash, and not because of git: MSYS fork emulation wants
+shared memory a restricted token denies. That reframes the whole thing.
+Codex was not blocked by its sandbox; it was blocked by *choosing* a
+shell, and it chooses by looking at PATH.
+
+**Wall 1: the shell.** `shell: posix|native` in the profile. `native`
+means the runner takes every PATH entry carrying a POSIX shell off the
+agent's environment — stated as the intent, not a list of directory
+names, because a hardcoded `/usr/bin` is a guess about somebody else's
+install. Codex then picks `pwsh.exe`, and a real run confirmed it.
+
+**Wall 2: the launcher is a shell script.** `command: codex` resolves
+to npm's extensionless shim, which is written in `sh` and dies calling
+`sed` before the agent exists. Taking the shell away breaks the thing
+that starts the agent. So under `shell: native` the command is resolved
+against the *runner's* PATH — the one that still has a shell on it —
+and a Windows executable sibling wins over a POSIX script. `codex.cmd`
+runs on the stripped PATH; `codex` does not.
+
+**Wall 3: 8191 characters.** `codex.cmd` is a batch file, and cmd.exe
+truncates a command line at 8191 characters. The prompt carries the
+whole task file. So the agent got a prompt cut off mid-sentence *and
+lost the flags that came after it* — the log's banner read
+`workspace-write [workdir, /tmp, $TMPDIR]` with the `--add-dir` simply
+gone. Codex replied "Send me the issue to fix." Nothing errored.
+Nothing warned. It was handed half a job and answered accordingly.
+
+That one is worth dwelling on, because the diagnosis was only possible
+by accident: the log happens to echo the prompt back. The prompt is the
+one input to a run that was written down nowhere — the log holds
+whatever the agent chose to repeat, which is a different thing. It is
+saved beside the run log now, as sent. `prompt: argv|stdin` is the fix
+for the truncation itself, and stdin is the better default for any
+agent whose prompt can grow: argv limits are per-OS, per-launcher, and
+silent.
+
+**Wall 4, still standing: the git directory.** With all three fixed,
+Codex read the contract, did the work, wrote the file — and could not
+commit:
+
+    Cannot commit because Git cannot create
+    C:/.../.git/worktrees/bot-fixer-T-0008/index.lock: Permission denied
+
+`--add-dir` had been granted and the banner confirms the sandbox
+accepted it. It does not make that path writable in practice, and the
+free probes could not establish why without spending more runs to find
+out. So F-26's conclusion stands and is now load-bearing: on Windows,
+under a sandbox, an agent in a *linked worktree* cannot commit. The
+narrower fix is not a flag — it is giving each task a `git clone
+--shared` instead, where the git directory sits inside the workspace
+the sandbox already grants, and only a push at the end crosses the
+boundary.
+
+What all four have in common is the thing to keep. A truncated prompt,
+a dead launcher, a missing shell and a denied lock are four different
+faults, and every one of them arrived as *an agent that produced
+nothing*. Three were invisible in the runner's own evidence, because
+the runner measures the tree and all three happened before the tree was
+touched. The one that was visible was visible only because Codex wrote
+`.bot-blocked` — a channel built in F-4 for agents that crash, which
+has now diagnosed three separate infrastructure faults and zero crashes.
+
+A last one, smaller and the same shape: the prompt told every agent to
+run `verify:` itself. A verify string is a POSIX command by convention
+here, and an agent with no POSIX shell cannot run one — `cargo test …`
+is shell-neutral, `test -f …` is not. The prompt now says what was
+always true instead: the runner runs the verifier afterwards, in a
+clean checkout, and that is the result that counts.

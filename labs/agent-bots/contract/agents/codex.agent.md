@@ -18,6 +18,16 @@ Non-interactive mode is a **subcommand**, not a flag: `codex exec
 invocation for every agent — the argv template has to come from the
 profile.
 
+The prompt goes on **stdin**, not in argv, and that is not a style
+choice. `shell: native` below means the runner launches `codex.cmd`
+rather than npm's `sh` shim, and cmd.exe truncates a command line at
+8191 characters. A prompt carrying a whole task file goes past that
+silently, taking the flags that follow it with it — the first attempt
+lost `--add-dir` and half the task, and Codex answered "send me the
+issue to fix". `codex exec` reads its instructions from stdin when no
+prompt argument is given, which keeps argv short enough that no
+launcher can lose it. See F-27.
+
 `-s workspace-write` is the middle sandbox policy; the other two are
 `read-only` (cannot commit) and `danger-full-access`. Codex sandboxes
 model-generated shell commands itself, which makes it the one agent
@@ -32,9 +42,12 @@ file it had been given and could not write `index.lock`. It said so
 through `.bot-blocked` and stopped, which is the correct behaviour and
 a completely useless outcome.
 
-`--add-dir` fixes that much, and the honest description of the fix is
-that it hands the sandbox the whole object store and every ref in the
-repository. There is no narrower grant: objects and `refs/heads/*` live
+`--add-dir` is the documented way to widen that, and it is declared
+here — the banner confirms the sandbox accepts it. It does **not** make
+`.git/worktrees/<leaf>/index.lock` writable in practice, and the run
+still ends at "cannot commit". What the flag would grant if it worked
+is worth stating anyway, because it is the reason the real answer lies
+elsewhere: the whole object store and every ref in the repository. There is no narrower grant: objects and `refs/heads/*` live
 in the common directory for a linked worktree, so "let this agent
 commit on its own branch" and "let this agent rewrite `main`" are the
 same permission. That is not a Codex flaw — it is what a linked
@@ -43,7 +56,9 @@ where the git directory is inside the sandbox and only a push at the
 end crosses the boundary. See F-26.
 
 `{git_dir}` is substituted by the runner, because the path is
-per-machine and a contract file is not.
+per-machine and a contract file is not. It is kept despite not being
+sufficient: removing it would make the next person rediscover that the
+git directory is the problem rather than reading it here.
 
 It is not enough on Windows. With the git directory granted, the next
 thing the run hit was `CreateFileMapping Win32 error 5` — Git Bash's
