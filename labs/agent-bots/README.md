@@ -587,8 +587,40 @@ worktree, is most of the value.
 running unattended. Four bots means four tabs shoving the user's own
 work aside. A bot session should be *background* by default and get a
 tab only when opened — which in turn means the telemetry tail and the
-idle toast have to work with no visible tab. Whether that holds today
-is worth checking before the design sets.
+idle toast have to work with no visible tab.
+
+**Checked, and they do not — for a reason that improves the design.**
+The tail itself is tab-independent: `telemetry_tails` is a map keyed by
+agent session id, polled by one task in `start_telemetry_poll`. What is
+tab-bound is *discovery*. `register_telemetry` is called from exactly
+one place, the adoption scan, and that scan walks `groups[].tabs[]` and
+matches a transcript against an open tab's working directory. A session
+with no tab is never scanned, so it is never adopted, so it is never
+registered. No tail, no `Idle`, no toast.
+
+The fix is not to make adoption work without a tab. It is to notice
+that **the inbox should never have been waiting for a session to go
+idle.** In this design the runner decides a run is over — that is the
+whole point of it writing the handoff — and it says so by creating a
+file. So the event the UI wants is *a handoff appearing in
+`.state/handoffs/`*, which CodeScope can watch exactly the way it
+already watches the transcript directories. Telemetry only matters for
+a bot you are actually watching, and by then you have opened a tab and
+adoption works normally.
+
+Two things follow.
+
+Stage 1's "a bot run is just a session CodeScope opened for you" holds
+only for a bot you opened a tab for. An unattended run is not a session
+in CodeScope's sense at all: it is a process the runner owns, and the
+product's entire stake in it is the state directory.
+
+Which makes the integration surface smaller than this section assumed.
+Not "teach telemetry to work headless" but **one watcher on one
+directory, plus a renderer for documents that already have a fixed
+shape.** The handoff, the review and the board are all already parsed
+by `bot-tick.sh` with twenty lines of `awk`; `core/src/overview.rs` is
+the precedent for where the pure-data half belongs.
 
 ### 7.5 The destination is multiple bots
 
