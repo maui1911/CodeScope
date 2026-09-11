@@ -221,6 +221,22 @@ agent summary; it reads the tree.
 form — stronger, because a ref is verifiable and cannot silently go
 stale.
 
+The built version of this is narrower and more interesting than the
+sketch. A review that ends `changes-requested` makes the runner write
+the follow-up task: `owner` and `verify` from the review task, which is
+contract; `touches` from the paths the findings cite, each re-checked
+against the tree; `base` from the commit the reviewer actually had; and
+an objective that is a **path to the review**, never a copy of it. The
+bot that found the problem does not get to say what may be touched to
+fix it — that would be self-reported scope, which is the one thing
+this design refuses everywhere else. See F-21.
+
+The derived task lands in `.state/proposed/`, and running it is the
+acceptance. `--chain` dispatches it in the same breath, and is off by
+default: a task written by a machine and started by a machine with
+nothing in between is a different risk class, and in the product that
+gap is where the approval inbox goes.
+
 **Concurrency control without locks.** Each task declares `touches:`
 globs, and the runner refuses to dispatch a task whose files another
 in-flight task already claims. Both sides are expanded against the base
@@ -282,8 +298,8 @@ detects that it happened.
 
 | | |
 |---|---|
-| Covered | the file contract; **two bots** (`fixer`, `reviewer`) and two task kinds (`change`, `review`); contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the `.bot-review.md` output channel; verifier, in a clean checkout of the branch tip; evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup |
-| **Not** covered | scheduling/routines, bot-to-bot handoff (both bots hand to a human), the approval inbox, per-bot memory, rebase-on-collision, resume after a crash, pushing, opening PRs, any GPUI surface |
+| Covered | the file contract; **two bots** (`fixer`, `reviewer`), two task kinds (`change`, `review`) and the handoff between them; contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the `.bot-review.md` output channel; verifier, in a clean checkout of the branch tip; evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup |
+| **Not** covered | scheduling/routines, the approval inbox, per-bot memory, rebase-on-collision, resume after a crash, pushing, opening PRs, any GPUI surface |
 
 Two deliberate omissions:
 
@@ -316,6 +332,14 @@ labs/agent-bots/run/bot-run.sh \
 Work through those in order on the first run — step 2 is where a wrong
 path or a broken verifier shows up, and it costs no tokens.
 
+`run/sweep.sh` drives every stub in `run/stubs/` through the runner and
+checks each verdict, then reports any worktree or lock left behind. It
+is the one command that says whether the loop still holds:
+
+```bash
+bash labs/agent-bots/run/sweep.sh
+```
+
 A task that already finished will not re-run; pass `--reset` to discard
 the live task and start over. Exit codes are `0` done, `1` blocked,
 `2` needs-review.
@@ -337,8 +361,22 @@ labs/agent-bots/run/bot-run.sh   --task labs/agent-bots/examples/T-0005-review-o
 
 Its verifier is `run/review-shape.sh`, which checks the review against
 the tree it claims to be about — including that every cited `path:line`
-exists at that commit and falls inside `touches:`. What it cannot check
-is whether the review is *right*; see F-19 for where that ceiling sits.
+is a real file and a real line at that commit, and falls inside
+`touches:`. What it cannot check is whether the review is *right*; see
+F-19 for where that ceiling sits.
+
+A review task that also declares `on_changes_requested:` and
+`derived_verify:` hands its verdict on. `changes-requested` then makes
+the runner write a task for that bot into `.state/proposed/` and
+address the handoff to it by name:
+
+```bash
+# review, then hand the findings to the fixer as a scoped task
+labs/agent-bots/run/bot-run.sh   --task labs/agent-bots/examples/T-0006-review-telemetry.md
+
+# ... and dispatch that task too, rather than printing the command
+labs/agent-bots/run/bot-run.sh   --task labs/agent-bots/examples/T-0006-review-telemetry.md --chain
+```
 
 **Which CLI runs is data.** The task's `agent:` wins, otherwise the
 charter's; the profile lives in `contract/agents/<id>.agent.md`. There is no
@@ -377,6 +415,7 @@ are committed.
 | `.state/tasks/<id>.md` | the live task — the repo copy is only a definition |
 | `.state/handoffs/<ts>_<bot>__to__human__<id>.md` | the handoff |
 | `.state/reviews/<ts>_<bot>_<id>.md` | a review, harvested off the worktree |
+| `.state/proposed/<id>.md` | a task one bot's run wrote for another |
 | `.state/runs/<day>/<id>-<ts>.log` | agent + verifier output |
 | `<repo>.worktrees/bot-<owner>-<id>/` | the work |
 
@@ -550,11 +589,19 @@ The second bot now exists — `reviewer`, which reads and judges and
 commits nothing — and the first thing it did was find four open races
 in the dispatch path that dispatched it (F-20). That is the argument
 for this direction in one run: a second bot is not twice the throughput,
-it is a different pair of eyes on work the first one cannot see. What
-is still missing before it is really multi-bot is the handoff *between*
-them: today both bots hand to a human, and a review that ends
-`changes-requested` becomes a fixer task only because a person writes
-one.
+it is a different pair of eyes on work the first one cannot see.
+
+The handoff between them is built too (F-21): a review that ends
+`changes-requested` becomes a scoped task for the fixer, written by the
+runner rather than by either bot. The first time that ran end to end,
+the fixer read the review, checked its single finding against the
+source, and refused it with a reason — which turned out to be the one
+outcome the runner had no verdict for (F-22).
+
+What is still missing is everything about *when*. Nothing schedules a
+bot, nothing notices that a task has become ready, and `--chain` is one
+link long by construction. The board records what happened; nothing yet
+reads it to decide what happens next.
 
 And the board stops being a maybe. It was designed append-only from the
 start (§3.2) precisely so it would survive concurrent writers, so the
@@ -1333,14 +1380,16 @@ said so itself rather than claiming a repro it did not have. The guard
 went in anyway — F-15 already committed this script to running on
 macOS, and every other array expansion in the file had the same shape.
 
-One finding is open rather than fixed. The control plane defaults to a
-directory beside the *script*, so two checkouts of the same repository
-take different `dispatch.lock` directories and scan different `tasks/`
-trees while creating branches in one shared object store: **the lock is
-scoped to the state directory and the conflict it prevents is scoped to
-the repository.** That is a question about where the control plane
-lives, which §7.2 already has to answer for the product port, and
-patching the prototype's default would paper over it.
+One finding was open at the time and is now guarded rather than
+solved. The control plane defaults to a directory beside the *script*,
+so two checkouts of the same repository take different `dispatch.lock`
+directories and scan different `tasks/` trees while creating branches
+in one shared object store: **the lock is scoped to the state
+directory and the conflict it prevents is scoped to the repository.**
+The runner now refuses to use the default state from a linked worktree
+and asks for an explicit `--state`, which closes the case it can
+detect. Where the control plane should actually live is still §7.2's
+question for the product port.
 
 Two things worth recording about the run itself, beyond the bugs.
 
@@ -1362,3 +1411,119 @@ first time in this experiment that it has visibly paid.
 Criterion 2 is still not met. Nothing here was an agent claiming
 success while being wrong — the reviewer was right, carefully, and said
 where it wasn't sure.
+
+---
+
+### F-21 · A handoff between bots is a task the runner writes, not a message a bot sends
+
+*2026-09-11, closing the loop between two bots.*
+
+Until now every handoff ended `to: human`, because there was nobody
+else to address. A review that says `changes-requested` is the first
+thing in this design with an obvious next recipient, and the obvious
+implementation is to let the reviewer emit the task.
+
+That fails for exactly the reason the agent does not write its own
+handoff. A task is a *scope*: it says which files may be edited and
+what will judge the result. Letting the bot that decided what is wrong
+also decide what may be touched to fix it is self-reported scope, and
+the loop's one rule is that self-reported anything is not evidence.
+
+So the runner writes it, and every field comes from somewhere that is
+not the review's prose:
+
+| field | source |
+|---|---|
+| `owner`, `verify` | the review **task**, which is contract |
+| `touches` | the paths the findings cite, re-checked against the tree |
+| `base` | the commit the worktree was actually at |
+| objective | a **path** to the review — never a copy of it |
+
+That last row is the Grok Bot lesson taken literally: *the message
+carries a path*. Inline the findings into the derived task and there
+are two copies free to disagree, and the bot reads the copy.
+
+Three consequences fell out, none of them anticipated:
+
+**"No verifier, no dispatch" applies one level up.** A review task that
+declares `on_changes_requested:` must also declare `derived_verify:`,
+and dispatch refuses without it — checked before the review runs, not
+after, because the moment to discover that a handoff cannot be
+delivered is before producing the thing to deliver. The verifier cannot
+come from the review for the same reason the scope cannot.
+
+**The citations are re-checked even though the verifier already checked
+them.** `verify:` is data; a task is free to name a different one. A
+path that will scope another bot is not something to take on trust from
+the file it came out of.
+
+**A stable derived id is a fork, not a queue.** Re-reviewing the same
+task would write over a follow-up that is still open, so the runner
+refuses to derive while one exists. Same reasoning as the overlap
+check, one level up.
+
+The dispatch of the derived task is a separate decision, and `--chain`
+is off by default. A task written by a machine and started by a machine
+with nothing in between is a different risk class from one a human read
+first; in the product that gap is where the approval inbox goes. The
+flag exists so the chain can be demonstrated without pretending the
+gate does not matter.
+
+**One bug found by the chain itself.** Running it with a stub, the
+child inherited `BOT_AGENT_CMD` and the *fixer* ran the reviewer stub —
+which wrote `.bot-review.md`. The runner harvested it unconditionally,
+so the file left the worktree, never counted as uncommitted, and a
+change run that produced a review instead of a commit came back `done`.
+Harvesting is now gated on `kind: review`; on a change task the file
+stays where it is and the run is `needs-review`, which is what a bot
+acting outside its charter should look like.
+
+---
+
+### F-22 · An empty commit is an answer, and no verifier reads answers
+
+*2026-09-11, the first real bot-to-bot chain.*
+
+The reviewer handed the fixer a finding. The fixer read the review by
+the path it was given, read `core/src/telemetry.rs` end to end, decided
+the finding asserted nothing about the code — no defect, no incorrect
+behaviour, nothing at the cited line to be wrong about — and answered
+with an **empty commit** whose message is the argument, because the
+derived task names the commit message as the channel for a finding the
+fixer disagrees with.
+
+That is the right answer, arrived at the right way. The runner reported
+`done`.
+
+It was not wrong by accident so much as by construction. The verdict
+rules are "one commit, verifier green, diff inside `touches:`", and an
+empty commit satisfies all three without the runner ever learning
+whether anything was decided. Every other `done` in this design means
+*a verifier proved something about a diff*. Here there is no diff, and
+what needs judging is a piece of reasoning.
+
+So a commit with an empty diff is now `needs-review`, with the commit
+subjects quoted in the blocker. Not because the answer is suspect —
+`run/stubs/refusenik.sh` is the regression and it is modelled on the
+real run — but because the thing that has to be evaluated is an
+argument, and the runner cannot read arguments. The same rule as F-18:
+an outcome the runner cannot check does not get reported as proven.
+
+Two things worth keeping from the run itself.
+
+**The handoff worked as designed and the evidence says so.** The fixer
+was given a path, not a copy; it opened the review, took its claim
+seriously enough to check it against the source, and refused it with a
+reason a human can audit. It also noticed, and said, that the review's
+own text admits to being a stub — and then explicitly declined to rest
+its rejection on that, resting it on having read the file instead. That
+is the distinction between corroboration and evidence, unprompted.
+
+**Disagreement has to be a first-class outcome or the chain is a
+rubber stamp.** If the only shapes a derived task can end in are "fixed"
+and "blocked", every finding becomes a change, and a reviewer's
+mistakes get written into the code by a second bot that had no way to
+push back. The derived task says so in as many words: *a finding you
+disagree with is not a finding you skip; say so, with the reason.
+Silence reads as agreement, and the next reader cannot tell the
+difference between fixed and missed.*

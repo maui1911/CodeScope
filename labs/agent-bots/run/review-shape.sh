@@ -23,6 +23,7 @@
 #   BOT_REVIEW        path to the harvested review
 #   BOT_REVIEWED_SHA  the commit the worktree was checked out at
 #   BOT_TOUCHES       the task's touches: globs, comma-separated
+#   BOT_TASK_ID       the task this review is supposed to answer
 #
 # It runs inside the clean verify checkout, so `git` here is that tree.
 
@@ -65,24 +66,55 @@ if [ -n "${BOT_REVIEWED_SHA:-}" ] && [ "$REVIEWED" != "$BOT_REVIEWED_SHA" ]; the
     fail "review says it covers $REVIEWED, but the worktree was $BOT_REVIEWED_SHA"
 fi
 
+if [ -n "${BOT_TASK_ID:-}" ] && [ "$TASK" != "$BOT_TASK_ID" ]; then
+    fail "review answers task '$TASK', but this run is '$BOT_TASK_ID'"
+fi
+
 grep -q '^# What I could not check' "$BOT_REVIEW" \
     || fail "no 'What I could not check' section - the blind spots are part of the answer"
 
-BLIND="$(sed -n '/^# What I could not check/,$p' "$BOT_REVIEW" \
-    | sed '1d' | sed '/^[[:space:]]*$/d' | head -n 5)"
+# One reader that consumes the whole file. The `sed | sed | head`
+# version SIGPIPEd under pipefail on a review with more than five
+# blind-spot lines - the wrong way round, since that is the thorough
+# answer - and it counted the template's closing `---` as content, so
+# an empty section passed.
+BLIND="$(awk '
+    /^# What I could not check/ { inside = 1; next }
+    inside && /^# / { exit }
+    inside && /^---[[:space:]]*$/ { exit }
+    inside && NF { print }
+' "$BOT_REVIEW")"
 [ -n "$BLIND" ] || fail "'What I could not check' is empty"
 
 grep -q '^# Findings' "$BOT_REVIEW" || fail "no 'Findings' section"
 
-FINDINGS_BODY="$(sed -n '/^# Findings/,/^# /p' "$BOT_REVIEW" | sed '1d;$d')"
+FINDINGS_BODY="$(awk '
+    /^# Findings/ { inside = 1; next }
+    inside && /^# / { exit }
+    inside { print }
+' "$BOT_REVIEW")"
 
-if printf '%s\n' "$FINDINGS_BODY" | grep -q '^No findings\.'; then
+# Exactly that line and nothing else. `grep -q` matched it *anywhere*
+# in the section and returned straight away, so a review could claim no
+# findings, list five, and skip every citation and scope check below.
+FINDINGS_TRIMMED="$(printf '%s\n' "$FINDINGS_BODY" | sed '/^[[:space:]]*$/d')"
+if [ "$FINDINGS_TRIMMED" = "No findings." ]; then
+    # A verdict is a claim about the findings, so the two have to agree.
+    # `changes-requested` with nothing to change is not something a
+    # reader can work around: it asks for work and names none of it, and
+    # downstream it would derive a task scoped to no paths at all.
+    [ "$VERDICT" != "changes-requested" ] \
+        || fail "verdict is changes-requested but the review lists no findings - which is it?"
     echo "review-shape: ok - no findings, $VERDICT"
     exit 0
 fi
 
+# Path and line, kept together. Dropping the line number before
+# validating meant `bot-run.sh:999999` passed as long as the file
+# existed - and what the contract promises is that the *citation* is
+# real, not that the file is.
 CITED="$(printf '%s\n' "$FINDINGS_BODY" \
-    | sed -n 's/^-[[:space:]]\{1,\}\([^[:space:]]\{1,\}\):[0-9]\{1,\}.*/\1/p')"
+    | sed -n 's/^-[[:space:]]\{1,\}\([^[:space:]]\{1,\}\):\([0-9]\{1,\}\).*/\1:\2/p')"
 
 [ -n "$CITED" ] || fail "no findings and no 'No findings.' line - a review has to say which it is"
 
@@ -90,7 +122,7 @@ split_globs() {
     GLOBS_OUT=()
     local raw=() g
     IFS=',' read -ra raw <<< "$1"
-    for g in "${raw[@]}"; do
+    for g in ${raw[@]+"${raw[@]}"}; do
         g="${g#"${g%%[![:space:]]*}"}"
         g="${g%"${g##*[![:space:]]}"}"
         [ -n "$g" ] && GLOBS_OUT+=("$g")
@@ -98,24 +130,37 @@ split_globs() {
 }
 split_globs "${BOT_TOUCHES:-}"
 
+# An empty scope is not an unlimited one. Skipping the loop when no glob
+# parsed would let a review of `touches: ,` cite anything in the repo.
+[ "${#GLOBS_OUT[@]}" -gt 0 ] \
+    || fail "BOT_TOUCHES ('${BOT_TOUCHES:-}') normalises to no globs, so nothing can be in scope"
+
 COUNT=0
-while IFS= read -r path; do
-    [ -n "$path" ] || continue
+while IFS= read -r citation; do
+    [ -n "$citation" ] || continue
     COUNT=$((COUNT + 1))
+    path="${citation%:*}"
+    line="${citation##*:}"
 
     git cat-file -e "$BOT_REVIEWED_SHA:$path" 2>/dev/null \
         || fail "finding cites '$path', which does not exist at $BOT_REVIEWED_SHA"
 
-    if [ "${#GLOBS_OUT[@]}" -gt 0 ]; then
-        ok=0
-        for g in "${GLOBS_OUT[@]}"; do
-            # shellcheck disable=SC2254  # a glob, on purpose
-            case "$path" in $g) ok=1; break ;; esac
-        done
-        [ "$ok" -eq 1 ] \
-            || fail "finding cites '$path', which is outside touches: ${BOT_TOUCHES:-}"
+    [ "$(git cat-file -t "$BOT_REVIEWED_SHA:$path" 2>/dev/null)" = "blob" ] \
+        || fail "finding cites '$path', which is not a file at $BOT_REVIEWED_SHA"
+
+    lines="$(git cat-file blob "$BOT_REVIEWED_SHA:$path" | wc -l | tr -d ' ')"
+    if [ "$line" -lt 1 ] || [ "$line" -gt "$lines" ]; then
+        fail "finding cites '$path:$line', but that file has $lines lines at $BOT_REVIEWED_SHA"
     fi
+
+    ok=0
+    for g in ${GLOBS_OUT[@]+"${GLOBS_OUT[@]}"}; do
+        # shellcheck disable=SC2254  # a glob, on purpose
+        case "$path" in $g) ok=1; break ;; esac
+    done
+    [ "$ok" -eq 1 ] \
+        || fail "finding cites '$path', which is outside touches: ${BOT_TOUCHES:-}"
 done <<< "$CITED"
 
-echo "review-shape: ok - $COUNT cited path(s), $VERDICT"
+echo "review-shape: ok - $COUNT cited path:line(s), $VERDICT"
 exit 0

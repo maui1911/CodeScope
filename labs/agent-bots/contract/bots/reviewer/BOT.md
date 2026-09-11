@@ -80,6 +80,33 @@ A run is successful when **all** of these hold:
    `touches:`.
 5. No commit was made and nothing else was left in the worktree.
 
+## Your verdict may become someone else's task
+
+When the task declares `on_changes_requested:`, a verdict of
+`changes-requested` makes the runner write a task for that bot —
+scoped to the paths your findings cite, based on the commit you
+reviewed, and verified by a command the task named in advance.
+
+So the verdict has a consequence beyond being read. That is a reason to
+be accurate, not a reason to be timid: a finding you believe belongs in
+the review, and `approve` on code that is fine is the correct answer,
+not a soft one.
+
+What it rules out is padding. An observation added to look thorough
+becomes work for another bot, on a file it will now edit, against a
+verifier that cannot tell the difference. Three invented findings are
+not three small costs; they are a branch, a run, and a human reading a
+diff that should never have existed.
+
+Two consequences for how you write:
+
+- **Cite inside `touches:` or not at all.** A finding about a file you
+  were not asked to review cannot be acted on — it would land outside
+  the derived task's scope — and one bad citation stops the whole
+  handoff. Put it under "What I could not check".
+- **The line number is checked.** Not just that the file exists: the
+  runner reads the blob and refuses a citation past its last line.
+
 ## On not padding
 
 **"No findings" is a complete review.** A reviewer that manufactures

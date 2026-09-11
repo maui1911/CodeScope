@@ -17,9 +17,13 @@ can tell them.
 - core/src/example.rs:301 — second finding.
 
 Ranked by what would actually break, hardest first. Every line starts
-with a real `path:line` inside the task's `touches:`; the runner checks
-that the path exists in the commit under review and refuses the run if
-it does not.
+with a real `path:line` inside the task's `touches:`. The runner reads
+the blob at the commit under review and refuses the run if the path is
+not a file there, or if the line is past its end.
+
+These citations are also the scope of whatever comes next: when the
+task declares `on_changes_requested:`, this list is what the derived
+task's `touches:` is built from.
 
 If there is nothing to report, this section is exactly:
 
@@ -54,4 +58,8 @@ Field reference:
 The runner harvests this file, deletes it from the worktree, and stores
 it in the control plane. Its verdict goes on the handoff; the file
 itself is the artifact a human reads. You never write the handoff.
+
+`changes-requested` with no findings is refused: a verdict is a claim
+about the findings, and asking for work while naming none of it is not
+something a reader can resolve.
 -->

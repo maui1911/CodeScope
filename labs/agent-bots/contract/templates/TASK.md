@@ -43,6 +43,18 @@ Field reference:
            tasks are exempt from the overlap check in both directions,
            because a bot that writes nothing cannot conflict at merge.
            See README F-19.
+  on_changes_requested
+           review tasks only, optional. The bot that receives the
+           follow-up when the verdict is `changes-requested`. The
+           runner writes that task itself, scoped to the paths the
+           findings cite, based on the commit that was reviewed, and
+           drops it in `.state/proposed/`. Leave it out and the review
+           stops with a human.
+  derived_verify
+           required whenever `on_changes_requested:` is set. The
+           verifier the derived task gets. It has to be declared here
+           because the only other source is the review, and a bot does
+           not choose how its own follow-up is judged. See README F-21.
   owner    which bot in contract/bots/ runs this.
   status   todo | dispatched | blocked | needs-review | done
            On the repo copy this is always `todo` - it is a definition.

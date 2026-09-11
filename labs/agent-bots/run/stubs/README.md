@@ -14,6 +14,9 @@ regression tests for F-4 and F-8.
 | `liar.sh` | an agent that **claims success and is wrong**: commits a deliberately failing test, prints a confident summary, exits 0 | `blocked`, verifier exit 101, worktree kept |
 | `sloppy.sh` | an agent that does the job correctly and leaves an unlinked `TODO` behind | `blocked`, the offending added line quoted |
 | `meddler.sh` | not an agent — a **verifier** that passes while committing into the worktree it was judging | `blocked`, "verifier changed the tree it was measuring" |
+| `fabulist.sh` | a reviewer that writes a confident, well-formed review citing a file this repo has never had | `blocked`, the invented path quoted |
+| `critic.sh` | a reviewer whose findings are well-formed and real: the positive case for the bot-to-bot handoff | `done`, a task derived for the next bot and the handoff addressed to it |
+| `refusenik.sh` | an agent that answers with an **empty commit** carrying its reasoning | `needs-review`, the commit subject quoted |
 
 Before F-4 was fixed, the first two both landed on `done` as a no-op,
 and the cleanup path then deleted the branch — the evidence went with
@@ -36,6 +39,19 @@ real agent's flags.
 agent, so it is named in a task's `verify:` instead of being injected
 through `BOT_AGENT_CMD`. `examples/T-0003-meddling-verifier.md` wires
 it up; run that one with `--skip-agent`.
+
+`critic.sh` and `fabulist.sh` are a pair, both for review tasks:
+fabulist is the negative case (a confident review citing a file that
+does not exist), critic the positive one (everything checks out, so the
+handoff is derived). Point critic at
+`examples/T-0006-review-telemetry.md`, and add `--chain` to watch the
+derived task dispatch itself.
+
+One thing to know when chaining with a stub: the child inherits
+`BOT_AGENT_CMD`, so both halves of the chain run the same stub. That is
+how the harvest bug in F-21 was found — a fixer behaving like a
+reviewer — but it does mean a stubbed chain is not two different
+bots.
 
 `liar.sh` appends to `core/src/telemetry.rs`, so point it at a task
 whose `touches:` covers that file, or it will trip the scope check

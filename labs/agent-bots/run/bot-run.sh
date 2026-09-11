@@ -34,6 +34,9 @@
 #                        Needed to re-run a task that already finished.
 #   --allow-overlap      Dispatch even though another in-flight task
 #                        declares files this one also touches.
+#   --chain              After a review that asks for changes, dispatch
+#                        the task derived from it instead of stopping
+#                        at "here is the command". Off by default.
 #   -h, --help           This text.
 #
 # Exit codes: 0 done, 1 blocked, 2 needs-review.
@@ -74,6 +77,7 @@ SKIP_AGENT=0
 KEEP=0
 RESET=0
 ALLOW_OVERLAP=0
+CHAIN=0
 AGENT_EXIT=0
 
 # Repo-relative, and deliberately a single variable: the prompt points
@@ -180,13 +184,14 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --task)          TASK="${2:-}"; shift 2 ;;
         --repo)          REPO="${2:-}"; shift 2 ;;
-        --state)         STATE="${2:-}"; shift 2 ;;
+        --state)         STATE="${2:-}"; BOT_STATE_WAS_EXPLICIT=1; shift 2 ;;
         --worktree-root) WORKTREE_ROOT="${2:-}"; shift 2 ;;
         --dry-run)       DRY_RUN=1; shift ;;
         --skip-agent)    SKIP_AGENT=1; shift ;;
         --keep)          KEEP=1; shift ;;
         --reset)         RESET=1; shift ;;
         --allow-overlap) ALLOW_OVERLAP=1; shift ;;
+        --chain)         CHAIN=1; shift ;;
         -h|--help)       usage; exit 0 ;;
         *)               die "unknown argument: $1 (try --help)" ;;
     esac
@@ -205,6 +210,43 @@ fi
 
 STATE="${STATE:-$LAB_DIR/.state}"
 WORKTREE_ROOT="${WORKTREE_ROOT:-${REPO}.worktrees}"
+
+# Absolute, both of them, and not as tidiness: the verifier runs after a
+# `cd` into the verify checkout, so a relative --state would hand it a
+# review path that resolves inside a throwaway worktree - every review
+# task failing with "no review", and the build cache quietly created in
+# there too.
+abspath() {   # abspath <path> - works on a path that does not exist yet
+    case "$1" in
+        /*|[A-Za-z]:[\\/]*) printf '%s\n' "$1" ;;
+        *) printf '%s\n' "$(cd "$(dirname "$1")" 2>/dev/null && pwd || printf '%s' "$PWD")/$(basename "$1")" ;;
+    esac
+}
+mkdir -p "$STATE"
+STATE="$(cd "$STATE" && pwd)"
+WORKTREE_ROOT="$(abspath "$WORKTREE_ROOT")"
+
+# The control plane is keyed to this checkout, and the conflicts it
+# exists to prevent are keyed to the repository. For a single checkout
+# those are the same thing. For a linked worktree they are not: two
+# checkouts of one repo would take different dispatch locks and scan
+# different task directories while creating branches in one shared
+# object store, and both would pass the overlap check. Refuse the
+# default there rather than coordinate something it cannot see.
+if [ -z "${BOT_STATE_WAS_EXPLICIT:-}" ]; then
+    GIT_DIR_HERE="$(git -C "$REPO" rev-parse --absolute-git-dir 2>/dev/null || true)"
+    GIT_COMMON="$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+    if [ -n "$GIT_DIR_HERE" ] && [ -n "$GIT_COMMON" ] && [ "$GIT_DIR_HERE" != "$GIT_COMMON" ]; then
+        die "this is a linked worktree, and --state was not given.
+
+The default control plane sits beside the script, so runs from two
+checkouts of one repository would not see each other while sharing a
+branch namespace - the overlap check would pass and both would
+dispatch. Point every checkout at one state directory:
+
+    --state <path shared by all checkouts of $REPO>"
+    fi
+fi
 
 
 # --------------------------------------------------------------------
@@ -274,6 +316,14 @@ case "$TASK_KIND" in
     *) die "kind '$TASK_KIND' is not one of: change, review" ;;
 esac
 
+# What a `changes-requested` verdict turns into. Both come from the
+# task, which is contract - never from the review, which is a claim.
+# "No verifier, no dispatch" applies one level up: a review task that
+# cannot say how its follow-up would be proven does not get to produce
+# one. See F-21.
+TASK_ON_CHANGES="$(field on_changes_requested)"
+TASK_DERIVED_VERIFY="$(field derived_verify)"
+
 for f in id owner base branch touches verify; do
     var="TASK_$(printf '%s' "$f" | tr '[:lower:]' '[:upper:]')"
     [ -n "${!var}" ] || die "task is missing required field: $f"
@@ -339,6 +389,23 @@ done
 # that task's contract and gets the same treatment.
 if [ "$TASK_KIND" = "review" ]; then
     base_has "templates/REVIEW.md" || missing_at_base "templates/REVIEW.md"
+
+    # Checked now, not after the review is written: the moment to find
+    # out that a handoff cannot be delivered is before the run that
+    # produces it. Same shape as F-1 and F-3.
+    if [ -n "$TASK_ON_CHANGES" ]; then
+        case "$TASK_ON_CHANGES" in
+            *[!a-zA-Z0-9_-]*) die "on_changes_requested must be [a-zA-Z0-9_-]+, got '$TASK_ON_CHANGES'" ;;
+        esac
+        base_has "bots/$TASK_ON_CHANGES/BOT.md" || missing_at_base "bots/$TASK_ON_CHANGES/BOT.md"
+        [ -n "$TASK_DERIVED_VERIFY" ] || die \
+"task hands 'changes-requested' to '$TASK_ON_CHANGES' but declares no derived_verify:
+
+The derived task needs a verifier for the same reason this one does -
+and it has to come from here, because the only other source is the
+review, and a bot does not get to choose how its own follow-up is
+judged. See F-21."
+    fi
 fi
 
 TASK_AGENT="$(field agent)"
@@ -469,26 +536,38 @@ split_globs() {
     done
 }
 
-BASE_FILES="$(git -C "$REPO" ls-tree -r --name-only "$BASE_SHA")"
-
-# expand_globs <comma-separated> - the paths at base those globs match.
+# expand_globs <comma-separated> [sha] - the paths those globs match in
+# a tree. The sha matters: expanding another task's globs against *this*
+# task's base answers a question nobody asked. A file that exists only
+# in the other task's base does not expand, and a wildcard that would
+# have collided with it passes.
 expand_globs() {
-    local file g
+    local file g files
     local -a globs
     split_globs "$1"
     globs=(${GLOBS_OUT[@]+"${GLOBS_OUT[@]}"})
     [ "${#globs[@]}" -gt 0 ] || return 0
+    files="$(git -C "$REPO" ls-tree -r --name-only "${2:-$BASE_SHA}" 2>/dev/null || true)"
+    [ -n "$files" ] || return 0
     while IFS= read -r file; do
         for g in ${globs[@]+"${globs[@]}"}; do
             # shellcheck disable=SC2254  # a glob, on purpose
             case "$file" in $g) printf '%s\n' "$file"; break ;; esac
         done
-    done <<< "$BASE_FILES"
+    done <<< "$files"
 }
 
-MY_FILES="$(expand_globs "$TASK_TOUCHES" | sort -u)"
 split_globs "$TASK_TOUCHES"
 MY_GLOBS=(${GLOBS_OUT[@]+"${GLOBS_OUT[@]}"})
+
+# `touches: ,` is non-empty as a string and empty as a scope. Left
+# alone it means "no glob matches anything", which the scope check
+# reads as "every file is a violation" and review-shape.sh reads as
+# "skip the scope loop entirely" - opposite answers to the same typo.
+[ "${#MY_GLOBS[@]}" -gt 0 ] \
+    || die "touches: '$TASK_TOUCHES' normalises to no globs at all"
+
+MY_FILES="$(expand_globs "$TASK_TOUCHES" | sort -u)"
 
 OVERLAP_REPORT=""
 OVERLAP_IDS=""
@@ -529,7 +608,11 @@ if [ -d "$STATE/tasks" ]; then
         fi
 
         other_touches="$(field touches "$live")"
-        other_files="$(expand_globs "$other_touches" | sort -u)"
+        # Against that task's own base, recorded at its dispatch. Two
+        # tasks that branched from different commits see different
+        # trees, and the file that collides may exist in only one.
+        other_base="$(field base_sha "$live")"
+        other_files="$(expand_globs "$other_touches" "${other_base:-$BASE_SHA}" | sort -u)"
 
         shared=""
         if [ -n "$MY_FILES" ] && [ -n "$other_files" ]; then
@@ -865,6 +948,17 @@ cp "$TASK" "$LIVE_TASK"
 # --worktree-root - so a run started with a different root read a live
 # claim as a ghost and dispatched straight over it.
 set_field worktree "$WT"
+set_field base_sha "$BASE_SHA"
+
+# Last thing before this run becomes visible to everyone else: are we
+# still the lock holder? If the lock was broken while we were inside
+# it, the exclusion we are about to rely on stopped being true, and
+# claiming anyway would make the board say two runs agreed when they
+# never met.
+[ "$(cat "$STATE/dispatch.lock/owner" 2>/dev/null || true)" = "$RUN_TOKEN" ] || die \
+"the dispatch lock was broken while this run was inside it - refusing to claim.
+Nothing was dispatched. Re-run once no other run is in flight."
+
 set_status dispatched
 board "dispatched" "$TASK_BRANCH @ ${BASE_SHA:0:12}"
 
@@ -941,9 +1035,16 @@ fi
 # same reason: it is the artifact, so it belongs in the control plane,
 # and it must be out of the worktree before the evidence is read or it
 # would count as an uncommitted file the bot left behind.
+#
+# Only for a review task. Harvesting it unconditionally meant a change
+# task that wrote one had the file quietly moved out of its worktree -
+# so it never counted as an uncommitted file, and a run that produced a
+# review instead of a commit came back `done`. Found by a chain run
+# where the child inherited the parent's stub override and the fixer
+# behaved like a reviewer.
 REVIEW_FILE=""
 REVIEW_VERDICT=""
-if [ -f "$WT/.bot-review.md" ]; then
+if [ "$TASK_KIND" = "review" ] && [ -f "$WT/.bot-review.md" ]; then
     mkdir -p "$STATE/reviews"
     REVIEW_FILE="$STATE/reviews/${TS}_${TASK_OWNER}_${TASK_ID}.md"
     mv "$WT/.bot-review.md" "$REVIEW_FILE"
@@ -964,9 +1065,16 @@ if [ -z "$HEAD_SHA" ]; then
     TOUCHED=""
     NUMSTAT="worktree unreadable"
     TODO_VIOLATIONS=""
+    BASE_IS_ANCESTOR=1
     TREE_BROKEN=1
 else
     TREE_BROKEN=0
+    # `BASE_SHA..HEAD` counts commits reachable from HEAD and not from
+    # base, which is zero both when nothing happened and when the branch
+    # was reset onto the base or behind it. Those are opposite outcomes,
+    # and the second one reaches the no-op path that deletes the branch.
+    BASE_IS_ANCESTOR=1
+    git -C "$WT" merge-base --is-ancestor "$BASE_SHA" HEAD 2>/dev/null || BASE_IS_ANCESTOR=0
     COMMITS="$(git -C "$WT" rev-list --count "$BASE_SHA..HEAD")"
     DIRTY="$(git -C "$WT" status --porcelain | wc -l | tr -d ' ')"
     # quotepath=off keeps non-ASCII paths unquoted, so the scope check
@@ -1076,6 +1184,7 @@ else
         && export BOT_REVIEW="$REVIEW_FILE" \
         && export BOT_REVIEWED_SHA="$HEAD_SHA" \
         && export BOT_TOUCHES="$TASK_TOUCHES" \
+        && export BOT_TASK_ID="$TASK_ID" \
         && eval "$TASK_VERIFY" ) </dev/null >>"$RUN_LOG" 2>&1 || VERIFY_EXIT=$?
     say "  exit $VERIFY_EXIT"
     board "verified" "exit $VERIFY_EXIT"
@@ -1125,6 +1234,11 @@ elif [ -n "$TREE_MUTATED" ]; then
     # worth reporting.
     STATUS="blocked"
     BLOCKERS="$TREE_MUTATED"
+elif [ "$BASE_IS_ANCESTOR" -eq 0 ]; then
+    STATUS="blocked"
+    BLOCKERS="the branch no longer descends from the commit it was dispatched at.
+base $BASE_SHA is not an ancestor of head $HEAD_SHA, so the commit count
+below describes nothing and any work that was done has been discarded."
 elif [ -n "$AGENT_BLOCKED" ]; then
     STATUS="blocked"
     BLOCKERS="agent reported blocked: $AGENT_BLOCKED"
@@ -1161,6 +1275,25 @@ Remove it before re-running:
 elif [ "$DIRTY" -ne 0 ]; then
     STATUS="needs-review"
     BLOCKERS="$DIRTY uncommitted file(s) left in the worktree"
+elif [ "$COMMITS" -gt 0 ] && [ -z "$TOUCHED" ]; then
+    # F-22: a commit with no diff. Found by the first bot-to-bot chain,
+    # where it was the *right* answer - the fixer read the review,
+    # checked the finding against the code, rejected it, and put the
+    # reasoning in the commit message because the task named that as
+    # the channel for disagreement.
+    #
+    # The runner still must not call it `done`. Every other `done` means
+    # "a verifier proved something about a diff"; here there is no diff,
+    # and what has to be judged is an argument. The same rule as F-18:
+    # an outcome the runner cannot check does not get reported as
+    # proven. So it goes to a human with the message in front of them.
+    STATUS="needs-review"
+    BLOCKERS="$COMMITS commit(s), none of them changing a file.
+
+That is a legitimate answer - a reasoned refusal is a result, and the
+message is the artifact - but it is an argument, and no verifier reads
+arguments. Read it:
+$(git -C "$WT" log --format='    %h %s' "$BASE_SHA..HEAD" 2>/dev/null)"
 elif [ "$COMMITS" -gt 1 ]; then
     # BOT.md acceptance criterion 3. The work may well be fine; a human
     # decides whether to squash.
@@ -1179,14 +1312,159 @@ else
     STATUS="done"
 fi
 
+# --------------------------------------------------------------------
+# Handoff to another bot
+#
+# F-21: a handoff between bots is a task the runner writes, not a
+# message a bot sends. Letting the reviewer emit the next task fails
+# for exactly the reason the agent does not write its own handoff - it
+# would be self-reported scope, and the bot that decides what is wrong
+# would also decide what is allowed to be touched to fix it.
+#
+# So every field comes from somewhere that is not the review's prose:
+#
+#   owner, verify  from the review *task*, which is contract
+#   touches        from the cited paths, re-checked against the tree
+#   base           from the commit the worktree was actually at
+#   objective      a *path* to the review, never a copy of it
+#
+# That last one is the Grok Bot lesson taken literally: the message
+# carries a path. Inline the findings and there are two copies free to
+# disagree, and the fixer reads the copy.
+# --------------------------------------------------------------------
+
+DERIVED_TASK=""
+DERIVED_ID=""
+DERIVED_WHY=""
+
+if [ "$TASK_KIND" = "review" ] && [ "$STATUS" = "done" ] \
+   && [ "$REVIEW_VERDICT" = "changes-requested" ]; then
+    if [ -z "$TASK_ON_CHANGES" ]; then
+        DERIVED_WHY="the task declares no on_changes_requested:, so this review stops with a human"
+    else
+        CITED="$(sed -n 's/^-[[:space:]]\{1,\}\([^[:space:]]\{1,\}\):[0-9]\{1,\}.*/\1/p' \
+            "$REVIEW_FILE" | sort -u)"
+
+        # Re-checked here even though review-shape.sh already checked
+        # them: `verify:` is data, a task is free to name a different
+        # one, and a path that scopes a bot is not something to take on
+        # trust from the file it came out of.
+        CITED_OK=""
+        CITED_BAD=""
+        while IFS= read -r cited_path; do
+            [ -n "$cited_path" ] || continue
+            if ! git -C "$REPO" cat-file -e "$HEAD_SHA:$cited_path" 2>/dev/null; then
+                CITED_BAD="$CITED_BAD $cited_path(missing)"
+                continue
+            fi
+            in_scope=0
+            for g in ${MY_GLOBS[@]+"${MY_GLOBS[@]}"}; do
+                # shellcheck disable=SC2254  # a glob, on purpose
+                case "$cited_path" in $g) in_scope=1; break ;; esac
+            done
+            if [ "$in_scope" -eq 1 ]; then
+                CITED_OK="$CITED_OK$cited_path"$'\n'
+            else
+                CITED_BAD="$CITED_BAD $cited_path(out of scope)"
+            fi
+        done <<< "$CITED"
+
+        if [ -z "$CITED_OK" ]; then
+            DERIVED_WHY="the review asks for changes but cites no usable path, so there is nothing to scope a task to"
+        elif [ -n "$CITED_BAD" ]; then
+            DERIVED_WHY="the review cites paths the tree does not support:$CITED_BAD - a human decides what that means"
+        elif [ -f "$STATE/tasks/$TASK_ID-fix.md" ]; then
+            # The derived id is stable, so a second review of the same
+            # task would write over a follow-up that is still open. Two
+            # fix tasks for one review is not a queue, it is a fork; the
+            # same reasoning as the overlap check, one level up.
+            DERIVED_WHY="a follow-up for this review already exists and is '$(field status "$STATE/tasks/$TASK_ID-fix.md")' at $STATE/tasks/$TASK_ID-fix.md - resolve that one first"
+        else
+            DERIVED_ID="$TASK_ID-fix"
+            DERIVED_TASK="$STATE/proposed/$DERIVED_ID.md"
+            DERIVED_TOUCHES="$(printf '%s' "$CITED_OK" \
+                | awk 'NF { if (n++) printf ", "; printf "%s", $0 } END { print "" }')"
+            mkdir -p "$STATE/proposed"
+
+            cat > "$DERIVED_TASK" <<DERIVED_END
+---
+id: $DERIVED_ID
+kind: change
+title: Address the findings from $TASK_ID
+owner: $TASK_ON_CHANGES
+status: todo
+base: $HEAD_SHA
+branch: bot/$TASK_ON_CHANGES/$DERIVED_ID
+touches: $DERIVED_TOUCHES
+verify: $TASK_DERIVED_VERIFY
+---
+
+# Objective
+
+Answer the findings in the review at:
+
+    $REVIEW_FILE
+
+Read that file. It is the task. Each finding names a path and a line
+and states one claim; answer every one of them, either by changing the
+code or by establishing that the finding is wrong.
+
+A finding you disagree with is not a finding you skip. Say so in the
+commit message, with the reason. Silence reads as agreement, and the
+next reader cannot tell the difference between "fixed" and "missed".
+
+# Acceptance
+
+- [ ] The \`verify:\` command exits 0.
+- [ ] The diff stays inside \`touches:\`.
+- [ ] Every finding in the review is either fixed or answered.
+
+# Context
+
+Written by the runner from the review above: verdict
+\`$REVIEW_VERDICT\`, about commit $HEAD_SHA, by \`$TASK_OWNER\`.
+
+Nothing in this file came from the reviewer's prose. \`owner:\` and
+\`verify:\` are from $TASK_ID's own frontmatter, which is contract.
+\`touches:\` is the set of paths the findings cite, each one re-checked
+to exist at that commit and to fall inside what the reviewer was
+allowed to look at. \`base:\` is the commit the reviewer actually had
+in its worktree, not a branch tip that may since have moved.
+
+The review is a set of *claims*. It has been checked for shape and for
+whether its citations are real; it has not been checked for whether it
+is right. That is your job, and disagreeing with it is a valid outcome.
+
+# Notes
+
+This task was generated. It lives under \`.state/proposed/\` because
+that is the gate: a proposal becomes work when a human runs it. See
+README F-21.
+DERIVED_END
+
+            board "handed-off" "$DERIVED_ID -> $TASK_ON_CHANGES"
+            say "  handoff   $DERIVED_ID to $TASK_ON_CHANGES ($DERIVED_TASK)"
+        fi
+    fi
+fi
+
 # The no-op branch cleans up after itself below, so pointing a human at
 # a worktree that is about to be deleted would be a lie.
 if [ "$STATUS" = "blocked" ]; then
     NEXT="Human triages the blocker above. Task stays open; worktree kept at $WT."
 elif [ "$STATUS" = "needs-review" ]; then
     NEXT="Human resolves the blocker above in $WT, then pushes and opens a PR."
+elif [ "$TASK_KIND" = "review" ] && [ -n "$DERIVED_TASK" ]; then
+    NEXT="Read $REVIEW_FILE, then hand it on:
+
+    labs/agent-bots/run/bot-run.sh --task $DERIVED_TASK
+
+That task is scoped to the paths the findings cite and is based on the
+commit that was reviewed. Running it is the acceptance - nothing is in
+flight until a human (or --chain) starts it."
 elif [ "$TASK_KIND" = "review" ]; then
-    NEXT="Read $REVIEW_FILE - verdict ${REVIEW_VERDICT:-(none)}. Nothing was changed and nothing can be merged from this run; acting on a finding is a new task for a bot that commits."
+    NEXT="Read $REVIEW_FILE - verdict ${REVIEW_VERDICT:-(none)}. Nothing was changed and nothing can be merged from this run; acting on a finding is a new task for a bot that commits.${DERIVED_WHY:+
+No task was derived: $DERIVED_WHY.}"
 elif [ "${NOOP:-0}" -eq 1 ]; then
     NEXT="Nothing to review - the verifier already passed at base. Give this bot a task with real work in it."
 else
@@ -1205,16 +1483,36 @@ if [ "$TASK_KIND" = "review" ]; then
     REVIEW_EVIDENCE="
     review:   ${REVIEW_FILE:-(none written)}
     verdict:  ${REVIEW_VERDICT:-(none)}
-    reviewed: $HEAD_SHA"
+    reviewed: $HEAD_SHA${DERIVED_TASK:+
+    derived:  $DERIVED_ID -> $TASK_ON_CHANGES
+              $DERIVED_TASK}"
 fi
 
-HANDOFF="$STATE/handoffs/${TS}_${TASK_OWNER}__to__human__${TASK_ID}.md"
+# Who this handoff is addressed to. Every run until now said "human",
+# because there was nobody else to say. A derived task changes that: the
+# handoff names the bot that gets it, and the artifact is the path to
+# the task rather than a branch. The message carries a path.
+# What this run actually produced. A review's branch is thrown away at
+# cleanup, so naming it here would point the reader at something that
+# is about to stop existing.
+if [ "$TASK_KIND" = "review" ]; then
+    ARTIFACT="    review:   ${REVIEW_FILE:-(none written)}${DERIVED_TASK:+
+    task:     $DERIVED_TASK}"
+else
+    ARTIFACT="    branch:   $TASK_BRANCH
+    worktree: $WT"
+fi
+
+HANDOFF_TO="human"
+[ -z "$DERIVED_TASK" ] || HANDOFF_TO="$TASK_ON_CHANGES"
+
+HANDOFF="$STATE/handoffs/${TS}_${TASK_OWNER}__to__${HANDOFF_TO}__${TASK_ID}.md"
 cat > "$HANDOFF" <<HANDOFF_END
 ---
 task: $TASK_ID
 kind: $TASK_KIND
 from: $TASK_OWNER
-to: human
+to: $HANDOFF_TO
 at: $TS_ISO
 status: $STATUS
 ---
@@ -1225,8 +1523,7 @@ $TASK_TITLE
 
 # Artifact
 
-    branch:   $TASK_BRANCH
-    worktree: $WT
+$ARTIFACT
 
 # Evidence
 
@@ -1234,6 +1531,8 @@ $TASK_TITLE
     head:     $HEAD_SHA
     commits:  $COMMITS
     numstat:  $NUMSTAT
+    subjects:
+$(if [ "$TREE_BROKEN" -eq 0 ] && [ "$COMMITS" -gt 0 ]; then git -C "$WT" log --format='      %h %s' "$BASE_SHA..HEAD"; else echo "      (no commits)"; fi)
     uncommit: $DIRTY file(s)
     agent:    $AGENT_ID -> exit $AGENT_EXIT$([ "$SKIP_AGENT" -eq 1 ] && printf ' (skipped)')
     argv:     $AGENT_INVOCATION
@@ -1280,6 +1579,37 @@ step "Result: $STATUS"
 say "  handoff  $HANDOFF"
 say "  board    $BOARD"
 say "  log      $RUN_LOG"
+[ -z "$DERIVED_TASK" ] || say "  next     $DERIVED_TASK"
+
+# --------------------------------------------------------------------
+# Chain
+#
+# Off by default, and that default is the point: a task written by a
+# machine and started by a machine with nothing in between is a
+# different risk class from one a human read first. In the product this
+# is where the approval inbox goes. Here it is a flag, so the chain can
+# be demonstrated without pretending the gate does not matter.
+#
+# A derived task is always `kind: change`, and a change task never
+# derives anything, so the chain is one link long by construction. The
+# depth counter is belt and braces against that stopping being true.
+# --------------------------------------------------------------------
+
+if [ "$CHAIN" -eq 1 ] && [ -n "$DERIVED_TASK" ]; then
+    depth="${BOT_CHAIN_DEPTH:-0}"
+    if [ "$depth" -ge 3 ]; then
+        say "  chain stopped at depth $depth"
+    else
+        step "Chain"
+        say "  dispatching $DERIVED_ID to $TASK_ON_CHANGES"
+        board "chained" "$DERIVED_ID"
+        CHAIN_EXIT=0
+        BOT_CHAIN_DEPTH=$((depth + 1))             bash "${BASH_SOURCE[0]}"                 --task "$DERIVED_TASK"                 --repo "$REPO"                 --state "$STATE"                 --worktree-root "$WORKTREE_ROOT" || CHAIN_EXIT=$?
+        # The chain's outcome is the one a caller cares about, and this
+        # run can only be `done` or it would not have got here.
+        exit "$CHAIN_EXIT"
+    fi
+fi
 
 # Distinct codes so a caller can branch without parsing the handoff.
 case "$STATUS" in
