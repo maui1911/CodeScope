@@ -116,8 +116,6 @@ fi
 STATE="${STATE:-$LAB_DIR/.state}"
 WORKTREE_ROOT="${WORKTREE_ROOT:-${REPO}.worktrees}"
 
-BOT_AGENT_CMD="${BOT_AGENT_CMD:-claude}"
-BOT_AGENT_ARGS="${BOT_AGENT_ARGS:---permission-mode auto}"
 
 # --------------------------------------------------------------------
 # Task frontmatter

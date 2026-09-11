@@ -107,6 +107,12 @@ Most of the hard half already exists in the product:
 | Persistence + retention | `projects.json`, `session.rs` |
 | Verification surface | `git.rs`, `diff.rs`, `pr.rs` (incl. `CiStatus`) |
 
+One gap in that row, found the hard way (F-10): every field on
+`AgentProfile` describes how to start an *interactive* session for a
+human to type into — `resume_args`, `new_session_args`,
+`session_id_flag`. There is no headless invocation in it, because
+nothing in the product has ever needed one. A bot layer does.
+
 `SessionState::Idle` plus `write_input` is, between them, a complete
 agent loop. The motor is built.
 
@@ -293,11 +299,18 @@ A task that already finished will not re-run; pass `--reset` to discard
 the live task and start over. Exit codes are `0` done, `1` blocked,
 `2` needs-review.
 
-`BOT_AGENT_CMD` and `BOT_AGENT_ARGS` select the agent; the defaults
-target Claude Code headless mode. Check them against your installed CLI
-version first. See the script header for the full flag list.
+**Which CLI runs is data.** The task's `agent:` wins, otherwise the
+charter's; the profile lives in `contract/agents/<id>.md`. There is no
+built-in default — a bot says what it runs on. `claude`, `codex`,
+`gemini`, `copilot` and `pi` are filled in and verified; `opencode` is
+a blank stub that dispatch refuses. A task can pin `model:` too, and
+dispatch refuses rather than silently dropping the pin when the
+profile has no model flag. See F-10.
 
-**The agent runs under `--permission-mode auto`, not `acceptEdits`.**
+`BOT_AGENT_CMD` and `BOT_AGENT_ARGS` override the profile; they exist
+for the stubs in `run/stubs/`.
+
+**Claude Code runs under `--permission-mode auto`, not `acceptEdits`.**
 The prompt asks it to run the verifier and to commit; both are Bash
 calls, and `acceptEdits` covers edits only. An unattended run under
 `acceptEdits` cannot finish its job — it makes no commit, which is
@@ -769,4 +782,79 @@ That last part is the same fix as F-7's — the evidence block should
 say which instruction sources and which model produced this tree.
 Together they are what makes a handoff auditable rather than merely
 plausible.
+
+*Recording half now implemented — see F-10. Choosing a profile per bot
+is done; pinning a model per bot is available via `model:` on a task
+but has no charter-level equivalent yet.*
+
+### F-10 · The loop had quietly assumed Claude Code
+
+*2026-09-11.*
+
+CodeScope is CLI-agnostic — `claude`, `codex`, `copilot`, `opencode`,
+`pi`, `gemini` all have profiles in `agent_registry`. The bot loop did
+not. It hard-coded `claude -p "$PROMPT"`.
+
+The contract itself turned out to be portable already: plain Markdown,
+and `.bot-blocked` is just a file. Exactly two things were
+Claude-shaped, and they are worth separating because they fail
+differently.
+
+**The invocation.** Codex settles the argument on its own: its headless
+mode is a *subcommand*, `codex exec <prompt>`, not a `-p` flag. There
+is no single argv shape to hard-code, so the invocation has to be data.
+`contract/agents/<id>.md` now carries the command, a headless template
+with a `{prompt}` placeholder, the fragment that lets the CLI work
+unattended, a model flag and the instruction files it reads — same
+frontmatter parser as tasks and charters. Five were verified against
+the CLIs installed here:
+
+| Agent | Headless | Unattended |
+|---|---|---|
+| `claude` | `-p {prompt}` | `--permission-mode auto` |
+| `codex` | `exec {prompt}` | `-s workspace-write` |
+| `gemini` | `-p {prompt}` | `--approval-mode auto_edit` |
+| `copilot` | `-p {prompt}` | `--allow-all-tools` |
+| `pi` | `--print {prompt}` | *(none needed)* |
+
+`opencode` is a deliberately blank stub — it is not installed here, so
+every field would have been a guess. An empty `headless` means
+*unfilled*, and dispatch refuses with an explanation. A plausible guess
+would instead have failed inside an agent run, after a worktree had
+been spent on it.
+
+`pi` is the reason these fragments stay opaque strings. Its flags in
+this area (`--no-tools`, `--tools <allowlist>`) *restrict* rather than
+permit, because its tools are on by default. So "let it work
+unattended" maps to adding a flag for four CLIs and adding nothing for
+the fifth. A boolean like `autonomous: true` could not express that,
+and a normalised enum would have to grow a case per CLI forever.
+
+**The instruction sources.** Codex reads `AGENTS.md`, Gemini reads
+`GEMINI.md`, Claude Code reads `CLAUDE.md`. A contract that states its
+conventions in the wrong file is *invisible* to that agent — which
+makes this contract data, not trivia. The runner now records which of
+an agent's declared instruction files were actually present in the
+worktree, and warns on a miss, because a `MISSING` there means every
+judgement the bot made was worse-informed than it looked. That is the
+part of F-7 the evidence block was missing, and it also closes F-9's
+recording half: the handoff carries the agent id, the resolved argv,
+and whether a model was pinned.
+
+**A product-level gap this exposed.** `AgentProfile` in
+`agent_registry` has `resume_args`, `new_session_args`,
+`session_id_flag`, `resume_by_id_args` — every field is about starting
+an *interactive* session for a human to type into. There is no headless
+invocation anywhere in it, because nothing in the product has ever
+needed one. A bot layer does. Whatever ports this will either extend
+`AgentProfile` or carry a parallel record, and that is a real design
+decision rather than a detail.
+
+**One bug found in the making.** The old `BOT_AGENT_ARGS="${BOT_AGENT_ARGS:---permission-mode auto}"`
+default survived the rewrite. Since `BOT_AGENT_ARGS` being *set* is the
+signal that a stub is being injected, every run silently took the
+override path and dropped the profile's `-p {prompt}` — so the agent
+would have been invoked with no prompt at all. Caught by reading the
+resolved argv in the plan output, which is precisely why the plan
+prints it.
 
