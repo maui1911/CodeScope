@@ -1005,6 +1005,11 @@ Rules for this run:
   - Commit your work to this branch. Exactly one commit, message in English.
   - If nothing needs changing, commit nothing and say so. A no-op is a
     result, not a failure - do not manufacture a commit to have one.
+  - If you cannot commit - some sandboxes will not let you write to
+    .git at all - then leave your changes in the tree and write the
+    commit message you would have used to '.bot-commit-msg' in the
+    worktree root. The runner commits what you leave behind, and that
+    file is the only place your reasoning survives.
   - No new TODO or FIXME without a linked issue number.
   - Do NOT push, do NOT open a PR, do NOT run cargo fmt.
   - Do NOT edit anything under $CONTRACT_DIR/.
@@ -1527,6 +1532,86 @@ elif [ "$TASK_KIND" = "review" ]; then
     say "  review    none written"
 fi
 
+# The third channel out of the worktree, harvested like the other two.
+# An agent that cannot commit still has to be able to say *why* it did
+# what it did, and a message is the only part of a commit that is not
+# mechanical.
+#
+# Only for a change task. A reviewer writing a commit message is out of
+# contract, and harvesting it would quietly tidy away the evidence of
+# that - which is the bug F-21 caught in the review channel, one file
+# over.
+COMMIT_MSG_FILE=""
+if [ "$TASK_KIND" != "review" ] && [ -s "$WT/.bot-commit-msg" ]; then
+    COMMIT_MSG_FILE="${RUN_LOG%.log}-commit-msg.txt"
+    mv "$WT/.bot-commit-msg" "$COMMIT_MSG_FILE"
+    say "  message   $COMMIT_MSG_FILE"
+elif [ "$TASK_KIND" != "review" ] && [ -f "$WT/.bot-commit-msg" ]; then
+    rm -f "$WT/.bot-commit-msg"
+fi
+
+# --------------------------------------------------------------------
+# The commit the agent could not make
+#
+# Additive, not a replacement: an agent that commits its own work still
+# does, and this only ever touches what is *left over*. A sandboxed
+# agent can write files and not history - Codex denies the model writes
+# to `.git` wherever `.git` is (F-28) - so without this the loop is
+# closed to every agent whose sandbox works.
+#
+# It changes nothing about the evidence. A commit is a mechanical act
+# that asserts nothing; every check below still reads the tree, and
+# `git add -A` means out-of-scope files land in the diff where the scope
+# check already catches them rather than being quietly dropped. The one
+# thing the agent contributes is the message, and a message was never
+# evidence.
+#
+# Not for a review, which must leave the tree alone, and not after a
+# blocked or crashed run - committing a half-finished tree would turn a
+# refusal into a result.
+# --------------------------------------------------------------------
+
+COMMITTED_BY="agent"
+RUNNER_COMMIT_NOTE=""
+if [ "$TASK_KIND" != "review" ] && [ -z "$AGENT_BLOCKED" ] && [ "$AGENT_EXIT" -eq 0 ]; then
+    LEFTOVER="$(git -C "$WT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "${LEFTOVER:-0}" -gt 0 ]; then
+        step "Commit"
+        say "  $LEFTOVER path(s) left uncommitted - committing them"
+        COMMIT_FROM="$COMMIT_MSG_FILE"
+        if [ -z "$COMMIT_FROM" ]; then
+            # Still committed, because work that cannot be measured
+            # cannot be judged. Flagged, because the reasoning is the
+            # half a runner cannot supply.
+            COMMIT_FROM="${RUN_LOG%.log}-commit-msg.txt"
+            { printf '%s: %s\n\n' "$TASK_ID" "$TASK_TITLE"
+              printf 'Subject written by the runner: the agent left these changes\n'
+              printf 'uncommitted and wrote nothing to .bot-commit-msg.\n'
+            } > "$COMMIT_FROM"
+            RUNNER_COMMIT_NOTE="the agent left its work uncommitted and wrote no commit message"
+        fi
+        # Author is the bot, committer is the runner. That is what the
+        # split is for, and it is the honest reading: the bot did the
+        # work, this script recorded it.
+        if git -C "$WT" add -A >>"$RUN_LOG" 2>&1 \
+            && GIT_COMMITTER_NAME=bot-run GIT_COMMITTER_EMAIL=bot-run@invalid \
+               git -C "$WT" \
+                 -c "user.name=$TASK_OWNER (via $AGENT_ID)" \
+                 -c "user.email=$TASK_OWNER@bots.invalid" \
+                 commit --quiet --file="$COMMIT_FROM" >>"$RUN_LOG" 2>&1; then
+            COMMITTED_BY="runner"
+            board "runner-committed" "$LEFTOVER path(s)"
+            say "  committed by the runner"
+        else
+            # Left exactly as it was. The uncommitted-files branch of
+            # the verdict below then describes it, which is what would
+            # have happened before this step existed.
+            say "  could not commit - see $RUN_LOG"
+            board "runner-commit-failed" "$LEFTOVER path(s)"
+        fi
+    fi
+fi
+
 # A worktree the agent wrecked must still produce a handoff, so none of
 # these may take the script down under `set -e`.
 HEAD_SHA="$(git -C "$WT" rev-parse HEAD 2>/dev/null)" || HEAD_SHA=""
@@ -1797,6 +1882,15 @@ That is a legitimate answer - a reasoned refusal is a result, and the
 message is the artifact - but it is an argument, and no verifier reads
 arguments. Read it:
 $(git -C "$WT" log --format='    %h %s' "$BASE_SHA..HEAD" 2>/dev/null)"
+elif [ -n "$RUNNER_COMMIT_NOTE" ]; then
+    # The work is here and it verified. What is missing is the half a
+    # runner cannot write: why. Same rule as F-18 - an outcome the
+    # runner cannot check does not get reported as proven.
+    STATUS="needs-review"
+    BLOCKERS="$RUNNER_COMMIT_NOTE.
+The changes are committed and the verifier passed on them, so the work
+is sound as far as anything here can tell. What is missing is the
+reason for it, and no verifier reads reasons."
 elif [ "$COMMITS" -gt 1 ]; then
     # BOT.md acceptance criterion 3. The work may well be fine; a human
     # decides whether to squash.
@@ -2420,6 +2514,7 @@ $ARTIFACT
     subjects:
 $(if [ "$TREE_BROKEN" -eq 0 ] && [ "$COMMITS" -gt 0 ]; then git -C "$WT" log --format='      %h %s' "$BASE_SHA..HEAD"; else echo "      (no commits)"; fi)
     uncommit: $DIRTY file(s)
+    committed: by the $COMMITTED_BY${COMMIT_MSG_FILE:+, message from $COMMIT_MSG_FILE}
     agent:    $AGENT_ID -> exit $AGENT_EXIT$([ "$SKIP_AGENT" -eq 1 ] && printf ' (skipped)')
     argv:     $AGENT_INVOCATION
     model:    ${TASK_MODEL:-(not pinned - whatever the CLI defaulted to)}
