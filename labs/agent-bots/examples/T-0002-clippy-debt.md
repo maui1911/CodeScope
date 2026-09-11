@@ -16,7 +16,7 @@ with every one of the 542 library tests still passing and no behaviour
 changed.
 
 This is the first task with real work in it. As of `labs/agent-bots`
-the crate carries 21 findings across four lints:
+the crate carries 12 findings across four lints:
 
 | Lint | Count | Where |
 |---|---|---|

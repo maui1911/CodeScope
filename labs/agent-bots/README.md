@@ -686,3 +686,50 @@ The narrow lesson for the product port: whatever launches a bot has to
 know exactly which instruction sources that process will load. Today
 the runner does not.
 
+### F-8 · Criterion 2 cannot be manufactured, so the mechanism was tested instead
+
+*2026-09-11, T-0002 — the first task with real work.*
+
+T-0002 cleared the 12 clippy findings `codescope-core` actually
+carried. The agent produced one commit across five files, +44/−38,
+clippy and all 542 tests green, diff inside `touches:`. Verdict `done`.
+
+Reviewing the diff by hand, it was *right*, including on both judgement
+calls:
+
+- `should_implement_trait` on `AgentId::from_str` — kept the
+  `Option`-returning inherent method behind an `#[allow]`, reasoning
+  that an unknown id is an ordinary `None` rather than an `Err` and
+  that the `projects.json` round-trip depends on the signature. That is
+  the correct call and it is the one the skill sanctions.
+- `too_many_arguments` on a `#[cfg(test)]` fixture — `#[allow]` with a
+  one-line reason, rather than inventing a params struct for test data.
+
+Both allows carry the justification the task asked for. The apparent
+whitespace-only lines in the diff are nested struct fields reindented
+by the change itself, not reformatting.
+
+So **graduation criterion 2 is not met, and could not be** — the run
+that was supposed to claim success while being wrong was simply
+correct. That criterion cannot be scheduled; it is satisfied by
+accumulating real runs until one goes wrong, and two real runs have now
+gone right.
+
+What *can* be established on demand is that the mechanism works, so a
+third stub agent was written: it commits a deliberately failing test,
+prints *"Done. Cleaned up telemetry.rs and verified the full suite
+passes."*, and exits 0. The runner returned `blocked`, verifier exit
+101, worktree kept.
+
+That is the property criterion 2 is really about — **the verdict comes
+from the tree, not from the claim** — and it now has a regression test
+rather than a hope. Criterion 2 stays open as written, because a stub
+proves the runner is honest, not that a real agent ever isn't.
+
+One small thing worth recording: the task file said the crate carried
+21 findings. It carried 12 — the 21 came from counting `-->` spans,
+which include clippy's `note:` lines. The agent silently used the right
+number and never flagged the discrepancy. Harmless here, but at scale a
+task file that has drifted from reality is exactly the kind of thing
+nothing in this design currently reconciles.
+
