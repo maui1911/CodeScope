@@ -850,6 +850,20 @@ needed one. A bot layer does. Whatever ports this will either extend
 `AgentProfile` or carry a parallel record, and that is a real design
 decision rather than a detail.
 
+**Parked: no second CLI has actually run.** Only `claude` has been
+through a real run. The other four profiles are flag-verified against
+their `--help` and exercised as far as the resolved argv, which proves
+the *dispatch* path but not the loop. Re-running T-0002 under
+`agent: codex` was the intended next test and is postponed on quota.
+
+Worth noting for whoever picks it up: the test does not need Codex
+specifically. Any second CLI proves the profile mechanism end to end.
+Codex is merely the most informative one, because its subcommand shape
+differs most from the template the loop was originally written around —
+so if the contract is only agnostic on paper, Codex is where that shows
+first. `gemini`, `copilot` and `pi` are the cheaper substitutes if the
+point is just to see a non-Claude agent complete a task.
+
 **One bug found in the making.** The old `BOT_AGENT_ARGS="${BOT_AGENT_ARGS:---permission-mode auto}"`
 default survived the rewrite. Since `BOT_AGENT_ARGS` being *set* is the
 signal that a stub is being injected, every run silently took the
