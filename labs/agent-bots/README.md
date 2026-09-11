@@ -492,3 +492,42 @@ a sandbox, and that is a design decision, not a one-line change.
 
 Same run also hardened `owner:` and `id:`, which were being spliced
 into filesystem paths unsanitised.
+### F-7 · The charter is not the agent's only instruction source
+
+*2026-09-11, first real agent run.*
+
+The run itself was clean: the agent read its charter, ran the verifier
+before and after, noticed that the only clippy hit matching
+`telemetry.rs` was in `core/src/agents/opencode/telemetry.rs` and
+therefore outside `touches:`, made no commit, wrote no `.bot-blocked`,
+and explained why. Exactly the behaviour the contract asks for.
+
+It reported in Dutch.
+
+`context/CONVENTIONS.md` says English only. Nothing in the prompt or
+the contract asked for Dutch — the nested agent inherited it from the
+host: `~/.claude/CLAUDE.md`, the project `CLAUDE.md`, and the user's
+output-style and language settings all load into a `claude -p` session
+before the prompt is read.
+
+So `BOT.md`'s "Nothing else is an instruction" is false as written. A
+bot is not a clean room; its charter is *additive* to whatever the host
+config already says, and the host wins on anything it states more
+specifically. Harmless here — this project's `CLAUDE.md` agrees with
+the contract. It stops being harmless when the whole premise is
+narrow, differentiated roles: two bots on one machine inherit the same
+host instructions, so the part of their behaviour the contract does not
+pin down is identical by construction.
+
+Unresolved, and it does not have a clean fix at this layer. Options are
+to launch with the host config suppressed (making the contract the
+only source, at the cost of losing project conventions the bot should
+have), to fold the host config into the contract deliberately, or to
+accept the overlap and stop claiming exclusivity in `BOT.md`. Worth a
+decision before any multi-bot work, because it bounds how different two
+bots can actually be.
+
+The narrow lesson for the product port: whatever launches a bot has to
+know exactly which instruction sources that process will load. Today
+the runner does not.
+
