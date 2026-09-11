@@ -37,7 +37,7 @@
 # Exit codes: 0 done, 1 blocked, 2 needs-review.
 #
 # Which agent runs is data, not code. The task's `agent:` wins, else
-# the charter's; the profile lives in contract/agents/<id>.md and
+# the charter's; the profile lives in contract/agents/<id>.agent.md and
 # carries the invocation, the flag that lets it work unattended, and
 # the instruction files it reads. Nothing here assumes Claude Code -
 # Codex alone rules that out, since its headless mode is a subcommand
@@ -175,7 +175,7 @@ BASE_SHA="$(git -C "$REPO" rev-parse --verify "$TASK_BASE^{commit}" 2>/dev/null)
 # Agent profile
 #
 # Nothing here may assume Claude Code. CodeScope is CLI-agnostic and so
-# is this: the invocation is data, held in contract/agents/<id>.md.
+# is this: the invocation is data, held in contract/agents/<id>.agent.md.
 # Codex alone proves why it has to be - its headless mode is a
 # subcommand (`codex exec <prompt>`), not a `-p` flag, so there is no
 # single argv shape to hard-code. See F-10.
@@ -194,7 +194,7 @@ case "$AGENT_ID" in
     *[!a-zA-Z0-9_-]*) die "agent id must be [a-zA-Z0-9_-]+, got '$AGENT_ID'" ;;
 esac
 
-PROFILE="$LAB_DIR/contract/agents/$AGENT_ID.md"
+PROFILE="$LAB_DIR/contract/agents/$AGENT_ID.agent.md"
 [ -f "$PROFILE" ] || die "no agent profile at $PROFILE"
 
 AGENT_CMD="$(field command "$PROFILE")"
@@ -235,7 +235,7 @@ fi
 # exist. Fail here, before a worktree and an agent run are spent on it.
 # Same shape as F-1: prove the precondition at base, not halfway.
 for rel in "bots/$TASK_OWNER/BOT.md" \
-           "agents/$AGENT_ID.md" \
+           "agents/$AGENT_ID.agent.md" \
            "context/CONVENTIONS.md" \
            "context/ARCHITECTURE.md" \
            "context/GLOSSARY.md"; do

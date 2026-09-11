@@ -47,7 +47,7 @@ Field reference:
            `core/*.rs` matches `core/src/telemetry.rs` and scopes the
            whole crate. Name files explicitly when you mean them.
   agent    optional. Overrides the charter's `agent:` for this task.
-           Must name a profile in contract/agents/. Use it when a task
+           Must name a profile in contract/agents/ Use it when a task
            needs a different CLI than the bot normally runs on.
   model    optional. Passed through the profile's `model_flag`.
            Dispatch refuses if the profile has no such flag, rather

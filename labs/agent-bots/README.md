@@ -300,7 +300,7 @@ the live task and start over. Exit codes are `0` done, `1` blocked,
 `2` needs-review.
 
 **Which CLI runs is data.** The task's `agent:` wins, otherwise the
-charter's; the profile lives in `contract/agents/<id>.md`. There is no
+charter's; the profile lives in `contract/agents/<id>.agent.md`. There is no
 built-in default — a bot says what it runs on. `claude`, `codex`,
 `gemini`, `copilot` and `pi` are filled in and verified; `opencode` is
 a blank stub that dispatch refuses. A task can pin `model:` too, and
@@ -803,7 +803,7 @@ differently.
 **The invocation.** Codex settles the argument on its own: its headless
 mode is a *subcommand*, `codex exec <prompt>`, not a `-p` flag. There
 is no single argv shape to hard-code, so the invocation has to be data.
-`contract/agents/<id>.md` now carries the command, a headless template
+`contract/agents/<id>.agent.md` now carries the command, a headless template
 with a `{prompt}` placeholder, the fragment that lets the CLI work
 unattended, a model flag and the instruction files it reads — same
 frontmatter parser as tasks and charters. Five were verified against
@@ -863,6 +863,44 @@ differs most from the template the loop was originally written around —
 so if the contract is only agnostic on paper, Codex is where that shows
 first. `gemini`, `copilot` and `pi` are the cheaper substitutes if the
 point is just to see a non-Claude agent complete a task.
+
+### F-11 · A contract file got swallowed by instruction-file discovery
+
+*2026-09-11, minutes after the profiles were committed.*
+
+The profiles were named `contract/agents/<id>.md`, so the Claude Code
+profile was `contract/agents/claude.md`. That file was then loaded into
+a running session **as a `CLAUDE.md` instruction file** — the discovery
+matches case-insensitively, and on Windows the filesystem does too.
+
+It was caught by seeing the profile's own text appear as project
+instructions in a session that had no business reading it. Nothing
+broke, because the file happens to contain accurate prose about the
+agent. That is luck, not design: a profile is a *description of a tool*
+and was being served to that tool as *orders*.
+
+`gemini.md` had the same collision waiting against `GEMINI.md`.
+`codex.md` and `copilot.md` did not, because those CLIs read
+`AGENTS.md` — which is exactly what makes this hard to spot by
+inspection. The landmine only exists for agents whose instruction file
+is named after the agent, so five of six profiles looked fine.
+
+Profiles are now `<id>.agent.md`. The lookup stays mechanical and the
+name cannot be mistaken for an instruction file by any of them.
+
+This is F-7 for the third time, and by now the pattern is the point:
+**the contract does not get to decide what the host treats as
+instructions.** F-7 was the host config leaking *in*. This is a
+contract file leaking *out*, into the host's own discovery. Both come
+from the same missing idea — nothing in the design declares the
+boundary between "files the bot reads because we told it to" and "files
+the runtime picks up on its own".
+
+For the product port, the concrete rule: **no file inside `.codescope/`
+may be named such that any supported agent's instruction discovery
+would claim it.** That list grows every time a CLI is added, so it
+belongs next to `instruction_files` in the profile rather than in
+someone's memory.
 
 **One bug found in the making.** The old `BOT_AGENT_ARGS="${BOT_AGENT_ARGS:---permission-mode auto}"`
 default survived the rewrite. Since `BOT_AGENT_ARGS` being *set* is the
