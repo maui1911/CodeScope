@@ -733,3 +733,40 @@ number and never flagged the discrepancy. Harmless here, but at scale a
 task file that has drifted from reality is exactly the kind of thing
 nothing in this design currently reconciles.
 
+### F-9 · Nobody chose the model, and nothing recorded it
+
+*2026-09-11, noticed while cherry-picking T-0002 for review.*
+
+The bot's commit carried `Co-Authored-By: Claude Fable 5.1`. The run
+that produced it was launched as plain `claude -p` with
+`--permission-mode auto` and no model flag, so the nested session
+resolved whatever the host's configured default happened to be at that
+moment. It was not a decision, and the handoff does not mention it.
+
+Three consequences, in ascending order of importance:
+
+1. **Runs are not reproducible.** Re-running the same task tomorrow may
+   use a different model if the host default has changed. The evidence
+   block records the SHA, the numstat and the verifier exit code, and
+   none of that identifies what produced the work.
+2. **`BOT_AGENT_ARGS` is global.** It is one environment variable for
+   every bot, which contradicts the premise that bots are individually
+   configured. A charter can describe a role but cannot say what to run
+   it on.
+3. **Model choice is per-bot leverage, and it is being left on the
+   table.** A triage bot that reads and routes does not need what a bot
+   rewriting a parser needs. In a multi-bot setup (§7.5) that is
+   straightforwardly the difference between a loop you can afford to
+   run often and one you cannot.
+
+The fix is small and shaped like something CodeScope already has:
+`AgentProfile` in `agent_registry` is exactly a per-agent argv record.
+The charter should be able to name an agent profile, the runner should
+pass it explicitly instead of inheriting a default, and the handoff
+evidence should record what actually ran.
+
+That last part is the same fix as F-7's — the evidence block should
+say which instruction sources and which model produced this tree.
+Together they are what makes a handoff auditable rather than merely
+plausible.
+
