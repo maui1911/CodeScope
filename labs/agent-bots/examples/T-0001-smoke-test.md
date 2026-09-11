@@ -49,7 +49,7 @@ version of this task used
 `cargo clippy -p codescope-core --all-targets -- -D warnings`, which
 fails on ~12 pre-existing findings in files this task may not touch
 (`settings.rs` and others). That made every run `blocked` on debt the
-bot was forbidden from fixing. See README section 7.
+bot was forbidden from fixing. See README F-1.
 
 The rule that came out of it: **a verifier must be a predicate the
 owner can actually satisfy inside its own `touches:`.** A verifier

@@ -344,7 +344,157 @@ Until then it stays in `labs/`.
 
 ---
 
-## 7. Findings
+## 7. What production would look like
+
+None of this is built. It is written down because the prototype's own
+layout is an artefact of prototyping, and the differences matter.
+
+### 7.1 Where bots run
+
+**Locally, on the user's machine, in a worktree of the project.** No
+cloud VM. That is the deliberate inverse of Grok Bot and it is mostly
+gain: your credentials, your git, your network, and a real isolation
+boundary per bot instead of one shared machine.
+
+It costs one thing Grok Bot sells, though, and the product has to be
+honest about it: **"always-on" does not hold.** With CodeScope closed,
+nothing runs. A routine on a schedule means "runs while the app is
+open", which is a weaker promise than the word suggests. That is
+defensible for coding agents — you want to review the results anyway —
+but it has to be said in the UI rather than discovered. The alternative
+is a headless service alongside the app, which is a much larger
+commitment than it first appears.
+
+### 7.2 Where the contract lives
+
+In the project's repo, with a per-user layer above it. F-3 constrains
+this more than it looks.
+
+**Per project, in the project's repo:** `.codescope/` at the root,
+committed — `context/`, project-specific bots and skills. It travels
+with the branch, every worktree checkout has it automatically, and it
+is reviewable through a PR. Exactly the role `CLAUDE.md` already plays.
+
+For this repo that means `labs/agent-bots/contract/` eventually becomes
+a plain `.codescope/` at the root. Its current location is scaffolding.
+
+**Per user, global:** `%APPDATA%\CodeScope\bots\` — bots the user wants
+across projects. Here is the tension: such a bot is in no commit, so
+the F-3 check cannot cover it and no handoff can prove which version of
+the charter ran.
+
+The resolution: **global is a template, project is an instance.** A
+global bot is materialised into that project's `.codescope/bots/` on
+first use and becomes versioned from then on. That is what Grok Bot
+does with templates — a one-way copy, no live link — and it keeps the
+F-3 property intact. Accepting unversioned global bots instead only
+works if the handoff records the charter's hash, which is half the work
+for less of the benefit.
+
+**The control plane stays out of the project repo** (§3.1). It goes
+through `codescope_core::paths` into the state directory —
+`%LOCALAPPDATA%\CodeScope\bots\<project-id>\` — one per project, with
+board, tasks, handoffs and runs. Routing it through `paths` is what
+gives dev/installed separation for free, which `CLAUDE.md` requires of
+any new on-disk state.
+
+Worktrees need nothing new: `Project::worktree_root_path()` already
+resolves to `{project}.worktrees`, so a bot task lands in
+`{project}.worktrees/bot-<owner>-<taskid>`.
+
+### 7.3 Resolving F-7
+
+In production this gets *better*, not worse: the bot runs in the
+project's worktree, so inheriting that project's `CLAUDE.md` is exactly
+what you want. A bot that does not know the project conventions is
+useless.
+
+So: **declare, do not suppress.** Three layers, stated explicitly:
+
+| Layer | Scope |
+|---|---|
+| `CLAUDE.md` | true for every agent in this project |
+| `.codescope/context/` | true for every *bot* — glossary, architecture |
+| `BOT.md` | what makes *this* bot different: role, scope, escalation |
+
+And the cheap part that makes it auditable: the runner records which
+instruction sources were loaded, with their hashes, in the handoff
+evidence. When two bots behave identically, you can see why. That is
+roughly five lines and it resolves the honest half of F-7 without
+throwing away the project conventions.
+
+`BOT.md`'s claim that "Nothing else is an instruction" has to go. It
+was simply wrong.
+
+### 7.4 The UI
+
+The first version needs almost no new UI, and **the handoff is the
+UI.**
+
+*Stage 1 — no new concepts.* A bot run is a session CodeScope opened
+for you, in a worktree, with a marker. Tab, telemetry badge, idle
+toast, diff viewer, PR status: all of it exists and all of it already
+works. The only new thing is *why* the session started. The sidebar
+already renders bot worktrees with `+N -M`, ahead/behind and CI — they
+need a label, not their own tree. Starting one goes in the project's
+right-click menu next to worktree creation, plus the command palette,
+behind a dialog that mirrors `NewWorktreeDialog`.
+
+*Stage 2 — the inbox.* This is the part that genuinely needs new
+surface, and it is a queue rather than a dashboard: *"2 bots done, 1
+blocked."* A sidebar badge, a list, and the existing toast path
+underneath. A handoff is already a structured document — objective,
+artifact, evidence, status, blockers, next action. Rendering one well,
+with the SHA linked into the diff viewer and the branch into the
+worktree, is most of the value.
+
+*Stage 3 — the board.* See §7.5; this is less optional than it looks.
+
+**The pitfall to design around:** bot runs must not open tabs while
+running unattended. Four bots means four tabs shoving the user's own
+work aside. A bot session should be *background* by default and get a
+tab only when opened — which in turn means the telemetry tail and the
+idle toast have to work with no visible tab. Whether that holds today
+is worth checking before the design sets.
+
+### 7.5 The destination is multiple bots
+
+The position taken for this project, 2026-09-11: **the power is in the
+orchestration and the board, which means multiple bots.** A single bot
+doing one task in a worktree is a thin delta over what CodeScope
+already does when you open an agent session there — automated dispatch,
+verification and handoff are real, but incremental. Parallel bots with
+distinct scopes, a board showing who owns what, and handoffs between
+them is the point where hosting becomes orchestration. It is also what
+made the Grok Bot pattern spread: the Chief of Staff, not the
+single agent.
+
+That is almost certainly right about the destination. It does not
+change the order — every multi-agent system that works was a
+single-agent loop that worked first, and an adversarial review found
+seven findings in *one* bot's loop, which multi-bot would multiply
+rather than avoid. The single loop only stopped lying about its verdict
+today, and only on a no-op task.
+
+What it does change is the priority *within* the plan. Two items move
+from "someday" to "next", because they are multi-bot blockers rather
+than single-bot polish:
+
+1. **F-7 becomes blocking.** Two bots on one machine inherit identical
+   host instructions, so everything the contract does not pin down is
+   identical by construction. If differentiated roles are the value
+   proposition, F-7 attacks it directly. §7.3 is the fix.
+2. **The `touches:` overlap check and rebase-on-collision stop being
+   optional.** Two bots working one repo *will* collide. Today nothing
+   reads another task's `touches:` (§3.4), which is survivable with one
+   bot and not with four.
+
+And the board stops being a maybe. It was designed append-only from the
+start (§3.2) precisely so it would survive concurrent writers, so the
+single-bot phase should be treated as scaffolding for it rather than as
+a destination of its own.
+
+## 8. Findings
 
 Running log. Each entry is something a run taught that the design did
 not predict — that is the only reason this folder exists.
@@ -519,13 +669,18 @@ narrow, differentiated roles: two bots on one machine inherit the same
 host instructions, so the part of their behaviour the contract does not
 pin down is identical by construction.
 
-Unresolved, and it does not have a clean fix at this layer. Options are
-to launch with the host config suppressed (making the contract the
-only source, at the cost of losing project conventions the bot should
-have), to fold the host config into the contract deliberately, or to
-accept the overlap and stop claiming exclusivity in `BOT.md`. Worth a
-decision before any multi-bot work, because it bounds how different two
-bots can actually be.
+**Resolved in design, not yet in code — see §7.3.** Suppressing the
+host config was rejected: it would cost the project conventions a bot
+genuinely needs. The decision is to declare the layers instead
+(`CLAUDE.md` → `context/` → `BOT.md`) and have the runner record which
+instruction sources were loaded, with hashes, in the handoff evidence.
+`BOT.md` has been corrected already; the evidence recording has not
+been written.
+
+This was promoted from "worth deciding eventually" to a multi-bot
+blocker once the destination was settled (§7.5): if differentiated
+roles are the value, then instructions the contract does not pin down
+being identical across every bot attacks the premise directly.
 
 The narrow lesson for the product port: whatever launches a bot has to
 know exactly which instruction sources that process will load. Today
