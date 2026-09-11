@@ -1,0 +1,3 @@
+# Control plane. Mutable coordination state never belongs in git -
+# see ../README.md section 3.1.
+.state/
