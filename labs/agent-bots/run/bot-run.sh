@@ -1368,6 +1368,16 @@ fi
 # work is worse than no harness.
 printf 'bot-run surface for %s\n' "$TASK_ID" > "$WT/.git/bot-surface"
 
+# Whose commit this is, set on the surface rather than on the commit, so
+# that it holds whoever ends up making it. Codex committed its own work
+# here and signed it as the human whose git config it inherited - a bot
+# commit attributed to a person, which is F-17's ambient identity in the
+# one place it actually matters. The runner adds itself as committer
+# when the runner commits; git's own author/committer split says the
+# rest.
+git -C "$WT" config user.name "$TASK_OWNER (via $AGENT_ID)" >>"$RUN_LOG" 2>&1 || true
+git -C "$WT" config user.email "$TASK_OWNER@bots.invalid" >>"$RUN_LOG" 2>&1 || true
+
 say "  created $WT (clone of $ORIGIN_REPO)"
 
 # Only now, with a worktree that actually exists, does the live task

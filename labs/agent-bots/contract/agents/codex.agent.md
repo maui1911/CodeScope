@@ -42,29 +42,33 @@ file it had been given and could not write `index.lock`. It said so
 through `.bot-blocked` and stopped, which is the correct behaviour and
 a completely useless outcome.
 
-`--add-dir` is the documented way to widen that, and it is declared
-here — the banner confirms the sandbox accepts it. It does **not** make
-`.git/worktrees/<leaf>/index.lock` writable in practice, and the run
-still ends at "cannot commit". What the flag would grant if it worked
-is worth stating anyway, because it is the reason the real answer lies
-elsewhere: the whole object store and every ref in the repository. There is no narrower grant: objects and `refs/heads/*` live
-in the common directory for a linked worktree, so "let this agent
-commit on its own branch" and "let this agent rewrite `main`" are the
-same permission. That is not a Codex flaw — it is what a linked
-worktree is. The narrower answer is a per-task `git clone --shared`,
-where the git directory is inside the sandbox and only a push at the
-end crosses the boundary. See F-26.
+`--add-dir` is the documented way to widen that, and it works — but it
+has to name the git directory the agent is actually being denied, which
+took three runs to get right. While the work happened in a linked
+worktree there was no good directory to name: objects and
+`refs/heads/*` live in the *project's* git directory, so "let this
+agent commit on its own branch" and "let this agent rewrite `main`"
+were the same permission. That is not a Codex flaw — it is what a
+linked worktree is, and it is most of why the work surface is a
+standalone clone now (F-28).
+
+With the surface being its own repository, `{git_dir}` means the
+surface's own `.git` and the grant is a throwaway clone's history and
+nothing else. That is the combination that works: Codex commits, the
+verifier passes, the branch goes back. The first completed loop under a
+second CLI. F-30 is the write-up of how nearly this was missed — the
+flag had been pointed at the project's git directory the whole time,
+while the error named the surface's, three inches apart on screen.
 
 `{git_dir}` is substituted by the runner, because the path is
 per-machine and a contract file is not. It is kept despite not being
 sufficient: removing it would make the next person rediscover that the
 git directory is the problem rather than reading it here.
 
-It is not enough on Windows. With the git directory granted, the next
-thing the run hit was `CreateFileMapping Win32 error 5` — Git Bash's
-fork emulation needs shared memory the restricted token denies, so
-Codex could not run the verifier it had been told to run before
-editing.
+Granting the directory was not enough on its own. The next thing the
+run hit was `CreateFileMapping Win32 error 5` — Git Bash's fork
+emulation needs shared memory the restricted token denies, so Codex
+could not run the verifier it had been told to run before editing.
 
 Hence `shell: native`. Codex picks the shell it runs commands in by
 looking at PATH; it finds Git Bash because Git Bash is there, and Git

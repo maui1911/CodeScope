@@ -493,10 +493,9 @@ worktree and branch.
 ## 6. What would have to be true to graduate this
 
 1. The loop runs unattended and green three times on a real issue in
-   this repo. *(Claude Code only. Codex now reads the contract, runs
-   its own commands and does the work; it cannot commit, because a
-   linked worktree's git directory is outside anything its sandbox will
-   make writable. See F-26 and F-27.)*
+   this repo. *(Claude Code, and now Codex: one completed run, `done`,
+   verifier green, branch pushed back. Three has not happened yet for
+   either. F-26, F-27 and F-30 are what it took.)*
 2. The verifier catches at least one agent run that *claimed* success
    and was wrong. If that never happens, the verifier is not verifying.
 3. A handoff between two bots survives a rebase. *(Half done: a
@@ -2114,30 +2113,25 @@ counted bot worktrees with `git worktree list`. A clone is not
 registered anywhere, so that check would have passed by construction
 forever. It counts directories now.
 
-**And the part that did not work.** The whole detour began with Codex
-being unable to write `index.lock`. With the git directory now *inside*
-the workspace the sandbox grants, it still cannot:
+**And the part that did not work — at first.** The whole detour began
+with Codex being unable to write `index.lock`. With the git directory
+now *inside* the workspace the sandbox grants, it still could not:
 
     Cannot commit because Git cannot create
     C:/...worktrees/bot-fixer-T-0008/.git/index.lock: Permission denied
 
-Same run, same sandbox, same message, different path. Codex denies
-writes to `.git` wherever it finds it — the binary carries a permissions
-table with `/.git` in it next to `read`, `write` and `deny` — so this
-is a deliberate carve-out and no arrangement of directories gets around
-it. `--add-dir` does not, and the clone does not.
+Same sandbox, same message, different path. At which point I concluded
+that Codex denies writes to `.git` wherever it finds it — a deliberate
+carve-out no arrangement of directories could get around.
 
-That is worth having learned, because it kills a whole family of fixes
-at once and points at the one that is left. The assumption that breaks
-is not *where the git directory is*. It is **that the agent makes the
-commit**. A sandboxed agent can write files and not history; the runner
-can write history and should not be inventing the reasoning that goes
-in the message. So the next thing to try is the agent writing its commit
-message to a file — which it can — and the runner doing the commit,
-which is also the arrangement this project already argues for
-everywhere else: the runner writes the handoff, the runner runs the
-verifier, the runner reads the evidence. Nothing about "the agent
-commits" was ever load-bearing except habit.
+**That conclusion was wrong, and the way it was wrong is the finding.**
+See F-30. The carve-out is real: `.git` inside the workspace *is*
+denied by default. What is not true is that nothing lifts it. Naming
+that directory with `--add-dir` lifts it exactly — and the reason the
+run above still failed is that `--add-dir` was pointed at the
+*project's* git directory, because the substitution feeding it was
+still computed from the project. It had never been pointed at the
+surface's own `.git` at all.
 
 The clone stands on its own regardless. It is what makes a plain folder
 possible at all, and it removes an isolation model that was only ever
@@ -2216,3 +2210,81 @@ What this does not do is merge. For a git project the loop ends at
 strictly weaker, and honestly so — there is no history to merge into,
 and manufacturing one would be inventing a project structure the user
 did not ask for.
+
+---
+
+### F-30 · Two failures, one message, two causes
+
+*2026-09-11, the correction.*
+
+F-28 ended on a confident sentence: Codex denies the model writes to
+`.git` wherever `.git` is, so no arrangement of directories gets around
+it. The evidence was two runs producing the same error at two different
+paths, plus a permissions table inside the binary with `/.git` in it.
+It read like a carve-out, and half of it was.
+
+It was wrong, and the shape of the mistake is one this document already
+has a name for.
+
+The two runs did fail for the same *reason* in the sense that both were
+denied a write to a `.git`. They did not fail for the same *cause*. In
+the first, `.git` was outside the workspace. In the second it was
+inside — and still denied, because a sandbox that grants a workspace
+does not thereby grant the `.git` in it. What I did not check is what
+`--add-dir` was actually pointed at, and the answer is: the *project's*
+git directory, both times. The substitution feeding it was computed
+from the project, and it stayed that way after the surface stopped
+being a worktree. The grant had never once named the directory the
+agent was being denied.
+
+Point it at the surface's own `.git` and Codex commits. Clean run,
+`done`, verifier green, branch pushed back. The first completed loop
+under a second CLI.
+
+So the carve-out is real — `.git` inside the workspace is denied by
+default, which is a sensible thing for a sandbox to do — and it is
+liftable by naming it, which is also sensible. Both halves obvious in
+hindsight; the confident wrong half came from generalising to "wherever
+`.git` is" on evidence that only supported "in the two places it was
+tried".
+
+This is F-23's rule pointed at myself. *A log tells you what happened;
+it must not be asked what is true.* Two log lines that match are two
+log lines that match. The thing that would have caught it is the thing
+the runner does to its agents on every run and I did not do here:
+**read the invocation, not the outcome.** The argv was printed in the
+plan on every one of those runs, and it said `--add-dir
+C:/dev/codescope-public/.git` while the failure said
+`C:/dev/codescope-public.worktrees/bot-fixer-T-0008/.git`. Two different
+paths, on screen, three inches apart.
+
+### What stays
+
+The runner-commit, built on the strength of the wrong conclusion, is
+kept — because the reasoning that led to it survives the correction
+intact. A sandboxed agent *can* write files and not history; that Codex
+turns out to be grantable does not make every agent grantable, and an
+agent that can only edit is now a first-class citizen of this loop
+rather than a run that produces nothing. It is additive: an agent that
+commits its own work still does, and the runner only ever touches what
+is left over. Nothing in the evidence changes, because a commit is a
+mechanical act that asserts nothing — `git add -A` puts out-of-scope
+files in the diff where the scope check already catches them, instead
+of dropping them quietly.
+
+What the agent still owns is the message, and that is the right split.
+`.bot-commit-msg` joins `.bot-blocked` and `.bot-review.md` as a channel
+out of the worktree. A change committed with no message is committed
+anyway — work that cannot be measured cannot be judged — and reported
+`needs-review`, because no verifier reads reasons.
+
+### And one thing the completed run exposed
+
+Codex's own commit was signed `maui <maui.wind@gmail.com>`. It inherited
+the ambient git identity and attributed a bot's work to the person
+sitting at the machine. That is F-17's ambient identity, third
+appearance, finally in the path that matters: the meddling verifier had
+it, `mover.sh` had it, and now the real agent. The surface sets
+`user.name` and `user.email` at creation, so it holds whoever ends up
+committing — the bot as author, the runner as committer when the runner
+does it, which is what git's split is for.

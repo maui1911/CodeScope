@@ -18,6 +18,7 @@ regression tests for F-4, F-8 and F-25.
 | `stumped.sh` | a reviewer that completes the paperwork and reports `verdict: blocked` — its own escalation | `blocked`, pointing at the review's blind-spots section |
 | `critic.sh` | a reviewer whose findings are well-formed and real: the positive case for the bot-to-bot handoff | `done`, a task derived for the next bot and the handoff addressed to it |
 | `refusenik.sh` | an agent that answers with an **empty commit** carrying its reasoning | `needs-review`, the commit subject quoted |
+| `handless.sh` | an agent that does the work and **cannot commit it** - every sandboxed agent's shape | `done`, one commit made by the runner; `needs-review` when no message was left |
 | `scribe.sh` | an agent that writes one file, commits it, and optionally reaches outside the surface to edit the project - the folder counterpart to `mover.sh` | `done` and a patch, or `needs-review` when the folder gained the same file |
 | `mover.sh` | an agent that does its work and **moves the base ref out from under itself** while doing it | one of four, by configuration: `done` after a clean rebase, or `needs-review` for a conflict, a verifier that is now red, or a branch the new base has emptied |
 
