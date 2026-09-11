@@ -4,6 +4,7 @@ display_name: Codex CLI
 command: codex
 headless: exec {prompt}
 autonomy: -s workspace-write --add-dir {git_dir}
+shell: native
 model_flag: -m
 instruction_files: AGENTS.md
 verified: 2026-09-11
@@ -45,14 +46,24 @@ per-machine and a contract file is not.
 
 It is not enough on Windows. With the git directory granted, the next
 thing the run hit was `CreateFileMapping Win32 error 5` — Git Bash's
-fork emulation needs shared memory the sandbox denies, so Codex could
-not run the verifier it had been told to run before editing. The
-sandbox is per-OS and the profile is one file for every machine, which
-is a gap in this contract rather than a detail: `autonomy:` is the only
-field here whose correct value depends on the host. Unresolved. On this
-machine the loop gets as far as "agent reports blocked, honestly, with
-a reason a human can act on" — which is the runner working and the
-agent not.
+fork emulation needs shared memory the restricted token denies, so
+Codex could not run the verifier it had been told to run before
+editing.
+
+Hence `shell: native`. Codex picks the shell it runs commands in by
+looking at PATH; it finds Git Bash because Git Bash is there, and Git
+Bash is the one thing on this machine that its sandbox kills. Take it
+off the PATH and it picks PowerShell, which the sandbox is perfectly
+happy with — as is `git.exe`, which is a native Win32 binary and was
+never the problem. The runner does the PATH surgery, because the
+runner is the only thing that knows what is on this machine's PATH.
+
+That has a consequence for `verify:`. A verify string is a POSIX
+command by convention here, and an agent without a POSIX shell cannot
+be told to run one. `cargo test …` is shell-neutral and fine;
+`test -f …` is not. So the prompt stops ordering it and says what has
+always been true instead: the runner runs the verifier afterwards, in
+a clean checkout, and that is the result that counts.
 
 Reads `AGENTS.md`, not `CLAUDE.md`. A bot contract that names its
 conventions in the wrong file is invisible to this agent — which makes

@@ -527,6 +527,8 @@ AGENT_AUTONOMY="$(field_at_base autonomy "$PROFILE_REL")"
 AGENT_MODEL_FLAG="$(field_at_base model_flag "$PROFILE_REL")"
 AGENT_INSTRUCTION_FILES="$(field_at_base instruction_files "$PROFILE_REL")"
 AGENT_VERIFIED="$(field_at_base verified "$PROFILE_REL")"
+AGENT_SHELL="$(field_at_base shell "$PROFILE_REL")"
+AGENT_SHELL="${AGENT_SHELL:-posix}"
 
 [ -n "$AGENT_CMD" ] || die "profile '$AGENT_ID' declares no command"
 
@@ -565,6 +567,26 @@ fi
 if [ -n "$TASK_MODEL" ] && [ -z "$AGENT_MODEL_FLAG" ]; then
     die "task pins model '$TASK_MODEL' but profile '$AGENT_ID' has no model_flag"
 fi
+
+# Which shell family the agent runs its own commands in. `posix` leaves
+# the environment alone; `native` means this agent must not be handed a
+# POSIX shell, and the runner takes them off its PATH. See F-27 - it is
+# a per-OS fact about an agent, and the only reason it is a contract
+# field rather than a detail is that the runner is the only thing that
+# can act on it.
+case "$AGENT_SHELL" in
+    posix|native) ;;
+    *) die "profile '$AGENT_ID' declares shell '$AGENT_SHELL'; expected posix or native" ;;
+esac
+
+# A stub is a bash script. Taking bash away from one would test the
+# PATH surgery and nothing else.
+[ "$AGENT_OVERRIDDEN" -eq 0 ] || AGENT_SHELL="posix"
+
+IS_WINDOWS=0
+case "$(uname -s 2>/dev/null || printf 'unknown')" in
+    MINGW*|MSYS*|CYGWIN*) IS_WINDOWS=1 ;;
+esac
 
 WT_LEAF="$(printf '%s' "$TASK_BRANCH" | tr '/' '-')"
 WT="$WORKTREE_ROOT/$WT_LEAF"
@@ -806,7 +828,11 @@ Rules for this run:
   - You are already on branch '$TASK_BRANCH'. Do not switch branches.
   - Edit only files matching: $TASK_TOUCHES
   - The verifier is: $TASK_VERIFY
-    It must exit 0. Run it before you edit anything, and again after.
+    It must exit 0.$(if [ "$AGENT_SHELL" = "native" ]; then printf ' It is written for a POSIX shell and you
+    may not have one; the runner runs it after you stop, in a clean
+    checkout of your commit, and that result is the one that counts.
+    Run it yourself only if your shell can.'; else printf ' Run it before you edit anything, and again
+    after.'; fi)
   - Commit your work to this branch. Exactly one commit, message in English.
   - If nothing needs changing, commit nothing and say so. A no-op is a
     result, not a failure - do not manufacture a commit to have one.
@@ -873,6 +899,55 @@ fi
 AGENT_INVOCATION="$AGENT_CMD ${AGENT_ARGV_DISPLAY[*]}"
 
 # --------------------------------------------------------------------
+# The agent's PATH
+#
+# Only ever different from the runner's when a profile says `shell:
+# native`, and then only on Windows. Codex is the case: it picks the
+# shell it runs commands in by looking at PATH, finds Git Bash, and Git
+# Bash dies inside Codex's own Windows sandbox - MSYS fork emulation
+# needs shared memory a restricted token denies. Off the PATH, it picks
+# PowerShell and works. See F-27.
+#
+# The rule is the intent rather than a list of directory names: drop
+# every entry that carries a POSIX shell. A hardcoded `/usr/bin` would
+# be a guess about somebody else's install.
+# --------------------------------------------------------------------
+
+AGENT_PATH="$PATH"
+AGENT_SHELL_NOTE="posix (runner's own PATH)"
+if [ "$AGENT_SHELL" = "native" ] && [ "$IS_WINDOWS" -eq 1 ]; then
+    AGENT_PATH=""
+    IFS=':' read -ra PATH_PARTS <<< "$PATH"
+    for p in ${PATH_PARTS[@]+"${PATH_PARTS[@]}"}; do
+        [ -n "$p" ] || continue
+        if [ -e "$p/bash.exe" ] || [ -e "$p/sh.exe" ]; then continue; fi
+        AGENT_PATH="${AGENT_PATH:+$AGENT_PATH:}$p"
+    done
+
+    # An npm launcher like `codex` is itself an sh script: it dies
+    # calling `sed` before the agent has started, which looks exactly
+    # like the agent failing. So the command is resolved against the
+    # runner's PATH - the one that still has a shell on it - and a
+    # Windows executable sibling wins over a POSIX script.
+    AGENT_RESOLVED="$(command -v "$AGENT_CMD" 2>/dev/null || true)"
+    if [ -n "$AGENT_RESOLVED" ]; then
+        case "$AGENT_RESOLVED" in
+            *.exe|*.cmd|*.bat|*.com) AGENT_CMD="$AGENT_RESOLVED" ;;
+            *)
+                for ext in .cmd .exe .bat; do
+                    if [ -f "$AGENT_RESOLVED$ext" ]; then
+                        AGENT_CMD="$AGENT_RESOLVED$ext"
+                        break
+                    fi
+                done
+                ;;
+        esac
+    fi
+    AGENT_INVOCATION="$AGENT_CMD ${AGENT_ARGV_DISPLAY[*]}"
+    AGENT_SHELL_NOTE="native (no POSIX shell on the agent's PATH)"
+fi
+
+# --------------------------------------------------------------------
 # Plan
 # --------------------------------------------------------------------
 
@@ -897,6 +972,7 @@ cat <<PLAN
   profile   $PROFILE
   argv      $AGENT_INVOCATION
   reads     ${AGENT_INSTRUCTION_FILES:-(none declared)}
+  shell     $AGENT_SHELL_NOTE
 PLAN
 
 if [ -n "$STALE_DISPATCH" ]; then
@@ -1133,7 +1209,7 @@ else
     say "  $AGENT_INVOCATION (output -> $RUN_LOG)"
     # stdin is closed on purpose: a headless agent that decides to
     # prompt would otherwise inherit the runner's terminal and hang.
-    ( cd "$WT" && "$AGENT_CMD" "${AGENT_ARGV[@]}" ) \
+    ( cd "$WT" && PATH="$AGENT_PATH" "$AGENT_CMD" "${AGENT_ARGV[@]}" ) \
         </dev/null >>"$RUN_LOG" 2>&1 || AGENT_EXIT=$?
     say "  exit $AGENT_EXIT"
     board "agent-ran" "exit $AGENT_EXIT"
@@ -2035,6 +2111,7 @@ $(if [ "$TREE_BROKEN" -eq 0 ] && [ "$COMMITS" -gt 0 ]; then git -C "$WT" log --f
     argv:     $AGENT_INVOCATION
     model:    ${TASK_MODEL:-(not pinned - whatever the CLI defaulted to)}
     reads:    $INSTR_STATUS
+    shell:    $AGENT_SHELL_NOTE
     verify:   $TASK_VERIFY -> exit $VERIFY_EXIT
               (ran in a $VERIFY_WHERE, so this is evidence about the
                branch and not about the agent's leftovers)
