@@ -1551,6 +1551,21 @@ fi
 REBASE_STATE="not attempted"
 REBASED=0
 
+# Puts the worktree back on its branch after the replay. `move` points
+# the branch at the verified tip first; `keep` leaves it exactly where
+# it has been the whole time, which is the point of detaching.
+REATTACH_FAILED=""
+reattach() {   # reattach <move|keep>
+    local rc=0
+    if [ "$1" = "move" ]; then
+        git -C "$WT" checkout -B "$TASK_BRANCH" >>"$RUN_LOG" 2>&1 || rc=$?
+    else
+        git -C "$WT" checkout "$TASK_BRANCH" >>"$RUN_LOG" 2>&1 || rc=$?
+    fi
+    [ "$rc" -eq 0 ] || REATTACH_FAILED="$1"
+    return 0
+}
+
 if [ "$NO_REBASE" -eq 1 ]; then
     REBASE_STATE="skipped (--no-rebase)"
 elif [ "$STATUS" != "done" ] || [ "$NOOP" -eq 1 ]; then
@@ -1580,6 +1595,22 @@ Somebody has to say what it should land on."
     elif [ "$NEW_BASE_SHA" = "$BASE_SHA" ]; then
         REBASE_STATE="not needed - $TASK_BASE is still ${BASE_SHA:0:12}"
         say "  $REBASE_STATE"
+    elif ! git -C "$WT" checkout --detach >>"$RUN_LOG" 2>&1; then
+        # Detaching is the first thing, not an implementation detail:
+        # `git rebase` moves the checked-out branch as its opening act,
+        # so replaying on the branch itself would leave $TASK_BRANCH at
+        # an unverified tip for as long as the second verifier takes -
+        # and a run killed inside that window leaves it there for good.
+        # If the worktree will not detach, nothing has moved yet and
+        # nothing should.
+        REBASE_STATE="could not detach $WT - not attempted"
+        say "  $REBASE_STATE"
+        board "rebase-skipped" "detach failed"
+        STATUS="needs-review"
+        BLOCKERS="$TASK_BASE has moved to ${NEW_BASE_SHA:0:12} and the worktree could
+not be detached to replay the work there, so nothing was attempted and
+$TASK_BRANCH is untouched. It verified against ${BASE_SHA:0:12}. See
+$RUN_LOG for what git said."
     else
         say "  $TASK_BASE moved ${BASE_SHA:0:12} -> ${NEW_BASE_SHA:0:12}"
         PRE_REBASE_HEAD="$HEAD_SHA"
@@ -1605,17 +1636,18 @@ Somebody has to say what it should land on."
             [ -n "$REBASE_CONFLICTS" ] \
                 || REBASE_CONFLICTS="(git named none - see $RUN_LOG)"
             if git -C "$WT" rebase --abort >>"$RUN_LOG" 2>&1; then
+                reattach keep
                 REBASE_STATE="conflict - branch left on ${PRE_REBASE_HEAD:0:12}"
-                say "  conflict; aborted, branch unchanged"
+                say "  conflict; aborted, branch never moved"
                 board "rebase-conflict" "${NEW_BASE_SHA:0:12}"
                 STATUS="needs-review"
                 BLOCKERS="verified against ${BASE_SHA:0:12}, and it no longer applies.
 $TASK_BASE has moved to ${NEW_BASE_SHA:0:12}, and replaying this work
 onto it conflicts in:
 $(printf '%s\n' "$REBASE_CONFLICTS" | sed 's/^/    /')
-The rebase was aborted, so $TASK_BRANCH is still the tree that passed
-the verifier. Resolving this is a judgement about two changes, which is
-the one thing a runner must not make up."
+The replay ran on a detached head, so $TASK_BRANCH never moved: it is
+still the tree that passed the verifier. Resolving this is a judgement
+about two changes, which is the one thing a runner must not make up."
             else
                 # Abort failed: the worktree is mid-rebase, a state no
                 # later run can start from. Say it loudly - the next
@@ -1626,9 +1658,10 @@ the one thing a runner must not make up."
                 board "rebase-stuck" "${NEW_BASE_SHA:0:12}"
                 STATUS="blocked"
                 BLOCKERS="the rebase onto ${NEW_BASE_SHA:0:12} conflicted and could not be
-aborted. $WT is mid-rebase, and no run can use it until that is undone:
+aborted. $WT is mid-rebase, and no run can use it until that is undone.
+$TASK_BRANCH itself is untouched and still points at the verified tree:
     git -C $WT rebase --abort
-    git -C $WT reset --hard $PRE_REBASE_HEAD
+    git -C $WT checkout $TASK_BRANCH
 Conflicting paths:
 $(printf '%s\n' "$REBASE_CONFLICTS" | sed 's/^/    /')"
             fi
@@ -1642,16 +1675,16 @@ $(printf '%s\n' "$REBASE_CONFLICTS" | sed 's/^/    /')"
                 # this work. Reported rather than cleaned up, because
                 # from here "already fixed" and "silently lost" are the
                 # same picture.
-                git -C "$WT" reset --hard "$PRE_REBASE_HEAD" >>"$RUN_LOG" 2>&1 || true
+                reattach keep
                 REBASE_STATE="emptied - the new base already carries this work"
                 say "  $REBASE_STATE"
                 board "rebase-emptied" "${NEW_BASE_SHA:0:12}"
                 STATUS="needs-review"
                 BLOCKERS="replaying this onto ${NEW_BASE_SHA:0:12} left no commits at all:
 every patch in it is already present on $TASK_BASE. The work was done
-twice, or it was done elsewhere first. The branch is back on
-${PRE_REBASE_HEAD:0:12} so the diff is still readable. It probably
-wants throwing away, and that is a decision, not a cleanup rule."
+twice, or it was done elsewhere first. $TASK_BRANCH never moved, so the
+diff is still readable. It probably wants throwing away, and that is a
+decision, not a cleanup rule."
             else
                 # Verify the rebased tree, keeping the first run's
                 # result to fall back on: that is what describes the
@@ -1665,12 +1698,32 @@ wants throwing away, and that is a decision, not a cleanup rule."
                 REVERIFY_EXIT="$VERIFY_EXIT"
                 REVERIFY_TAIL="$VERIFY_TAIL"
 
-                if [ "$REVERIFY_EXIT" -eq 0 ] && [ -z "$TREE_MUTATED" ] \
-                   && [ -z "$VERIFY_WT_LEFTOVER" ]; then
-                    # The one path that keeps `done`. Every number in the
-                    # handoff below is re-read, because they all describe
-                    # the old base and a reader has no way to tell which
-                    # of them moved.
+                if [ -n "$VERIFY_WT_LEFTOVER" ]; then
+                    # Its own outcome, and not `rebase-red`: the rebased
+                    # tree may be perfectly good. What is wrong is that
+                    # the next run for this task cannot start. Folding it
+                    # in with a failing verifier would put "does not
+                    # verify" on the board next to an exit code of 0.
+                    reattach keep
+                    REBASE_STATE="re-verify checkout could not be removed - branch not moved"
+                    say "  $REBASE_STATE"
+                    board "rebase-stuck" "verify checkout left over"
+                    STATUS="needs-review"
+                    BLOCKERS="the re-verify checkout could not be removed: $VERIFY_WT_LEFTOVER
+It exited $REVERIFY_EXIT, so the rebased tree may well be fine - but the
+branch was left on ${PRE_REBASE_HEAD:0:12} rather than moved onto a
+result this run could not finish measuring. Remove it before re-running:
+    git -C $REPO worktree remove --force $VERIFY_WT_LEFTOVER"
+                    VERIFY_EXIT="$FIRST_VERIFY_EXIT"
+                    VERIFY_WHERE="$FIRST_VERIFY_WHERE"
+                    VERIFY_TAIL="$FIRST_VERIFY_TAIL"
+                    TREE_MUTATED=""
+                elif [ "$REVERIFY_EXIT" -eq 0 ] && [ -z "$TREE_MUTATED" ]; then
+                    # The one path that moves the branch. Every number in
+                    # the handoff below is re-read, because they all
+                    # describe the old base and a reader has no way to
+                    # tell which of them moved.
+                    reattach move
                     BASE_SHA="$NEW_BASE_SHA"
                     HEAD_SHA="$REBASED_HEAD"
                     COMMITS="$REBASED_COMMITS"
@@ -1687,11 +1740,24 @@ wants throwing away, and that is a decision, not a cleanup rule."
                     set_field base_sha "$BASE_SHA"
                     REBASED=1
                     REBASE_STATE="clean, re-verified on ${NEW_BASE_SHA:0:12}"
-                    say "  $REBASE_STATE"
                     board "rebased" "${PRE_REBASE_HEAD:0:12} -> ${HEAD_SHA:0:12}"
+
+                    # One more look at the ref. This step narrows the
+                    # window between "verified" and "merged"; it cannot
+                    # close it, and a runner that re-read until the base
+                    # held still would never finish in a busy repo. So
+                    # the honest thing is to notice and say so: the
+                    # handoff's claim is about a commit, not about a tip.
+                    LATE_BASE_SHA="$(git -C "$REPO" rev-parse --verify \
+                        "$TASK_BASE^{commit}" 2>/dev/null || true)"
+                    if [ -n "$LATE_BASE_SHA" ] && [ "$LATE_BASE_SHA" != "$NEW_BASE_SHA" ]; then
+                        REBASE_STATE="$REBASE_STATE - and $TASK_BASE moved on again to ${LATE_BASE_SHA:0:12} while that ran"
+                        board "base-moved-again" "${LATE_BASE_SHA:0:12}"
+                    fi
+                    say "  $REBASE_STATE"
                 else
-                    git -C "$WT" reset --hard "$PRE_REBASE_HEAD" >>"$RUN_LOG" 2>&1 || true
-                    REBASE_STATE="clean, but red on ${NEW_BASE_SHA:0:12} - branch put back"
+                    reattach keep
+                    REBASE_STATE="clean, but red on ${NEW_BASE_SHA:0:12} - branch not moved"
                     say "  $REBASE_STATE"
                     board "rebase-red" "verify exit $REVERIFY_EXIT"
                     STATUS="needs-review"
@@ -1702,10 +1768,10 @@ the new base disagrees with this change in a way no merge could have
 shown.
     $TASK_VERIFY -> exit $REVERIFY_EXIT${REVERIFY_TAIL:+
 $(printf '%s\n' "$REVERIFY_TAIL" | sed 's/^/    /')}
-The branch is back on ${PRE_REBASE_HEAD:0:12} - the tree that passed -
-so the evidence recorded below is still true of it.${TREE_MUTATED:+
-The re-verify also changed the worktree: $TREE_MUTATED}${VERIFY_WT_LEFTOVER:+
-Its checkout could not be removed either: $VERIFY_WT_LEFTOVER}"
+The replay ran on a detached head, so $TASK_BRANCH never left
+${PRE_REBASE_HEAD:0:12} - the tree that passed - and the evidence
+recorded below is still true of it.${TREE_MUTATED:+
+The re-verify also changed the worktree: $TREE_MUTATED}"
                     # Put the first verifier's result back: it is the one
                     # that describes the branch as it now stands.
                     VERIFY_EXIT="$FIRST_VERIFY_EXIT"
@@ -1714,6 +1780,30 @@ Its checkout could not be removed either: $VERIFY_WT_LEFTOVER}"
                     TREE_MUTATED=""
                 fi
             fi
+        fi
+
+        # Whatever happened above, the worktree was supposed to end up
+        # back on its branch. A failure here is not cosmetic in one
+        # direction: if the *move* did not take, the handoff is about to
+        # name a branch that does not point at the tree it describes,
+        # which is the one thing this whole step exists to prevent.
+        if [ "$REATTACH_FAILED" = "move" ]; then
+            REBASE_STATE="re-verified, but the branch could not be moved onto it"
+            board "rebase-stuck" "checkout -B failed"
+            STATUS="blocked"
+            BLOCKERS="the rebased tree verified and $TASK_BRANCH could not be moved onto
+it. The worktree is detached at ${REBASED_HEAD:-(unknown)} and the
+branch still points at ${PRE_REBASE_HEAD:0:12}, so nothing is lost and
+nothing is ready:
+    git -C $WT checkout -B $TASK_BRANCH ${REBASED_HEAD:-HEAD}
+See $RUN_LOG for what git said."
+        elif [ -n "$REATTACH_FAILED" ]; then
+            # The branch is right; only the worktree is off it. Worth a
+            # line, not a verdict of its own.
+            BLOCKERS="$BLOCKERS
+
+Note: $WT is left detached - 'git -C $WT checkout $TASK_BRANCH' failed.
+$TASK_BRANCH itself points where this handoff says it does."
         fi
     fi
 fi

@@ -1812,14 +1812,24 @@ no way to tell which of them moved.
 
 Three decisions worth keeping.
 
-**The branch only ever moves on success.** On conflict, on red, on
-emptied, it is put back precisely where it was. That keeps an invariant
-a reader can rely on without qualification: *the branch named in a
-handoff is a tree that verified*. What did not work is in the handoff as
-prose, not as a tip somebody has to bisect for. It also means the
-verifier's own result has to be saved and restored around the second
-run, or the handoff would describe the branch using a measurement of a
-tree that was thrown away — F-13's mistake, re-committed one layer up.
+**The branch only ever moves on success** — and the first version of
+that sentence was not true. `git rebase` moves the checked-out branch as
+its opening act, so replaying on the branch itself left `TASK_BRANCH`
+pointing at an unverified tip for as long as the second verifier took,
+and a run killed inside that window left it there for good. Resetting it
+afterwards is a rollback, and a rollback is a promise about a code path
+that runs after the damage. So the replay happens on a **detached
+head**: the branch does not move until something has verified, and on
+conflict, red or emptied there is nothing to undo because nothing was
+done. `checkout -B` is the only thing that ever advances it.
+
+That keeps an invariant a reader can rely on without qualification:
+*the branch named in a handoff is a tree that verified*. What did not
+work is in the handoff as prose, not as a tip somebody has to bisect
+for. It also means the verifier's own result has to be saved and
+restored around the second run, or the handoff would describe the branch
+using a measurement of a tree that was thrown away — F-13's mistake,
+re-committed one layer up.
 
 **It is gated on the verdict, not on a copy of the verdict's
 conditions.** The rebase runs only when the run would otherwise be
@@ -1828,12 +1838,26 @@ that lead there, which is two lists free to disagree about what "done"
 means — and the failure mode is a rebase burying a reason that was
 already established.
 
+**The window narrows; it does not close.** The base can move *again*
+while the second verifier runs, and re-reading until it holds still
+would never terminate in a busy repo. So the ref is read once more at
+the end, and if it moved the handoff says so and keeps its `done` — the
+claim being made is about a commit, which is printed, not about a tip.
+A runner that quietly implied otherwise would be doing the thing this
+finding exists to stop.
+
 **No fetch.** The base ref is re-read locally, so `origin/main` moves
 only because something else fetched it. A runner that reached the
 network in order to measure would be changing the world it is
 describing, and the same task would get different answers depending on
 when it ran. What the runner promises is narrow and checkable: *this
 verified against the base as this machine currently understands it*.
+
+The sweep checks three things per case and not one, which is the part
+worth copying elsewhere. The exit code and the board event are both the
+run's own account of itself; the **branch ref** is not. Every check but
+that one would stay green if the invariant above quietly stopped
+holding, which is precisely how a rollback rots.
 
 `run/stubs/mover.sh` is the regression — an agent that does its work and
 moves the base out from under itself while it is at it, driven by four
