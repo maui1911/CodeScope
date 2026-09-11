@@ -39,7 +39,13 @@
 #                        at "here is the command". Off by default.
 #   -h, --help           This text.
 #
-# Exit codes: 0 done, 1 blocked, 2 needs-review.
+# Exit codes: 0 done, 1 blocked, 2 needs-review, 3 never started.
+#
+# 3 is its own code because it is not a result. An overlapping claim, or
+# a lock broken mid-dispatch, means nothing ran and nothing was decided:
+# the right answer is to come back later, not to count a failure against
+# the task. A scheduler that cannot tell those apart backs off from work
+# it never attempted.
 #
 # Which agent runs is data, not code. The task's `agent:` wins, else
 # the charter's; the profile lives in contract/agents/<id>.agent.md and
@@ -91,6 +97,11 @@ LAB_DIR="$(dirname "$SCRIPT_DIR")"
 die() { printf 'bot-run: %s\n' "$*" >&2; exit 1; }
 say() { printf '%s\n' "$*"; }
 step() { printf '\n== %s\n' "$*"; }
+
+# Nothing ran and nothing was decided - come back later. Separate from
+# die so a scheduler can tell "refused" from "failed": one is a reason
+# to retry, the other is a reason to stop.
+refuse() { printf 'bot-run: %s\n' "$*" >&2; exit 3; }
 
 usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//;$d'; }
 
@@ -147,7 +158,8 @@ take_lock() {   # take_lock <dir> <what>
         # directory first going away, which is the property that closes
         # it: any change of identity shows up in the token.
         owner_before="$(cat "$dir/owner" 2>/dev/null || true)"
-        if [ -n "$(find "$dir" -maxdepth 0 -mmin +10 2>/dev/null)" ] \
+        if [ "${FIND_AGE_OK:-1}" -eq 1 ] \
+           && [ -n "$(find "$dir" -maxdepth 0 -mmin +10 2>/dev/null)" ] \
            && [ -n "$owner_before" ] \
            && mkdir "$dir.break" 2>/dev/null; then
             owner_now="$(cat "$dir/owner" 2>/dev/null || true)"
@@ -164,7 +176,11 @@ take_lock() {   # take_lock <dir> <what>
         [ "$waited" -le 300 ] || die "timed out waiting for the $what lock at $dir
 Another run is holding it, or it was left behind. Remove it by hand if
 no other run is in flight:
-    rm -rf $dir"
+    rm -rf $dir$([ "${FIND_AGE_OK:-1}" -eq 1 ] || printf '%s' "
+
+This build of find rejects '-maxdepth 0 -mmin', so the stale-lock
+takeover is disabled here and a lock left by a killed run will never be
+reclaimed on its own.")"
         sleep 0.2
     done
     printf '%s\n' "$RUN_TOKEN" > "$dir/owner"
@@ -208,6 +224,10 @@ fi
 [ -d "$REPO/.git" ] || git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 \
     || die "not a git repo: $REPO"
 
+# Canonical, so that "the same repo" is one string rather than three
+# spellings of one path. The state directory is keyed on it below.
+REPO="$(git -C "$REPO" rev-parse --show-toplevel)"
+
 STATE="${STATE:-$LAB_DIR/.state}"
 WORKTREE_ROOT="${WORKTREE_ROOT:-${REPO}.worktrees}"
 
@@ -225,6 +245,37 @@ abspath() {   # abspath <path> - works on a path that does not exist yet
 mkdir -p "$STATE"
 STATE="$(cd "$STATE" && pwd)"
 WORKTREE_ROOT="$(abspath "$WORKTREE_ROOT")"
+
+# A control plane belongs to one repository. Live tasks and locks are
+# keyed by task id alone, so pointing the default state at a second repo
+# with --repo would have one run read, overwrite or block on the other's
+# T-0001. Stamp it once and refuse to answer for anyone else.
+if [ -f "$STATE/REPO" ]; then
+    STATE_REPO="$(cat "$STATE/REPO")"
+    [ "$STATE_REPO" = "$REPO" ] || die \
+"this control plane belongs to another repository.
+
+    state: $STATE
+    it is for:  $STATE_REPO
+    you asked:  $REPO
+
+Task ids and locks are not namespaced by repo, so sharing one state
+directory between two would have them claim each other's tasks. Give
+this repo its own:
+
+    --state <a directory for $REPO>"
+else
+    printf '%s\n' "$REPO" > "$STATE/REPO"
+fi
+
+# `-mmin` and `-maxdepth` are the whole basis of every age check here -
+# the stale-lock break, and the scheduler's recurrence. Both are BSD
+# primitives as well as GNU ones, but "documented" and "present on the
+# machine in front of you" are different claims, and the failure mode if
+# they are absent is silence: the expression errors, the test reads
+# false, and stale locks are simply never reclaimed. Ask once, out loud.
+FIND_AGE_OK=1
+find "$STATE" -maxdepth 0 -mmin +1 >/dev/null 2>&1 || FIND_AGE_OK=0
 
 # The control plane is keyed to this checkout, and the conflicts it
 # exists to prevent are keyed to the repository. For a single checkout
@@ -323,6 +374,19 @@ esac
 # one. See F-21.
 TASK_ON_CHANGES="$(field on_changes_requested)"
 TASK_DERIVED_VERIFY="$(field derived_verify)"
+
+# Inherited by the derived task, one hop and no further. A task a human
+# allowed to run unattended may produce a follow-up that runs
+# unattended; a task a human starts by hand produces one that waits for
+# a hand. The permission travels with the work rather than being
+# re-decided by whichever bot happened to write the file.
+TASK_SCHEDULE="$(field schedule)"
+[ -z "$(field every)" ] || TASK_SCHEDULE="auto"
+TASK_SCHEDULE="${TASK_SCHEDULE:-manual}"
+case "$TASK_SCHEDULE" in
+    auto|manual) ;;
+    *) die "schedule '$TASK_SCHEDULE' is not one of: auto, manual" ;;
+esac
 
 for f in id owner base branch touches verify; do
     var="TASK_$(printf '%s' "$f" | tr '[:lower:]' '[:upper:]')"
@@ -900,7 +964,7 @@ if [ -n "$OVERLAP_IDS" ]; then
         board "overlap-allowed" "${OVERLAP_IDS# }"
     else
         board "dispatch-refused" "overlaps ${OVERLAP_IDS# }"
-        die "another in-flight task already claims files this one touches.
+        refuse "another in-flight task already claims files this one touches.
 
 $OVERLAP_REPORT
 Two branches editing one file do not conflict now; they conflict at
@@ -955,7 +1019,7 @@ set_field base_sha "$BASE_SHA"
 # it, the exclusion we are about to rely on stopped being true, and
 # claiming anyway would make the board say two runs agreed when they
 # never met.
-[ "$(cat "$STATE/dispatch.lock/owner" 2>/dev/null || true)" = "$RUN_TOKEN" ] || die \
+[ "$(cat "$STATE/dispatch.lock/owner" 2>/dev/null || true)" = "$RUN_TOKEN" ] || refuse \
 "the dispatch lock was broken while this run was inside it - refusing to claim.
 Nothing was dispatched. Re-run once no other run is in flight."
 
@@ -1397,6 +1461,7 @@ base: $HEAD_SHA
 branch: bot/$TASK_ON_CHANGES/$DERIVED_ID
 touches: $DERIVED_TOUCHES
 verify: $TASK_DERIVED_VERIFY
+schedule: $TASK_SCHEDULE
 ---
 
 # Objective

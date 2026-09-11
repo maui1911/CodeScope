@@ -298,8 +298,8 @@ detects that it happened.
 
 | | |
 |---|---|
-| Covered | the file contract; **two bots** (`fixer`, `reviewer`), two task kinds (`change`, `review`) and the handoff between them; contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the `.bot-review.md` output channel; verifier, in a clean checkout of the branch tip; evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup |
-| **Not** covered | scheduling/routines, the approval inbox, per-bot memory, rebase-on-collision, resume after a crash, pushing, opening PRs, any GPUI surface |
+| Covered | the file contract; **two bots** (`fixer`, `reviewer`), two task kinds (`change`, `review`), the handoff between them and a scheduler that reads the board; contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the `.bot-review.md` output channel; verifier, in a clean checkout of the branch tip; evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup |
+| **Not** covered | the approval inbox, per-bot memory, rebase-on-collision, resume after a crash, any trigger other than "someone ran a tick", pushing, opening PRs, any GPUI surface |
 
 Two deliberate omissions:
 
@@ -333,12 +333,50 @@ Work through those in order on the first run — step 2 is where a wrong
 path or a broken verifier shows up, and it costs no tokens.
 
 `run/sweep.sh` drives every stub in `run/stubs/` through the runner and
-checks each verdict, then reports any worktree or lock left behind. It
-is the one command that says whether the loop still holds:
+checks each verdict, starts two colliding tasks at the same moment to
+prove exactly one can claim, and reports any worktree or lock left
+behind. It is the one command that says whether the loop still holds:
 
 ```bash
 bash labs/agent-bots/run/sweep.sh
 ```
+
+### Letting it decide for itself
+
+`run/bot-tick.sh` reads the world, prints a decision for every task it
+can see, and dispatches the ones that are ready:
+
+```bash
+# what would happen, and why - changes nothing
+bash labs/agent-bots/run/bot-tick.sh --dry-run
+
+# actually run up to two, two at a time
+bash labs/agent-bots/run/bot-tick.sh --max 2 --parallel 2
+
+# keep going
+bash labs/agent-bots/run/bot-tick.sh --watch 300
+```
+
+```
+TASK           OWNER     DECISION     RUNS  LAST         WHY
+T-0004         fixer     manual          0  never        no schedule: auto
+T-0005         reviewer  cooling         5  blocked      blocked 2 time(s), last one under 30m ago
+T-0006         reviewer  due             6  done         every: 1d elapsed
+T-0006-fix     fixer     ready           0  never        never run
+```
+
+`RUNS` and `LAST` come off the board — they are the two questions only
+an event log can answer, since a dispatch that was *refused* never
+wrote a handoff. `DECISION` does not: what is true right now comes from
+the live task and from whether its worktree is on disk, because a run
+that died mid-flight appended no closing row. F-23 has the reasoning.
+
+**Scheduling is opt-in.** A task runs unattended only with
+`schedule: auto`, or `every: <duration>` which implies it. Everything
+else reports `manual` and is left alone — the first tick ever run
+offered to dispatch the overlap *fixture*, which is what a directory of
+task files looks like to something that cannot tell a fixture from a
+job.
 
 A task that already finished will not re-run; pass `--reset` to discard
 the live task and start over. Exit codes are `0` done, `1` blocked,
@@ -416,6 +454,7 @@ are committed.
 | `.state/handoffs/<ts>_<bot>__to__human__<id>.md` | the handoff |
 | `.state/reviews/<ts>_<bot>_<id>.md` | a review, harvested off the worktree |
 | `.state/proposed/<id>.md` | a task one bot's run wrote for another |
+| `.state/REPO` | which repository this control plane belongs to |
 | `.state/runs/<day>/<id>-<ts>.log` | agent + verifier output |
 | `<repo>.worktrees/bot-<owner>-<id>/` | the work |
 
@@ -598,10 +637,18 @@ the fixer read the review, checked its single finding against the
 source, and refused it with a reason — which turned out to be the one
 outcome the runner had no verdict for (F-22).
 
-What is still missing is everything about *when*. Nothing schedules a
-bot, nothing notices that a task has become ready, and `--chain` is one
-link long by construction. The board records what happened; nothing yet
-reads it to decide what happens next.
+And the board is read now. `bot-tick.sh` (F-23) decides what should run
+from three sources it is careful to keep separate: the live task for
+what is true, the board for what has happened, file mtimes for how long
+ago. That is what makes "this has ended `blocked` three times in a row,
+leave it to a human" expressible at all.
+
+What is still not scheduling: there is no daemon, no trigger on a git
+event, nothing that survives the process. A tick is a thing you run and
+`--watch` is a `sleep` in a loop. The only reason that is enough is
+that the whole state is on disk and every tick re-reads it from
+nothing — which is the same property that made crash recovery cheap,
+arriving twice for the price of one design decision.
 
 And the board stops being a maybe. It was designed append-only from the
 start (§3.2) precisely so it would survive concurrent writers, so the
@@ -1527,3 +1574,78 @@ push back. The derived task says so in as many words: *a finding you
 disagree with is not a finding you skip; say so, with the reason.
 Silence reads as agreement, and the next reader cannot tell the
 difference between fixed and missed.*
+
+---
+
+### F-23 · A log tells you what happened; it must not be asked what is true
+
+*2026-09-11, the first thing that reads the board.*
+
+The board had been write-only for the whole experiment. `bot-tick.sh`
+is the first reader, and the first question it had to answer was not
+"what should run" but **which facts may be taken from a log at all**.
+
+Three kinds of fact, three different sources, and mixing them up is the
+whole trap:
+
+| question | source | why not the others |
+|---|---|---|
+| what is true now | the live task, plus whether its worktree is on disk | a run that died mid-flight appended no closing row, so the board's last word about it is a lie by omission — and status already has a single writer (§3.2); deriving it from the log would create a second answer |
+| what has happened | the board, and only the board | a dispatch that was *refused* never wrote a handoff, so the handoffs directory cannot count attempts even in principle |
+| how long ago | file mtimes | the board's timestamps are ISO strings, and turning those into epoch seconds portably is a worse problem than this one deserves; `find -mmin` is on both GNU and BSD |
+
+That split is what makes loop detection possible at all. "This task has
+ended `blocked` three times in a row" is a question only the event log
+can answer, and it is exactly the question that stops a scheduler
+burning an afternoon re-running something that needs a human.
+
+Four things the first tick got wrong, all of them instructive.
+
+**A directory of task files is not a queue.** The first run offered to
+dispatch `T-0004` — the *overlap fixture*, a file whose entire purpose
+is to sit there looking like a task. A scheduler that runs everything
+it can see will run the first fixture anybody drops in `examples/`, and
+this repo has three. So `schedule:` is **opt-in**: `auto` or nothing
+happens. Everything else is reported as `manual` and left alone.
+
+**Recurrence is decided by the clock, not by the status.** The first
+version asked the status first, so clearing a live task made a routine
+that had run minutes ago look like one that had never run — "no live
+task" reads as `todo`. For a task with `every:`, the interval *is* the
+question; status only says whether it is running right now.
+
+**Refusal is not failure, and needed its own exit code.** An overlapping
+claim means nothing ran and nothing was decided. Counting that as a
+failed run would have the backoff and the give-up counter park a task
+that was never attempted. Exit 3 now means "never started", distinct
+from blocked and from needs-review.
+
+**Permission travels with the work, one hop.** A derived task inherits
+`schedule:` from the review that produced it: a task a human allowed to
+run unattended may produce a follow-up that runs unattended; a task a
+human starts by hand produces one that waits for a hand. The
+alternative — letting whichever bot wrote the file decide — is the same
+mistake as letting it choose its own scope (F-21).
+
+And then the part that was worth all of it. `sweep.sh` now generates
+two tasks that declare the same file and starts them **at the same
+moment**, against one control plane:
+
+```
+dispatch  T-990A.md
+dispatch  T-990B.md
+  T-990A  ->  refused - nothing ran, try again
+  T-990B  ->  done
+```
+
+Exactly one claimed. The board carries both runs' rows, interleaved and
+intact. That is F-14 (the board survives concurrent writers), F-16 (the
+overlap is real and named) and F-17 (the claim is serialised) all being
+load-bearing at once — and until this run, every one of them was a
+guard against something that had never actually happened.
+
+What is still not scheduling, and should not be mistaken for it: there
+is no daemon, no trigger on a git event, no queue that survives the
+process. A tick is a thing you run, `--watch` is a `sleep` in a loop,
+and the only reason that is enough is that the entire state is on disk
+and the next tick re-reads it from nothing.

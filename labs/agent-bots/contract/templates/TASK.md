@@ -43,6 +43,17 @@ Field reference:
            tasks are exempt from the overlap check in both directions,
            because a bot that writes nothing cannot conflict at merge.
            See README F-19.
+  schedule manual (default) | auto
+           Whether bot-tick.sh may dispatch this on its own. Opt-in,
+           because a scheduler that runs every file it can see will run
+           the first fixture somebody leaves in examples/. A derived
+           task inherits this from the review that produced it - one
+           hop, no further.
+  every    optional, e.g. 30m, 6h, 1d. Makes the task a routine: the
+           scheduler re-runs it once the interval since its last handoff
+           has passed. Implies `schedule: auto`, since a recurrence is
+           unattended by definition. Recurrence is decided by the clock,
+           not by the status - see README F-23.
   on_changes_requested
            review tasks only, optional. The bot that receives the
            follow-up when the verdict is `changes-requested`. The

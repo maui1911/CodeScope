@@ -8,6 +8,8 @@ base: labs/agent-bots
 branch: bot/reviewer/T-0006
 touches: core/src/telemetry.rs
 verify: bash labs/agent-bots/run/review-shape.sh
+schedule: auto
+every: 1d
 on_changes_requested: fixer
 derived_verify: cargo test -p codescope-core --lib
 ---
@@ -52,6 +54,12 @@ a finding you believe belongs in the review. What it rules out is
 padding, because here padding becomes somebody else's task.
 
 # Notes
+
+This one is a **routine**: `schedule: auto` with `every: 1d`, so
+`bot-tick.sh` re-runs it once a day and hands any findings to the
+fixer. It is the only task in `examples/` that the scheduler will touch
+on its own — the rest are fixtures and one-offs, and a scheduler that
+ran everything it could find would run those too.
 
 Out of scope: the per-agent parsers, `context_window_for_model`, and
 anything under `core/src/agents/`. Findings about them go under "What I
