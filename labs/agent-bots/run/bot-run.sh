@@ -266,10 +266,6 @@ else
     SURFACE="import"
     [ -d "$REPO" ] || die "not a directory, and not a git repo: $REPO"
     REPO="$(cd "$REPO" && pwd)"
-    die "$REPO is a plain folder, not a git work tree.
-
-The work surface for a folder is imported rather than cloned, and that
-half is not built yet. Point --repo at a git work tree."
 fi
 
 STATE="${STATE:-$LAB_DIR/.state}"
@@ -397,13 +393,13 @@ field() {
 # anything the runner decides from the contract has to be read from
 # there too, or the two halves of one dispatch disagree. See F-12.
 field_at_base() {
-    field_from "$1" "$(git -C "$REPO" show "$BASE_SHA:$CONTRACT_DIR/$2" 2>/dev/null || true)"
+    field_from "$1" "$(git -C "$ORIGIN_REPO" show "$BASE_SHA:$CONTRACT_DIR/$2" 2>/dev/null || true)"
 }
 
 # base_has <contract-relative-path> - does the contract file exist at
 # the base commit at all.
 base_has() {
-    git -C "$REPO" cat-file -e "$BASE_SHA:$CONTRACT_DIR/$1" 2>/dev/null
+    git -C "$ORIGIN_REPO" cat-file -e "$BASE_SHA:$CONTRACT_DIR/$1" 2>/dev/null
 }
 
 TASK_ID="$(field id)"
@@ -473,7 +469,137 @@ esac
 # launched from an older tree. See F-12.
 BOT_DIR="$LAB_DIR/contract/bots/$TASK_OWNER"
 
-BASE_SHA="$(git -C "$REPO" rev-parse --verify "$TASK_BASE^{commit}" 2>/dev/null)" \
+# --------------------------------------------------------------------
+# The origin repository
+#
+# What the surface is cloned from and pushed back to. For a git project
+# that is the project. For a plain folder there is nothing to clone, so
+# the folder is snapshotted into a bare repository under state first -
+# and from that line down, every other line in this script is the same
+# for both kinds.
+#
+# The snapshot is a commit, which makes it three things at once: the
+# base the work is cut from, the tree the scope and overlap checks
+# expand their globs against, and a restore point the folder did not
+# have. That last one is not a side effect worth apologising for. A
+# folder with no version control has no undo, and pointing an
+# autonomous agent at one without giving it an undo would be the
+# reckless part of this whole design.
+# --------------------------------------------------------------------
+
+IMPORT_LOG="$STATE/import.log"
+IMPORT_REPORT=""
+
+snapshot_folder() {   # snapshot the folder into $ORIGIN_REPO as refs/heads/folder
+    local idx cidx tree ctree parent commit count
+    local -a parentarg=()
+
+    [ -d "$ORIGIN_REPO" ] || git init --bare --quiet "$ORIGIN_REPO" \
+        || die "could not create the snapshot repository at $ORIGIN_REPO"
+
+    # What never gets imported. A folder has no .gitignore discipline by
+    # definition - that is most of what makes it a folder - so without
+    # this the first snapshot of a node project is node_modules and the
+    # first of a rust one is target/. The second half of the list is not
+    # about size: an agent that cannot read a file cannot leak it, and a
+    # directory that was never a repository has never had a reason to
+    # keep a .env out of itself.
+    #
+    # It goes in the snapshot repo's info/exclude rather than in the
+    # user's folder, because it is this runner's opinion and the folder
+    # is not this runner's to write to.
+    cat > "$ORIGIN_REPO/info/exclude" <<'EXCLUDE'
+.git/
+node_modules/
+target/
+dist/
+build/
+out/
+.venv/
+venv/
+__pycache__/
+.next/
+.nuxt/
+.gradle/
+vendor/
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+.npmrc
+.netrc
+EXCLUDE
+
+    mkdir -p "$STATE/tmp"
+    idx="$STATE/tmp/import-$$.idx"
+    cidx="$STATE/tmp/contract-$$.idx"
+    rm -f "$idx" "$cidx"
+
+    # The folder as it is now. A .gitignore inside it is honoured on top
+    # of the list above: the folder's own opinion about what is not
+    # source outranks a default written by a stranger.
+    ( cd "$REPO" && GIT_INDEX_FILE="$idx" \
+        git -c core.bare=false --git-dir="$ORIGIN_REPO" --work-tree="$REPO" \
+            add -A -- . ) >>"$IMPORT_LOG" 2>&1 \
+        || { rm -f "$idx"; die "could not import $REPO; see $IMPORT_LOG"; }
+
+    # The contract travels with the snapshot. The rule that an agent
+    # reads its charter from its own checkout does not get an exception
+    # for folders - it gets a path.
+    ( cd "$LAB_DIR/contract" && GIT_INDEX_FILE="$cidx" \
+        git -c core.bare=false --git-dir="$ORIGIN_REPO" --work-tree="$LAB_DIR/contract" \
+            add -A -- . ) >>"$IMPORT_LOG" 2>&1 \
+        || { rm -f "$idx" "$cidx"; die "could not import the contract; see $IMPORT_LOG"; }
+    ctree="$(GIT_INDEX_FILE="$cidx" git --git-dir="$ORIGIN_REPO" write-tree)"
+    rm -f "$cidx"
+    GIT_INDEX_FILE="$idx" git -c core.bare=false --git-dir="$ORIGIN_REPO" \
+        --work-tree="$REPO" read-tree --prefix="$CONTRACT_DIR/" "$ctree" >>"$IMPORT_LOG" 2>&1 \
+        || { rm -f "$idx"; die "could not graft the contract in; see $IMPORT_LOG"; }
+
+    tree="$(GIT_INDEX_FILE="$idx" git --git-dir="$ORIGIN_REPO" write-tree)"
+    rm -f "$idx"
+
+    parent="$(git --git-dir="$ORIGIN_REPO" rev-parse -q --verify refs/heads/folder 2>/dev/null || true)"
+    if [ -n "$parent" ] \
+       && [ "$(git --git-dir="$ORIGIN_REPO" rev-parse "$parent^{tree}")" = "$tree" ]; then
+        # Nothing has changed. Reuse the commit rather than making an
+        # identical one, so two runs against an untouched folder share
+        # a base - which is what lets the overlap check tell that they
+        # are talking about the same tree.
+        IMPORT_REPORT="unchanged since ${parent:0:12}"
+        return 0
+    fi
+
+    [ -z "$parent" ] || parentarg=(-p "$parent")
+    # An explicit identity. A snapshot signed as whoever happened to run
+    # the bot would be a commit nobody made.
+    commit="$(GIT_AUTHOR_NAME=bot-run GIT_AUTHOR_EMAIL=bot-run@invalid \
+        GIT_COMMITTER_NAME=bot-run GIT_COMMITTER_EMAIL=bot-run@invalid \
+        git --git-dir="$ORIGIN_REPO" commit-tree "$tree" \
+            ${parentarg[@]+"${parentarg[@]}"} -m "snapshot of $REPO")" \
+        || die "could not commit the snapshot; see $IMPORT_LOG"
+    git --git-dir="$ORIGIN_REPO" update-ref refs/heads/folder "$commit" \
+        || die "could not move refs/heads/folder; see $IMPORT_LOG"
+    count="$(git --git-dir="$ORIGIN_REPO" ls-tree -r --name-only "$commit" | wc -l | tr -d ' ')"
+    IMPORT_REPORT="$count file(s) at ${commit:0:12}${parent:+, was ${parent:0:12}}"
+    return 0
+}
+
+ORIGIN_REPO="$REPO"
+if [ "$SURFACE" = "import" ]; then
+    [ "$TASK_BASE" = "folder" ] || die \
+"$REPO is a plain folder, so this task's base: must be the word 'folder'
+and not '$TASK_BASE'. There is no ref to cut from; the runner snapshots
+the folder and the work is cut from that."
+    ORIGIN_REPO="$STATE/snapshot.git"
+    # Not labs/agent-bots/contract: that path means something in this
+    # repository and nothing in somebody's folder.
+    CONTRACT_DIR=".bot-contract"
+    snapshot_folder
+fi
+
+BASE_SHA="$(git -C "$ORIGIN_REPO" rev-parse --verify "$TASK_BASE^{commit}" 2>/dev/null)" \
     || die "cannot resolve base ref '$TASK_BASE' (fetch first?)"
 
 # --------------------------------------------------------------------
@@ -719,7 +845,7 @@ expand_globs() {
     split_globs "$1"
     globs=(${GLOBS_OUT[@]+"${GLOBS_OUT[@]}"})
     [ "${#globs[@]}" -gt 0 ] || return 0
-    files="$(git -C "$REPO" ls-tree -r --name-only "${2:-$BASE_SHA}" 2>/dev/null || true)"
+    files="$(git -C "$ORIGIN_REPO" ls-tree -r --name-only "${2:-$BASE_SHA}" 2>/dev/null || true)"
     [ -n "$files" ] || return 0
     while IFS= read -r file; do
         for g in ${globs[@]+"${globs[@]}"}; do
@@ -912,8 +1038,12 @@ valid outcome; guessing is not."
 # invocation without reprinting the whole prompt.
 # --------------------------------------------------------------------
 
-GIT_COMMON_DIR="$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-[ -n "$GIT_COMMON_DIR" ] || GIT_COMMON_DIR="$REPO/.git"
+# The surface is a standalone repository, so its git directory is
+# inside the one directory the agent is allowed to write. The
+# substitution is kept because a profile may still have to name it - a
+# sandbox that grants the workspace does not necessarily grant the .git
+# inside it, which is exactly what Codex does. See F-28.
+GIT_COMMON_DIR="$WT/.git"
 
 case "$AGENT_HEADLESS" in
     *"{prompt}"*)
@@ -1020,7 +1150,8 @@ cat <<PLAN
   repo      $REPO
   base      $BASE_PLAN
   branch    $TASK_BRANCH
-  surface   $WT ($SURFACE)
+  surface   $WT ($SURFACE${IMPORT_REPORT:+ - $IMPORT_REPORT})
+  origin    $ORIGIN_REPO
   touches   $TASK_TOUCHES
   overlap   $OVERLAP_SUMMARY
   verify    $TASK_VERIFY
@@ -1193,15 +1324,15 @@ if [ -e "$VERIFY_WT" ]; then
 
     rm -rf $VERIFY_WT"
 fi
-if git -C "$REPO" rev-parse --verify --quiet "refs/heads/$TASK_BRANCH" >/dev/null 2>&1; then
+if git -C "$ORIGIN_REPO" rev-parse --verify --quiet "refs/heads/$TASK_BRANCH" >/dev/null 2>&1; then
     # The work happens on a clone and is pushed back here at the end.
     # A branch of this name already in the project is either an earlier
     # run nobody cleaned up or somebody's work, and the push would be
     # the thing that told you.
-    die "branch '$TASK_BRANCH' already exists in $REPO
+    die "branch '$TASK_BRANCH' already exists in $ORIGIN_REPO
 
 That is where this run's result gets pushed, so it has to be free:
-    git -C $REPO branch -D $TASK_BRANCH"
+    git -C $ORIGIN_REPO branch -D $TASK_BRANCH"
 fi
 
 mkdir -p "$WORKTREE_ROOT"
@@ -1215,7 +1346,7 @@ mkdir -p "$WORKTREE_ROOT"
 # project after this clone is still readable here, which is what lets
 # the rebase step replay onto a base that moved.
 SURFACE_OK=0
-if git clone --shared --no-checkout --quiet "$REPO" "$WT" >>"$RUN_LOG" 2>&1; then
+if git clone --shared --no-checkout --quiet "$ORIGIN_REPO" "$WT" >>"$RUN_LOG" 2>&1; then
     git -C "$WT" checkout --quiet -b "$TASK_BRANCH" "$BASE_SHA" >>"$RUN_LOG" 2>&1 \
         && SURFACE_OK=1
 fi
@@ -1232,7 +1363,7 @@ fi
 # work is worse than no harness.
 printf 'bot-run surface for %s\n' "$TASK_ID" > "$WT/.git/bot-surface"
 
-say "  created $WT (clone of $REPO)"
+say "  created $WT (clone of $ORIGIN_REPO)"
 
 # Only now, with a worktree that actually exists, does the live task
 # come into being. A dispatch that fails must not leave one behind.
@@ -1764,7 +1895,11 @@ elif [ "$TASK_KIND" = "review" ]; then
     REBASE_STATE="not applicable - a review has nothing to replay"
 else
     step "Rebase"
-    NEW_BASE_SHA="$(git -C "$REPO" rev-parse --verify "$TASK_BASE^{commit}" 2>/dev/null)" \
+    # For a folder, "has the base moved" is "has the folder changed",
+    # and the only way to ask is to snapshot it again. An unchanged
+    # folder reuses its commit, so this is a stat walk and not a copy.
+    [ "$SURFACE" != "import" ] || snapshot_folder
+    NEW_BASE_SHA="$(git -C "$ORIGIN_REPO" rev-parse --verify "$TASK_BASE^{commit}" 2>/dev/null)" \
         || NEW_BASE_SHA=""
 
     if [ -z "$NEW_BASE_SHA" ]; then
@@ -1935,7 +2070,7 @@ result this run could not finish measuring. Remove it before re-running:
                     # held still would never finish in a busy repo. So
                     # the honest thing is to notice and say so: the
                     # handoff's claim is about a commit, not about a tip.
-                    LATE_BASE_SHA="$(git -C "$REPO" rev-parse --verify \
+                    LATE_BASE_SHA="$(git -C "$ORIGIN_REPO" rev-parse --verify \
                         "$TASK_BASE^{commit}" 2>/dev/null || true)"
                     if [ -n "$LATE_BASE_SHA" ] && [ "$LATE_BASE_SHA" != "$NEW_BASE_SHA" ]; then
                         REBASE_STATE="$REBASE_STATE - and $TASK_BASE moved on again to ${LATE_BASE_SHA:0:12} while that ran"
@@ -2011,13 +2146,33 @@ fi
 
 PUSHED=""
 PUSH_FAILED=""
+PATCH_FILE=""
 if [ "$TREE_BROKEN" -eq 0 ] && [ "$COMMITS" -gt 0 ]; then
     step "Result branch"
     if git -C "$WT" push --quiet origin \
         "refs/heads/$TASK_BRANCH:refs/heads/$TASK_BRANCH" >>"$RUN_LOG" 2>&1; then
         PUSHED="$TASK_BRANCH"
-        say "  $TASK_BRANCH -> $REPO"
+        say "  $TASK_BRANCH -> $ORIGIN_REPO"
         board "pushed" "$TASK_BRANCH @ ${HEAD_SHA:0:12}"
+        if [ "$SURFACE" = "import" ]; then
+            # A folder has nothing to pull a branch into. The snapshot
+            # keeps the history so nothing is lost, and the patch is the
+            # part a human can actually act on: `git apply --check` will
+            # say whether it still fits the folder as it stands now,
+            # which a branch in a repository the folder has never heard
+            # of cannot.
+            mkdir -p "$STATE/patches"
+            PATCH_FILE="$STATE/patches/${TS}_${TASK_ID}.patch"
+            if git -C "$WT" format-patch --stdout "$BASE_SHA..$TASK_BRANCH" \
+                > "$PATCH_FILE" 2>>"$RUN_LOG"; then
+                say "  patch    $PATCH_FILE"
+                board "patch-written" "$PATCH_FILE"
+            else
+                rm -f "$PATCH_FILE"
+                PATCH_FILE=""
+                say "  could not write the patch"
+            fi
+        fi
     else
         PUSH_FAILED="$TASK_BRANCH"
         say "  could not push $TASK_BRANCH into $REPO"
@@ -2028,8 +2183,8 @@ if [ "$TREE_BROKEN" -eq 0 ] && [ "$COMMITS" -gt 0 ]; then
         [ "$BLOCKERS" != "none" ] || BLOCKERS=""
         BLOCKERS="${BLOCKERS:+$BLOCKERS
 
-}the branch could not be pushed back into $REPO, so it exists only on
-the work surface:
+}the branch could not be pushed back into $ORIGIN_REPO, so it exists
+only on the work surface:
     git -C $WT log --oneline $BASE_SHA..$TASK_BRANCH
 Move it by hand before anything removes $WT. See $RUN_LOG."
     fi
@@ -2076,7 +2231,7 @@ if [ "$TASK_KIND" = "review" ] && [ "$STATUS" = "done" ] \
         CITED_BAD=""
         while IFS= read -r cited_path; do
             [ -n "$cited_path" ] || continue
-            if ! git -C "$REPO" cat-file -e "$HEAD_SHA:$cited_path" 2>/dev/null; then
+            if ! git -C "$WT" cat-file -e "$HEAD_SHA:$cited_path" 2>/dev/null; then
                 CITED_BAD="$CITED_BAD $cited_path(missing)"
                 continue
             fi
@@ -2192,10 +2347,12 @@ No task was derived: $DERIVED_WHY.}"
 elif [ "${NOOP:-0}" -eq 1 ]; then
     NEXT="Nothing to review - the verifier already passed at base. Give this bot a task with real work in it."
 else
-    if [ -n "$PUSHED" ]; then
-        NEXT="Human reviews 'git -C $REPO log --patch $TASK_BASE..$TASK_BRANCH', then opens a PR. $WT is a throwaway clone and can go."
+    if [ -n "$PATCH_FILE" ]; then
+        NEXT="Human reads $PATCH_FILE, checks it still fits with 'git apply --check --directory=. $PATCH_FILE' from $REPO, and applies it. $REPO is a plain folder: the snapshot in $ORIGIN_REPO is the only history there is."
+    elif [ -n "$PUSHED" ]; then
+        NEXT="Human reviews 'git -C $ORIGIN_REPO log --patch $TASK_BASE..$TASK_BRANCH', then opens a PR. $WT is a throwaway clone and can go."
     else
-        NEXT="Human reviews $WT. Nothing was pushed back into $REPO, so the surface is the only copy."
+        NEXT="Human reviews $WT. Nothing was pushed back into $ORIGIN_REPO, so the surface is the only copy."
     fi
 fi
 
@@ -2227,8 +2384,9 @@ if [ "$TASK_KIND" = "review" ]; then
     ARTIFACT="    review:   ${REVIEW_FILE:-(none written)}${DERIVED_TASK:+
     task:     $DERIVED_TASK}"
 else
-    ARTIFACT="    branch:   $TASK_BRANCH${PUSHED:+ (pushed into $REPO)}${PUSH_FAILED:+ (ON THE SURFACE ONLY - the push failed)}
-    surface:  $WT"
+    ARTIFACT="    branch:   $TASK_BRANCH${PUSHED:+ (pushed into $ORIGIN_REPO)}${PUSH_FAILED:+ (ON THE SURFACE ONLY - the push failed)}
+    surface:  $WT${PATCH_FILE:+
+    patch:    $PATCH_FILE}"
 fi
 
 HANDOFF_TO="human"

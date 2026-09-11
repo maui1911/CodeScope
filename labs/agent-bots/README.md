@@ -309,7 +309,7 @@ detects that it happened.
 
 | | |
 |---|---|
-| Covered | the file contract; **two bots** (`fixer`, `reviewer`), two task kinds (`change`, `review`), the handoff between them and a scheduler that reads the board; contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the `.bot-review.md` output channel; verifier, in a clean checkout of the branch tip; evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup; rebase onto a base that moved, re-verified there |
+| Covered | plain-folder projects as well as git ones; the file contract; **two bots** (`fixer`, `reviewer`), two task kinds (`change`, `review`), the handoff between them and a scheduler that reads the board; contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the `.bot-review.md` output channel; verifier, in a clean checkout of the branch tip; evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup; rebase onto a base that moved, re-verified there |
 | **Not** covered | the approval inbox, per-bot memory, re-verifying a branch that is *waiting* rather than running, resume after a crash, any trigger other than "someone ran a tick", pushing, opening PRs, any GPUI surface |
 
 Two deliberate omissions:
@@ -466,6 +466,12 @@ from your working tree. While this branch is unmerged that means
 otherwise. It also means contract edits only reach the agent once they
 are committed.
 
+**Unless the project is a plain folder**, in which case `base:` is the
+literal word `folder`. There is no ref to cut from, so the runner
+snapshots the folder into a bare repository under state, grafts the
+contract in at `.bot-contract/`, and the work is cut from that. See
+F-29 — including what the snapshot deliberately leaves behind.
+
 ### Where things land
 
 | Path | What |
@@ -478,6 +484,8 @@ are committed.
 | `.state/REPO` | which repository this control plane belongs to |
 | `.state/runs/<day>/<id>-<ts>.log` | agent + verifier output |
 | `<repo>.worktrees/bot-<owner>-<id>/` | the work surface — a clone, with its own `.git` |
+| `.state/snapshot.git` | plain-folder projects only: the folder, committed, and the base the work is cut from |
+| `.state/patches/<ts>_<id>.patch` | plain-folder projects only: the result, as something a folder can apply |
 
 `.state/` is git-ignored, and a clean no-op run removes its own
 worktree and branch.
@@ -2134,3 +2142,77 @@ commits" was ever load-bearing except habit.
 The clone stands on its own regardless. It is what makes a plain folder
 possible at all, and it removes an isolation model that was only ever
 isolating the checkout.
+
+---
+
+### F-29 · A folder has no base, so the runner makes one
+
+*2026-09-11, the other half of F-28.*
+
+Once the work surface is its own repository, a project that is not a
+repository stops being a special case and becomes a *seeding* question:
+where do the files in the surface come from? For a git project, a
+`--shared` clone. For a plain folder, a snapshot.
+
+The snapshot is a bare repository under state with one branch,
+`refs/heads/folder`, and it is three things at once:
+
+- the **base** the work is cut from, which a folder does not otherwise
+  have,
+- the **tree** the scope check and the overlap check expand their globs
+  against, which they were always going to need,
+- and an **undo**, which is the part that matters most and was not the
+  goal. A folder with no version control has no restore point. Pointing
+  an autonomous agent at one and hoping would have been the reckless
+  part of this whole design; now the first thing that happens to a
+  folder is that it gets committed.
+
+Four decisions, each of which had an obvious wrong answer.
+
+**"The base moved" means "the folder changed", and the only way to ask
+is to snapshot it again.** That sounds expensive and is not: an
+unchanged folder produces the same tree, the runner notices and reuses
+the existing commit rather than making an identical one. So the check
+is a stat walk. Reusing the commit is also what lets two runs against an
+untouched folder share a base — without that, every run would invent its
+own base and the overlap check could never tell that two tasks were
+talking about the same tree. Once that is in place the entire
+rebase-on-collision path from F-25 works on folders unchanged, with all
+four outcomes; only the meaning of "the base" differs.
+
+**The exclude list lives in the snapshot repo, not in the folder.** A
+folder has no `.gitignore` discipline — that is most of what makes it a
+folder — so without a list the first snapshot of a node project is
+`node_modules` and the first of a rust one is `target/`. That list is
+this runner's opinion, and the user's folder is not this runner's to
+write to, so it goes in the snapshot's `info/exclude`. A `.gitignore`
+that *is* in the folder is honoured on top of it: the folder's own
+opinion about what is not source outranks a default written by a
+stranger.
+
+The second half of the list is not about size. `.env`, `*.pem`, `*.key`,
+`.netrc` — an agent that cannot read a file cannot leak it, and a
+directory that was never a repository has never had a reason to keep
+those out of itself. Making one into a repo without that list would take
+a project whose secrets were safe by being un-versioned and commit them
+into a store an agent then reads.
+
+**The contract travels with the snapshot.** The rule that an agent reads
+its charter from its own checkout does not get an exception for folders;
+it gets a path. The contract is grafted in at `.bot-contract/` rather
+than `labs/agent-bots/contract/`, because that second path means
+something in this repository and nothing at all in somebody's folder.
+
+**A folder gets a patch, not a branch.** The result is pushed into the
+snapshot repo, so nothing is lost, but a folder has nowhere to pull a
+branch *to*. The artifact a human can act on is a patch file, and the
+useful thing about it is `git apply --check`: it answers "does this
+still fit the folder as it stands now", which a branch in a repository
+the folder has never heard of cannot.
+
+What this does not do is merge. For a git project the loop ends at
+"here is a branch, verified against this base"; for a folder it ends at
+"here is a patch, verified against this snapshot". The second is
+strictly weaker, and honestly so — there is no history to merge into,
+and manufacturing one would be inventing a project structure the user
+did not ask for.
