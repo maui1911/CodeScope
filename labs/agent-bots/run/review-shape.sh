@@ -118,6 +118,21 @@ CITED="$(printf '%s\n' "$FINDINGS_BODY" \
 
 [ -n "$CITED" ] || fail "no findings and no 'No findings.' line - a review has to say which it is"
 
+# Every bullet, not only the ones that happened to parse. Checking the
+# extracted subset let a review pass with one good citation and a
+# second, malformed finding beside it - and the contract is that every
+# finding cites a real path:line, not that at least one does.
+BULLETS="$(printf '%s\n' "$FINDINGS_BODY" | grep -c '^-[[:space:]]' || true)"
+CITED_COUNT="$(printf '%s\n' "$CITED" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
+if [ "$BULLETS" != "$CITED_COUNT" ]; then
+    fail "$BULLETS finding(s), $CITED_COUNT with a usable path:line citation.
+Every finding has to name where it is. The offenders:
+$(printf '%s\n' "$FINDINGS_BODY" \
+    | grep '^-[[:space:]]' \
+    | grep -v '^-[[:space:]]\{1,\}[^[:space:]]\{1,\}:[0-9]\{1,\}' \
+    | sed 's/^/    /')"
+fi
+
 split_globs() {
     GLOBS_OUT=()
     local raw=() g

@@ -157,14 +157,22 @@ take_lock() {   # take_lock <dir> <what>
         # being judged. A fresh holder cannot appear without the
         # directory first going away, which is the property that closes
         # it: any change of identity shows up in the token.
+        # `-prune` rather than `-maxdepth 0`: same "this path only, do
+        # not descend", and it is POSIX where -maxdepth is an
+        # extension. Whether a given BSD find implements -maxdepth is a
+        # question this no longer has to have an opinion about.
         owner_before="$(cat "$dir/owner" 2>/dev/null || true)"
         if [ "${FIND_AGE_OK:-1}" -eq 1 ] \
-           && [ -n "$(find "$dir" -maxdepth 0 -mmin +10 2>/dev/null)" ] \
-           && [ -n "$owner_before" ] \
+           && [ -n "$(find "$dir" -prune -mmin +10 -print 2>/dev/null)" ] \
            && mkdir "$dir.break" 2>/dev/null; then
             owner_now="$(cat "$dir/owner" 2>/dev/null || true)"
+            # An old lock with no owner file at all is the run that was
+            # killed between `mkdir` and writing its token. Refusing to
+            # break those - which the first version did, by requiring a
+            # non-empty owner - meant the one crash the ten-minute
+            # recovery exists for was the one it could not recover.
             if [ "$owner_now" = "$owner_before" ]; then
-                say "  breaking a stale $what lock at $dir (owner $owner_before)"
+                say "  breaking a stale $what lock at $dir (owner ${owner_before:-none recorded})"
                 rm -rf "$dir"
             fi
             rmdir "$dir.break" 2>/dev/null || true
@@ -178,7 +186,7 @@ Another run is holding it, or it was left behind. Remove it by hand if
 no other run is in flight:
     rm -rf $dir$([ "${FIND_AGE_OK:-1}" -eq 1 ] || printf '%s' "
 
-This build of find rejects '-maxdepth 0 -mmin', so the stale-lock
+This build of find rejects '-prune -mmin', so the stale-lock
 takeover is disabled here and a lock left by a killed run will never be
 reclaimed on its own.")"
         sleep 0.2
@@ -239,7 +247,11 @@ WORKTREE_ROOT="${WORKTREE_ROOT:-${REPO}.worktrees}"
 abspath() {   # abspath <path> - works on a path that does not exist yet
     case "$1" in
         /*|[A-Za-z]:[\\/]*) printf '%s\n' "$1" ;;
-        *) printf '%s\n' "$(cd "$(dirname "$1")" 2>/dev/null && pwd || printf '%s' "$PWD")/$(basename "$1")" ;;
+        # Relative: anchor on $PWD and keep every component. Resolving
+        # through `cd "$(dirname ...)"` dropped them - for `foo/bar`
+        # whose parent does not exist yet the cd fails, the fallback
+        # appends only `bar`, and the worktree root silently moves.
+        *) printf '%s\n' "$PWD/$1" ;;
     esac
 }
 mkdir -p "$STATE"
@@ -250,32 +262,44 @@ WORKTREE_ROOT="$(abspath "$WORKTREE_ROOT")"
 # keyed by task id alone, so pointing the default state at a second repo
 # with --repo would have one run read, overwrite or block on the other's
 # T-0001. Stamp it once and refuse to answer for anyone else.
+#
+# The identity is the *common git directory*, not the worktree root.
+# Every linked worktree of one repository shares it, which is what makes
+# the advice below - point every checkout at one --state - something
+# this check permits rather than something it blocks. Using the
+# top-level path would have rejected exactly the arrangement it tells
+# you to use.
+REPO_IDENTITY="$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || printf '%s' "$REPO")"
 if [ -f "$STATE/REPO" ]; then
     STATE_REPO="$(cat "$STATE/REPO")"
-    [ "$STATE_REPO" = "$REPO" ] || die \
+    [ "$STATE_REPO" = "$REPO_IDENTITY" ] || die \
 "this control plane belongs to another repository.
 
-    state: $STATE
-    it is for:  $STATE_REPO
-    you asked:  $REPO
+    state:     $STATE
+    it is for: $STATE_REPO
+    you asked: $REPO_IDENTITY
 
 Task ids and locks are not namespaced by repo, so sharing one state
 directory between two would have them claim each other's tasks. Give
 this repo its own:
 
-    --state <a directory for $REPO>"
+    --state <a directory for $REPO>
+
+Linked worktrees of one repository are not two repositories, and do
+not trip this: they share a common git directory, which is what is
+compared here."
 else
-    printf '%s\n' "$REPO" > "$STATE/REPO"
+    printf '%s\n' "$REPO_IDENTITY" > "$STATE/REPO"
 fi
 
-# `-mmin` and `-maxdepth` are the whole basis of every age check here -
+# `find -prune -mmin` is the whole basis of every age check here -
 # the stale-lock break, and the scheduler's recurrence. Both are BSD
 # primitives as well as GNU ones, but "documented" and "present on the
 # machine in front of you" are different claims, and the failure mode if
 # they are absent is silence: the expression errors, the test reads
 # false, and stale locks are simply never reclaimed. Ask once, out loud.
 FIND_AGE_OK=1
-find "$STATE" -maxdepth 0 -mmin +1 >/dev/null 2>&1 || FIND_AGE_OK=0
+find "$STATE" -prune -mmin +1 -print >/dev/null 2>&1 || FIND_AGE_OK=0
 
 # The control plane is keyed to this checkout, and the conflicts it
 # exists to prevent are keyed to the repository. For a single checkout
@@ -517,6 +541,19 @@ That marks an unverified stub, not a default. Fill in the invocation
 against the real CLI and set 'verified' before dispatching with it -
 a guessed flag fails inside the agent run, after a worktree has
 already been spent on it."
+fi
+
+# `verified:` was printed in the plan and checked by nobody, while the
+# error above tells profile authors to set it before dispatching. A
+# field that documents a safety boundary and gates nothing is the
+# boundary not existing. Same shape as F-18.
+if [ "$AGENT_OVERRIDDEN" -eq 0 ] \
+   && { [ -z "$AGENT_VERIFIED" ] || [ "$AGENT_VERIFIED" = "never" ]; }; then
+    die "profile '$AGENT_ID' is marked verified: ${AGENT_VERIFIED:-(absent)}.
+
+The invocation in a profile is a claim about a CLI's real flags, and an
+unverified one fails inside the agent run - after a worktree has been
+spent on it. Run it by hand once, then record the date you did."
 fi
 
 if [ -n "$TASK_MODEL" ] && [ -z "$AGENT_MODEL_FLAG" ]; then
@@ -1001,6 +1038,25 @@ say "  created $WT"
 
 # Only now, with a worktree that actually exists, does the live task
 # come into being. A dispatch that fails must not leave one behind.
+# From here to `board "dispatched"` the worktree exists and the control
+# plane does not know about it yet. A failure in between - a full disk,
+# a permission - would leave a branch and a worktree that no live task
+# claims, and the next attempt would stop at the existing-path guard
+# needing hands. Undo the half-dispatch instead.
+rollback_dispatch() {
+    local rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    say ""
+    say "dispatch failed after the worktree was created - rolling it back"
+    rm -f "$LIVE_TASK" "$LIVE_TASK.tmp"
+    git -C "$REPO" worktree remove --force "$WT" >/dev/null 2>&1 || true
+    git -C "$REPO" branch -D "$TASK_BRANCH" >/dev/null 2>&1 || true
+    board "dispatch-failed" "rolled back"
+    release_locks
+    exit "$rc"
+}
+trap rollback_dispatch EXIT
+
 if [ "$RESET_PENDING" -eq 1 ]; then
     rm -f "$LIVE_TASK"
     say "  reset: discarded the previous live task"
@@ -1030,6 +1086,10 @@ board "dispatched" "$TASK_BRANCH @ ${BASE_SHA:0:12}"
 # its job. Holding it through the agent run would serialise the bots
 # themselves, which is the opposite of the point.
 drop_lock "$STATE/dispatch.lock"
+
+# Past the half-dispatch window: from here a failure leaves a worktree
+# a human is meant to look at, which is the whole point of `blocked`.
+trap release_locks EXIT
 
 # --------------------------------------------------------------------
 # Agent
@@ -1363,6 +1423,15 @@ elif [ "$COMMITS" -gt 1 ]; then
     # decides whether to squash.
     STATUS="needs-review"
     BLOCKERS="$COMMITS commits, charter asks for exactly one"
+elif [ "$TASK_KIND" = "review" ] && [ "$REVIEW_VERDICT" = "blocked" ]; then
+    # The reviewer's own escalation. REVIEW.md defines `blocked` as a
+    # review that could not be completed, and a run that reports one as
+    # `done` buries it: the task goes terminal, the scheduler never
+    # comes back to it, and the only record of the refusal is inside a
+    # file nobody was told to open.
+    STATUS="blocked"
+    BLOCKERS="the reviewer could not complete this review. Its reasons are
+under 'What I could not check' in $REVIEW_FILE"
 elif [ "$COMMITS" -eq 0 ]; then
     STATUS="done"
     NOOP=1
@@ -1633,11 +1702,35 @@ board "handoff" "$STATUS"
 if [ "$STATUS" = "done" ] && [ "$COMMITS" -eq 0 ] && [ "$DIRTY" -eq 0 ] && [ "$KEEP" -eq 0 ]; then
     step "Cleanup"
     say "  no-op run, removing worktree"
+    CLEAN_FAILED=""
     git -C "$REPO" worktree remove "$WT" >>"$RUN_LOG" 2>&1 \
         || git -C "$REPO" worktree remove --force "$WT" >>"$RUN_LOG" 2>&1 \
-        || say "  could not remove $WT - remove it by hand"
-    git -C "$REPO" branch -D "$TASK_BRANCH" >>"$RUN_LOG" 2>&1 || true
-    board "cleaned"
+        || CLEAN_FAILED="worktree $WT"
+    if [ -z "$CLEAN_FAILED" ]; then
+        git -C "$REPO" branch -D "$TASK_BRANCH" >>"$RUN_LOG" 2>&1 \
+            || CLEAN_FAILED="branch $TASK_BRANCH"
+    fi
+
+    if [ -n "$CLEAN_FAILED" ]; then
+        # The handoff has already been written saying `done`, and it was
+        # true of the work. It is not true of the tree: the next run for
+        # this task will stop at the existing-path guard. Recording
+        # `cleaned` and walking away would leave a live task claiming a
+        # clean no-op while its worktree is still sitting there.
+        say "  could not remove $CLEAN_FAILED"
+        board "clean-failed" "$CLEAN_FAILED"
+        STATUS="needs-review"
+        set_status "$STATUS"
+        {
+            printf '\n# Cleanup failed\n\n'
+            printf 'The run itself was a clean no-op, but %s could not be\n' "$CLEAN_FAILED"
+            printf 'removed. Remove it before re-running this task:\n\n'
+            printf '    git -C %s worktree remove --force %s\n' "$REPO" "$WT"
+            printf '    git -C %s branch -D %s\n' "$REPO" "$TASK_BRANCH"
+        } >> "$HANDOFF"
+    else
+        board "cleaned"
+    fi
 fi
 
 step "Result: $STATUS"

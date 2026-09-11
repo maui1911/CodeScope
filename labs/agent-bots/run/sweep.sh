@@ -29,8 +29,40 @@ WT_ROOT="${REPO}.worktrees"
 
 FAILURES=0
 
-cleanup() {   # cleanup <branch>
+# Every branch this sweep is allowed to destroy. It force-deletes, so
+# the list has to be exhaustive *and* checked before anything runs: a
+# developer with real work on bot/fixer/T-0001 would otherwise lose it
+# to a regression suite.
+SWEEP_BRANCHES="
+bot/fixer/T-0001
+bot/fixer/T-0003
+bot/fixer/T-0006-fix
+bot/fixer/T-990A
+bot/fixer/T-990B
+bot/reviewer/T-0005
+bot/reviewer/T-0006
+"
+
+PRE_EXISTING=""
+for b in $SWEEP_BRANCHES; do
+    if git -C "$REPO" rev-parse --verify --quiet "refs/heads/$b" >/dev/null 2>&1; then
+        PRE_EXISTING="$PRE_EXISTING  $b"$'\n'
+    fi
+done
+if [ -n "$PRE_EXISTING" ]; then
+    printf 'sweep: refusing to run - these branches already exist and this\n'
+    printf 'script force-deletes every one of them:\n\n%s\n' "$PRE_EXISTING"
+    printf 'They are left over from an earlier run, or they are yours. Either\n'
+    printf 'way the sweep is not the thing that should decide.\n'
+    exit 1
+fi
+
+cleanup() {   # cleanup <branch> - only ever a branch from SWEEP_BRANCHES
     local leaf
+    case " $(printf '%s' "$SWEEP_BRANCHES" | tr '\n' ' ') " in
+        *" $1 "*) ;;
+        *) printf 'sweep: refusing to clean up unowned branch %s\n' "$1"; return 0 ;;
+    esac
     leaf="$(printf '%s' "$1" | tr '/' '-')"
     git -C "$REPO" worktree remove --force "$WT_ROOT/$leaf" >/dev/null 2>&1
     git -C "$REPO" worktree remove --force "$WT_ROOT/$leaf-verify" >/dev/null 2>&1
@@ -82,6 +114,9 @@ cleanup bot/fixer/T-0003
 
 run "fabulist.sh"            1 "$EX/T-0005-review-overlap-check.md" fabulist.sh
 cleanup bot/reviewer/T-0005
+
+run "stumped.sh"             1 "$EX/T-0006-review-telemetry.md" stumped.sh
+cleanup bot/reviewer/T-0006
 
 rm -f "$STATE/tasks/T-0006-fix.md" "$STATE/proposed/T-0006-fix.md" 2>/dev/null
 run "critic.sh"              0 "$EX/T-0006-review-telemetry.md" critic.sh

@@ -174,8 +174,8 @@ handoff_within() {   # handoff_within <id> <minutes>
 # If this build of find rejects the age test, every recurrence check
 # silently reads "not run recently" and every routine fires on every
 # tick. Ask once and say so, rather than scheduling on a false answer.
-if ! find "$STATE" -maxdepth 0 -mmin +1 >/dev/null 2>&1; then
-    die "this build of find rejects '-maxdepth 0 -mmin', which every
+if ! find "$STATE" -prune -mmin +1 -print >/dev/null 2>&1; then
+    die "this build of find rejects '-prune -mmin', which every
 'every:' schedule here depends on. Without it a routine would run on
 every tick instead of on its interval."
 fi
@@ -251,6 +251,15 @@ decide_and_run() {
                     decision="stale"
                     why="says dispatched, no worktree - needs --reset by hand"
                 fi
+            elif [ -n "$worktree" ] && [ -d "$worktree" ]; then
+                # A blocked run keeps its worktree on purpose - it is
+                # the evidence a human is meant to look at. Marking the
+                # task due anyway would have the next tick pass --reset,
+                # hit the runner's existing-path guard, and fail; the
+                # routine would spend every interval re-failing instead
+                # of waiting for the cleanup it is asking for.
+                decision="held"
+                why="$status, worktree kept at $worktree"
             elif [ -n "$every" ]; then
                 # A recurrence is decided by the clock, not by the live
                 # task. Asking the status first got this wrong: clearing

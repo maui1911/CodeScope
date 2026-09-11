@@ -15,6 +15,7 @@ regression tests for F-4 and F-8.
 | `sloppy.sh` | an agent that does the job correctly and leaves an unlinked `TODO` behind | `blocked`, the offending added line quoted |
 | `meddler.sh` | not an agent — a **verifier** that passes while committing into the worktree it was judging | `blocked`, "verifier changed the tree it was measuring" |
 | `fabulist.sh` | a reviewer that writes a confident, well-formed review citing a file this repo has never had | `blocked`, the invented path quoted |
+| `stumped.sh` | a reviewer that completes the paperwork and reports `verdict: blocked` — its own escalation | `blocked`, pointing at the review's blind-spots section |
 | `critic.sh` | a reviewer whose findings are well-formed and real: the positive case for the bot-to-bot handoff | `done`, a task derived for the next bot and the handoff addressed to it |
 | `refusenik.sh` | an agent that answers with an **empty commit** carrying its reasoning | `needs-review`, the commit subject quoted |
 

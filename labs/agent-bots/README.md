@@ -1681,3 +1681,61 @@ is no daemon, no trigger on a git event, no queue that survives the
 process. A tick is a thing you run, `--watch` is a `sleep` in a loop,
 and the only reason that is enough is that the entire state is on disk
 and the next tick re-reads it from nothing.
+
+---
+
+### F-24 · By the fifth review, nothing new in kind
+
+*2026-09-11, the last round before this merged.*
+
+Eleven more findings, all real, all fixed — and not one of them a new
+*kind* of mistake. Every one is a shape already written down here,
+appearing somewhere it had not been looked for yet. That is worth
+recording, because it is the first sign this list has converged.
+
+**F-4's shape — an escalation reported as success.** A review with
+`verdict: blocked` makes no commit, so it fell through to the generic
+zero-commit branch and came back `done`. The task went terminal, the
+scheduler never returned to it, and the only record of the refusal sat
+inside a file nobody had been told to open. F-4 was a crashed agent
+reported as a clean no-op; this is a reviewer saying *I could not do
+this* and being thanked for it. `run/stubs/stumped.sh` is the
+regression.
+
+**F-18's shape — a promise nothing checks.** `verified:` was printed in
+the plan, described in the profile as the safety boundary, named in an
+error message telling authors to set it before dispatching, and gated
+nothing at all. A field that documents a boundary and enforces none is
+the boundary not existing.
+
+**F-17's shape — a guard that stops at the first happy path.** The
+stale-lock takeover refused to break a lock with no `owner` file, which
+is precisely the lock left by a run killed between `mkdir` and writing
+its token: the one crash the ten-minute recovery exists for was the one
+it could not recover. Similarly, cleanup failure at the end of a no-op
+run printed a warning and still recorded `cleaned` — so a live task
+claimed a clean tree while its worktree sat there waiting to block the
+next run.
+
+Two are worth naming on their own.
+
+**The advice contradicted the check.** The linked-worktree guard tells
+you to point every checkout at one `--state`; the ownership stamp then
+compared `git rev-parse --show-toplevel`, which differs per checkout,
+so the second one would reject the shared state as another repo's. The
+documented safe path was the one path the code refused. It compares the
+common git directory now — the thing that is actually per-repository.
+
+**The regression suite was a hazard.** `sweep.sh` force-deletes seven
+fixed branch names. A developer with real work on `bot/fixer/T-0001`
+would have lost it to running the tests. It now enumerates exactly what
+it may destroy, refuses to start if any of those already exist, and
+will not clean up a branch outside that list. A test harness that can
+eat your work is worse than no harness, and "it only deletes bot
+branches" is an assumption about somebody else's naming.
+
+What this round did not find: a new category. After twenty-three
+findings the failure modes here are a short list — *self-reported
+evidence, a check that runs before the thing it guards, a criterion
+nobody evaluates, a log asked what is true* — and the remaining work is
+recognising them in one more place, not discovering another one.
