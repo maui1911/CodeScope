@@ -120,7 +120,7 @@ pub fn rank(rows: &[impl AsRef<str>], needle: &str) -> Vec<usize> {
         .collect();
     // Stable sort by descending score so ties preserve original order
     // (matches the C# `OrderByDescending` which is also stable).
-    scored.sort_by(|a, b| b.score.cmp(&a.score));
+    scored.sort_by_key(|s| std::cmp::Reverse(s.score));
     scored.into_iter().map(|s| s.index).collect()
 }
 

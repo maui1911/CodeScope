@@ -61,6 +61,8 @@ impl AgentId {
     /// because `opencode` clashes with a reserved name. The alias list
     /// is intentionally small and explicit; unknown binaries still
     /// resolve to `None`.
+    // Not `FromStr`: an unknown id is an ordinary `None`, not an `Err`, and callers rely on it.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         if s.eq_ignore_ascii_case("claude") {
             Some(AgentId::Claude)
