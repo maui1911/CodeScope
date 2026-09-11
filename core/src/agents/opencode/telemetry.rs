@@ -681,6 +681,8 @@ mod tests {
         )
     }
 
+    // Test fixture: one argument per JSON field it emits; a params struct would only add noise.
+    #[allow(clippy::too_many_arguments)]
     fn assistant_msg_json(
         session: &str,
         created_ms: i64,

@@ -248,9 +248,11 @@ mod tests {
     fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
-        let mut settings = Settings::default();
-        settings.theme = "tokyo-night".into();
-        settings.scrollback = 50_000;
+        let settings = Settings {
+            theme: "tokyo-night".into(),
+            scrollback: 50_000,
+            ..Default::default()
+        };
         settings.save_to(&path).unwrap();
 
         let loaded = Settings::load_from(&path).unwrap();
@@ -283,8 +285,7 @@ mod tests {
     fn default_agent_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
-        let mut settings = Settings::default();
-        settings.default_agent = "codex".into();
+        let settings = Settings { default_agent: "codex".into(), ..Default::default() };
         settings.save_to(&path).unwrap();
 
         let loaded = Settings::load_from(&path).unwrap();
@@ -293,8 +294,7 @@ mod tests {
 
     #[test]
     fn default_agent_serialises_as_camel_case() {
-        let mut settings = Settings::default();
-        settings.default_agent = "codex".into();
+        let settings = Settings { default_agent: "codex".into(), ..Default::default() };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(
             json.contains("\"defaultAgent\""),
@@ -335,15 +335,19 @@ mod tests {
     fn full_dialog_surface_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
-        let mut settings = Settings::default();
-        settings.theme = "tokyo-night".into();
-        settings.font.family = "JetBrains Mono".into();
-        settings.font.size = 15.0;
-        settings.font.line_height_multiplier = 1.2;
-        settings.scrollback = 25_000;
-        settings.cursor.shape = CursorShape::Underline;
-        settings.cursor.blinking = false;
-        settings.default_agent = "codex".into();
+        let settings = Settings {
+            theme: "tokyo-night".into(),
+            font: FontSettings {
+                family: "JetBrains Mono".into(),
+                size: 15.0,
+                line_height_multiplier: 1.2,
+                ..Default::default()
+            },
+            scrollback: 25_000,
+            cursor: CursorSettings { shape: CursorShape::Underline, blinking: false },
+            default_agent: "codex".into(),
+            ..Default::default()
+        };
         settings.save_to(&path).unwrap();
 
         let loaded = Settings::load_from(&path).unwrap();

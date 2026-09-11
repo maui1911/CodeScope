@@ -544,19 +544,21 @@ mod tests {
 
     #[test]
     fn from_settings_uses_overrides_when_provided() {
-        let mut settings = Settings::default();
-        settings.agents = vec![AgentProfile {
-            id: "custom".into(),
-            display_name: "Custom".into(),
-            command: "custom-cli".into(),
-            resume_args: vec![],
-            new_session_args: vec![],
-            session_id_flag: None,
-            resume_by_id_args: vec![],
-            is_default: true,
-            icon: None,
-            context_window_tokens: 0,
-        }];
+        let settings = Settings {
+            agents: vec![AgentProfile {
+                id: "custom".into(),
+                display_name: "Custom".into(),
+                command: "custom-cli".into(),
+                resume_args: vec![],
+                new_session_args: vec![],
+                session_id_flag: None,
+                resume_by_id_args: vec![],
+                is_default: true,
+                icon: None,
+                context_window_tokens: 0,
+            }],
+            ..Default::default()
+        };
         let reg = AgentRegistry::from_settings(&settings);
         assert_eq!(reg.get_all().len(), 1);
         assert_eq!(reg.get_default().unwrap().id, "custom");
@@ -568,8 +570,7 @@ mod tests {
         // on the codex profile and demote every other built-in
         // (Claude included) so `get_default()` returns Codex without
         // the caller having to hand-edit per-profile flags.
-        let mut settings = Settings::default();
-        settings.default_agent = "codex".into();
+        let settings = Settings { default_agent: "codex".into(), ..Default::default() };
         let reg = AgentRegistry::from_settings(&settings);
         let def = reg.get_default().expect("default present");
         assert_eq!(def.id, "codex");
@@ -584,8 +585,7 @@ mod tests {
         // Hand-edited `settings.json` with `"defaultAgent": "Codex"`
         // (mixed case) still resolves — matches the lookup behaviour
         // of `get_by_id`.
-        let mut settings = Settings::default();
-        settings.default_agent = "CODEX".into();
+        let settings = Settings { default_agent: "CODEX".into(), ..Default::default() };
         let reg = AgentRegistry::from_settings(&settings);
         assert_eq!(reg.get_default().unwrap().id, "codex");
     }
@@ -595,8 +595,7 @@ mod tests {
         // Typos must not silently wipe the baked-in default — the
         // user should still get Claude back when they fat-finger an
         // unknown id.
-        let mut settings = Settings::default();
-        settings.default_agent = "bard".into();
+        let settings = Settings { default_agent: "bard".into(), ..Default::default() };
         let reg = AgentRegistry::from_settings(&settings);
         assert_eq!(reg.get_default().unwrap().id, "claude");
     }
@@ -605,8 +604,7 @@ mod tests {
     fn from_settings_default_agent_gemini_promotes_the_new_built_in() {
         // `"defaultAgent": "gemini"` must promote the Rust-port-only
         // built-in and demote Claude, same as any C#-era agent id.
-        let mut settings = Settings::default();
-        settings.default_agent = "gemini".into();
+        let settings = Settings { default_agent: "gemini".into(), ..Default::default() };
         let reg = AgentRegistry::from_settings(&settings);
         let def = reg.get_default().expect("default present");
         assert_eq!(def.id, "gemini");
