@@ -105,41 +105,75 @@ usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//;$d';
 #     than proceeding unlocked.
 # --------------------------------------------------------------------
 
+# Identifies this run inside a lock. A bare PID is not enough - they
+# are reused - so the clock and $RANDOM go in as well.
+RUN_TOKEN="$$-$(date -u +%s)-${RANDOM}"
+
 LOCKS_HELD=()
+
+# Only ever remove a lock this run still owns. Without the token check
+# a run whose lock was broken out from under it deletes the *next*
+# holder's lock on the way out, leaving that one inside the critical
+# section with the door open behind it.
+_release_one() {
+    local dir="$1"
+    if [ "$(cat "$dir/owner" 2>/dev/null || true)" = "$RUN_TOKEN" ]; then
+        rm -f "$dir/owner"
+        rmdir "$dir" 2>/dev/null || true
+    fi
+}
 
 release_locks() {
     local d
-    [ "${#LOCKS_HELD[@]}" -gt 0 ] || return 0
-    for d in "${LOCKS_HELD[@]}"; do rmdir "$d" 2>/dev/null || true; done
+    for d in ${LOCKS_HELD[@]+"${LOCKS_HELD[@]}"}; do _release_one "$d"; done
     LOCKS_HELD=()
 }
 trap release_locks EXIT
 
 take_lock() {   # take_lock <dir> <what>
-    local dir="$1" what="$2" waited=0
+    local dir="$1" what="$2" waited=0 owner_before owner_now
     while ! mkdir "$dir" 2>/dev/null; do
-        if [ -n "$(find "$dir" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then
-            say "  breaking a stale $what lock at $dir"
-            rmdir "$dir" 2>/dev/null || true
-            continue
+        # Breaking a stale lock is itself a race, and the first version
+        # lost it: two runs both judged the same directory stale, both
+        # removed it, and both walked in. Two things make it safe. The
+        # break is serialised by a second mkdir, so only one process
+        # breaks; and the owner token is re-read *after* winning that,
+        # so a lock that was recreated in the meantime is not the one
+        # being judged. A fresh holder cannot appear without the
+        # directory first going away, which is the property that closes
+        # it: any change of identity shows up in the token.
+        owner_before="$(cat "$dir/owner" 2>/dev/null || true)"
+        if [ -n "$(find "$dir" -maxdepth 0 -mmin +10 2>/dev/null)" ] \
+           && [ -n "$owner_before" ] \
+           && mkdir "$dir.break" 2>/dev/null; then
+            owner_now="$(cat "$dir/owner" 2>/dev/null || true)"
+            if [ "$owner_now" = "$owner_before" ]; then
+                say "  breaking a stale $what lock at $dir (owner $owner_before)"
+                rm -rf "$dir"
+            fi
+            rmdir "$dir.break" 2>/dev/null || true
         fi
+        # Unconditionally, including after a break attempt: the first
+        # version skipped both on the stale path, so a lock it could not
+        # remove spun forever at full speed.
         waited=$((waited + 1))
         [ "$waited" -le 300 ] || die "timed out waiting for the $what lock at $dir
 Another run is holding it, or it was left behind. Remove it by hand if
 no other run is in flight:
-    rmdir $dir"
+    rm -rf $dir"
         sleep 0.2
     done
+    printf '%s\n' "$RUN_TOKEN" > "$dir/owner"
     LOCKS_HELD+=("$dir")
 }
 
 drop_lock() {   # drop_lock <dir>
     local dir="$1" d kept=()
-    rmdir "$dir" 2>/dev/null || true
-    if [ "${#LOCKS_HELD[@]}" -gt 0 ]; then
-        for d in "${LOCKS_HELD[@]}"; do [ "$d" = "$dir" ] || kept+=("$d"); done
-    fi
-    LOCKS_HELD=("${kept[@]}")
+    _release_one "$dir"
+    for d in ${LOCKS_HELD[@]+"${LOCKS_HELD[@]}"}; do
+        [ "$d" = "$dir" ] || kept+=("$d")
+    done
+    LOCKS_HELD=(${kept[@]+"${kept[@]}"})
 }
 
 while [ $# -gt 0 ]; do
@@ -228,6 +262,18 @@ TASK_BRANCH="$(field branch)"
 TASK_TOUCHES="$(field touches)"
 TASK_VERIFY="$(field verify)"
 
+# Two kinds of task, because a reviewer breaks half the acceptance
+# rules a change task lives by: it must produce no commit, and its
+# output is a file the runner harvests rather than a diff. Everything
+# else - worktree, evidence, verifier, handoff - is identical, which is
+# the claim this second kind exists to test. See F-19.
+TASK_KIND="$(field kind)"
+TASK_KIND="${TASK_KIND:-change}"
+case "$TASK_KIND" in
+    change|review) ;;
+    *) die "kind '$TASK_KIND' is not one of: change, review" ;;
+esac
+
 for f in id owner base branch touches verify; do
     var="TASK_$(printf '%s' "$f" | tr '[:lower:]' '[:upper:]')"
     [ -n "${!var}" ] || die "task is missing required field: $f"
@@ -288,6 +334,12 @@ for rel in "bots/$TASK_OWNER/BOT.md" \
            "context/GLOSSARY.md"; do
     base_has "$rel" || missing_at_base "$rel"
 done
+
+# A review task is pointed at the template as well, so it is part of
+# that task's contract and gets the same treatment.
+if [ "$TASK_KIND" = "review" ]; then
+    base_has "templates/REVIEW.md" || missing_at_base "templates/REVIEW.md"
+fi
 
 TASK_AGENT="$(field agent)"
 TASK_MODEL="$(field model)"
@@ -410,7 +462,7 @@ split_globs() {
     local raw=() g
     GLOBS_OUT=()
     IFS=',' read -ra raw <<< "$1"
-    for g in "${raw[@]}"; do
+    for g in ${raw[@]+"${raw[@]}"}; do
         g="${g#"${g%%[![:space:]]*}"}"
         g="${g%"${g##*[![:space:]]}"}"
         [ -n "$g" ] && GLOBS_OUT+=("$g")
@@ -424,10 +476,10 @@ expand_globs() {
     local file g
     local -a globs
     split_globs "$1"
-    globs=("${GLOBS_OUT[@]}")
+    globs=(${GLOBS_OUT[@]+"${GLOBS_OUT[@]}"})
     [ "${#globs[@]}" -gt 0 ] || return 0
     while IFS= read -r file; do
-        for g in "${globs[@]}"; do
+        for g in ${globs[@]+"${globs[@]}"}; do
             # shellcheck disable=SC2254  # a glob, on purpose
             case "$file" in $g) printf '%s\n' "$file"; break ;; esac
         done
@@ -436,7 +488,7 @@ expand_globs() {
 
 MY_FILES="$(expand_globs "$TASK_TOUCHES" | sort -u)"
 split_globs "$TASK_TOUCHES"
-MY_GLOBS=("${GLOBS_OUT[@]}")
+MY_GLOBS=(${GLOBS_OUT[@]+"${GLOBS_OUT[@]}"})
 
 OVERLAP_REPORT=""
 OVERLAP_IDS=""
@@ -457,9 +509,16 @@ if [ -d "$STATE/tasks" ]; then
         [ -n "$other_id" ] || continue
         [ "$other_id" != "$TASK_ID" ] || continue
         [ "$(field status "$live")" = "dispatched" ] || continue
+        # A reviewer claims nothing: it cannot conflict at merge, which
+        # is the only reason this check exists.
+        [ "$(field kind "$live")" != "review" ] || continue
 
         other_branch="$(field branch "$live")"
-        other_wt="$WORKTREE_ROOT/$(printf '%s' "$other_branch" | tr '/' '-')"
+        # The path that run recorded for itself, not one recomputed from
+        # this run's --worktree-root. The fallback covers a live task
+        # written before that field existed.
+        other_wt="$(field worktree "$live")"
+        other_wt="${other_wt:-$WORKTREE_ROOT/$(printf '%s' "$other_branch" | tr '/' '-')}"
         if [ ! -d "$other_wt" ]; then
             # Status says in flight; the filesystem says the run is
             # over. A dispatch that died is not holding anything, and
@@ -483,8 +542,8 @@ if [ -d "$STATE/tasks" ]; then
         # declare `core/src/new_thing.rs` collide just as hard over a
         # file neither has created yet.
         split_globs "$other_touches"
-        for g in "${GLOBS_OUT[@]}"; do
-            for mine in "${MY_GLOBS[@]}"; do
+        for g in ${GLOBS_OUT[@]+"${GLOBS_OUT[@]}"}; do
+            for mine in ${MY_GLOBS[@]+"${MY_GLOBS[@]}"}; do
                 if [ "$g" = "$mine" ]; then
                     shared="$shared"$'\n'"$g  (declared by both, absent at base)"
                 fi
@@ -504,7 +563,9 @@ fi
 scan_overlaps
 
 if [ -n "$OVERLAP_IDS" ]; then
-    if [ "$ALLOW_OVERLAP" -eq 1 ]; then
+    if [ "$TASK_KIND" = "review" ]; then
+        OVERLAP_SUMMARY="${OVERLAP_IDS# } - a review writes nothing, so it proceeds"
+    elif [ "$ALLOW_OVERLAP" -eq 1 ]; then
         OVERLAP_SUMMARY="${OVERLAP_IDS# } - allowed by --allow-overlap"
     else
         OVERLAP_SUMMARY="${OVERLAP_IDS# } - dispatch will be refused"
@@ -535,15 +596,34 @@ Your task, verbatim:
 $(cat "$TASK")
 ---
 
+$(if [ "$TASK_KIND" = "review" ]; then cat <<REVIEW_RULES
+Rules for this run:
+  - You are reviewing, not changing. Commit NOTHING.
+  - Read only. The files under review are: $TASK_TOUCHES
+  - Write exactly one file: '.bot-review.md' in the worktree root,
+    in the shape of $CONTRACT_DIR/templates/REVIEW.md.
+  - Its 'reviewed:' field must be $BASE_SHA - the commit you are on.
+  - Every finding must cite a real path:line inside $TASK_TOUCHES
+    that exists at that commit. A made-up path fails the run.
+  - 'No findings.' is a complete review. Do not pad.
+  - Leave nothing else behind: no scratch files, no notes, no commit.
+  - Do NOT push, do NOT open a PR, do NOT edit anything under
+    $CONTRACT_DIR/.
+  - Do NOT write a handoff. The runner does that.
+REVIEW_RULES
+else cat <<CHANGE_RULES
 Rules for this run:
   - You are already on branch '$TASK_BRANCH'. Do not switch branches.
   - Edit only files matching: $TASK_TOUCHES
   - The verifier is: $TASK_VERIFY
     It must exit 0. Run it before you edit anything, and again after.
   - Commit your work to this branch. Exactly one commit, message in English.
+  - No new TODO or FIXME without a linked issue number.
   - Do NOT push, do NOT open a PR, do NOT run cargo fmt.
   - Do NOT edit anything under $CONTRACT_DIR/.
   - Do NOT write a handoff or a report file. The runner does that.
+CHANGE_RULES
+fi)
 
 If you cannot complete the task inside those limits, write one line
 saying why to the file '.bot-blocked' in the worktree root, make no
@@ -589,6 +669,7 @@ AGENT_INVOCATION="$AGENT_CMD ${AGENT_ARGV_DISPLAY[*]}"
 step "Plan"
 cat <<PLAN
   task      $TASK_ID  $TASK_TITLE
+  kind      $TASK_KIND
   owner     $TASK_OWNER
   repo      $REPO
   base      $TASK_BASE @ ${BASE_SHA:0:12}
@@ -682,12 +763,19 @@ board() {
 # and understands the `0,/re/` address; BSD sed - macOS, which this
 # project ships - does neither, and would fail here *after* the handoff
 # was written, leaving the live task stuck on `dispatched` forever.
-set_status() {
-    awk -v s="$1" '
-        !done && index($0, "status:") == 1 { print "status: " s; done = 1; next }
+set_field() {   # set_field <key> <value> - replace, or insert before the closing fence
+    awk -v k="$1" -v v="$2" '
+        /^---[[:space:]]*$/ {
+            fence++
+            if (fence == 2 && !done) { print k ": " v; done = 1 }
+            print; next
+        }
+        fence == 1 && !done && index($0, k ":") == 1 { print k ": " v; done = 1; next }
         { print }
     ' "$LIVE_TASK" > "$LIVE_TASK.tmp" && mv "$LIVE_TASK.tmp" "$LIVE_TASK"
 }
+
+set_status() { set_field status "$1"; }
 
 # --------------------------------------------------------------------
 # Claim
@@ -719,7 +807,13 @@ fi
 scan_overlaps
 
 if [ -n "$OVERLAP_IDS" ]; then
-    if [ "$ALLOW_OVERLAP" -eq 1 ]; then
+    if [ "$TASK_KIND" = "review" ]; then
+        # Not a refusal, and not nothing either: the review is about the
+        # base commit, and someone is editing those files right now, so
+        # it will be describing a tree that has already moved.
+        board "review-of-moving-target" "${OVERLAP_IDS# }"
+        say "  note: ${OVERLAP_IDS# } is editing files under review - this review describes ${BASE_SHA:0:12}, not their branches"
+    elif [ "$ALLOW_OVERLAP" -eq 1 ]; then
         board "overlap-allowed" "${OVERLAP_IDS# }"
     else
         board "dispatch-refused" "overlaps ${OVERLAP_IDS# }"
@@ -765,6 +859,12 @@ if [ "$RESET_PENDING" -eq 1 ]; then
     say "  reset: discarded the previous live task"
 fi
 cp "$TASK" "$LIVE_TASK"
+# Where this run's worktree actually is, rather than where a later run
+# would guess it is. The overlap scan tests that path to decide whether
+# a dispatch is still alive, and it used to recompute it from its *own*
+# --worktree-root - so a run started with a different root read a live
+# claim as a ghost and dispatched straight over it.
+set_field worktree "$WT"
 set_status dispatched
 board "dispatched" "$TASK_BRANCH @ ${BASE_SHA:0:12}"
 
@@ -809,7 +909,7 @@ step "Evidence"
 INSTR_STATUS=""
 if [ -n "$AGENT_INSTRUCTION_FILES" ]; then
     IFS=',' read -ra instr_list <<< "$AGENT_INSTRUCTION_FILES"
-    for f in "${instr_list[@]}"; do
+    for f in ${instr_list[@]+"${instr_list[@]}"}; do
         f="$(printf '%s' "$f" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
         [ -n "$f" ] || continue
         if [ -f "$WT/$f" ]; then
@@ -835,6 +935,23 @@ if [ -f "$WT/.bot-blocked" ]; then
     rm -f "$WT/.bot-blocked"
     [ -n "$AGENT_BLOCKED" ] || AGENT_BLOCKED="(agent wrote .bot-blocked but left it empty)"
     say "  agent reported blocked"
+fi
+
+# The reviewer's output channel, harvested the same way and for the
+# same reason: it is the artifact, so it belongs in the control plane,
+# and it must be out of the worktree before the evidence is read or it
+# would count as an uncommitted file the bot left behind.
+REVIEW_FILE=""
+REVIEW_VERDICT=""
+if [ -f "$WT/.bot-review.md" ]; then
+    mkdir -p "$STATE/reviews"
+    REVIEW_FILE="$STATE/reviews/${TS}_${TASK_OWNER}_${TASK_ID}.md"
+    mv "$WT/.bot-review.md" "$REVIEW_FILE"
+    REVIEW_VERDICT="$(field verdict "$REVIEW_FILE")"
+    say "  review    $REVIEW_FILE (${REVIEW_VERDICT:-no verdict})"
+    board "review-written" "${REVIEW_VERDICT:-no verdict}"
+elif [ "$TASK_KIND" = "review" ]; then
+    say "  review    none written"
 fi
 
 # A worktree the agent wrecked must still produce a handoff, so none of
@@ -881,7 +998,7 @@ if [ -n "$TOUCHED" ]; then
         [ -n "$file" ] || continue
         ok=0
         IFS=',' read -ra globs <<< "$TASK_TOUCHES"
-        for g in "${globs[@]}"; do
+        for g in ${globs[@]+"${globs[@]}"}; do
             g="$(printf '%s' "$g" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
             [ -n "$g" ] || continue
             # shellcheck disable=SC2254  # glob on purpose
@@ -925,6 +1042,7 @@ step "Verifier"
 VERIFY_EXIT=0
 VERIFY_WHERE="(not run)"
 VERIFY_WT_LEFTOVER=""
+VERIFY_TAIL=""
 TREE_MUTATED=""
 if [ "$TREE_BROKEN" -eq 1 ]; then
     say "  skipped - worktree unreadable"
@@ -938,6 +1056,11 @@ elif ! git -C "$REPO" worktree add --detach "$VERIFY_WT" "$HEAD_SHA" >>"$RUN_LOG
 else
     VERIFY_WHERE="clean checkout of ${HEAD_SHA:0:12}"
     PRE_STATE="$(tree_state)"
+    # Where the verifier's output starts, so its last words can go in
+    # the handoff. "See the log" is the least useful sentence a handoff
+    # can contain: the reader is reading it *because* they were not
+    # watching the run.
+    LOG_MARK="$(wc -l < "$RUN_LOG" | tr -d ' ')"
     say "  $TASK_VERIFY"
     say "  in $VERIFY_WT"
     # The one tool-specific line in the runner, and it is a cost
@@ -945,11 +1068,21 @@ else
     # rebuild every dependency per run. The cache lives under state, so
     # it belongs to the runner - an agent cannot seed it from its own
     # worktree - and cargo's own lock serialises concurrent runs.
+    # A review task's verifier is given the review instead of a build:
+    # the subject changes with the kind, the contract ("an executable
+    # that must exit 0") does not. See F-19.
     ( cd "$VERIFY_WT" \
         && export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$STATE/cache/target}" \
+        && export BOT_REVIEW="$REVIEW_FILE" \
+        && export BOT_REVIEWED_SHA="$HEAD_SHA" \
+        && export BOT_TOUCHES="$TASK_TOUCHES" \
         && eval "$TASK_VERIFY" ) </dev/null >>"$RUN_LOG" 2>&1 || VERIFY_EXIT=$?
     say "  exit $VERIFY_EXIT"
     board "verified" "exit $VERIFY_EXIT"
+    if [ "$VERIFY_EXIT" -ne 0 ]; then
+        VERIFY_TAIL="$(tail -n "+$((LOG_MARK + 1))" "$RUN_LOG" \
+            | sed '/^[[:space:]]*$/d' | tail -n 5)"
+    fi
 
     # A checkout that will not go away is not cosmetic: the next run for
     # this task hits the leftover guard and refuses to start. It has to
@@ -998,9 +1131,20 @@ elif [ -n "$AGENT_BLOCKED" ]; then
 elif [ "$AGENT_EXIT" -ne 0 ]; then
     STATUS="blocked"
     BLOCKERS="agent exited $AGENT_EXIT without reporting - see $RUN_LOG"
+elif [ "$TASK_KIND" = "review" ] && [ "$COMMITS" -ne 0 ]; then
+    # The reviewer's one hard boundary. A commit from a reviewer is a
+    # failed run even when the change is an improvement: the whole
+    # value of a second bot is that it has no stake in the diff.
+    STATUS="blocked"
+    BLOCKERS="a reviewer must not commit, and this run made $COMMITS commit(s)"
+elif [ "$TASK_KIND" = "review" ] && [ -z "$REVIEW_FILE" ]; then
+    STATUS="blocked"
+    BLOCKERS="no .bot-review.md was written - the run produced nothing to read"
 elif [ "$VERIFY_EXIT" -ne 0 ]; then
     STATUS="blocked"
-    BLOCKERS="verifier exited $VERIFY_EXIT - see $RUN_LOG"
+    BLOCKERS="verifier exited $VERIFY_EXIT${VERIFY_TAIL:+:
+$VERIFY_TAIL}
+Full output: $RUN_LOG"
 elif [ -n "$SCOPE_VIOLATIONS" ]; then
     STATUS="blocked"
     BLOCKERS="files changed outside touches:"$'\n'"$SCOPE_VIOLATIONS"
@@ -1025,7 +1169,12 @@ elif [ "$COMMITS" -gt 1 ]; then
 elif [ "$COMMITS" -eq 0 ]; then
     STATUS="done"
     NOOP=1
-    BLOCKERS="none - no-op run, nothing needed changing"
+    if [ "$TASK_KIND" = "review" ]; then
+        # Zero commits is the *success* shape here, not an empty run.
+        BLOCKERS="none - review delivered, verdict ${REVIEW_VERDICT:-(none)}"
+    else
+        BLOCKERS="none - no-op run, nothing needed changing"
+    fi
 else
     STATUS="done"
 fi
@@ -1036,6 +1185,8 @@ if [ "$STATUS" = "blocked" ]; then
     NEXT="Human triages the blocker above. Task stays open; worktree kept at $WT."
 elif [ "$STATUS" = "needs-review" ]; then
     NEXT="Human resolves the blocker above in $WT, then pushes and opens a PR."
+elif [ "$TASK_KIND" = "review" ]; then
+    NEXT="Read $REVIEW_FILE - verdict ${REVIEW_VERDICT:-(none)}. Nothing was changed and nothing can be merged from this run; acting on a finding is a new task for a bot that commits."
 elif [ "${NOOP:-0}" -eq 1 ]; then
     NEXT="Nothing to review - the verifier already passed at base. Give this bot a task with real work in it."
 else
@@ -1046,10 +1197,22 @@ fi
 # Handoff - written by the runner
 # --------------------------------------------------------------------
 
+# Appended to the last evidence line rather than given a line of its
+# own, so a change task does not carry a blank gap where a review would
+# have been.
+REVIEW_EVIDENCE=""
+if [ "$TASK_KIND" = "review" ]; then
+    REVIEW_EVIDENCE="
+    review:   ${REVIEW_FILE:-(none written)}
+    verdict:  ${REVIEW_VERDICT:-(none)}
+    reviewed: $HEAD_SHA"
+fi
+
 HANDOFF="$STATE/handoffs/${TS}_${TASK_OWNER}__to__human__${TASK_ID}.md"
 cat > "$HANDOFF" <<HANDOFF_END
 ---
 task: $TASK_ID
+kind: $TASK_KIND
 from: $TASK_OWNER
 to: human
 at: $TS_ISO
@@ -1081,7 +1244,7 @@ $TASK_TITLE
                branch and not about the agent's leftovers)
     touched:
 $(if [ -n "$TOUCHED" ]; then printf '%s\n' "$TOUCHED" | sed 's/^/      /'; else echo "      (none)"; fi)
-    log:      $RUN_LOG
+    log:      $RUN_LOG$REVIEW_EVIDENCE
 
 # Status
 

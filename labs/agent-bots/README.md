@@ -282,8 +282,8 @@ detects that it happened.
 
 | | |
 |---|---|
-| Covered | the file contract; one bot; one task; contract-read-at-base (existence *and* argv); cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; verifier, in a clean checkout of the branch tip; evidence capture incl. scope check; handoff write; append-only board; no-op cleanup |
-| **Not** covered | scheduling/routines, multi-bot handoff, the approval inbox, per-bot memory, rebase-on-collision, resume after a crash, pushing, opening PRs, any GPUI surface |
+| Covered | the file contract; **two bots** (`fixer`, `reviewer`) and two task kinds (`change`, `review`); contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the `.bot-review.md` output channel; verifier, in a clean checkout of the branch tip; evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup |
+| **Not** covered | scheduling/routines, bot-to-bot handoff (both bots hand to a human), the approval inbox, per-bot memory, rebase-on-collision, resume after a crash, pushing, opening PRs, any GPUI surface |
 
 Two deliberate omissions:
 
@@ -325,6 +325,21 @@ before it costs a worktree; the plan prints the overlapping paths, and
 `--allow-overlap` overrides it. `examples/T-0004-overlap-fixture.md`
 reproduces both that refusal and the stale-dispatch case by hand.
 
+**Two kinds of task.** `kind: change` is the default and is what T-0001
+and T-0002 are. `kind: review` runs the `reviewer` charter instead: it
+must commit nothing, it writes `.bot-review.md`, and the runner
+harvests that into `.state/reviews/` and points the handoff at it.
+
+```bash
+# a review run - the reviewer reads, judges, and commits nothing
+labs/agent-bots/run/bot-run.sh   --task labs/agent-bots/examples/T-0005-review-overlap-check.md
+```
+
+Its verifier is `run/review-shape.sh`, which checks the review against
+the tree it claims to be about — including that every cited `path:line`
+exists at that commit and falls inside `touches:`. What it cannot check
+is whether the review is *right*; see F-19 for where that ceiling sits.
+
 **Which CLI runs is data.** The task's `agent:` wins, otherwise the
 charter's; the profile lives in `contract/agents/<id>.agent.md`. There is no
 built-in default — a bot says what it runs on. `claude`, `codex`,
@@ -361,6 +376,7 @@ are committed.
 | `.state/board.md` | append-only event log |
 | `.state/tasks/<id>.md` | the live task — the repo copy is only a definition |
 | `.state/handoffs/<ts>_<bot>__to__human__<id>.md` | the handoff |
+| `.state/reviews/<ts>_<bot>_<id>.md` | a review, harvested off the worktree |
 | `.state/runs/<day>/<id>-<ts>.log` | agent + verifier output |
 | `<repo>.worktrees/bot-<owner>-<id>/` | the work |
 
@@ -529,6 +545,16 @@ than single-bot polish:
    when the base moves under a branch that already passed: rebase,
    re-verify, and route a failed rebase to a human. With one bot that
    is a rare annoyance; with four it is the normal case.
+
+The second bot now exists — `reviewer`, which reads and judges and
+commits nothing — and the first thing it did was find four open races
+in the dispatch path that dispatched it (F-20). That is the argument
+for this direction in one run: a second bot is not twice the throughput,
+it is a different pair of eyes on work the first one cannot see. What
+is still missing before it is really multi-bot is the handoff *between*
+them: today both bots hand to a human, and a review that ends
+`changes-requested` becomes a fixer task only because a person writes
+one.
 
 And the board stops being a maybe. It was designed append-only from the
 start (§3.2) precisely so it would survive concurrent writers, so the
@@ -1208,3 +1234,131 @@ documentation that happens to sit near the code; it is the
 specification the verdict is derived from. A criterion nobody evaluates
 is worse than a missing one, because it teaches the reader that the
 ones beside it are checked.
+
+---
+
+### F-19 · A review cannot be verified the way a patch can
+
+*2026-09-11, building the second bot.*
+
+The reviewer was meant to be a second charter and nothing more. It
+turned out to break the two rules the loop was built on, which is the
+most useful thing it could have done.
+
+**"No verifier, no dispatch" met a task with no executable predicate.**
+A patch has one: run the tests. A judgement does not — there is no
+command that exits 0 when an opinion is correct. The rule could have
+been dropped for review tasks, which would have made it a rule about
+convenience. Instead the *subject* changes and the rule stands:
+`run/review-shape.sh` is an executable that must exit 0, and what it
+checks is the review.
+
+What it can prove, and does:
+
+- the review exists, parses, and names a verdict in the vocabulary
+- it is about the commit the runner actually checked out — a review of
+  the wrong tree reads as current and describes something else
+- every finding cites a path that **exists at that commit**
+- every cited path is inside the task's `touches:`
+- it says what it could not check
+
+What it cannot prove is whether any of it is *right*. That ceiling is
+the finding. The check that earns its keep is the citation one: a
+reviewer's characteristic failure is not lying about its verdict, it is
+naming a file that does not exist, and that is mechanically decidable.
+`run/stubs/fabulist.sh` is the regression — a well-formed, confident,
+correctly-signed review whose findings point at
+`labs/agent-bots/run/dispatch.sh`, a file this repo has never had. It
+lands on `blocked` with the invented path quoted in the handoff.
+
+**Zero commits is the success shape.** A reviewer that commits has
+failed, even when the change is an improvement — the whole value of a
+second bot is that it has no stake in the diff. That inverted three
+verdict rules at once, and the split it exposed is worth keeping:
+everything about the *loop* (worktree, base pinning, evidence off the
+tree, the runner writing the handoff, `.bot-blocked`) was already
+kind-agnostic. Only the acceptance model was not, because it had been
+written from one example. A `kind:` on the task, four verdict branches
+and a second prompt were the entire cost.
+
+The overlap check (F-16) falls out for free: a review claims nothing,
+so it can never conflict at merge, so review tasks are exempt in both
+directions. What it does get is a note — if another in-flight task is
+editing the files under review, the review describes a tree that has
+already moved, and the handoff says so rather than pretending the
+verdict is about the branch.
+
+---
+
+### F-20 · The reviewer's first run found four real bugs in the code that dispatched it
+
+*2026-09-11, the first real run of a second bot.*
+
+T-0005 pointed the reviewer at the dispatch path of `bot-run.sh` and
+asked one question: can two runs started together both dispatch tasks
+that touch the same file? It answered no, correctly, and named what
+closes the window — the worktree and the live task are both visible
+before `drop_lock`, so there is no state in which one run has passed
+its check but not yet claimed. Then it found four other windows that
+were open. All four verified; all four fixed in the same commit as this
+finding.
+
+1. **Breaking a stale lock was itself a race.** Two runs could both
+   judge the same directory stale, both remove it, and both walk in —
+   the takeover added in F-17 to stop one crash wedging the control
+   plane had reintroduced the race F-17 was about. It is now serialised
+   by a second `mkdir`, and the owner token is re-read after winning
+   that: a fresh holder cannot appear without the directory first going
+   away, so any change of identity shows up in the token.
+2. **`drop_lock` removed a lock without checking it still owned it.** A
+   run whose lock was broken out from under it deleted the *next*
+   holder's lock on the way out, leaving that one inside the critical
+   section with the door open. Every release now checks the token.
+3. **`waited` was not incremented on the stale branch**, so a lock that
+   could not be removed spun at full speed forever. Both the counter
+   and the sleep are now unconditional.
+4. **"Is that dispatch still alive" was answered with a guess.** The
+   live task recorded `branch:` but never where its worktree was, so
+   the scan recomputed the path from *its own* `--worktree-root`. A run
+   started with a different root finds nothing there, reads a live
+   claim as a ghost, prints it as ignored and dispatches over it. The
+   runner now records `worktree:` on the live task and the scan reads
+   it.
+
+A fifth finding is correct and untestable here:
+`LOCKS_HELD=("${kept[@]}")` on an empty array is an unbound-variable
+error under `set -u` on bash before 4.4, which is what macOS ships as
+`/bin/bash`. The local bash is 5.2, where it is legal; the reviewer
+said so itself rather than claiming a repro it did not have. The guard
+went in anyway — F-15 already committed this script to running on
+macOS, and every other array expansion in the file had the same shape.
+
+One finding is open rather than fixed. The control plane defaults to a
+directory beside the *script*, so two checkouts of the same repository
+take different `dispatch.lock` directories and scan different `tasks/`
+trees while creating branches in one shared object store: **the lock is
+scoped to the state directory and the conflict it prevents is scoped to
+the repository.** That is a question about where the control plane
+lives, which §7.2 already has to answer for the product port, and
+patching the prototype's default would paper over it.
+
+Two things worth recording about the run itself, beyond the bugs.
+
+**The blind-spots section did the work it was added for.** The reviewer
+wrote that its probe script for the lock interleaving was refused by
+the sandbox, so three findings were read off the code and not
+reproduced — "I would not call the race observed until someone has run
+it". A review that had listed only findings would have read as five
+verified defects. The section that is hardest to get a model to write
+is the one that made the rest usable.
+
+**It read the findings it was reviewing against.** F-16 and F-17 were
+in the task's context as *claims to test*, and the review opens by
+confirming F-17's window is genuinely closed before saying where the
+mechanism still fails. That is the behaviour the `context/` folder was
+copied from Grok Bot's community pattern to produce, and it is the
+first time in this experiment that it has visibly paid.
+
+Criterion 2 is still not met. Nothing here was an agent claiming
+success while being wrong — the reviewer was right, carefully, and said
+where it wasn't sure.

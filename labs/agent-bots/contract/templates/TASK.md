@@ -35,6 +35,14 @@ Known traps, prior attempts, things deliberately out of scope.
 Field reference:
 
   id       stable, unique. Used for the branch name and the log.
+  kind     change (default) | review
+           A `review` task inverts the acceptance rules: it must make
+           NO commit, its bot writes `.bot-review.md` in the worktree
+           root, and the runner harvests that file into the control
+           plane. A commit from a reviewer is a failed run. Review
+           tasks are exempt from the overlap check in both directions,
+           because a bot that writes nothing cannot conflict at merge.
+           See README F-19.
   owner    which bot in contract/bots/ runs this.
   status   todo | dispatched | blocked | needs-review | done
            On the repo copy this is always `todo` - it is a definition.
@@ -56,4 +64,8 @@ Field reference:
            It must be a predicate the owner can satisfy inside its own
            `touches:` - a whole-crate gate blocks every run on debt the
            bot may not fix. See README F-1.
+           On a `kind: review` task the subject changes but the rule
+           does not: run/review-shape.sh checks the review against the
+           tree it claims to be about. The runner exports BOT_REVIEW,
+           BOT_REVIEWED_SHA and BOT_TOUCHES for it.
 -->
