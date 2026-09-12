@@ -13,13 +13,22 @@
 # there and still bypasses it, but it now says so on the board and in
 # the handoff, which is the difference between a gate and a suggestion.
 #
+# The same gate covers the other thing a bot produces for its own
+# future: a memory note. That is agent prose which the runner pastes
+# into a later prompt, so it is the injection channel this loop would
+# otherwise have built without a door on it - see run/memory.sh.
+#
 #   bash labs/agent-bots/run/bot-approve.sh                 # the inbox
 #   bash labs/agent-bots/run/bot-approve.sh --id T-0006-fix
 #   bash labs/agent-bots/run/bot-approve.sh --id T-0006-fix --revoke
+#   bash labs/agent-bots/run/bot-approve.sh --memory reviewer/2026-...md
+#   bash labs/agent-bots/run/bot-approve.sh --forget reviewer/2026-...md
 #
 #   --id <task-id>       a proposal in <state>/proposed
 #   --task <path>        the same proposal, by path
-#   --revoke             take an approval back off a task
+#   --memory <bot>/<f>   a note in <state>/bots/<bot>/memory
+#   --forget <bot>/<f>   delete a note - approved or not
+#   --revoke             take an approval back off a task or a note
 #   --state <dir>        Control plane. Default: <labs>/agent-bots/.state
 #   --repo <dir>         Project. Default: the repo this script is in
 #   -h, --help
@@ -33,12 +42,16 @@ LAB_DIR="$(dirname "$SCRIPT_DIR")"
 
 # shellcheck source=approval.sh
 . "$SCRIPT_DIR/approval.sh"
+# shellcheck source=memory.sh
+. "$SCRIPT_DIR/memory.sh"
 
 die()  { printf 'bot-approve: %s\n' "$*" >&2; exit 1; }
 usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//;$d'; }
 
 TASK=""
 TASK_ID=""
+MEMORY_REF=""
+FORGET_REF=""
 STATE=""
 REPO=""
 REVOKE=0
@@ -49,6 +62,8 @@ while [ $# -gt 0 ]; do
         --task)    TASK="${2:-}"; shift 2 ;;
         --state)   STATE="${2:-}"; shift 2 ;;
         --repo)    REPO="${2:-}"; shift 2 ;;
+        --memory)  MEMORY_REF="${2:-}"; shift 2 ;;
+        --forget)  FORGET_REF="${2:-}"; shift 2 ;;
         --revoke)  REVOKE=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *)         die "unknown argument: $1 (try --help)" ;;
@@ -80,6 +95,114 @@ if [ -z "$REPO" ]; then
     REPO="$(git -C "$LAB_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
 fi
 
+# memory_ref_path <bot>/<file> - resolve, or refuse.
+#
+# Two components, neither allowed to contain a slash or a `..`, and the
+# result is checked to be inside the directory it is supposed to be in.
+# The argument comes from a person typing at a shell, which is not a
+# threat - but this builds a path that other flags then delete, and a
+# path built by string joining is worth one function of paranoia.
+memory_ref_path() {
+    local ref="$1" bot note path
+    bot="${ref%%/*}"
+    note="${ref#*/}"
+    [ -n "$bot" ] && [ -n "$note" ] && [ "$bot" != "$ref" ] \
+        || die "expected <bot>/<note-file>, got '$ref'"
+    case "$bot$note" in
+        */*|*..*) die "'$ref' is not a <bot>/<note-file> pair" ;;
+    esac
+    path="$(memory_dir "$STATE" "$bot")/$note"
+    [ -f "$path" ] || die "no note at $path"
+    printf '%s\n' "$path"
+}
+
+if [ -n "$FORGET_REF" ]; then
+    FORGET_PATH="$(memory_ref_path "$FORGET_REF")"
+    rm -f "$FORGET_PATH"
+    printf 'forgotten: %s\n' "$FORGET_REF"
+    exit 0
+fi
+
+if [ -n "$MEMORY_REF" ]; then
+    NOTE="$(memory_ref_path "$MEMORY_REF")"
+    NOTE_BOT="${MEMORY_REF%%/*}"
+
+    if [ "$REVOKE" -eq 1 ]; then
+        [ "$(memory_state "$NOTE")" != "none" ] \
+            || die "$MEMORY_REF is not approved - nothing to revoke"
+        awk '
+            /^---[[:space:]]*$/ { fence++; print; next }
+            fence == 1 && /^approved_(by|at|body):/ { next }
+            { print }
+        ' "$NOTE" > "$NOTE.tmp" && mv "$NOTE.tmp" "$NOTE"
+        printf 'revoked: %s is no longer read back into prompts\n' "$MEMORY_REF"
+        exit 0
+    fi
+
+    if [ "$(memory_state "$NOTE")" = "ok" ]; then
+        printf '%s is already approved by %s\n' \
+            "$MEMORY_REF" "$(memory_field approved_by "$NOTE")"
+        exit 0
+    fi
+
+    # The shape check again, here rather than only at harvest. A note on
+    # disk is a file somebody may have edited since, and this is the
+    # last point before it starts arriving in prompts.
+    NOTE_REFUSED="$(memory_body_refused "$(memory_body "$NOTE")")"
+    [ -z "$NOTE_REFUSED" ] || die "refusing to approve $MEMORY_REF: $NOTE_REFUSED"
+
+    # The cap is refused, not rotated. Dropping the oldest to make room
+    # would mean a bot's memory quietly reshapes itself whenever it
+    # learns something, and nobody would ever be told which fact went
+    # away. docs/HANDOFF.md in this repository grew to 3600 lines
+    # because nothing ever said no, and it was deleted rather than read.
+    HAVE="$(memory_approved_count "$STATE" "$NOTE_BOT")"
+    if [ "$HAVE" -ge "$MEMORY_MAX_NOTES" ]; then
+        printf 'bot-approve: %s already has %s approved notes, which is the limit.\n\n' \
+            "$NOTE_BOT" "$HAVE" >&2
+        printf 'Memory is capped rather than rotated: a bot with two hundred notes\n' >&2
+        printf 'has a diary, not a memory, and nothing would ever tell you which\n' >&2
+        printf 'fact had been pushed out. Retire one first:\n\n' >&2
+        for f in "$(memory_dir "$STATE" "$NOTE_BOT")"/*.md; do
+            [ -f "$f" ] || continue
+            [ "$(memory_state "$f")" = "ok" ] || continue
+            printf '    --forget %s/%s\n' "$NOTE_BOT" "$(basename "$f")" >&2
+        done
+        exit 1
+    fi
+
+    WHO="$(git -C "${REPO:-$LAB_DIR}" config user.email 2>/dev/null || true)"
+    [ -n "$WHO" ] || WHO="${USER:-${USERNAME:-unknown}}"
+    WHEN="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    BODY="$(memory_body_hash "$NOTE")"
+
+    awk -v who="$WHO" -v when="$WHEN" -v body="$BODY" '
+        /^---[[:space:]]*$/ {
+            fence++
+            if (fence == 2 && !done) {
+                print "approved_by: " who
+                print "approved_at: " when
+                print "approved_body: " body
+                done = 1
+            }
+            print; next
+        }
+        fence == 1 && /^approved_(by|at|body):/ { next }
+        { print }
+    ' "$NOTE" > "$NOTE.tmp" && mv "$NOTE.tmp" "$NOTE"
+
+    [ "$(memory_state "$NOTE")" = "ok" ] \
+        || die "wrote an approval to $NOTE and it does not read back as valid"
+
+    BOARD="$STATE/board.md"
+    [ ! -f "$BOARD" ] \
+        || printf '| %s | %s | memory-approved | %s |\n' \
+            "$WHEN" "$NOTE_BOT" "$(basename "$NOTE")" >> "$BOARD"
+
+    printf 'remembered: %s will be read back into %s prompts\n' "$MEMORY_REF" "$NOTE_BOT"
+    exit 0
+fi
+
 # --------------------------------------------------------------------
 # The inbox
 #
@@ -91,11 +214,28 @@ fi
 
 if [ -z "$TASK" ] && [ -z "$TASK_ID" ]; then
     [ -d "$PROPOSED" ] || { printf 'inbox: empty - no proposals at %s\n' "$PROPOSED"; exit 0; }
+    # A proposal is kept after it runs - it is the record of what was
+    # dispatched - so listing every file in here would have the count
+    # stop meaning "waiting" after the first one completed. What belongs
+    # in an inbox is what somebody still has to do something about: not
+    # yet approved, approved and not yet run, or approved and then
+    # edited. A proposal whose live task has reached a terminal status is
+    # history, and it is counted separately rather than hidden, because
+    # "empty" and "nothing left to do here" are the same sentence only
+    # if you can see the difference.
     found=0
+    done_count=0
     for f in "$PROPOSED"/*.md; do
         [ -f "$f" ] || continue
-        found=$((found + 1))
         id="$(approval_field id "$f")"
+        live_status=""
+        [ -z "$id" ] || [ ! -f "$STATE/tasks/$id.md" ] \
+            || live_status="$(approval_field status "$STATE/tasks/$id.md")"
+        case "$live_status" in
+            ""|todo|dispatched) ;;
+            *) done_count=$((done_count + 1)); continue ;;
+        esac
+        found=$((found + 1))
         title="$(approval_field title "$f")"
         owner="$(approval_field owner "$f")"
         state="$(approval_state "$f")"
@@ -108,10 +248,40 @@ if [ -z "$TASK" ] && [ -z "$TASK_ID" ]; then
         printf '                 %s\n' "${title:-(no title)}"
     done
     if [ "$found" -eq 0 ]; then
-        printf 'inbox: empty - no proposals at %s\n' "$PROPOSED"
+        printf 'inbox: empty - nothing waiting at %s\n' "$PROPOSED"
     else
-        printf '\n%s proposal(s). To let one run:\n' "$found"
+        printf '\n%s proposal(s) waiting. To let one run:\n' "$found"
         printf '    bash %s --id <id>\n' "${BASH_SOURCE[0]}"
+    fi
+    [ "$done_count" -eq 0 ] \
+        || printf '%s more already ran and are kept as the record of what was dispatched.\n' \
+            "$done_count"
+
+    # And the notes, in the same queue, because they are the same
+    # question: a machine wants something remembered and nobody has
+    # agreed to it yet. Waiting notes are shown in full - a note is one
+    # fact and the whole point is that somebody reads it.
+    mem_waiting=0
+    for d in "$STATE"/bots/*/; do
+        [ -d "$d" ] || continue
+        b="$(basename "$d")"
+        md="$(memory_dir "$STATE" "$b")"
+        [ -d "$md" ] || continue
+        for f in "$md"/*.md; do
+            [ -f "$f" ] || continue
+            st="$(memory_state "$f")"
+            [ "$st" != "ok" ] || continue
+            [ "$mem_waiting" -ne 0 ] || printf '\nnotes waiting to be remembered:\n'
+            mem_waiting=$((mem_waiting + 1))
+            printf '  %s/%s  (from %s)%s\n' \
+                "$b" "$(basename "$f")" "$(memory_field from "$f")" \
+                "$([ "$st" = "stale" ] && printf ' - EDITED SINCE IT WAS APPROVED' || true)"
+            printf '      %s\n' "$(memory_body "$f" | sed '/^[[:space:]]*$/d' | tr '\n' ' ')"
+        done
+    done
+    if [ "$mem_waiting" -gt 0 ]; then
+        printf '\nTo keep one:\n'
+        printf '    bash %s --memory <bot>/<note-file>\n' "${BASH_SOURCE[0]}"
     fi
     exit 0
 fi

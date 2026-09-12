@@ -22,6 +22,15 @@
 #   then editing `T-0006-fix` leaves an approval that no longer applies.
 #   Approve the bytes, not the file name - F-17, one level up.
 
+# Every digest in here goes through the lab's own repository, because
+# `git hash-object` uses the *containing* repository's object format and
+# all three callers have to agree. Approve from a SHA-256 repository and
+# list from outside it and the same bytes hash two ways, which reads as
+# `stale` - an approval refused for being in a different directory.
+# $SCRIPT_DIR is set by every caller before it sources this, and is
+# inside the lab.
+approval_hash_repo() { printf '%s\n' "${SCRIPT_DIR:-.}"; }
+
 # approval_field <key> <file>
 #
 # The frontmatter reader, kept separate from each script's own `field`
@@ -52,7 +61,7 @@ approval_body_hash() {
         /^---[[:space:]]*$/ { fence++; print; next }
         fence == 1 && /^approved_(by|at|body):/ { next }
         { print }
-    ' "$1" | git hash-object --stdin
+    ' "$1" | git -C "$(approval_hash_repo)" hash-object --stdin
 }
 
 # approval_state <file> -> none | stale | ok

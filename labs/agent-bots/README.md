@@ -259,6 +259,36 @@ went through a person, a review and a merge, which is the thing an
 approval is trying to establish and a stronger claim than a line in a
 file.
 
+**Per-bot memory goes through the same gate, and that is the whole
+design.** A run may write one fact to `.bot-memory` — something that
+would have made it easier had the bot known it at the start. The runner
+stores it under `.state/bots/<name>/memory/` **unapproved**, and
+`memory_block` only ever assembles notes carrying a valid approval, so
+a bot asking to remember something and a bot deciding to are different
+events with a person in between.
+
+The reason to be this careful about a feature that sounds like a cache:
+**a note is the only thing in this loop where an agent's own prose comes
+back to it as input.** That is rules 1 and 2 of §3.6 at once, and it is
+an injection channel the loop would otherwise have built for itself, for
+free. So `run/memory.sh` is mostly limits — one fact, 400 bytes, twenty
+notes per bot, and a refusal for any note containing a `---` fence or a
+heading, because a note that closes the section it is quoted inside and
+opens another one rewrites the prompt around it. That check is about
+shape, not opinion: a note that says something *wrong* is a note nobody
+should approve, and no amount of reading catches a structural breakout
+reliably.
+
+The cap is refused rather than rotated. `docs/HANDOFF.md` in this
+repository grew to 3600 lines because nothing ever said no, and it was
+deleted rather than read — a bot with two hundred notes has a diary, not
+a memory. `bot-approve.sh --forget <bot>/<note>` is how one goes.
+
+And the notes arrive in the prompt labelled: *claims, not contract*,
+with the charter named as the winner and the run that produced each one
+named next to it, so the bot can go and check instead of taking its own
+word for it. F-23, applied to a bot's own past.
+
 **Concurrency control without locks.** Each task declares `touches:`
 globs, and the runner refuses to dispatch a task whose files another
 in-flight task already claims. Both sides are expanded against the base
@@ -411,8 +441,8 @@ list; the sites do not.
 
 | | |
 |---|---|
-| Covered | plain-folder projects as well as git ones; the file contract; **two bots** (`fixer`, `reviewer`), two deliverables (`produces: commit`, `produces: report`), the handoff between them and a scheduler that reads the board; contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the report channel (`artifact:`, `shape:`, harvested into `.state/artifacts/`) with citations *and* quotes checked against the blob; verifier, in a clean checkout of the branch tip; the surface disarm (hooks, command-naming config, `core.worktree`, and the identity of `.git` itself); the approval gate on derived tasks, hashed over the task body, with `--chain` as a recorded bypass; evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup; rebase onto a base that moved, re-verified there |
-| **Not** covered | per-bot memory, re-verifying a branch that is *waiting* rather than running, resume after a crash, any trigger other than "someone ran a tick", pushing, opening PRs, any GPUI surface |
+| Covered | plain-folder projects as well as git ones; the file contract; **two bots** (`fixer`, `reviewer`), two deliverables (`produces: commit`, `produces: report`), the handoff between them and a scheduler that reads the board; contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the report channel (`artifact:`, `shape:`, harvested into `.state/artifacts/`) with citations *and* quotes checked against the blob; verifier, in a clean checkout of the branch tip; the surface disarm (hooks, command-naming config, `core.worktree`, and the identity of `.git` itself); the approval gate on derived tasks *and* on per-bot memory, hashed over the body, with `--chain` as a recorded bypass; per-bot memory itself - one fact per run, capped, refused if it would restructure the prompt it is quoted in; evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup; rebase onto a base that moved, re-verified there |
+| **Not** covered | re-verifying a branch that is *waiting* rather than running, resume after a crash, any trigger other than "someone ran a tick", pushing, opening PRs, any GPUI surface |
 
 Two deliberate omissions:
 
@@ -543,9 +573,11 @@ address the handoff to it by name:
 # review, then hand the findings to the fixer as a scoped task
 labs/agent-bots/run/bot-run.sh   --task labs/agent-bots/examples/T-0006-review-telemetry.md
 
-# the inbox: what a bot proposed and nobody has agreed to yet
+# the inbox: proposed tasks and notes nobody has agreed to yet
 labs/agent-bots/run/bot-approve.sh
 labs/agent-bots/run/bot-approve.sh --id T-0006-fix
+labs/agent-bots/run/bot-approve.sh --memory fixer/<note-file>
+labs/agent-bots/run/bot-approve.sh --forget fixer/<note-file>
 
 # ... or skip the reader and say so on the board
 labs/agent-bots/run/bot-run.sh   --task labs/agent-bots/examples/T-0006-review-telemetry.md --chain
@@ -615,7 +647,9 @@ F-29 — including what the snapshot deliberately leaves behind.
 | `.state/tasks/<id>.md` | the live task — the repo copy is only a definition |
 | `.state/handoffs/<ts>_<bot>__to__human__<id>.md` | the handoff |
 | `.state/artifacts/<ts>_<bot>_<id>_<name>` | a report, harvested off the worktree |
-| `.state/proposed/<id>.md` | a task one bot's run wrote for another |
+| `.state/proposed/<id>.md` | a task one bot's run wrote for another — needs an approval before it runs |
+| `.state/bots/<bot>/memory/<ts>_<id>.md` | one fact that bot asked to remember — read back into its prompts only once approved |
+| `.state/tmp/dispatched-<id>.md` | the bytes a proposal was dispatched with, snapshotted at the gate |
 | `.state/REPO` | which repository this control plane belongs to |
 | `.state/runs/<day>/<id>-<ts>.log` | agent + verifier output |
 | `<repo>.worktrees/bot-<owner>-<id>/` | the work surface — a clone, with its own `.git` |
@@ -3243,3 +3277,94 @@ from where it is used:
   contradicts the code it documents is a defect with a slower failure
   mode, and this file is long enough that the only way it stays true is
   for a reader to keep catching it.
+
+---
+
+### F-41 · Memory is an approval problem before it is a storage problem
+
+*2026-09-12, building the last thing on the list.*
+
+Per-bot memory had been on the "not covered" line since the first
+draft, described as a thing bots would obviously want: a run learns
+something, later runs know it. Written that way it is a cache, and a
+cache is a morning's work.
+
+It is not a cache. **A note is the only thing in this loop where an
+agent's own prose comes back to it as input**, on a later run, pasted
+into a prompt by the runner. Threat model rules 1 and 2 at once — and an
+injection channel the loop builds for itself, for free, unless something
+stands in front of it. Build the store first and you have built the
+channel and left the door for round fourteen.
+
+So the store is four files' worth of limits and one directory:
+
+- **Nothing is live until a human approves it.** Same three fields as a
+  proposed task, same hash over the body, same inbox. A run writing to
+  `.bot-memory` is a bot *asking*.
+- **One fact, 400 bytes, twenty notes.** And the cap is refused, not
+  rotated: `docs/HANDOFF.md` in this repository grew to 3600 lines
+  because nothing ever said no, and was deleted rather than read. A bot
+  with two hundred notes has a diary. `--forget` is how one goes, and a
+  person chooses which.
+- **A note may not restructure the prompt it is quoted in.** No `---`
+  fence, no `#` heading, nothing that repeats one of the runner's own
+  section markers. That is checkable; "is this note honest" is not, and
+  the two failure modes want different mechanisms. A note that says
+  something wrong is a note nobody should approve. A note that closes
+  its section and opens a new one is a note no reader reliably catches.
+- **They arrive labelled.** *Claims, not contract*, charter wins, and
+  each one names the run that produced it so the bot can go and look.
+  F-23 turned on a bot's own past: prose is a claim about what
+  happened, and what happened is somewhere else.
+
+The sweep drives the whole order: the note is stored and not live, an
+unapproved note is **absent from the resolved prompt**, an approved one
+is **present**, and a prompt-shaped note never gets stored at all. The
+two prompt assertions are the ones that matter — everything else is
+about files, and the prompt is the thing that actually reaches a model.
+
+---
+
+### F-42 · The thing you validated has to be the thing you use
+
+*2026-09-12, the fourteenth round, on the approval gate itself.*
+
+Four, and the first is the gate defeating itself.
+
+**The approval hashed the proposal and then the runner read the file
+again.** Parse the frontmatter, build the prompt, copy to the live task
+— three more reads of a path in a directory anybody may edit, and an
+edit in that window changes what runs without touching the approval that
+was checked. The gate had the shape of `stat` then `open`. So the first
+thing it does now is copy the bytes to `.state/tmp/dispatched-<id>.md`
+and point `$TASK` at the snapshot; every read after that, the live copy
+included, is of the file that was validated. This is F-38's sentence
+again — *an identity you compare is a race* — arriving at a feature
+built two hours after F-38 was written, which is the honest measure of
+how easily it comes back.
+
+**`BOT_RUN_ACTIVE` did not cover the path its own comment claimed.** It
+was exported around the agent, and the comment said it catches the loop
+reaching for its own gate "through a verifier or a hook". `run_verify`
+did not export it. `verify:` is a shell command sourced from repo
+content (F-6) running inside the loop, so a verifier — including one the
+agent had just edited on its branch — could call `bot-approve.sh` and
+approve the next proposal. Exported there too, and the sweep drives it
+through a real `verify:` rather than by setting the variable by hand,
+because the variable being set is the thing under test. The fixture is
+chosen so the negative shows: `bot-approve.sh` with no arguments lists
+the inbox and exits 0, so without the guard the verifier passes.
+
+Two more:
+
+- **`git hash-object` takes its object format from wherever it runs.**
+  Approve from inside a SHA-256 repository and list from outside it and
+  the same bytes hash two ways — an approval reported `stale` for being
+  read from a different directory. All three callers now hash through
+  the lab's own repository.
+- **An inbox listed everything ever proposed.** A proposal is kept after
+  it runs, because it is the record of what was dispatched, so the count
+  stopped meaning "waiting" the moment the first one completed.
+  Terminal live tasks are now counted separately rather than hidden:
+  *empty* and *nothing left to do here* are the same sentence only if
+  you can see the difference.

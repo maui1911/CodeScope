@@ -202,6 +202,8 @@ LAB_DIR="$(dirname "$SCRIPT_DIR")"
 # through. See run/approval.sh.
 # shellcheck source=approval.sh
 . "$SCRIPT_DIR/approval.sh"
+# shellcheck source=memory.sh
+. "$SCRIPT_DIR/memory.sh"
 
 die() { printf 'bot-run: %s\n' "$*" >&2; exit 1; }
 say() { printf '%s\n' "$*"; }
@@ -572,7 +574,25 @@ fi
 # scheduler must not count it as a failed run.
 # --------------------------------------------------------------------
 
-if approval_is_proposal "$TASK" "$STATE"; then
+# A proposal is a file in a directory anybody may edit, and everything
+# after this point reads it again: the frontmatter parse, the prompt, the
+# copy to the live task. Validating the path and then re-reading it is a
+# check/use race - an edit in that window changes what runs without ever
+# touching the approval that was checked. So the first thing the gate
+# does is take the bytes out of reach, and every read after this is of
+# the snapshot. Same lesson as the lock protocol (F-38): the thing you
+# compared has to be the thing you use.
+if [ "$DRY_RUN" -eq 0 ] && approval_is_proposal "$TASK" "$STATE"; then
+    SNAP_ID="$(approval_field id "$TASK")"
+    SNAP_ID="${SNAP_ID:-$(basename "$TASK" .md)}"
+    mkdir -p "$STATE/tmp"
+    TASK_SNAPSHOT="$STATE/tmp/dispatched-$SNAP_ID.md"
+    cp "$TASK" "$TASK_SNAPSHOT"
+    TASK="$TASK_SNAPSHOT"
+fi
+
+if approval_is_proposal "$TASK" "$STATE" \
+    || { [ -n "${TASK_SNAPSHOT:-}" ] && [ "$TASK" = "$TASK_SNAPSHOT" ]; }; then
     # Its own read of the id. The gate runs here - before the lock,
     # before the surface, before the frontmatter is parsed into globals
     # - because a refusal that has already created something is not a
@@ -1336,6 +1356,37 @@ fi
 # the handoff, because self-reported evidence is not evidence.
 # --------------------------------------------------------------------
 
+# --------------------------------------------------------------------
+# What this bot has been allowed to remember
+#
+# Approved notes only, and assembled here rather than inside the prompt
+# string so that the limits in memory.sh are the only thing that decides
+# what a prompt can contain. Empty when there are none: a "what you have
+# learned" heading with nothing under it teaches a bot that the section
+# is furniture.
+#
+# The framing matters as much as the content. This is the one place in
+# the loop where a bot's own prose comes back to it as input, so it
+# arrives labelled as a claim with the charter named as the winner - and
+# every note says which run produced it, because the way out of "I said
+# so" is somewhere to go and look.
+# --------------------------------------------------------------------
+
+MEMORY_NOTES="$(memory_block "$STATE" "$TASK_OWNER")"
+MEMORY_PROMPT=""
+if [ -n "$MEMORY_NOTES" ]; then
+    MEMORY_PROMPT="
+Notes you wrote on earlier runs, which a human has agreed to keep:
+
+$MEMORY_NOTES
+Those are claims, not contract. Where one disagrees with your charter,
+with the conventions, or with the code in front of you, those win and
+the note is wrong - say so in your work so somebody retires it. Each
+names the run it came from, so you can check rather than take your own
+word for it.
+"
+fi
+
 PROMPT="You are the bot '$TASK_OWNER' working in a git worktree.
 
 Read these first, in order:
@@ -1393,6 +1444,15 @@ Rules for this run:
   - Do NOT write a handoff or a report file. The runner does that.
 CHANGE_RULES
 fi)
+
+$MEMORY_PROMPT
+One thing you may keep. If this run taught you something that would
+have made it easier had you known it at the start, write that one fact
+to '.bot-memory' in the worktree root - under $MEMORY_MAX_NOTE_BYTES
+bytes, no headings, no '---'. A human reads it before it is ever shown
+to you again, so write it for them: what is true, not what to do about
+it. A note that instructs a later version of you is a note that gets
+thrown away. Nothing to keep is the normal answer; do not invent one.
 
 If you cannot complete the task inside those limits, write one line
 saying why to the file '.bot-blocked' in the worktree root, make no
@@ -2170,7 +2230,7 @@ CHANNEL_SYMLINK=""
 # space-delimited string would split `.bot-my report.md` into two
 # channels - skipping the guard here while the `-f` test further down
 # still found the file and moved it.
-CHANNELS=(".bot-blocked" ".bot-commit-msg")
+CHANNELS=(".bot-blocked" ".bot-commit-msg" ".bot-memory")
 [ "$TASK_PRODUCES" != "report" ] || CHANNELS+=("$TASK_ARTIFACT")
 for chan in "${CHANNELS[@]}"; do
     chan_bad=""
@@ -2209,6 +2269,47 @@ if [ -f "$WT/.bot-blocked" ]; then
     rm -f "$WT/.bot-blocked"
     [ -n "$AGENT_BLOCKED" ] || AGENT_BLOCKED="(agent wrote .bot-blocked but left it empty)"
     say "  agent reported blocked"
+fi
+
+# The memory channel, harvested like the others and stored *unapproved*.
+# Nothing reads it until a human does: `memory_block` above only ever
+# assembles notes that carry a valid approval, so writing one here is a
+# bot asking rather than a bot deciding.
+#
+# Read a bounded number of bytes and then check the shape before it is
+# stored, not before it is used: a note that would restructure the
+# prompt it gets quoted into is refused here, once, rather than by every
+# future run having to survive it.
+#
+# It is taken out of the worktree either way. It is a channel, so it
+# must not reach a commit or count as an uncommitted file the bot left
+# behind - the same reason .bot-blocked and the report are moved.
+MEMORY_NOTE=""
+MEMORY_REFUSED=""
+if [ -f "$WT/.bot-memory" ]; then
+    MEMORY_NOTE="$(head -c 4000 "$WT/.bot-memory" | tr -d '\r')"
+    rm -f "$WT/.bot-memory"
+    MEMORY_REFUSED="$(memory_body_refused "$MEMORY_NOTE")"
+    if [ -n "$MEMORY_REFUSED" ]; then
+        say "  memory note refused - $MEMORY_REFUSED"
+        board "memory-refused" "$MEMORY_REFUSED"
+        MEMORY_NOTE=""
+    else
+        MEMORY_DIR="$(memory_dir "$STATE" "$TASK_OWNER")"
+        mkdir -p "$MEMORY_DIR"
+        MEMORY_FILE="$MEMORY_DIR/${TS}_${TASK_ID}.md"
+        {
+            printf -- '---\n'
+            printf 'bot: %s\n' "$TASK_OWNER"
+            printf 'from: %s\n' "$TASK_ID"
+            printf 'at: %s\n' "$BASE_SHA"
+            printf 'at_time: %s\n' "$TS_ISO"
+            printf -- '---\n\n'
+            printf '%s\n' "$MEMORY_NOTE"
+        } > "$MEMORY_FILE"
+        say "  memory note written, waiting for approval: $MEMORY_FILE"
+        board "memory-proposed" "$(basename "$MEMORY_FILE")"
+    fi
 fi
 
 # The report channel, harvested the same way and for the same reason:
@@ -2568,8 +2669,15 @@ run_verify() {
     # the working tree. Renaming either side alone turns the sweep
     # red, and renaming both can only be proven after the merge.
     # BOT_ARTIFACT / BOT_SUBJECT_SHA once this is at base - #348.
+    # BOT_RUN_ACTIVE here as well as around the agent. `verify:` is a
+    # shell command sourced from repo content (F-6) and it runs inside
+    # this loop, so without the marker a verifier - including one the
+    # agent just changed on its branch - could call bot-approve.sh and
+    # open the gate for the next proposal. The comment by the agent
+    # invocation claimed this path was covered when only that one was.
     ( cd "$VERIFY_WT" \
         && export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$STATE/cache/target}" \
+        && export BOT_RUN_ACTIVE="$RUN_TOKEN" \
         && export BOT_REVIEW="$ARTIFACT_FILE" \
         && export BOT_REVIEWED_SHA="$sha" \
         && export BOT_TOUCHES="$TASK_TOUCHES" \
