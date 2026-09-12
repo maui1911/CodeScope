@@ -48,6 +48,7 @@ bot/fixer/T-991D
 bot/fixer/T-995A
 bot/fixer/T-997A
 bot/fixer/T-998A
+bot/fixer/T-998B
 bot/fixer/shared
 bot-sweep/base
 bot-sweep/committed-secret
@@ -57,7 +58,8 @@ bot-sweep/committed-secret
 # Everything under $STATE/tasks belongs to whoever is running the lab;
 # only these are the sweep's to remove.
 SWEEP_TASK_IDS="T-0001 T-0003 T-0005 T-0006 T-0006-fix T-990A T-990B
-T-993A T-993B T-993C T-993D T-993E T-995A T-996A T-996B T-997A T-998A
+T-993A T-993B T-993C T-993D T-993E T-995A T-996A T-996B T-997A
+T-998A T-998B
 T-991A T-991B T-991C T-991D"
 
 is_sweep_task() {   # is_sweep_task <id>
@@ -84,15 +86,30 @@ PRE_EXISTING=""
 # other run's task file out from under it: `set_field` then fails on a
 # missing file after its handoff was written, and the run dies without
 # a status. Refuse instead.
-if [ -d "$STATE/tasks" ]; then
-    for f in "$STATE"/tasks/*.md; do
+#
+# And a file carrying one of the sweep's *own* ids is refused too, which
+# is the part an id cannot settle on its own. `T-0006-fix` is what the
+# runner derives from `T-0006`, and `T-0005`/`T-0006` are the ids the
+# shipped examples use - so a human who ran the examples and kept the
+# proposal has files this script would have called its own and deleted,
+# without the preflight ever mentioning them. An id says what a file is
+# about, never who wrote it. The only sound claim to a file is having
+# created it, so the sweep starts from nothing and removes only what it
+# made. Proposals are included: nothing dispatches them, which is
+# exactly why they were the ones with no guard.
+for sdir in tasks proposed; do
+    [ -d "$STATE/$sdir" ] || continue
+    for f in "$STATE/$sdir"/*.md; do
         [ -f "$f" ] || continue
         id="$(sed -n 's/^id:[[:space:]]*//p' "$f" | head -n1)"
         [ -n "$id" ] || continue
-        is_sweep_task "$id" \
-            || PRE_EXISTING="$PRE_EXISTING  live task $id ($f)"$'\n'
+        if is_sweep_task "$id"; then
+            PRE_EXISTING="$PRE_EXISTING  $sdir/$id ($f) - an id this sweep uses"$'\n'
+        elif [ "$sdir" = "tasks" ]; then
+            PRE_EXISTING="$PRE_EXISTING  live task $id ($f)"$'\n'
+        fi
     done
-fi
+done
 for b in $SWEEP_BRANCHES; do
     if git -C "$REPO" rev-parse --verify --quiet "refs/heads/$b" >/dev/null 2>&1; then
         PRE_EXISTING="$PRE_EXISTING  branch  $b"$'\n'
@@ -152,6 +169,13 @@ cleanup() {   # cleanup <branch> - only ever a branch from SWEEP_BRANCHES
         fi
     fi
     git -C "$REPO" branch -D "$1" >/dev/null 2>&1
+    # The runner pins the base commit for as long as a surface exists,
+    # so the evidence in a kept surface stays readable, and drops the pin
+    # in drop_surface. A run that ends blocked keeps its surface and so
+    # keeps its pin - and the sweep, which ends a good many runs blocked
+    # on purpose, was leaving one behind every time. The leaf of a sweep
+    # branch is its task id.
+    git -C "$REPO" update-ref -d "refs/bot-base/${1##*/}" >/dev/null 2>&1
     return 0
 }
 
@@ -176,7 +200,12 @@ run() {   # run <label> <expected> <task> <stub-or-empty> [extra args...]
     check "$label" "$expect" "$rc"
 }
 
-drop_sweep_tasks
+# No drop_sweep_tasks here. It used to open the run, on the reasoning
+# that a previous sweep may have left files behind - and it deleted by
+# id, so it could just as well have been a human's. The preflight above
+# refuses to start while any of them exist, which says the same thing
+# without removing anything: from here on, every file with one of these
+# ids is one this invocation made.
 
 cleanup bot/fixer/T-0001
 run "skip-agent no-op"       0 "$EX/T-0001-smoke-test.md" "" --skip-agent
@@ -241,6 +270,9 @@ cleanup bot/reviewer/T-0005
 run "stumped.sh"             1 "$EX/T-0006-review-telemetry.md" stumped.sh
 cleanup bot/reviewer/T-0006
 
+# Both provably this run's: the preflight refused to start if either
+# was there, and the only thing since that could have written them is
+# the stumped.sh run above.
 rm -f "$STATE/tasks/T-0006-fix.md" "$STATE/proposed/T-0006-fix.md" 2>/dev/null
 run "critic.sh"              0 "$EX/T-0006-review-telemetry.md" critic.sh
 cleanup bot/reviewer/T-0006
@@ -750,6 +782,20 @@ fi
 # checked directly against a throwaway pair of repos before this
 # guard was written, rather than assumed.
 SAB_LOG="$(ls -t "$STATE"/runs/*/T-998A-*.log 2>/dev/null | head -n1)"
+
+# core.worktree is the one on that list that executes nothing: it moves
+# the working tree the runner then measures and publishes. Asserted on
+# the board, which is where the disarm names what it took away - reading
+# the config back would prove nothing, because the key being absent is
+# also what a disarm that never looked leaves behind. (The run log holds
+# the agent's output; `say` goes to the console.)
+if grep -q "| T-998A | config-disarmed |.*core\.worktree" "$STATE/board.md" 2>/dev/null; then
+    printf 'ok    %-28s the worktree was put back\n' "core.worktree disarmed"
+else
+    printf 'FAIL  %-28s core.worktree survived the disarm\n' "core.worktree disarmed"
+    FAILURES=$((FAILURES + 1))
+fi
+
 SAB_OK=1
 if git -C "$REPO" rev-parse --verify --quiet "refs/heads/$SAB_BRANCH" >/dev/null 2>&1; then
     SAB_OK=0
@@ -764,7 +810,84 @@ else
 fi
 
 cleanup bot/fixer/T-998A
+
+# --------------------------------------------------------------------
+# What the agent answers when the runner asks which repository this is
+#
+# `.git` is the agent's to write, and `.git` is also what git reads to
+# find the repository. A one-line `gitdir:` file there - the same form
+# every linked worktree uses - redirects the disarm, the evidence, the
+# commit and the push at a repository the agent picked. The disarm now
+# compares the resolved git dir against the one recorded at creation,
+# removes the pointer unfollowed, and blocks.
+# --------------------------------------------------------------------
+
+cat > "$SAB_TASKS/T-998B.md" <<EOF
+---
+id: T-998B
+title: An agent that swaps the repository under the runner
+owner: fixer
+status: todo
+base: labs/agent-bots
+branch: bot/fixer/T-998B
+touches: labs/agent-bots/.sweep/*
+verify: true
+---
+
+# Objective
+
+Generated by sweep.sh. The work is honest; the .git it leaves is not.
+EOF
+
+HIJRC=0
+BOT_AGENT_CMD="$STUBS/hijacker.sh" BOT_AGENT_ARGS="" \
+    BOT_HIJACK_FILE="labs/agent-bots/.sweep/mine.txt" \
+    bash "$RUN" --task "$SAB_TASKS/T-998B.md" --reset --repo "$REPO" >/dev/null 2>&1 || HIJRC=$?
+check "swapped .git blocks" 1 "$HIJRC"
+
+HIJ_HANDOFF="$(ls -t "$STATE"/handoffs/*T-998B.md 2>/dev/null | head -n1)"
+if [ -n "$HIJ_HANDOFF" ] && grep -q 'which repository it is about' "$HIJ_HANDOFF"; then
+    printf 'ok    %-28s the handoff names the swap\n' "swapped .git reason"
+else
+    printf 'FAIL  %-28s blocked for some other reason\n' "swapped .git reason"
+    FAILURES=$((FAILURES + 1))
+fi
+
+# `cleanup` refuses a surface without a .git/bot-surface marker, and
+# there is no marker here because the runner removed the redirect that
+# was standing where .git should be - which is the check passing, not a
+# surface of unknown provenance. The path is a sweep branch leaf.
+rm -rf "$WT_ROOT/bot-fixer-T-998B"
+git -C "$REPO" branch -D bot/fixer/T-998B >/dev/null 2>&1
+
 rm -f "$STATE"/tasks/T-998*.md 2>/dev/null
+
+# --------------------------------------------------------------------
+# A lock nobody can break any more
+#
+# Breaking a stale lock is serialised by a second directory, and that
+# directory was permanent if the run holding it died: every later
+# `mkdir` of it failed, so the stale path was never entered again and
+# the abandoned lock outlived every waiter. Both are aged out now. The
+# fixture is the crash: an old lock with an old break marker beside it,
+# and a run that has to get past both.
+# --------------------------------------------------------------------
+
+if find "$STATE" -prune -mmin +1 -print >/dev/null 2>&1; then
+    mkdir -p "$STATE/dispatch.lock" "$STATE/dispatch.lock.break"
+    printf 'a-run-that-died\n' > "$STATE/dispatch.lock/owner"
+    touch -t 202001010000 "$STATE/dispatch.lock" "$STATE/dispatch.lock.break"
+    WEDGERC=0
+    bash "$RUN" --task "$EX/T-0001-smoke-test.md" --reset --repo "$REPO" \
+        --skip-agent >/dev/null 2>&1 || WEDGERC=$?
+    check "wedged lock recovered" 0 "$WEDGERC"
+    rm -rf "$STATE/dispatch.lock" "$STATE/dispatch.lock.break"
+    cleanup bot/fixer/T-0001
+    rm -f "$STATE"/tasks/T-0001.md 2>/dev/null
+else
+    printf 'skip  %-28s this find rejects -mmin\n' "wedged lock recovered"
+fi
+
 rm -rf "$SAB_TASKS"
 
 # --------------------------------------------------------------------
@@ -995,7 +1118,9 @@ rm -rf "$FOLDER_ROOT" "$FPROJ.worktrees"
 # filesystem rather than `git worktree list`, because a surface is a
 # clone and the project has never heard of it.
 LEFT_WT="$(ls -d "$WT_ROOT"/bot-* 2>/dev/null | wc -l | tr -d ' ')"
-LEFT_LOCKS="$(ls -d "$STATE"/*.lock 2>/dev/null | wc -l | tr -d ' ')"
+# `*.lock` on its own never matched `dispatch.lock.break`, which is the
+# one a killed run leaves behind and the one that wedges the next.
+LEFT_LOCKS="$(ls -d "$STATE"/*.lock "$STATE"/*.lock.break 2>/dev/null | wc -l | tr -d ' ')"
 printf '\nbot worktrees left: %s\nlocks left:         %s\n' "$LEFT_WT" "$LEFT_LOCKS"
 [ "$LEFT_WT" -eq 0 ] || FAILURES=$((FAILURES + 1))
 [ "$LEFT_LOCKS" -eq 0 ] || FAILURES=$((FAILURES + 1))

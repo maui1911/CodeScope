@@ -249,7 +249,7 @@ release_locks() {
 trap release_locks EXIT
 
 take_lock() {   # take_lock <dir> <what>
-    local dir="$1" what="$2" waited=0 owner_before owner_now
+    local dir="$1" what="$2" waited=0 owner_before owner_now cleared_break
     while ! mkdir "$dir" 2>/dev/null; do
         # Breaking a stale lock is itself a race, and the first version
         # lost it: two runs both judged the same directory stale, both
@@ -265,7 +265,25 @@ take_lock() {   # take_lock <dir> <what>
         # extension. Whether a given BSD find implements -maxdepth is a
         # question this no longer has to have an opinion about.
         owner_before="$(cat "$dir/owner" 2>/dev/null || true)"
+        # The break marker is itself a lock, and it is held for two
+        # reads and an `rm -rf`. A run killed inside that window leaves
+        # it behind, and then nothing recovers anything here ever again:
+        # every later `mkdir "$dir.break"` fails, the stale path below is
+        # never entered, and the abandoned main lock outlives every
+        # waiter. So the marker gets the same ten-minute treatment as the
+        # lock it guards. Clearing it costs a whole pass - two waiters
+        # that both clear it go back to the wait rather than standing in
+        # the break section together, where both would judge one
+        # directory stale and one could `rm -rf` the other's fresh lock.
+        cleared_break=0
         if [ "${FIND_AGE_OK:-1}" -eq 1 ] \
+           && [ -n "$(find "$dir.break" -prune -mmin +10 -print 2>/dev/null)" ]; then
+            say "  clearing an abandoned break marker at $dir.break"
+            rmdir "$dir.break" 2>/dev/null || true
+            cleared_break=1
+        fi
+        if [ "$cleared_break" -eq 0 ] \
+           && [ "${FIND_AGE_OK:-1}" -eq 1 ] \
            && [ -n "$(find "$dir" -prune -mmin +10 -print 2>/dev/null)" ] \
            && mkdir "$dir.break" 2>/dev/null; then
             owner_now="$(cat "$dir/owner" 2>/dev/null || true)"
@@ -287,7 +305,7 @@ take_lock() {   # take_lock <dir> <what>
         [ "$waited" -le 300 ] || refuse "timed out waiting for the $what lock at $dir
 Another run is holding it, or it was left behind. Remove it by hand if
 no other run is in flight:
-    rm -rf $dir$([ "${FIND_AGE_OK:-1}" -eq 1 ] || printf '%s' "
+    rm -rf $dir $dir.break$([ "${FIND_AGE_OK:-1}" -eq 1 ] || printf '%s' "
 
 This build of find rejects '-prune -mmin', so the stale-lock
 takeover is disabled here and a lock left by a killed run will never be
@@ -1655,6 +1673,16 @@ git -C "$WT" remote remove origin >>"$RUN_LOG" 2>&1 || true
 # work is worse than no harness.
 printf 'bot-run surface for %s\n' "$TASK_ID" > "$WT/.git/bot-surface"
 
+# Everything the runner does after the agent's turn is `git -C "$WT"`,
+# and the first thing git does with that is ask `.git` where the
+# repository is. `.git` is the agent's to write - that is F-28 - and the
+# answer need not be a directory: a symlink, or a one-line
+# `gitdir: /somewhere/else` file, is a valid `.git`. Then the hook
+# cleanup, the config enumeration, the evidence reads and the push all
+# run against a repository the agent chose. Record which one this is
+# while it is still only ours; the disarm checks it has not changed.
+SURFACE_GIT_DIR="$(git -C "$WT" rev-parse --absolute-git-dir 2>/dev/null || true)"
+
 # --shared means the base objects are read out of $ORIGIN_REPO through
 # alternates rather than copied here. A surface kept as evidence - a
 # conflict, a red re-verify, a push that failed - therefore depends on
@@ -1804,8 +1832,9 @@ fi
 #   1. The hook directory is emptied and pointed at a runner-owned
 #      empty directory through GIT_CONFIG_*, which behaves like `-c`
 #      and so outranks anything in the surface's config.
-#   2. Local config keys that name a command are enumerated from what
-#      is actually there and unset. Enumerating beats a deny-list of
+#   2. Local config keys that name a command - or name where the
+#      repository and its worktree are - are enumerated from what is
+#      actually there and unset. Enumerating beats a deny-list of
 #      guesses: `--name-only` reports the keys the agent really wrote.
 #   3. The exported GIT_CONFIG_* pairs apply to every git invocation
 #      for the rest of the run, including the ones in $ORIGIN_REPO.
@@ -1824,8 +1853,38 @@ fi
 # check sees it. Named in #349 rather than left implied.
 # --------------------------------------------------------------------
 
+SURFACE_HIJACKED=""
 if [ "$SKIP_AGENT" -eq 0 ]; then
     step "Disarm"
+
+    # Before anything is read or written through it: is `.git` still the
+    # directory this run made? Every check below - and every git call
+    # after them - trusts `.git` to say where the repository is, so a
+    # redirect here is not one hole among the others, it is the floor
+    # they all stand on. The impostor is removed rather than followed,
+    # which leaves `git -C "$WT"` unable to resolve anything; the
+    # evidence reads are all guarded, so that arrives as an unreadable
+    # tree and a blocked run instead of measurements of somebody else's
+    # repository.
+    GIT_DIR_NOW="$(git -C "$WT" rev-parse --absolute-git-dir 2>/dev/null || true)"
+    if [ -n "$SURFACE_GIT_DIR" ] && [ -d "$WT/.git" ] && [ ! -L "$WT/.git" ] \
+        && [ "$GIT_DIR_NOW" = "$SURFACE_GIT_DIR" ]; then
+        :
+    else
+        if [ -L "$WT/.git" ] || { [ -e "$WT/.git" ] && [ ! -d "$WT/.git" ]; }; then
+            # A symlink or a `gitdir:` file: not the repository, only a
+            # pointer at one. Removing the pointer takes nothing with it.
+            rm -f "$WT/.git"
+            SURFACE_HIJACKED="the surface's .git was replaced with a link or a gitdir: file"
+        else
+            # A directory, but not the one this run created. Left alone:
+            # whatever is in there, an `rm -rf` decided by a mismatch is
+            # not how this runner finds out what.
+            SURFACE_HIJACKED="the surface's .git no longer resolves to ${SURFACE_GIT_DIR:-the directory this run created} (now: ${GIT_DIR_NOW:-unreadable})"
+        fi
+        say "  $SURFACE_HIJACKED"
+        board "surface-hijacked" "$WT"
+    fi
 
     EMPTY_HOOKS="$STATE/empty-hooks"
     mkdir -p "$EMPTY_HOOKS"
@@ -1834,23 +1893,56 @@ if [ "$SKIP_AGENT" -eq 0 ]; then
     # (`.sample` suffix); anything else in there after the agent ran is
     # the agent's. Removing the directory outright is simpler than
     # deciding which is which.
-    rm -rf "$WT/.git/hooks"
-    mkdir -p "$WT/.git/hooks"
+    #
+    # Skipped when the repository was swapped: there is nothing of ours
+    # left in there to disarm, and `mkdir -p "$WT/.git/hooks"` would
+    # build a fresh half-repository exactly where the impostor was taken
+    # away. The GIT_CONFIG_* exports below still happen - they apply to
+    # every git call for the rest of the run, including the ones in
+    # $ORIGIN_REPO, and that is not conditional on this surface.
+    if [ -z "$SURFACE_HIJACKED" ]; then
+        rm -rf "$WT/.git/hooks"
+        mkdir -p "$WT/.git/hooks"
+    fi
 
     DISARMED=""
     # while-read, not a `for` over `$(...)`: a subsection name may
     # contain a space (`filter.my driver.clean` is a legal key) and word
     # splitting would hand `config --unset` two halves of one name.
-    CONFIG_KEYS="$(git -C "$WT" config --local --list --name-only 2>/dev/null || true)"
+    CONFIG_KEYS=""
+    [ -n "$SURFACE_HIJACKED" ] \
+        || CONFIG_KEYS="$(git -C "$WT" config --local --list --name-only 2>/dev/null || true)"
     while IFS= read -r key; do
         [ -n "$key" ] || continue
         case "$key" in
-            core.hookspath|core.fsmonitor|core.sshcommand|core.pager|core.editor             |core.askpass|core.gitproxy|diff.external|alias.*|*.textconv             |filter.*.clean|filter.*.smudge|filter.*.process             |*.helper|uploadpack.*|receivepack.*|*.sshcommand|*.proxy \
-            |url.*.insteadof|url.*.pushinsteadof|remote.*.pushurl|remote.*.url)
+            core.hookspath|core.fsmonitor|core.sshcommand \
+            |core.pager|core.editor|core.askpass|core.gitproxy \
+            |diff.external|alias.*|*.textconv \
+            |filter.*.clean|filter.*.smudge|filter.*.process \
+            |*.helper|uploadpack.*|receivepack.*|*.sshcommand|*.proxy \
+            |url.*.insteadof|url.*.pushinsteadof|remote.*.pushurl|remote.*.url \
+            |core.worktree)
                 git -C "$WT" config --local --unset-all "$key" >/dev/null 2>&1 || true
                 DISARMED="${DISARMED:+$DISARMED, }$key" ;;
         esac
     done <<< "$CONFIG_KEYS"
+
+    # The last one on that list is a different kind of thing from the
+    # rest, and it is there for the same reason. `core.worktree` names no
+    # program; it names the directory git treats as the working tree.
+    # Point it at the user's home and the runner's own `status`, `add`,
+    # `diff` and `commit` read and publish files from there - no hook, no
+    # filter, nothing executed, the whole measurement just quietly about
+    # somewhere else. A clone does not set it, so anything found here was
+    # put there after the clone was made.
+    #
+    # `core.bare` was on this list for one round and came off it: a clone
+    # is born with `core.bare = false`, so unsetting it fired on every
+    # single run and turned `config-disarmed` - which is supposed to mean
+    # "the agent wrote something it should not have" - into a line that
+    # appears always and therefore says nothing. An agent that sets it
+    # true breaks the measurement rather than redirecting it, and a
+    # worktree git refuses to read is already a blocked run.
 
     # Highest precedence, and for every git call from here on rather
     # than per call site - a disarm that has to be remembered at thirty
@@ -1861,7 +1953,11 @@ if [ "$SKIP_AGENT" -eq 0 ]; then
     export GIT_CONFIG_KEY_1="core.fsmonitor"
     export GIT_CONFIG_VALUE_1="false"
 
-    say "  hooks emptied, core.hooksPath -> $EMPTY_HOOKS"
+    if [ -n "$SURFACE_HIJACKED" ]; then
+        say "  nothing to disarm - the repository this run made is gone"
+    else
+        say "  hooks emptied, core.hooksPath -> $EMPTY_HOOKS"
+    fi
     [ -z "$DISARMED" ] || {
         say "  unset in the surface's config: $DISARMED"
         board "config-disarmed" "$DISARMED"
@@ -1926,7 +2022,13 @@ for chan in "${CHANNELS[@]}"; do
     if [ -L "$WT/$chan" ]; then
         chan_bad="a symlink"
     elif [ -f "$WT/$chan" ] \
-        && [ -n "$(find "$WT/$chan" -maxdepth 0 -links +1 2>/dev/null)" ]; then
+        && [ -n "$(find "$WT/$chan" -prune -links +1 -print 2>/dev/null)" ]; then
+        # `-prune -print` and not `-maxdepth 0`, for the reason
+        # take_lock spells out: same "this path only", and POSIX rather
+        # than a GNU extension. On a find that rejects -maxdepth the
+        # command fails, the substitution is empty, and the guard waves
+        # through the one case it exists for - on macOS, which this lab
+        # says it supports.
         # A hard link is the same trick with nothing to see: `-L` is
         # false, `-f` is true, and the file *is* the host's file - same
         # inode, same content - so `mv` publishes it just as well. More
@@ -2021,8 +2123,16 @@ fi
 
 COMMITTED_BY="agent"
 RUNNER_COMMIT_NOTE=""
-if [ "$TASK_PRODUCES" = "commit" ] && [ -z "$AGENT_BLOCKED" ] && [ "$AGENT_EXIT" -eq 0 ]; then
-    LEFTOVER="$(git -C "$WT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$TASK_PRODUCES" = "commit" ] && [ -z "$AGENT_BLOCKED" ] \
+    && [ "$AGENT_EXIT" -eq 0 ] && [ -z "$SURFACE_HIJACKED" ]; then
+    # Guarded like the evidence reads further down, and it was the one
+    # git call between the disarm and them that was not: `2>/dev/null`
+    # hides the message, it does not stop `pipefail` from failing the
+    # pipeline and `set -e` from taking the script out at 128 - with no
+    # handoff, and the live task left on `dispatched`. A tree that
+    # cannot be read has nothing to commit; the verdict below says why.
+    LEFTOVER="$(git -C "$WT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')" \
+        || LEFTOVER=0
     if [ "${LEFTOVER:-0}" -gt 0 ]; then
         step "Commit"
         say "  $LEFTOVER path(s) left uncommitted - committing them"
@@ -2107,13 +2217,27 @@ else
     # cannot delete it invisibly.
     TOUCHED="$(git -C "$WT" -c core.quotepath=off diff --name-only --no-renames "$BASE_SHA..HEAD" 2>/dev/null)" \
         || { TOUCHED=""; TREE_BROKEN=1; }
-    NUMSTAT="$(git -C "$WT" diff --shortstat "$BASE_SHA..HEAD" | sed 's/^ *//')"
+    # Guarded like the three reads above, and for the same reason: a
+    # surface whose alternates the agent removed resolves HEAD and not
+    # $BASE_SHA, so this fails, and an unguarded pipeline under
+    # `pipefail` takes the script out before it writes the blocked
+    # handoff it promises. An empty result is "nothing changed"; a
+    # failure is "nobody knows", and those must not print the same line.
+    NUMSTAT="$(git -C "$WT" diff --shortstat "$BASE_SHA..HEAD" 2>/dev/null | sed 's/^ *//')" \
+        || { NUMSTAT="(diff unreadable)"; TREE_BROKEN=1; }
     [ -n "$NUMSTAT" ] || NUMSTAT="no committed changes"
 
     # CLAUDE.md, and the charter's acceptance criterion 4. It was in the
     # charter and nowhere in the code, which made it a suggestion - see
     # F-18. Added lines only: pre-existing debt is not this bot's.
-    TODO_VIOLATIONS="$(git -C "$WT" diff -U0 "$BASE_SHA..HEAD" \
+    # git and grep are separated on purpose. `grep` exits 1 when it
+    # matches nothing, so the whole pipeline needs `|| true` - and with
+    # the diff inside that pipeline, a diff that *could not be read*
+    # comes out as "no violations found", which is the one answer this
+    # check must never give by accident.
+    TODO_DIFF="$(git -C "$WT" diff -U0 "$BASE_SHA..HEAD" 2>/dev/null)" \
+        || { TODO_DIFF=""; TREE_BROKEN=1; }
+    TODO_VIOLATIONS="$(printf '%s\n' "$TODO_DIFF" \
         | grep -E '^\+' | grep -Ev '^\+\+\+' \
         | grep -E 'TODO|FIXME' | grep -Ev '#[0-9]+' || true)"
 fi
@@ -2328,7 +2452,24 @@ run_verify "$HEAD_SHA"
 # then deleted the branch. See F-4.
 BLOCKERS="none"
 NOOP=0
-if [ "$TREE_BROKEN" -eq 1 ]; then
+if [ -n "$SURFACE_HIJACKED" ]; then
+    # Above the unreadable worktree, because it is the reason for it:
+    # removing the redirect is what left git with nothing to resolve.
+    STATUS="blocked"
+    # No backticks in this string. Every BLOCKERS value is a
+    # double-quoted heredoc-ish block, so a backtick pair in the prose
+    # is command substitution: the first draft said "goes through
+    # `git -C $WT`", which ran git with no subcommand, pasted its help
+    # text into the blocker, and exited 1 under `set -e` - killing the
+    # run, with no handoff, at the exact moment it had just caught an
+    # agent redirecting the runner's tools.
+    BLOCKERS="$SURFACE_HIJACKED.
+Every measurement this runner makes goes through 'git -C $WT', and that
+asks .git which repository it is about. An agent that answers that
+question has not answered the task: it has aimed the runner's own tools,
+which run outside the sandbox, at a repository of its choosing. The
+pointer was removed unfollowed and nothing here was measured."
+elif [ "$TREE_BROKEN" -eq 1 ]; then
     STATUS="blocked"
     BLOCKERS="worktree is unreadable - git could not resolve HEAD in $WT"
 elif [ -n "$TREE_MUTATED" ]; then
@@ -2379,8 +2520,15 @@ $VERIFY_TAIL}
 Full output: $RUN_LOG"
 elif [ -n "$PROTECTED_IN_DIFF" ]; then
     STATUS="blocked"
+    # Backticks would be command substitution here, not quotation marks
+    # - see the note in the surface-hijacked branch above. This one
+    # shipped: it ran `git add` with no pathspec in the runner's own
+    # working directory on every blocked-by-a-secret run, and the only
+    # reason it was never noticed is that git answers a bare `git add`
+    # with "Nothing specified, nothing added." and exit 0. That sentence
+    # then went into the handoff where the words "git add" belonged.
     BLOCKERS="this commit carries files that never travel:"$'\n'"$PROTECTED_IN_DIFF
-They are excluded from every `git add` this runner performs and from
+They are excluded from every 'git add' this runner performs and from
 the surface's exclude file, so one reaching a commit means an agent put
 it there deliberately. Nothing is pushed."
 elif [ -n "$SCOPE_VIOLATIONS" ]; then
@@ -2609,18 +2757,41 @@ $RUN_LOG for what git said."
         [ "$BRANCH_NOW" = "$PRE_REBASE_HEAD" ] || BRANCH_MOVED="${BRANCH_NOW:-(gone)}"
 
         if [ -n "$BRANCH_MOVED" ]; then
+            # `rebase --abort` is allowed to fail here: the replay may
+            # have finished, in which case there is nothing to abort.
+            # What matters is not whether either command exited 0 but
+            # whether the ref is back, which is a question with an
+            # answer - so ask it. "It has been put back" was printed
+            # unconditionally before, including when both restoring
+            # commands had failed and the branch was left at an
+            # unverified replayed tip.
             git -C "$WT" rebase --abort >>"$RUN_LOG" 2>&1 || true
             git -C "$WT" update-ref "refs/heads/$TASK_BRANCH" "$PRE_REBASE_HEAD" \
                 >>"$RUN_LOG" 2>&1 || true
+            BRANCH_RESTORED="$(git -C "$WT" rev-parse --verify -q \
+                "refs/heads/$TASK_BRANCH" 2>/dev/null || true)"
             reattach keep
-            REBASE_STATE="the branch moved during a detached replay - put back"
-            say "  $REBASE_STATE"
             board "rebase-stuck" "branch moved under a detached replay"
             STATUS="blocked"
-            BLOCKERS="$TASK_BRANCH was replayed on a detached head precisely so that it
+            if [ "$BRANCH_RESTORED" = "$PRE_REBASE_HEAD" ]; then
+                REBASE_STATE="the branch moved during a detached replay - put back"
+                say "  $REBASE_STATE"
+                BLOCKERS="$TASK_BRANCH was replayed on a detached head precisely so that it
 could not move, and it moved anyway: ${PRE_REBASE_HEAD:0:12} ->
 $BRANCH_MOVED. It has been put back, and this run is not reporting a
 verdict built on a tree something else was editing. See $RUN_LOG."
+            else
+                REBASE_STATE="the branch moved during a detached replay and could not be put back"
+                say "  $REBASE_STATE"
+                BLOCKERS="$TASK_BRANCH was replayed on a detached head precisely so that it
+could not move, it moved anyway (${PRE_REBASE_HEAD:0:12} -> $BRANCH_MOVED),
+and restoring it failed: it now reads ${BRANCH_RESTORED:-(gone)}.
+That tip is a replay nothing verified. Nothing may be built on this
+branch or merged from it until somebody puts it back by hand:
+    git -C $ORIGIN_REPO update-ref refs/heads/$TASK_BRANCH $PRE_REBASE_HEAD
+${PRE_REBASE_HEAD:0:12} is the tree that passed the verifier against
+${BASE_SHA:0:12}. See $RUN_LOG for what git said."
+            fi
         elif [ "$REBASE_EXIT" -ne 0 ]; then
             REBASE_CONFLICTS="$(git -C "$WT" -c core.quotepath=off \
                 diff --name-only --diff-filter=U 2>/dev/null | sort -u || true)"
@@ -2694,8 +2865,15 @@ decision, not a cleanup rule."
                 # can land a patch on a path the original diff never
                 # touched, so the check that ran on the old diff has not
                 # been run on this one.
+                # `|| true` here used to turn a diff that could not be
+                # read into an empty one, and an empty one means "no
+                # path is out of scope and none is protected" - so a
+                # damaged object store was a way past both checks and
+                # onto the branch-moving path below. Keep the status.
+                REBASED_DIFF_BROKEN=0
                 REBASED_TOUCHED="$(git -C "$WT" -c core.quotepath=off \
-                    diff --name-only --no-renames "$NEW_BASE_SHA..$REBASED_HEAD" 2>/dev/null || true)"
+                    diff --name-only --no-renames "$NEW_BASE_SHA..$REBASED_HEAD" 2>/dev/null)" \
+                    || { REBASED_TOUCHED=""; REBASED_DIFF_BROKEN=1; }
                 REBASED_SCOPE=""
                 REBASED_PROTECTED=""
                 if [ -n "$REBASED_TOUCHED" ]; then
@@ -2763,6 +2941,20 @@ The replay ran on a detached head, so $TASK_BRANCH never left
 ${PRE_REBASE_HEAD:0:12} - the tree that passed - and the evidence
 recorded below is still true of it.${TREE_MUTATED:+
 The re-verify also changed the worktree: $TREE_MUTATED}"
+                elif [ "$REBASED_DIFF_BROKEN" -eq 1 ]; then
+                    # Above protected and scope because it is the reason
+                    # neither could be checked, and above the move
+                    # because an unchecked diff is not permission to
+                    # move anything.
+                    REBASE_STATE="the rebased diff could not be read - branch not moved"
+                    board "rebase-stuck" "rebased diff unreadable"
+                    STATUS="blocked"
+                    REBASE_KEPT_REASON="the work replayed onto ${NEW_BASE_SHA:0:12} and the diff of the
+result could not be read at all. Scope and protected paths are checked
+against that diff, and a replay is not a copy - it can land a patch on a
+path the original never touched - so neither check has been run on this
+tree. $TASK_BRANCH was left on ${PRE_REBASE_HEAD:0:12}, where both did
+pass. See $RUN_LOG."
                 elif [ -n "$REBASED_PROTECTED" ]; then
                     # Ahead of scope: one of these is a file in the
                     # wrong place, the other is a secret.
@@ -2802,7 +2994,8 @@ was left on ${PRE_REBASE_HEAD:0:12}, where the diff was in bounds."
                         COMMITS="$REBASED_COMMITS"
                         TOUCHED="$REBASED_TOUCHED"
                         NUMSTAT="$(git -C "$WT" diff --shortstat "$BASE_SHA..HEAD" \
-                            | sed 's/^ *//')"
+                            2>/dev/null | sed 's/^ *//')" \
+                            || { NUMSTAT="(diff unreadable)"; TREE_BROKEN=1; }
                         [ -n "$NUMSTAT" ] || NUMSTAT="no committed changes"
                         # The live task records the base its worktree
                         # stands on, and the overlap scan expands other
@@ -3307,6 +3500,23 @@ if [ -n "$CLEAN_WHY" ]; then
         board "clean-failed" "$CLEAN_FAILED"
         STATUS="needs-review"
         set_status "$STATUS"
+        # And the handoff, which still says `status: done` in its
+        # frontmatter - the machine-readable half, and the half a board
+        # consumer reads. One record with two answers in it is worse
+        # than either answer: the task file would say needs-review while
+        # the document describing the same run said done.
+        # The address is `1,/^---$/`: line 1 is the opening delimiter and
+        # sed looks for the end pattern from line 2 on, so the range is
+        # exactly the frontmatter.
+        HANDOFF_TMP="$HANDOFF.$$"
+        if sed "1,/^---$/s/^status: .*/status: $STATUS/" "$HANDOFF" \
+                > "$HANDOFF_TMP" 2>/dev/null \
+            && mv "$HANDOFF_TMP" "$HANDOFF"; then
+            :
+        else
+            rm -f "$HANDOFF_TMP"
+            say "  warning: the handoff still says 'status: done' - could not rewrite it"
+        fi
         {
             printf '\n# Cleanup failed\n\n'
             printf 'The run finished (%s), but %s could not be\n' "$CLEAN_WHY" "$CLEAN_FAILED"

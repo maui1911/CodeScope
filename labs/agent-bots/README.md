@@ -305,11 +305,91 @@ detects that it happened.
 
 ---
 
+### 3.6 Threat model
+
+The list above is where this section used to live, and it is why twelve
+rounds of review kept finding the same thing in twelve shapes: it stops
+at *an agent might be sloppy or wrong*. The sentence it was missing:
+
+> **The agent's output is an input to the runner's tools.**
+
+Everything the agent produces is read back by a program that runs
+outside the sandbox, with the runner's privileges, in reach of the
+control plane and of the user's own project. The diff is the part
+everyone remembers to check. It is not the only thing being read.
+
+#### Who this defends against
+
+Not a determined attacker who already has a shell on this machine —
+that game is over before it starts. The adversary here is an agent that
+is confused, over-helpful, trained on a habit that does not apply, or
+steered by text it read while working. None of those is distinguishable
+from malice at the boundary, so the mechanisms are written as if it were
+malice: *it probably meant well* is not a property a runner can measure.
+
+#### What the agent controls, and what reads it back
+
+| Surface | What the agent can do with it | What holds it |
+|---|---|---|
+| The worktree | write anything anywhere, in scope or not | scope check against `touches:`, protected paths, `PROTECTED_IN_DIFF` — F-17, F-34 |
+| `.git` | name programs the runner's own git then runs; answer *which repository is this*; move the working tree somewhere else | the disarm: hooks emptied, command-naming config enumerated and unset, `.git`'s identity compared against the one recorded at creation — F-36, F-37 |
+| The channels | make `.bot-blocked`, `.bot-commit-msg` or the report a symlink or a hard link to a host file, and have it harvested into the control plane | the channel guard: links are removed unread, not followed — F-36 |
+| Its own prose | assert findings nobody checked, describe work it did not do | the claim verifier, evidence read off the tree rather than off the summary — F-23, F-33 |
+| Its exit code | claim success | the verifier, in a clean checkout the agent never touched — F-13 |
+| Its commit | put a secret in the tree itself, past every pathspec | the diff is checked after the fact, not only the `add` — F-34 |
+
+#### The five rules the mechanisms come from
+
+1. **Nothing the agent wrote decides what the runner executes, or
+   where.** Hooks, `core.hooksPath`, `diff.external`, `filter.*.clean`,
+   `url.*.insteadOf`, `core.worktree`, the identity of `.git` itself.
+2. **Nothing the agent wrote is believed about the tree.** The tree is
+   read. The summary is a claim that explains a verdict; it never is
+   one.
+3. **What leaves the surface is content the runner copied, never a path
+   the runner followed.** A symlink is a name for somewhere else, and
+   nowhere else is this run's to carry out.
+4. **Every claim carries something checkable back to the blob.** A
+   citation proves a file was opened; the quote proves the line was
+   read.
+5. **A measurement that could not be taken is not an empty
+   measurement.** A diff that failed is not a diff with nothing in it, a
+   push that exited 0 is not a push that landed, and a restore that ran
+   is not a restore that worked. This is the one that hides, because
+   `|| true` spells *unknown* and *nothing* identically.
+
+#### Knowingly open
+
+- **The agent's process is not confined.** It runs with the runner's
+  privileges. The sandbox is a worktree convention, not a kernel
+  boundary — everything above is about what the *runner* will act on,
+  not about what the agent can reach.
+- **The project's object store is readable from the surface.** That is
+  what `--shared` means; `objects/info/alternates` still names the path
+  after the remote is removed.
+- **`verify:` is host execution sourced from repo content** (F-6), and
+  so is the charter's `agent:` argv.
+- **Content filters** need a `filter.<n>.clean` *and* a `.gitattributes`
+  naming it. The config half is disarmed; the tracked half arrives
+  through the diff, where the scope check sees it — #349.
+- **The agent reads more than the charter** and the runner cannot
+  enumerate it (F-7).
+
+#### When a finding is finished
+
+When you can say which of the five rules it serves, and what reads the
+thing it produced. A new finding is *the same one again* when it is one
+of those five at a site nobody had looked at yet — which is what the
+last three rounds were, and why they felt endless. The rules end the
+list; the sites do not.
+
+---
+
 ## 4. What the prototype covers
 
 | | |
 |---|---|
-| Covered | plain-folder projects as well as git ones; the file contract; **two bots** (`fixer`, `reviewer`), two deliverables (`produces: commit`, `produces: report`), the handoff between them and a scheduler that reads the board; contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the report channel (`artifact:`, `shape:`, harvested into `.state/artifacts/`) with citations *and* quotes checked against the blob; verifier, in a clean checkout of the branch tip; evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup; rebase onto a base that moved, re-verified there |
+| Covered | plain-folder projects as well as git ones; the file contract; **two bots** (`fixer`, `reviewer`), two deliverables (`produces: commit`, `produces: report`), the handoff between them and a scheduler that reads the board; contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the report channel (`artifact:`, `shape:`, harvested into `.state/artifacts/`) with citations *and* quotes checked against the blob; verifier, in a clean checkout of the branch tip; the surface disarm (hooks, command-naming config, `core.worktree`, and the identity of `.git` itself); evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup; rebase onto a base that moved, re-verified there |
 | **Not** covered | the approval inbox, per-bot memory, re-verifying a branch that is *waiting* rather than running, resume after a crash, any trigger other than "someone ran a tick", pushing, opening PRs, any GPUI surface |
 
 Two deliberate omissions:
@@ -2749,3 +2829,103 @@ been asked here, because the threat model in the README stops at "an
 agent might be sloppy or wrong". It does not say "an agent's output is
 an input to my tools", and that sentence is the one this finding is
 about.
+
+---
+
+### F-37 · A measurement that could not be taken is not an empty measurement
+
+*2026-09-12, the twelfth round.*
+
+Nine findings, and they read as a direct continuation of the one before:
+the reviewer had picked up the thread and started pulling. Two of them
+were structural.
+
+**`.git` need not be a directory.**
+
+The disarm empties the hooks and unsets the config through
+`git -C "$WT"`, and the first thing git does with `-C` is ask `.git`
+where the repository is. A one-line file reading
+`gitdir: /somewhere/else` is a valid `.git` — it is the form every
+linked worktree uses, so it is not a trick git tolerates by accident.
+Write one before the turn ends and the hook cleanup, the config
+enumeration, the evidence, the commit and the push all run against a
+repository the agent picked. The disarm was standing on the one thing
+it had not checked.
+
+The clone's git dir is recorded at creation now and compared before
+anything is read through it. A pointer that has changed is removed
+unfollowed rather than resolved, which leaves git unable to answer
+anything about the surface — and every evidence read is guarded, so
+that arrives as an unreadable tree and a blocked run with a verdict that
+names the swap, instead of measurements of somebody else's repository.
+`hijacker.sh` does it with a `gitdir:` file, which needs no symlink
+privilege and therefore runs on Windows too.
+
+**`core.worktree` names no program, and that is why it was missed.**
+
+The disarm's deny-list was built by asking *which keys name something
+git will execute*. `core.worktree` names a directory. Set it and the
+runner's own `status`, `add`, `diff` and `commit` read and publish files
+from wherever it points — nothing executed, no hook, no filter, the
+whole measurement just quietly about somewhere else. The rule was too
+narrow by one word: it is not *what git runs*, it is *what git does and
+where*.
+
+`core.bare` went on the same list and came off it in the same session.
+A clone is born with `core.bare = false`, so unsetting it fired on every
+run, and `config-disarmed` — an event that is supposed to mean *the
+agent wrote something it should not have* — appeared on the board every
+single time. A signal that is always on is not a signal.
+
+**And the class the other seven belong to.**
+
+- `$dir.break` is the mutex that serialises breaking a stale lock, held
+  for two reads and an `rm -rf`. A run killed inside that window left it
+  behind for ever: every later `mkdir` of it failed, so the stale path
+  was never entered again and the abandoned lock outlived every waiter.
+  The recovery mechanism had a permanent failure of its own.
+- `rebase --abort` and `update-ref` both had their exit status
+  discarded, and the handoff said "it has been put back" either way. The
+  ref is read back now; if it is not the tree that verified, the run
+  says so and names the command to fix it by hand.
+- The rebased diff was read with `|| true`, so a damaged object store
+  produced an empty diff — and an empty diff means no path is out of
+  scope and none is protected. Both gates open, on the branch-moving
+  path.
+- `git diff --shortstat` and `git status --porcelain` were unguarded
+  under `pipefail`: the script exits 128 with no handoff and the live
+  task stuck on `dispatched`. The second of those was the one that
+  turned the new `.git` check from a blocked run into a crash, the first
+  time it fired.
+- `find -maxdepth` is GNU, in a guard on a lab that says it supports BSD
+  `find` — and 20 lines above it, `take_lock` uses the portable
+  `-prune ... -print` for exactly this reason.
+- A failed cleanup downgraded the task to `needs-review` while the
+  handoff's frontmatter still said `status: done`. One run, one record,
+  two answers.
+- `drop_sweep_tasks` took a task id as proof of ownership, and
+  `T-0006-fix` is what the runner derives from `T-0006` — an id a human
+  running the shipped examples has too. The sweep now refuses to start
+  while any of its ids already exist, rather than deleting them: the
+  only sound claim to a file is having created it.
+
+**And one that was found while fixing them,** which is the finding in
+miniature. The new blocker text read *"goes through `git -C $WT`"*, with
+backticks, inside a double-quoted shell string. Backticks are command
+substitution. The sentence ran git, pasted its help output into the
+blocker, and exited 1 under `set -e` — killing the run, with no handoff,
+at the precise moment it had just caught an agent redirecting the
+runner's tools. Grepping for the rest turned up one that had shipped:
+*"excluded from every `git add` this runner performs"* ran a bare
+`git add` in the runner's own working directory on every
+blocked-by-a-secret run, and went unnoticed only because git answers
+that with "Nothing specified, nothing added." and exit 0.
+
+Prose that looks like documentation was an input to the shell. Which is
+the threat model with the agent taken out of it, and the reason it is
+now written down as §3.6 rather than implied by thirty-seven findings:
+**a measurement that could not be taken is not an empty measurement**,
+and the same `|| true` that hides a broken diff hides a broken restore,
+a broken push, and a broken `add`. The sweep is 67 checks now; four of
+them are this round, and one of those is a lock left deliberately
+wedged.
