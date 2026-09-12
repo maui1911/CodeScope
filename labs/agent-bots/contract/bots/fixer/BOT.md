@@ -1,6 +1,7 @@
 ---
 id: fixer
 agent: claude
+produces: commit
 ---
 
 # Bot: fixer
@@ -13,6 +14,10 @@ A charter, not a prompt. It describes the job, the boundaries, and what
 Close small, well-specified defects in `codescope-core`. One task, one
 branch, one concern. The fixer does not design, does not refactor
 opportunistically, and does not expand scope.
+
+The charter declares `produces: commit`. A task handed to this bot that
+asks for a report instead is refused at dispatch: what a bot does is
+its charter's to say, not a task's. See README F-32.
 
 ## Primary job
 
@@ -44,7 +49,9 @@ change the job.
 - Edit files matching the task `touches:` globs.
 - Run the task `verify:` command, plus any read-only command
   (`cargo check`, `cargo test`, `git diff`, `grep`).
-- Commit to the current branch.
+- Commit to the current branch — or, if your sandbox will not let
+  you write to `.git`, leave the changes in the tree and write the
+  message to `.bot-commit-msg`. The runner commits what you leave.
 
 ## Actions not allowed
 
@@ -57,6 +64,12 @@ change the job.
 ## Output
 
 One commit on the branch. That is the whole of it.
+
+If you cannot make it, the runner will — but only the message is yours
+to write, so write it. `.bot-commit-msg` in the worktree root, the
+message you would have used, nothing else. A change that lands with no
+explanation is committed and still not `done`: no verifier reads
+reasons, so an unexplained diff goes to a human.
 
 You do **not** write the handoff. The runner writes it from
 `templates/HANDOFF.md` after reading the tree and running the verifier,

@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 #
-# review-shape.sh - the verifier for a `kind: review` task.
+# review-shape.sh - the verifier for the reviewer's report.
+#
+# One shape among several: `produces: report` says a task leaves a file
+# beside the tree, and `shape:` says which template that file has to
+# match. This is the verifier for templates/REVIEW.md. Another report
+# role brings its own template and its own checker; the runner hands
+# every one of them the same three facts.
 #
 # "No verifier, no dispatch" is the rule, and a review has no cargo
 # command that can prove it. What it does have is a shape, and a set of
@@ -20,8 +26,13 @@
 #
 # The runner exports what it needs; there are no arguments.
 #
-#   BOT_REVIEW        path to the harvested review
+#   BOT_REVIEW        path to the harvested report
 #   BOT_REVIEWED_SHA  the commit the worktree was checked out at
+#
+# Named for the reviewer rather than for the role, because the
+# runner exporting them lives at base while this script is read from
+# the checkout under test - so the pair can only be renamed once
+# both halves are already merged. See #348.
 #   BOT_TOUCHES       the task's touches: globs, comma-separated
 #   BOT_TASK_ID       the task this review is supposed to answer
 #
@@ -31,7 +42,7 @@ set -euo pipefail
 
 fail() { printf 'review-shape: %s\n' "$*" >&2; exit 1; }
 
-[ -n "${BOT_REVIEW:-}" ] || fail "BOT_REVIEW is not set - this verifier is for kind: review tasks"
+[ -n "${BOT_REVIEW:-}" ] || fail "BOT_REVIEW is not set - this verifier is for produces: report tasks"
 [ -f "$BOT_REVIEW" ] || fail "no review at $BOT_REVIEW"
 
 field() {
@@ -150,12 +161,48 @@ split_globs "${BOT_TOUCHES:-}"
 [ "${#GLOBS_OUT[@]}" -gt 0 ] \
     || fail "BOT_TOUCHES ('${BOT_TOUCHES:-}') normalises to no globs, so nothing can be in scope"
 
+# --------------------------------------------------------------------
+# The claims, against the tree they are about
+#
+# Everything above checks that a citation *resolves*: the file is there
+# at that commit, the line is inside it, the path is in scope. That
+# catches an invented path and an invented coordinate and nothing else.
+# A reviewer can still point at a line that really exists and describe
+# something that is not on it - which is the failure mode that reads
+# most like competence, because every mechanical property checks out.
+#
+# So a finding also quotes what it is about, and the quote has to be
+# there. Substring, not equality: quoting a fragment of a long line is
+# the honest way to cite one, and a fragment cannot be guessed either.
+# Whitespace is normalised on both sides, because re-indenting a quote
+# is not the same as inventing one.
+#
+# This does not move F-19's ceiling. Nothing here can tell you whether
+# the finding is *right* - only that the reviewer was looking at the
+# line it says it was looking at. That is the difference between having
+# read the file and having read the file listing.
+# --------------------------------------------------------------------
+
+# Below this, a match proves nothing: `{` occurs on half the lines in
+# any Rust file, and a quote that identifies nothing is not evidence.
+# Counted without whitespace, so indentation cannot pad it.
+QUOTE_MIN=8
+
+norm() {   # norm <text> - collapse whitespace runs, trim both ends
+    printf '%s' "$1" | tr '\t' ' ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//'
+}
+
 COUNT=0
-while IFS= read -r citation; do
-    [ -n "$citation" ] || continue
+CUR_CITE=""
+CUR_QUOTE=""
+CUR_QN=0
+
+check_finding() {
+    local path line lines ok g i src want have dense last
+    [ -n "$CUR_CITE" ] || return 0
     COUNT=$((COUNT + 1))
-    path="${citation%:*}"
-    line="${citation##*:}"
+    path="${CUR_CITE%:*}"
+    line="${CUR_CITE##*:}"
 
     git cat-file -e "$BOT_REVIEWED_SHA:$path" 2>/dev/null \
         || fail "finding cites '$path', which does not exist at $BOT_REVIEWED_SHA"
@@ -163,7 +210,12 @@ while IFS= read -r citation; do
     [ "$(git cat-file -t "$BOT_REVIEWED_SHA:$path" 2>/dev/null)" = "blob" ] \
         || fail "finding cites '$path', which is not a file at $BOT_REVIEWED_SHA"
 
-    lines="$(git cat-file blob "$BOT_REVIEWED_SHA:$path" | wc -l | tr -d ' ')"
+    # awk, not `wc -l`: wc counts newlines, so a file whose last line
+    # has none - generated config, a hand-edited fixture - comes back one
+    # short, and a finding citing that last line is refused as past the
+    # end of a file it is inside. awk counts records, and an unterminated
+    # final line is a record.
+    lines="$(git cat-file blob "$BOT_REVIEWED_SHA:$path" | awk 'END { print NR }')"
     if [ "$line" -lt 1 ] || [ "$line" -gt "$lines" ]; then
         fail "finding cites '$path:$line', but that file has $lines lines at $BOT_REVIEWED_SHA"
     fi
@@ -175,7 +227,82 @@ while IFS= read -r citation; do
     done
     [ "$ok" -eq 1 ] \
         || fail "finding cites '$path', which is outside touches: ${BOT_TOUCHES:-}"
-done <<< "$CITED"
 
-echo "review-shape: ok - $COUNT cited path:line(s), $VERDICT"
+    [ "$CUR_QN" -gt 0 ] || fail "the finding at '$CUR_CITE' quotes nothing.
+
+Every finding quotes the code it is about, on '> ' lines under its
+bullet. A citation that resolves proves a file was opened; a quote that
+matches proves this line was read."
+
+    dense="$(norm "$(printf '%s' "$CUR_QUOTE" | tr '\n' ' ')" | tr -d ' ')"
+    [ "${#dense}" -ge "$QUOTE_MIN" ] \
+        || fail "the quote under '$CUR_CITE' carries ${#dense} characters of content.
+Anything shorter than $QUOTE_MIN matches too much to be evidence. Quote more
+of the line, or more lines."
+
+    # A multi-line quote is consecutive lines starting at the cited one.
+    # Reading the window in one go rather than a line at a time: the
+    # blob is fetched once per finding, not once per quoted line.
+    last=$((line + CUR_QN - 1))
+    [ "$last" -le "$lines" ] \
+        || fail "the quote under '$CUR_CITE' is $CUR_QN lines long, which runs past the end
+of '$path' ($lines lines at $BOT_REVIEWED_SHA)"
+
+    src="$(git cat-file blob "$BOT_REVIEWED_SHA:$path" | sed -n "${line},${last}p")"
+
+    i=0
+    while IFS= read -r want; do
+        i=$((i + 1))
+        want="$(norm "$want")"
+        # A blank quote line is not a claim about anything. It still
+        # costs an index, so a quote can straddle a blank source line
+        # without the ones after it sliding.
+        [ -n "$want" ] || continue
+        have="$(norm "$(printf '%s\n' "$src" | sed -n "${i}p")")"
+        case "$have" in
+            *"$want"*) ;;
+            *) fail "the quote under '$CUR_CITE' is not what is at that line.
+
+  $path:$((line + i - 1)) is
+      $have
+  the review quotes
+      $want" ;;
+        esac
+    done <<< "$CUR_QUOTE"
+}
+
+# One pass over the findings, pairing each bullet with the quote lines
+# that follow it. A bullet may wrap over several lines - the template
+# does it - so anything that is not a new bullet and not a quote line
+# belongs to the prose and is ignored.
+while IFS= read -r ln; do
+    case "$ln" in
+        -[[:space:]]*)
+            check_finding
+            CUR_CITE="$(printf '%s\n' "$ln" \
+                | sed -n 's/^-[[:space:]]\{1,\}\([^[:space:]]\{1,\}\):\([0-9]\{1,\}\).*/\1:\2/p')"
+            CUR_QUOTE=""
+            CUR_QN=0
+            ;;
+        *)
+            stripped="${ln#"${ln%%[![:space:]]*}"}"
+            case "$stripped" in
+                '>'*)
+                    q="${stripped#>}"
+                    q="${q# }"
+                    if [ "$CUR_QN" -eq 0 ]; then
+                        CUR_QUOTE="$q"
+                    else
+                        CUR_QUOTE="$CUR_QUOTE
+$q"
+                    fi
+                    CUR_QN=$((CUR_QN + 1))
+                    ;;
+            esac
+            ;;
+    esac
+done <<< "$FINDINGS_BODY"
+check_finding
+
+echo "review-shape: ok - $COUNT cited and quoted finding(s), $VERDICT"
 exit 0

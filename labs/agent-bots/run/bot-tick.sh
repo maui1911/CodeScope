@@ -60,6 +60,15 @@ usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//;$d';
 
 TASK_DIRS=()
 STATE=""
+# Whether the caller named one, which is a different fact from which
+# one is in use. bot-run reads the *presence* of --state as proof that
+# somebody coordinated the control plane on purpose, and so waives its
+# refusal to run from a linked worktree on the default plane. Forwarding
+# the option unconditionally made that proof automatic: two linked
+# checkouts would each resolve their own default state directory, each
+# be told it was deliberate, and dispatch overlapping work at each
+# other. Forward the flag only when it was actually given.
+STATE_EXPLICIT=""
 REPO=""
 MAX=1
 PARALLEL=1
@@ -72,7 +81,7 @@ WATCH=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --tasks)     TASK_DIRS+=("${2:-}"); shift 2 ;;
-        --state)     STATE="${2:-}"; shift 2 ;;
+        --state)     STATE="${2:-}"; STATE_EXPLICIT=1; shift 2 ;;
         --repo)      REPO="${2:-}"; shift 2 ;;
         --max)       MAX="${2:-}"; shift 2 ;;
         --parallel)  PARALLEL="${2:-}"; shift 2 ;;
@@ -90,11 +99,18 @@ REPO="${REPO:-$(git -C "$LAB_DIR" rev-parse --show-toplevel)}"
 STATE="${STATE:-$LAB_DIR/.state}"
 mkdir -p "$STATE"
 STATE="$(cd "$STATE" && pwd)"
+# An array rather than `${VAR:+--state $STATE}`: a state directory is a
+# path, and a path is allowed a space in it.
+STATE_ARGS=()
+[ -z "$STATE_EXPLICIT" ] || STATE_ARGS=(--state "$STATE")
 BOARD="$STATE/board.md"
 
 if [ "${#TASK_DIRS[@]}" -eq 0 ]; then
     TASK_DIRS=("$LAB_DIR/examples" "$STATE/proposed")
 fi
+
+# shellcheck source=approval.sh
+. "$SCRIPT_DIR/approval.sh"
 
 RUNNER="$SCRIPT_DIR/bot-run.sh"
 [ -x "$RUNNER" ] || [ -f "$RUNNER" ] || die "no runner at $RUNNER"
@@ -189,6 +205,7 @@ FAILURES=0
 
 decide_and_run() {
     local dispatched_this_tick=0
+    local inbox_count=0
     local -a to_dispatch=()
     local -a to_dispatch_reset=()
 
@@ -197,6 +214,7 @@ decide_and_run() {
     printf '%s\n' "---------------------------------------------------------------------------------"
 
     local dir file id owner every schedule live status worktree decision why reset
+    local inbox_why approved
     local attempts outcomes last_outcome blocked_streak
     for dir in ${TASK_DIRS[@]+"${TASK_DIRS[@]}"}; do
         [ -d "$dir" ] || continue
@@ -233,10 +251,31 @@ decide_and_run() {
             last_outcome="${last_outcome:-never}"
             blocked_streak="$(consecutive_blocked "$id")"
 
+            # A proposal was written by a bot, and the scheduler reads
+            # the proposal directory alongside the repository's own
+            # tasks - so without this, one bot's conclusion started
+            # another bot's work with nobody in between. Worse than it
+            # sounds: a derived task used to inherit `schedule:` from
+            # the review that produced it, so a recurring review made a
+            # recurring fix task.
+            inbox_why=""
+            approved=""
+            if approval_is_proposal "$file" "$STATE"; then
+                case "$(approval_state_file "$file")" in
+                    ok)    approved=1 ;;
+                    stale) inbox_why="approved, then edited - approve it again" ;;
+                    *)     inbox_why="waiting for approval" ;;
+                esac
+            fi
+
             decision="ready"
             why="never run"
 
-            if [ "$schedule" != "auto" ]; then
+            if [ -n "$inbox_why" ]; then
+                decision="inbox"
+                why="$inbox_why"
+                inbox_count=$((inbox_count + 1))
+            elif [ "$schedule" != "auto" ] && [ -z "$approved" ]; then
                 # The gate, and it is opt-in on purpose. A scheduler
                 # that runs everything it can find will run the first
                 # fixture somebody drops in the examples folder - and
@@ -305,6 +344,16 @@ decide_and_run() {
         done
     done
 
+    # Ahead of "nothing to dispatch", because those are different
+    # sentences and only one of them asks the reader for something. A
+    # tick that ends quiet while three proposals sit waiting has not
+    # finished; it is holding a queue nobody has been shown.
+    if [ "$inbox_count" -gt 0 ]; then
+        say ""
+        say "inbox: $inbox_count proposal(s) waiting for approval"
+        say "    bash $SCRIPT_DIR/bot-approve.sh"
+    fi
+
     [ "${#to_dispatch[@]}" -gt 0 ] || { say ""; say "nothing to dispatch"; return 0; }
 
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -334,7 +383,7 @@ decide_and_run() {
         bash "$RUNNER" \
             --task "${to_dispatch[$i]}" \
             --repo "$REPO" \
-            --state "$STATE" \
+            ${STATE_ARGS[@]+"${STATE_ARGS[@]}"} \
             ${to_dispatch_reset[$i]:+${to_dispatch_reset[$i]}} \
             ${CHAIN:+$CHAIN} \
             > "$STATE/runs/tick-$(basename "${to_dispatch[$i]}" .md).out" 2>&1 &
