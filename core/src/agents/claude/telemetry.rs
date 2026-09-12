@@ -1329,6 +1329,15 @@ mod tests {
     const MODEL_STDOUT: &str = r#"{"parentUuid":"d1eeb7b9-…","isSidechain":false,"promptId":"daf3a846-…","type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to \u001b[1mOpus 5 (1M context)\u001b[22m and saved as your default for new sessions</local-command-stdout>"},"uuid":"70319ba8-…","timestamp":"2026-08-15T19:22:54.460Z","userType":"external","entrypoint":"cli","cwd":"C:\\dev\\codescope-public","sessionId":"8aa860f5-…","version":"2.1.233","gitBranch":"main"}"#;
     /// `/clear` answer: nothing printed, so a `system` entry instead.
     const CLEAR_STDOUT: &str = r#"{"parentUuid":"3ff4f733-…","isSidechain":false,"type":"system","subtype":"local_command","content":"<local-command-stdout></local-command-stdout>","level":"info","timestamp":"2026-09-11T06:51:27.219Z","uuid":"d5e8e2ca-…","isMeta":false,"userType":"external","entrypoint":"cli","cwd":"C:\\dev\\codescope-public","sessionId":"c96c3d3a-…","version":"2.1.268"}"#;
+    /// `/effort high` — the command in the issue's own repro. It was
+    /// missing from the transcripts this rule was derived from, so it
+    /// was covered by argument rather than by evidence until somebody
+    /// ran it. Same shape as `/model`, which is the point: the rule is
+    /// keyed on the answer, not on a list of command names.
+    const EFFORT_INVOCATION: &str = r#"{"parentUuid":"7c11eae0-…","isSidechain":false,"promptId":"13b90a4f-…","type":"user","message":{"role":"user","content":"<command-name>/effort</command-name>\n            <command-message>effort</command-message>\n            <command-args>high</command-args>"},"uuid":"b72e1cda-…","timestamp":"2026-09-12T18:41:24.562Z","userType":"external","entrypoint":"cli","cwd":"C:\\dev\\codescope-public","sessionId":"c96c3d3a-…","version":"2.1.268","gitBranch":"fix/telemetry-slash-command-busy"}"#;
+    /// `/effort high` answer, captured 2026-09-12.
+    const EFFORT_STDOUT: &str = r#"{"parentUuid":"b72e1cda-…","isSidechain":false,"promptId":"13b90a4f-…","type":"user","message":{"role":"user","content":"<local-command-stdout>Set effort level to high (saved as your default for new sessions): Comprehensive implementation with extensive testing and documentation</local-command-stdout>"},"uuid":"0882b682-…","timestamp":"2026-09-12T18:41:24.562Z","userType":"external","entrypoint":"cli","cwd":"C:\\dev\\codescope-public","sessionId":"c96c3d3a-…","version":"2.1.268","gitBranch":"fix/telemetry-slash-command-busy"}"#;
+
     /// `/m` invocation — a project command that expands into a prompt.
     const M_INVOCATION: &str = r#"{"parentUuid":"98e6783e-…","isSidechain":false,"promptId":"09ac6ae5-…","type":"user","message":{"role":"user","content":"<command-message>m</command-message>\n<command-name>/m</command-name>"},"uuid":"88b9f93d-…","timestamp":"2026-09-11T06:51:38.667Z","origin":{"kind":"human"},"userType":"external","entrypoint":"cli","cwd":"C:\\dev\\codescope-public","sessionId":"c96c3d3a-…","version":"2.1.268","gitBranch":"main"}"#;
     /// `/m` expansion (`isMeta: true`). A model turn follows this one.
@@ -1344,7 +1353,12 @@ mod tests {
         assert_eq!(system.kind, EntryKind::Other);
         assert!(system.local_command_answer);
 
-        for line in [MODEL_INVOCATION, M_INVOCATION, M_EXPANSION] {
+        // The repro's own command, captured after the rule was written.
+        let effort = parse_line(EFFORT_STDOUT).expect("should parse");
+        assert_eq!(effort.kind, EntryKind::User);
+        assert!(effort.local_command_answer);
+
+        for line in [MODEL_INVOCATION, EFFORT_INVOCATION, M_INVOCATION, M_EXPANSION] {
             assert!(!parse_line(line).expect("should parse").local_command_answer);
         }
     }
@@ -1418,6 +1432,25 @@ mod tests {
         // changed by itself.
         append_lines(&path, &[CLEAR_STDOUT]);
         assert!(read_lines(&path, &mut tail, &mut snap, &mut last_user_ts));
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Idle);
+    }
+
+    #[test]
+    fn the_repro_command_goes_idle() {
+        // `/effort high`, invocation then answer, exactly as issue #343
+        // describes typing it.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, &[EFFORT_INVOCATION]);
+
+        let mut tail = FileTail::default();
+        let mut snap: Option<TelemetrySnapshot> = None;
+        let mut last_user_ts = None;
+        read_lines(&path, &mut tail, &mut snap, &mut last_user_ts);
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Busy);
+
+        append_lines(&path, &[EFFORT_STDOUT]);
+        read_lines(&path, &mut tail, &mut snap, &mut last_user_ts);
         assert_eq!(snap.as_ref().unwrap().state, SessionState::Idle);
     }
 
