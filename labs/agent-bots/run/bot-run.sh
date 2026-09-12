@@ -585,6 +585,16 @@ fi
 if [ "$DRY_RUN" -eq 0 ] && approval_is_proposal "$TASK" "$STATE"; then
     SNAP_ID="$(approval_field id "$TASK")"
     SNAP_ID="${SNAP_ID:-$(basename "$TASK" .md)}"
+    # The same rule the task id is held to further down, applied here
+    # because this is earlier: the snapshot builds a path out of a field
+    # read from a file, and the check that this is a single harmless
+    # segment lives three hundred lines below. Whoever can write a
+    # proposal can also write its approval, so this is not an escalation
+    # - it is a path assembled from file content before anything had
+    # looked at it, which is how F-35 keeps happening.
+    case "$SNAP_ID" in
+        *[!a-zA-Z0-9_-]*|"") die "task id must be [a-zA-Z0-9_-]+, got '$SNAP_ID'" ;;
+    esac
     mkdir -p "$STATE/tmp"
     TASK_SNAPSHOT="$STATE/tmp/dispatched-$SNAP_ID.md"
     cp "$TASK" "$TASK_SNAPSHOT"
