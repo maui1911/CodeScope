@@ -127,28 +127,30 @@ if [ -n "$MEMORY_REF" ]; then
     NOTE="$(memory_ref_path "$MEMORY_REF")"
     NOTE_BOT="${MEMORY_REF%%/*}"
 
+    NOTE_TEXT="$(cat "$NOTE")"
+
     if [ "$REVOKE" -eq 1 ]; then
-        [ "$(memory_state "$NOTE")" != "none" ] \
+        [ "$(memory_state "$NOTE_TEXT")" != "none" ] \
             || die "$MEMORY_REF is not approved - nothing to revoke"
-        awk '
+        printf '%s\n' "$NOTE_TEXT" | awk '
             /^---[[:space:]]*$/ { fence++; print; next }
             fence == 1 && /^approved_(by|at|body):/ { next }
             { print }
-        ' "$NOTE" > "$NOTE.tmp" && mv "$NOTE.tmp" "$NOTE"
+        ' > "$NOTE.tmp" && mv "$NOTE.tmp" "$NOTE"
         printf 'revoked: %s is no longer read back into prompts\n' "$MEMORY_REF"
         exit 0
     fi
 
-    if [ "$(memory_state "$NOTE")" = "ok" ]; then
+    if [ "$(memory_state "$NOTE_TEXT")" = "ok" ]; then
         printf '%s is already approved by %s\n' \
-            "$MEMORY_REF" "$(memory_field approved_by "$NOTE")"
+            "$MEMORY_REF" "$(memory_field approved_by "$NOTE_TEXT")"
         exit 0
     fi
 
     # The shape check again, here rather than only at harvest. A note on
     # disk is a file somebody may have edited since, and this is the
     # last point before it starts arriving in prompts.
-    NOTE_REFUSED="$(memory_body_refused "$(memory_body "$NOTE")")"
+    NOTE_REFUSED="$(memory_body_refused "$(memory_body "$NOTE_TEXT")")"
     [ -z "$NOTE_REFUSED" ] || die "refusing to approve $MEMORY_REF: $NOTE_REFUSED"
 
     # The cap is refused, not rotated. Dropping the oldest to make room
@@ -165,7 +167,7 @@ if [ -n "$MEMORY_REF" ]; then
         printf 'fact had been pushed out. Retire one first:\n\n' >&2
         for f in "$(memory_dir "$STATE" "$NOTE_BOT")"/*.md; do
             [ -f "$f" ] || continue
-            [ "$(memory_state "$f")" = "ok" ] || continue
+            [ "$(memory_state_file "$f")" = "ok" ] || continue
             printf '    --forget %s/%s\n' "$NOTE_BOT" "$(basename "$f")" >&2
         done
         exit 1
@@ -174,9 +176,12 @@ if [ -n "$MEMORY_REF" ]; then
     WHO="$(git -C "${REPO:-$LAB_DIR}" config user.email 2>/dev/null || true)"
     [ -n "$WHO" ] || WHO="${USER:-${USERNAME:-unknown}}"
     WHEN="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    BODY="$(memory_body_hash "$NOTE")"
+    # The hash is of the bytes already in hand, and the rewrite below
+    # reads from those same bytes rather than opening the note again -
+    # otherwise an approval could be stamped onto text nobody hashed.
+    BODY="$(memory_body_hash "$NOTE_TEXT")"
 
-    awk -v who="$WHO" -v when="$WHEN" -v body="$BODY" '
+    printf '%s\n' "$NOTE_TEXT" | awk -v who="$WHO" -v when="$WHEN" -v body="$BODY" '
         /^---[[:space:]]*$/ {
             fence++
             if (fence == 2 && !done) {
@@ -189,9 +194,9 @@ if [ -n "$MEMORY_REF" ]; then
         }
         fence == 1 && /^approved_(by|at|body):/ { next }
         { print }
-    ' "$NOTE" > "$NOTE.tmp" && mv "$NOTE.tmp" "$NOTE"
+    ' > "$NOTE.tmp" && mv "$NOTE.tmp" "$NOTE"
 
-    [ "$(memory_state "$NOTE")" = "ok" ] \
+    [ "$(memory_state_file "$NOTE")" = "ok" ] \
         || die "wrote an approval to $NOTE and it does not read back as valid"
 
     BOARD="$STATE/board.md"
@@ -213,7 +218,12 @@ fi
 # --------------------------------------------------------------------
 
 if [ -z "$TASK" ] && [ -z "$TASK_ID" ]; then
-    [ -d "$PROPOSED" ] || { printf 'inbox: empty - no proposals at %s\n' "$PROPOSED"; exit 0; }
+    # No early exit when the proposal directory is absent. A run that
+    # only ever committed creates .state/bots/<bot>/memory and
+    # never .state/proposed, so bailing out here reported an empty
+    # shared inbox while notes were sitting in it. The glob below
+    # yields nothing on its own, which is the same thing said without
+    # skipping the rest of the queue.
     # A proposal is kept after it runs - it is the record of what was
     # dispatched - so listing every file in here would have the count
     # stop meaning "waiting" after the first one completed. What belongs
@@ -225,22 +235,30 @@ if [ -z "$TASK" ] && [ -z "$TASK_ID" ]; then
     # if you can see the difference.
     found=0
     done_count=0
+    running_count=0
     for f in "$PROPOSED"/*.md; do
         [ -f "$f" ] || continue
-        id="$(approval_field id "$f")"
+        ftext="$(cat "$f")"
+        id="$(approval_field id "$ftext")"
         live_status=""
         [ -z "$id" ] || [ ! -f "$STATE/tasks/$id.md" ] \
-            || live_status="$(approval_field status "$STATE/tasks/$id.md")"
+            || live_status="$(approval_field_file status "$STATE/tasks/$id.md")"
         case "$live_status" in
-            ""|todo|dispatched) ;;
+            ""|todo) ;;
+            # In flight: it is running right now, so there is nothing
+            # for a reader to do about it and printing an approval
+            # command next to it would be an instruction to nowhere.
+            # Counted, because "not in the queue" and "not happening"
+            # are different.
+            dispatched) running_count=$((running_count + 1)); continue ;;
             *) done_count=$((done_count + 1)); continue ;;
         esac
         found=$((found + 1))
-        title="$(approval_field title "$f")"
-        owner="$(approval_field owner "$f")"
-        state="$(approval_state "$f")"
+        title="$(approval_field title "$ftext")"
+        owner="$(approval_field owner "$ftext")"
+        state="$(approval_state "$ftext")"
         case "$state" in
-            ok)    mark="approved by $(approval_field approved_by "$f")" ;;
+            ok)    mark="approved by $(approval_field approved_by "$ftext")" ;;
             stale) mark="APPROVAL STALE - the task changed after it was approved" ;;
             *)     mark="waiting" ;;
         esac
@@ -253,6 +271,8 @@ if [ -z "$TASK" ] && [ -z "$TASK_ID" ]; then
         printf '\n%s proposal(s) waiting. To let one run:\n' "$found"
         printf '    bash %s --id <id>\n' "${BASH_SOURCE[0]}"
     fi
+    [ "$running_count" -eq 0 ] \
+        || printf '%s in flight right now.\n' "$running_count"
     [ "$done_count" -eq 0 ] \
         || printf '%s more already ran and are kept as the record of what was dispatched.\n' \
             "$done_count"
@@ -269,14 +289,15 @@ if [ -z "$TASK" ] && [ -z "$TASK_ID" ]; then
         [ -d "$md" ] || continue
         for f in "$md"/*.md; do
             [ -f "$f" ] || continue
-            st="$(memory_state "$f")"
+            ftext="$(cat "$f")"
+            st="$(memory_state "$ftext")"
             [ "$st" != "ok" ] || continue
             [ "$mem_waiting" -ne 0 ] || printf '\nnotes waiting to be remembered:\n'
             mem_waiting=$((mem_waiting + 1))
             printf '  %s/%s  (from %s)%s\n' \
-                "$b" "$(basename "$f")" "$(memory_field from "$f")" \
+                "$b" "$(basename "$f")" "$(memory_field from "$ftext")" \
                 "$([ "$st" = "stale" ] && printf ' - EDITED SINCE IT WAS APPROVED' || true)"
-            printf '      %s\n' "$(memory_body "$f" | sed '/^[[:space:]]*$/d' | tr '\n' ' ')"
+            printf '      %s\n' "$(memory_body "$ftext" | sed '/^[[:space:]]*$/d' | tr '\n' ' ')"
         done
     done
     if [ "$mem_waiting" -gt 0 ]; then
@@ -306,24 +327,34 @@ Only proposals are gated. A task committed to the repository is already
 the thing an approval is trying to establish: a human wrote it, somebody
 reviewed it, and it was merged."
 
-ID="$(approval_field id "$TASK")"
+# One read. The id, the state, the hash and the rewrite are all of
+# these bytes. Three separate opens of a file in a directory anybody may
+# edit is how an approval gets stamped onto text nobody hashed - which
+# is the defect the review found in the memory half. This is the same
+# defect in the task half, found by going looking for it rather than by
+# being told.
+TASK_TEXT="$(cat "$TASK")"
+
+ID="$(approval_field id "$TASK_TEXT")"
 [ -n "$ID" ] || die "$TASK has no 'id:' - it is not a task file"
 
 if [ "$REVOKE" -eq 1 ]; then
-    [ "$(approval_state "$TASK")" != "none" ] || die "$ID is not approved - nothing to revoke"
-    awk '
+    [ "$(approval_state "$TASK_TEXT")" != "none" ] \
+        || die "$ID is not approved - nothing to revoke"
+    printf '%s\n' "$TASK_TEXT" | awk '
         /^---[[:space:]]*$/ { fence++; print; next }
         fence == 1 && /^approved_(by|at|body):/ { next }
         { print }
-    ' "$TASK" > "$TASK.tmp" && mv "$TASK.tmp" "$TASK"
+    ' > "$TASK.tmp" && mv "$TASK.tmp" "$TASK"
     printf 'revoked: %s is back in the inbox\n' "$ID"
     exit 0
 fi
 
-STATE_NOW="$(approval_state "$TASK")"
+STATE_NOW="$(approval_state "$TASK_TEXT")"
 if [ "$STATE_NOW" = "ok" ]; then
     printf '%s is already approved by %s at %s\n' \
-        "$ID" "$(approval_field approved_by "$TASK")" "$(approval_field approved_at "$TASK")"
+        "$ID" "$(approval_field approved_by "$TASK_TEXT")" \
+        "$(approval_field approved_at "$TASK_TEXT")"
     exit 0
 fi
 
@@ -338,9 +369,9 @@ WHEN="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # approval lines in it - which is exactly what approval_body_hash
 # computes afterwards, so the two agree by construction rather than by
 # both being careful.
-BODY="$(approval_body_hash "$TASK")"
+BODY="$(approval_body_hash "$TASK_TEXT")"
 
-awk -v who="$WHO" -v when="$WHEN" -v body="$BODY" '
+printf '%s\n' "$TASK_TEXT" | awk -v who="$WHO" -v when="$WHEN" -v body="$BODY" '
     /^---[[:space:]]*$/ {
         fence++
         if (fence == 2 && !done) {
@@ -353,9 +384,9 @@ awk -v who="$WHO" -v when="$WHEN" -v body="$BODY" '
     }
     fence == 1 && /^approved_(by|at|body):/ { next }
     { print }
-' "$TASK" > "$TASK.tmp" && mv "$TASK.tmp" "$TASK"
+' > "$TASK.tmp" && mv "$TASK.tmp" "$TASK"
 
-[ "$(approval_state "$TASK")" = "ok" ] \
+[ "$(approval_state_file "$TASK")" = "ok" ] \
     || die "wrote an approval to $TASK and it does not read back as valid - nothing was approved"
 
 BOARD="$STATE/board.md"

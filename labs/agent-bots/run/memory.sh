@@ -28,6 +28,14 @@
 #   - A note names the run that produced it and the commit it was
 #     about, so a reader can go and look. F-23: prose is a claim about
 #     what happened, and the thing that happened is somewhere else.
+#
+# Every function here takes *text*, not a path, and that is the point
+# rather than a style choice. Validating a file and then rendering it is
+# two opens of something a third party may replace in between - the note
+# that went into the prompt need not be the note whose approval was
+# checked. So a caller reads the bytes once and asks every question of
+# those same bytes. The `_file` wrappers exist for the places that
+# genuinely only have a name, and each of them reads exactly once.
 
 # At most this many approved notes per bot, and this much of them. Both
 # are checked where the note becomes live, not where it is written: a
@@ -40,10 +48,9 @@ MEMORY_MAX_TOTAL_BYTES=8000
 # memory_dir <state> <bot>
 memory_dir() { printf '%s/bots/%s/memory\n' "$1" "$2"; }
 
-# memory_field <key> <file> - the frontmatter reader, named so that
-# sourcing this cannot shadow a caller's own.
+# memory_field <key> <text> - the frontmatter reader.
 memory_field() {
-    awk -v key="$1" '
+    printf '%s\n' "$2" | awk -v key="$1" '
         /^---[[:space:]]*$/ { fence++; next }
         fence == 1 && !found && index($0, key ":") == 1 {
             value = substr($0, length(key) + 2)
@@ -53,15 +60,29 @@ memory_field() {
             found = 1
         }
         fence > 1 { exit }
-    ' "$2"
+    '
 }
 
-# memory_body <file> - everything after the frontmatter.
+# memory_body <text> - everything after the frontmatter.
 memory_body() {
-    awk '
+    printf '%s\n' "$1" | awk '
         /^---[[:space:]]*$/ { fence++; next }
         fence >= 2 { print }
-    ' "$1"
+    '
+}
+
+# memory_body_hash <text>
+#
+# Through the lab's repository, for the reason approval.sh spells out:
+# `git hash-object` takes its object format from wherever it is run, and
+# a note that hashes two ways is a note that goes stale by being read
+# from a different directory.
+memory_body_hash() {
+    printf '%s\n' "$1" | awk '
+        /^---[[:space:]]*$/ { fence++; print; next }
+        fence == 1 && /^approved_(by|at|body):/ { next }
+        { print }
+    ' | git -C "$(approval_hash_repo)" hash-object --stdin
 }
 
 # memory_body_refused <text> - empty if the text may be remembered,
@@ -89,16 +110,22 @@ memory_body_refused() {
     fi
 }
 
-# memory_state <file> -> none | stale | ok
+# memory_state <text> -> none | stale | ok
 #
-# The same three fields and the same rule as a proposed task: the
-# approval carries a hash of the note with the approval lines removed,
-# so a note edited after somebody read it is `stale` and not live.
+# All three approval fields, because the contract says three and an
+# approval missing its timestamp is an approval nobody can date. A
+# truncated one used to pass on `approved_by` plus a matching hash and
+# then render a blank `approved_at` wherever it was shown.
+#
+# `stale` is a state of its own and not a kind of `none`: one has never
+# been looked at, the other was looked at and then changed underneath
+# the person who looked, and those send a reader to do different things.
 memory_state() {
-    local who body
+    local who when body
     who="$(memory_field approved_by "$1")"
+    when="$(memory_field approved_at "$1")"
     body="$(memory_field approved_body "$1")"
-    if [ -z "$who" ] || [ -z "$body" ]; then
+    if [ -z "$who" ] || [ -z "$when" ] || [ -z "$body" ]; then
         printf 'none\n'
     elif [ "$body" = "$(memory_body_hash "$1")" ]; then
         printf 'ok\n'
@@ -107,45 +134,29 @@ memory_state() {
     fi
 }
 
-# memory_body_hash <file>
-#
-# Through the lab's repository, for the reason approval.sh spells out:
-# `git hash-object` takes its object format from wherever it is run, and
-# a note that hashes two ways is a note that goes stale by being read
-# from a different directory.
-memory_body_hash() {
-    awk '
-        /^---[[:space:]]*$/ { fence++; print; next }
-        fence == 1 && /^approved_(by|at|body):/ { next }
-        { print }
-    ' "$1" | git -C "$(approval_hash_repo)" hash-object --stdin
-}
+# memory_state_file <file> - one read, then every question of those
+# bytes. Convenience for a caller that has a name and no text yet.
+memory_state_file() { memory_state "$(cat "$1")"; }
 
 # memory_approved_count <state> <bot>
+#
+# One read per note, and only the number the cap is about. A companion
+# that also returned the waiting count was written first and had no
+# caller: bot-approve lists the waiting notes rather than counting them,
+# because a queue whose contents nobody can see is just a number.
 memory_approved_count() {
     local dir f n=0
     dir="$(memory_dir "$1" "$2")"
-    [ -d "$dir" ] || { printf '0\n'; return 0; }
-    for f in "$dir"/*.md; do
-        [ -f "$f" ] || continue
-        [ "$(memory_state "$f")" = "ok" ] || continue
-        n=$((n + 1))
-    done
+    if [ -d "$dir" ]; then
+        for f in "$dir"/*.md; do
+            [ -f "$f" ] || continue
+            [ "$(memory_state "$(cat "$f")")" = "ok" ] || continue
+            n=$((n + 1))
+        done
+    fi
     printf '%s\n' "$n"
 }
 
-# memory_waiting_count <state> <bot>
-memory_waiting_count() {
-    local dir f n=0
-    dir="$(memory_dir "$1" "$2")"
-    [ -d "$dir" ] || { printf '0\n'; return 0; }
-    for f in "$dir"/*.md; do
-        [ -f "$f" ] || continue
-        [ "$(memory_state "$f")" = "ok" ] && continue
-        n=$((n + 1))
-    done
-    printf '%s\n' "$n"
-}
 
 # memory_block <state> <bot>
 #
@@ -153,26 +164,32 @@ memory_waiting_count() {
 # at all when there are none, because an empty "what you have learned"
 # heading teaches a bot that the section is furniture.
 #
+# Each note is read once and both the approval check and the rendering
+# are done against those bytes. Two opens would mean a note replaced in
+# between goes into the prompt carrying somebody's approval of different
+# text, which is the whole mechanism defeated by a race.
+#
 # Sorted by file name, which is the timestamp, so the order a reader
 # sees is the order the bot learned them. Total size is enforced here as
 # well as at approval: approvals accumulate over months and this is the
 # one place that knows what the prompt actually gets.
 memory_block() {
-    local dir f body from at n=0 total=0 bytes out=""
+    local dir f text body from at n=0 total=0 bytes out=""
     dir="$(memory_dir "$1" "$2")"
     [ -d "$dir" ] || return 0
     for f in "$dir"/*.md; do
         [ -f "$f" ] || continue
-        [ "$(memory_state "$f")" = "ok" ] || continue
-        body="$(memory_body "$f" | sed '/^[[:space:]]*$/d')"
+        text="$(cat "$f")"
+        [ "$(memory_state "$text")" = "ok" ] || continue
+        body="$(memory_body "$text" | sed '/^[[:space:]]*$/d')"
         [ -n "$body" ] || continue
         bytes="$(printf '%s' "$body" | wc -c | tr -d ' ')"
         total=$((total + bytes))
         [ "$total" -le "$MEMORY_MAX_TOTAL_BYTES" ] || break
         n=$((n + 1))
         [ "$n" -le "$MEMORY_MAX_NOTES" ] || break
-        from="$(memory_field from "$f")"
-        at="$(memory_field at "$f")"
+        from="$(memory_field from "$text")"
+        at="$(memory_field at "$text")"
         out="$out  - (from ${from:-an earlier run}${at:+, ${at:0:12}}) $(printf '%s' "$body" | tr '\n' ' ')
 "
     done

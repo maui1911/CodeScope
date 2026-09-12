@@ -261,7 +261,7 @@ decide_and_run() {
             inbox_why=""
             approved=""
             if approval_is_proposal "$file" "$STATE"; then
-                case "$(approval_state "$file")" in
+                case "$(approval_state_file "$file")" in
                     ok)    approved=1 ;;
                     stale) inbox_why="approved, then edited - approve it again" ;;
                     *)     inbox_why="waiting for approval" ;;

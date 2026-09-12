@@ -261,7 +261,17 @@ release_locks() {
     for d in ${LOCKS_HELD[@]+"${LOCKS_HELD[@]}"}; do _release_one "$d"; done
     LOCKS_HELD=()
 }
-trap release_locks EXIT
+
+# The private copy of the task goes with the locks: it is this
+# invocation's and nobody else may read it, so leaving it behind would
+# turn $STATE/tmp into a pile of half-dispatched tasks that look like
+# records. The record of what was dispatched is published separately,
+# and only once the gate has passed.
+on_exit() {
+    release_locks
+    [ -z "${SNAPSHOT_HELD:-}" ] || rm -f "$SNAPSHOT_HELD"
+}
+trap on_exit EXIT
 
 take_lock() {   # take_lock <dir> <what>
     local dir="$1" what="$2" waited=0 owner_before owner_now cleared_break
@@ -583,7 +593,7 @@ fi
 # the snapshot. Same lesson as the lock protocol (F-38): the thing you
 # compared has to be the thing you use.
 if [ "$DRY_RUN" -eq 0 ] && approval_is_proposal "$TASK" "$STATE"; then
-    SNAP_ID="$(approval_field id "$TASK")"
+    SNAP_ID="$(approval_field_file id "$TASK")"
     SNAP_ID="${SNAP_ID:-$(basename "$TASK" .md)}"
     # The same rule the task id is held to further down, applied here
     # because this is earlier: the snapshot builds a path out of a field
@@ -596,9 +606,18 @@ if [ "$DRY_RUN" -eq 0 ] && approval_is_proposal "$TASK" "$STATE"; then
         *[!a-zA-Z0-9_-]*|"") die "task id must be [a-zA-Z0-9_-]+, got '$SNAP_ID'" ;;
     esac
     mkdir -p "$STATE/tmp"
-    TASK_SNAPSHOT="$STATE/tmp/dispatched-$SNAP_ID.md"
-    cp "$TASK" "$TASK_SNAPSHOT"
+    # Per invocation, not per task. One name shared by every run of a
+    # task is a second copy of the bug this snapshot exists to fix: two
+    # dispatches of T-x, the first validates, the second overwrites, and
+    # the first then parses and copies bytes nothing checked. The run
+    # token is unique to this process, and `set -C` means creating the
+    # file is the claim rather than a hope about names.
+    TASK_SNAPSHOT="$STATE/tmp/dispatch-$SNAP_ID-$RUN_TOKEN.md"
+    ( set -C; : > "$TASK_SNAPSHOT" ) 2>/dev/null \
+        || die "could not create a private copy of the task at $TASK_SNAPSHOT"
+    cat "$TASK" > "$TASK_SNAPSHOT"
     TASK="$TASK_SNAPSHOT"
+    SNAPSHOT_HELD="$TASK_SNAPSHOT"
 fi
 
 if approval_is_proposal "$TASK" "$STATE" \
@@ -607,15 +626,20 @@ if approval_is_proposal "$TASK" "$STATE" \
     # before the surface, before the frontmatter is parsed into globals
     # - because a refusal that has already created something is not a
     # refusal. That costs one extra read of one field.
-    GATE_ID="$(approval_field id "$TASK")"
+    # One read, then every question of those bytes. $TASK is this run's
+    # private snapshot by now, so nobody else can change it underneath
+    # these lines - but the shape is the one that survives somebody
+    # moving this block, and this gate is where that matters most.
+    GATE_TEXT="$(cat "$TASK")"
+    GATE_ID="$(approval_field id "$GATE_TEXT")"
     GATE_ID="${GATE_ID:-$(basename "$TASK" .md)}"
-    case "$(approval_state "$TASK")" in
+    case "$(approval_state "$GATE_TEXT")" in
         ok) ;;
         stale)
             refuse "$GATE_ID was approved and then edited.
 
-    approved by: $(approval_field approved_by "$TASK")
-    approved at: $(approval_field approved_at "$TASK")
+    approved by: $(approval_field approved_by "$GATE_TEXT")
+    approved at: $(approval_field approved_at "$GATE_TEXT")
 
 An approval records a hash of the task as it read at the time, so this
 one no longer describes the file. Somebody agreed to something else.
@@ -634,6 +658,12 @@ want, and is a decision rather than a default.
 
 The runner's --chain does it without asking, and says so on the board." ;;
     esac
+
+    # Only now. This file is the record of the bytes a dispatch ran
+    # with, so writing it before the gate would have every refusal -
+    # including the stale-approval one - overwrite the record of the
+    # last thing that actually ran with something that never did.
+    cp "$TASK" "$STATE/tmp/dispatched-$SNAP_ID.md" 2>/dev/null || true
 fi
 
 # `find -prune -mmin` is the whole basis of every age check here -
@@ -3892,7 +3922,8 @@ if [ "$CHAIN" -eq 1 ] && [ -n "$DERIVED_TASK" ]; then
         # board, in the proposal, and in the handoff of whatever runs
         # next.
         CHAIN_WHEN="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        CHAIN_BODY="$(approval_body_hash "$DERIVED_TASK")"
+        CHAIN_TEXT="$(cat "$DERIVED_TASK")"
+        CHAIN_BODY="$(approval_body_hash "$CHAIN_TEXT")"
         awk -v when="$CHAIN_WHEN" -v body="$CHAIN_BODY" '
             /^---[[:space:]]*$/ {
                 fence++
@@ -3906,7 +3937,7 @@ if [ "$CHAIN" -eq 1 ] && [ -n "$DERIVED_TASK" ]; then
             }
             fence == 1 && /^approved_(by|at|body):/ { next }
             { print }
-        ' "$DERIVED_TASK" > "$DERIVED_TASK.tmp" && mv "$DERIVED_TASK.tmp" "$DERIVED_TASK"
+        ' <<< "$CHAIN_TEXT" > "$DERIVED_TASK.tmp" && mv "$DERIVED_TASK.tmp" "$DERIVED_TASK"
 
         say "  dispatching $DERIVED_ID to $TASK_ON_CHANGES"
         say "  --chain: approved without a reader"

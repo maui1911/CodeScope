@@ -326,6 +326,19 @@ bash "$APPROVE" --id T-0006-fix --state "$STATE" --repo "$REPO" >/dev/null 2>&1 
     || APPROVE_RC=$?
 check "approve" 0 "$APPROVE_RC"
 
+# All three approval fields, on both halves of the gate. A truncated
+# approval - `approved_by` plus a matching hash, no date - used to pass,
+# and then every place that shows an approval printed a blank timestamp.
+# An approval nobody can put a time on is not the record it claims to be.
+sed '/^approved_at:/d' "$STATE/proposed/T-0006-fix.md" > "$STATE/proposed/T-0006-fix.tmp" \
+    && mv "$STATE/proposed/T-0006-fix.tmp" "$STATE/proposed/T-0006-fix.md"
+NODATE_RC=0
+bash "$RUN" --task "$STATE/proposed/T-0006-fix.md" --reset --skip-agent >/dev/null 2>&1 \
+    || NODATE_RC=$?
+check "approval needs a date" 3 "$NODATE_RC"
+cleanup bot/fixer/T-0006-fix
+bash "$APPROVE" --id T-0006-fix --state "$STATE" --repo "$REPO" >/dev/null 2>&1
+
 run "refusenik.sh"           2 "$STATE/proposed/T-0006-fix.md" refusenik.sh
 cleanup bot/fixer/T-0006-fix
 
@@ -1078,6 +1091,20 @@ if bash "$RUN" --task "$SAB_TASKS/T-0900.md" --repo "$REPO" --dry-run 2>&1 \
 else
     printf 'FAIL  %-28s an approved note never reached the prompt\n' "note is read after approval"
     FAILURES=$((FAILURES + 1))
+fi
+
+# And the same three-field rule on the memory half, checked where it
+# matters: the prompt. A note whose approval lost its date must stop
+# being read back, not merely look odd in a listing.
+if [ -n "$MEM_FILE" ]; then
+    sed '/^approved_at:/d' "$MEM_FILE" > "$MEM_FILE.tmp" && mv "$MEM_FILE.tmp" "$MEM_FILE"
+fi
+if bash "$RUN" --task "$SAB_TASKS/T-0900.md" --repo "$REPO" --dry-run 2>&1 \
+        | grep -q "$MEM_NOTE"; then
+    printf 'FAIL  %-28s a dateless approval still fed the prompt\n' "note needs a date"
+    FAILURES=$((FAILURES + 1))
+else
+    printf 'ok    %-28s a dateless approval stops being read\n' "note needs a date"
 fi
 
 # A note that closes the section it is quoted inside and opens another

@@ -426,6 +426,15 @@ malice: *it probably meant well* is not a property a runner can measure.
   through the diff, where the scope check sees it — #349.
 - **The agent reads more than the charter** and the runner cannot
   enumerate it (F-7).
+- **The agent's turn is assumed to end when its process does.** Every
+  channel read, every evidence read and the disarm itself are
+  `[ -f ]` then read, which is two opens of a path the agent owned a
+  moment ago. Nothing stops an agent backgrounding something that keeps
+  writing. `tree_state` catches a worktree that moves across the
+  verifier, and the channels are removed after being read, so the
+  exposure is narrow rather than closed - and closing it means
+  snapshotting the surface before measuring it, which is a different
+  design.
 
 #### When a finding is finished
 
@@ -3368,3 +3377,83 @@ Two more:
   Terminal live tasks are now counted separately rather than hidden:
   *empty* and *nothing left to do here* are the same sentence only if
   you can see the difference.
+
+---
+
+### F-43 · Fixed at the site it was reported, not at the shape it has
+
+*2026-09-12, the fifteenth round - and one question from the user.*
+
+Six findings, and two of them were the sentence from F-42 arriving
+again: *the thing you validated has to be the thing you use.*
+
+**The dispatch snapshot had one name per task, not per invocation.** Two
+runs of `T-x`: the first snapshots and validates, the second overwrites
+that file, and the first then parses and copies bytes nothing checked.
+The fix for a check/use race, with a check/use race in it. Unique per
+run token now, created with `set -C` so the create is the claim, removed
+on the way out — and the shared `dispatched-<id>.md` record is written
+only *after* the gate passes, because writing it before meant every
+refusal overwrote the record of the last thing that actually ran with
+something that never did.
+
+**`memory_block` validated each note and then opened it again to
+render.** A note replaced in between goes into the prompt carrying
+somebody's approval of different text. That is the whole mechanism
+defeated by a race, in the feature built specifically to have a
+mechanism.
+
+Then the user asked the question that made this finding worth its own
+entry: *you said it keeps finding the same thing in different places —
+can you check whether these six occur anywhere else in the PR, so we get
+ahead of it?*
+
+They did. **The task half of `bot-approve.sh` had the identical defect
+and nobody reported it:** `approval_state "$TASK"`, then
+`approval_body_hash "$TASK"`, then `awk ... "$TASK"` — three opens of a
+file in a directory anybody may edit, so the hash was of one version and
+the approval got stamped onto another. The review found it in
+`memory.sh` and stopped there, and I had fixed `memory.sh` and stopped
+there. Two readers, both anchored on the line they were shown.
+
+So the fix is not per-site. **Both `approval.sh` and `memory.sh` now
+take text rather than a path**, with thin `_file` wrappers for callers
+that only have a name and are only asking one question. A caller that
+needs two answers has to read the bytes itself, which makes the right
+shape the easy one instead of the remembered one.
+
+The rest of the audit, for the record, because a negative result is
+worth as much as a finding:
+
+- **Predictable temp paths written before a claim.** Clean elsewhere —
+  the folder-import index files use the pid, the handoff rewrite uses
+  the pid, the sweep uses `mktemp`.
+- **A contract of N fields checked as fewer.** This was the finding
+  (`approved_at` was never required, on both halves, so a truncated
+  approval passed and then rendered a blank date). Checked the others:
+  `review-shape.sh` requires all three of its frontmatter fields and
+  the runner's required-task-field loop is complete.
+- **An early exit that hides a later section.** This was the finding
+  (no `.state/proposed` meant the shared inbox reported empty while
+  notes sat in it). No other multi-part listing has a guard at the top.
+- **A count whose label stopped being true.** This was the finding
+  twice over — the inbox counted completed proposals as "waiting", and
+  then in-flight ones too. Also removed a `memory_counts` helper that
+  returned a waiting count nobody called: a queue whose contents nobody
+  can see is a number.
+- **Check-then-read on a path the agent owns.** Five of those, all in
+  the evidence phase, all resting on the agent's turn having ended when
+  its process did. Nothing stops an agent backgrounding something. That
+  is now written down under "knowingly open" in §3.6 rather than
+  pretended away — closing it means snapshotting the surface before
+  measuring it, which is a different design and not a two-line fix.
+
+Two new checks, both of which the review would otherwise find next
+round: a truncated approval is refused at dispatch, and a note whose
+approval lost its date stops reaching the prompt. Sweep is 87.
+
+What generalises: **a review comment names a line, and the defect has a
+shape.** Fixing the line is what gets asked for and it is half the job;
+the other half is grepping for the shape and finding the instance
+nobody pointed at. Fifteen rounds in, that is the only thing that has
+reliably reduced the next round.

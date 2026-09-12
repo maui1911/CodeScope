@@ -21,6 +21,14 @@
 #   of the task as it read at the time, so approving `T-0006-fix` and
 #   then editing `T-0006-fix` leaves an approval that no longer applies.
 #   Approve the bytes, not the file name - F-17, one level up.
+#
+# Every function here takes *text*, not a path, for the reason memory.sh
+# gives at length: validating a file and then reading it again is two
+# opens of something that may be replaced in between, so the bytes that
+# get used need not be the bytes whose approval was checked. A caller
+# reads once and asks every question of those same bytes. The `_file`
+# wrappers are for callers that only have a name, and each reads exactly
+# once.
 
 # Every digest in here goes through the lab's own repository, because
 # `git hash-object` uses the *containing* repository's object format and
@@ -36,7 +44,7 @@ approval_hash_repo() { printf '%s\n' "${SCRIPT_DIR:-.}"; }
 # The frontmatter reader, kept separate from each script's own `field`
 # so that sourcing this cannot quietly redefine one of them.
 approval_field() {
-    awk -v key="$1" '
+    printf '%s\n' "$2" | awk -v key="$1" '
         /^---[[:space:]]*$/ { fence++; next }
         fence == 1 && !found && index($0, key ":") == 1 {
             value = substr($0, length(key) + 2)
@@ -46,7 +54,7 @@ approval_field() {
             found = 1
         }
         fence > 1 { exit }
-    ' "$2"
+    '
 }
 
 # approval_body_hash <file>
@@ -57,11 +65,11 @@ approval_field() {
 # `approved_by:` is prose, and stripping it would make two different
 # tasks hash the same.
 approval_body_hash() {
-    awk '
+    printf '%s\n' "$1" | awk '
         /^---[[:space:]]*$/ { fence++; print; next }
         fence == 1 && /^approved_(by|at|body):/ { next }
         { print }
-    ' "$1" | git -C "$(approval_hash_repo)" hash-object --stdin
+    ' | git -C "$(approval_hash_repo)" hash-object --stdin
 }
 
 # approval_state <file> -> none | stale | ok
@@ -71,11 +79,16 @@ approval_body_hash() {
 # the other was looked at and then changed underneath the person who
 # looked. Reporting the second as the first would send them back to do
 # the same reading again with no idea it had moved.
+# All three fields, because the contract says three. A truncated
+# approval carrying only `approved_by` and a matching hash used to pass,
+# and then every place that shows an approval rendered a blank date - an
+# approval nobody can put a time on is not the record it claims to be.
 approval_state() {
-    local who body
+    local who when body
     who="$(approval_field approved_by "$1")"
+    when="$(approval_field approved_at "$1")"
     body="$(approval_field approved_body "$1")"
-    if [ -z "$who" ] || [ -z "$body" ]; then
+    if [ -z "$who" ] || [ -z "$when" ] || [ -z "$body" ]; then
         printf 'none\n'
     elif [ "$body" = "$(approval_body_hash "$1")" ]; then
         printf 'ok\n'
@@ -83,6 +96,14 @@ approval_state() {
         printf 'stale\n'
     fi
 }
+
+# approval_state_file <file> / approval_field_file <key> <file>
+#
+# One read each, for a caller that has a name and is only asking one
+# question. A caller asking two must read the bytes itself - two
+# wrappers in a row is the thing this shape exists to prevent.
+approval_state_file() { approval_state "$(cat "$1")"; }
+approval_field_file() { approval_field "$1" "$(cat "$2")"; }
 
 # approval_is_proposal <file> <state-dir>
 #
