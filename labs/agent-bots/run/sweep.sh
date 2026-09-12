@@ -21,6 +21,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAB_DIR="$(dirname "$SCRIPT_DIR")"
 REPO="$(git -C "$LAB_DIR" rev-parse --show-toplevel)"
 
+# shellcheck source=live-task.sh
+. "$SCRIPT_DIR/live-task.sh"
+
 RUN="$SCRIPT_DIR/bot-run.sh"
 APPROVE="$SCRIPT_DIR/bot-approve.sh"
 STUBS="$SCRIPT_DIR/stubs"
@@ -91,22 +94,6 @@ drop_sweep_tasks() {   # remove this script's live tasks and proposals
     done
 }
 
-# live_task_verdict <file> -> blocks | record
-#
-# Whether somebody else's live task stands in this script's way. A
-# function rather than an inline `case` because the preflight runs
-# before anything can check it, and a decision nothing can reach is a
-# decision nothing tests - so the checks near the bottom call this, and
-# the preflight calls the same thing.
-live_task_verdict() {
-    local st
-    st="$(sed -n 's/^status:[[:space:]]*//p' "$1" | head -n1)"
-    case "$st" in
-        done|blocked|needs-review) printf 'record\n' ;;
-        *)                         printf 'blocks\n' ;;
-    esac
-}
-
 PRE_EXISTING=""
 # Somebody else's finished runs. Reported, never touched, and not a
 # reason to refuse - see the case below.
@@ -155,8 +142,11 @@ for sdir in tasks proposed; do
             # refuses on, deliberately: a run that died mid-flight left
             # that status behind and needs a human, which is exactly
             # what a refusal fetches.
-            live_status="$(sed -n 's/^status:[[:space:]]*//p' "$f" | head -n1)"
-            if [ "$(live_task_verdict "$f")" = "record" ]; then
+            # One read, both questions of those bytes - the file is in a
+            # directory somebody else's runner writes to.
+            live_text="$(cat "$f")"
+            live_status="$(live_task_status "$live_text")"
+            if [ "$(live_task_verdict "$live_text")" = "record" ]; then
                 FINISHED_RUNS="$FINISHED_RUNS  $id ($live_status)"$'\n'
             else
                 PRE_EXISTING="$PRE_EXISTING  live task $id ($f) - status: ${live_status:-none}"$'\n'
@@ -710,7 +700,7 @@ verdict_case() {   # verdict_case <label> <status-line> <expected>
     local f="$VERDICT_DIR/T-0000.md" got
     printf -- '---\nid: T-0000\nowner: fixer\n%s\n---\n\n# Objective\n\nGenerated.\n' \
         "$2" > "$f"
-    got="$(live_task_verdict "$f")"
+    got="$(live_task_verdict "$(cat "$f")")"
     CHECKS=$((CHECKS + 1))
     if [ "$got" = "$3" ]; then
         printf 'ok    %-28s %s\n' "$1" "$got"
@@ -810,6 +800,74 @@ FORGET_RC=0
 BOT_RUN_ACTIVE=pretend bash "$FORGET" T-0995 --state "$STATE" >/dev/null 2>&1 || FORGET_RC=$?
 check "no forgetting from a run" 1 "$FORGET_RC"
 rm -f "$STATE/tasks/T-0995.md"
+
+# A live process beats a finished status. The runner writes its verdict
+# before cleaning up, so `done` on disk is normal while work remains -
+# and this pid is unambiguously alive, since it is the one asking.
+write_live T-0994 done
+mkdir -p "$STATE/running"
+printf '%s\n' "$$" > "$STATE/running/T-0994.sweep-alive"
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$STATE" >/dev/null 2>&1 || FORGET_RC=$?
+check "a live run beats done" 1 "$FORGET_RC"
+if [ -f "$STATE/tasks/T-0994.md" ]; then
+    printf 'ok    %-28s kept while a pid is alive\n' "live marker keeps it"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s deleted under a running process\n' "live marker keeps it"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+# --force is the way past it, deliberately.
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$STATE" --force >/dev/null 2>&1 || FORGET_RC=$?
+check "force beats a live run" 0 "$FORGET_RC"
+rm -f "$STATE/running/T-0994.sweep-alive"
+
+# A marker whose process is gone is litter, not a claim: the pid is
+# the fact, the file is only what it left behind.
+write_live T-0994 done
+printf '999999\n' > "$STATE/running/T-0994.sweep-dead"
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$STATE" >/dev/null 2>&1 || FORGET_RC=$?
+check "a dead marker is litter" 0 "$FORGET_RC"
+if [ -f "$STATE/running/T-0994.sweep-dead" ]; then
+    printf 'FAIL  %-28s the stale marker survived\n' "dead marker swept up"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+else
+    printf 'ok    %-28s the stale marker went with it\n' "dead marker swept up"
+    CHECKS=$((CHECKS + 1))
+fi
+
+# All three parts of a surface, in the order drop_surface uses them:
+# the verify checkout beside it, the clone, then the base pin. Leaving
+# the pin holds the base objects alive in the project for ever, and
+# leaving the verify checkout leaves a directory nothing else removes.
+write_live T-0994 done
+mkdir -p "$WT_ROOT/bot-fixer-T-0994/.git" "$WT_ROOT/bot-fixer-T-0994-verify"
+printf 'bot-run surface for T-0994\n' > "$WT_ROOT/bot-fixer-T-0994/.git/bot-surface"
+printf 'gitdir: %s/.git/worktrees/bot-fixer-T-0994\n' "$WT_ROOT/bot-fixer-T-0994" \
+    > "$WT_ROOT/bot-fixer-T-0994-verify/.git"
+git -C "$REPO" update-ref "refs/bot-base/T-0994" HEAD >/dev/null 2>&1
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$STATE" --repo "$REPO" --surface >/dev/null 2>&1 || FORGET_RC=$?
+check "surface goes in three parts" 0 "$FORGET_RC"
+SURF_LEFT=""
+[ ! -e "$WT_ROOT/bot-fixer-T-0994" ] || SURF_LEFT="$SURF_LEFT clone"
+[ ! -e "$WT_ROOT/bot-fixer-T-0994-verify" ] || SURF_LEFT="$SURF_LEFT verify"
+! git -C "$REPO" rev-parse --verify --quiet "refs/bot-base/T-0994" >/dev/null 2>&1 \
+    || SURF_LEFT="$SURF_LEFT pin"
+if [ -z "$SURF_LEFT" ]; then
+    printf 'ok    %-28s clone, verify and pin\n' "nothing of it is left"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s still there:%s\n' "nothing of it is left" "$SURF_LEFT"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+git -C "$REPO" update-ref -d "refs/bot-base/T-0994" >/dev/null 2>&1 || true
+rm -rf "$WT_ROOT/bot-fixer-T-0994" "$WT_ROOT/bot-fixer-T-0994-verify"
 
 # A surface is removed only on a marker that names this task. The
 # directory here is not a surface at all, which is the case worth
@@ -1739,6 +1797,33 @@ if [ "$LEFT_LOCKS" -eq 0 ]; then
     CHECKS=$((CHECKS + 1))
 else
     printf 'FAIL  %-28s %s still in %s\n' "no locks left" "$LEFT_LOCKS" "$STATE"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+# The private task snapshot is this invocation's and nobody else may
+# read it, so one left behind is a half-dispatched task sitting in a
+# directory that looks like records. The comment on the runner's exit
+# trap has promised this since the gate was built; for a while a later
+# trap turned the promise off. F-48.
+LEFT_SNAPS="$(ls "$STATE"/tmp/dispatch-*.md 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$LEFT_SNAPS" -eq 0 ]; then
+    printf 'ok    %-28s none\n' "no task snapshots left"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s %s still in %s/tmp\n' \
+        "no task snapshots left" "$LEFT_SNAPS" "$STATE"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+# A run marker outliving its run is the same kind of finding as a lock:
+# it says a process is in there, and nothing is.
+LEFT_MARKS="$(ls "$STATE"/running/* 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$LEFT_MARKS" -eq 0 ]; then
+    printf 'ok    %-28s none\n' "no run markers left"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s %s still in %s/running\n' \
+        "no run markers left" "$LEFT_MARKS" "$STATE"
     CHECKS=$((CHECKS + 1))
     FAILURES=$((FAILURES + 1))
 fi

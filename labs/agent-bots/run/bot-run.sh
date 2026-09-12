@@ -204,6 +204,8 @@ LAB_DIR="$(dirname "$SCRIPT_DIR")"
 . "$SCRIPT_DIR/approval.sh"
 # shellcheck source=memory.sh
 . "$SCRIPT_DIR/memory.sh"
+# shellcheck source=live-task.sh
+. "$SCRIPT_DIR/live-task.sh"
 
 die() { printf 'bot-run: %s\n' "$*" >&2; exit 1; }
 say() { printf '%s\n' "$*"; }
@@ -270,6 +272,11 @@ release_locks() {
 on_exit() {
     release_locks
     [ -z "${SNAPSHOT_HELD:-}" ] || rm -f "$SNAPSHOT_HELD"
+    # The marker says a process is in here, so it goes when the process
+    # does - including on a die, a refusal or a Ctrl-C. What it leaves
+    # behind on a kill -9 is a stale marker, which is why anything
+    # reading it tests the pid rather than the file (live-task.sh).
+    [ -z "${RUNNING_MARK:-}" ] || rm -f "$RUNNING_MARK"
 }
 trap on_exit EXIT
 
@@ -612,6 +619,19 @@ if [ "$DRY_RUN" -eq 0 ] && approval_is_proposal "$TASK" "$STATE"; then
     # the first then parses and copies bytes nothing checked. The run
     # token is unique to this process, and `set -C` means creating the
     # file is the claim rather than a hope about names.
+    # Snapshots from runs that were killed before their trap
+    # could fire. The run token starts with the pid, so liveness is a
+    # property of the name - and only this id's are touched, because
+    # another task's leftovers are not this run's to judge. F-48.
+    for stale in "$STATE/tmp/dispatch-$SNAP_ID-"*.md; do
+        [ -f "$stale" ] || continue
+        stale_pid="${stale##*dispatch-$SNAP_ID-}"
+        stale_pid="${stale_pid%%-*}"
+        case "$stale_pid" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        kill -0 "$stale_pid" 2>/dev/null || rm -f "$stale"
+    done
     TASK_SNAPSHOT="$STATE/tmp/dispatch-$SNAP_ID-$RUN_TOKEN.md"
     ( set -C; : > "$TASK_SNAPSHOT" ) 2>/dev/null \
         || die "could not create a private copy of the task at $TASK_SNAPSHOT"
@@ -1987,15 +2007,24 @@ drop_surface() {
     return 0
 }
 
+# Both exit paths end in on_exit rather than in release_locks, because
+# on_exit is where everything this invocation privately owns is
+# dropped - the locks, the task snapshot, the run marker. Calling only
+# release_locks here is how the snapshot and the marker leaked: the
+# comment on on_exit promises `$STATE/tmp` never fills up with
+# half-dispatched tasks, and 15 of them had accumulated. F-48.
 rollback_dispatch() {
     local rc=$?
-    [ "$rc" -eq 0 ] && return 0
+    if [ "$rc" -eq 0 ]; then
+        on_exit
+        return 0
+    fi
     say ""
     say "dispatch failed after the work surface was created - rolling it back"
     rm -f "$LIVE_TASK" "$LIVE_TASK.tmp"
     drop_surface >/dev/null 2>&1 || true
     board "dispatch-failed" "rolled back"
-    release_locks
+    on_exit
     exit "$rc"
 }
 trap rollback_dispatch EXIT
@@ -2024,6 +2053,29 @@ set_field base_sha "$BASE_SHA"
 "the dispatch lock was broken while this run was inside it - refusing to claim.
 Nothing was dispatched. Re-run once no other run is in flight."
 
+# From here the live task is not the only thing that says a run is
+# happening, and it needed not to be. `status:` records where the run
+# got to; it is written before the cleanup below and rewritten if that
+# cleanup fails, so `done` sits on disk while there is still work to
+# do. Anything outside this process that acts on the live task - the
+# sweep's preflight, bot-forget.sh - was reading a status and calling
+# it a state. The marker is the state: it exists exactly as long as
+# this process, and carries the pid so a reader can tell a live run
+# from a killed one. F-47.
+mkdir -p "$STATE/running"
+# A marker whose process is gone is litter from a killed run, and this
+# task's own dispatch is the right place to sweep it: nothing else
+# knows the id is free, and the pid says so rather than the file's
+# existence. Same judgement take_lock makes before breaking an
+# abandoned break marker.
+live_task_running "$STATE" "$TASK_ID" | while read -r mark _pid state; do
+    [ "$state" = "gone" ] || continue
+    say "  clearing a run marker whose process is gone: $(basename "$mark")"
+    rm -f "$mark"
+done
+RUNNING_MARK="$STATE/running/$TASK_ID.$RUN_TOKEN"
+printf '%s\n' "$$" > "$RUNNING_MARK"
+
 set_status dispatched
 board "dispatched" "$TASK_BRANCH @ ${BASE_SHA:0:12}"
 
@@ -2034,7 +2086,10 @@ drop_lock "$STATE/dispatch.lock"
 
 # Past the half-dispatch window: from here a failure leaves a worktree
 # a human is meant to look at, which is the whole point of `blocked`.
-trap release_locks EXIT
+# Still on_exit and not release_locks: this trap replaced the one
+# installed at the top, and for a while that quietly turned off the
+# snapshot and marker cleanup for every run that got this far. F-48.
+trap on_exit EXIT
 
 # --------------------------------------------------------------------
 # Agent

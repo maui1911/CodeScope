@@ -18,20 +18,29 @@
 # under a state directory will eventually take somebody's evidence with
 # it. See README F-46.
 #
-# What this removes: the live task, and with --surface the work surface
-# if one is still on disk. What it never removes: the handoff, the
-# artifacts, the memory notes and the board. Those are the record of
-# what happened; the live task is only the record of *where the runner
-# got to*, and once a verdict is written the board and the handoff say
-# everything it does.
+# What this removes: the live task, and with --surface the work
+# surface, the verify checkout beside it and the base pin in the
+# project. What it never removes *from*: the handoff, the artifacts,
+# the memory notes and the board - it appends a `forgotten` row to the
+# board rather than editing it, because retiring a record is itself an
+# event and the board is append-only either way.
+#
+# The live task is only the record of *where the runner got to*; once a
+# verdict is written, the handoff and the board say everything it does.
 #
 #   bash labs/agent-bots/run/bot-forget.sh T-0010
 #   bash labs/agent-bots/run/bot-forget.sh T-0010 --surface
 #
 #   <task-id>            The id, as it appears in the frontmatter.
-#   --surface            Also remove the work surface, if present.
-#   --force              Forget a task still marked `dispatched`.
+#   --surface            Also remove the work surface, if present -
+#                        the verify checkout beside it and the base pin
+#                        in the project go with it, because that is
+#                        what the runner's own removal does.
+#   --force              Forget a record whose run has not reached a
+#                        verdict, or one whose process is still alive.
 #   --state <dir>        Control plane. Default: <labs>/agent-bots/.state
+#   --repo <dir>         Project, for the base pin. Default: the
+#                        repository this control plane is stamped to.
 #   -h, --help           This text.
 #
 # Exit: 0 forgotten, 1 refused or nothing to forget.
@@ -41,11 +50,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAB_DIR="$(dirname "$SCRIPT_DIR")"
 
+# shellcheck source=live-task.sh
+. "$SCRIPT_DIR/live-task.sh"
+
 die() { printf 'bot-forget: %s\n' "$*" >&2; exit 1; }
 usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//;$d'; }
 
 TASK_ID=""
 STATE=""
+REPO=""
 SURFACE=0
 FORCE=0
 
@@ -54,6 +67,7 @@ while [ $# -gt 0 ]; do
         --surface) SURFACE=1; shift ;;
         --force)   FORCE=1; shift ;;
         --state)   STATE="${2:-}"; shift 2 ;;
+        --repo)    REPO="${2:-}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         -*)        die "unknown option: $1 (try --help)" ;;
         *)
@@ -84,30 +98,54 @@ STATE="$(cd "$STATE" && pwd)"
 LIVE="$STATE/tasks/$TASK_ID.md"
 [ -f "$LIVE" ] || die "no live task at $LIVE - already forgotten, or never ran"
 
-field() {   # field <key> <file>
-    sed -n "s/^$1:[[:space:]]*//p" "$2" | head -n1
-}
+# One read, every question asked of those bytes. The alternative is
+# reading a file three times in a directory another runner writes to,
+# which is F-43 and was already a bug twice.
+LIVE_TEXT="$(cat "$LIVE")"
+STATUS="$(live_task_status "$LIVE_TEXT")"
+WORKTREE="$(live_task_field worktree "$LIVE_TEXT")"
 
-STATUS="$(field status "$LIVE")"
-WORKTREE="$(field worktree "$LIVE")"
+# Two separate questions, and conflating them was the bug.
+#
+# "Is a process in there?" is answered by the marker under
+# `.state/running/`, never by the status. The runner writes a terminal
+# status *before* its cleanup and rewrites it to `needs-review` if that
+# cleanup fails, so `done` is on disk while there is still work to do -
+# and deleting this file in that window makes the run's last
+# `set_field` fail on a missing file, ending it with no status at all.
+# That is precisely the bug sweep.sh's preflight was built around, and
+# a status-only gate here walked straight back into it. F-47.
+RUNNING="$(live_task_running "$STATE" "$TASK_ID")"
+ALIVE="$(printf '%s\n' "$RUNNING" | grep ' alive$' || true)"
+if [ -n "$ALIVE" ] && [ "$FORCE" -eq 0 ]; then
+    printf 'bot-forget: a run for %s is still going.\n\n' "$TASK_ID" >&2
+    printf '%s\n\n' "$ALIVE" >&2
+    printf 'The status says "%s", and that is not the question: the runner\n' \
+        "${STATUS:-none}" >&2
+    printf 'writes its verdict before cleaning up, so a finished-looking\n' >&2
+    printf 'status is normal while a process is still in there. Wait for it.\n' >&2
+    exit 1
+fi
 
-# `dispatched` is the one status that might still be moving. Refusing
-# is not caution for its own sake: the runner is the single writer of
-# this file (README 3.2), and taking it out from under a live run makes
-# `set_field` fail after the handoff is written, which ends the run with
-# no status at all. That is the bug the sweep's preflight was built
-# around.
-if [ "$STATUS" = "dispatched" ] && [ "$FORCE" -eq 0 ]; then
-    printf 'bot-forget: %s still says "dispatched".\n\n' "$TASK_ID" >&2
-    printf 'Either a run is in flight, or one died without writing a verdict.\n' >&2
-    printf 'Those look identical from here and they want opposite things, so\n' >&2
-    printf 'look before deciding:\n\n' >&2
+# "Did the run reach a verdict?" is the status, and the answer comes
+# from live-task.sh so that this and the sweep cannot disagree about
+# it - they did, one commit apart: the sweep called a missing status
+# unsafe and this let it through.
+if [ "$(live_task_verdict "$LIVE_TEXT")" != "record" ] && [ "$FORCE" -eq 0 ]; then
+    printf 'bot-forget: %s has no verdict - status: %s\n\n' "$TASK_ID" "${STATUS:-none}" >&2
+    printf 'A run in flight and a run that died leave the same word behind,\n' >&2
+    printf 'and they want opposite things. Nothing here can tell them apart,\n' >&2
+    printf 'so look first:\n\n' >&2
+    if [ -n "$RUNNING" ]; then
+        printf '%s\n' "$RUNNING" >&2
+    else
+        printf '    no run marker - nothing is working on it\n' >&2
+    fi
     if [ -n "$WORKTREE" ]; then
         if [ -d "$WORKTREE" ]; then
             printf '    surface still on disk: %s\n' "$WORKTREE" >&2
         else
             printf '    surface is gone: %s\n' "$WORKTREE" >&2
-            printf '    (a clean run removes it last, so this one probably finished)\n' >&2
         fi
     fi
     printf '    board:  grep -F "| %s | " %s/board.md\n\n' "$TASK_ID" "$STATE" >&2
@@ -115,18 +153,59 @@ if [ "$STATUS" = "dispatched" ] && [ "$FORCE" -eq 0 ]; then
     exit 1
 fi
 
+# A surface is three things, not one, and removing only the middle one
+# was a leak in both directions: an interrupted verification leaves a
+# `-verify` checkout nothing else will ever remove, and every retired
+# surface leaves its `refs/bot-base/<id>` pin in the project for good,
+# holding the base objects alive. This mirrors `drop_surface` in
+# bot-run.sh, including the order - the pin goes last, so a removal
+# that refused still leaves the pin pointing at what the surface was
+# cut from.
 REMOVED_SURFACE=""
-if [ "$SURFACE" -eq 1 ] && [ -n "$WORKTREE" ] && [ -d "$WORKTREE" ]; then
-    # The same check the runner makes before it removes a surface, and
-    # it is stronger than "a runner made this": the marker names the
-    # task, so it answers "made for *this* run" rather than only
-    # "made by something like me". A hijacked surface whose `.git` was
-    # replaced has no marker and is refused - which is the right answer
-    # here, since that is a thing to look at rather than to delete.
-    grep -q "surface for $TASK_ID\$" "$WORKTREE/.git/bot-surface" 2>/dev/null \
-        || die "$WORKTREE has no .git/bot-surface marker for $TASK_ID - refusing to remove it"
-    rm -rf "$WORKTREE"
-    REMOVED_SURFACE="$WORKTREE"
+REMOVED_VERIFY=""
+REMOVED_PIN=""
+if [ "$SURFACE" -eq 1 ] && [ -n "$WORKTREE" ]; then
+    # The verify checkout is a linked worktree, so its `.git` is a
+    # *file* pointing back at its parent: that file both identifies it
+    # and says whose it is. Same proof the runner uses.
+    VERIFY_WT="$WORKTREE-verify"
+    if [ -e "$VERIFY_WT" ]; then
+        if [ -f "$VERIFY_WT/.git" ] \
+           && grep -q "$(basename "$WORKTREE")" "$VERIFY_WT/.git" 2>/dev/null; then
+            rm -rf "$VERIFY_WT"
+            REMOVED_VERIFY="$VERIFY_WT"
+        else
+            die "$VERIFY_WT is not a verify checkout for $WORKTREE - refusing to remove it"
+        fi
+    fi
+
+    if [ -d "$WORKTREE" ]; then
+        # Stronger than "a runner made this": the marker names the
+        # task, so it answers "made for *this* run" rather than "made
+        # by something like me" - two branches whose leaf names collide
+        # would each find a marked surface at that path. A hijacked
+        # surface whose `.git` was replaced has no marker and is
+        # refused, which is right: that is a thing to look at.
+        grep -q "surface for $TASK_ID\$" "$WORKTREE/.git/bot-surface" 2>/dev/null \
+            || die "$WORKTREE has no .git/bot-surface marker for $TASK_ID - refusing to remove it"
+        rm -rf "$WORKTREE"
+        [ ! -e "$WORKTREE" ] || die "could not remove $WORKTREE"
+        REMOVED_SURFACE="$WORKTREE"
+    fi
+
+    # Nothing borrows the base objects any more. The stamp holds the
+    # git directory this control plane belongs to, which is what
+    # `git -C` wants; --repo overrides it for a plane whose project has
+    # moved.
+    PIN_REPO="$REPO"
+    [ -n "$PIN_REPO" ] || PIN_REPO="$(cat "$STATE/REPO" 2>/dev/null || true)"
+    if [ -n "$PIN_REPO" ] \
+       && git -C "$PIN_REPO" rev-parse --git-dir >/dev/null 2>&1 \
+       && git -C "$PIN_REPO" rev-parse --verify --quiet "refs/bot-base/$TASK_ID" >/dev/null 2>&1
+    then
+        git -C "$PIN_REPO" update-ref -d "refs/bot-base/$TASK_ID" >/dev/null 2>&1 \
+            && REMOVED_PIN="refs/bot-base/$TASK_ID"
+    fi
 fi
 
 rm -f "$LIVE"
@@ -139,6 +218,17 @@ printf '| %s | %s | forgotten | %s |\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TASK_ID" "was ${STATUS:-no status}" \
     >> "$STATE/board.md"
 
+# A marker whose process is gone is this id's litter, and the pid said
+# so. Same judgement the lock protocol makes before it breaks a stale
+# holder, and it happens after the gates rather than before, so nothing
+# is cleared on a run that turned out to be alive.
+printf '%s\n' "$RUNNING" | while read -r mark _pid state; do
+    [ "$state" = "gone" ] || continue
+    rm -f "$mark"
+done
+
 printf 'forgotten: %s (was %s)\n' "$TASK_ID" "${STATUS:-no status}"
+[ -z "$REMOVED_VERIFY" ]  || printf 'removed verify checkout: %s\n' "$REMOVED_VERIFY"
 [ -z "$REMOVED_SURFACE" ] || printf 'removed surface: %s\n' "$REMOVED_SURFACE"
+[ -z "$REMOVED_PIN" ]     || printf 'removed base pin: %s\n' "$REMOVED_PIN"
 printf 'kept: the handoff, the board and anything under artifacts/ or bots/\n'
