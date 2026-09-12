@@ -2977,3 +2977,104 @@ and the same `|| true` that hides a broken diff hides a broken restore,
 a broken push, and a broken `add`. The sweep is 67 checks now; four of
 them are this round, and one of those is a lock left deliberately
 wedged.
+
+---
+
+### F-38 · An identity you compare is a race; an identity you name is not
+
+*2026-09-12, the backlog on the PR underneath.*
+
+Twenty-two review threads were still open on the parent PR while the
+branch above it was on its twelfth round. Checking them one by one
+against the code: **eleven were already fixed** - on the branch that has
+not merged down yet, so from the parent's diff they are as open as they
+ever were. Two more are F-6, which is not a bug but graduation
+criterion 5. Nine were real.
+
+That ratio is the first finding, and it is about process rather than
+code. **A stacked PR's review comments describe a tree that no longer
+exists**, and nothing on the page says which ones. The reviewer is not
+wrong and the author is not ignoring them; the comments are simply
+pinned to a commit the work has moved past. Half the backlog was a
+merge that had not happened. Read it as a queue of unfixed defects and
+you will fix eleven things twice.
+
+**The one worth keeping is four lines of locking.**
+
+Releasing a lock was: read the owner file, compare it to this run's
+token, and if it matches remove the file and `rmdir`. Every word of
+that is careful and it still has a window - the lock is broken as
+stale, a new run creates the same directory and writes *its* token, and
+the old process, still holding a comparison it made a moment ago,
+deletes the new holder's marker and rmdirs its lock. The critical
+section is then open from the outside, which is precisely the thing a
+lock exists to prevent.
+
+The fix is to stop comparing. The token becomes the *name* of the file:
+
+```bash
+: > "$dir/owner.$RUN_TOKEN"            # take
+rm -f "$dir/owner.$RUN_TOKEN"          # release - can only be ours
+rmdir "$dir" 2>/dev/null || true       # fails while anyone else's is there
+```
+
+There is no window because there is no comparison. `rm -f` names a file
+only this run could have created, and `rmdir` refuses a directory that
+still holds somebody else's. The same change makes "are we still the
+holder?" a file test instead of reading back contents another process
+may have rewritten.
+
+Its twin, one round late: **ten minutes of mtime is a guess about the
+holder, and the mtime is never refreshed while the critical section
+runs.** A legitimately slow dispatch - a large checkout, a folder
+snapshot - looked exactly like a crash and had its lock taken away
+while it was still inside. The token starts with the holder's pid and
+the holder is on this machine, because the lock is a directory on it,
+so the question has a real answer: `kill -0`. A pid that is gone is a
+run that is gone. A reused pid costs one missed recovery and a clear
+timeout message; breaking a live lock costs two runners in one critical
+section, and those prices are not close.
+
+The other seven:
+
+- **`tree_state` hashed untracked *paths*, not untracked *contents*.**
+  `status --porcelain` names the file and says nothing about what is in
+  it, so a verifier rewriting an untracked file it did not create left
+  every byte of the hash where it was. Ignored paths stay out on
+  purpose - a build cache moving is not meddling, which is the line the
+  verify checkout already drew.
+- **`awk -v v="$2"` runs the value through awk's escape processing**,
+  so a worktree root of `C:\tmp` was stored in the live task as
+  `C:<TAB>mp` and the overlap scan then read the live surface as stale.
+  On the platform this lab is developed on. Through `ENVIRON` now.
+- **`--dry-run` created the control plane** - `.state/` and every
+  directory under it, in a clean checkout - before reaching the branch
+  that prints the plan and stops. Third time this flag has been caught
+  changing something it says it does not.
+- **`bot-tick.sh` always forwarded `--state`.** `bot-run` reads the
+  *presence* of that option as proof somebody coordinated the control
+  plane deliberately, and waives its refusal to run from a linked
+  worktree on the default plane. Forwarding it unconditionally made the
+  proof automatic: two linked checkouts would each resolve their own
+  default state, each be told it was deliberate, and dispatch over each
+  other.
+- **The surface marker proved provenance, not ownership.** The leaf is
+  the branch with `/` turned into `-`, which is not injective:
+  `bot/a-b/c` and `bot/a/b-c` name one directory. Both tasks would find
+  a marked surface there and each believe it was its own. The marker
+  names the task; now it is read rather than merely counted.
+- **A branch committed to and then reset back is not a branch nothing
+  happened on.** `merge-base --is-ancestor` is true when HEAD *is* the
+  base, so the run reads as zero commits, in scope, clean - the no-op
+  shape, and the no-op path deletes the surface and the branch, which
+  is where the commit still was. The reflog is the only witness that
+  survives a reset, so it is asked how many distinct tips the branch
+  has had.
+- **The `.state/REPO` stamp was check-then-write.** Two first runs for
+  two repositories sharing a fresh control plane both saw no file and
+  both walked into the same task and lock namespace. `set -C` makes
+  creating the file the claim, and the loser reads back what landed.
+
+Four new checks: a reset that must not be cleaned up, the surface it
+must leave behind, and a dry run against a fresh state directory that
+has to still not exist afterwards. Sweep is 71.

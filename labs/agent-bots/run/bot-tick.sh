@@ -60,6 +60,15 @@ usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//;$d';
 
 TASK_DIRS=()
 STATE=""
+# Whether the caller named one, which is a different fact from which
+# one is in use. bot-run reads the *presence* of --state as proof that
+# somebody coordinated the control plane on purpose, and so waives its
+# refusal to run from a linked worktree on the default plane. Forwarding
+# the option unconditionally made that proof automatic: two linked
+# checkouts would each resolve their own default state directory, each
+# be told it was deliberate, and dispatch overlapping work at each
+# other. Forward the flag only when it was actually given.
+STATE_EXPLICIT=""
 REPO=""
 MAX=1
 PARALLEL=1
@@ -72,7 +81,7 @@ WATCH=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --tasks)     TASK_DIRS+=("${2:-}"); shift 2 ;;
-        --state)     STATE="${2:-}"; shift 2 ;;
+        --state)     STATE="${2:-}"; STATE_EXPLICIT=1; shift 2 ;;
         --repo)      REPO="${2:-}"; shift 2 ;;
         --max)       MAX="${2:-}"; shift 2 ;;
         --parallel)  PARALLEL="${2:-}"; shift 2 ;;
@@ -90,6 +99,10 @@ REPO="${REPO:-$(git -C "$LAB_DIR" rev-parse --show-toplevel)}"
 STATE="${STATE:-$LAB_DIR/.state}"
 mkdir -p "$STATE"
 STATE="$(cd "$STATE" && pwd)"
+# An array rather than `${VAR:+--state $STATE}`: a state directory is a
+# path, and a path is allowed a space in it.
+STATE_ARGS=()
+[ -z "$STATE_EXPLICIT" ] || STATE_ARGS=(--state "$STATE")
 BOARD="$STATE/board.md"
 
 if [ "${#TASK_DIRS[@]}" -eq 0 ]; then
@@ -334,7 +347,7 @@ decide_and_run() {
         bash "$RUNNER" \
             --task "${to_dispatch[$i]}" \
             --repo "$REPO" \
-            --state "$STATE" \
+            ${STATE_ARGS[@]+"${STATE_ARGS[@]}"} \
             ${to_dispatch_reset[$i]:+${to_dispatch_reset[$i]}} \
             ${CHAIN:+$CHAIN} \
             > "$STATE/runs/tick-$(basename "${to_dispatch[$i]}" .md).out" 2>&1 &

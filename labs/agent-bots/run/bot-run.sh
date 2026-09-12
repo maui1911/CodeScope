@@ -233,12 +233,19 @@ LOCKS_HELD=()
 # a run whose lock was broken out from under it deletes the *next*
 # holder's lock on the way out, leaving that one inside the critical
 # section with the door open behind it.
+# The token is the *name* of the file, not its contents, and that is
+# what makes releasing safe rather than merely careful. Read-then-delete
+# has a window: the lock is broken as stale, a new run mkdirs the same
+# directory and writes its token, and the old process - still holding a
+# comparison it made a moment ago - deletes the new holder's owner file
+# and rmdirs its lock, reopening the critical section from the outside.
+# With the token in the name, `rm -f "$dir/owner.$RUN_TOKEN"` can only
+# ever remove this run's own marker, and `rmdir` fails while somebody
+# else's is in there. No window to lose.
 _release_one() {
     local dir="$1"
-    if [ "$(cat "$dir/owner" 2>/dev/null || true)" = "$RUN_TOKEN" ]; then
-        rm -f "$dir/owner"
-        rmdir "$dir" 2>/dev/null || true
-    fi
+    rm -f "$dir/owner.$RUN_TOKEN" 2>/dev/null || true
+    rmdir "$dir" 2>/dev/null || true
 }
 
 release_locks() {
@@ -250,6 +257,7 @@ trap release_locks EXIT
 
 take_lock() {   # take_lock <dir> <what>
     local dir="$1" what="$2" waited=0 owner_before owner_now cleared_break
+    local holder_pid holder_alive
     while ! mkdir "$dir" 2>/dev/null; do
         # Breaking a stale lock is itself a race, and the first version
         # lost it: two runs both judged the same directory stale, both
@@ -264,7 +272,7 @@ take_lock() {   # take_lock <dir> <what>
         # not descend", and it is POSIX where -maxdepth is an
         # extension. Whether a given BSD find implements -maxdepth is a
         # question this no longer has to have an opinion about.
-        owner_before="$(cat "$dir/owner" 2>/dev/null || true)"
+        owner_before="$(ls "$dir" 2>/dev/null | head -n1 || true)"
         # The break marker is itself a lock, and it is held for two
         # reads and an `rm -rf`. A run killed inside that window leaves
         # it behind, and then nothing recovers anything here ever again:
@@ -286,14 +294,34 @@ take_lock() {   # take_lock <dir> <what>
            && [ "${FIND_AGE_OK:-1}" -eq 1 ] \
            && [ -n "$(find "$dir" -prune -mmin +10 -print 2>/dev/null)" ] \
            && mkdir "$dir.break" 2>/dev/null; then
-            owner_now="$(cat "$dir/owner" 2>/dev/null || true)"
+            owner_now="$(ls "$dir" 2>/dev/null | head -n1 || true)"
             # An old lock with no owner file at all is the run that was
             # killed between `mkdir` and writing its token. Refusing to
             # break those - which the first version did, by requiring a
             # non-empty owner - meant the one crash the ten-minute
             # recovery exists for was the one it could not recover.
-            if [ "$owner_now" = "$owner_before" ]; then
-                say "  breaking a stale $what lock at $dir (owner ${owner_before:-none recorded})"
+            # Ten minutes of mtime is a guess about the holder, and
+            # the mtime is never refreshed while a critical section
+            # runs - so a legitimately slow one (a big checkout, a
+            # folder snapshot) looked exactly like a crash and had its
+            # lock taken away while it was still inside. The token
+            # starts with the holder's pid, and the holder is on this
+            # machine because the lock is a directory on it, so the
+            # question has a real answer: ask it. A pid that is gone is
+            # a run that is gone. A reused pid costs one missed
+            # recovery and a clear timeout message; breaking a live
+            # lock costs two runners in the same critical section.
+            holder_pid="${owner_now#owner.}"
+            holder_pid="${holder_pid%%-*}"
+            holder_alive=0
+            case "$holder_pid" in
+                ''|*[!0-9]*) ;;
+                *) kill -0 "$holder_pid" 2>/dev/null && holder_alive=1 ;;
+            esac
+            if [ "$holder_alive" -eq 1 ]; then
+                say "  $what lock at $dir is old but its holder (pid $holder_pid) is alive - waiting"
+            elif [ "$owner_now" = "$owner_before" ]; then
+                say "  breaking a stale $what lock at $dir (owner ${owner_before#owner.})"
                 rm -rf "$dir"
             fi
             rmdir "$dir.break" 2>/dev/null || true
@@ -312,7 +340,7 @@ takeover is disabled here and a lock left by a killed run will never be
 reclaimed on its own.")"
         sleep 0.2
     done
-    printf '%s\n' "$RUN_TOKEN" > "$dir/owner"
+    : > "$dir/owner.$RUN_TOKEN"
     LOCKS_HELD+=("$dir")
 }
 
@@ -456,8 +484,18 @@ WORKTREE_ROOT="$(abspath "$WORKTREE_ROOT")"
 refuse_inside_repo --state "$STATE"
 refuse_inside_repo --worktree-root "$WORKTREE_ROOT"
 
-mkdir -p "$STATE"
-STATE="$(cd "$STATE" && pwd)"
+# Not under --dry-run: the usage text says it changes nothing on disk,
+# and creating the control plane - `.state/` in a clean checkout, with
+# every subdirectory under it - is a change. Everything a dry run reads
+# from here is already guarded for absence, because a first run has to
+# work too.
+[ "$DRY_RUN" -eq 1 ] || mkdir -p "$STATE"
+# `cd && pwd` resolves symlinks and drive-letter case, which the string
+# form cannot - but only for a directory that exists. Under --dry-run it
+# deliberately does not, and abspath has already made this absolute. The
+# unguarded form exited the script there, which is a strange way for
+# "changes nothing" to fail.
+[ ! -d "$STATE" ] || STATE="$(cd "$STATE" && pwd)"
 refuse_inside_repo --state "$STATE"
 
 # A control plane belongs to one repository. Live tasks and locks are
@@ -491,7 +529,27 @@ Linked worktrees of one repository are not two repositories, and do
 not trip this: they share a common git directory, which is what is
 compared here."
 elif [ "$DRY_RUN" -eq 0 ]; then
-    printf '%s\n' "$REPO_IDENTITY" > "$STATE/REPO"
+    # noclobber, so creating the file *is* the claim. Check-then-write
+    # let two first runs for two different repositories both see no
+    # REPO file and both walk into the same task and lock namespace;
+    # whichever wrote last only changed what *later* runs would compare
+    # against, never the collision happening right then. Now exactly one
+    # creates it and the loser reads back what actually landed, which
+    # sends it through the same comparison as every run after it.
+    if ! ( set -C; printf '%s\n' "$REPO_IDENTITY" > "$STATE/REPO" ) 2>/dev/null; then
+        STAMPED="$(cat "$STATE/REPO" 2>/dev/null || true)"
+        [ "$STAMPED" = "$REPO_IDENTITY" ] || die \
+"$STATE was claimed by another repository while this run was starting.
+
+It now belongs to:
+    $STAMPED
+and this run is for:
+    $REPO_IDENTITY
+
+Two repositories cannot share one control plane. Give this one its own:
+
+    --state <a directory for $REPO>"
+    fi
 fi
 
 # `find -prune -mmin` is the whole basis of every age check here -
@@ -500,8 +558,13 @@ fi
 # machine in front of you" are different claims, and the failure mode if
 # they are absent is silence: the expression errors, the test reads
 # false, and stale locks are simply never reclaimed. Ask once, out loud.
+# Falls back to `.` because the question is about this build of find,
+# not about $STATE - and under --dry-run $STATE deliberately does not
+# exist yet, which would otherwise answer "your find is broken".
 FIND_AGE_OK=1
-find "$STATE" -prune -mmin +1 -print >/dev/null 2>&1 || FIND_AGE_OK=0
+find "$STATE" -prune -mmin +1 -print >/dev/null 2>&1 \
+    || find . -prune -mmin +1 -print >/dev/null 2>&1 \
+    || FIND_AGE_OK=0
 
 # The control plane is keyed to this checkout, and the conflicts it
 # exists to prevent are keyed to the repository. For a single checkout
@@ -1516,8 +1579,15 @@ board() {
 # and understands the `0,/re/` address; BSD sed - macOS, which this
 # project ships - does neither, and would fail here *after* the handoff
 # was written, leaving the live task stuck on `dispatched` forever.
+# The value goes through the environment, never through `awk -v`.
+# `-v` runs the assignment through awk's escape processing, so a
+# worktree root of `C:\tmp` is stored as `C:<TAB>mp` - and the overlap
+# scan then compares the real path against that and calls the live
+# surface stale. The key is a bare word by construction; the value is
+# whatever a path happens to be.
 set_field() {   # set_field <key> <value> - replace, or insert before the closing fence
-    awk -v k="$1" -v v="$2" '
+    BOT_FIELD_VALUE="$2" awk -v k="$1" '
+        BEGIN { v = ENVIRON["BOT_FIELD_VALUE"] }
         /^---[[:space:]]*$/ {
             fence++
             if (fence == 2 && !done) { print k ": " v; done = 1 }
@@ -1730,7 +1800,13 @@ drop_surface() {
             return 1
         fi
     fi
-    [ -f "$WT/.git/bot-surface" ] || { say "  refusing to remove $WT - not a surface this run made"; return 1; }
+    # And whose it is, not only that it is one. The leaf is the branch
+    # with `/` turned into `-`, which is not injective: `bot/a-b/c` and
+    # `bot/a/b-c` land on the same directory name. Two such tasks would
+    # each find a marked surface at that path and each believe it was
+    # looking at its own. The marker names the task; read it.
+    grep -q "surface for $TASK_ID\$" "$WT/.git/bot-surface" 2>/dev/null \
+        || { say "  refusing to remove $WT - not a surface this run made"; return 1; }
     rm -rf "$WT"
     [ ! -e "$WT" ] || return 1
     # Nothing borrows the base objects any more. Last, so that a removal
@@ -1770,7 +1846,9 @@ set_field base_sha "$BASE_SHA"
 # it, the exclusion we are about to rely on stopped being true, and
 # claiming anyway would make the board say two runs agreed when they
 # never met.
-[ "$(cat "$STATE/dispatch.lock/owner" 2>/dev/null || true)" = "$RUN_TOKEN" ] || refuse \
+# The marker is named for its holder, so "is it still ours" is a file
+# test and not a comparison of contents somebody else may have rewritten.
+[ -e "$STATE/dispatch.lock/owner.$RUN_TOKEN" ] || refuse \
 "the dispatch lock was broken while this run was inside it - refusing to claim.
 Nothing was dispatched. Re-run once no other run is in flight."
 
@@ -2174,6 +2252,7 @@ fi
 
 # A worktree the agent wrecked must still produce a handoff, so none of
 # these may take the script down under `set -e`.
+BRANCH_RESET=""
 HEAD_SHA="$(git -C "$WT" rev-parse HEAD 2>/dev/null)" || HEAD_SHA=""
 if [ -z "$HEAD_SHA" ]; then
     HEAD_SHA="(unreadable)"
@@ -2183,6 +2262,7 @@ if [ -z "$HEAD_SHA" ]; then
     TOUCHED=""
     NUMSTAT="worktree unreadable"
     TODO_VIOLATIONS=""
+    BRANCH_RESET=""
     BASE_IS_ANCESTOR=1
     TREE_BROKEN=1
 else
@@ -2240,6 +2320,19 @@ else
     TODO_VIOLATIONS="$(printf '%s\n' "$TODO_DIFF" \
         | grep -E '^\+' | grep -Ev '^\+\+\+' \
         | grep -E 'TODO|FIXME' | grep -Ev '#[0-9]+' || true)"
+
+    # `merge-base --is-ancestor` is true when HEAD *is* the base, so a
+    # branch that was committed to and then reset back reads exactly
+    # like a branch nothing happened on - zero commits, in bounds,
+    # clean. That is the no-op path, and the no-op path deletes the
+    # surface and the branch, taking the only copy of whatever was done
+    # with it. The reflog is the one place the difference survives a
+    # reset, so ask it how many distinct tips this branch has had.
+    if [ "$COMMITS" -eq 0 ]; then
+        BRANCH_TIPS="$(git -C "$WT" reflog show --format='%H' "$TASK_BRANCH" 2>/dev/null \
+            | sort -u | wc -l | tr -d ' ')" || BRANCH_TIPS=1
+        [ "${BRANCH_TIPS:-1}" -le 1 ] || BRANCH_RESET="$BRANCH_TIPS"
+    fi
 fi
 
 say "  head      ${HEAD_SHA:0:12}"
@@ -2314,7 +2407,17 @@ fi
 tree_state() {   # tree_state <dir> [tracked-only]
     {
         git -C "$1" rev-parse HEAD
-        [ -n "${2:-}" ] || git -C "$1" -c core.quotepath=off status --porcelain
+        if [ -z "${2:-}" ]; then
+            git -C "$1" -c core.quotepath=off status --porcelain
+            # `status --porcelain` names an untracked path and says
+            # nothing about what is in it, so a verifier that rewrites
+            # an untracked file it did not create leaves every byte of
+            # this hash where it was. Ignored paths stay out on purpose:
+            # a build cache moving is not meddling, which is the same
+            # line the verify checkout draws.
+            git -C "$1" ls-files --others --exclude-standard \
+                | git -C "$1" hash-object --stdin-paths
+        fi
         git -C "$1" diff HEAD
     } 2>/dev/null | git hash-object --stdin
 }
@@ -2602,6 +2705,17 @@ elif [ "$TASK_PRODUCES" = "report" ] && [ "$ARTIFACT_VERDICT" = "blocked" ]; the
     STATUS="blocked"
     BLOCKERS="$TASK_OWNER could not complete this report. Its reasons are
 in $ARTIFACT_FILE"
+elif [ -n "$BRANCH_RESET" ]; then
+    # Above the no-op branch, because from there the two are the same
+    # picture and only one of them may be cleaned up.
+    STATUS="needs-review"
+    BLOCKERS="this branch has pointed at $BRANCH_RESET different commits and is back on
+the one it was cut from. Zero commits here does not mean nothing
+happened - it means whatever happened was undone, and the reflog in
+$WT is the only record of it left:
+    git -C $WT reflog show $TASK_BRANCH
+The surface is kept rather than cleaned up, because the no-op path
+deletes it and there would then be nothing to look at."
 elif [ "$COMMITS" -eq 0 ]; then
     STATUS="done"
     NOOP=1
