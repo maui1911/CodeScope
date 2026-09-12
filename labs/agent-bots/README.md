@@ -450,7 +450,7 @@ list; the sites do not.
 
 | | |
 |---|---|
-| Covered | plain-folder projects as well as git ones; the file contract; **two bots** (`fixer`, `reviewer`), two deliverables (`produces: commit`, `produces: report`), the handoff between them and a scheduler that reads the board; contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the report channel (`artifact:`, `shape:`, harvested into `.state/artifacts/`) with citations *and* quotes checked against the blob; verifier, in a clean checkout of the branch tip; the surface disarm (hooks, command-naming config, `core.worktree`, and the identity of `.git` itself); the approval gate on derived tasks *and* on per-bot memory, hashed over the body, with `--chain` as a recorded bypass; per-bot memory itself - one fact per run, capped, refused if it would restructure the prompt it is quoted in; evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup; rebase onto a base that moved, re-verified there; retiring a finished record (`bot-forget.sh`) without touching the board or the handoff |
+| Covered | plain-folder projects as well as git ones; the file contract; **two bots** (`fixer`, `reviewer`), two deliverables (`produces: commit`, `produces: report`), the handoff between them and a scheduler that reads the board; contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the report channel (`artifact:`, `shape:`, harvested into `.state/artifacts/`) with citations *and* quotes checked against the blob; verifier, in a clean checkout of the branch tip; the surface disarm (hooks, command-naming config, `core.worktree`, and the identity of `.git` itself); the approval gate on derived tasks *and* on per-bot memory, hashed over the body, with `--chain` as a recorded bypass; per-bot memory itself - one fact per run, capped, refused if it would restructure the prompt it is quoted in; evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup; rebase onto a base that moved, re-verified there; retiring a finished record (`bot-forget.sh`), which appends to the board rather than editing it and leaves the handoff alone |
 | **Not** covered | re-verifying a branch that is *waiting* rather than running, resume after a crash, any trigger other than "someone ran a tick", pushing, opening PRs, any GPUI surface |
 
 Two deliberate omissions:
@@ -621,11 +621,22 @@ labs/agent-bots/run/bot-forget.sh T-0010
 labs/agent-bots/run/bot-forget.sh T-0010 --surface   # and the clone
 ```
 
-It refuses a task still saying `dispatched` — a run in flight and a run
-that died look identical from outside and want opposite things — and
-`--force` is the way past that. It never touches the handoff, the
-board, the artifacts or a bot's memory, and it appends `forgotten` to
-the board, because retiring a record is itself an event. F-46.
+Two separate gates, and conflating them was a bug. A **run marker**
+under `.state/running/` says whether a process is in there, carrying
+its pid so a killed run is distinguishable from a live one; the
+**status** says whether the run reached a verdict. Neither answers the
+other's question: the runner writes `done` *before* its cleanup and
+rewrites it if that cleanup fails, so a finished-looking status is
+normal while there is still work to do. `--force` is the way past
+either gate.
+
+It removes nothing *from* the handoff, the artifacts or a bot's
+memory, and it appends a `forgotten` row to the board rather than
+editing it — retiring a record is itself an event, and the board is
+append-only either way. `--surface` removes all three parts of a
+surface, the way the runner's own `drop_surface` does: the verify
+checkout beside it, the clone, and then the `refs/bot-base/<id>` pin
+in the project. F-46 and F-47.
 
 **Which CLI runs is data.** The task's `agent:` wins, otherwise the
 charter's; the profile lives in `contract/agents/<id>.agent.md`. There is no
@@ -3673,3 +3684,120 @@ plane would be the deeper fix — `--state` already takes a path, so it
 is a default and a paragraph away — and it is the same sentence as
 F-44 one level down: a fixture directory next to a jobs directory,
 except this time the fixtures and the jobs are *runs*.
+
+---
+
+### F-47 · A status is where the run got to, not whether anybody is in there
+
+*2026-09-12, the review of F-46's own fix.*
+
+`bot-forget.sh` gated on the status: `done`, `blocked` and
+`needs-review` meant finished, so the record could go. The review
+pointed at the runner and asked what order it does things in.
+
+    set_status "$STATUS"        # done
+    board "handoff" "$STATUS"
+    ...
+    drop_surface || CLEAN_FAILED=...
+    if [ -n "$CLEAN_FAILED" ]; then
+        STATUS="needs-review"
+        set_status "$STATUS"    # and the handoff's frontmatter too
+
+A terminal status is on disk *while the runner still has work to do*.
+Delete the live task in that window and the run's last `set_field`
+fails on a missing file, and the run ends with no status at all —
+which is **exactly** the bug `sweep.sh`'s preflight was built around,
+one commit after I fixed it there. I had written the rule into the
+suite and then walked back into it in the tool the suite made
+necessary.
+
+The status could never have answered it. It records where the run
+*got to*; the question was whether a process is still in there, and
+nothing on disk said. So the runner now writes
+`.state/running/<id>.<run-token>` holding its pid, created where the
+task becomes `dispatched` and removed in the exit trap — so it
+survives a `die`, a refusal and a Ctrl-C, and what it leaves behind on
+a `kill -9` is a stale marker that anything reading it tests with
+`kill -0`. A file is a claim; a process is a fact. The lock protocol
+had already learned that (F-38); nothing else had.
+
+Two gates now, because there are two questions: *is anybody in there*
+(the marker) and *did the run reach a verdict* (the status).
+
+**And the same review found the decision stated twice.** `sweep.sh`
+treated a missing status as unsafe; `bot-forget.sh`, written a commit
+later, let it through and deleted the file. One rule in two places is
+two rules, and the reader picks — so `run/live-task.sh` is now the one
+definition, text-first for the reason F-43 gave, and both callers
+source it. That makes three: `approval.sh` for "approved",
+`memory.sh` for "remembered", `live-task.sh` for "finished". Every one
+of them exists because two readers of the same file disagreed in
+production.
+
+**A surface turned out to be three things.** `--surface` removed the
+clone and stopped. The runner's `drop_surface` removes the sibling
+`-verify` checkout first, then the clone, then deletes
+`refs/bot-base/<id>` from the project — and the order is load-bearing,
+so a removal that refuses still leaves the pin pointing at what the
+surface was cut from. Retiring a surface without the pin leaks a ref
+that holds the base objects alive for ever, and without the verify
+checkout leaves a directory nothing will ever clean up. Mirrored now,
+order included.
+
+What generalises: **when you write a second tool that acts on another
+tool's file, read what the first one does to that file and in what
+order — not what its field names suggest.** `status: done` reads like
+a fact about a finished run. It is a field one process writes twice.
+
+---
+
+### F-48 · Three EXIT traps in sequence, and the last one dropped what the first one promised
+
+*2026-09-12, found by a check written for something else.*
+
+F-47's fix added two lines to the sweep's leftover report — no run
+marker should outlive its run, no task snapshot should outlive its
+dispatch. Both went red immediately: **23 markers and 15 snapshots on
+disk.**
+
+The runner installs the EXIT trap three times:
+
+    trap on_exit EXIT              # locks, snapshot, marker
+    ...
+    trap rollback_dispatch EXIT    # the half-dispatch window
+    ...
+    trap release_locks EXIT        # from the agent run onward
+
+Each one replaces the last, and the last one drops everything except
+the locks. So from the dispatch onward — which is every run that gets
+as far as calling an agent — the private task snapshot and the run
+marker were never removed at all. `rollback_dispatch` had the same
+hole on its failure path.
+
+The comment on `on_exit` is the part worth reading twice:
+
+> The private copy of the task goes with the locks: it is this
+> invocation's and nobody else may read it, so leaving it behind would
+> turn `$STATE/tmp` into a pile of half-dispatched tasks that look
+> like records.
+
+That is exactly what had happened, in the directory the comment names,
+while the comment sat above a function the later traps had taken out
+of the exit path. The rule was written down, was correct, and was not
+running.
+
+Both later paths go through `on_exit` now. And because a killed run
+cannot run any trap at all, a dispatch also clears *its own task's*
+dead markers and snapshots — pid from the marker, pid from the run
+token in the snapshot's name, `kill -0` either way. Only its own id:
+another task's leftovers are not this run's to judge, which is the
+same line the sweep's preflight draws.
+
+What generalises, and it is not "test your cleanup": **a trap is a
+variable, not a declaration.** `trap X EXIT` reads like a statement
+about the program and behaves like an assignment — the last write
+wins, from anywhere, including from a function three hundred lines
+away. Every one of the three was locally correct; the bug was in the
+sequence, which no single reading of any one of them shows. The two
+leftover checks are the only thing that could have found it, and they
+existed for eleven minutes before they did.
