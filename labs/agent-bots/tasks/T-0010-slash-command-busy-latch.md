@@ -130,9 +130,15 @@ it is a one-line extension of the same rule; until then the timeout in
 the captured lines rule it out: it is `true` on the expansion of a
 prompt-expanding command, which is the one case that must stay `Busy`,
 and it is also `true` on image placeholders and on the
-`<local-command-caveat>` notice. Key on the
-`<local-command-stdout>` / `<local-command-stderr>` markers and on
-`subtype: "local_command"`, not on `isMeta`.
+`<local-command-caveat>` notice.
+
+What to key on instead is the two answer shapes in Acceptance, and
+nothing else: a `user` entry whose content is the
+`<local-command-stdout>` envelope, and a `system` entry whose
+`subtype:` is `local_command` and whose content is that same envelope.
+The subtype is required on the second and meaningless on the first —
+`user` entries carry no `subtype:` — which is why they are two rules
+and not one with an option.
 
 **The command name is not the discriminator either.** `/effort high`
 is the command in the issue's repro and it does not appear anywhere in
