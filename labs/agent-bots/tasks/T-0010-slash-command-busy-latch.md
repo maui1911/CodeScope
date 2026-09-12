@@ -36,12 +36,21 @@ from this machine's own transcripts.
 
 - [ ] The `verify:` command exits 0.
 - [ ] The diff stays inside `touches:`.
-- [ ] A `type: "user"` entry whose content contains
-      `<local-command-stdout>` or `<local-command-stderr>` leaves the
-      state `Idle`.
-- [ ] A `type: "system"` entry with `subtype: "local_command"` does the
-      same. This is the spelling used when the command prints nothing,
-      and today it parses to `EntryKind::Other` and is ignored.
+- [ ] A `type: "user"` entry whose message content **is** the stdout
+      envelope leaves the state `Idle`: the string starts with
+      `<local-command-stdout>` and ends with `</local-command-stdout>`.
+      Not "contains" — an ordinary prompt may quote those tags, this
+      task file does, and a rule that reads a quotation as an answer
+      paints real work as idle. That is the expensive direction to be
+      wrong in.
+- [ ] A `type: "system"` entry with `subtype: "local_command"` whose
+      content is that same envelope does the same. This is the
+      spelling used when the command prints nothing, and today it
+      parses to `EntryKind::Other` and is ignored. The subtype is part
+      of the rule, not decoration: `turn_duration`,
+      `stop_hook_summary`, `compact_boundary` and
+      `model_refusal_fallback` are also `type: "system"` and must keep
+      being ignored.
 - [ ] A `<command-name>` invocation entry with no such answer after it
       still leaves the state `Busy`. This is the negative control and
       it must be a test of its own: a prompt-expanding command
@@ -106,6 +115,16 @@ work. This is the case that must stay `Busy`:
 ```
 
 # Notes
+
+**`<local-command-stderr>` is deliberately not in the rule.** The tag
+exists in the CLI's vocabulary, and no line carrying it appears
+anywhere in the captured transcripts — so there is no evidence for
+what the entry around it looks like: whether it is a `user` entry or a
+`system` one, and whether it arrives alone or paired with a stdout
+envelope in the same content. Adding it on the strength of the name is
+exactly the guess this task exists to avoid. If such a line turns up
+it is a one-line extension of the same rule; until then the timeout in
+#351 is what covers it.
 
 **`isMeta` is not the discriminator.** It was the first candidate and
 the captured lines rule it out: it is `true` on the expansion of a

@@ -4,10 +4,11 @@
 #
 # A bot that finds something writes a task for another bot. Until now
 # that task went straight into the scheduler's reach: `bot-tick.sh`
-# reads `.state/proposed/` alongside the repository's own examples, and
-# a derived task inherited `schedule:` from the review that produced it
-# - so a recurring review produced a recurring fix task, and a machine's
-# conclusion started a machine's work with nobody in between.
+# reads `.state/proposed/` alongside the repository's own task files,
+# and a derived task inherited `schedule:` from the review that
+# produced it - so a recurring review produced a recurring fix task,
+# and a machine's conclusion started a machine's work with nobody in
+# between.
 #
 # This is the gate that was a flag. `--chain` on the runner is still
 # there and still bypasses it, but it now says so on the board and in
