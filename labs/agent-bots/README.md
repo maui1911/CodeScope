@@ -588,6 +588,46 @@ F-29 — including what the snapshot deliberately leaves behind.
 `.state/` is git-ignored, and a clean no-op run removes its own
 worktree and branch.
 
+### Why this is bash
+
+It is the first question anyone asks after reading 3,300 lines of
+`set -euo pipefail`, so it belongs here rather than in someone's head.
+
+Three reasons it was the right call. **The work is orchestration** —
+start a process, move a file, call `git`, read an exit code — which is
+the one domain a shell is actually for. **CodeScope shells out to git
+by policy** (no libgit2; see the root `CLAUDE.md`), so every git
+sequence in `bot-run.sh` transfers to Rust as-is: the runner is a
+transcript of the calls the product will make, not a parallel design.
+And **a lab with no build step can be thrown away**, which is the
+status this has: nothing ships, nothing depends on it.
+
+What it cost is smaller than it looks. Read the findings below and
+almost every one of them is about git semantics and trust — a citation
+is not a read line, a check before the claim is advice, the verifier
+was measuring the wrong tree, the agent writes `.git`. Those would have
+arrived exactly as late in Rust or Python, because they are questions
+about what the runner *believes*, and no type system has an opinion
+about that.
+
+The genuinely language-specific defects never earned a finding of their
+own. They are bullet points inside findings whose lesson is about
+something else: `${a[@]}` under `set -u` on the bash macOS ships,
+`find -maxdepth` as a GNU extension, backticks inside a double-quoted
+string, unguarded pipelines under `pipefail`, MSYS rewriting
+`branch:.env` into a Windows path list. Cheap, every one caught by the
+sweep or a review, and not one of them changed the design.
+
+**The exception is the one worth carrying forward.** `|| true` spells
+*unknown* and *nothing* identically, which is rule 5 of §3.6 and took
+three rounds to see. In a language with `Result` that rule is a
+compile error instead of a review round — and that is an argument for
+the graduation in §6, not for a rewrite now. Twelve review rounds and
+67 green checks are the asset here; porting resets the regression suite
+and re-finds the same design findings in a new dialect. The language
+changes when this moves into `codescope-core`, and the thing that moves
+is the contract, not the script.
+
 ## 6. What would have to be true to graduate this
 
 1. The loop runs unattended and green three times on a real issue in
@@ -606,6 +646,14 @@ worktree and branch.
    command sourced from repo content. See F-6.
 
 Until then it stays in `labs/`.
+
+The runner itself does not graduate. What crosses over is the contract
+- the `TASK.md` fields, the three planes, the verdict chain, the disarm
+rules and the five rules in §3.6 - as Rust in `codescope-core`,
+reusing the worktree, process and retention machinery that is already
+there. The bash is a transcript of the calls that code will make. See
+"Why this is bash" in §5 for why it was written that way and what it
+cost.
 
 ---
 
