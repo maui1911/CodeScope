@@ -231,11 +231,33 @@ bot that found the problem does not get to say what may be touched to
 fix it — that would be self-reported scope, which is the one thing
 this design refuses everywhere else. See F-21.
 
-The derived task lands in `.state/proposed/`, and running it is the
-acceptance. `--chain` dispatches it in the same breath, and is off by
-default: a task written by a machine and started by a machine with
-nothing in between is a different risk class, and in the product that
-gap is where the approval inbox goes.
+The derived task lands in `.state/proposed/`, **and nothing will run
+it until somebody approves it.** `run/bot-approve.sh` with no arguments
+is the inbox - what is waiting, whose it is, and the one command that
+moves it; with `--id` it writes `approved_by:`, `approved_at:` and
+`approved_body:` onto the proposal. The runner refuses a proposal
+without those, and `bot-tick.sh` shows it as `inbox` rather than
+queueing it.
+
+Two details carry the weight. `approved_body` is a hash of the task
+with the approval lines removed, so **the approval is of the bytes and
+not of the name**: edit the proposal afterwards and the runner says so
+and sends you back to read it again. And `bot-approve.sh` refuses to run
+inside a bot run, which is the part that catches the loop reaching for
+its own gate through a verifier or a hook. The agent's real containment
+is different and stronger - the control plane is not in its worktree, so
+an approval in the control plane is not the agent's.
+
+`--chain` still dispatches in the same breath, and now has to open the
+gate to do it: it writes the approval itself, with
+`approved_by: --chain (nobody read this)`, and puts `approval-bypassed`
+on the board. The gate's value is not that a machine cannot open it. It
+is that a machine opening it leaves a mark.
+
+None of this applies to a task committed to the repository. That one
+went through a person, a review and a merge, which is the thing an
+approval is trying to establish and a stronger claim than a line in a
+file.
 
 **Concurrency control without locks.** Each task declares `touches:`
 globs, and the runner refuses to dispatch a task whose files another
@@ -389,8 +411,8 @@ list; the sites do not.
 
 | | |
 |---|---|
-| Covered | plain-folder projects as well as git ones; the file contract; **two bots** (`fixer`, `reviewer`), two deliverables (`produces: commit`, `produces: report`), the handoff between them and a scheduler that reads the board; contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the report channel (`artifact:`, `shape:`, harvested into `.state/artifacts/`) with citations *and* quotes checked against the blob; verifier, in a clean checkout of the branch tip; the surface disarm (hooks, command-naming config, `core.worktree`, and the identity of `.git` itself); evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup; rebase onto a base that moved, re-verified there |
-| **Not** covered | the approval inbox, per-bot memory, re-verifying a branch that is *waiting* rather than running, resume after a crash, any trigger other than "someone ran a tick", pushing, opening PRs, any GPUI surface |
+| Covered | plain-folder projects as well as git ones; the file contract; **two bots** (`fixer`, `reviewer`), two deliverables (`produces: commit`, `produces: report`), the handoff between them and a scheduler that reads the board; contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the report channel (`artifact:`, `shape:`, harvested into `.state/artifacts/`) with citations *and* quotes checked against the blob; verifier, in a clean checkout of the branch tip; the surface disarm (hooks, command-naming config, `core.worktree`, and the identity of `.git` itself); the approval gate on derived tasks, hashed over the task body, with `--chain` as a recorded bypass; evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup; rebase onto a base that moved, re-verified there |
+| **Not** covered | per-bot memory, re-verifying a branch that is *waiting* rather than running, resume after a crash, any trigger other than "someone ran a tick", pushing, opening PRs, any GPUI surface |
 
 Two deliberate omissions:
 
@@ -521,7 +543,11 @@ address the handoff to it by name:
 # review, then hand the findings to the fixer as a scoped task
 labs/agent-bots/run/bot-run.sh   --task labs/agent-bots/examples/T-0006-review-telemetry.md
 
-# ... and dispatch that task too, rather than printing the command
+# the inbox: what a bot proposed and nobody has agreed to yet
+labs/agent-bots/run/bot-approve.sh
+labs/agent-bots/run/bot-approve.sh --id T-0006-fix
+
+# ... or skip the reader and say so on the board
 labs/agent-bots/run/bot-run.sh   --task labs/agent-bots/examples/T-0006-review-telemetry.md --chain
 ```
 
@@ -3078,3 +3104,75 @@ The other seven:
 Four new checks: a reset that must not be cleaned up, the surface it
 must leave behind, and a dry run against a fresh state directory that
 has to still not exist afterwards. Sweep is 71.
+
+---
+
+### F-39 · The gate was a flag, and the flag was not the hole
+
+*2026-09-12, building the thing the README had been promising.*
+
+`--chain` was off by default and the README said the gap it left is
+where the approval inbox goes. That sentence had been true for eleven
+rounds and it described the wrong gap.
+
+**`bot-tick.sh` reads `.state/proposed/` alongside the repository's own
+examples.** A derived task landed there and the scheduler picked it up
+like anything else — so the gate was not "off by default", it was
+"absent, with a flag sitting next to where it should have been". And
+one line makes it worse than that: the derived task carried
+`schedule: $TASK_SCHEDULE`, inherited from the review that wrote it. A
+recurring review produced a **recurring fix task**. The parent's
+recurrence is a statement about reading telemetry every day; it says
+nothing about committing code every day, and it was being read as
+though it did.
+
+So the inbox is not a feature that was missing from a design that held
+without it. It is the missing half of a claim the README was already
+making.
+
+What it is:
+
+- A proposal carries `approved_by:`, `approved_at:` and
+  `approved_body:` or it does not run. The runner refuses it before the
+  lock and before the surface — a refusal that has already created
+  something is not a refusal — and exits 3, so a scheduler reads
+  "nothing happened" rather than "this failed".
+- `approved_body` is a hash of the task with the approval lines
+  removed. **The approval is of the bytes, not of the name.** Approve
+  `T-0006-fix`, edit `T-0006-fix`, and the approval no longer describes
+  it: `stale` is its own verdict with its own sentence, because "never
+  approved" and "approved, then changed underneath you" send a reader to
+  do different things.
+- One definition, in `run/approval.sh`, sourced by all three scripts.
+  Three copies of six lines would be three chances to disagree about
+  what approved means, and the one that drifts is the one that lets
+  something through. First shared file in the lab, and it earned it.
+- The derived task's `schedule:` is now `manual`, and an approved
+  proposal is dispatchable whatever it says — the approval *is* the
+  scheduling decision for a one-shot task.
+
+And what it is not, which took longer to get right than the code. **An
+approval is not proof that a human did it**, and nothing on this side of
+the filesystem can be. What it is is proof that something outside a work
+surface did it, and that is a real boundary: the agent only ever has the
+surface, the control plane is not its to write, so an approval in the
+control plane is not the agent's. `bot-approve.sh` also refuses when
+`BOT_RUN_ACTIVE` or `BOT_CHAIN_DEPTH` is set, which catches the loop
+reaching for its own gate through a verifier or a hook — not the
+containment, the sanity check on the containment.
+
+`--chain` keeps working and now has to open the gate rather than walk
+around it: it writes `approved_by: --chain (nobody read this)` and
+boards `approval-bypassed`. That is the honest shape of a bypass. A gate
+a machine cannot open is not what this needs; a gate a machine can open
+*silently* is.
+
+Four checks: an unapproved proposal is refused, the loop cannot approve
+for itself, approving then running works, and a task edited after
+approval is refused again. Sweep is 75.
+
+**The one to carry into per-bot memory**, which is next and is the same
+shape: memory is text an agent wrote that the runner later feeds back
+into a prompt. It is an approval gate problem before it is a storage
+problem, and building the store first would be building the injection
+channel and leaving the gate for round thirteen.

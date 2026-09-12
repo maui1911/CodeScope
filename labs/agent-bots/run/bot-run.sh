@@ -197,6 +197,12 @@ strip_protected() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAB_DIR="$(dirname "$SCRIPT_DIR")"
 
+# What "approved" means lives in one file, because three scripts have to
+# agree about it and the one that drifts is the one that lets something
+# through. See run/approval.sh.
+# shellcheck source=approval.sh
+. "$SCRIPT_DIR/approval.sh"
+
 die() { printf 'bot-run: %s\n' "$*" >&2; exit 1; }
 say() { printf '%s\n' "$*"; }
 step() { printf '\n== %s\n' "$*"; }
@@ -550,6 +556,54 @@ Two repositories cannot share one control plane. Give this one its own:
 
     --state <a directory for $REPO>"
     fi
+fi
+
+# --------------------------------------------------------------------
+# The gate
+#
+# A task that arrived in the control plane was written by a bot. One in
+# the repository was written by a person, reviewed and merged - which is
+# the thing an approval is trying to establish, already done and done
+# better. So the gate is exactly this directory and nothing else.
+#
+# Before the lock, before the surface, before anything is claimed: a
+# refusal here has to cost nothing, or the gate becomes a thing people
+# route around. `refuse` and not `die` - nothing was attempted, so a
+# scheduler must not count it as a failed run.
+# --------------------------------------------------------------------
+
+if approval_is_proposal "$TASK" "$STATE"; then
+    # Its own read of the id. The gate runs here - before the lock,
+    # before the surface, before the frontmatter is parsed into globals
+    # - because a refusal that has already created something is not a
+    # refusal. That costs one extra read of one field.
+    GATE_ID="$(approval_field id "$TASK")"
+    GATE_ID="${GATE_ID:-$(basename "$TASK" .md)}"
+    case "$(approval_state "$TASK")" in
+        ok) ;;
+        stale)
+            refuse "$GATE_ID was approved and then edited.
+
+    approved by: $(approval_field approved_by "$TASK")
+    approved at: $(approval_field approved_at "$TASK")
+
+An approval records a hash of the task as it read at the time, so this
+one no longer describes the file. Somebody agreed to something else.
+Read it again and approve what is there now:
+
+    bash $SCRIPT_DIR/bot-approve.sh --id $GATE_ID" ;;
+        *)
+            refuse "$GATE_ID is a proposal and nobody has approved it.
+
+A bot wrote this task. Starting it because another bot suggested it is
+the whole loop closing with no one in it - which may well be what you
+want, and is a decision rather than a default.
+
+    bash $SCRIPT_DIR/bot-approve.sh              # what is waiting
+    bash $SCRIPT_DIR/bot-approve.sh --id $GATE_ID
+
+The runner's --chain does it without asking, and says so on the board." ;;
+    esac
 fi
 
 # `find -prune -mmin` is the whole basis of every age check here -
@@ -1886,7 +1940,12 @@ else
     # stdin is the prompt file or nothing at all - never the runner's
     # terminal. A headless agent that decides to ask a question would
     # otherwise inherit it and hang, and either of these ends in EOF.
-    ( cd "$WT" && PATH="$AGENT_PATH" "$AGENT_CMD" ${AGENT_ARGV[@]+"${AGENT_ARGV[@]}"} ) \
+    # BOT_RUN_ACTIVE is what bot-approve.sh looks for. It is not the
+    # agent's containment - that is the control plane being outside the
+    # worktree - it is the part that catches the loop reaching for its
+    # own gate, through a verifier or a hook or a helpful subprocess.
+    ( cd "$WT" && PATH="$AGENT_PATH" BOT_RUN_ACTIVE="$RUN_TOKEN" \
+        "$AGENT_CMD" ${AGENT_ARGV[@]+"${AGENT_ARGV[@]}"} ) \
         <"$AGENT_STDIN" >>"$RUN_LOG" 2>&1 || AGENT_EXIT=$?
     say "  exit $AGENT_EXIT"
     board "agent-ran" "exit $AGENT_EXIT"
@@ -3399,7 +3458,7 @@ base: $(if [ "$SURFACE" = "import" ]; then printf 'folder'; else printf '%s' "$H
 branch: bot/$TASK_ON_CHANGES/$DERIVED_ID
 touches: $DERIVED_TOUCHES
 verify: $TASK_DERIVED_VERIFY
-schedule: $TASK_SCHEDULE
+schedule: manual
 ---
 
 # Objective
@@ -3668,10 +3727,39 @@ if [ "$CHAIN" -eq 1 ] && [ -n "$DERIVED_TASK" ]; then
         say "  chain stopped at depth $depth"
     else
         step "Chain"
+        # The gate is real, so this has to open it rather than step
+        # around it - and the approval it writes says in its own text
+        # that no one read the task. A bypass nobody can see in the
+        # record is not a bypass, it is a hole; this one is on the
+        # board, in the proposal, and in the handoff of whatever runs
+        # next.
+        CHAIN_WHEN="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        CHAIN_BODY="$(approval_body_hash "$DERIVED_TASK")"
+        awk -v when="$CHAIN_WHEN" -v body="$CHAIN_BODY" '
+            /^---[[:space:]]*$/ {
+                fence++
+                if (fence == 2 && !done) {
+                    print "approved_by: --chain (nobody read this)"
+                    print "approved_at: " when
+                    print "approved_body: " body
+                    done = 1
+                }
+                print; next
+            }
+            fence == 1 && /^approved_(by|at|body):/ { next }
+            { print }
+        ' "$DERIVED_TASK" > "$DERIVED_TASK.tmp" && mv "$DERIVED_TASK.tmp" "$DERIVED_TASK"
+
         say "  dispatching $DERIVED_ID to $TASK_ON_CHANGES"
+        say "  --chain: approved without a reader"
+        board "approval-bypassed" "$DERIVED_ID via --chain"
         board "chained" "$DERIVED_ID"
         CHAIN_EXIT=0
-        BOT_CHAIN_DEPTH=$((depth + 1))             bash "${BASH_SOURCE[0]}"                 --task "$DERIVED_TASK"                 --repo "$REPO"                 --state "$STATE"                 --worktree-root "$WORKTREE_ROOT" || CHAIN_EXIT=$?
+        BOT_CHAIN_DEPTH=$((depth + 1)) bash "${BASH_SOURCE[0]}" \
+            --task "$DERIVED_TASK" \
+            --repo "$REPO" \
+            --state "$STATE" \
+            --worktree-root "$WORKTREE_ROOT" || CHAIN_EXIT=$?
         # The chain's outcome is the one a caller cares about, and this
         # run can only be `done` or it would not have got here.
         exit "$CHAIN_EXIT"

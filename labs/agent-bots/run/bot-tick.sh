@@ -109,6 +109,9 @@ if [ "${#TASK_DIRS[@]}" -eq 0 ]; then
     TASK_DIRS=("$LAB_DIR/examples" "$STATE/proposed")
 fi
 
+# shellcheck source=approval.sh
+. "$SCRIPT_DIR/approval.sh"
+
 RUNNER="$SCRIPT_DIR/bot-run.sh"
 [ -x "$RUNNER" ] || [ -f "$RUNNER" ] || die "no runner at $RUNNER"
 
@@ -202,6 +205,7 @@ FAILURES=0
 
 decide_and_run() {
     local dispatched_this_tick=0
+    local inbox_count=0
     local -a to_dispatch=()
     local -a to_dispatch_reset=()
 
@@ -210,6 +214,7 @@ decide_and_run() {
     printf '%s\n' "---------------------------------------------------------------------------------"
 
     local dir file id owner every schedule live status worktree decision why reset
+    local inbox_why approved
     local attempts outcomes last_outcome blocked_streak
     for dir in ${TASK_DIRS[@]+"${TASK_DIRS[@]}"}; do
         [ -d "$dir" ] || continue
@@ -246,10 +251,31 @@ decide_and_run() {
             last_outcome="${last_outcome:-never}"
             blocked_streak="$(consecutive_blocked "$id")"
 
+            # A proposal was written by a bot, and the scheduler reads
+            # the proposal directory alongside the repository's own
+            # tasks - so without this, one bot's conclusion started
+            # another bot's work with nobody in between. Worse than it
+            # sounds: a derived task used to inherit `schedule:` from
+            # the review that produced it, so a recurring review made a
+            # recurring fix task.
+            inbox_why=""
+            approved=""
+            if approval_is_proposal "$file" "$STATE"; then
+                case "$(approval_state "$file")" in
+                    ok)    approved=1 ;;
+                    stale) inbox_why="approved, then edited - approve it again" ;;
+                    *)     inbox_why="waiting for approval" ;;
+                esac
+            fi
+
             decision="ready"
             why="never run"
 
-            if [ "$schedule" != "auto" ]; then
+            if [ -n "$inbox_why" ]; then
+                decision="inbox"
+                why="$inbox_why"
+                inbox_count=$((inbox_count + 1))
+            elif [ "$schedule" != "auto" ] && [ -z "$approved" ]; then
                 # The gate, and it is opt-in on purpose. A scheduler
                 # that runs everything it can find will run the first
                 # fixture somebody drops in the examples folder - and
@@ -317,6 +343,16 @@ decide_and_run() {
                 "$id" "${owner:-?}" "$decision" "$attempts" "$last_outcome" "$why"
         done
     done
+
+    # Ahead of "nothing to dispatch", because those are different
+    # sentences and only one of them asks the reader for something. A
+    # tick that ends quiet while three proposals sit waiting has not
+    # finished; it is holding a queue nobody has been shown.
+    if [ "$inbox_count" -gt 0 ]; then
+        say ""
+        say "inbox: $inbox_count proposal(s) waiting for approval"
+        say "    bash $SCRIPT_DIR/bot-approve.sh"
+    fi
 
     [ "${#to_dispatch[@]}" -gt 0 ] || { say ""; say "nothing to dispatch"; return 0; }
 

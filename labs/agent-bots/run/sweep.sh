@@ -22,6 +22,7 @@ LAB_DIR="$(dirname "$SCRIPT_DIR")"
 REPO="$(git -C "$LAB_DIR" rev-parse --show-toplevel)"
 
 RUN="$SCRIPT_DIR/bot-run.sh"
+APPROVE="$SCRIPT_DIR/bot-approve.sh"
 STUBS="$SCRIPT_DIR/stubs"
 EX="$LAB_DIR/examples"
 STATE="$LAB_DIR/.state"
@@ -285,7 +286,39 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
+# The gate, in the order a person meets it. A derived task is written
+# by a bot and read by the scheduler, so without this the loop closes
+# with nobody in it - and a derived task used to inherit `schedule:`
+# from the review that produced it, which made a recurring review into
+# a recurring fix task.
+UNAPPROVED_RC=0
+bash "$RUN" --task "$STATE/proposed/T-0006-fix.md" --skip-agent >/dev/null 2>&1 \
+    || UNAPPROVED_RC=$?
+check "proposal needs approval" 3 "$UNAPPROVED_RC"
+
+# And the loop may not open it for itself. Not the containment - that is
+# the control plane being outside the worktree - the part that catches
+# the runner reaching for its own gate.
+SELFAPPROVE_RC=0
+BOT_RUN_ACTIVE=sweep bash "$APPROVE" --id T-0006-fix --state "$STATE" >/dev/null 2>&1 \
+    || SELFAPPROVE_RC=$?
+check "no self-approval" 1 "$SELFAPPROVE_RC"
+
+APPROVE_RC=0
+bash "$APPROVE" --id T-0006-fix --state "$STATE" --repo "$REPO" >/dev/null 2>&1 \
+    || APPROVE_RC=$?
+check "approve" 0 "$APPROVE_RC"
+
 run "refusenik.sh"           2 "$STATE/proposed/T-0006-fix.md" refusenik.sh
+cleanup bot/fixer/T-0006-fix
+
+# An approval is of the bytes, not of the name. Editing the task after
+# somebody read it leaves an approval describing something else.
+printf '\nA line added after the approval.\n' >> "$STATE/proposed/T-0006-fix.md"
+STALE_RC=0
+bash "$RUN" --task "$STATE/proposed/T-0006-fix.md" --reset --skip-agent >/dev/null 2>&1 \
+    || STALE_RC=$?
+check "approval goes stale" 3 "$STALE_RC"
 cleanup bot/fixer/T-0006-fix
 
 drop_sweep_tasks
