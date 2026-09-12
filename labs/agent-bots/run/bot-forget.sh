@@ -116,7 +116,10 @@ WORKTREE="$(live_task_field worktree "$LIVE_TEXT")"
 # That is precisely the bug sweep.sh's preflight was built around, and
 # a status-only gate here walked straight back into it. F-47.
 RUNNING="$(live_task_running "$STATE" "$TASK_ID")"
-ALIVE="$(printf '%s\n' "$RUNNING" | grep ' alive$' || true)"
+# Field two, not a line suffix: the path is last so that a state
+# directory with a space in it still parses, which means `alive` is no
+# longer at the end of the line. F-49.
+ALIVE="$(printf '%s\n' "$RUNNING" | awk '$2 == "alive"' || true)"
 if [ -n "$ALIVE" ] && [ "$FORCE" -eq 0 ]; then
     printf 'bot-forget: a run for %s is still going.\n\n' "$TASK_ID" >&2
     printf '%s\n\n' "$ALIVE" >&2
@@ -197,32 +200,52 @@ if [ "$SURFACE" -eq 1 ] && [ -n "$WORKTREE" ]; then
     # git directory this control plane belongs to, which is what
     # `git -C` wants; --repo overrides it for a plane whose project has
     # moved.
+    #
+    # Everything here is fatal rather than best-effort, and the reason
+    # is the order of what follows: the live task is about to be
+    # deleted, and it is the only record naming this pin. A silent
+    # failure leaves a ref holding the base objects alive for ever and
+    # removes the evidence needed to retry - which is exactly the leak
+    # this path exists to close. The runner's own drop_surface can
+    # afford `|| true` on the same call because its live task survives
+    # and the next run can try again. This one cannot. F-49, and rule 5
+    # of 3.6: a removal that could not be attempted is not a removal.
     PIN_REPO="$REPO"
     [ -n "$PIN_REPO" ] || PIN_REPO="$(cat "$STATE/REPO" 2>/dev/null || true)"
-    if [ -n "$PIN_REPO" ] \
-       && git -C "$PIN_REPO" rev-parse --git-dir >/dev/null 2>&1 \
-       && git -C "$PIN_REPO" rev-parse --verify --quiet "refs/bot-base/$TASK_ID" >/dev/null 2>&1
+    [ -n "$PIN_REPO" ] \
+        || die "no project to remove refs/bot-base/$TASK_ID from - $STATE/REPO is missing, so pass --repo"
+    git -C "$PIN_REPO" rev-parse --git-dir >/dev/null 2>&1 \
+        || die "$PIN_REPO is not a git repository, so whether refs/bot-base/$TASK_ID exists cannot be established"
+    if git -C "$PIN_REPO" rev-parse --verify --quiet "refs/bot-base/$TASK_ID" >/dev/null 2>&1
     then
         git -C "$PIN_REPO" update-ref -d "refs/bot-base/$TASK_ID" >/dev/null 2>&1 \
-            && REMOVED_PIN="refs/bot-base/$TASK_ID"
+            || die "could not remove refs/bot-base/$TASK_ID from $PIN_REPO.
+The live task is still here, so this can be retried once that ref is
+free - which is the whole reason it is not being deleted first."
+        REMOVED_PIN="refs/bot-base/$TASK_ID"
     fi
 fi
 
-rm -f "$LIVE"
-
-# The board is append-only and this is an event: somebody decided a
-# record had served its purpose. Same principle as --chain recording
-# its own bypass - the value of a door is not that it cannot be opened,
-# it is that opening it leaves a mark.
+# The mark goes down before the act, not after. The board is
+# append-only and this is an event: somebody decided a record had
+# served its purpose - same principle as --chain recording its own
+# bypass, where the value of a door is not that it cannot be opened but
+# that opening it leaves a mark. A mark written afterwards is a mark
+# that can fail to be written, and then the record is gone with nothing
+# saying who removed it. This way round, a board that cannot be
+# appended to stops the removal instead.
 printf '| %s | %s | forgotten | %s |\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TASK_ID" "was ${STATUS:-no status}" \
-    >> "$STATE/board.md"
+    >> "$STATE/board.md" \
+    || die "could not append to $STATE/board.md - nothing was removed"
+
+rm -f "$LIVE"
 
 # A marker whose process is gone is this id's litter, and the pid said
 # so. Same judgement the lock protocol makes before it breaks a stale
 # holder, and it happens after the gates rather than before, so nothing
 # is cleared on a run that turned out to be alive.
-printf '%s\n' "$RUNNING" | while read -r mark _pid state; do
+printf '%s\n' "$RUNNING" | while read -r _pid state mark; do
     [ "$state" = "gone" ] || continue
     rm -f "$mark"
 done

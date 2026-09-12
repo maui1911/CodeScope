@@ -21,15 +21,30 @@
 # `.state/running/`, which exists for exactly as long as a process
 # does. See live_task_running below and F-47.
 
-# live_task_status <text> - the declared status, or empty.
-live_task_status() {
-    printf '%s\n' "$1" | sed -n 's/^status:[[:space:]]*//p' | head -n1
+# live_task_field <key> <text> - the frontmatter reader.
+#
+# Frontmatter only, counting fences, which is the runner's own parser
+# and not a shorthand for it. A plain `sed -n 's/^status:...'` over the
+# whole document reads a *body* line too: a task with no frontmatter
+# status and the words `status: done` somewhere in its prose came back
+# `done`, and this file's whole job is deciding whether something may
+# be deleted. Missing has to read as missing. F-49.
+live_task_field() {
+    printf '%s\n' "$2" | awk -v key="$1" '
+        /^---[[:space:]]*$/ { fence++; next }
+        fence == 1 && !found && index($0, key ":") == 1 {
+            value = substr($0, length(key) + 2)
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            print value
+            found = 1
+        }
+        fence > 1 { exit }
+    '
 }
 
-# live_task_field <key> <text>
-live_task_field() {
-    printf '%s\n' "$2" | sed -n "s/^$1:[[:space:]]*//p" | head -n1
-}
+# live_task_status <text> - the declared status, or empty.
+live_task_status() { live_task_field status "$1"; }
 
 # live_task_verdict <text> -> record | blocks
 #
@@ -56,9 +71,16 @@ live_task_verdict() {
 
 # live_task_running <state> <task-id>
 #
-# One line per marker: `<file> <pid> alive|gone`. Empty when no run for
+# One line per marker: `<pid> alive|gone <path>`. Empty when no run for
 # this id has a marker, which is the only evidence that nothing is
 # working on it.
+#
+# The path goes *last* because it is the field that can contain a
+# space, and the last field of a `read` absorbs the remainder. With the
+# path first, one space in the state directory - `C:/Users/Some
+# Name/...`, which is most of Windows - shifted every field and no
+# caller removed a dead marker again. A record format is an interface,
+# and this one is read by two scripts. F-49.
 #
 # `kill -0` rather than the marker's existence, because a killed run
 # leaves its marker behind - the same liveness test the lock protocol
@@ -70,9 +92,9 @@ live_task_running() {
         [ -f "$m" ] || continue
         pid="$(cat "$m" 2>/dev/null || true)"
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            printf '%s %s alive\n' "$m" "$pid"
+            printf '%s alive %s\n' "$pid" "$m"
         else
-            printf '%s %s gone\n' "$m" "${pid:-unknown}"
+            printf '%s gone %s\n' "${pid:-unknown}" "$m"
         fi
     done
 }

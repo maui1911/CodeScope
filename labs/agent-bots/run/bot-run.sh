@@ -1230,7 +1230,12 @@ fi
 
 EFFECTIVE_STATUS="$TASK_STATUS"
 if [ -f "$LIVE_TASK" ] && [ "$RESET_PENDING" -eq 0 ]; then
-    EFFECTIVE_STATUS="$(sed -n 's/^status:[[:space:]]*//p' "$LIVE_TASK" | head -n1)"
+    # Frontmatter, not the whole document. This decides whether the
+    # task is already in flight, already finished, or free to run, and
+    # a plain `sed -n 's/^status:...'` reads a *body* line too - the
+    # same defect the review found in live-task.sh, one directory over
+    # and with a dispatch hanging off it. F-49.
+    EFFECTIVE_STATUS="$(live_task_field status "$(cat "$LIVE_TASK")")"
 fi
 
 case "$EFFECTIVE_STATUS" in
@@ -2068,7 +2073,7 @@ mkdir -p "$STATE/running"
 # knows the id is free, and the pid says so rather than the file's
 # existence. Same judgement take_lock makes before breaking an
 # abandoned break marker.
-live_task_running "$STATE" "$TASK_ID" | while read -r mark _pid state; do
+live_task_running "$STATE" "$TASK_ID" | while read -r _pid state mark; do
     [ "$state" = "gone" ] || continue
     say "  clearing a run marker whose process is gone: $(basename "$mark")"
     rm -f "$mark"

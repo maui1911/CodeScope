@@ -3801,3 +3801,67 @@ away. Every one of the three was locally correct; the bug was in the
 sequence, which no single reading of any one of them shows. The two
 leftover checks are the only thing that could have found it, and they
 existed for eleven minutes before they did.
+
+---
+
+### F-49 · Three ways to read a file wrong, all in the safety code
+
+*2026-09-12, the second round on F-47's fix.*
+
+Every one of these was in the part of the code whose job is deciding
+whether something may be deleted.
+
+**A silent failure in front of a destructive step.** `--surface`
+deleted `refs/bot-base/<id>` with `update-ref -d ... 2>/dev/null &&`,
+and then deleted the live task regardless. If the ref was locked, the
+pin survived, the record naming it did not, and no later invocation
+could retry - the permanent leak this path exists to close, created by
+the path itself. The runner's `drop_surface` can afford `|| true` on
+the same call because its live task survives and the next run tries
+again; this one cannot, so every step is fatal now. Rule 5 of the
+threat model with a `git` command in it: **a removal that could not be
+attempted is not a removal.**
+
+The same reordering applies to the board row. It was appended *after*
+the live task was removed, so a board that could not be written left
+no trace of who removed the record. The mark goes down first now, and
+a failed append stops the removal.
+
+**A parser laxer than the runner's.** `live_task_status` was
+`sed -n 's/^status:...' | head -n1` over the whole document, so a task
+with no frontmatter status and a line starting `status: done` anywhere
+in its prose - a findings list, a quoted example - read as a finished
+record, which is the answer that permits deletion. Frontmatter only
+now, counting fences, which is what the runner always did.
+
+Then the grep for the shape found two more, neither reported.
+`drop_sweep_tasks` read `id:` the same lax way *and deletes on it*, so
+a file whose prose quoted `id: T-0001` was one of the sweep's own. And
+`bot-run.sh` read the live status that way to decide whether a task
+was in flight, finished, or free to dispatch. Three sites, one shape,
+and only one of them was in the file the review pointed at.
+
+**A record format that splits on spaces.** `live_task_running` printed
+`<path> <pid> alive|gone` and both callers parsed it with
+`read -r mark pid state`. One space in the state directory -
+`C:/Users/Some Name/...`, which is most of Windows - shifts every
+field, and no caller ever removes a dead marker again. Silently: the
+loop runs, the comparison fails, nothing happens. The path is last
+now, because the last field of a `read` absorbs the remainder.
+
+And one more leftover check, which is the round's own lesson turned
+into something that runs: **no `refs/bot-base/*` may survive a
+sweep.** It went red immediately - the `.git`-hijack fixture cleans up
+by hand, because `cleanup` refuses a surface whose marker the fixture
+deliberately destroyed, and the hand-rolled version forgot the pin.
+The same defect the review had just found in `--surface`, in the file
+that tests for it, found by the check written for the other one.
+
+What generalises: **the code that decides whether to delete something
+is read by more people than it is written by, and every one of these
+was a reading error in a line that looked right.** A `sed` that gets
+the common case, a `read` that works until a path has a space, an
+`&&` that swallows the answer. None of the three would show up in a
+run that went well, which is the only kind of run anybody watches.
+
+Sweep is 118.
