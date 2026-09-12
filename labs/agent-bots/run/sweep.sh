@@ -71,7 +71,8 @@ bot-sweep/committed-secret
 SWEEP_TASK_IDS="T-0001 T-0003 T-0005 T-0006 T-0006-fix T-990A T-990B
 T-993A T-993B T-993C T-993D T-993E T-995A T-996A T-996B T-997A
 T-998A T-998B T-999A T-0900 T-0901
-T-991A T-991B T-991C T-991D"
+T-991A T-991B T-991C T-991D
+T-0994 T-0995"
 
 is_sweep_task() {   # is_sweep_task <id>
     case " $(printf '%s' "$SWEEP_TASK_IDS" | tr '\n' ' ') " in
@@ -90,7 +91,26 @@ drop_sweep_tasks() {   # remove this script's live tasks and proposals
     done
 }
 
+# live_task_verdict <file> -> blocks | record
+#
+# Whether somebody else's live task stands in this script's way. A
+# function rather than an inline `case` because the preflight runs
+# before anything can check it, and a decision nothing can reach is a
+# decision nothing tests - so the checks near the bottom call this, and
+# the preflight calls the same thing.
+live_task_verdict() {
+    local st
+    st="$(sed -n 's/^status:[[:space:]]*//p' "$1" | head -n1)"
+    case "$st" in
+        done|blocked|needs-review) printf 'record\n' ;;
+        *)                         printf 'blocks\n' ;;
+    esac
+}
+
 PRE_EXISTING=""
+# Somebody else's finished runs. Reported, never touched, and not a
+# reason to refuse - see the case below.
+FINISHED_RUNS=""
 # A live task that is not the sweep's own means somebody's run is in
 # flight in this control plane. The sweep dispatches over the same files
 # and used to clear every live task on its way past, which takes the
@@ -117,7 +137,30 @@ for sdir in tasks proposed; do
         if is_sweep_task "$id"; then
             PRE_EXISTING="$PRE_EXISTING  $sdir/$id ($f) - an id this sweep uses"$'\n'
         elif [ "$sdir" = "tasks" ]; then
-            PRE_EXISTING="$PRE_EXISTING  live task $id ($f)"$'\n'
+            # A live task is only in the way while it is *in flight*.
+            # The refusal is about collision: the sweep dispatches into
+            # this control plane, and a run still going is dispatching
+            # into it too. A run that has reached a verdict is a
+            # record, and a record collides with nobody. Left alone
+            # either way - the sweep removes only what it made.
+            #
+            # The first real run in this lab is what surfaced this.
+            # T-0010 finished, wrote `status: done`, and blocked the
+            # regression suite until somebody deleted the record of
+            # it. A suite whose price is the evidence of your work gets
+            # that price paid, and then the suite is measuring a lab
+            # nobody uses. See README F-46.
+            #
+            # `dispatched` with nothing running is the case this still
+            # refuses on, deliberately: a run that died mid-flight left
+            # that status behind and needs a human, which is exactly
+            # what a refusal fetches.
+            live_status="$(sed -n 's/^status:[[:space:]]*//p' "$f" | head -n1)"
+            if [ "$(live_task_verdict "$f")" = "record" ]; then
+                FINISHED_RUNS="$FINISHED_RUNS  $id ($live_status)"$'\n'
+            else
+                PRE_EXISTING="$PRE_EXISTING  live task $id ($f) - status: ${live_status:-none}"$'\n'
+            fi
         fi
     done
     # And again by file name, because the file name is what the cleanup
@@ -157,7 +200,14 @@ if [ -n "$PRE_EXISTING" ]; then
     printf 'force-deletes every one of them:\n\n%s\n' "$PRE_EXISTING"
     printf 'They are left over from an earlier run, or they are yours. Either\n'
     printf 'way the sweep is not the thing that should decide.\n'
+    printf '\nA live task that has reached a verdict - done, blocked or\n'
+    printf 'needs-review - is a record rather than a collision, and does not\n'
+    printf 'stop this script. One still saying "dispatched" does.\n'
     exit 1
+fi
+
+if [ -n "$FINISHED_RUNS" ]; then
+    printf 'sweep: leaving these finished runs alone:\n%s\n' "$FINISHED_RUNS"
 fi
 
 cleanup() {   # cleanup <branch> - only ever a branch from SWEEP_BRANCHES
@@ -642,6 +692,145 @@ else
 fi
 
 rm -rf "$DEF_STATE"
+
+# --------------------------------------------------------------------
+# Somebody else's live task
+#
+# The preflight refuses on one, and it had to learn the difference
+# between a run in flight and a run that finished - the first real task
+# in this lab wrote `status: done` and locked the suite out until the
+# record of it was deleted (F-46). The decision is a function precisely
+# so it can be checked here; the preflight itself runs before anything
+# in this file can assert about it.
+# --------------------------------------------------------------------
+
+VERDICT_DIR="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-verdict.$$")"
+mkdir -p "$VERDICT_DIR"
+verdict_case() {   # verdict_case <label> <status-line> <expected>
+    local f="$VERDICT_DIR/T-0000.md" got
+    printf -- '---\nid: T-0000\nowner: fixer\n%s\n---\n\n# Objective\n\nGenerated.\n' \
+        "$2" > "$f"
+    got="$(live_task_verdict "$f")"
+    CHECKS=$((CHECKS + 1))
+    if [ "$got" = "$3" ]; then
+        printf 'ok    %-28s %s\n' "$1" "$got"
+    else
+        printf 'FAIL  %-28s expected %s, got %s\n' "$1" "$3" "$got"
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
+verdict_case "finished run is a record"  "status: done"          record
+verdict_case "blocked run is a record"   "status: blocked"       record
+verdict_case "review run is a record"    "status: needs-review"  record
+verdict_case "in-flight run blocks"      "status: dispatched"    blocks
+# A task with no status at all is the case the vocabulary cannot speak
+# for, and the refusal is the only answer that does not guess.
+verdict_case "statusless run blocks"     "title: no status here" blocks
+rm -rf "$VERDICT_DIR"
+
+# --------------------------------------------------------------------
+# Retiring a record
+#
+# bot-forget.sh is the supported way to clear a live task, and it
+# exists because there was none: the only route was `rm` under a
+# directory whose entire purpose is being the record (F-46). A tool
+# that deletes things gets checked on what it refuses, not on what it
+# removes.
+# --------------------------------------------------------------------
+
+FORGET="$SCRIPT_DIR/bot-forget.sh"
+mkdir -p "$STATE/tasks"
+
+write_live() {   # write_live <id> <status>
+    cat > "$STATE/tasks/$1.md" <<EOF
+---
+id: $1
+title: Generated by sweep.sh
+owner: fixer
+status: $2
+base: labs/agent-bots
+branch: bot/fixer/$1
+touches: labs/agent-bots/.sweep/$1.txt
+worktree: $WT_ROOT/bot-fixer-$1
+---
+
+# Objective
+
+Generated by sweep.sh to be forgotten.
+EOF
+}
+
+# A finished record goes, and the board says who decided.
+write_live T-0994 done
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$STATE" >/dev/null 2>&1 || FORGET_RC=$?
+check "forget a finished run" 0 "$FORGET_RC"
+if [ -f "$STATE/tasks/T-0994.md" ]; then
+    printf 'FAIL  %-28s the live task is still there\n' "forget removes the record"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+else
+    printf 'ok    %-28s the live task is gone\n' "forget removes the record"
+    CHECKS=$((CHECKS + 1))
+fi
+if grep -q "| T-0994 | forgotten |" "$STATE/board.md" 2>/dev/null; then
+    printf 'ok    %-28s board says forgotten\n' "forget leaves a mark"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s no "forgotten" row for T-0994\n' "forget leaves a mark"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+
+# An in-flight one stays, because "a run is going" and "a run died" look
+# identical from here and want opposite things.
+write_live T-0995 dispatched
+FORGET_RC=0
+bash "$FORGET" T-0995 --state "$STATE" >/dev/null 2>&1 || FORGET_RC=$?
+check "in-flight record stays" 1 "$FORGET_RC"
+if [ -f "$STATE/tasks/T-0995.md" ]; then
+    printf 'ok    %-28s refused and kept\n' "refusal keeps the record"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s it deleted what it refused\n' "refusal keeps the record"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+
+# --force is the deliberate override, and it is the only way past it.
+FORGET_RC=0
+bash "$FORGET" T-0995 --state "$STATE" --force >/dev/null 2>&1 || FORGET_RC=$?
+check "force forgets it anyway" 0 "$FORGET_RC"
+
+# And not from inside a run: a run that can retire its own record can
+# write its own history. Same door as bot-approve.sh.
+write_live T-0995 done
+FORGET_RC=0
+BOT_RUN_ACTIVE=pretend bash "$FORGET" T-0995 --state "$STATE" >/dev/null 2>&1 || FORGET_RC=$?
+check "no forgetting from a run" 1 "$FORGET_RC"
+rm -f "$STATE/tasks/T-0995.md"
+
+# A surface is removed only on a marker that names this task. The
+# directory here is not a surface at all, which is the case worth
+# refusing: `rm -rf` on the strength of a task file's own field is how
+# a tool like this takes somebody's checkout with it.
+write_live T-0994 done
+mkdir -p "$WT_ROOT/bot-fixer-T-0994/.git"
+printf 'bot-run surface for T-SOMETHING-ELSE\n' > "$WT_ROOT/bot-fixer-T-0994/.git/bot-surface"
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$STATE" --surface >/dev/null 2>&1 || FORGET_RC=$?
+check "surface needs its marker" 1 "$FORGET_RC"
+if [ -d "$WT_ROOT/bot-fixer-T-0994" ]; then
+    printf 'ok    %-28s the directory is untouched\n' "wrong marker keeps it"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s it removed a directory it could not identify\n' "wrong marker keeps it"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$WT_ROOT/bot-fixer-T-0994"
+rm -f "$STATE/tasks/T-0994.md"
 
 # --------------------------------------------------------------------
 # A base that moves under the run
