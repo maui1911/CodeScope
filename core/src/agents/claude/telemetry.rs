@@ -134,6 +134,13 @@ struct Entry {
     /// (issue #293). A mixed batch (a real tool racing a question)
     /// still counts as working.
     awaiting_user_input: bool,
+    /// True when this entry is the CLI's own answer to a client-side
+    /// slash command (`/model`, `/clear`, …): its content *is* a
+    /// `<local-command-stdout>` envelope, written either as a `user`
+    /// entry or as a `system` entry with `subtype: "local_command"`.
+    /// No model turn follows, so nothing else would unlatch the `Busy`
+    /// its invocation entry set (issue #343).
+    local_command_answer: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -165,6 +172,24 @@ fn parse_line(line: &str) -> Option<Entry> {
         Some("assistant") => EntryKind::Assistant,
         _ => EntryKind::Other,
     };
+
+    // Client-side slash command answers. See the field doc on
+    // `Entry::local_command_answer`. A `user` entry carries the
+    // envelope in `message.content`; a `system` entry carries it at the
+    // top level, and only the `local_command` subtype counts — the
+    // other system subtypes (`turn_duration`, `compact_boundary`, …)
+    // stay ignored.
+    let local_command_content = match (
+        obj.get("type").and_then(Value::as_str),
+        obj.get("subtype").and_then(Value::as_str),
+    ) {
+        (Some("user"), _) => obj.get("message").and_then(|m| m.get("content")),
+        (Some("system"), Some("local_command")) => obj.get("content"),
+        _ => None,
+    };
+    let local_command_answer = local_command_content
+        .and_then(Value::as_str)
+        .is_some_and(is_local_command_stdout);
 
     let timestamp_secs = obj
         .get("timestamp")
@@ -263,7 +288,15 @@ fn parse_line(line: &str) -> Option<Entry> {
         timestamp_secs,
         user_carries_tool_result,
         awaiting_user_input,
+        local_command_answer,
     })
+}
+
+/// True when `content` *is* a `<local-command-stdout>` envelope, not
+/// merely contains one: an ordinary prompt may quote the tags, and
+/// reading that quotation as an answer would paint real work as idle.
+fn is_local_command_stdout(content: &str) -> bool {
+    content.starts_with("<local-command-stdout>") && content.ends_with("</local-command-stdout>")
 }
 
 /// Thin re-export of [`crate::time::parse_iso8601_secs`] kept under
@@ -435,6 +468,14 @@ pub fn process_new_lines(
         };
 
         match entry.kind {
+            // The CLI answered a client-side slash command by itself
+            // (issue #343): no model turn follows, so this is the only
+            // entry that will ever release the `Busy` its invocation
+            // set. Not a fresh prompt either, so `last_user_ts` stays.
+            _ if entry.local_command_answer => {
+                state = SessionState::Idle;
+                changed = true;
+            }
             EntryKind::User => {
                 state = SessionState::Busy;
                 // Anchor for the last-turn duration; tool-result
@@ -1274,6 +1315,184 @@ mod tests {
         pending.insert("aaa111".to_string());
         apply_agent_markers("<task-id>aaa111</task-id>", &mut pending);
         assert!(pending.contains("aaa111"));
+    }
+
+    // --- client-side slash commands (issue #343) ---
+    //
+    // Captured from `~/.claude/projects/C--dev-codescope-public/*.jsonl`.
+    // Long content is elided with `…`; nothing else is edited.
+
+    /// `/model` invocation. A prompt-expanding command writes the same
+    /// shape, so this alone must not decide anything.
+    const MODEL_INVOCATION: &str = r#"{"parentUuid":"6fbd4b13-…","isSidechain":false,"promptId":"daf3a846-…","type":"user","message":{"role":"user","content":"<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args></command-args>"},"uuid":"d1eeb7b9-…","timestamp":"2026-08-15T19:22:54.460Z","userType":"external","entrypoint":"cli","cwd":"C:\\dev\\codescope-public","sessionId":"8aa860f5-…","version":"2.1.233","gitBranch":"main"}"#;
+    /// `/model` answer: a `user` entry whose content is the envelope.
+    const MODEL_STDOUT: &str = r#"{"parentUuid":"d1eeb7b9-…","isSidechain":false,"promptId":"daf3a846-…","type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to \u001b[1mOpus 5 (1M context)\u001b[22m and saved as your default for new sessions</local-command-stdout>"},"uuid":"70319ba8-…","timestamp":"2026-08-15T19:22:54.460Z","userType":"external","entrypoint":"cli","cwd":"C:\\dev\\codescope-public","sessionId":"8aa860f5-…","version":"2.1.233","gitBranch":"main"}"#;
+    /// `/clear` answer: nothing printed, so a `system` entry instead.
+    const CLEAR_STDOUT: &str = r#"{"parentUuid":"3ff4f733-…","isSidechain":false,"type":"system","subtype":"local_command","content":"<local-command-stdout></local-command-stdout>","level":"info","timestamp":"2026-09-11T06:51:27.219Z","uuid":"d5e8e2ca-…","isMeta":false,"userType":"external","entrypoint":"cli","cwd":"C:\\dev\\codescope-public","sessionId":"c96c3d3a-…","version":"2.1.268"}"#;
+    /// `/effort high` — the command in the issue's own repro. It was
+    /// missing from the transcripts this rule was derived from, so it
+    /// was covered by argument rather than by evidence until somebody
+    /// ran it. Same shape as `/model`, which is the point: the rule is
+    /// keyed on the answer, not on a list of command names.
+    const EFFORT_INVOCATION: &str = r#"{"parentUuid":"7c11eae0-…","isSidechain":false,"promptId":"13b90a4f-…","type":"user","message":{"role":"user","content":"<command-name>/effort</command-name>\n            <command-message>effort</command-message>\n            <command-args>high</command-args>"},"uuid":"b72e1cda-…","timestamp":"2026-09-12T18:41:24.562Z","userType":"external","entrypoint":"cli","cwd":"C:\\dev\\codescope-public","sessionId":"c96c3d3a-…","version":"2.1.268","gitBranch":"fix/telemetry-slash-command-busy"}"#;
+    /// `/effort high` answer, captured 2026-09-12.
+    const EFFORT_STDOUT: &str = r#"{"parentUuid":"b72e1cda-…","isSidechain":false,"promptId":"13b90a4f-…","type":"user","message":{"role":"user","content":"<local-command-stdout>Set effort level to high (saved as your default for new sessions): Comprehensive implementation with extensive testing and documentation</local-command-stdout>"},"uuid":"0882b682-…","timestamp":"2026-09-12T18:41:24.562Z","userType":"external","entrypoint":"cli","cwd":"C:\\dev\\codescope-public","sessionId":"c96c3d3a-…","version":"2.1.268","gitBranch":"fix/telemetry-slash-command-busy"}"#;
+
+    /// `/m` invocation — a project command that expands into a prompt.
+    const M_INVOCATION: &str = r#"{"parentUuid":"98e6783e-…","isSidechain":false,"promptId":"09ac6ae5-…","type":"user","message":{"role":"user","content":"<command-message>m</command-message>\n<command-name>/m</command-name>"},"uuid":"88b9f93d-…","timestamp":"2026-09-11T06:51:38.667Z","origin":{"kind":"human"},"userType":"external","entrypoint":"cli","cwd":"C:\\dev\\codescope-public","sessionId":"c96c3d3a-…","version":"2.1.268","gitBranch":"main"}"#;
+    /// `/m` expansion (`isMeta: true`). A model turn follows this one.
+    const M_EXPANSION: &str = r##"{"parentUuid":"88b9f93d-…","isSidechain":false,"promptId":"09ac6ae5-…","type":"user","message":{"role":"user","content":[{"type":"text","text":"# Switch to main and pull\n\nRun these commands in the current repository:\n\n1. `git checkout main`…"}]},"isMeta":true,"uuid":"a7f0ed7d-…","timestamp":"2026-09-11T06:51:38.667Z","userType":"external","entrypoint":"cli","cwd":"C:\\dev\\codescope-public","sessionId":"c96c3d3a-…","version":"2.1.268","gitBranch":"main"}"##;
+
+    #[test]
+    fn parse_local_command_answer_detects_both_captured_shapes() {
+        let user = parse_line(MODEL_STDOUT).expect("should parse");
+        assert_eq!(user.kind, EntryKind::User);
+        assert!(user.local_command_answer);
+
+        let system = parse_line(CLEAR_STDOUT).expect("should parse");
+        assert_eq!(system.kind, EntryKind::Other);
+        assert!(system.local_command_answer);
+
+        // The repro's own command, captured after the rule was written.
+        let effort = parse_line(EFFORT_STDOUT).expect("should parse");
+        assert_eq!(effort.kind, EntryKind::User);
+        assert!(effort.local_command_answer);
+
+        for line in [MODEL_INVOCATION, EFFORT_INVOCATION, M_INVOCATION, M_EXPANSION] {
+            assert!(!parse_line(line).expect("should parse").local_command_answer);
+        }
+    }
+
+    #[test]
+    fn parse_local_command_answer_needs_the_whole_envelope() {
+        // A prompt that merely quotes the tags is real work. Derived from
+        // the captured answer by moving the envelope off either edge.
+        let quoted_after = MODEL_STDOUT.replace(
+            r#""content":"<local-command-stdout>"#,
+            r#""content":"why did <local-command-stdout>"#,
+        );
+        let quoted_before = MODEL_STDOUT.replace(
+            r#"</local-command-stdout>""#,
+            r#"</local-command-stdout> mean that?""#,
+        );
+        for line in [quoted_after, quoted_before] {
+            let entry = parse_line(&line).expect("should parse");
+            assert!(!entry.local_command_answer, "{line}");
+        }
+    }
+
+    #[test]
+    fn parse_local_command_answer_needs_the_local_command_subtype() {
+        // Other `system` subtypes stay ignored, even carrying the same
+        // content as the captured `/clear` answer.
+        for subtype in
+            ["turn_duration", "stop_hook_summary", "compact_boundary", "model_refusal_fallback"]
+        {
+            let line = CLEAR_STDOUT.replace(
+                r#""subtype":"local_command""#,
+                &format!(r#""subtype":"{subtype}""#),
+            );
+            let entry = parse_line(&line).expect("should parse");
+            assert!(!entry.local_command_answer, "{subtype}");
+        }
+    }
+
+    #[test]
+    fn client_side_command_with_output_is_idle_not_busy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, &[MODEL_INVOCATION]);
+
+        let mut tail = FileTail::default();
+        let mut snap: Option<TelemetrySnapshot> = None;
+        let mut last_user_ts = None;
+        read_lines(&path, &mut tail, &mut snap, &mut last_user_ts);
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Busy);
+
+        append_lines(&path, &[MODEL_STDOUT]);
+        read_lines(&path, &mut tail, &mut snap, &mut last_user_ts);
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Idle);
+    }
+
+    #[test]
+    fn client_side_command_without_output_is_idle_not_busy() {
+        // The `/clear` invocation was not captured; the `/model` one is
+        // the same shape and sets the same latch.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, &[MODEL_INVOCATION]);
+
+        let mut tail = FileTail::default();
+        let mut snap: Option<TelemetrySnapshot> = None;
+        let mut last_user_ts = None;
+        read_lines(&path, &mut tail, &mut snap, &mut last_user_ts);
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Busy);
+
+        // Arrives alone in its own poll, so it must mark the snapshot
+        // changed by itself.
+        append_lines(&path, &[CLEAR_STDOUT]);
+        assert!(read_lines(&path, &mut tail, &mut snap, &mut last_user_ts));
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Idle);
+    }
+
+    #[test]
+    fn the_repro_command_goes_idle() {
+        // `/effort high`, invocation then answer, exactly as issue #343
+        // describes typing it.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, &[EFFORT_INVOCATION]);
+
+        let mut tail = FileTail::default();
+        let mut snap: Option<TelemetrySnapshot> = None;
+        let mut last_user_ts = None;
+        read_lines(&path, &mut tail, &mut snap, &mut last_user_ts);
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Busy);
+
+        append_lines(&path, &[EFFORT_STDOUT]);
+        read_lines(&path, &mut tail, &mut snap, &mut last_user_ts);
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Idle);
+    }
+
+    #[test]
+    fn prompt_expanding_command_stays_busy() {
+        // Negative control: the invocation and its expansion with no
+        // stdout answer after them are work waiting for a model turn.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, &[M_INVOCATION, M_EXPANSION]);
+
+        let tail = ClaudeTranscriptTail::new(path);
+        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Busy);
+        assert_eq!(tail.poll_interval(), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn client_side_command_polls_at_idle_rate() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, answer) in [("model.jsonl", MODEL_STDOUT), ("clear.jsonl", CLEAR_STDOUT)] {
+            let path = tmp.path().join(name);
+            write_lines(&path, &[MODEL_INVOCATION, answer]);
+
+            let tail = ClaudeTranscriptTail::new(path);
+            assert_eq!(tail.poll_interval(), Duration::from_secs(2), "{name}");
+        }
+    }
+
+    #[test]
+    fn local_command_answer_does_not_reset_last_user_ts() {
+        // Not a fresh prompt — same exemption as a tool-result entry.
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, answer) in [("model.jsonl", MODEL_STDOUT), ("clear.jsonl", CLEAR_STDOUT)] {
+            let path = tmp.path().join(name);
+            write_lines(&path, &[answer]);
+
+            let mut tail = FileTail::default();
+            let mut snap: Option<TelemetrySnapshot> = None;
+            let mut last_user_ts = Some(1.0);
+            read_lines(&path, &mut tail, &mut snap, &mut last_user_ts);
+            assert_eq!(last_user_ts, Some(1.0), "{name}");
+        }
     }
 
     // --- model_display_name ---
