@@ -1788,7 +1788,25 @@ fi
 # in .git/objects/info/alternates and an agent that wants a remote back
 # can add one. It removes the accident, which is the case that actually
 # happens, and it makes the claim in the header true by default.
+# `|| true` here meant the one case this block exists for - the remove
+# not working - left the agent with exactly the writable remote it is
+# supposed to take away. A transient config lock is enough. So: remove,
+# then ask whether it is gone, and if it is still there treat it as a
+# failed dispatch and take the surface back down before anything runs in
+# it. A security boundary that fails open is a comment.
 git -C "$WT" remote remove origin >>"$RUN_LOG" 2>&1 || true
+if [ -n "$(git -C "$WT" remote 2>/dev/null || printf 'unreadable')" ]; then
+    say "  could not remove the clone's remote - not starting an agent here"
+    board "dispatch-failed" "origin still present in $WT"
+    rm -rf "$WT"
+    git -C "$ORIGIN_REPO" update-ref -d "refs/bot-base/$TASK_ID" >/dev/null 2>&1 || true
+    die "the work surface at $WT still has a remote pointing at $ORIGIN_REPO,
+and removing it did not work - see $RUN_LOG.
+
+Nothing was started. That remote lets anything running in the surface
+push into the project without a --force and without asking, which is
+the accident this loop is built not to have."
+fi
 
 # Proof that this directory is ours before anything ever removes it.
 # Cleanup is `rm -rf` now rather than `git worktree remove`, and an
@@ -3166,9 +3184,31 @@ was left on ${PRE_REBASE_HEAD:0:12}, where the diff was in bounds."
                         HEAD_SHA="$REBASED_HEAD"
                         COMMITS="$REBASED_COMMITS"
                         TOUCHED="$REBASED_TOUCHED"
+                        NUMSTAT_BROKEN=0
                         NUMSTAT="$(git -C "$WT" diff --shortstat "$BASE_SHA..HEAD" \
                             2>/dev/null | sed 's/^ *//')" \
-                            || { NUMSTAT="(diff unreadable)"; TREE_BROKEN=1; }
+                            || { NUMSTAT=""; NUMSTAT_BROKEN=1; }
+                        # The status, not the emptiness. An empty shortstat is also
+                        # what commits that change nothing produce, and F-22 says
+                        # that is an answer rather than a fault.
+                        if [ "$NUMSTAT_BROKEN" -eq 1 ]; then
+                            # This runs *after* the verdict, so setting TREE_BROKEN
+                            # here was worse than not noticing: the publish gate
+                            # reads that flag and quietly skips the push, while
+                            # STATUS stays `done`, the handoff reports success and
+                            # the run exits 0 - with no branch in the project. A
+                            # verdict already written cannot be corrected by a flag.
+                            # It has to be rewritten.
+                            NUMSTAT="(diff unreadable)"
+                            TREE_BROKEN=1
+                            STATUS="needs-review"
+                            BLOCKERS="the work replayed onto ${NEW_BASE_SHA:0:12}, verified there, and then
+the diff of the result could not be read. $TASK_BRANCH was moved onto
+${REBASED_HEAD:0:12} and nothing was pushed, because a run that cannot read
+its own result has not measured what it would be publishing. The branch is
+in $WT, which is kept:
+    git -C $WT log --stat $NEW_BASE_SHA..$TASK_BRANCH"
+                        fi
                         [ -n "$NUMSTAT" ] || NUMSTAT="no committed changes"
                         # The live task records the base its worktree
                         # stands on, and the overlap scan expands other

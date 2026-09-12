@@ -578,10 +578,21 @@ first run under it proved that this buys less than it sounds. A linked
 worktree's git directory is outside the worktree, so worktrees isolate
 the *checkout* and never the repository (F-26) — the work surface is a
 standalone clone now, for that reason and because a plain folder has no
-worktree to add (F-28). It did not rescue Codex: it denies the model
-writes to `.git` wherever `.git` is, so the assumption that has to give
-is not where the git directory lives but that the *agent* makes the
-commit.
+worktree to add (F-28).
+
+That did rescue Codex, once the profile stopped hoping and started
+saying so. Codex denies writes to `.git` wherever `.git` is, and a
+standalone clone puts it inside the one directory the agent is granted
+— so `codex.agent.md` passes it explicitly as
+`--add-dir {git_dir}`, which the runner substitutes with the surface's
+own `.git`. Codex commits and completes the loop under that (F-30).
+
+The runner's own commit stayed, and it is a fallback rather than the
+plan: an agent that leaves its work uncommitted still gets measured,
+with the handoff saying who made the commit and, when the agent wrote
+no message, that the subject is the runner's. Work that cannot be
+measured cannot be judged — and which of the two happened is not
+something to guess from an empty diff.
 
 **`base:` must be a ref that contains the contract.** The agent reads
 its charter and context from its own checkout — the base commit — not
@@ -3176,3 +3187,59 @@ shape: memory is text an agent wrote that the runner later feeds back
 into a prompt. It is an approval gate problem before it is a storage
 problem, and building the store first would be building the injection
 channel and leaving the gate for round thirteen.
+
+---
+
+### F-40 · A guardrail with `|| true` on it is a comment
+
+*2026-09-12, the thirteenth round.*
+
+Four, and two of them are about the same mistake made in two different
+ways: writing down what a mechanism is *for* and then not checking that
+it happened.
+
+**`git remote remove origin || true`.** The block above it explains, at
+length, that a clone is born with a writable remote pointing at the
+user's repository and that removing it takes away the one push an agent
+could make by habit. Then it swallows the failure. A config lock is
+enough, and the run carries on and starts an agent in a surface with
+exactly the capability the paragraph says it removed — quietly, because
+the whole point of `|| true` is that nothing is said. The remove is
+followed by `git remote` now, and a remote that is still there is a
+failed dispatch: the surface comes down, the base pin is dropped, and
+no agent runs.
+
+Which generalises past this line. **A guardrail is a claim about state,
+so it ends with a read, not with a command.** The push already worked
+this way — believed because the destination has the ref, not because
+`git push` exited 0 (F-36) — and this is the same sentence about a
+different verb.
+
+**A verdict already written cannot be corrected by a flag.** The
+previous round guarded the post-rebase `--shortstat` by setting
+`TREE_BROKEN=1`, which reads exactly like the three guards above it.
+Except those run *before* the verdict and this one runs after. So the
+flag did reach the publish gate, which skipped the push in silence,
+while `STATUS` stayed `done`, the handoff reported success and the run
+exited 0 — with no branch in the project. The guard turned a crash into
+something worse than a crash: a false report. It rewrites `STATUS` and
+`BLOCKERS` now, and it keys off the command's exit status rather than an
+empty result, because an empty `--shortstat` is also what commits that
+change nothing produce and F-22 says that is an answer.
+
+Two smaller ones, both about a claim being checked in a different place
+from where it is used:
+
+- **The sweep's ownership preflight read `id:` from the frontmatter;
+  the cleanup deletes by file name.** A pre-existing
+  `proposed/T-0006-fix.md` whose id is missing or says something else
+  passed the scan and was deleted anyway — the exact hole the preflight
+  had been added to close, one round earlier. Now both questions are
+  asked, and the one that decides is the one that deletes.
+- **The usage section still carried F-28's conclusion** that granting
+  the git directory "did not rescue Codex", two rounds after F-30
+  recorded that it did: `codex.agent.md` passes the surface's own
+  `.git` as `--add-dir {git_dir}` and Codex commits under it. Prose that
+  contradicts the code it documents is a defect with a slower failure
+  mode, and this file is long enough that the only way it stays true is
+  for a reader to keep catching it.

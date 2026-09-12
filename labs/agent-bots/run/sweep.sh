@@ -111,6 +111,21 @@ for sdir in tasks proposed; do
             PRE_EXISTING="$PRE_EXISTING  live task $id ($f)"$'\n'
         fi
     done
+    # And again by file name, because the file name is what the cleanup
+    # actually removes. The scan above reads `id:` out of the
+    # frontmatter, so a pre-existing `proposed/T-0006-fix.md` whose id
+    # is missing - or says something else - walked straight past it, and
+    # `rm -f "$STATE/proposed/T-0006-fix.md"` then deleted it anyway.
+    # Two questions were being asked about one file in two places, and
+    # the one that decides has to be the one that deletes.
+    for id in $(printf '%s' "$SWEEP_TASK_IDS" | tr '\n' ' '); do
+        f="$STATE/$sdir/$id.md"
+        [ -f "$f" ] || continue
+        case "$PRE_EXISTING" in
+            *"($f)"*) continue ;;
+        esac
+        PRE_EXISTING="$PRE_EXISTING  $sdir/$id ($f) - a file name this sweep removes"$'\n'
+    done
 done
 for b in $SWEEP_BRANCHES; do
     if git -C "$REPO" rev-parse --verify --quiet "refs/heads/$b" >/dev/null 2>&1; then
