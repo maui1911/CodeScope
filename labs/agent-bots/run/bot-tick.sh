@@ -10,7 +10,7 @@
 #   bot-tick.sh [options]
 #
 #   --tasks <dir>        Where task definitions live. Repeatable.
-#                        Default: <labs>/examples and <state>/proposed.
+#                        Default: <labs>/tasks and <state>/proposed.
 #   --state <dir>        Control plane. Default: <labs>/agent-bots/.state
 #   --repo <dir>         Repo root. Default: the repo this script is in.
 #   --max <n>            Dispatch at most n tasks this tick. Default 1.
@@ -105,8 +105,15 @@ STATE_ARGS=()
 [ -z "$STATE_EXPLICIT" ] || STATE_ARGS=(--state "$STATE")
 BOARD="$STATE/board.md"
 
+# Real work and fixtures do not share a directory, and the default set
+# is the real one. `examples/` is a directory of *shapes* - the overlap
+# fixture, the meddling verifier, a routine on `every: 1d` - and a
+# scheduler cannot tell a shape from a job. The first tick ever run
+# offered to dispatch the overlap fixture, and the one before this
+# change would still have run T-0006 daily on nobody's request. Pass
+# `--tasks examples` to exercise those on purpose.
 if [ "${#TASK_DIRS[@]}" -eq 0 ]; then
-    TASK_DIRS=("$LAB_DIR/examples" "$STATE/proposed")
+    TASK_DIRS=("$LAB_DIR/tasks" "$STATE/proposed")
 fi
 
 # shellcheck source=approval.sh

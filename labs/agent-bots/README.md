@@ -348,8 +348,8 @@ detects that it happened.
 - **The task file is a host-execution surface.** `verify:` is run with
   `eval` on the *runner's* machine, outside the worktree and outside
   any agent permission model. Task definitions are repo content, so
-  whoever can land a commit in `examples/` controls a shell command
-  with your privileges. That is acceptable while the task files are
+  whoever can land a commit in `tasks/` or `examples/` controls a
+  shell command with your privileges. That is acceptable while the task files are
   your own; it becomes a hard gate the moment a task could arrive from
   a pull request. See F-6.
 - **Secrets.** Gate before the push, not after. A key in a pushed
@@ -509,6 +509,15 @@ bash labs/agent-bots/run/bot-tick.sh --max 2 --parallel 2
 bash labs/agent-bots/run/bot-tick.sh --watch 300
 ```
 
+The table below is a tick over the *fixtures*, which is the only place
+this many decisions exist side by side. The no-argument form above
+reads `tasks/` and prints what is really queued:
+
+```bash
+bash labs/agent-bots/run/bot-tick.sh --dry-run \
+  --tasks labs/agent-bots/examples
+```
+
 ```
 TASK           OWNER     DECISION     RUNS  LAST         WHY
 T-0004         fixer     manual          0  never        no schedule: auto
@@ -529,6 +538,15 @@ else reports `manual` and is left alone — the first tick ever run
 offered to dispatch the overlap *fixture*, which is what a directory of
 task files looks like to something that cannot tell a fixture from a
 job.
+
+**Real work lives in `tasks/`, fixtures in `examples/`**, and the
+default set a tick reads is `tasks/` plus `.state/proposed/`. Opt-in
+scheduling was the first answer to the fixture problem and it is not
+the whole one: `examples/T-0006` is a routine on `every: 1d`, written
+to demonstrate recurrence, so a default that included `examples/`
+would re-run a demo review daily on nobody's request. Pass
+`--tasks labs/agent-bots/examples` to exercise the shapes on purpose.
+F-44.
 
 A task that already finished will not re-run; pass `--reset` to discard
 the live task and start over. Exit codes are `0` done, `1` blocked,
@@ -670,8 +688,8 @@ worktree and branch.
 
 ### Why this is bash
 
-It is the first question anyone asks after reading 3,300 lines of
-`set -euo pipefail`, so it belongs here rather than in someone's head.
+It is the first question anyone asks after reading nearly 7,000 lines
+of `set -euo pipefail`, so it belongs here rather than in someone's head.
 
 Three reasons it was the right call. **The work is orchestration** —
 start a process, move a file, call `git`, read an exit code — which is
@@ -702,8 +720,8 @@ sweep or a review, and not one of them changed the design.
 *unknown* and *nothing* identically, which is rule 5 of §3.6 and took
 three rounds to see. In a language with `Result` that rule is a
 compile error instead of a review round — and that is an argument for
-the graduation in §6, not for a rewrite now. Twelve review rounds and
-67 green checks are the asset here; porting resets the regression suite
+the graduation in §6, not for a rewrite now. Sixteen review rounds and
+89 green checks are the asset here; porting resets the regression suite
 and re-finds the same design findings in a new dialect. The language
 changes when this moves into `codescope-core`, and the thing that moves
 is the contract, not the script.
@@ -3457,3 +3475,56 @@ shape.** Fixing the line is what gets asked for and it is half the job;
 the other half is grepping for the shape and finding the instance
 nobody pointed at. Fifteen rounds in, that is the only thing that has
 reliably reduced the next round.
+
+---
+
+### F-44 · Opt-in scheduling was half the answer, the default directory was the other half
+
+*2026-09-12, writing the first real task.*
+
+F-23's lesson was that a directory of task files is not a queue, and
+the fix was `schedule:` — opt-in, `auto` or nothing happens. That
+closes the case of a fixture with no schedule, which is what `T-0004`
+is.
+
+It does not close the case of a fixture *with* one.
+`examples/T-0006-review-telemetry.md` is a routine on `every: 1d`,
+written precisely to demonstrate that recurrence works, and the
+scheduler's default task set was `examples/` plus `.state/proposed/`.
+A tick left on `--watch` would have re-run a demo review every day,
+correctly, on nobody's request. Opt-in was not violated: the fixture
+opts in, because opting in is the thing it exists to show.
+
+So real work goes in `tasks/` and that is the default; `examples/` is
+reachable only by naming it. `tasks/T-0010` is the first file in it —
+the client-side slash command latching the busy dot, issue #343.
+
+What generalises: **a safety rule and a default are not the same
+control, and the rule cannot cover for the default.** The rule said
+"only tasks that asked for it". The default said "and here is a
+directory of tasks that asked for it, as a demonstration". A
+demonstration of a feature is indistinguishable from a use of it to
+everything downstream of the file, which is why the two belong in
+different directories rather than behind one more field.
+
+The same sentence is worth carrying to the product: a fixtures folder
+shipped next to a jobs folder is a loaded gun the moment anything scans
+for work, and `verify:` in §3.5 is what it is loaded with.
+
+The review added the half I had missed, and it is the same shape one
+turn further out: **every tick in the sweep named its directory with
+`--tasks`, so nothing exercised the default at all.** A suite that
+always passes the argument cannot see a bad default, which is why the
+bad default survived twelve rounds of it. Two checks now — the ids a
+no-argument tick decides about are exactly the ids in `tasks/`, and no
+fixture id is among them — and they fail by name rather than by
+arithmetic.
+
+Writing those down turned up a smaller version of the same thing.
+"The sweep is *N* checks" had been a number in prose for three
+findings running, and the two assertions at the bottom — no worktree
+left, no lock left — printed no verdict line, so the same suite could
+honestly be called 85 or 87 depending on whether you counted them.
+They have labels now and the sweep prints `checks: 89 ok, 0 failed, 1
+skipped`. A count nobody can run is the check-count version of rule 5
+in §3.6: it does not distinguish *measured* from *remembered*.

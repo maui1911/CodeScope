@@ -29,6 +29,13 @@ STATE="$LAB_DIR/.state"
 WT_ROOT="${REPO}.worktrees"
 
 FAILURES=0
+# Counted rather than remembered. "The sweep is N checks" had been a
+# number in prose three findings running, and prose cannot be run - the
+# two leftover assertions at the bottom were checks nobody had counted,
+# which is how the same suite could honestly be called 85 or 87. Now it
+# says.
+CHECKS=0
+SKIPS=0
 
 # Every branch this sweep is allowed to destroy. It force-deletes, so
 # the list has to be exhaustive *and* checked before anything runs: a
@@ -199,6 +206,7 @@ cleanup() {   # cleanup <branch> - only ever a branch from SWEEP_BRANCHES
 }
 
 check() {   # check <label> <expected> <actual>
+    CHECKS=$((CHECKS + 1))
     if [ "$2" = "$3" ]; then
         printf 'ok    %-28s exit %s\n' "$1" "$3"
     else
@@ -243,9 +251,11 @@ run "liar.sh"                1 "$EX/T-0001-smoke-test.md" liar.sh
 # refuses as "already exists" - and the handoff sends a reader to it.
 if git -C "$REPO" rev-parse --verify --quiet "refs/heads/bot/fixer/T-0001" >/dev/null 2>&1; then
     printf 'FAIL  %-28s a blocked run pushed its branch\n' "blocked stays home"
+    CHECKS=$((CHECKS + 1))
     FAILURES=$((FAILURES + 1))
 else
     printf 'ok    %-28s no branch in the project\n' "blocked stays home"
+    CHECKS=$((CHECKS + 1))
 fi
 cleanup bot/fixer/T-0001
 
@@ -298,8 +308,10 @@ cleanup bot/reviewer/T-0006
 
 if [ -f "$STATE/proposed/T-0006-fix.md" ]; then
     printf 'ok    %-28s derived for fixer\n' "handoff"
+    CHECKS=$((CHECKS + 1))
 else
     printf 'FAIL  %-28s no task was derived\n' "handoff"
+    CHECKS=$((CHECKS + 1))
     FAILURES=$((FAILURES + 1))
 fi
 
@@ -557,9 +569,11 @@ CLAIMED="$(grep -c ' ->  done' "$TICK_OUT" || true)"
 REFUSED="$(grep -c ' ->  refused' "$TICK_OUT" || true)"
 if [ "$CLAIMED" = "1" ] && [ "$REFUSED" = "1" ]; then
     printf 'ok    %-28s one claimed, one refused\n' "two runners at once"
+    CHECKS=$((CHECKS + 1))
 else
     printf 'FAIL  %-28s claimed=%s refused=%s (see %s)\n' \
         "two runners at once" "$CLAIMED" "$REFUSED" "$TICK_OUT"
+    CHECKS=$((CHECKS + 1))
     FAILURES=$((FAILURES + 1))
 fi
 
@@ -567,6 +581,67 @@ cleanup bot/fixer/T-990A
 cleanup bot/fixer/T-990B
 rm -f "$STATE"/tasks/T-990*.md 2>/dev/null
 rm -rf "$TMP_TASKS"
+
+# --------------------------------------------------------------------
+# The default task directory
+#
+# Every other tick in this suite names its directory with --tasks,
+# which is precisely what leaves the default unchecked - and the
+# default is a control, not filing (F-44). It pointed at `examples/`,
+# where one fixture is a routine on `every: 1d`, so a tick left
+# running would have re-run a demo review daily. One tick with no
+# --tasks at all is the only thing that can see that.
+#
+# A fresh state directory rather than the sweep's, so `proposed/` is
+# empty and the set of ids the tick prints is a fact about which
+# directories it scanned rather than about what an earlier case left
+# behind.
+# --------------------------------------------------------------------
+
+DEF_STATE="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-def.$$")"
+mkdir -p "$DEF_STATE"
+bash "$SCRIPT_DIR/bot-tick.sh" --dry-run --state "$DEF_STATE" --repo "$REPO" \
+    > "$DEF_STATE/tick.out" 2>&1 || true
+
+# The first column is the task id. "TASK" does not match /^T-/, and the
+# "would dispatch" list that follows prints paths, which do not either.
+awk '$1 ~ /^T-/ { print $1 }' "$DEF_STATE/tick.out" | sort -u > "$DEF_STATE/seen.ids"
+grep -h '^id:' "$LAB_DIR"/tasks/*.md 2>/dev/null \
+    | sed 's/^id:[[:space:]]*//' | sort -u > "$DEF_STATE/real.ids"
+grep -h '^id:' "$EX"/*.md 2>/dev/null \
+    | sed 's/^id:[[:space:]]*//' | sort -u > "$DEF_STATE/fixture.ids"
+
+DEF_SEEN="$(cat "$DEF_STATE/seen.ids")"
+DEF_REAL="$(cat "$DEF_STATE/real.ids")"
+if [ -n "$DEF_REAL" ] && [ "$DEF_SEEN" = "$DEF_REAL" ]; then
+    printf 'ok    %-28s tasks/ and nothing else\n' "default task dir"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s decided about [%s], tasks/ holds [%s]\n' "default task dir" \
+        "$(printf '%s' "$DEF_SEEN" | tr '\n' ' ')" \
+        "$(printf '%s' "$DEF_REAL" | tr '\n' ' ')"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+
+# Named separately from the equality above, because this is the
+# property F-44 is about and it should fail by name: a fixture id that
+# is not also a real task id must not be in the set the tick decided
+# about. Ids the two directories share are excluded - `tasks/` winning
+# a name back is not a leak.
+DEF_LEAK="$(grep -Fxv -f "$DEF_STATE/real.ids" "$DEF_STATE/fixture.ids" 2>/dev/null \
+    | grep -Fx -f "$DEF_STATE/seen.ids" 2>/dev/null || true)"
+if [ -z "$DEF_LEAK" ]; then
+    printf 'ok    %-28s no fixture in the default set\n' "fixtures stay out"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s %s reached the scheduler\n' "fixtures stay out" \
+        "$(printf '%s' "$DEF_LEAK" | tr '\n' ' ')"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+
+rm -rf "$DEF_STATE"
 
 # --------------------------------------------------------------------
 # A base that moves under the run
@@ -631,8 +706,10 @@ run_mover() {   # run_mover <label> <exit> <event> <id> <mine> <body> <theirs> <
     if tail -n "+$((mark + 1))" "$STATE/board.md" 2>/dev/null \
         | grep -q "| $id | $event |"; then
         printf 'ok    %-28s board says %s\n' "$label event" "$event"
+        CHECKS=$((CHECKS + 1))
     else
         printf 'FAIL  %-28s no "%s" row for %s\n' "$label event" "$event" "$id"
+        CHECKS=$((CHECKS + 1))
         FAILURES=$((FAILURES + 1))
     fi
 
@@ -663,9 +740,11 @@ run_mover() {   # run_mover <label> <exit> <event> <id> <mine> <body> <theirs> <
     fi
     if [ "$ok" = 1 ]; then
         printf 'ok    %-28s %s\n' "$label ref" "$desc"
+        CHECKS=$((CHECKS + 1))
     else
         printf 'FAIL  %-28s expected %s; tip %s, base %s\n' \
             "$label ref" "$want" "${tip:-(none)}" "${newbase:-(none)}"
+        CHECKS=$((CHECKS + 1))
         FAILURES=$((FAILURES + 1))
     fi
 
@@ -769,17 +848,21 @@ SEC_NOW="$(git -C "$REPO" ls-tree "$SEC_BRANCH" -- .env 2>/dev/null | awk '{prin
 SEC_TIP="$(git -C "$REPO" ls-tree "refs/heads/bot/fixer/T-995A" -- .env 2>/dev/null | awk '{print $3}')"
 if [ "$SEC_TIP" = "$SEC_BLOB" ] && [ "$SEC_NOW" = "$SEC_BLOB" ]; then
     printf 'ok    %-28s left exactly as the base had it\n' "tracked secret"
+    CHECKS=$((CHECKS + 1))
 else
     printf 'FAIL  %-28s base %s, branch %s, expected %s\n' \
         "tracked secret" "${SEC_NOW:-(gone)}" "${SEC_TIP:-(deleted)}" "$SEC_BLOB"
+    CHECKS=$((CHECKS + 1))
     FAILURES=$((FAILURES + 1))
 fi
 
 SEC_HANDOFF="$(ls -t "$STATE"/handoffs/*T-995A.md 2>/dev/null | head -n1)"
 if [ -n "$SEC_HANDOFF" ] && grep -q 'files that never travel' "$SEC_HANDOFF"; then
     printf 'ok    %-28s the handoff says why\n' "tracked secret reason"
+    CHECKS=$((CHECKS + 1))
 else
     printf 'FAIL  %-28s the blocker does not name the held path\n' "tracked secret reason"
+    CHECKS=$((CHECKS + 1))
     FAILURES=$((FAILURES + 1))
 fi
 
@@ -833,9 +916,11 @@ check "rigged run still lands" 0 "$SABRC"
 
 if [ -e "$SAB_MARKER" ]; then
     printf 'FAIL  %-28s the hook ran during a runner git call\n' "agent hook disarmed"
+    CHECKS=$((CHECKS + 1))
     FAILURES=$((FAILURES + 1))
 else
     printf 'ok    %-28s nothing the agent left in .git ran\n' "agent hook disarmed"
+    CHECKS=$((CHECKS + 1))
 fi
 
 # Two questions, because "the branch is not there" alone would also
@@ -855,8 +940,10 @@ SAB_LOG="$(ls -t "$STATE"/runs/*/T-998A-*.log 2>/dev/null | head -n1)"
 # the agent's output; `say` goes to the console.)
 if grep -q "| T-998A | config-disarmed |.*core\.worktree" "$STATE/board.md" 2>/dev/null; then
     printf 'ok    %-28s the worktree was put back\n' "core.worktree disarmed"
+    CHECKS=$((CHECKS + 1))
 else
     printf 'FAIL  %-28s core.worktree survived the disarm\n' "core.worktree disarmed"
+    CHECKS=$((CHECKS + 1))
     FAILURES=$((FAILURES + 1))
 fi
 
@@ -868,8 +955,10 @@ fi
 [ -n "$SAB_LOG" ] && grep -q 'origin was not there' "$SAB_LOG" || SAB_OK=0
 if [ "$SAB_OK" -eq 1 ]; then
     printf 'ok    %-28s the agent had no remote to push to\n' "origin removed"
+    CHECKS=$((CHECKS + 1))
 else
     printf 'FAIL  %-28s the clone still had a writable origin\n' "origin removed"
+    CHECKS=$((CHECKS + 1))
     FAILURES=$((FAILURES + 1))
 fi
 
@@ -912,8 +1001,10 @@ check "swapped .git blocks" 1 "$HIJRC"
 HIJ_HANDOFF="$(ls -t "$STATE"/handoffs/*T-998B.md 2>/dev/null | head -n1)"
 if [ -n "$HIJ_HANDOFF" ] && grep -q 'which repository it is about' "$HIJ_HANDOFF"; then
     printf 'ok    %-28s the handoff names the swap\n' "swapped .git reason"
+    CHECKS=$((CHECKS + 1))
 else
     printf 'FAIL  %-28s blocked for some other reason\n' "swapped .git reason"
+    CHECKS=$((CHECKS + 1))
     FAILURES=$((FAILURES + 1))
 fi
 
@@ -954,6 +1045,7 @@ if find "$STATE" -prune -mmin +1 -print >/dev/null 2>&1; then
     rm -f "$STATE"/tasks/T-0001.md 2>/dev/null
 else
     printf 'skip  %-28s this find rejects -mmin\n' "wedged lock recovered"
+    SKIPS=$((SKIPS + 1))
 fi
 
 # --------------------------------------------------------------------
@@ -991,8 +1083,10 @@ check "reset is not a no-op" 2 "$RESETRC"
 
 if [ -d "$WT_ROOT/bot-fixer-T-999A" ]; then
     printf 'ok    %-28s the surface was kept to look at\n' "reset keeps the evidence"
+    CHECKS=$((CHECKS + 1))
 else
     printf 'FAIL  %-28s the surface was cleaned up anyway\n' "reset keeps the evidence"
+    CHECKS=$((CHECKS + 1))
     FAILURES=$((FAILURES + 1))
 fi
 
@@ -1014,10 +1108,12 @@ bash "$RUN" --task "$EX/T-0001-smoke-test.md" --repo "$REPO" \
 check "dry run" 0 "$DRYRC"
 if [ -e "$DRY_STATE" ]; then
     printf 'FAIL  %-28s it created the control plane\n' "dry run changes nothing"
+    CHECKS=$((CHECKS + 1))
     FAILURES=$((FAILURES + 1))
     rm -rf "$DRY_STATE"
 else
     printf 'ok    %-28s no control plane was created\n' "dry run changes nothing"
+    CHECKS=$((CHECKS + 1))
 fi
 
 # --------------------------------------------------------------------
@@ -1062,8 +1158,10 @@ check "run that keeps a note" 0 "$MEMRC"
 MEM_FILE="$(grep -l "$MEM_NOTE" "$MEM_DIR"/*.md 2>/dev/null | head -n1)"
 if [ -n "$MEM_FILE" ]; then
     printf 'ok    %-28s stored, not yet live\n' "note waits for a reader"
+    CHECKS=$((CHECKS + 1))
 else
     printf 'FAIL  %-28s no note was stored\n' "note waits for a reader"
+    CHECKS=$((CHECKS + 1))
     FAILURES=$((FAILURES + 1))
 fi
 
@@ -1073,9 +1171,11 @@ rm -f "$STATE/tasks/T-0900.md" 2>/dev/null
 if bash "$RUN" --task "$SAB_TASKS/T-0900.md" --repo "$REPO" --dry-run 2>&1 \
         | grep -q "$MEM_NOTE"; then
     printf 'FAIL  %-28s an unapproved note reached the prompt\n' "note is not read yet"
+    CHECKS=$((CHECKS + 1))
     FAILURES=$((FAILURES + 1))
 else
     printf 'ok    %-28s nothing reads it until somebody agrees\n' "note is not read yet"
+    CHECKS=$((CHECKS + 1))
 fi
 
 MEMAPPRC=0
@@ -1088,8 +1188,10 @@ check "remember it" 0 "$MEMAPPRC"
 if bash "$RUN" --task "$SAB_TASKS/T-0900.md" --repo "$REPO" --dry-run 2>&1 \
         | grep -q "$MEM_NOTE"; then
     printf 'ok    %-28s and then it is in the prompt\n' "note is read after approval"
+    CHECKS=$((CHECKS + 1))
 else
     printf 'FAIL  %-28s an approved note never reached the prompt\n' "note is read after approval"
+    CHECKS=$((CHECKS + 1))
     FAILURES=$((FAILURES + 1))
 fi
 
@@ -1102,9 +1204,11 @@ fi
 if bash "$RUN" --task "$SAB_TASKS/T-0900.md" --repo "$REPO" --dry-run 2>&1 \
         | grep -q "$MEM_NOTE"; then
     printf 'FAIL  %-28s a dateless approval still fed the prompt\n' "note needs a date"
+    CHECKS=$((CHECKS + 1))
     FAILURES=$((FAILURES + 1))
 else
     printf 'ok    %-28s a dateless approval stops being read\n' "note needs a date"
+    CHECKS=$((CHECKS + 1))
 fi
 
 # A note that closes the section it is quoted inside and opens another
@@ -1124,9 +1228,11 @@ BOT_AGENT_CMD="$STUBS/rememberer.sh" BOT_AGENT_ARGS="" \
 MEM_AFTER="$(ls "$MEM_DIR"/*.md 2>/dev/null | wc -l | tr -d ' ')"
 if [ "$BADRC" -eq 0 ] && [ "$MEM_AFTER" = "$MEM_BEFORE" ]; then
     printf 'ok    %-28s a prompt-shaped note is not stored\n' "note cannot restructure"
+    CHECKS=$((CHECKS + 1))
 else
     printf 'FAIL  %-28s exit %s, notes %s -> %s\n' \
         "note cannot restructure" "$BADRC" "$MEM_BEFORE" "$MEM_AFTER"
+    CHECKS=$((CHECKS + 1))
     FAILURES=$((FAILURES + 1))
 fi
 
@@ -1177,8 +1283,10 @@ check "verifier cannot approve" 1 "$VGATERC"
 VGATE_LOG="$(ls -t "$STATE"/runs/*/T-0901-*.log 2>/dev/null | head -n1)"
 if [ -n "$VGATE_LOG" ] && grep -q 'refusing to approve from inside a bot run' "$VGATE_LOG"; then
     printf 'ok    %-28s the guard is what stopped it\n' "verifier gate reason"
+    CHECKS=$((CHECKS + 1))
 else
     printf 'FAIL  %-28s it failed for some other reason\n' "verifier gate reason"
+    CHECKS=$((CHECKS + 1))
     FAILURES=$((FAILURES + 1))
 fi
 
@@ -1300,8 +1408,10 @@ run_folder() {   # run_folder <label> <exit> <event-or-empty> [disturb] [body] [
     if [ -n "$event" ]; then
         if grep -q "| T-992 | $event |" "$FSTATE/board.md" 2>/dev/null; then
             printf 'ok    %-28s board says %s\n' "$label event" "$event"
+            CHECKS=$((CHECKS + 1))
         else
             printf 'FAIL  %-28s no "%s" row\n' "$label event" "$event"
+            CHECKS=$((CHECKS + 1))
             FAILURES=$((FAILURES + 1))
         fi
     fi
@@ -1324,8 +1434,10 @@ for unwanted in node_modules/dep.js .env ignored.txt; do
 done
 if [ -z "$LEAKED" ] && [ -n "$IMPORTED" ]; then
     printf 'ok    %-28s node_modules, .env and .gitignore honoured\n' "folder import excludes"
+    CHECKS=$((CHECKS + 1))
 else
     printf 'FAIL  %-28s imported:%s\n' "folder import excludes" "${LEAKED:- nothing at all}"
+    CHECKS=$((CHECKS + 1))
     FAILURES=$((FAILURES + 1))
 fi
 
@@ -1333,8 +1445,10 @@ fi
 # charter that is not there.
 if [ "$(git --git-dir="$FSTATE/snapshot.git" ls-tree -r --name-only refs/heads/folder 2>/dev/null | grep -c '^.bot-contract/')" -gt 0 ]; then
     printf 'ok    %-28s contract grafted in\n' "folder contract"
+    CHECKS=$((CHECKS + 1))
 else
     printf 'FAIL  %-28s no .bot-contract in the snapshot\n' "folder contract"
+    CHECKS=$((CHECKS + 1))
     FAILURES=$((FAILURES + 1))
 fi
 
@@ -1370,9 +1484,11 @@ run_folder "secret in the commit"  1 "" "" "" scribe.sh "" .env
 # different door.
 if [ -z "$(ls "$FSTATE/patches" 2>/dev/null)" ]; then
     printf 'ok    %-28s nothing was published\n' "secret stays put"
+    CHECKS=$((CHECKS + 1))
 else
     printf 'FAIL  %-28s a patch was written for a blocked run: %s\n' \
         "secret stays put" "$(ls "$FSTATE/patches")"
+    CHECKS=$((CHECKS + 1))
     FAILURES=$((FAILURES + 1))
 fi
 
@@ -1406,6 +1522,7 @@ if [ "$SYMOK" -eq 1 ]; then
     check "symlinked channel" 1 "$SYMRC"
 else
     printf 'skip  %-28s this shell does not make symlinks\n' "symlinked channel"
+    SKIPS=$((SKIPS + 1))
 fi
 
 rm -rf "$FOLDER_ROOT" "$FPROJ.worktrees"
@@ -1418,9 +1535,25 @@ LEFT_WT="$(ls -d "$WT_ROOT"/bot-* 2>/dev/null | wc -l | tr -d ' ')"
 # `*.lock` on its own never matched `dispatch.lock.break`, which is the
 # one a killed run leaves behind and the one that wedges the next.
 LEFT_LOCKS="$(ls -d "$STATE"/*.lock "$STATE"/*.lock.break 2>/dev/null | wc -l | tr -d ' ')"
-printf '\nbot worktrees left: %s\nlocks left:         %s\n' "$LEFT_WT" "$LEFT_LOCKS"
-[ "$LEFT_WT" -eq 0 ] || FAILURES=$((FAILURES + 1))
-[ "$LEFT_LOCKS" -eq 0 ] || FAILURES=$((FAILURES + 1))
+printf '\n'
+if [ "$LEFT_WT" -eq 0 ]; then
+    printf 'ok    %-28s none\n' "no worktrees left"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s %s still on disk under %s\n' \
+        "no worktrees left" "$LEFT_WT" "$WT_ROOT"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+if [ "$LEFT_LOCKS" -eq 0 ]; then
+    printf 'ok    %-28s none\n' "no locks left"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s %s still in %s\n' "no locks left" "$LEFT_LOCKS" "$STATE"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
 
-printf 'failures: %s\n' "$FAILURES"
+printf '\nchecks: %s ok, %s failed, %s skipped\n' \
+    "$((CHECKS - FAILURES))" "$FAILURES" "$SKIPS"
 exit "$FAILURES"
