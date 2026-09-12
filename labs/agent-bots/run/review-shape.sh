@@ -26,15 +26,18 @@
 #
 # The runner exports what it needs; there are no arguments.
 #
-#   BOT_REVIEW        path to the harvested report
-#   BOT_REVIEWED_SHA  the commit the worktree was checked out at
-#
-# Named for the reviewer rather than for the role, because the
-# runner exporting them lives at base while this script is read from
-# the checkout under test - so the pair can only be renamed once
-# both halves are already merged. See #348.
+#   BOT_ARTIFACT      path to the harvested report
+#   BOT_SUBJECT_SHA   the commit the worktree was checked out at
 #   BOT_TOUCHES       the task's touches: globs, comma-separated
 #   BOT_TASK_ID       the task this review is supposed to answer
+#
+# All four are named for the *job* and not for the role that had it
+# first. A report is an artifact, and the commit it is about is its
+# subject, whether the reader is a reviewer, a doc writer or a
+# benchmark. The two that were BOT_REVIEW and BOT_REVIEWED_SHA could
+# only be renamed across two merges, because this script is read from
+# the checkout under test while the runner exporting them is at base -
+# see the block comment at the export site and #348.
 #
 # It runs inside the clean verify checkout, so `git` here is that tree.
 
@@ -42,8 +45,9 @@ set -euo pipefail
 
 fail() { printf 'review-shape: %s\n' "$*" >&2; exit 1; }
 
-[ -n "${BOT_REVIEW:-}" ] || fail "BOT_REVIEW is not set - this verifier is for produces: report tasks"
-[ -f "$BOT_REVIEW" ] || fail "no review at $BOT_REVIEW"
+[ -n "${BOT_ARTIFACT:-}" ] \
+    || fail "BOT_ARTIFACT is not set - this verifier is for produces: report tasks"
+[ -f "$BOT_ARTIFACT" ] || fail "no report at $BOT_ARTIFACT"
 
 field() {
     awk -v key="$1" '
@@ -55,7 +59,7 @@ field() {
             print value
             found = 1
         }
-    ' "$BOT_REVIEW"
+    ' "$BOT_ARTIFACT"
 }
 
 TASK="$(field task)"
@@ -73,15 +77,15 @@ esac
 
 # A review of the wrong commit is worse than no review: it reads as
 # current and describes something else.
-if [ -n "${BOT_REVIEWED_SHA:-}" ] && [ "$REVIEWED" != "$BOT_REVIEWED_SHA" ]; then
-    fail "review says it covers $REVIEWED, but the worktree was $BOT_REVIEWED_SHA"
+if [ -n "${BOT_SUBJECT_SHA:-}" ] && [ "$REVIEWED" != "$BOT_SUBJECT_SHA" ]; then
+    fail "review says it covers $REVIEWED, but the worktree was $BOT_SUBJECT_SHA"
 fi
 
 if [ -n "${BOT_TASK_ID:-}" ] && [ "$TASK" != "$BOT_TASK_ID" ]; then
     fail "review answers task '$TASK', but this run is '$BOT_TASK_ID'"
 fi
 
-grep -q '^# What I could not check' "$BOT_REVIEW" \
+grep -q '^# What I could not check' "$BOT_ARTIFACT" \
     || fail "no 'What I could not check' section - the blind spots are part of the answer"
 
 # One reader that consumes the whole file. The `sed | sed | head`
@@ -94,16 +98,16 @@ BLIND="$(awk '
     inside && /^# / { exit }
     inside && /^---[[:space:]]*$/ { exit }
     inside && NF { print }
-' "$BOT_REVIEW")"
+' "$BOT_ARTIFACT")"
 [ -n "$BLIND" ] || fail "'What I could not check' is empty"
 
-grep -q '^# Findings' "$BOT_REVIEW" || fail "no 'Findings' section"
+grep -q '^# Findings' "$BOT_ARTIFACT" || fail "no 'Findings' section"
 
 FINDINGS_BODY="$(awk '
     /^# Findings/ { inside = 1; next }
     inside && /^# / { exit }
     inside { print }
-' "$BOT_REVIEW")"
+' "$BOT_ARTIFACT")"
 
 # Exactly that line and nothing else. `grep -q` matched it *anywhere*
 # in the section and returned straight away, so a review could claim no
@@ -204,20 +208,20 @@ check_finding() {
     path="${CUR_CITE%:*}"
     line="${CUR_CITE##*:}"
 
-    git cat-file -e "$BOT_REVIEWED_SHA:$path" 2>/dev/null \
-        || fail "finding cites '$path', which does not exist at $BOT_REVIEWED_SHA"
+    git cat-file -e "$BOT_SUBJECT_SHA:$path" 2>/dev/null \
+        || fail "finding cites '$path', which does not exist at $BOT_SUBJECT_SHA"
 
-    [ "$(git cat-file -t "$BOT_REVIEWED_SHA:$path" 2>/dev/null)" = "blob" ] \
-        || fail "finding cites '$path', which is not a file at $BOT_REVIEWED_SHA"
+    [ "$(git cat-file -t "$BOT_SUBJECT_SHA:$path" 2>/dev/null)" = "blob" ] \
+        || fail "finding cites '$path', which is not a file at $BOT_SUBJECT_SHA"
 
     # awk, not `wc -l`: wc counts newlines, so a file whose last line
     # has none - generated config, a hand-edited fixture - comes back one
     # short, and a finding citing that last line is refused as past the
     # end of a file it is inside. awk counts records, and an unterminated
     # final line is a record.
-    lines="$(git cat-file blob "$BOT_REVIEWED_SHA:$path" | awk 'END { print NR }')"
+    lines="$(git cat-file blob "$BOT_SUBJECT_SHA:$path" | awk 'END { print NR }')"
     if [ "$line" -lt 1 ] || [ "$line" -gt "$lines" ]; then
-        fail "finding cites '$path:$line', but that file has $lines lines at $BOT_REVIEWED_SHA"
+        fail "finding cites '$path:$line', but that file has $lines lines at $BOT_SUBJECT_SHA"
     fi
 
     ok=0
@@ -246,9 +250,9 @@ of the line, or more lines."
     last=$((line + CUR_QN - 1))
     [ "$last" -le "$lines" ] \
         || fail "the quote under '$CUR_CITE' is $CUR_QN lines long, which runs past the end
-of '$path' ($lines lines at $BOT_REVIEWED_SHA)"
+of '$path' ($lines lines at $BOT_SUBJECT_SHA)"
 
-    src="$(git cat-file blob "$BOT_REVIEWED_SHA:$path" | sed -n "${line},${last}p")"
+    src="$(git cat-file blob "$BOT_SUBJECT_SHA:$path" | sed -n "${line},${last}p")"
 
     i=0
     while IFS= read -r want; do
