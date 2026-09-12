@@ -6,7 +6,7 @@
 # beside the tree, and `shape:` says which template that file has to
 # match. This is the verifier for templates/REVIEW.md. Another report
 # role brings its own template and its own checker; the runner hands
-# every one of them the same three facts.
+# every one of them the same four facts.
 #
 # "No verifier, no dispatch" is the rule, and a review has no cargo
 # command that can prove it. What it does have is a shape, and a set of
@@ -34,10 +34,15 @@
 # All four are named for the *job* and not for the role that had it
 # first. A report is an artifact, and the commit it is about is its
 # subject, whether the reader is a reviewer, a doc writer or a
-# benchmark. The two that were BOT_REVIEW and BOT_REVIEWED_SHA could
-# only be renamed across two merges, because this script is read from
-# the checkout under test while the runner exporting them is at base -
-# see the block comment at the export site and #348.
+# benchmark.
+#
+# The two that were BOT_REVIEW and BOT_REVIEWED_SHA could only be
+# renamed across two merges, and the direction matters: `verify:` runs
+# inside the verify checkout, so *this* script is the copy at base
+# while the runner exporting the names is the copy in the working
+# tree. A branch that renames both sides therefore runs its new runner
+# against the old script, and goes red on a change that is correct.
+# See the block comment at the export site and #348.
 #
 # It runs inside the clean verify checkout, so `git` here is that tree.
 
