@@ -460,8 +460,8 @@ $4
 Everything else. This is a fixture, not a review.
 EOF
     ( cd "$REPO" \
-        && BOT_REVIEW="$SHAPE_DIR/review.md" \
-           BOT_REVIEWED_SHA="$SHAPE_SHA" \
+        && BOT_ARTIFACT="$SHAPE_DIR/review.md" \
+           BOT_SUBJECT_SHA="$SHAPE_SHA" \
            BOT_TOUCHES="$SHAPE_PATH" \
            BOT_TASK_ID="T-SHAPE" \
            bash "$SHAPE" ) >/dev/null 2>&1 || rc=$?
