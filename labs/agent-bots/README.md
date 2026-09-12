@@ -450,7 +450,7 @@ list; the sites do not.
 
 | | |
 |---|---|
-| Covered | plain-folder projects as well as git ones; the file contract; **two bots** (`fixer`, `reviewer`), two deliverables (`produces: commit`, `produces: report`), the handoff between them and a scheduler that reads the board; contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the report channel (`artifact:`, `shape:`, harvested into `.state/artifacts/`) with citations *and* quotes checked against the blob; verifier, in a clean checkout of the branch tip; the surface disarm (hooks, command-naming config, `core.worktree`, and the identity of `.git` itself); the approval gate on derived tasks *and* on per-bot memory, hashed over the body, with `--chain` as a recorded bypass; per-bot memory itself - one fact per run, capped, refused if it would restructure the prompt it is quoted in; evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup; rebase onto a base that moved, re-verified there |
+| Covered | plain-folder projects as well as git ones; the file contract; **two bots** (`fixer`, `reviewer`), two deliverables (`produces: commit`, `produces: report`), the handoff between them and a scheduler that reads the board; contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the report channel (`artifact:`, `shape:`, harvested into `.state/artifacts/`) with citations *and* quotes checked against the blob; verifier, in a clean checkout of the branch tip; the surface disarm (hooks, command-naming config, `core.worktree`, and the identity of `.git` itself); the approval gate on derived tasks *and* on per-bot memory, hashed over the body, with `--chain` as a recorded bypass; per-bot memory itself - one fact per run, capped, refused if it would restructure the prompt it is quoted in; evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup; rebase onto a base that moved, re-verified there; retiring a finished record (`bot-forget.sh`) without touching the board or the handoff |
 | **Not** covered | re-verifying a branch that is *waiting* rather than running, resume after a crash, any trigger other than "someone ran a tick", pushing, opening PRs, any GPUI surface |
 
 Two deliberate omissions:
@@ -610,6 +610,23 @@ labs/agent-bots/run/bot-approve.sh --forget fixer/<note-file>
 labs/agent-bots/run/bot-run.sh   --task labs/agent-bots/examples/T-0006-review-telemetry.md --chain
 ```
 
+**Retiring a record.** A live task under `.state/tasks/` outlives its
+run on purpose — it is how a later dispatch knows the task finished,
+and what a human reads when something went wrong. `bot-forget.sh`
+removes one, and it is the supported way because the only other one
+was `rm` under the directory whose whole job is being the record:
+
+```bash
+labs/agent-bots/run/bot-forget.sh T-0010
+labs/agent-bots/run/bot-forget.sh T-0010 --surface   # and the clone
+```
+
+It refuses a task still saying `dispatched` — a run in flight and a run
+that died look identical from outside and want opposite things — and
+`--force` is the way past that. It never touches the handoff, the
+board, the artifacts or a bot's memory, and it appends `forgotten` to
+the board, because retiring a record is itself an event. F-46.
+
 **Which CLI runs is data.** The task's `agent:` wins, otherwise the
 charter's; the profile lives in `contract/agents/<id>.agent.md`. There is no
 built-in default — a bot says what it runs on. `claude`, `codex`,
@@ -729,9 +746,13 @@ is the contract, not the script.
 ## 6. What would have to be true to graduate this
 
 1. The loop runs unattended and green three times on a real issue in
-   this repo. *(Claude Code, and now Codex: one completed run, `done`,
-   verifier green, branch pushed back. Three has not happened yet for
-   either. F-26, F-27 and F-30 are what it took.)*
+   this repo. *(**One of three, and the first on a real issue.**
+   T-0010 — a scheduler tick, no babysitting — produced the fix for
+   issue #343, verifier green in a clean checkout, one commit inside
+   `touches:`, and that commit is now on `main` as part of #354. Two
+   to go, and F-45 is what the first one actually proved. Earlier runs
+   under Claude Code and Codex completed on fixtures: F-26, F-27 and
+   F-30 are what those took.)*
 2. The verifier catches at least one agent run that *claimed* success
    and was wrong. If that never happens, the verifier is not verifying.
 3. A handoff between two bots survives a rebase. *(Half done: a
@@ -3528,3 +3549,127 @@ honestly be called 85 or 87 depending on whether you counted them.
 They have labels now and the sweep prints `checks: 89 ok, 0 failed, 1
 skipped`. A count nobody can run is the check-count version of rule 5
 in §3.6: it does not distinguish *measured* from *remembered*.
+
+---
+
+### F-45 · The first real run, and what it did not prove
+
+*2026-09-12. Sixteen review rounds, and then a task.*
+
+`tasks/T-0010` went through a scheduler tick with nobody watching:
+surface created and disarmed, prompt assembled from charter plus task
+plus context, `claude -p` with `--permission-mode auto`, channels
+harvested, evidence read out of the tree, verifier run in a clean
+checkout of the branch tip. Three minutes fifty-two seconds, `done`,
+one commit, diff inside `touches:`. The commit is on `main` now as
+part of #354, authored by `fixer (via claude) <fixer@bots.invalid>`
+because rewriting that would have erased the only interesting thing
+about its provenance.
+
+Then the part that matters more than the verdict: **`done` is a claim,
+so it was checked against something else.** The narrow verifier the
+task declared is deliberately narrower than the crate (F-1), so it
+cannot see a regression elsewhere. Independently: 551 crate tests
+green, clippy clean on the changed file, and the diff read line by
+line. It held.
+
+The work was good in a way a verifier cannot measure. The rule was
+implemented on the two answer shapes the task quoted and not one step
+further; the guard arm was placed above the `EntryKind::User` arm
+rather than inside it; `last_user_ts` was left alone; every test drove
+the parser from the captured constants rather than from lines written
+to match the prose. And the commit message noted, unprompted, that a
+pending background agent still forces `Busy` afterwards — an
+interaction with the test from #299 that nothing in the task
+mentioned. It had gone and read the neighbours.
+
+**What this does not prove, and it is most of the list.**
+
+*That the contract is right.* One task, written by the same person who
+wrote the runner, in a file the runner's author knows the parser of.
+The interesting failure is a task written by somebody who has not read
+`bot-run.sh`.
+
+*That the loop is unattended.* The scheduler dispatched it; a human
+wrote the task, captured the transcript lines the task quotes, took it
+through two review rounds, and then reviewed the output. The agent's
+turn was unattended. The loop was not.
+
+*That the verifier verifies.* Criterion 2 wants a run that claimed
+success and was wrong. This one claimed success and was right, which
+is the outcome that teaches least. Twenty stubs lie on purpose and the
+runner catches all twenty; no real agent has lied yet.
+
+*That it saves time.* Writing the task, capturing the evidence and
+reviewing the diff cost more than writing the patch would have. That
+is the honest shape of a first run and it is not an argument either
+way — the question is whether the second and third cost less, and
+there is no data.
+
+What generalises is smaller than the event: **the human half of the
+contract is the half that decides.** #343 insisted the discriminator be
+checked against real captured transcript lines. Doing that ruled out
+`isMeta` and turned one answer shape into two, which are precisely the
+two things a bot handed the issue text alone would have got wrong.
+The agent wrote all the code and none of the decisions.
+
+---
+
+### F-46 · The suite refused to run because the lab had been used
+
+*2026-09-12, minutes after F-45.*
+
+T-0010 finished, wrote `status: done` into `.state/tasks/T-0010.md`,
+and the next `sweep.sh` refused to start:
+
+    sweep: refusing to run - these already exist and this script
+    force-deletes every one of them:
+
+      live task T-0010 (.../.state/tasks/T-0010.md)
+
+The refusal is right in general and wrong here. It exists because the
+sweep dispatches into this control plane, and a run still in flight is
+dispatching into it too — the old behaviour cleared every live task on
+its way past, which took another run's file out from under it and
+ended that run with no status at all. What it could not tell was *in
+flight* from *finished*. A live task carries `status:`, and `done`,
+`blocked` and `needs-review` are verdicts: a record, not a collision.
+`dispatched` still refuses, deliberately, because a run that died
+mid-flight left exactly that and wants a human.
+
+The decision is a function rather than an inline `case`, for the
+reason F-44 gave one turn earlier: the preflight runs before anything
+in the file can assert about it, so a check has to be able to reach
+the decision. Five checks call `live_task_verdict`; the preflight
+calls the same thing.
+
+**The second half was worse, and it is why this has its own finding.**
+The way out of that refusal was to delete the live task. There was no
+command for it — nothing removed a record and nothing offered to — so
+the documented route was `rm -f` under `.state/`, which is the
+directory whose entire purpose is being the record. A recovery
+procedure that reads *delete the evidence of the only real run the
+loop has completed* will eventually be followed by somebody in a
+hurry. And the pressure is in the wrong direction: the suite is what
+tells you the loop still holds, so anything that makes the suite
+unrunnable after real work gets cleared out of the way rather than
+understood.
+
+Hence `run/bot-forget.sh`: removes the live task, optionally the
+surface, refuses on `dispatched` without `--force`, refuses from
+inside a run the way `bot-approve.sh` does, removes a surface only on
+a `.git/bot-surface` marker that names *that* task, and appends
+`forgotten` to the board. Nine checks, and they are about what it
+refuses rather than what it removes — including a directory whose
+marker names a different task, because `rm -rf` on the strength of a
+task file's own field is how a tool like this takes somebody's
+checkout with it.
+
+What generalises: **a regression suite and the thing it tests cannot
+share a mutable directory without one of them eventually being
+sacrificed.** Here they share `.state/`, and the suite won on the
+strength of being easier to run. Giving real work its own control
+plane would be the deeper fix — `--state` already takes a path, so it
+is a default and a paragraph away — and it is the same sentence as
+F-44 one level down: a fixture directory next to a jobs directory,
+except this time the fixtures and the jobs are *runs*.
