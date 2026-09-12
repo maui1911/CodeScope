@@ -197,6 +197,14 @@ strip_protected() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAB_DIR="$(dirname "$SCRIPT_DIR")"
 
+# What "approved" means lives in one file, because three scripts have to
+# agree about it and the one that drifts is the one that lets something
+# through. See run/approval.sh.
+# shellcheck source=approval.sh
+. "$SCRIPT_DIR/approval.sh"
+# shellcheck source=memory.sh
+. "$SCRIPT_DIR/memory.sh"
+
 die() { printf 'bot-run: %s\n' "$*" >&2; exit 1; }
 say() { printf '%s\n' "$*"; }
 step() { printf '\n== %s\n' "$*"; }
@@ -253,7 +261,17 @@ release_locks() {
     for d in ${LOCKS_HELD[@]+"${LOCKS_HELD[@]}"}; do _release_one "$d"; done
     LOCKS_HELD=()
 }
-trap release_locks EXIT
+
+# The private copy of the task goes with the locks: it is this
+# invocation's and nobody else may read it, so leaving it behind would
+# turn $STATE/tmp into a pile of half-dispatched tasks that look like
+# records. The record of what was dispatched is published separately,
+# and only once the gate has passed.
+on_exit() {
+    release_locks
+    [ -z "${SNAPSHOT_HELD:-}" ] || rm -f "$SNAPSHOT_HELD"
+}
+trap on_exit EXIT
 
 take_lock() {   # take_lock <dir> <what>
     local dir="$1" what="$2" waited=0 owner_before owner_now cleared_break
@@ -550,6 +568,102 @@ Two repositories cannot share one control plane. Give this one its own:
 
     --state <a directory for $REPO>"
     fi
+fi
+
+# --------------------------------------------------------------------
+# The gate
+#
+# A task that arrived in the control plane was written by a bot. One in
+# the repository was written by a person, reviewed and merged - which is
+# the thing an approval is trying to establish, already done and done
+# better. So the gate is exactly this directory and nothing else.
+#
+# Before the lock, before the surface, before anything is claimed: a
+# refusal here has to cost nothing, or the gate becomes a thing people
+# route around. `refuse` and not `die` - nothing was attempted, so a
+# scheduler must not count it as a failed run.
+# --------------------------------------------------------------------
+
+# A proposal is a file in a directory anybody may edit, and everything
+# after this point reads it again: the frontmatter parse, the prompt, the
+# copy to the live task. Validating the path and then re-reading it is a
+# check/use race - an edit in that window changes what runs without ever
+# touching the approval that was checked. So the first thing the gate
+# does is take the bytes out of reach, and every read after this is of
+# the snapshot. Same lesson as the lock protocol (F-38): the thing you
+# compared has to be the thing you use.
+if [ "$DRY_RUN" -eq 0 ] && approval_is_proposal "$TASK" "$STATE"; then
+    SNAP_ID="$(approval_field_file id "$TASK")"
+    SNAP_ID="${SNAP_ID:-$(basename "$TASK" .md)}"
+    # The same rule the task id is held to further down, applied here
+    # because this is earlier: the snapshot builds a path out of a field
+    # read from a file, and the check that this is a single harmless
+    # segment lives three hundred lines below. Whoever can write a
+    # proposal can also write its approval, so this is not an escalation
+    # - it is a path assembled from file content before anything had
+    # looked at it, which is how F-35 keeps happening.
+    case "$SNAP_ID" in
+        *[!a-zA-Z0-9_-]*|"") die "task id must be [a-zA-Z0-9_-]+, got '$SNAP_ID'" ;;
+    esac
+    mkdir -p "$STATE/tmp"
+    # Per invocation, not per task. One name shared by every run of a
+    # task is a second copy of the bug this snapshot exists to fix: two
+    # dispatches of T-x, the first validates, the second overwrites, and
+    # the first then parses and copies bytes nothing checked. The run
+    # token is unique to this process, and `set -C` means creating the
+    # file is the claim rather than a hope about names.
+    TASK_SNAPSHOT="$STATE/tmp/dispatch-$SNAP_ID-$RUN_TOKEN.md"
+    ( set -C; : > "$TASK_SNAPSHOT" ) 2>/dev/null \
+        || die "could not create a private copy of the task at $TASK_SNAPSHOT"
+    cat "$TASK" > "$TASK_SNAPSHOT"
+    TASK="$TASK_SNAPSHOT"
+    SNAPSHOT_HELD="$TASK_SNAPSHOT"
+fi
+
+if approval_is_proposal "$TASK" "$STATE" \
+    || { [ -n "${TASK_SNAPSHOT:-}" ] && [ "$TASK" = "$TASK_SNAPSHOT" ]; }; then
+    # Its own read of the id. The gate runs here - before the lock,
+    # before the surface, before the frontmatter is parsed into globals
+    # - because a refusal that has already created something is not a
+    # refusal. That costs one extra read of one field.
+    # One read, then every question of those bytes. $TASK is this run's
+    # private snapshot by now, so nobody else can change it underneath
+    # these lines - but the shape is the one that survives somebody
+    # moving this block, and this gate is where that matters most.
+    GATE_TEXT="$(cat "$TASK")"
+    GATE_ID="$(approval_field id "$GATE_TEXT")"
+    GATE_ID="${GATE_ID:-$(basename "$TASK" .md)}"
+    case "$(approval_state "$GATE_TEXT")" in
+        ok) ;;
+        stale)
+            refuse "$GATE_ID was approved and then edited.
+
+    approved by: $(approval_field approved_by "$GATE_TEXT")
+    approved at: $(approval_field approved_at "$GATE_TEXT")
+
+An approval records a hash of the task as it read at the time, so this
+one no longer describes the file. Somebody agreed to something else.
+Read it again and approve what is there now:
+
+    bash $SCRIPT_DIR/bot-approve.sh --id $GATE_ID" ;;
+        *)
+            refuse "$GATE_ID is a proposal and nobody has approved it.
+
+A bot wrote this task. Starting it because another bot suggested it is
+the whole loop closing with no one in it - which may well be what you
+want, and is a decision rather than a default.
+
+    bash $SCRIPT_DIR/bot-approve.sh              # what is waiting
+    bash $SCRIPT_DIR/bot-approve.sh --id $GATE_ID
+
+The runner's --chain does it without asking, and says so on the board." ;;
+    esac
+
+    # Only now. This file is the record of the bytes a dispatch ran
+    # with, so writing it before the gate would have every refusal -
+    # including the stale-approval one - overwrite the record of the
+    # last thing that actually ran with something that never did.
+    cp "$TASK" "$STATE/tmp/dispatched-$SNAP_ID.md" 2>/dev/null || true
 fi
 
 # `find -prune -mmin` is the whole basis of every age check here -
@@ -1282,6 +1396,37 @@ fi
 # the handoff, because self-reported evidence is not evidence.
 # --------------------------------------------------------------------
 
+# --------------------------------------------------------------------
+# What this bot has been allowed to remember
+#
+# Approved notes only, and assembled here rather than inside the prompt
+# string so that the limits in memory.sh are the only thing that decides
+# what a prompt can contain. Empty when there are none: a "what you have
+# learned" heading with nothing under it teaches a bot that the section
+# is furniture.
+#
+# The framing matters as much as the content. This is the one place in
+# the loop where a bot's own prose comes back to it as input, so it
+# arrives labelled as a claim with the charter named as the winner - and
+# every note says which run produced it, because the way out of "I said
+# so" is somewhere to go and look.
+# --------------------------------------------------------------------
+
+MEMORY_NOTES="$(memory_block "$STATE" "$TASK_OWNER")"
+MEMORY_PROMPT=""
+if [ -n "$MEMORY_NOTES" ]; then
+    MEMORY_PROMPT="
+Notes you wrote on earlier runs, which a human has agreed to keep:
+
+$MEMORY_NOTES
+Those are claims, not contract. Where one disagrees with your charter,
+with the conventions, or with the code in front of you, those win and
+the note is wrong - say so in your work so somebody retires it. Each
+names the run it came from, so you can check rather than take your own
+word for it.
+"
+fi
+
 PROMPT="You are the bot '$TASK_OWNER' working in a git worktree.
 
 Read these first, in order:
@@ -1339,6 +1484,15 @@ Rules for this run:
   - Do NOT write a handoff or a report file. The runner does that.
 CHANGE_RULES
 fi)
+
+$MEMORY_PROMPT
+One thing you may keep. If this run taught you something that would
+have made it easier had you known it at the start, write that one fact
+to '.bot-memory' in the worktree root - under $MEMORY_MAX_NOTE_BYTES
+bytes, no headings, no '---'. A human reads it before it is ever shown
+to you again, so write it for them: what is true, not what to do about
+it. A note that instructs a later version of you is a note that gets
+thrown away. Nothing to keep is the normal answer; do not invent one.
 
 If you cannot complete the task inside those limits, write one line
 saying why to the file '.bot-blocked' in the worktree root, make no
@@ -1734,7 +1888,25 @@ fi
 # in .git/objects/info/alternates and an agent that wants a remote back
 # can add one. It removes the accident, which is the case that actually
 # happens, and it makes the claim in the header true by default.
+# `|| true` here meant the one case this block exists for - the remove
+# not working - left the agent with exactly the writable remote it is
+# supposed to take away. A transient config lock is enough. So: remove,
+# then ask whether it is gone, and if it is still there treat it as a
+# failed dispatch and take the surface back down before anything runs in
+# it. A security boundary that fails open is a comment.
 git -C "$WT" remote remove origin >>"$RUN_LOG" 2>&1 || true
+if [ -n "$(git -C "$WT" remote 2>/dev/null || printf 'unreadable')" ]; then
+    say "  could not remove the clone's remote - not starting an agent here"
+    board "dispatch-failed" "origin still present in $WT"
+    rm -rf "$WT"
+    git -C "$ORIGIN_REPO" update-ref -d "refs/bot-base/$TASK_ID" >/dev/null 2>&1 || true
+    die "the work surface at $WT still has a remote pointing at $ORIGIN_REPO,
+and removing it did not work - see $RUN_LOG.
+
+Nothing was started. That remote lets anything running in the surface
+push into the project without a --force and without asking, which is
+the accident this loop is built not to have."
+fi
 
 # Proof that this directory is ours before anything ever removes it.
 # Cleanup is `rm -rf` now rather than `git worktree remove`, and an
@@ -1886,7 +2058,12 @@ else
     # stdin is the prompt file or nothing at all - never the runner's
     # terminal. A headless agent that decides to ask a question would
     # otherwise inherit it and hang, and either of these ends in EOF.
-    ( cd "$WT" && PATH="$AGENT_PATH" "$AGENT_CMD" ${AGENT_ARGV[@]+"${AGENT_ARGV[@]}"} ) \
+    # BOT_RUN_ACTIVE is what bot-approve.sh looks for. It is not the
+    # agent's containment - that is the control plane being outside the
+    # worktree - it is the part that catches the loop reaching for its
+    # own gate, through a verifier or a hook or a helpful subprocess.
+    ( cd "$WT" && PATH="$AGENT_PATH" BOT_RUN_ACTIVE="$RUN_TOKEN" \
+        "$AGENT_CMD" ${AGENT_ARGV[@]+"${AGENT_ARGV[@]}"} ) \
         <"$AGENT_STDIN" >>"$RUN_LOG" 2>&1 || AGENT_EXIT=$?
     say "  exit $AGENT_EXIT"
     board "agent-ran" "exit $AGENT_EXIT"
@@ -2093,7 +2270,7 @@ CHANNEL_SYMLINK=""
 # space-delimited string would split `.bot-my report.md` into two
 # channels - skipping the guard here while the `-f` test further down
 # still found the file and moved it.
-CHANNELS=(".bot-blocked" ".bot-commit-msg")
+CHANNELS=(".bot-blocked" ".bot-commit-msg" ".bot-memory")
 [ "$TASK_PRODUCES" != "report" ] || CHANNELS+=("$TASK_ARTIFACT")
 for chan in "${CHANNELS[@]}"; do
     chan_bad=""
@@ -2132,6 +2309,47 @@ if [ -f "$WT/.bot-blocked" ]; then
     rm -f "$WT/.bot-blocked"
     [ -n "$AGENT_BLOCKED" ] || AGENT_BLOCKED="(agent wrote .bot-blocked but left it empty)"
     say "  agent reported blocked"
+fi
+
+# The memory channel, harvested like the others and stored *unapproved*.
+# Nothing reads it until a human does: `memory_block` above only ever
+# assembles notes that carry a valid approval, so writing one here is a
+# bot asking rather than a bot deciding.
+#
+# Read a bounded number of bytes and then check the shape before it is
+# stored, not before it is used: a note that would restructure the
+# prompt it gets quoted into is refused here, once, rather than by every
+# future run having to survive it.
+#
+# It is taken out of the worktree either way. It is a channel, so it
+# must not reach a commit or count as an uncommitted file the bot left
+# behind - the same reason .bot-blocked and the report are moved.
+MEMORY_NOTE=""
+MEMORY_REFUSED=""
+if [ -f "$WT/.bot-memory" ]; then
+    MEMORY_NOTE="$(head -c 4000 "$WT/.bot-memory" | tr -d '\r')"
+    rm -f "$WT/.bot-memory"
+    MEMORY_REFUSED="$(memory_body_refused "$MEMORY_NOTE")"
+    if [ -n "$MEMORY_REFUSED" ]; then
+        say "  memory note refused - $MEMORY_REFUSED"
+        board "memory-refused" "$MEMORY_REFUSED"
+        MEMORY_NOTE=""
+    else
+        MEMORY_DIR="$(memory_dir "$STATE" "$TASK_OWNER")"
+        mkdir -p "$MEMORY_DIR"
+        MEMORY_FILE="$MEMORY_DIR/${TS}_${TASK_ID}.md"
+        {
+            printf -- '---\n'
+            printf 'bot: %s\n' "$TASK_OWNER"
+            printf 'from: %s\n' "$TASK_ID"
+            printf 'at: %s\n' "$BASE_SHA"
+            printf 'at_time: %s\n' "$TS_ISO"
+            printf -- '---\n\n'
+            printf '%s\n' "$MEMORY_NOTE"
+        } > "$MEMORY_FILE"
+        say "  memory note written, waiting for approval: $MEMORY_FILE"
+        board "memory-proposed" "$(basename "$MEMORY_FILE")"
+    fi
 fi
 
 # The report channel, harvested the same way and for the same reason:
@@ -2491,8 +2709,15 @@ run_verify() {
     # the working tree. Renaming either side alone turns the sweep
     # red, and renaming both can only be proven after the merge.
     # BOT_ARTIFACT / BOT_SUBJECT_SHA once this is at base - #348.
+    # BOT_RUN_ACTIVE here as well as around the agent. `verify:` is a
+    # shell command sourced from repo content (F-6) and it runs inside
+    # this loop, so without the marker a verifier - including one the
+    # agent just changed on its branch - could call bot-approve.sh and
+    # open the gate for the next proposal. The comment by the agent
+    # invocation claimed this path was covered when only that one was.
     ( cd "$VERIFY_WT" \
         && export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$STATE/cache/target}" \
+        && export BOT_RUN_ACTIVE="$RUN_TOKEN" \
         && export BOT_REVIEW="$ARTIFACT_FILE" \
         && export BOT_REVIEWED_SHA="$sha" \
         && export BOT_TOUCHES="$TASK_TOUCHES" \
@@ -3107,9 +3332,31 @@ was left on ${PRE_REBASE_HEAD:0:12}, where the diff was in bounds."
                         HEAD_SHA="$REBASED_HEAD"
                         COMMITS="$REBASED_COMMITS"
                         TOUCHED="$REBASED_TOUCHED"
+                        NUMSTAT_BROKEN=0
                         NUMSTAT="$(git -C "$WT" diff --shortstat "$BASE_SHA..HEAD" \
                             2>/dev/null | sed 's/^ *//')" \
-                            || { NUMSTAT="(diff unreadable)"; TREE_BROKEN=1; }
+                            || { NUMSTAT=""; NUMSTAT_BROKEN=1; }
+                        # The status, not the emptiness. An empty shortstat is also
+                        # what commits that change nothing produce, and F-22 says
+                        # that is an answer rather than a fault.
+                        if [ "$NUMSTAT_BROKEN" -eq 1 ]; then
+                            # This runs *after* the verdict, so setting TREE_BROKEN
+                            # here was worse than not noticing: the publish gate
+                            # reads that flag and quietly skips the push, while
+                            # STATUS stays `done`, the handoff reports success and
+                            # the run exits 0 - with no branch in the project. A
+                            # verdict already written cannot be corrected by a flag.
+                            # It has to be rewritten.
+                            NUMSTAT="(diff unreadable)"
+                            TREE_BROKEN=1
+                            STATUS="needs-review"
+                            BLOCKERS="the work replayed onto ${NEW_BASE_SHA:0:12}, verified there, and then
+the diff of the result could not be read. $TASK_BRANCH was moved onto
+${REBASED_HEAD:0:12} and nothing was pushed, because a run that cannot read
+its own result has not measured what it would be publishing. The branch is
+in $WT, which is kept:
+    git -C $WT log --stat $NEW_BASE_SHA..$TASK_BRANCH"
+                        fi
                         [ -n "$NUMSTAT" ] || NUMSTAT="no committed changes"
                         # The live task records the base its worktree
                         # stands on, and the overlap scan expands other
@@ -3399,7 +3646,7 @@ base: $(if [ "$SURFACE" = "import" ]; then printf 'folder'; else printf '%s' "$H
 branch: bot/$TASK_ON_CHANGES/$DERIVED_ID
 touches: $DERIVED_TOUCHES
 verify: $TASK_DERIVED_VERIFY
-schedule: $TASK_SCHEDULE
+schedule: manual
 ---
 
 # Objective
@@ -3668,10 +3915,40 @@ if [ "$CHAIN" -eq 1 ] && [ -n "$DERIVED_TASK" ]; then
         say "  chain stopped at depth $depth"
     else
         step "Chain"
+        # The gate is real, so this has to open it rather than step
+        # around it - and the approval it writes says in its own text
+        # that no one read the task. A bypass nobody can see in the
+        # record is not a bypass, it is a hole; this one is on the
+        # board, in the proposal, and in the handoff of whatever runs
+        # next.
+        CHAIN_WHEN="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        CHAIN_TEXT="$(cat "$DERIVED_TASK")"
+        CHAIN_BODY="$(approval_body_hash "$CHAIN_TEXT")"
+        awk -v when="$CHAIN_WHEN" -v body="$CHAIN_BODY" '
+            /^---[[:space:]]*$/ {
+                fence++
+                if (fence == 2 && !done) {
+                    print "approved_by: --chain (nobody read this)"
+                    print "approved_at: " when
+                    print "approved_body: " body
+                    done = 1
+                }
+                print; next
+            }
+            fence == 1 && /^approved_(by|at|body):/ { next }
+            { print }
+        ' <<< "$CHAIN_TEXT" > "$DERIVED_TASK.tmp" && mv "$DERIVED_TASK.tmp" "$DERIVED_TASK"
+
         say "  dispatching $DERIVED_ID to $TASK_ON_CHANGES"
+        say "  --chain: approved without a reader"
+        board "approval-bypassed" "$DERIVED_ID via --chain"
         board "chained" "$DERIVED_ID"
         CHAIN_EXIT=0
-        BOT_CHAIN_DEPTH=$((depth + 1))             bash "${BASH_SOURCE[0]}"                 --task "$DERIVED_TASK"                 --repo "$REPO"                 --state "$STATE"                 --worktree-root "$WORKTREE_ROOT" || CHAIN_EXIT=$?
+        BOT_CHAIN_DEPTH=$((depth + 1)) bash "${BASH_SOURCE[0]}" \
+            --task "$DERIVED_TASK" \
+            --repo "$REPO" \
+            --state "$STATE" \
+            --worktree-root "$WORKTREE_ROOT" || CHAIN_EXIT=$?
         # The chain's outcome is the one a caller cares about, and this
         # run can only be `done` or it would not have got here.
         exit "$CHAIN_EXIT"

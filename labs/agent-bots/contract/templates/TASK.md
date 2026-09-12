@@ -108,3 +108,25 @@ Field reference:
            for it — the first two still named for the reviewer, which
            issue #348 is about.
 -->
+
+## `approved_by:` / `approved_at:` / `approved_body:`
+
+Not written by hand and not written by a bot. `run/bot-approve.sh` puts
+these three on a task that lives in `.state/proposed/` - a task one
+bot's run wrote for another - and the runner refuses to dispatch such a
+task without them.
+
+`approved_body` is a hash of the task with these three lines removed,
+so it describes what was actually read. Edit the task afterwards and
+the approval no longer applies: the runner says so and sends you back to
+read it again. Approve the bytes, not the file name.
+
+None of this applies to a task file in the repository. That one went
+through a person, a review and a merge on its way in, which is the thing
+an approval is trying to establish and a stronger claim than a line in a
+file.
+
+`bot-run.sh --chain` writes one of these itself and records
+`approval-bypassed` on the board, with `approved_by: --chain (nobody
+read this)`. The gate's value is not that it cannot be opened by a
+machine; it is that a machine opening it leaves a mark.
