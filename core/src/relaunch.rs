@@ -41,6 +41,13 @@ const DETACHED_PROCESS: u32 = 0x0000_0008;
 #[cfg(windows)]
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
+/// Windows `CREATE_BREAKAWAY_FROM_JOB`: the child is not assigned to the
+/// parent's job (`winbase.h`). CodeScope puts itself in a
+/// `KILL_ON_JOB_CLOSE` job (`codescope_terminal::process_group`), so a
+/// child that stays in it is killed the moment the old instance exits.
+#[cfg(windows)]
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
 /// Build (but do not spawn) the command that starts `exe` as the next
 /// CodeScope instance: arguments `[WAIT_FOR_PID_ARG, old_pid]`, null
 /// stdio, detached from the current process on Windows.
@@ -65,9 +72,22 @@ pub fn relaunch_command(exe: &Path, old_pid: u32, dev: Option<&OsStr>) -> Comman
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        cmd.creation_flags(
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB,
+        );
     }
     cmd
+}
+
+/// Drop `CREATE_BREAKAWAY_FROM_JOB` from a [`relaunch_command`]. Spawning
+/// fails with access denied when a job CodeScope runs in (one it was
+/// launched inside, not its own) does not allow breakaway; retrying
+/// without the flag is the fallback, and the child then survives only if
+/// no enclosing job kills it on close.
+#[cfg(windows)]
+pub fn without_job_breakaway(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
 }
 
 /// Read the pid following the first [`WAIT_FOR_PID_ARG`] in `args` (the

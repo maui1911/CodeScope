@@ -28,7 +28,8 @@ mod imp {
     use anyhow::{Context, Result};
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JobObjectExtendedLimitInformation, SetInformationJobObject,
     };
@@ -66,7 +67,11 @@ mod imp {
 
             let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
                 BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
-                    LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                    // BREAKAWAY_OK only lets a child that asks for it
+                    // (`CREATE_BREAKAWAY_FROM_JOB`) leave: the restart
+                    // after an update (#341) does, PTY children do not.
+                    LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                        | JOB_OBJECT_LIMIT_BREAKAWAY_OK,
                     ..Default::default()
                 },
                 ..Default::default()

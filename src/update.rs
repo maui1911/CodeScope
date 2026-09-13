@@ -197,8 +197,17 @@ pub fn relaunch() -> Result<(), String> {
     let dev = std::env::var_os("CODESCOPE_DEV");
     let mut cmd =
         codescope_core::relaunch::relaunch_command(&exe, std::process::id(), dev.as_deref());
-    let result = cmd
-        .spawn()
+    let spawned = match cmd.spawn() {
+        // An enclosing job that forbids breakaway rejects the spawn.
+        #[cfg(windows)]
+        Err(err) => {
+            log_update(&format!("restart: spawn with job breakaway failed ({err}), retrying"));
+            codescope_core::relaunch::without_job_breakaway(&mut cmd);
+            cmd.spawn()
+        }
+        other => other,
+    };
+    let result = spawned
         .map(|_| ())
         .map_err(|err| format!("spawn {}: {err}", exe.display()));
     match &result {
