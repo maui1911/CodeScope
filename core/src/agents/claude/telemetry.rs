@@ -19,7 +19,7 @@
 use std::collections::HashSet;
 use std::io::{BufRead as _, BufReader, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
 
@@ -591,6 +591,19 @@ pub fn process_new_lines(
 // High-level tail handle
 // ---------------------------------------------------------------------------
 
+/// How long a [`SessionState::Busy`] transcript may stay unchanged — no
+/// new bytes, same mtime — before the tail drops it to
+/// [`SessionState::Idle`] (issue #351). A fallback for a turn that ends
+/// without an assistant entry: the CLI was killed, the machine slept, or
+/// a CLI writes a shape the parser does not recognise.
+///
+/// Deliberately generous. A dead session shown busy for ten minutes
+/// costs a glance; a working session shown idle invites the user to type
+/// into it or close it. And a working session can be silent for a long
+/// time: an assistant entry is written per finished content block, so a
+/// long thinking or generation step writes nothing until it ends.
+pub const BUSY_QUIET_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 /// Handle to a watched JSONL transcript. Tracks read position so
 /// repeated `poll()` calls only read new bytes.
 ///
@@ -610,6 +623,13 @@ pub struct ClaudeTranscriptTail {
     /// Latest computed snapshot, or `None` if no entries have been
     /// parsed yet.
     pub snapshot: Option<TelemetrySnapshot>,
+    /// Tail clock at the last poll that saw the transcript change. Starts
+    /// at construction. See [`BUSY_QUIET_TIMEOUT`].
+    last_activity: Instant,
+    /// File mtime seen by the last poll, whether or not bytes were read.
+    /// `FileTail::last_mtime` only moves on a clean read, so a same-length
+    /// rewrite would not show up there.
+    observed_mtime: Option<SystemTime>,
 }
 
 impl ClaudeTranscriptTail {
@@ -617,14 +637,17 @@ impl ClaudeTranscriptTail {
     /// so existing transcript content is consumed before the first
     /// poll interval fires.
     pub fn new(path: PathBuf) -> Self {
+        let now = Instant::now();
         let mut tail = Self {
             path,
             tail: FileTail::default(),
             last_user_ts: None,
             pending_agents: HashSet::new(),
             snapshot: None,
+            last_activity: now,
+            observed_mtime: None,
         };
-        tail.poll();
+        tail.poll_at(now);
         tail
     }
 
@@ -640,13 +663,46 @@ impl ClaudeTranscriptTail {
     ///
     /// Returns `true` when the snapshot changed.
     pub fn poll(&mut self) -> bool {
-        process_new_lines(
+        self.poll_at(Instant::now())
+    }
+
+    /// [`Self::poll`] with the tail clock passed in, so the quiet-window
+    /// fallback can be tested without waiting for it.
+    ///
+    /// Any sign the file is being written — bytes read (entries, a
+    /// partial line, lines that change nothing) or a moved mtime —
+    /// restarts the window. Once it lapses a `Busy` snapshot becomes
+    /// `Idle`; `PendingToolUse` is exempt (a running tool or a permission
+    /// prompt writes nothing until it resolves), and so is a session with
+    /// background agents pending (they write to their own transcripts).
+    pub fn poll_at(&mut self, now: Instant) -> bool {
+        let pos_before = self.tail.last_pos;
+        let mtime = std::fs::metadata(&self.path)
+            .ok()
+            .and_then(|m| crate::telemetry::modified_or_none(&m));
+        let changed = process_new_lines(
             &self.path,
             &mut self.tail,
             &mut self.snapshot,
             &mut self.last_user_ts,
             &mut self.pending_agents,
-        )
+        );
+        if self.tail.last_pos != pos_before || mtime != self.observed_mtime {
+            self.last_activity = now;
+            self.observed_mtime = mtime;
+        }
+
+        // Only the state moves: tokens, turns, model and the turn anchor
+        // still describe what the transcript said.
+        if let Some(snapshot) = self.snapshot.as_mut()
+            && snapshot.state == SessionState::Busy
+            && self.pending_agents.is_empty()
+            && now.saturating_duration_since(self.last_activity) >= BUSY_QUIET_TIMEOUT
+        {
+            snapshot.state = SessionState::Idle;
+            return true;
+        }
+        changed
     }
 
     /// Suggested poll interval for the next wake-up: 250 ms while the
@@ -1493,6 +1549,179 @@ mod tests {
             read_lines(&path, &mut tail, &mut snap, &mut last_user_ts);
             assert_eq!(last_user_ts, Some(1.0), "{name}");
         }
+    }
+
+    // --- quiet-window fallback (issue #351) ---
+    //
+    // The tests drive the clock through `poll_at`; nothing waits for it.
+    // Each takes its start instant *after* `new()`, so the window that
+    // construction opened is never longer than the one the test assumes.
+
+    /// A timeout plus one second: the first instant that is unambiguously
+    /// past the window.
+    fn past_timeout() -> Duration {
+        BUSY_QUIET_TIMEOUT + Duration::from_secs(1)
+    }
+
+    #[test]
+    fn silent_busy_session_goes_idle_after_quiet_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, &[PROMPT]);
+
+        let mut tail = ClaudeTranscriptTail::new(path);
+        let start = Instant::now();
+        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Busy);
+
+        assert!(!tail.poll_at(start + BUSY_QUIET_TIMEOUT / 2));
+        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Busy);
+        assert_eq!(tail.poll_interval(), Duration::from_millis(250));
+
+        assert!(tail.poll_at(start + past_timeout()));
+        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Idle);
+        assert_eq!(tail.poll_interval(), Duration::from_secs(2));
+
+        // Already idle: a later poll has nothing to report.
+        assert!(!tail.poll_at(start + past_timeout() * 2));
+    }
+
+    #[test]
+    fn appended_bytes_restart_the_quiet_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, &[PROMPT]);
+
+        let mut tail = ClaudeTranscriptTail::new(path.clone());
+        let start = Instant::now();
+
+        // An entry that does not change the state still counts.
+        let half = start + BUSY_QUIET_TIMEOUT / 2;
+        append_lines(&path, &[r#"{"type":"file-history-snapshot","messageId":"x","snapshot":{}}"#]);
+        tail.poll_at(half);
+
+        tail.poll_at(start + past_timeout());
+        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Busy);
+
+        assert!(tail.poll_at(half + past_timeout()));
+        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Idle);
+    }
+
+    #[test]
+    fn changed_mtime_alone_restarts_the_quiet_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, &[PROMPT]);
+        let original = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let mut tail = ClaudeTranscriptTail::new(path.clone());
+        let start = Instant::now();
+
+        // Same length, so no bytes are read; only the mtime moves.
+        let rewritten = PROMPT.replace(r#""content":"go""#, r#""content":"GO""#);
+        assert_eq!(rewritten.len(), PROMPT.len());
+        write_lines(&path, &[&rewritten]);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(original + Duration::from_secs(3600))
+            .unwrap();
+        let half = start + BUSY_QUIET_TIMEOUT / 2;
+        tail.poll_at(half);
+
+        tail.poll_at(start + past_timeout());
+        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Busy);
+
+        assert!(tail.poll_at(half + past_timeout()));
+        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Idle);
+    }
+
+    #[test]
+    fn pending_tool_use_is_never_timed_out() {
+        // A long tool call writes nothing until it finishes.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(
+            &path,
+            &[
+                PROMPT,
+                r#"{"type":"assistant","sessionId":"s","timestamp":"2026-08-09T08:00:05Z","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}],"usage":{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+            ],
+        );
+
+        let mut tail = ClaudeTranscriptTail::new(path);
+        let start = Instant::now();
+        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::PendingToolUse);
+
+        assert!(!tail.poll_at(start + past_timeout()));
+        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::PendingToolUse);
+    }
+
+    #[test]
+    fn pending_background_agents_are_never_timed_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, &[PROMPT]);
+
+        let mut tail = ClaudeTranscriptTail::new(path.clone());
+        let start = Instant::now();
+        // Launched live, after the catch-up read.
+        append_lines(&path, &[LAUNCH, END_TURN]);
+        tail.poll_at(start);
+        assert!(!tail.pending_agents.is_empty());
+        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Busy);
+
+        assert!(!tail.poll_at(start + past_timeout()));
+        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Busy);
+    }
+
+    #[test]
+    fn new_prompt_after_timeout_is_busy_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, &[PROMPT]);
+
+        let mut tail = ClaudeTranscriptTail::new(path.clone());
+        let start = Instant::now();
+        tail.poll_at(start + past_timeout());
+        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Idle);
+
+        let resumed = start + past_timeout() * 2;
+        append_lines(&path, &[PROMPT]);
+        assert!(tail.poll_at(resumed));
+        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Busy);
+
+        // The window restarted at the new prompt, not at the old one.
+        tail.poll_at(resumed + BUSY_QUIET_TIMEOUT / 2);
+        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Busy);
+        tail.poll_at(resumed + past_timeout());
+        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Idle);
+    }
+
+    #[test]
+    fn timeout_changes_only_the_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(
+            &path,
+            &[
+                r#"{"type":"user","sessionId":"s","timestamp":"2026-04-22T08:00:00Z","message":{"role":"user","content":"hi"}}"#,
+                r#"{"type":"assistant","sessionId":"s","timestamp":"2026-04-22T08:01:00Z","message":{"role":"assistant","model":"claude-opus-4-7[1m]","stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":20,"cache_creation_input_tokens":100,"cache_read_input_tokens":50}}}"#,
+                r#"{"type":"user","sessionId":"s","timestamp":"2026-04-22T08:02:00Z","message":{"role":"user","content":"again"}}"#,
+            ],
+        );
+
+        let mut tail = ClaudeTranscriptTail::new(path);
+        let start = Instant::now();
+        let before = tail.snapshot.clone().unwrap();
+        let last_user_ts = tail.last_user_ts;
+        assert_eq!(before.state, SessionState::Busy);
+        assert!(last_user_ts.is_some());
+
+        assert!(tail.poll_at(start + past_timeout()));
+        let after = tail.snapshot.clone().unwrap();
+        assert_eq!(after, TelemetrySnapshot { state: SessionState::Idle, ..before });
+        assert_eq!(tail.last_user_ts, last_user_ts);
     }
 
     // --- model_display_name ---
