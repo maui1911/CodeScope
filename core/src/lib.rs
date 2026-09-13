@@ -30,6 +30,7 @@ pub mod paths;
 pub mod pr;
 pub mod process;
 pub mod projects;
+pub mod relaunch;
 pub mod session;
 pub mod settings;
 pub mod tab_drag;
