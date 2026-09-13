@@ -108,7 +108,22 @@ fn main() -> Result<()> {
     {
         let argv: Vec<String> = std::env::args().skip(1).collect();
         write_boot_phase(&paths, &format!("main:argv {argv:?}"));
+        // Restart after an update (#341): the previous instance spawned us
+        // and is still shutting down, holding the single-instance lock.
+        // Wait for it so we don't exit as "already running"; after the
+        // timeout we try the lock anyway.
+        if let Some(pid) = codescope_core::relaunch::parse_wait_for_pid(&argv) {
+            let gone = codescope_core::relaunch::wait_for_exit(
+                pid,
+                std::time::Duration::from_secs(15),
+                std::time::Duration::from_millis(100),
+                codescope_core::relaunch::pid_is_alive,
+                std::thread::sleep,
+            );
+            write_boot_phase(&paths, &format!("relaunch:waited pid={pid} gone={gone}"));
+        }
     }
+    update::remember_launch_exe();
 
     // Single-instance guard (#247). One running CodeScope per
     // user/session (the mutex lives in the per-session `Local\`

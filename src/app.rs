@@ -6335,8 +6335,13 @@ impl AppShell {
                 crate::update::start_install(self.update_state.clone(), info);
             }
             ToastActionKind::RestartForUpdate => {
+                // Spawn the swapped binary first (#341); it waits for this
+                // pid to exit. If the spawn fails we still quit, so the
+                // user never keeps an old binary that thinks it updated;
+                // the reason is in update.log.
+                let _ = crate::update::relaunch();
                 // Graceful quit rather than process::exit(0): runs
-                // gpui's normal shutdown so the user can relaunch into
+                // gpui's normal shutdown so the new instance starts on
                 // the freshly-swapped binary. layout.json / projects.json
                 // are already flushed synchronously on mutation; pending
                 // window geometry is debounced and treated as droppable
