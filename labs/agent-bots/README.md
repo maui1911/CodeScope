@@ -3964,4 +3964,17 @@ letting `set -e` leave `forgotten` as the board's last word. That last
 one has no sweep case; a removal that fails halfway is hard to stage
 portably.
 
-Sweep is 133.
+A second Codex pass confirmed those four and found the same classes
+elsewhere. A marker whose pid could not be read came back `gone` — a
+failed read standing in for a finished process — and is `unknown` now,
+which every caller treats as possibly alive; only `--force` clears one.
+The runner's own `drop_surface`, the function `bot-forget` was written to
+mirror, still alternated check and removal, and since every caller runs
+it under `||` a verify checkout that would not go was reported as a clean
+removal. `on_exit` could stop at a snapshot that would not go before the
+marker went. And the sweep's own pin checks used `rev-parse --verify`, so
+"no base pins left" passed with a broken pin on disk; they assert
+absence through `update-ref --stdin` now, and a check proves the helper
+sees a broken ref.
+
+Sweep is 140.

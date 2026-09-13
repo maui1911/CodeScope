@@ -119,7 +119,10 @@ LOCK_WAIT="${BOT_FORGET_LOCK_WAIT:-15}"
 waited=0
 until mkdir "$LOCK_DIR" 2>/dev/null; do
     if [ "$waited" -ge "$LOCK_WAIT" ]; then
-        holder="$(ls "$LOCK_DIR" 2>/dev/null | head -n1)"
+        # A diagnostic, so it must not be what fails: the holder can
+        # release between the mkdir and this ls, and under pipefail
+        # that would exit without the explanation.
+        holder="$(ls "$LOCK_DIR" 2>/dev/null | head -n1 || true)"
         die "a dispatch is being claimed ($LOCK_DIR is held${holder:+ by ${holder#owner.}}).
 Try again in a moment. If that holder's pid is not running, the next
 dispatch will break the lock; this script will not break somebody
@@ -159,7 +162,10 @@ RUNNING="$(live_task_running "$STATE" "$TASK_ID")"
 # Field two, not a line suffix: the path is last so that a state
 # directory with a space in it still parses, which means `alive` is no
 # longer at the end of the line. F-49.
-ALIVE="$(printf '%s\n' "$RUNNING" | awk '$2 == "alive"' || true)"
+#
+# Anything but `gone`, not `alive`: a marker whose pid cannot be read
+# is a lookup that failed, and a failed lookup is not an ended process.
+ALIVE="$(printf '%s\n' "$RUNNING" | awk '$2 != "gone" && NF' || true)"
 if [ -n "$ALIVE" ] && [ "$FORCE" -eq 0 ]; then
     printf 'bot-forget: a run for %s is still going.\n\n' "$TASK_ID" >&2
     printf '%s\n\n' "$ALIVE" >&2
@@ -344,7 +350,9 @@ rm -f "$LIVE" 2>/dev/null || true
 # holder, and it happens after the gates rather than before, so nothing
 # is cleared on a run that turned out to be alive.
 printf '%s\n' "$RUNNING" | while read -r _pid state mark; do
-    [ "$state" = "gone" ] || continue
+    # `unknown` only when the human said --force: they looked, and
+    # that is the one thing that settles a marker nobody can read.
+    [ "$state" = "gone" ] || { [ "$state" = "unknown" ] && [ "$FORCE" -eq 1 ]; } || continue
     # Litter, and the record is already gone: a marker that will not go
     # is not a reason to exit non-zero on a forget that happened.
     rm -f "$mark" 2>/dev/null || true

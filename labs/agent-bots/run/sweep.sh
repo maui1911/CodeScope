@@ -764,6 +764,21 @@ rm -rf "$VERDICT_DIR"
 # --------------------------------------------------------------------
 
 FORGET="$SCRIPT_DIR/bot-forget.sh"
+
+# pin_absent <repo> <ref> - succeeds only when git confirms the ref does
+# not exist. `rev-parse --verify` fails the same way for a missing ref
+# and a broken one, so a leftover check built on it passed with a
+# malformed pin still on disk - the lookup-is-not-absence bug bot-forget
+# had just been fixed for. `update-ref --stdin` with `verify <ref>
+# <zero-oid>` asserts absence outright and fails on anything else. The
+# zero oid is derived rather than typed, so a SHA-256 repository gets
+# the right length.
+pin_absent() {
+    local zero
+    zero="$(git -C "$1" hash-object --stdin </dev/null 2>/dev/null | tr '0-9a-f' '0')"
+    [ -n "$zero" ] || return 1
+    printf 'verify %s %s\n' "$2" "$zero" | git -C "$1" update-ref --stdin >/dev/null 2>&1
+}
 mkdir -p "$STATE/tasks"
 
 write_live() {   # write_live <id> <status>
@@ -874,6 +889,39 @@ else
     CHECKS=$((CHECKS + 1))
 fi
 
+# A marker whose pid cannot be read is not a dead one. It came back
+# `gone`, and `gone` is what lets a forget through without --force - a
+# failed read standing in for a finished process. Garbage content is
+# the portable stand-in for an unreadable file; chmod means little on
+# Windows, and both land in the same branch.
+write_live T-0994 done
+printf 'garbage\n' > "$STATE/running/T-0994.sweep-unknown"
+check "an unreadable marker"       unknown \
+    "$(live_task_running "$STATE" T-0994 | awk '{ print $2 }')"
+check "unreadable is not settled"  active \
+    "$(live_task_settled "$STATE" T-0994 "$(cat "$STATE/tasks/T-0994.md")")"
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$STATE" >/dev/null 2>&1 || FORGET_RC=$?
+check "unreadable stops forget" 1 "$FORGET_RC"
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$STATE" --force >/dev/null 2>&1 || FORGET_RC=$?
+check "--force settles unreadable" 0 "$FORGET_RC"
+check "and clears the marker"   no \
+    "$([ -e "$STATE/running/T-0994.sweep-unknown" ] && printf yes || printf no)"
+rm -f "$STATE/running/T-0994.sweep-unknown"
+
+# The helper the leftover checks rely on has to see a broken pin, or
+# every "no pins left" line is vacuous for exactly that case.
+BROKEN_REPO="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-pin.$$")"
+git init --quiet --bare "$BROKEN_REPO/r.git"
+check "a missing pin is absent" yes \
+    "$(pin_absent "$BROKEN_REPO/r.git" refs/bot-base/T-0994 && printf yes || printf no)"
+mkdir -p "$BROKEN_REPO/r.git/refs/bot-base"
+printf 'not a sha\n' > "$BROKEN_REPO/r.git/refs/bot-base/T-0994"
+check "a broken pin is not absent" no \
+    "$(pin_absent "$BROKEN_REPO/r.git" refs/bot-base/T-0994 && printf yes || printf no)"
+rm -rf "$BROKEN_REPO"
+
 # All three parts of a surface, in the order drop_surface uses them:
 # the verify checkout beside it, the clone, then the base pin. Leaving
 # the pin holds the base objects alive in the project for ever, and
@@ -890,8 +938,7 @@ check "surface goes in three parts" 0 "$FORGET_RC"
 SURF_LEFT=""
 [ ! -e "$WT_ROOT/bot-fixer-T-0994" ] || SURF_LEFT="$SURF_LEFT clone"
 [ ! -e "$WT_ROOT/bot-fixer-T-0994-verify" ] || SURF_LEFT="$SURF_LEFT verify"
-! git -C "$REPO" rev-parse --verify --quiet "refs/bot-base/T-0994" >/dev/null 2>&1 \
-    || SURF_LEFT="$SURF_LEFT pin"
+pin_absent "$REPO" "refs/bot-base/T-0994" || SURF_LEFT="$SURF_LEFT pin"
 if [ -z "$SURF_LEFT" ]; then
     printf 'ok    %-28s clone, verify and pin\n' "nothing of it is left"
     CHECKS=$((CHECKS + 1))
@@ -968,8 +1015,7 @@ EOF
 FORGET_RC=0
 bash "$FORGET" T-0994 --state "$FOLDER_PLANE" --surface >/dev/null 2>&1 || FORGET_RC=$?
 check "folder pin is in snapshot" 0 "$FORGET_RC"
-if git --git-dir="$FOLDER_PLANE/snapshot.git" rev-parse --verify --quiet refs/bot-base/T-0994 \
-        >/dev/null 2>&1; then
+if ! pin_absent "$FOLDER_PLANE/snapshot.git" refs/bot-base/T-0994; then
     printf 'FAIL  %-28s the pin survived in snapshot.git\n' "folder pin removed"
     CHECKS=$((CHECKS + 1))
     FAILURES=$((FAILURES + 1))
@@ -2104,8 +2150,7 @@ fi
 # its pin. F-50.
 LEFT_PINS=0
 for id in $(printf '%s' "$SWEEP_TASK_IDS" | tr '\n' ' '); do
-    ! git -C "$REPO" rev-parse --verify --quiet "refs/bot-base/$id" >/dev/null 2>&1 \
-        || LEFT_PINS=$((LEFT_PINS + 1))
+    pin_absent "$REPO" "refs/bot-base/$id" || LEFT_PINS=$((LEFT_PINS + 1))
 done
 if [ "$LEFT_PINS" -eq 0 ]; then
     printf 'ok    %-28s none\n' "no base pins left"
@@ -2113,8 +2158,7 @@ if [ "$LEFT_PINS" -eq 0 ]; then
 else
     printf 'FAIL  %-28s %s still in %s\n' "no base pins left" "$LEFT_PINS" "$REPO"
     for id in $(printf '%s' "$SWEEP_TASK_IDS" | tr '\n' ' '); do
-        ! git -C "$REPO" rev-parse --verify --quiet "refs/bot-base/$id" >/dev/null 2>&1 \
-            || printf '        refs/bot-base/%s\n' "$id"
+        pin_absent "$REPO" "refs/bot-base/$id" || printf '        refs/bot-base/%s\n' "$id"
     done
     CHECKS=$((CHECKS + 1))
     FAILURES=$((FAILURES + 1))

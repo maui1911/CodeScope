@@ -82,9 +82,15 @@ live_task_verdict() {
 
 # live_task_running <state> <task-id>
 #
-# One line per marker: `<pid> alive|gone <path>`. Empty when no run for
-# this id has a marker, which is the only evidence that nothing is
-# working on it.
+# One line per marker: `<pid> alive|gone|unknown <path>`. Empty when no
+# run for this id has a marker, which is the only evidence that nothing
+# is working on it.
+#
+# `unknown` is a marker whose pid could not be read - unreadable, empty
+# or not a number. It used to come back `gone`, and `gone` is permission
+# to act: a lookup that failed was taken as proof the process had
+# ended. Only a pid that `kill -0` rejects says that. Every caller
+# treats anything but `gone` as somebody possibly in there.
 #
 # The path goes *last* because it is the field that can contain a
 # space, and the last field of a `read` absorbs the remainder. With the
@@ -102,11 +108,16 @@ live_task_running() {
     for m in "$1/running/$2".*; do
         [ -f "$m" ] || continue
         pid="$(cat "$m" 2>/dev/null || true)"
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            printf '%s alive %s\n' "$pid" "$m"
-        else
-            printf '%s gone %s\n' "${pid:-unknown}" "$m"
-        fi
+        case "$pid" in
+            ''|*[!0-9]*)
+                printf '? unknown %s\n' "$m" ;;
+            *)
+                if kill -0 "$pid" 2>/dev/null; then
+                    printf '%s alive %s\n' "$pid" "$m"
+                else
+                    printf '%s gone %s\n' "$pid" "$m"
+                fi ;;
+        esac
     done
 }
 
@@ -120,7 +131,7 @@ live_task_running() {
 # F-46 gave: the preflight runs before anything can assert about it, so
 # the decision has to be reachable from somewhere that can. F-50.
 live_task_settled() {
-    if live_task_running "$1" "$2" | awk '$2 == "alive" { found = 1 } END { exit !found }'
+    if live_task_running "$1" "$2" | awk '$2 != "gone" { found = 1 } END { exit !found }'
     then
         printf 'active\n'
     elif [ "$(live_task_verdict "$3")" = "record" ]; then

@@ -271,12 +271,15 @@ release_locks() {
 # and only once the gate has passed.
 on_exit() {
     release_locks
-    [ -z "${SNAPSHOT_HELD:-}" ] || rm -f "$SNAPSHOT_HELD"
+    # Each removal on its own, and none of them fatal: this runs under
+    # `set -e`, and a snapshot a Windows file lock keeps in place would
+    # otherwise end the trap before the marker below went too.
+    [ -z "${SNAPSHOT_HELD:-}" ] || rm -f "$SNAPSHOT_HELD" 2>/dev/null || true
     # The marker says a process is in here, so it goes when the process
     # does - including on a die, a refusal or a Ctrl-C. What it leaves
     # behind on a kill -9 is a stale marker, which is why anything
     # reading it tests the pid rather than the file (live-task.sh).
-    [ -z "${RUNNING_MARK:-}" ] || rm -f "$RUNNING_MARK"
+    [ -z "${RUNNING_MARK:-}" ] || rm -f "$RUNNING_MARK" 2>/dev/null || true
 }
 trap on_exit EXIT
 
@@ -1818,7 +1821,7 @@ mkdir -p "$STATE/running"
 live_task_running "$STATE" "$TASK_ID" | while read -r _pid state mark; do
     [ "$state" = "gone" ] || continue
     say "  clearing a run marker whose process is gone: $(basename "$mark")"
-    rm -f "$mark"
+    rm -f "$mark" 2>/dev/null || true
 done
 RUNNING_MARK="$STATE/running/$TASK_ID.$RUN_TOKEN"
 printf '%s\n' "$$" > "$RUNNING_MARK"
@@ -2008,15 +2011,19 @@ say "  created $WT (clone of $ORIGIN_REPO)"
 # else. The marker written at creation is the whole check: a path this
 # script computed is not by itself a reason to delete a directory tree.
 drop_surface() {
+    # Both proofs before either removal. They used to alternate - check
+    # the verify checkout, remove it, then check the surface - so a
+    # surface marker naming another task refused only after that
+    # task's verify checkout was gone. F-50, in the function bot-forget
+    # was written to mirror.
+    #
     # Two separate paths, two separate proofs. $VERIFY_WT is a sibling
     # directory name this script computed, and a linked worktree always
     # has a `.git` *file* pointing back at its parent - so that file
     # both identifies it and says whose it is.
     if [ -e "$VERIFY_WT" ]; then
-        if [ -f "$VERIFY_WT/.git" ] \
-           && grep -q "$(printf '%s' "$WT_LEAF")" "$VERIFY_WT/.git" 2>/dev/null; then
-            rm -rf "$VERIFY_WT"
-        else
+        if ! { [ -f "$VERIFY_WT/.git" ] \
+               && grep -q "$(printf '%s' "$WT_LEAF")" "$VERIFY_WT/.git" 2>/dev/null; }; then
             say "  refusing to remove $VERIFY_WT - not a verify checkout this run made"
             return 1
         fi
@@ -2028,7 +2035,15 @@ drop_surface() {
     # looking at its own. The marker names the task; read it.
     grep -q "surface for $TASK_ID\$" "$WT/.git/bot-surface" 2>/dev/null \
         || { say "  refusing to remove $WT - not a surface this run made"; return 1; }
-    rm -rf "$WT"
+    # Every caller runs this under `||`, which switches errexit off in
+    # here - so a removal that fails does not stop anything, and has to
+    # be looked at. A verify checkout that survived while its parent
+    # went would be a worktree pointing at nothing, reported as clean.
+    if [ -e "$VERIFY_WT" ]; then
+        rm -rf "$VERIFY_WT" 2>/dev/null
+        [ ! -e "$VERIFY_WT" ] || { say "  could not remove $VERIFY_WT"; return 1; }
+    fi
+    rm -rf "$WT" 2>/dev/null
     [ ! -e "$WT" ] || return 1
     # Nothing borrows the base objects any more. Last, so that a removal
     # that refused above still leaves the pin in place.
