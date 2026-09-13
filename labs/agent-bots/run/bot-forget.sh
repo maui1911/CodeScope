@@ -233,20 +233,30 @@ if [ "$SURFACE" -eq 1 ] && [ -n "$WORKTREE" ]; then
     # for there, found absent, and its record deleted with the actual
     # pin still in the project.
     #
-    # A record from before the field existed falls back to the runner's
-    # own condition, which is the task's `base:` and not the directory
-    # listing: `folder` means the snapshot, anything else the stamp.
+    # A record from before the field existed has no provenance, and
+    # nothing on disk *now* can stand in for it with certainty. The
+    # runner's rule is a probe of the project, not the task's `base:` -
+    # a git repository with a branch called `folder` is cut from the
+    # project, and the first fallback sent it to the snapshot. So the
+    # fallback asks the runner's question (bot-run.sh, SURFACE), and
+    # where the answer could have changed since - the project is a work
+    # tree now *and* a snapshot repository exists, so it may have been a
+    # folder then - it refuses and asks for --repo rather than guessing
+    # which of two repositories to delete a ref from.
     PIN_REPO="$REPO"
     [ -n "$PIN_REPO" ] || PIN_REPO="$(live_task_field origin_repo "$LIVE_TEXT")"
     if [ -z "$PIN_REPO" ]; then
-        if [ "$(live_task_field base "$LIVE_TEXT")" = "folder" ]; then
-            PIN_REPO="$STATE/snapshot.git"
+        STAMP="$(cat "$STATE/REPO" 2>/dev/null || true)"
+        [ -n "$STAMP" ] \
+            || die "no project to remove refs/bot-base/$TASK_ID from - $STATE/REPO is missing, so pass --repo. Nothing was removed."
+        if git -C "$STAMP" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            [ ! -d "$STATE/snapshot.git" ] \
+                || die "this record predates origin_repo:, and its pin could be in $STAMP or in $STATE/snapshot.git - the project is a repository now, but this plane also imported a folder once. Pass --repo with the one it was cut from. Nothing was removed."
+            PIN_REPO="$STAMP"
         else
-            PIN_REPO="$(cat "$STATE/REPO" 2>/dev/null || true)"
+            PIN_REPO="$STATE/snapshot.git"
         fi
     fi
-    [ -n "$PIN_REPO" ] \
-        || die "no project to remove refs/bot-base/$TASK_ID from - $STATE/REPO is missing, so pass --repo. Nothing was removed."
     git -C "$PIN_REPO" rev-parse --git-dir >/dev/null 2>&1 \
         || die "$PIN_REPO is not a git repository, so whether refs/bot-base/$TASK_ID exists cannot be established. Nothing was removed."
 

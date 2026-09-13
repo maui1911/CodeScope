@@ -3987,4 +3987,12 @@ behind. The runner now records `origin_repo:` in the live task, and
 not to what the directory happens to contain. Provenance is recorded,
 not inferred.
 
-Sweep is 144.
+The fourth pass showed the fallback for older records was inference
+too: the runner's rule is a probe of the project, not the task's
+`base:`, and a git repository with a branch called `folder` is cut from
+the project. The fallback now asks the runner's own question, and where
+the answer could have changed since — the project is a repository now
+and the plane also holds a snapshot — it refuses and asks for `--repo`
+instead of picking one of two repositories to delete a ref from.
+
+Sweep is 147.
