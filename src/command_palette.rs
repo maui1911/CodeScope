@@ -89,6 +89,10 @@ pub enum BuiltInCommand {
     /// same panel the `Ctrl+Shift+D` chord and the worktree menu's
     /// "View changes" row open. Keymap hint: Ctrl+Shift+D.
     ToggleDiffViewer,
+    /// Toggle the read-only bots inbox for the selected project's
+    /// `labs/agent-bots` control plane — same panel as the sidebar
+    /// footer "Bots" button. Keymap hint: Ctrl+Shift+I.
+    ToggleBotsInbox,
     /// Show / hide the sidebar. Keymap hint: Ctrl+Shift+B.
     ToggleSidebar,
     /// Open the "Add project" dialog. Keymap hint: none (the `+` button).
@@ -125,6 +129,7 @@ impl BuiltInCommand {
         match self {
             BuiltInCommand::ToggleOverview => "Toggle overview",
             BuiltInCommand::ToggleDiffViewer => "Toggle diff viewer",
+            BuiltInCommand::ToggleBotsInbox => "Toggle bots inbox",
             BuiltInCommand::ToggleSidebar => "Toggle sidebar",
             BuiltInCommand::NewProject => "New project",
             BuiltInCommand::NewSession => "New session",
@@ -141,6 +146,7 @@ impl BuiltInCommand {
         match self {
             BuiltInCommand::ToggleOverview => "Ctrl+Shift+O",
             BuiltInCommand::ToggleDiffViewer => "Ctrl+Shift+D",
+            BuiltInCommand::ToggleBotsInbox => "Ctrl+Shift+I",
             BuiltInCommand::ToggleSidebar => "Ctrl+Shift+B",
             BuiltInCommand::NewProject => "+",
             BuiltInCommand::NewSession => "Ctrl+Shift+T",
@@ -759,6 +765,8 @@ mod tests {
         assert_eq!(BuiltInCommand::NewSession.title(), "New session");
         assert_eq!(BuiltInCommand::ToggleSidebar.title(), "Toggle sidebar");
         assert_eq!(BuiltInCommand::ToggleOverview.title(), "Toggle overview");
+        assert_eq!(BuiltInCommand::ToggleBotsInbox.title(), "Toggle bots inbox");
+        assert_eq!(BuiltInCommand::ToggleBotsInbox.hint(), "Ctrl+Shift+I");
         assert_eq!(BuiltInCommand::NewProject.title(), "New project");
         assert_eq!(BuiltInCommand::OpenSettings.title(), "Open settings");
         assert_eq!(BuiltInCommand::ReloadTheme.title(), "Reload theme");

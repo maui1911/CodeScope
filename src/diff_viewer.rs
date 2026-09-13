@@ -108,6 +108,7 @@ impl AppShell {
         // The diff viewer and the Overview occupy the same work-area
         // slot; opening one dismisses the other.
         self.set_show_overview(false, cx);
+        self.set_show_bots(false, cx);
 
         self.diff_request_seq += 1;
         let request_id = self.diff_request_seq;

@@ -617,3 +617,50 @@ record:
   `codescope` Velopack pack ids; `%APPDATA%\CodeScope\projects.json`
   carries across unchanged.
 
+
+---
+
+## ADR-0023 — Bots inbox is a read-only view of the lab control plane
+
+**Date:** 2026-09-13
+**Status:** Accepted
+
+`labs/agent-bots` runs unattended coding bots against this repository.
+Its state lives in a control plane directory
+(`labs/agent-bots/.state/`: task files, an append-only `board.md`,
+handoffs), written by the lab's runner scripts only. Until now the only
+way to see what the bots did was reading those files by hand. The lab's
+README §7.4 calls the next step "Stage 2 — the inbox".
+
+**Decision:** CodeScope gets a **Bots inbox** panel that *reads* the
+control plane of the selected project and never writes to it.
+
+* **Where the data comes from:** `<project>/labs/agent-bots/.state`,
+  found per selected project (`codescope_core::bots::lab_control_plane`).
+  No settings, no product-level path, no AppPaths entry — the lab is
+  still an experiment, and a project without that directory simply has
+  no inbox (the footer button is hidden).
+* **Slot:** the work-area slot shared with the Overview and the diff
+  viewer; opening one closes the others. Entry points follow the
+  Overview: a sidebar footer "Bots" button (with a count of tasks that
+  are blocked or need review), `Ctrl+Shift+I`, and a palette command.
+  `Ctrl+Shift+B` was the first choice but already toggles the sidebar.
+* **Actions are navigation only:** open the handoff file, reveal a
+  worktree that still exists, copy the branch name. Dispatching,
+  approving memory notes and stopping runs stay with the runner
+  scripts, so the runner remains the single writer of the control
+  plane.
+* **Refresh:** a poll loop re-reads on the background executor every
+  2 s while the panel is visible and every 5 s otherwise (for the
+  badge). The plane is a few dozen small files; no file watcher.
+
+**Consequences:**
+
+* The mockup's "Open diff" action is not built: the diff viewer shows
+  a working tree against `HEAD`, not a bot branch against its base,
+  and a finished run's worktree is already cleaned up.
+* The inbox parser (`core/src/bots.rs`) follows the runner's formats
+  rather than a schema of its own; a format change in the lab needs a
+  matching change there.
+* Moving the control plane out of `labs/` (a product path or a setting)
+  is a later decision, when the bots graduate from the lab.

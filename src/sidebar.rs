@@ -224,6 +224,17 @@ enum PrLookup {
 /// (e.g. "New worktree…") can focus the dialog inline.
 type MenuItemAction = Box<dyn Fn(&mut Sidebar, &mut Window, &mut Context<Sidebar>) + 'static>;
 
+/// What the footer "Bots" button shows. See [`crate::bots_inbox`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BotsFooter {
+    /// The selected project has a bot control plane; hidden otherwise.
+    pub available: bool,
+    /// The bots inbox is on stage.
+    pub visible: bool,
+    /// Tasks that are blocked or waiting for review.
+    pub attention: usize,
+}
+
 /// Events the sidebar emits up to its host (`AppShell`). Today there
 /// is just one — "open a session at this path" — fired when the user
 /// clicks a worktree row or right after the new-worktree dialog
@@ -302,6 +313,9 @@ pub enum SidebarEvent {
     /// a "coming soon" toast — so this event is a placeholder hook
     /// the host can wire up to the real Overview once it lands.
     OpenOverview,
+    /// User clicked the footer "Bots" button. The host toggles the
+    /// bots inbox panel.
+    OpenBots,
     /// User picked "View changes" in a worktree's context menu. The
     /// host opens the full-pane diff viewer for that worktree —
     /// same panel `Ctrl+Shift+D` opens for the focused tab.
@@ -618,6 +632,11 @@ pub struct Sidebar {
     /// Mirrors the C# `Sidebar.OverviewButton`'s `IsOverviewVisible`
     /// DataTrigger.
     overview_visible: bool,
+    /// Footer "Bots" button state, pushed by `AppShell`'s bots poll:
+    /// whether the selected project has a bot control plane (the
+    /// button is hidden otherwise), whether the inbox is on stage, and
+    /// how many tasks need a human.
+    bots_footer: BotsFooter,
     /// Registry of agent profiles (claude / codex / opencode / copilot
     /// / pi by default, plus any `settings.agents` overrides). Threaded
     /// in from `AppShell` so the worktree + project context menus can
@@ -701,6 +720,7 @@ impl Sidebar {
             active_paths: HashSet::new(),
             active_context_path: None,
             overview_visible: false,
+            bots_footer: BotsFooter::default(),
             agent_registry,
             filter: String::new(),
             filter_focus,
@@ -765,6 +785,16 @@ impl Sidebar {
             return;
         }
         self.overview_visible = value;
+        cx.notify();
+    }
+
+    /// Push the footer "Bots" button state. No-op when unchanged, so
+    /// the bots poll does not re-render the sidebar every tick.
+    pub fn set_bots_footer(&mut self, value: BotsFooter, cx: &mut Context<Self>) {
+        if self.bots_footer == value {
+            return;
+        }
+        self.bots_footer = value;
         cx.notify();
     }
 
@@ -3863,6 +3893,64 @@ impl Render for Sidebar {
                         .child("New Project"),
                 );
 
+            // Bots — same shape as Overview, shown only when the
+            // selected project has a bot control plane. The count pill
+            // is the number of tasks blocked or waiting for review.
+            let bots = self.bots_footer;
+            let bots_btn = bots.available.then(|| {
+                div()
+                    .id("sidebar-footer-bots")
+                    .mt(px(4.0))
+                    .h(px(36.0))
+                    .px_3()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .rounded(px(6.0))
+                    .bg(elev)
+                    .text_size(px(12.0))
+                    .when(bots.visible, |s| {
+                        s.border_l_2()
+                            .border_color(accent)
+                            .text_color(accent)
+                    })
+                    .when(!bots.visible, |s| s.text_color(ink_dim))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(frost_hover).text_color(ink_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| {
+                            cx.emit(SidebarEvent::OpenBots);
+                        }),
+                    )
+                    .child(div().flex_grow().child("Bots"))
+                    .when(bots.attention > 0, |s| {
+                        s.child(
+                            div()
+                                .px(px(6.0))
+                                .rounded_full()
+                                .bg(theme::signal_warn())
+                                .text_size(px(10.0))
+                                .text_color(theme::canvas(&theme))
+                                .font(theme::font_mono())
+                                .child(SharedString::from(bots.attention.to_string())),
+                        )
+                    })
+                    .child(
+                        div()
+                            .px(px(5.0))
+                            .py(px(1.0))
+                            .border_1()
+                            .border_color(divider)
+                            .rounded(px(3.0))
+                            .text_size(px(10.0))
+                            .text_color(theme::text_faint())
+                            .font(theme::font_mono())
+                            .child("⌃⇧ I"),
+                    )
+            });
+
             div()
                 .flex()
                 .flex_col()
@@ -3870,6 +3958,7 @@ impl Render for Sidebar {
                 .border_color(divider)
                 .p_2()
                 .child(overview_btn)
+                .children(bots_btn)
                 .child(new_project_btn)
         };
 
