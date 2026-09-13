@@ -73,7 +73,7 @@ struct_fields InboxItem id title owner status branch worktree base_sha last_even
 # name (`use std::fs::{read_to_string, write};`) is called bare, so
 # those calls count too; a method call (`.write(`) or a macro
 # (`write!`) does not.
-for call in 'fs::write' 'create_dir' 'remove_file' 'remove_dir' 'OpenOptions' 'File::create'; do
+for call in 'fs::write' 'create_dir' 'remove_file' 'remove_dir' 'OpenOptions' 'File::create' 'File::options' 'write_all'; do
     ! grep -q "$call" <<< "$CODE" \
         || fail "$MOD calls $call outside its tests - this module only reads"
 done
