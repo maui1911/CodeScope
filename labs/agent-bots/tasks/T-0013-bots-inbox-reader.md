@@ -75,10 +75,13 @@ prose and those lines disagree, the lines win.
       - a missing `tasks/` directory is an empty list, not an error; an
         unreadable individual file is skipped, not fatal;
       - sorted: items that need attention first, then by `last_event.at`
-        descending, then by id.
-- [ ] Tests build a plane in `tempfile::tempdir()` from the captured
-      text under Context — not from lines written from this
-      description — and cover each bullet above, including a body line
+        descending with items without a `last_event` after those that
+        have one (as `core/src/overview.rs` orders), then by id.
+- [ ] Tests build a plane in `tempfile::tempdir()` starting from the
+      captured text under Context — not from lines written from this
+      description. The captured text is the baseline; the edge cases it
+      does not contain are added as small edits to it. Cover each bullet
+      above, including a body line
       `status: done` under a frontmatter with `status: blocked`, a
       board detail containing ` | `, two handoffs for one task (newest
       wins), and a task file without `id:` (skipped).

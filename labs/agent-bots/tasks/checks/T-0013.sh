@@ -23,17 +23,20 @@ CODE="$(awk '/^#\[cfg\(test\)\]/ { exit } { print }' "$MOD")"
 
 # Declarations, not mentions. A plain substring search also matched a
 # comment, so a module that only *named* these items in a doc comment
-# passed. Each item has to start a non-comment line as `pub <kind> <name>`
-# followed by something that is not part of an identifier.
+# passed. Block comments are dropped first, then `//` lines; each item
+# has to start a remaining line as `pub <kind> <name>` followed by
+# something that is not part of an identifier.
 #
 # Here-strings rather than `printf | grep -q`: grep -q stops at the first
 # match, and under pipefail the writer it abandons can fail the pipeline
 # on a module larger than a pipe buffer - a found match read as missing.
-DECLS="$(grep -Ev '^[[:space:]]*//' <<< "$CODE" || true)"
+UNBLOCKED="$(perl -0777 -pe 's{/\*.*?\*/}{}gs' <<< "$CODE")"
+DECLS="$(grep -Ev '^[[:space:]]*//' <<< "$UNBLOCKED" || true)"
 for decl in \
     'fn lab_control_plane' \
     'fn frontmatter_field' \
     'enum TaskStatus' \
+    'fn parse' \
     'fn needs_attention' \
     'struct BoardEvent' \
     'fn parse_board' \
