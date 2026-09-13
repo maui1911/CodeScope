@@ -438,7 +438,14 @@ pub fn process_new_lines(
     let mut tokens_used = snapshot.as_ref().map_or(0, |s| s.tokens_used);
     let mut turn_count = snapshot.as_ref().map_or(0, |s| s.turn_count);
     let mut last_turn_duration = snapshot.as_ref().and_then(|s| s.last_turn_duration);
-    let mut state = snapshot.as_ref().map_or(SessionState::Unknown, |s| s.state);
+    // An idle the quiet-window fallback produced (#351) is the tail's
+    // guess, not something the transcript said: the parser's own state
+    // was still `Busy`. Seed from that, so output that resumes without a
+    // terminal `stop_reason` reads as work again instead of staying idle,
+    // while an `end_turn` still resolves to `Idle` the normal way.
+    let mut state = snapshot.as_ref().map_or(SessionState::Unknown, |s| {
+        if s.quiet_timeout { SessionState::Busy } else { s.state }
+    });
     let mut model: Option<String> = snapshot.as_ref().and_then(|s| s.model.clone());
     let mut changed = false;
 
@@ -1711,6 +1718,50 @@ mod tests {
         assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Busy);
         tail.poll_at(resumed + past_timeout());
         assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Idle);
+    }
+
+    #[test]
+    fn resumed_output_after_timeout_is_busy_again() {
+        // A long turn that outlived the window and then streams on: an
+        // assistant entry without a terminal stop_reason.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, &[PROMPT]);
+
+        let mut tail = ClaudeTranscriptTail::new(path.clone());
+        let start = Instant::now();
+        tail.poll_at(start + past_timeout());
+        assert!(tail.snapshot.as_ref().unwrap().quiet_timeout);
+
+        append_lines(
+            &path,
+            &[r#"{"type":"assistant","sessionId":"s","timestamp":"2026-08-09T08:20:00Z","message":{"role":"assistant","stop_reason":null,"usage":{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#],
+        );
+        tail.poll_at(start + past_timeout() * 2);
+        let snap = tail.snapshot.as_ref().unwrap();
+        assert_eq!(snap.state, SessionState::Busy);
+        assert!(!snap.quiet_timeout);
+    }
+
+    #[test]
+    fn end_turn_after_timeout_is_a_real_idle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, &[PROMPT]);
+
+        let mut tail = ClaudeTranscriptTail::new(path.clone());
+        let start = Instant::now();
+        tail.poll_at(start + past_timeout());
+
+        append_lines(
+            &path,
+            &[r#"{"type":"assistant","sessionId":"s","timestamp":"2026-08-09T08:20:00Z","message":{"role":"assistant","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#],
+        );
+        tail.poll_at(start + past_timeout() * 2);
+        let snap = tail.snapshot.as_ref().unwrap();
+        assert_eq!(snap.state, SessionState::Idle);
+        // The transcript ended the turn itself this time.
+        assert!(!snap.quiet_timeout);
     }
 
     #[test]
