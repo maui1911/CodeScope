@@ -48,9 +48,14 @@ live_task_status() { live_task_field status "$1"; }
 
 # live_task_verdict <text> -> record | blocks
 #
-# `record` means the run reached a verdict: a reader may act around it,
-# and nothing is going to rewrite it out from under them. `blocks`
-# means the opposite, and covers three cases that want the same answer:
+# `record` means the run reached a verdict - and *only* that. It does
+# not mean nothing will write this file again: the runner writes its
+# verdict before cleaning up and rewrites it if the cleanup fails, so a
+# `record` can have a live process behind it. Whether anybody is still
+# in there is live_task_running's question, and every caller that acts
+# on a record has to ask it too; this function used to say otherwise,
+# and two callers believed it. F-50. `blocks` covers three cases that
+# want the same answer:
 #
 #   dispatched   a run is in flight, or one died leaving this behind.
 #                Those look identical from outside and want opposite
@@ -97,4 +102,24 @@ live_task_running() {
             printf '%s gone %s\n' "${pid:-unknown}" "$m"
         fi
     done
+}
+
+# live_task_settled <state> <task-id> <text> -> active | settled | unfinished
+#
+# Both questions, in the order that matters: a live process first,
+# because it outranks whatever the status says, and only then the
+# verdict. `settled` is the one answer that lets something act around
+# a live task; the sweep's preflight acted on the verdict alone and so
+# started beside a run still in its cleanup. A function for the reason
+# F-46 gave: the preflight runs before anything can assert about it, so
+# the decision has to be reachable from somewhere that can. F-50.
+live_task_settled() {
+    if live_task_running "$1" "$2" | awk '$2 == "alive" { found = 1 } END { exit !found }'
+    then
+        printf 'active\n'
+    elif [ "$(live_task_verdict "$3")" = "record" ]; then
+        printf 'settled\n'
+    else
+        printf 'unfinished\n'
+    fi
 }

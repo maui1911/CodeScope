@@ -628,7 +628,9 @@ its pid so a killed run is distinguishable from a live one; the
 other's question: the runner writes `done` *before* its cleanup and
 rewrites it if that cleanup fails, so a finished-looking status is
 normal while there is still work to do. `--force` is the way past
-either gate.
+either gate. And both gates, plus every removal after them, run while
+holding the runner's own `dispatch.lock`, so a claim cannot start
+between the checks and the act.
 
 It removes nothing *from* the handoff, the artifacts or a bot's
 memory, and it appends a `forgotten` row to the board rather than
@@ -3865,3 +3867,71 @@ the common case, a `read` that works until a path has a space, an
 run that went well, which is the only kind of run anybody watches.
 
 Sweep is 118.
+
+---
+
+### F-50 · The marker arrived after the damage it was meant to prevent
+
+*2026-09-13, the third round on the same PR.*
+
+F-47 put a run marker down where the task becomes `dispatched`. The
+review read the lines above that and listed what happens first:
+
+    take_lock dispatch.lock        # the claim
+    ...create the surface
+    ...write refs/bot-base/<id>
+    ...on --reset, discard the old live task
+    marker                         # <- F-47 put it here
+    set_status dispatched
+
+Every destructive step of a claim ran with the *old* record still
+visible — a terminal status on it and no marker anywhere — which is
+exactly the combination `bot-forget.sh` accepts as "finished". A forget
+landing in that window would pass both gates and delete the new
+surface out from under the `--reset` that was building it, because the
+new surface has the same path and the same marker text. The marker is
+taken the moment the claim is held now, and `on_exit` removes it on
+every path out, a refusal included.
+
+**That still left a check-then-act race**, and the review offered the
+fix: `bot-forget` holds `dispatch.lock` across every check and every
+removal. It is a client of the runner's lock protocol rather than a
+copy — owner file named `owner.<pid>-...`, which is how `take_lock`
+already tells a live holder from a dead one — and it never breaks
+anybody else's lock: it waits briefly, then refuses and names the
+holder. F-38 again, for the third time in this lab: two readers of one
+resource who each check before acting, and the answer is always that
+one of them has to hold something.
+
+**The sweep made the same mistake one file over.** Its preflight
+accepted a live task with a verdict as a record and started the suite
+beside it — while that run could still be in its cleanup. And the
+leftover checks written last round counted *every* marker, pin and
+`bot-*` surface on disk, so a real run that ended `blocked` and kept its
+evidence — which is what `blocked` is for — would fail the suite. Both
+questions are one function now, `live_task_settled` → `active |
+settled | unfinished`, with the process asked first, and the leftover
+checks vouch only for what this sweep made.
+
+The comment on `live_task_verdict` had to change too. It said a
+`record` is something "nothing is going to rewrite out from under"
+you, and two callers believed it. It is a record of a verdict and
+nothing more.
+
+**And a plain-folder project keeps its pin somewhere else.** The plane
+is stamped with the folder, but the surface is cut from
+`$STATE/snapshot.git` and the pin lives there — the runner's
+`ORIGIN_REPO` rule. `--surface` deleted the clone, then rejected the
+folder as not a repository and stopped: the record and the pin both
+survived, minus the one part that showed what they were for. The
+repository is resolved and validated *before* anything is removed now,
+by the runner's own precedence.
+
+What generalises is the order-of-operations version of F-43: **a check
+that can refuse has to run before the first thing it would have
+stopped.** The marker was checked after the claim had already done
+its damage; the pin repository was checked after the clone was already
+gone. Both were correct checks in the wrong place, and neither place
+looks wrong until you read the lines above it.
+
+Sweep is 125.

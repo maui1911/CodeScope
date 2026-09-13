@@ -95,6 +95,46 @@ STATE="${STATE:-$LAB_DIR/.state}"
 [ -d "$STATE" ] || die "no control plane at $STATE - nothing has run yet"
 STATE="$(cd "$STATE" && pwd)"
 
+# Hold the dispatch lock across every check and every removal below.
+# The marker closes the gap while a run is in flight; the lock closes
+# the one around it. Without it this script checks, and then acts, and
+# a runner can take the claim in between - the checks said "no marker,
+# a verdict", and by the time the removal runs a --reset has started
+# building a new surface at the same path. Two readers of one resource
+# who each check before acting is F-38 again, and the answer is the
+# same one: one of them has to hold something.
+#
+# A client of the runner's lock protocol, not a copy of it. The owner
+# file is named `owner.<token>` with the pid first, which is how
+# take_lock tells a live holder from a dead one - so a runner that
+# finds this script holding the lock waits, and one that finds it
+# killed breaks it. What this script does *not* do is break anybody
+# else's lock: it waits briefly and then refuses, and says whose it is.
+FORGET_TOKEN="$$-$(date -u +%s)-${RANDOM}"
+LOCK_DIR="$STATE/dispatch.lock"
+# A claim holds this lock for seconds, so a short wait covers the normal
+# case. BOT_FORGET_LOCK_WAIT exists for the sweep, which has to check
+# the refusal without spending fifteen seconds on it.
+LOCK_WAIT="${BOT_FORGET_LOCK_WAIT:-15}"
+waited=0
+until mkdir "$LOCK_DIR" 2>/dev/null; do
+    if [ "$waited" -ge "$LOCK_WAIT" ]; then
+        holder="$(ls "$LOCK_DIR" 2>/dev/null | head -n1)"
+        die "a dispatch is being claimed ($LOCK_DIR is held${holder:+ by ${holder#owner.}}).
+Try again in a moment. If that holder's pid is not running, the next
+dispatch will break the lock; this script will not break somebody
+else's."
+    fi
+    sleep 1
+    waited=$((waited + 1))
+done
+: > "$LOCK_DIR/owner.$FORGET_TOKEN"
+release_forget_lock() {
+    rm -f "$LOCK_DIR/owner.$FORGET_TOKEN" 2>/dev/null || true
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+trap release_forget_lock EXIT
+
 LIVE="$STATE/tasks/$TASK_ID.md"
 [ -f "$LIVE" ] || die "no live task at $LIVE - already forgotten, or never ran"
 
@@ -168,6 +208,29 @@ REMOVED_SURFACE=""
 REMOVED_VERIFY=""
 REMOVED_PIN=""
 if [ "$SURFACE" -eq 1 ] && [ -n "$WORKTREE" ]; then
+    # Which repository holds the pin, established before anything is
+    # removed. The first version worked it out last, after the clone
+    # was gone, and for a plain-folder project it worked it out wrong:
+    # the stamp in `$STATE/REPO` is the folder, but the surface is cut
+    # from `$STATE/snapshot.git` and the pin lives there (bot-run.sh,
+    # ORIGIN_REPO). So --surface deleted the clone, rejected the folder
+    # as not a repository, and stopped - leaving the record and the pin
+    # both, minus the one part that proved what they were for. A check
+    # that can refuse has to run before the first thing it would have
+    # stopped. F-50.
+    #
+    # --repo wins; then a snapshot repository if this plane has one,
+    # which is exactly the runner's own rule; then the stamp.
+    PIN_REPO="$REPO"
+    if [ -z "$PIN_REPO" ] && [ -d "$STATE/snapshot.git" ]; then
+        PIN_REPO="$STATE/snapshot.git"
+    fi
+    [ -n "$PIN_REPO" ] || PIN_REPO="$(cat "$STATE/REPO" 2>/dev/null || true)"
+    [ -n "$PIN_REPO" ] \
+        || die "no project to remove refs/bot-base/$TASK_ID from - $STATE/REPO is missing, so pass --repo. Nothing was removed."
+    git -C "$PIN_REPO" rev-parse --git-dir >/dev/null 2>&1 \
+        || die "$PIN_REPO is not a git repository, so whether refs/bot-base/$TASK_ID exists cannot be established. Nothing was removed."
+
     # The verify checkout is a linked worktree, so its `.git` is a
     # *file* pointing back at its parent: that file both identifies it
     # and says whose it is. Same proof the runner uses.
@@ -210,12 +273,6 @@ if [ "$SURFACE" -eq 1 ] && [ -n "$WORKTREE" ]; then
     # afford `|| true` on the same call because its live task survives
     # and the next run can try again. This one cannot. F-49, and rule 5
     # of 3.6: a removal that could not be attempted is not a removal.
-    PIN_REPO="$REPO"
-    [ -n "$PIN_REPO" ] || PIN_REPO="$(cat "$STATE/REPO" 2>/dev/null || true)"
-    [ -n "$PIN_REPO" ] \
-        || die "no project to remove refs/bot-base/$TASK_ID from - $STATE/REPO is missing, so pass --repo"
-    git -C "$PIN_REPO" rev-parse --git-dir >/dev/null 2>&1 \
-        || die "$PIN_REPO is not a git repository, so whether refs/bot-base/$TASK_ID exists cannot be established"
     if git -C "$PIN_REPO" rev-parse --verify --quiet "refs/bot-base/$TASK_ID" >/dev/null 2>&1
     then
         git -C "$PIN_REPO" update-ref -d "refs/bot-base/$TASK_ID" >/dev/null 2>&1 \

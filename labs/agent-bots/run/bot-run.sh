@@ -1799,6 +1799,30 @@ set_status() { set_field status "$1"; }
 
 take_lock "$STATE/dispatch.lock" "dispatch"
 
+# The run marker goes down the moment the claim is held, not when the
+# task is marked `dispatched`. Everything destructive happens between
+# those two points - the surface is created, the base pin is written,
+# and on --reset the previous live task is discarded - and all of it
+# ran with the *old* record visible, a terminal status on it and no
+# marker anywhere. A reader acting on "no marker and a verdict" could
+# delete the new surface out from under the reset that was building
+# it. Taken here, the marker covers the whole claim; on_exit removes
+# it on every path out, a refusal included. F-50.
+#
+# A marker whose process is gone is litter from a killed run, and this
+# task's own claim is the right place to sweep it: inside the lock,
+# nothing else can be deciding about the same id, and the pid says the
+# run is dead rather than the file's existence. Same judgement take_lock
+# makes before breaking an abandoned break marker.
+mkdir -p "$STATE/running"
+live_task_running "$STATE" "$TASK_ID" | while read -r _pid state mark; do
+    [ "$state" = "gone" ] || continue
+    say "  clearing a run marker whose process is gone: $(basename "$mark")"
+    rm -f "$mark"
+done
+RUNNING_MARK="$STATE/running/$TASK_ID.$RUN_TOKEN"
+printf '%s\n' "$$" > "$RUNNING_MARK"
+
 if [ -f "$LIVE_TASK" ] && [ "$RESET_PENDING" -eq 0 ]; then
     LOCKED_STATUS="$(field status "$LIVE_TASK")"
     [ "$LOCKED_STATUS" = "todo" ] || die \
@@ -2067,20 +2091,6 @@ Nothing was dispatched. Re-run once no other run is in flight."
 # it a state. The marker is the state: it exists exactly as long as
 # this process, and carries the pid so a reader can tell a live run
 # from a killed one. F-47.
-mkdir -p "$STATE/running"
-# A marker whose process is gone is litter from a killed run, and this
-# task's own dispatch is the right place to sweep it: nothing else
-# knows the id is free, and the pid says so rather than the file's
-# existence. Same judgement take_lock makes before breaking an
-# abandoned break marker.
-live_task_running "$STATE" "$TASK_ID" | while read -r _pid state mark; do
-    [ "$state" = "gone" ] || continue
-    say "  clearing a run marker whose process is gone: $(basename "$mark")"
-    rm -f "$mark"
-done
-RUNNING_MARK="$STATE/running/$TASK_ID.$RUN_TOKEN"
-printf '%s\n' "$$" > "$RUNNING_MARK"
-
 set_status dispatched
 board "dispatched" "$TASK_BRANCH @ ${BASE_SHA:0:12}"
 
