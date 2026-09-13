@@ -6,7 +6,7 @@ status: todo
 base: labs/agent-bots
 branch: bot/fixer/T-0011
 touches: core/src/agents/claude/telemetry.rs
-verify: cargo test -p codescope-core --lib agents::claude::telemetry && ! grep -q 'thread::sleep' core/src/agents/claude/telemetry.rs
+verify: grep -q 'BUSY_QUIET_TIMEOUT' core/src/agents/claude/telemetry.rs && ! grep -q 'thread::sleep' core/src/agents/claude/telemetry.rs && cargo test -p codescope-core --lib agents::claude::telemetry
 schedule: auto
 ---
 
@@ -26,13 +26,17 @@ not depend on the enumeration being complete: the CLI was killed, the
 machine slept mid-turn, or a future CLI writes a shape nobody captured.
 
 The window is measured by the tail's own clock from the last time it
-read new bytes, not from any timestamp inside the transcript.
+saw the transcript change — new bytes read, **or** a file modification
+time different from the one it last observed — not from any timestamp
+inside the transcript.
 
 # Acceptance
 
-- [ ] The `verify:` command exits 0. It includes a check that the file
-      contains no `thread::sleep`: the tests drive time, they do not
-      wait for it.
+- [ ] The `verify:` command exits 0. Besides the tests it checks that
+      the constant exists — the existing telemetry tests pass on an
+      untouched file, so without that the verifier would pass on no
+      work — and that the file contains no `thread::sleep`: the tests
+      drive time, they do not wait for it.
 - [ ] The diff stays inside `touches:`.
 - [ ] `BUSY_QUIET_TIMEOUT` is a named constant of **10 minutes**, with a
       doc comment saying why it is that large (see Notes).
@@ -48,6 +52,14 @@ read new bytes, not from any timestamp inside the transcript.
 - [ ] The same transcript with new bytes appended at half the timeout
       stays `Busy` at the point where the unrefreshed version would
       have timed out. The window restarts on every read that advances.
+- [ ] **A changed mtime alone also restarts the window.** A transcript
+      rewritten to the same length reads no bytes — `process_new_lines`
+      returns early on `file_len == tail.last_pos` — but it did change.
+      Its own test: after half the timeout, rewrite the file with the
+      same length and a later modification time (set it explicitly with
+      `std::fs::File::set_modified`, do not wait for the clock), then
+      poll past where the untouched version would have timed out; the
+      state is still `Busy`.
 - [ ] `poll_interval()` returns 2 s after the timeout fires, and 250 ms
       before it.
 - [ ] **`PendingToolUse` is never timed out.** A transcript ending in an
@@ -76,7 +88,12 @@ Point of entry: `core/src/agents/claude/telemetry.rs`.
   changed (`file_len == tail.last_pos`), which is the "no new bytes"
   case. Comparing `tail.last_pos` before and after the call is one way
   to tell whether bytes were read; a `true` return alone is not, since
-  bytes can be read without the snapshot changing.
+  bytes can be read without the snapshot changing. Bytes are not the
+  whole signal: the issue's rule is "no new bytes **and** an unchanged
+  mtime", so the tail also has to remember the modification time it
+  last saw (`FileTail::last_mtime` is only updated after a clean read,
+  so it is not that value on its own) and treat a difference as
+  activity.
 - `ClaudeTranscriptTail::poll_interval` — 250 ms for `Busy` and
   `PendingToolUse`, 2 s otherwise. It follows the snapshot, so it needs
   no change if the state is right.
@@ -113,9 +130,10 @@ state at `Busy` on purpose (see the comment above the
 `pending_agents` check). Timing that out would repaint the exact case
 that comment exists for.
 
-**The window restarts on bytes read, not on entries parsed.** A partial
-line, or entries that do not change the snapshot, are still evidence
-the CLI is alive.
+**The window restarts on any sign of change, not on entries parsed.**
+New bytes, a partial line, entries that do not change the snapshot, or
+a modification time that moved are all evidence the file is being
+written.
 
 **Do not add a sleep, a thread or a timer.** The tail is polled by the
 app at `poll_interval()`; the fallback is evaluated inside that poll.
