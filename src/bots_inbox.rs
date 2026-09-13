@@ -287,6 +287,11 @@ impl AppShell {
         self.show_bots = value;
         self.push_bots_footer(cx);
         if value {
+            // Opened before any read came back (right after startup):
+            // say so instead of "No bots in this project".
+            if self.bots.applied_id == 0 {
+                self.bots.reading = true;
+            }
             self.refresh_bots(cx);
         }
         cx.notify();
