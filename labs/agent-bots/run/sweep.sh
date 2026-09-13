@@ -1009,6 +1009,86 @@ else
 fi
 rm -rf "$MARK_PLANE"
 
+# A task body longer than a pipe buffer. The shared parser used to stop
+# at the closing fence, which SIGPIPEs the printf feeding it, and under
+# pipefail the caller died with a 141 on a status that parsed fine. Run
+# in a child with the callers' own shell options, so a 141 shows up as
+# an exit code here rather than as this sweep ending.
+LONG_RC=0
+LONG_STATUS="$(bash -c '
+    set -euo pipefail
+    . "$1/live-task.sh"
+    body="$(head -c 400000 /dev/zero | tr "\\0" x)"
+    text="$(printf -- "---\nid: T-0994\nstatus: done\n---\n\n%s\n" "$body")"
+    s="$(live_task_status "$text")"
+    printf "%s\n" "$s"
+' _ "$SCRIPT_DIR" 2>/dev/null)" || LONG_RC=$?
+check "a long body parses"        0    "$LONG_RC"
+check "a long body keeps status"  done "$LONG_STATUS"
+
+# Ownership of both halves is settled before either is removed. A
+# record whose worktree path now holds another task's surface - a
+# colliding branch leaf - used to lose the verify checkout first and
+# only then meet the marker that refused. F-50.
+OWN_PLANE="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-own.$$")"
+mkdir -p "$OWN_PLANE/tasks" "$OWN_PLANE/surface/.git" "$OWN_PLANE/surface-verify"
+: > "$OWN_PLANE/board.md"
+git init --quiet --bare "$OWN_PLANE/snapshot.git"
+printf 'bot-run surface for T-0995\n' > "$OWN_PLANE/surface/.git/bot-surface"
+printf 'gitdir: %s/.git/worktrees/surface\n' "$OWN_PLANE/surface" > "$OWN_PLANE/surface-verify/.git"
+cat > "$OWN_PLANE/tasks/T-0994.md" <<EOF
+---
+id: T-0994
+owner: fixer
+status: done
+worktree: $OWN_PLANE/surface
+---
+EOF
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$OWN_PLANE" --surface >/dev/null 2>&1 || FORGET_RC=$?
+check "another task's surface" 1 "$FORGET_RC"
+if [ -d "$OWN_PLANE/surface-verify" ] && [ -f "$OWN_PLANE/tasks/T-0994.md" ] \
+        && ! grep -q "forgotten" "$OWN_PLANE/board.md"; then
+    printf 'ok    %-28s verify checkout, record and board untouched\n' "ownership before removal"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s removed or marked before refusing\n' "ownership before removal"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$OWN_PLANE"
+
+# A pin that cannot be read is not a pin that is absent. A broken ref
+# answers `rev-parse --verify` exactly like a missing one, and the first
+# version took that as permission to delete the only record naming it.
+BROKEN_PLANE="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-broken.$$")"
+mkdir -p "$BROKEN_PLANE/tasks"
+: > "$BROKEN_PLANE/board.md"
+git init --quiet --bare "$BROKEN_PLANE/snapshot.git"
+mkdir -p "$BROKEN_PLANE/snapshot.git/refs/bot-base"
+printf 'not a sha\n' > "$BROKEN_PLANE/snapshot.git/refs/bot-base/T-0994"
+cat > "$BROKEN_PLANE/tasks/T-0994.md" <<EOF
+---
+id: T-0994
+owner: fixer
+status: done
+worktree: $BROKEN_PLANE/surface
+---
+EOF
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$BROKEN_PLANE" --surface >/dev/null 2>&1 || FORGET_RC=$?
+check "a broken pin stops forget" 1 "$FORGET_RC"
+if [ -f "$BROKEN_PLANE/tasks/T-0994.md" ] \
+        && grep -q "| T-0994 | forget-stopped |" "$BROKEN_PLANE/board.md"; then
+    printf 'ok    %-28s record kept, board says stopped\n' "broken pin keeps record"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s record gone or no forget-stopped row\n' "broken pin keeps record"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$BROKEN_PLANE"
+
 # A state directory with a space in it, which is most of Windows.
 # `live_task_running` puts the path last precisely so that a `read`
 # absorbs it; with the path first, one space shifted every field and no

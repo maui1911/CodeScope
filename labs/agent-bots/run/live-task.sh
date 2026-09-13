@@ -29,6 +29,13 @@
 # status and the words `status: done` somewhere in its prose came back
 # `done`, and this file's whole job is deciding whether something may
 # be deleted. Missing has to read as missing. F-49.
+#
+# awk reads to the end rather than stopping at the closing fence, for
+# the reason the runner's field_from gives: under `set -o pipefail` an
+# early exit SIGPIPEs the printf, and a task whose body is longer than a
+# pipe buffer took its caller down with a 141 despite a status that
+# parsed fine. Past the second fence nothing matches, so reading on
+# changes the cost and not the answer.
 live_task_field() {
     printf '%s\n' "$2" | awk -v key="$1" '
         /^---[[:space:]]*$/ { fence++; next }
@@ -39,7 +46,6 @@ live_task_field() {
             print value
             found = 1
         }
-        fence > 1 { exit }
     '
 }
 

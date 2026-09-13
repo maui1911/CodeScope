@@ -230,6 +230,34 @@ if [ "$SURFACE" -eq 1 ] && [ -n "$WORKTREE" ]; then
         || die "no project to remove refs/bot-base/$TASK_ID from - $STATE/REPO is missing, so pass --repo. Nothing was removed."
     git -C "$PIN_REPO" rev-parse --git-dir >/dev/null 2>&1 \
         || die "$PIN_REPO is not a git repository, so whether refs/bot-base/$TASK_ID exists cannot be established. Nothing was removed."
+
+    # Whose things these are, for both of them, before either goes. The
+    # first version checked each one just before removing it, so the
+    # verify checkout was gone by the time the surface's marker said the
+    # path belonged to another task - an old record whose worktree path
+    # a colliding branch leaf has since reused. Every ownership refusal
+    # happens here, where nothing has been removed yet. F-50.
+    #
+    # The verify checkout is a linked worktree, so its `.git` is a
+    # *file* pointing back at its parent: that file both identifies it
+    # and says whose it is. Same proof the runner uses.
+    VERIFY_WT="$WORKTREE-verify"
+    if [ -e "$VERIFY_WT" ]; then
+        [ -f "$VERIFY_WT/.git" ] \
+            && grep -q "$(basename "$WORKTREE")" "$VERIFY_WT/.git" 2>/dev/null \
+            || die "$VERIFY_WT is not a verify checkout for $WORKTREE - refusing to remove it. Nothing was removed."
+    fi
+    # Stronger than "a runner made this": the marker names the task, so
+    # it answers "made for *this* run" rather than "made by something
+    # like me" - two branches whose leaf names collide would each find a
+    # marked surface at that path. A hijacked surface whose `.git` was
+    # replaced has no marker and is refused, which is right: that is a
+    # thing to look at. The verify checkout's own proof is only its
+    # parent's leaf name, so this marker is what vouches for both.
+    if [ -d "$WORKTREE" ]; then
+        grep -q "surface for $TASK_ID\$" "$WORKTREE/.git/bot-surface" 2>/dev/null \
+            || die "$WORKTREE has no .git/bot-surface marker for $TASK_ID - refusing to remove it. Nothing was removed."
+    fi
 fi
 
 # The mark goes down before the act, not after - before the *first*
@@ -260,30 +288,18 @@ stop() {
 }
 
 if [ "$SURFACE" -eq 1 ] && [ -n "$WORKTREE" ]; then
-    # The verify checkout is a linked worktree, so its `.git` is a
-    # *file* pointing back at its parent: that file both identifies it
-    # and says whose it is. Same proof the runner uses.
-    VERIFY_WT="$WORKTREE-verify"
+    # Ownership was settled before the mark; what is left can only fail
+    # to happen. Each removal answers through `stop` rather than letting
+    # `set -e` end the script, which would leave `forgotten` as the
+    # board's last word on a record that is still here - a Windows file
+    # lock inside a checkout is enough.
     if [ -e "$VERIFY_WT" ]; then
-        if [ -f "$VERIFY_WT/.git" ] \
-           && grep -q "$(basename "$WORKTREE")" "$VERIFY_WT/.git" 2>/dev/null; then
-            rm -rf "$VERIFY_WT"
-            REMOVED_VERIFY="$VERIFY_WT"
-        else
-            stop "$VERIFY_WT is not a verify checkout for $WORKTREE - refusing to remove it"
-        fi
+        rm -rf "$VERIFY_WT" 2>/dev/null || true
+        [ ! -e "$VERIFY_WT" ] || stop "could not remove $VERIFY_WT"
+        REMOVED_VERIFY="$VERIFY_WT"
     fi
-
     if [ -d "$WORKTREE" ]; then
-        # Stronger than "a runner made this": the marker names the
-        # task, so it answers "made for *this* run" rather than "made
-        # by something like me" - two branches whose leaf names collide
-        # would each find a marked surface at that path. A hijacked
-        # surface whose `.git` was replaced has no marker and is
-        # refused, which is right: that is a thing to look at.
-        grep -q "surface for $TASK_ID\$" "$WORKTREE/.git/bot-surface" 2>/dev/null \
-            || stop "$WORKTREE has no .git/bot-surface marker for $TASK_ID - refusing to remove it"
-        rm -rf "$WORKTREE"
+        rm -rf "$WORKTREE" 2>/dev/null || true
         [ ! -e "$WORKTREE" ] || stop "could not remove $WORKTREE"
         REMOVED_SURFACE="$WORKTREE"
     fi
@@ -302,17 +318,26 @@ if [ "$SURFACE" -eq 1 ] && [ -n "$WORKTREE" ]; then
     # afford `|| true` on the same call because its live task survives
     # and the next run can try again. This one cannot. F-49, and rule 5
     # of 3.6: a removal that could not be attempted is not a removal.
-    if git -C "$PIN_REPO" rev-parse --verify --quiet "refs/bot-base/$TASK_ID" >/dev/null 2>&1
-    then
-        git -C "$PIN_REPO" update-ref -d "refs/bot-base/$TASK_ID" >/dev/null 2>&1 \
-            || stop "could not remove refs/bot-base/$TASK_ID from $PIN_REPO.
+    #
+    # The delete is attempted unconditionally, because a failed lookup
+    # is not an absent ref. The first version asked `rev-parse --verify`
+    # first and skipped the delete on any non-zero - and a broken ref
+    # answers exactly like a missing one there, so the record went and
+    # the ref stayed. `update-ref -d` has the distinction built in: a
+    # missing ref deletes cleanly, a broken or locked one fails. The
+    # lookup is kept only to say whether there was one to remove.
+    PIN_EXISTED=0
+    git -C "$PIN_REPO" rev-parse --verify --quiet "refs/bot-base/$TASK_ID" >/dev/null 2>&1 \
+        && PIN_EXISTED=1
+    git -C "$PIN_REPO" update-ref -d "refs/bot-base/$TASK_ID" >/dev/null 2>&1 \
+        || stop "could not remove refs/bot-base/$TASK_ID from $PIN_REPO.
 The live task is still here, so this can be retried once that ref is
 free - which is the whole reason it is not being deleted first."
-        REMOVED_PIN="refs/bot-base/$TASK_ID"
-    fi
+    [ "$PIN_EXISTED" -eq 0 ] || REMOVED_PIN="refs/bot-base/$TASK_ID"
 fi
 
-rm -f "$LIVE"
+rm -f "$LIVE" 2>/dev/null || true
+[ ! -e "$LIVE" ] || stop "could not remove $LIVE"
 
 # A marker whose process is gone is this id's litter, and the pid said
 # so. Same judgement the lock protocol makes before it breaks a stale
@@ -320,7 +345,9 @@ rm -f "$LIVE"
 # is cleared on a run that turned out to be alive.
 printf '%s\n' "$RUNNING" | while read -r _pid state mark; do
     [ "$state" = "gone" ] || continue
-    rm -f "$mark"
+    # Litter, and the record is already gone: a marker that will not go
+    # is not a reason to exit non-zero on a forget that happened.
+    rm -f "$mark" 2>/dev/null || true
 done
 
 printf 'forgotten: %s (was %s)\n' "$TASK_ID" "${STATUS:-no status}"

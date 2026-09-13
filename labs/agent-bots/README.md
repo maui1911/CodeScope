@@ -3947,4 +3947,21 @@ state directory, that append ended the trap and leaked exactly the lock,
 snapshot and marker the trap exists to release. A cleanup is only
 guaranteed if nothing before it can stop it.
 
-Sweep is 127.
+A Codex review then found three more, and each came with a failing
+sweep case before its fix. `bot-forget` checked the verify checkout's
+ownership, removed it, and only then read the surface marker that
+could refuse — so an old record whose path a colliding branch leaf had
+reused lost another task's verify checkout. Every ownership check now
+runs before the board mark. The pin was looked up with `rev-parse
+--verify` and the delete skipped on any failure, but a broken ref
+answers that exactly like a missing one; the delete is now attempted
+unconditionally, because `update-ref -d` already tells absent (success)
+from broken (failure). And `live-task.sh` had brought back the early
+`exit` that the runner's own parser documents as a SIGPIPE: a task body
+larger than a pipe buffer killed its caller with 141 under `pipefail`.
+The removals themselves also answer through `stop` now, rather than
+letting `set -e` leave `forgotten` as the board's last word. That last
+one has no sweep case; a removal that fails halfway is hard to stage
+portably.
+
+Sweep is 133.
