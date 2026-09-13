@@ -82,7 +82,11 @@ parent does not reliably kill its children.
 
 - **Windows:** the spawned process is associated with a Win32 **job
   object** flagged `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Closing the
-  job handle on tab dispose terminates the whole tree.
+  job handle on tab dispose terminates the whole tree. That PTY job
+  does not allow breakaway, so nothing started from a terminal can
+  leave it. CodeScope itself sits in a separate kill-on-close job that
+  *does* allow breakaway, only so the restart after an update (#341)
+  can outlive the old instance.
 - **Unix:** each tab is its own process group via `setpgid`; tab close
   calls `killpg(SIGTERM)` followed by `SIGKILL` on timeout.
 
