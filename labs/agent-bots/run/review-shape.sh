@@ -36,13 +36,11 @@
 # subject, whether the reader is a reviewer, a doc writer or a
 # benchmark.
 #
-# The two that were BOT_REVIEW and BOT_REVIEWED_SHA could only be
-# renamed across two merges, and the direction matters: `verify:` runs
-# inside the verify checkout, so *this* script is the copy at base
-# while the runner exporting the names is the copy in the working
-# tree. A branch that renames both sides therefore runs its new runner
-# against the old script, and goes red on a change that is correct.
-# See the block comment at the export site and #348.
+# The two that were BOT_REVIEW and BOT_REVIEWED_SHA were renamed across
+# two merges, because `verify:` runs inside the verify checkout: *this*
+# script is the copy at base, while the runner exporting the names is
+# the copy in the working tree. The old names are no longer exported.
+# See the block comment at the export site, #348 and README F-51.
 #
 # It runs inside the clean verify checkout, so `git` here is that tree.
 

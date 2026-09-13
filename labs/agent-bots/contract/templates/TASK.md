@@ -106,9 +106,8 @@ Field reference:
            report role brings its own checker. The runner exports
            BOT_ARTIFACT, BOT_SUBJECT_SHA, BOT_TOUCHES and BOT_TASK_ID
            for it, all four named for the job rather than for the role
-           that had it first. BOT_REVIEW and BOT_REVIEWED_SHA are
-           still exported alongside the first two for one more merge —
-           see #348.
+           that had it first. The old names, BOT_REVIEW and
+           BOT_REVIEWED_SHA, are no longer exported — see #348.
 -->
 
 ## `approved_by:` / `approved_at:` / `approved_body:`

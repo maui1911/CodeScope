@@ -4063,3 +4063,23 @@ shared, and that stays limited to the sweep's listed names.
 
 Sweep is 155, with the symlink case a skip on a Windows shell that
 cannot make links.
+
+### F-51 · The shim was not dead code; it was the proof
+
+*2026-09-13, #348 step two.*
+
+F-32's note on the verifier rename said exporting both names would be
+"green today, dead code the day it lands", and left the rename for
+later. When it came to it, the two-step version was the only one that
+could be checked at all. `verify:` runs in a checkout of `base:`, so a
+branch never tests its own verifier against its own runner — it tests
+the new runner against the old script. Step one (#353) exported both
+names and the sweep was green against the base script asking for the
+old ones. Step two removes the old exports, and the sweep is green
+because base now carries the script that reads only the new ones.
+
+A shim that lives for exactly one merge is not compatibility; it is
+the intermediate state made verifiable. What generalises: **when the
+checker runs at a different commit from the change, a rename has to
+pass through a state both commits accept** — and that state is worth
+one merge, not a note saying it cannot be proven.
