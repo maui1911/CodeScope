@@ -1040,9 +1040,8 @@ rm -rf "$FOLDER_PLANE"
 # the provenance disagree.
 #
 # The stamp is the git dir, `<project>/.git`, because that is what the
-# runner writes. These fixtures used to stamp the work tree instead, and
-# a fallback that tested the stamp for a `.git` inside it passed here
-# and could never have worked on a real plane.
+# runner writes; the fixtures used to stamp the work tree, a shape no
+# real plane has.
 STRAY_PLANE="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-stray.$$")"
 mkdir -p "$STRAY_PLANE/tasks"
 : > "$STRAY_PLANE/board.md"
@@ -1076,6 +1075,53 @@ for variant in recorded ambiguous legacy; do
     fi
 done
 rm -rf "$STRAY_PLANE"
+
+# A removal that cannot finish keeps the proof of whose tree it is, so
+# the retry is still allowed. Staged for real: on Windows a process
+# sitting in the directory (the case where every entry goes and the
+# folder does not), elsewhere an unwritable subdirectory. If the fault
+# could not be staged - root ignores the permission - it is a skip,
+# not a pass.
+PROOF_ROOT="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-proof.$$")"
+PROOF_TREE="$PROOF_ROOT/tree"
+mkdir -p "$PROOF_TREE/.git" "$PROOF_TREE/sub"
+printf 'bot-run surface for T-0994\n' > "$PROOF_TREE/.git/bot-surface"
+printf 'x\n' > "$PROOF_TREE/sub/file"
+PROOF_HOLDER=""
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+        MSYS_NO_PATHCONV=1 cmd.exe /c "cd /d $(cygpath -w "$PROOF_TREE") && ping -n 8 127.0.0.1 >nul" \
+            >/dev/null 2>&1 &
+        PROOF_HOLDER=$!
+        sleep 2 ;;
+    *)
+        chmod a-w "$PROOF_TREE/sub" ;;
+esac
+PROOF_RC=0
+remove_proof_last "$PROOF_TREE" .git/bot-surface || PROOF_RC=$?
+if [ ! -e "$PROOF_TREE" ]; then
+    printf 'skip  %-28s could not stage a removal that fails\n' "a stuck removal keeps proof"
+    SKIPS=$((SKIPS + 1))
+elif [ "$PROOF_RC" -ne 0 ] && [ -f "$PROOF_TREE/.git/bot-surface" ]; then
+    printf 'ok    %-28s failed and kept .git/bot-surface\n' "a stuck removal keeps proof"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s rc %s, proof %s\n' "a stuck removal keeps proof" "$PROOF_RC" \
+        "$([ -f "$PROOF_TREE/.git/bot-surface" ] && printf kept || printf gone)"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+if [ -n "$PROOF_HOLDER" ]; then
+    wait "$PROOF_HOLDER" 2>/dev/null || true
+else
+    chmod u+w "$PROOF_TREE/sub" 2>/dev/null || true
+fi
+if [ -e "$PROOF_TREE" ]; then
+    PROOF_RC=0
+    remove_proof_last "$PROOF_TREE" .git/bot-surface || PROOF_RC=$?
+    check "and the retry finishes" 0 "$PROOF_RC"
+fi
+rm -rf "$PROOF_ROOT"
 
 # --surface on a record that names no surface. A task whose frontmatter
 # was never closed runs, but set_field never inserts `worktree:` into it,

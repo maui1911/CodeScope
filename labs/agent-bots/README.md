@@ -4002,12 +4002,12 @@ folder is there and has no repository in it; anything else refuses and
 asks for `--repo`. A failed lookup is not a folder any more than it is a
 dead process.
 
-An Opus review then showed that fallback could never have worked: the
-runner stamps the *git dir*, `<project>/.git`, so "a folder with no
-`.git` in it" is always true of an unreadable repository — and the
-sweep's fixtures stamped the work tree, a shape the runner never
-writes, so they passed. Three fallbacks in a row had reconstructed
-provenance from the disk and each was wrong in a new case. The rule now
+An Opus review then showed that fallback was still wrong for the one
+case it was written for: the runner stamps the *git dir*,
+`<project>/.git`, so "a folder with no `.git` in it" is true of a
+repository git refuses to read — and the sweep's fixtures stamped the
+work tree, a shape the runner never writes. Three fallbacks in a row had
+reconstructed provenance from the disk and each was wrong in a new case. The rule now
 is only what is certain: the runner cuts from the stamp or from
 `snapshot.git`, and the snapshot exists only if a folder was imported.
 No snapshot, the stamp; a snapshot, refuse and ask for `--repo`. The
@@ -4021,6 +4021,16 @@ whose frontmatter was never closed still runs, but `set_field` never
 inserts `worktree:` into it, so `--surface` skipped its block and deleted
 the only record naming the clone and the pin. The runner reads its
 fields back and rolls back if they did not take; `--surface` refuses a
-record without `worktree:`. The partial-removal path has no sweep case.
+record without `worktree:`.
 
-Sweep is 149.
+A second Opus pass reproduced the case that fix still missed: when the
+*directory* is what is locked — on Windows, any process whose working
+directory is the tree, like a terminal opened on a blocked surface —
+every entry goes and the folder does not, so the final `rm -rf` took the
+proof and then failed. The folder is now renamed away and back before
+the proof goes; that rename is refused in exactly that case. The sweep
+stages it for real (a `cmd.exe` sitting in the tree on Windows, an
+unwritable subdirectory elsewhere) and failed against the previous
+helper with "proof gone".
+
+Sweep is 151.

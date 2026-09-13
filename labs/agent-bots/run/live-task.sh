@@ -153,6 +153,14 @@ live_task_settled() {
 # the proof last, and only once nothing before it failed - a tree that
 # could not be removed keeps what identifies it. Fails if anything is
 # left.
+#
+# "Nothing before it failed" is not enough on its own: the directory
+# itself can be what is locked. On Windows a process whose working
+# directory is the tree - a terminal opened on a blocked surface to read
+# the evidence, a dev server the agent left behind - lets every entry go
+# and not the folder, so the final `rm -rf` took the proof and then
+# failed. Whether the folder can go is asked first, by renaming it away
+# and back; a rename is refused in exactly that case.
 remove_proof_last() {
     local dir="$1" proof="$2" head rest e ok=1
     head="${proof%%/*}"
@@ -173,6 +181,11 @@ remove_proof_last() {
         done
     fi
     [ "$ok" -eq 1 ] || return 1
+    if [ -e "$dir" ]; then
+        local probe="$dir.removing.$$"
+        mv "$dir" "$probe" 2>/dev/null || return 1
+        mv "$probe" "$dir" 2>/dev/null || return 1
+    fi
     rm -rf "$dir" 2>/dev/null || true
     [ ! -e "$dir" ]
 }
