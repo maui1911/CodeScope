@@ -48,12 +48,38 @@ for decl in \
         || fail "$MOD declares no 'pub $decl' outside comments and tests"
 done
 
+# The app reads these structs from outside the module, so every field
+# the task names has to be `pub` too. The module's own tests would pass
+# with private fields.
+struct_fields() {   # struct_fields <struct> <field>...
+    local name="$1" body
+    shift
+    body="$(awk -v name="$name" '
+        $0 ~ "^[[:space:]]*pub struct " name "[[:space:]]*\\{" { inside = 1; next }
+        inside && /^[[:space:]]*\}/ { exit }
+        inside { print }' <<< "$DECLS")"
+    for field in "$@"; do
+        grep -Eq "^[[:space:]]*pub ${field}[[:space:]]*:" <<< "$body" \
+            || fail "$MOD: struct $name has no 'pub $field:' field"
+    done
+}
+struct_fields BoardEvent at task event detail
+struct_fields Handoff path task from at status blockers next_action
+struct_fields InboxItem id title owner status branch worktree base_sha last_event handoff
+
 # The module only reads the control plane. Writes in its tests go
 # through tempfile fixtures, so this looks only above the test module.
+# Besides the qualified names, a mutating std::fs function imported by
+# name (`use std::fs::{read_to_string, write};`) is called bare, so
+# those calls count too; a method call (`.write(`) or a macro
+# (`write!`) does not.
 for call in 'fs::write' 'create_dir' 'remove_file' 'remove_dir' 'OpenOptions' 'File::create'; do
     ! grep -q "$call" <<< "$CODE" \
         || fail "$MOD calls $call outside its tests - this module only reads"
 done
+BARE='(^|[^[:alnum:]_.])(write|create_dir|create_dir_all|remove_file|remove_dir|remove_dir_all|rename|copy|hard_link|set_permissions)[[:space:]]*\('
+! grep -Eq "$BARE" <<< "$DECLS" \
+    || fail "$MOD calls a mutating std::fs function outside its tests - this module only reads"
 
 MIN_TESTS=16
 LISTING="$(cargo test -p codescope-core --lib bots -- --list 2>/dev/null)" \
