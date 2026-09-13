@@ -979,6 +979,36 @@ else
 fi
 rm -rf "$FOLDER_PLANE"
 
+# A board that cannot be appended to stops *every* removal, the surface
+# included. The mark used to go down after the surface and before the
+# live task, so this refused with "nothing was removed" and three things
+# already gone. A directory where the board should be is the portable
+# way to make the append fail - chmod means little on Windows. F-50.
+MARK_PLANE="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-mark.$$")"
+mkdir -p "$MARK_PLANE/tasks" "$MARK_PLANE/board.md" "$MARK_PLANE/surface/.git"
+git init --quiet --bare "$MARK_PLANE/snapshot.git"
+printf 'bot-run surface for T-0994\n' > "$MARK_PLANE/surface/.git/bot-surface"
+cat > "$MARK_PLANE/tasks/T-0994.md" <<EOF
+---
+id: T-0994
+owner: fixer
+status: done
+worktree: $MARK_PLANE/surface
+---
+EOF
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$MARK_PLANE" --surface >/dev/null 2>&1 || FORGET_RC=$?
+check "no board, no forget" 1 "$FORGET_RC"
+if [ -d "$MARK_PLANE/surface" ] && [ -f "$MARK_PLANE/tasks/T-0994.md" ]; then
+    printf 'ok    %-28s surface and record both kept\n' "no board, no surface removal"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s removed something with no mark on the board\n' "no board, no surface removal"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$MARK_PLANE"
+
 # A state directory with a space in it, which is most of Windows.
 # `live_task_running` puts the path last precisely so that a `read`
 # absorbs it; with the path first, one space shifted every field and no
@@ -2014,7 +2044,15 @@ fi
 # directory that looks like records. The comment on the runner's exit
 # trap has promised this since the gate was built; for a while a later
 # trap turned the promise off. F-48.
-LEFT_SNAPS="$(ls "$STATE"/tmp/dispatch-*.md 2>/dev/null | wc -l | tr -d ' ')"
+#
+# This sweep's ids only, like the markers below: a foreign run started
+# mid-suite holds its own snapshot for its whole agent turn. F-50.
+LEFT_SNAPS=0
+for id in $(printf '%s' "$SWEEP_TASK_IDS" | tr '\n' ' '); do
+    for s in "$STATE/tmp/dispatch-$id-"*.md; do
+        [ ! -f "$s" ] || LEFT_SNAPS=$((LEFT_SNAPS + 1))
+    done
+done
 if [ "$LEFT_SNAPS" -eq 0 ]; then
     printf 'ok    %-28s none\n' "no task snapshots left"
     CHECKS=$((CHECKS + 1))

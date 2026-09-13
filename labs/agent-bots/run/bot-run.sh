@@ -2048,11 +2048,17 @@ rollback_dispatch() {
         on_exit
         return 0
     fi
-    say ""
-    say "dispatch failed after the work surface was created - rolling it back"
-    rm -f "$LIVE_TASK" "$LIVE_TASK.tmp"
+    # Everything before on_exit is best-effort, and has to be: this
+    # trap runs under `set -e`, and the failure being rolled back may be
+    # the state directory itself - full or unwritable. A board append
+    # that fails there would end the trap before on_exit, leaking the
+    # lock, the snapshot and the run marker, which is the one cleanup
+    # this path exists to guarantee. F-48.
+    say "" || true
+    say "dispatch failed after the work surface was created - rolling it back" || true
+    rm -f "$LIVE_TASK" "$LIVE_TASK.tmp" 2>/dev/null || true
     drop_surface >/dev/null 2>&1 || true
-    board "dispatch-failed" "rolled back"
+    board "dispatch-failed" "rolled back" 2>/dev/null || true
     on_exit
     exit "$rc"
 }

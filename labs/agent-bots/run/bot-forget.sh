@@ -230,7 +230,36 @@ if [ "$SURFACE" -eq 1 ] && [ -n "$WORKTREE" ]; then
         || die "no project to remove refs/bot-base/$TASK_ID from - $STATE/REPO is missing, so pass --repo. Nothing was removed."
     git -C "$PIN_REPO" rev-parse --git-dir >/dev/null 2>&1 \
         || die "$PIN_REPO is not a git repository, so whether refs/bot-base/$TASK_ID exists cannot be established. Nothing was removed."
+fi
 
+# The mark goes down before the act, not after - before the *first*
+# act, which with --surface is the verify checkout, not the live task.
+# The board is append-only and this is an event: somebody decided a
+# record had served its purpose - same principle as --chain recording
+# its own bypass, where the value of a door is not that it cannot be
+# opened but that opening it leaves a mark. A mark written afterwards is
+# a mark that can fail to be written, and then things are gone with
+# nothing saying who removed them. This way round, a board that cannot
+# be appended to stops every removal. F-50 again: the first version put
+# the mark after the surface and before the live task, so an unwritable
+# board said "nothing was removed" with three things already gone.
+printf '| %s | %s | forgotten | %s |\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TASK_ID" "was ${STATUS:-no status}" \
+    >> "$STATE/board.md" \
+    || die "could not append to $STATE/board.md - nothing was removed"
+
+# From here a refusal comes after the mark, so it leaves a second one:
+# the board would otherwise say `forgotten` about a record that is still
+# on disk. Best-effort, because the first append just worked and this is
+# the explanation of a failure, not a gate.
+stop() {
+    printf '| %s | %s | forget-stopped | %s |\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TASK_ID" "record kept" \
+        >> "$STATE/board.md" 2>/dev/null || true
+    die "$@"
+}
+
+if [ "$SURFACE" -eq 1 ] && [ -n "$WORKTREE" ]; then
     # The verify checkout is a linked worktree, so its `.git` is a
     # *file* pointing back at its parent: that file both identifies it
     # and says whose it is. Same proof the runner uses.
@@ -241,7 +270,7 @@ if [ "$SURFACE" -eq 1 ] && [ -n "$WORKTREE" ]; then
             rm -rf "$VERIFY_WT"
             REMOVED_VERIFY="$VERIFY_WT"
         else
-            die "$VERIFY_WT is not a verify checkout for $WORKTREE - refusing to remove it"
+            stop "$VERIFY_WT is not a verify checkout for $WORKTREE - refusing to remove it"
         fi
     fi
 
@@ -253,9 +282,9 @@ if [ "$SURFACE" -eq 1 ] && [ -n "$WORKTREE" ]; then
         # surface whose `.git` was replaced has no marker and is
         # refused, which is right: that is a thing to look at.
         grep -q "surface for $TASK_ID\$" "$WORKTREE/.git/bot-surface" 2>/dev/null \
-            || die "$WORKTREE has no .git/bot-surface marker for $TASK_ID - refusing to remove it"
+            || stop "$WORKTREE has no .git/bot-surface marker for $TASK_ID - refusing to remove it"
         rm -rf "$WORKTREE"
-        [ ! -e "$WORKTREE" ] || die "could not remove $WORKTREE"
+        [ ! -e "$WORKTREE" ] || stop "could not remove $WORKTREE"
         REMOVED_SURFACE="$WORKTREE"
     fi
 
@@ -276,25 +305,12 @@ if [ "$SURFACE" -eq 1 ] && [ -n "$WORKTREE" ]; then
     if git -C "$PIN_REPO" rev-parse --verify --quiet "refs/bot-base/$TASK_ID" >/dev/null 2>&1
     then
         git -C "$PIN_REPO" update-ref -d "refs/bot-base/$TASK_ID" >/dev/null 2>&1 \
-            || die "could not remove refs/bot-base/$TASK_ID from $PIN_REPO.
+            || stop "could not remove refs/bot-base/$TASK_ID from $PIN_REPO.
 The live task is still here, so this can be retried once that ref is
 free - which is the whole reason it is not being deleted first."
         REMOVED_PIN="refs/bot-base/$TASK_ID"
     fi
 fi
-
-# The mark goes down before the act, not after. The board is
-# append-only and this is an event: somebody decided a record had
-# served its purpose - same principle as --chain recording its own
-# bypass, where the value of a door is not that it cannot be opened but
-# that opening it leaves a mark. A mark written afterwards is a mark
-# that can fail to be written, and then the record is gone with nothing
-# saying who removed it. This way round, a board that cannot be
-# appended to stops the removal instead.
-printf '| %s | %s | forgotten | %s |\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TASK_ID" "was ${STATUS:-no status}" \
-    >> "$STATE/board.md" \
-    || die "could not append to $STATE/board.md - nothing was removed"
 
 rm -f "$LIVE"
 

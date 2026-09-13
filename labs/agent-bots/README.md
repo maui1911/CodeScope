@@ -3934,4 +3934,17 @@ its damage; the pin repository was checked after the clone was already
 gone. Both were correct checks in the wrong place, and neither place
 looks wrong until you read the lines above it.
 
-Sweep is 125.
+The next review found the rule broken twice more in the fixes for it.
+`bot-forget`'s board mark — the mark that is supposed to stop every
+removal when it cannot be written — sat after `--surface` and before the
+live task, so an unwritable board said "nothing was removed" with the
+verify checkout, the clone and the pin already gone. It goes down before
+the first removal now, and a refusal after it leaves a
+`forget-stopped` row so the board does not claim a record that is still
+there. And the dispatch rollback appended to the board before calling
+`on_exit`, under `set -e`: if the failure being rolled back was a full
+state directory, that append ended the trap and leaked exactly the lock,
+snapshot and marker the trap exists to release. A cleanup is only
+guaranteed if nothing before it can stop it.
+
+Sweep is 127.
