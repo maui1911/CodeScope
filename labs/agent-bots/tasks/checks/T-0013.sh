@@ -18,25 +18,37 @@ MOD=core/src/bots.rs
 grep -q '^pub mod bots;' core/src/lib.rs || fail "core/src/lib.rs does not declare 'pub mod bots;'"
 [ -f "$MOD" ] || fail "$MOD does not exist"
 
-for symbol in \
-    'pub fn lab_control_plane' \
-    'pub fn frontmatter_field' \
-    'pub enum TaskStatus' \
-    'pub fn needs_attention' \
-    'pub struct BoardEvent' \
-    'pub fn parse_board' \
-    'pub struct Handoff' \
-    'pub fn parse_handoff' \
-    'pub struct InboxItem' \
-    'pub fn load_inbox'; do
-    grep -q "$symbol" "$MOD" || fail "$MOD has no '$symbol'"
+# Everything above the test module, which is where the API has to be.
+CODE="$(awk '/^#\[cfg\(test\)\]/ { exit } { print }' "$MOD")"
+
+# Declarations, not mentions. A plain substring search also matched a
+# comment, so a module that only *named* these items in a doc comment
+# passed. Each item has to start a non-comment line as `pub <kind> <name>`
+# followed by something that is not part of an identifier.
+#
+# Here-strings rather than `printf | grep -q`: grep -q stops at the first
+# match, and under pipefail the writer it abandons can fail the pipeline
+# on a module larger than a pipe buffer - a found match read as missing.
+DECLS="$(grep -Ev '^[[:space:]]*//' <<< "$CODE" || true)"
+for decl in \
+    'fn lab_control_plane' \
+    'fn frontmatter_field' \
+    'enum TaskStatus' \
+    'fn needs_attention' \
+    'struct BoardEvent' \
+    'fn parse_board' \
+    'struct Handoff' \
+    'fn parse_handoff' \
+    'struct InboxItem' \
+    'fn load_inbox'; do
+    grep -Eq "^[[:space:]]*pub ${decl}([^[:alnum:]_]|$)" <<< "$DECLS" \
+        || fail "$MOD declares no 'pub $decl' outside comments and tests"
 done
 
 # The module only reads the control plane. Writes in its tests go
 # through tempfile fixtures, so this looks only above the test module.
-CODE="$(awk '/^#\[cfg\(test\)\]/ { exit } { print }' "$MOD")"
 for call in 'fs::write' 'create_dir' 'remove_file' 'remove_dir' 'OpenOptions' 'File::create'; do
-    ! printf '%s\n' "$CODE" | grep -q "$call" \
+    ! grep -q "$call" <<< "$CODE" \
         || fail "$MOD calls $call outside its tests - this module only reads"
 done
 

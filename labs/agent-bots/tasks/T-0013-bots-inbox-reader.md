@@ -30,7 +30,10 @@ prose and those lines disagree, the lines win.
       requires every public item below, at least 16 `bots::` tests in
       the harness listing, no `std::fs::write`, `create_dir`,
       `remove_file` or `OpenOptions` in the module (it only reads), and
-      then a passing test run. Read it; do not try to change it.
+      then a passing test run. Read it; do not try to change it. It
+      finds each public item as a declaration that starts its own
+      non-comment line (`pub fn name`, `pub struct Name`, …), so keep
+      one declaration per line, as rustfmt would.
 - [ ] The diff stays inside `touches:`.
 - [ ] `core/src/lib.rs` declares `pub mod bots;` in alphabetical order.
 - [ ] `pub fn lab_control_plane(project_root: &Path) -> Option<PathBuf>`
