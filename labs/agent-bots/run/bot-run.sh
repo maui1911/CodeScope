@@ -2091,6 +2091,12 @@ cp "$TASK" "$LIVE_TASK"
 # claim as a ghost and dispatched straight over it.
 set_field worktree "$WT"
 set_field base_sha "$BASE_SHA"
+# And which repository the surface was cut from, which is where its pin
+# lives. Anything retiring the surface later has to find that pin, and
+# re-deriving it from what the plane looks like *then* was wrong: a
+# `snapshot.git` left by an earlier folder task says nothing about this
+# one. Provenance is recorded, not inferred.
+set_field origin_repo "$ORIGIN_REPO"
 
 # Last thing before this run becomes visible to everyone else: are we
 # still the lock holder? If the lock was broken while we were inside

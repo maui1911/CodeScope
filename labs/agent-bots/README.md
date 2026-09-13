@@ -3977,4 +3977,14 @@ marker went. And the sweep's own pin checks used `rev-parse --verify`, so
 absence through `update-ref --stdin` now, and a check proves the helper
 sees a broken ref.
 
-Sweep is 140.
+The third pass found one: `bot-forget` looked for the pin in
+`snapshot.git` whenever the plane had one, which is not the runner's
+rule — the runner uses it only for `base: folder`. A plane that once ran
+a folder task would have a later task's pin looked for in the wrong
+repository, found absent, and the record deleted with the real pin left
+behind. The runner now records `origin_repo:` in the live task, and
+`bot-forget` reads it; older records fall back to the task's `base:`,
+not to what the directory happens to contain. Provenance is recorded,
+not inferred.
+
+Sweep is 144.

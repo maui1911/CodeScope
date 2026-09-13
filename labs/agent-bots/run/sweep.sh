@@ -988,6 +988,10 @@ rm -f "$STATE/tasks/T-0994.md"
 # --surface used to delete the clone, reject the folder as not a
 # repository and stop, leaving the record and the pin and nothing that
 # showed what they belonged to. F-50.
+#
+# This record has no `origin_repo:`, like one written before the runner
+# recorded it, so it also covers the fallback: `base: folder` is what
+# sends the lookup to the snapshot.
 FOLDER_PLANE="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-folder.$$")"
 mkdir -p "$FOLDER_PLANE/tasks" "$FOLDER_PLANE/project"
 : > "$FOLDER_PLANE/board.md"
@@ -1004,6 +1008,7 @@ cat > "$FOLDER_PLANE/tasks/T-0994.md" <<EOF
 ---
 id: T-0994
 owner: fixer
+base: folder
 status: done
 worktree: $FOLDER_PLANE/surface
 ---
@@ -1025,6 +1030,37 @@ else
 fi
 rm -rf "$FOLDER_PLANE"
 
+# The other way round: a plane that once held a folder task keeps its
+# `snapshot.git`, and a later task on a real repository must still have
+# its pin looked for in that repository. Two variants, because there
+# are two ways to find it - the recorded `origin_repo:`, and for an older
+# record the task's `base:`.
+STRAY_PLANE="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-stray.$$")"
+mkdir -p "$STRAY_PLANE/tasks"
+: > "$STRAY_PLANE/board.md"
+git init --quiet --bare "$STRAY_PLANE/snapshot.git"
+git init --quiet --bare "$STRAY_PLANE/project.git"
+printf '%s\n' "$STRAY_PLANE/project.git" > "$STRAY_PLANE/REPO"
+STRAY_TREE="$(git --git-dir="$STRAY_PLANE/project.git" mktree </dev/null)"
+STRAY_COMMIT="$(git --git-dir="$STRAY_PLANE/project.git" \
+    -c user.name=sweep -c user.email=sweep@bots.invalid \
+    commit-tree "$STRAY_TREE" -m "project")"
+for variant in recorded legacy; do
+    git --git-dir="$STRAY_PLANE/project.git" update-ref refs/bot-base/T-0994 "$STRAY_COMMIT"
+    {
+        printf -- '---\nid: T-0994\nowner: fixer\nbase: main\nstatus: done\n'
+        printf 'worktree: %s/surface\n' "$STRAY_PLANE"
+        [ "$variant" = legacy ] || printf 'origin_repo: %s/project.git\n' "$STRAY_PLANE"
+        printf -- '---\n'
+    } > "$STRAY_PLANE/tasks/T-0994.md"
+    FORGET_RC=0
+    bash "$FORGET" T-0994 --state "$STRAY_PLANE" --surface >/dev/null 2>&1 || FORGET_RC=$?
+    check "stray snapshot, $variant" 0 "$FORGET_RC"
+    check "pin gone from project, $variant" yes \
+        "$(pin_absent "$STRAY_PLANE/project.git" refs/bot-base/T-0994 && printf yes || printf no)"
+done
+rm -rf "$STRAY_PLANE"
+
 # A board that cannot be appended to stops *every* removal, the surface
 # included. The mark used to go down after the surface and before the
 # live task, so this refused with "nothing was removed" and three things
@@ -1040,6 +1076,7 @@ id: T-0994
 owner: fixer
 status: done
 worktree: $MARK_PLANE/surface
+origin_repo: $MARK_PLANE/snapshot.git
 ---
 EOF
 FORGET_RC=0
@@ -1088,6 +1125,7 @@ id: T-0994
 owner: fixer
 status: done
 worktree: $OWN_PLANE/surface
+origin_repo: $OWN_PLANE/snapshot.git
 ---
 EOF
 FORGET_RC=0
@@ -1119,6 +1157,7 @@ id: T-0994
 owner: fixer
 status: done
 worktree: $BROKEN_PLANE/surface
+origin_repo: $BROKEN_PLANE/snapshot.git
 ---
 EOF
 FORGET_RC=0

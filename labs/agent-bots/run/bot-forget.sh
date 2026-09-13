@@ -225,13 +225,26 @@ if [ "$SURFACE" -eq 1 ] && [ -n "$WORKTREE" ]; then
     # that can refuse has to run before the first thing it would have
     # stopped. F-50.
     #
-    # --repo wins; then a snapshot repository if this plane has one,
-    # which is exactly the runner's own rule; then the stamp.
+    # --repo wins. Then the `origin_repo:` the runner recorded when it
+    # cut the surface - provenance, not inference. The version before
+    # this picked `snapshot.git` whenever the plane had one, which is not
+    # the runner's rule: a folder task leaves that repository behind,
+    # and a later task on a real repository would have its pin looked
+    # for there, found absent, and its record deleted with the actual
+    # pin still in the project.
+    #
+    # A record from before the field existed falls back to the runner's
+    # own condition, which is the task's `base:` and not the directory
+    # listing: `folder` means the snapshot, anything else the stamp.
     PIN_REPO="$REPO"
-    if [ -z "$PIN_REPO" ] && [ -d "$STATE/snapshot.git" ]; then
-        PIN_REPO="$STATE/snapshot.git"
+    [ -n "$PIN_REPO" ] || PIN_REPO="$(live_task_field origin_repo "$LIVE_TEXT")"
+    if [ -z "$PIN_REPO" ]; then
+        if [ "$(live_task_field base "$LIVE_TEXT")" = "folder" ]; then
+            PIN_REPO="$STATE/snapshot.git"
+        else
+            PIN_REPO="$(cat "$STATE/REPO" 2>/dev/null || true)"
+        fi
     fi
-    [ -n "$PIN_REPO" ] || PIN_REPO="$(cat "$STATE/REPO" 2>/dev/null || true)"
     [ -n "$PIN_REPO" ] \
         || die "no project to remove refs/bot-base/$TASK_ID from - $STATE/REPO is missing, so pass --repo. Nothing was removed."
     git -C "$PIN_REPO" rev-parse --git-dir >/dev/null 2>&1 \
