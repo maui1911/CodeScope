@@ -4052,8 +4052,14 @@ a wrong-type path. And the sweep's lock fixtures used `mkdir -p` on the
 real control plane's `dispatch.lock` and removed it afterwards, so a
 real claim overlapping the suite could lose its owner file; both take
 the lock the way a runner does and give back only what they put there,
-skipping when it is really held. The sweep still shares `.state` with
-real runs; isolating it is a larger change than this PR.
+skipping when it is really held.
+
+That last one was a symptom. The sweep ran in `.state` beside real work,
+and every preflight, id scope and lock courtesy added over five rounds
+was a patch on sharing a control plane with runs it cannot see start. It
+has its own now, `.state-sweep`, named with `--state` on every runner
+invocation; only the repository's branch and ref namespace is still
+shared, and that stays limited to the sweep's listed names.
 
 Sweep is 155, with the symlink case a skip on a Windows shell that
 cannot make links.
