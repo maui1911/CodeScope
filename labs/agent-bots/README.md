@@ -4041,4 +4041,19 @@ said `forgotten`. The probe name is checked first, the rename back is
 retried and named if it still fails, and `bot-forget` refuses a surface
 with a stranded removal beside it.
 
-Sweep is 153.
+A Copilot review on top found four more. `remove_proof_last` walked
+through links: a surface, or its `.git`, that is a symlink had the
+target's entries removed before the proof was reached; it refuses a
+linked root or proof directory now. The rename back could move the tree
+*into* a directory recreated meanwhile; the destination is re-checked
+before every attempt. `bot-forget` read a file or symlink where the
+surface should be as an absent surface and reported success; it refuses
+a wrong-type path. And the sweep's lock fixtures used `mkdir -p` on the
+real control plane's `dispatch.lock` and removed it afterwards, so a
+real claim overlapping the suite could lose its owner file; both take
+the lock the way a runner does and give back only what they put there,
+skipping when it is really held. The sweep still shares `.state` with
+real runs; isolating it is a larger change than this PR.
+
+Sweep is 155, with the symlink case a skip on a Windows shell that
+cannot make links.

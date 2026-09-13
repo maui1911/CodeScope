@@ -166,6 +166,13 @@ remove_proof_last() {
     head="${proof%%/*}"
     rest=""
     [ "$head" = "$proof" ] || rest="${proof#*/}"
+    # Never through a link. The globs below expand the *target's*
+    # entries, so a surface - or its `.git` - that is a symlink had files
+    # outside it removed one by one before the proof was ever reached.
+    # A tree whose root or proof directory is a link is not a tree this
+    # removes.
+    [ ! -L "$dir" ] || return 1
+    [ ! -L "$dir/$head" ] || return 1
     for e in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
         [ -e "$e" ] || [ -L "$e" ] || continue
         [ "${e##*/}" != "$head" ] || continue
@@ -190,9 +197,12 @@ remove_proof_last() {
         local probe="$dir.removing.$$" tries=0
         [ ! -e "$probe" ] || return 1
         mv "$dir" "$probe" 2>/dev/null || return 1
-        until mv "$probe" "$dir" 2>/dev/null; do
+        # The destination has to stay absent for every attempt: if
+        # something recreated `$dir` meanwhile, `mv` would move the
+        # tree *into* it and the `rm -rf` below would take both.
+        until { [ ! -e "$dir" ] && [ ! -L "$dir" ] && mv "$probe" "$dir" 2>/dev/null; }; do
             tries=$((tries + 1))
-            if [ "$tries" -ge 5 ]; then
+            if [ "$tries" -ge 5 ] || [ -e "$dir" ] || [ -L "$dir" ]; then
                 printf 'remove_proof_last: %s is stranded at %s\n' "$dir" "$probe" >&2
                 return 1
             fi

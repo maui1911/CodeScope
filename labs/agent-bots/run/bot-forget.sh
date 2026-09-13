@@ -282,6 +282,17 @@ if [ "$SURFACE" -eq 1 ]; then
     # path under a probe name. Without this the retry found nothing at
     # the path, skipped both removals and printed `forgotten`, leaving
     # the clone with no record naming it.
+    # Absent and "not a directory" are different answers. A regular
+    # file or a symlink where the surface should be used to read as
+    # absent: both removals skipped, pin and record deleted, success
+    # reported, and the thing in the way still there. Same for the
+    # verify checkout. A link is refused even when it points at a
+    # directory - remove_proof_last will not walk through one.
+    for path in "$WORKTREE" "$VERIFY_WT"; do
+        if [ -L "$path" ] || { [ -e "$path" ] && [ ! -d "$path" ]; }; then
+            die "$path is not a directory (a file or a symlink) - refusing to guess what it is. Nothing was removed."
+        fi
+    done
     for stranded in "$WORKTREE".removing.* "$VERIFY_WT".removing.*; do
         [ -e "$stranded" ] || continue
         die "$stranded is a removal of this surface that did not finish - move it back to its name, then retry. Nothing was removed."

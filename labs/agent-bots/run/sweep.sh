@@ -965,22 +965,32 @@ check "dispatched is unfinished"   unfinished \
 # checks and the removals are one critical section with the runner's
 # claim, or a --reset can start building a new surface between this
 # script's "no marker, a verdict" and its `rm -rf`. F-50.
+#
+# The lock is the real control plane's, so the fixture takes it the way
+# a runner does - a plain mkdir that fails when somebody holds it - and
+# gives back only what it put there. `mkdir -p` would have walked into a
+# real claim's lock and the cleanup could then have taken its owner
+# file. A lock that is already held is a skip, not a pass.
 write_live T-0994 done
-mkdir -p "$STATE/dispatch.lock"
-: > "$STATE/dispatch.lock/owner.$$-0-sweep"
-FORGET_RC=0
-BOT_FORGET_LOCK_WAIT=1 bash "$FORGET" T-0994 --state "$STATE" >/dev/null 2>&1 || FORGET_RC=$?
-check "a held claim stops forget" 1 "$FORGET_RC"
-if [ -f "$STATE/tasks/T-0994.md" ] && [ -f "$STATE/dispatch.lock/owner.$$-0-sweep" ]; then
-    printf 'ok    %-28s record kept, lock not broken\n' "forget waits its turn"
-    CHECKS=$((CHECKS + 1))
+if mkdir "$STATE/dispatch.lock" 2>/dev/null; then
+    : > "$STATE/dispatch.lock/owner.$$-0-sweep"
+    FORGET_RC=0
+    BOT_FORGET_LOCK_WAIT=1 bash "$FORGET" T-0994 --state "$STATE" >/dev/null 2>&1 || FORGET_RC=$?
+    check "a held claim stops forget" 1 "$FORGET_RC"
+    if [ -f "$STATE/tasks/T-0994.md" ] && [ -f "$STATE/dispatch.lock/owner.$$-0-sweep" ]; then
+        printf 'ok    %-28s record kept, lock not broken\n' "forget waits its turn"
+        CHECKS=$((CHECKS + 1))
+    else
+        printf 'FAIL  %-28s it removed the record or broke a live lock\n' "forget waits its turn"
+        CHECKS=$((CHECKS + 1))
+        FAILURES=$((FAILURES + 1))
+    fi
+    rm -f "$STATE/dispatch.lock/owner.$$-0-sweep"
+    rmdir "$STATE/dispatch.lock" 2>/dev/null || true
 else
-    printf 'FAIL  %-28s it removed the record or broke a live lock\n' "forget waits its turn"
-    CHECKS=$((CHECKS + 1))
-    FAILURES=$((FAILURES + 1))
+    printf 'skip  %-28s a real claim holds dispatch.lock\n' "a held claim stops forget"
+    SKIPS=$((SKIPS + 1))
 fi
-rm -f "$STATE/dispatch.lock/owner.$$-0-sweep"
-rmdir "$STATE/dispatch.lock" 2>/dev/null
 rm -f "$STATE/tasks/T-0994.md"
 
 # A plain-folder project keeps its pin in the snapshot repository, not
@@ -1138,6 +1148,40 @@ check "a stranded removal stops" 1 "$FORGET_RC"
 check "and keeps its record" yes \
     "$([ -f "$STRAND_PLANE/tasks/T-0994.md" ] && printf yes || printf no)"
 rm -rf "$STRAND_PLANE"
+
+# A file where the surface should be is not an absent surface. It read
+# as absent: both removals skipped, pin and record gone, success.
+TYPE_PLANE="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-type.$$")"
+mkdir -p "$TYPE_PLANE/tasks"
+: > "$TYPE_PLANE/board.md"
+git init --quiet --bare "$TYPE_PLANE/snapshot.git"
+printf 'not a surface\n' > "$TYPE_PLANE/surface"
+printf -- '---\nid: T-0994\nowner: fixer\nstatus: done\nworktree: %s/surface\norigin_repo: %s/snapshot.git\n---\n' \
+    "$TYPE_PLANE" "$TYPE_PLANE" > "$TYPE_PLANE/tasks/T-0994.md"
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$TYPE_PLANE" --surface >/dev/null 2>&1 || FORGET_RC=$?
+check "a file is not a surface" 1 "$FORGET_RC"
+check "and the record stays" yes \
+    "$([ -f "$TYPE_PLANE/tasks/T-0994.md" ] && printf yes || printf no)"
+rm -rf "$TYPE_PLANE"
+
+# Removal never walks through a link. A surface whose `.git` is a
+# symlink used to have the link target's entries removed one by one.
+LINK_ROOT="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-link.$$")"
+mkdir -p "$LINK_ROOT/outside" "$LINK_ROOT/tree"
+printf 'bot-run surface for T-0994\n' > "$LINK_ROOT/outside/bot-surface"
+printf 'keep me\n' > "$LINK_ROOT/outside/precious"
+if ln -s "$LINK_ROOT/outside" "$LINK_ROOT/tree/.git" 2>/dev/null && [ -L "$LINK_ROOT/tree/.git" ]; then
+    LINK_RC=0
+    remove_proof_last "$LINK_ROOT/tree" .git/bot-surface || LINK_RC=$?
+    check "a linked .git is refused" 1 "$LINK_RC"
+    check "and its target is untouched" yes \
+        "$([ -f "$LINK_ROOT/outside/precious" ] && printf yes || printf no)"
+else
+    printf 'skip  %-28s this shell does not make symlinks\n' "a linked .git is refused"
+    SKIPS=$((SKIPS + 1))
+fi
+rm -rf "$LINK_ROOT"
 
 # --surface on a record that names no surface. A task whose frontmatter
 # was never closed runs, but set_field never inserts `worktree:` into it,
@@ -1731,8 +1775,16 @@ rm -f "$STATE"/tasks/T-998*.md 2>/dev/null
 # and a run that has to get past both.
 # --------------------------------------------------------------------
 
-if find "$STATE" -prune -mmin +1 -print >/dev/null 2>&1; then
-    mkdir -p "$STATE/dispatch.lock" "$STATE/dispatch.lock.break"
+if ! find "$STATE" -prune -mmin +1 -print >/dev/null 2>&1; then
+    printf 'skip  %-28s this find rejects -mmin\n' "wedged lock recovered"
+    SKIPS=$((SKIPS + 1))
+elif ! mkdir "$STATE/dispatch.lock" 2>/dev/null; then
+    # Somebody really holds it. Aging their lock to 2020 and removing
+    # it afterwards is how a sweep makes a real claim roll back.
+    printf 'skip  %-28s a real claim holds dispatch.lock\n' "wedged lock recovered"
+    SKIPS=$((SKIPS + 1))
+else
+    mkdir -p "$STATE/dispatch.lock.break"
     # A marker named for a pid that is not running: the lock protocol
     # names the owner file after its holder's run token, and the first
     # field of that token is the pid. 999999 is chosen to be absent, so
@@ -1743,12 +1795,16 @@ if find "$STATE" -prune -mmin +1 -print >/dev/null 2>&1; then
     bash "$RUN" --task "$EX/T-0001-smoke-test.md" --reset --repo "$REPO" \
         --skip-agent >/dev/null 2>&1 || WEDGERC=$?
     check "wedged lock recovered" 0 "$WEDGERC"
-    rm -rf "$STATE/dispatch.lock" "$STATE/dispatch.lock.break"
+    # Only what is still the fixture's. The run broke the fixture lock,
+    # took its own and released it, so a dispatch.lock here now is
+    # somebody else's unless the fixture's owner file is still inside.
+    if [ -f "$STATE/dispatch.lock/owner.999999-1577836800-1234" ]; then
+        rm -f "$STATE/dispatch.lock/owner.999999-1577836800-1234"
+        rmdir "$STATE/dispatch.lock" 2>/dev/null || true
+    fi
+    rmdir "$STATE/dispatch.lock.break" 2>/dev/null || true
     cleanup bot/fixer/T-0001
     rm -f "$STATE"/tasks/T-0001.md 2>/dev/null
-else
-    printf 'skip  %-28s this find rejects -mmin\n' "wedged lock recovered"
-    SKIPS=$((SKIPS + 1))
 fi
 
 # --------------------------------------------------------------------
