@@ -603,6 +603,13 @@ pub fn process_new_lines(
 /// into it or close it. And a working session can be silent for a long
 /// time: an assistant entry is written per finished content block, so a
 /// long thinking or generation step writes nothing until it ends.
+///
+/// Measured on [`Instant`], which is monotonic. On Linux and macOS it
+/// does not advance while the machine is suspended, so a session that
+/// was busy when the machine went to sleep goes idle ten minutes after
+/// wake rather than on wake. That is the safe direction to be late in,
+/// and a wall-clock timestamp would bring clock changes and rollback
+/// into a check that currently cannot be fooled by them.
 pub const BUSY_QUIET_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Handle to a watched JSONL transcript. Tracks read position so
