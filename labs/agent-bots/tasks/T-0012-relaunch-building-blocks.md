@@ -6,7 +6,7 @@ status: todo
 base: labs/agent-bots
 branch: bot/fixer/T-0012
 touches: core/src/relaunch.rs, core/src/lib.rs
-verify: grep -q '^pub mod relaunch;' core/src/lib.rs && cargo test -p codescope-core --lib relaunch && ! grep -q 'thread::sleep' core/src/relaunch.rs
+verify: bash labs/agent-bots/tasks/checks/T-0012.sh
 schedule: auto
 ---
 
@@ -33,7 +33,11 @@ separate, human change (see Notes).
 
 # Acceptance
 
-- [ ] The `verify:` command exits 0.
+- [ ] The `verify:` command exits 0. It is
+      `labs/agent-bots/tasks/checks/T-0012.sh`, outside `touches:`: it
+      requires every public item below to exist, at least 12
+      `relaunch::` tests in the harness listing, no `thread::sleep`, and
+      then a passing test run. Read it; do not try to change it.
 - [ ] The diff stays inside `touches:`.
 - [ ] `core/src/lib.rs` declares `pub mod relaunch;` in alphabetical
       order with the other modules. No re-exports are required.
@@ -67,9 +71,12 @@ separate, human change (see Notes).
       process still alive. It checks before its first sleep, so a pid
       that is already gone costs no sleep at all. Elapsed time is the
       sum of the durations it has passed to `sleep` — no `Instant`, no
-      real clock — so tests are exact. Tests cover: already gone (zero
-      sleeps), gone after N polls, and still alive at the timeout (and
-      that it never sleeps past the timeout).
+      real clock — so tests are exact. A `poll` of `Duration::ZERO`
+      could never add up to the timeout, so it means "check once": the
+      result of the single initial check, with no sleep. Tests cover:
+      already gone (zero sleeps), gone after N polls, still alive at the
+      timeout (and never sleeping past it), and a zero `poll` with the
+      process alive (returns `false`, zero sleeps).
 - [ ] `pub fn pid_is_alive(pid: u32) -> bool` answers for the real OS:
       - Windows: `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)`
         then `GetExitCodeProcess`; alive only if the exit code is
