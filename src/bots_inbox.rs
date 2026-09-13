@@ -51,6 +51,10 @@ pub(crate) struct BotsInboxState {
     /// Id of the task shown in the detail pane.
     pub selected: Option<String>,
     pub error: Option<String>,
+    /// The project root the shown data belongs to.
+    pub root: Option<String>,
+    /// Cleared for a newly selected project, first read not back yet.
+    pub reading: bool,
     /// Sequence stamp of the newest read started.
     pub request_id: u64,
     /// Stamp of the read currently shown; an older result that lands
@@ -160,6 +164,11 @@ impl AppShell {
     /// The loop waits for each read before scheduling the next, so a
     /// slow disk slows the poll down instead of stacking reads.
     pub(crate) fn start_bots_poll(&mut self, cx: &mut Context<Self>) {
+        // Selecting another project re-renders the sidebar; that is the
+        // moment to drop the old project's inbox, not the next poll.
+        let sidebar = self.sidebar_entity().clone();
+        cx.observe(&sidebar, |this, _, cx| this.reset_bots_on_project_change(cx)).detach();
+
         cx.spawn(async move |this, cx| {
             loop {
                 let Ok((request_id, root)) = this.update(cx, |this, cx| this.begin_bots_read(cx))
@@ -191,6 +200,27 @@ impl AppShell {
         .detach();
     }
 
+    /// When the selected project is no longer the one the inbox shows,
+    /// clear it (panel, badge and actions) and read the new one.
+    fn reset_bots_on_project_change(&mut self, cx: &mut Context<Self>) {
+        let root = self.active_project_path(cx);
+        if root == self.bots.root {
+            return;
+        }
+        self.bots = BotsInboxState {
+            root,
+            reading: true,
+            request_id: self.bots.request_id,
+            applied_id: self.bots.applied_id,
+            ..BotsInboxState::default()
+        };
+        self.push_bots_footer(cx);
+        if self.show_bots {
+            cx.notify();
+        }
+        self.refresh_bots(cx);
+    }
+
     fn begin_bots_read(&mut self, cx: &mut Context<Self>) -> (u64, Option<String>) {
         self.bots.request_id += 1;
         (self.bots.request_id, self.active_project_path(cx))
@@ -214,10 +244,13 @@ impl AppShell {
             Err(err) => (Vec::new(), Some(err)),
         };
         let state = &mut self.bots;
-        let changed = state.plane != snapshot.plane
+        let changed = state.reading
+            || state.plane != snapshot.plane
             || state.items != items
             || state.events != snapshot.events
             || state.error != error;
+        state.root = snapshot.root;
+        state.reading = false;
         if changed {
             state.selected = keep_selection(state.selected.as_deref(), &items);
             state.plane = snapshot.plane;
@@ -281,7 +314,8 @@ impl AppShell {
 
         let attention = attention_count(&state.items);
         let subtitle: SharedString = match (&state.plane, &state.error) {
-            (None, _) => "no control plane in the selected project".into(),
+            _ if state.reading => "reading…".into(),
+            (None, _) =>"no control plane in the selected project".into(),
             (Some(_), Some(err)) => SharedString::from(format!("error: {err}")),
             (Some(_), None) => {
                 let tasks = match state.items.len() {
@@ -364,6 +398,7 @@ impl AppShell {
             .child(back_button);
 
         let empty = match (&state.plane, &state.error) {
+            _ if state.reading => Some(("Reading…", "")),
             (None, _) => Some((
                 "No bots in this project",
                 "The inbox reads labs/agent-bots/.state under the selected project.",

@@ -8319,6 +8319,11 @@ impl AppShell {
         );
     }
 
+    /// The sidebar entity, for modules that need to observe it.
+    pub(crate) fn sidebar_entity(&self) -> &Entity<Sidebar> {
+        &self.sidebar
+    }
+
     /// Push the footer "Bots" button state into the sidebar. Thin
     /// accessor so `bots_inbox` does not reach into the private
     /// `sidebar` entity.
