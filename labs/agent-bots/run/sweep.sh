@@ -1123,6 +1123,22 @@ if [ -e "$PROOF_TREE" ]; then
 fi
 rm -rf "$PROOF_ROOT"
 
+# A stranded removal - a tree left under its probe name - stops a
+# retry instead of letting it find nothing and say `forgotten`.
+STRAND_PLANE="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-strand.$$")"
+mkdir -p "$STRAND_PLANE/tasks" "$STRAND_PLANE/surface.removing.1/.git"
+: > "$STRAND_PLANE/board.md"
+git init --quiet --bare "$STRAND_PLANE/snapshot.git"
+printf 'bot-run surface for T-0994\n' > "$STRAND_PLANE/surface.removing.1/.git/bot-surface"
+printf -- '---\nid: T-0994\nowner: fixer\nstatus: done\nworktree: %s/surface\norigin_repo: %s/snapshot.git\n---\n' \
+    "$STRAND_PLANE" "$STRAND_PLANE" > "$STRAND_PLANE/tasks/T-0994.md"
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$STRAND_PLANE" --surface >/dev/null 2>&1 || FORGET_RC=$?
+check "a stranded removal stops" 1 "$FORGET_RC"
+check "and keeps its record" yes \
+    "$([ -f "$STRAND_PLANE/tasks/T-0994.md" ] && printf yes || printf no)"
+rm -rf "$STRAND_PLANE"
+
 # --surface on a record that names no surface. A task whose frontmatter
 # was never closed runs, but set_field never inserts `worktree:` into it,
 # and --surface then skipped its whole block and printed `forgotten` -

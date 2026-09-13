@@ -182,9 +182,22 @@ remove_proof_last() {
     fi
     [ "$ok" -eq 1 ] || return 1
     if [ -e "$dir" ]; then
-        local probe="$dir.removing.$$"
+        # A name that already exists would make `mv` move the tree
+        # *into* it rather than rename it. And the rename back is
+        # retried, then named if it still fails: a tree left under the
+        # probe name is one no caller looks for (bot-forget refuses a
+        # record whose surface has one beside it).
+        local probe="$dir.removing.$$" tries=0
+        [ ! -e "$probe" ] || return 1
         mv "$dir" "$probe" 2>/dev/null || return 1
-        mv "$probe" "$dir" 2>/dev/null || return 1
+        until mv "$probe" "$dir" 2>/dev/null; do
+            tries=$((tries + 1))
+            if [ "$tries" -ge 5 ]; then
+                printf 'remove_proof_last: %s is stranded at %s\n' "$dir" "$probe" >&2
+                return 1
+            fi
+            sleep 1
+        done
     fi
     rm -rf "$dir" 2>/dev/null || true
     [ ! -e "$dir" ]

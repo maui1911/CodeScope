@@ -278,6 +278,14 @@ if [ "$SURFACE" -eq 1 ]; then
     # *file* pointing back at its parent: that file both identifies it
     # and says whose it is. Same proof the runner uses.
     VERIFY_WT="$WORKTREE-verify"
+    # A tree remove_proof_last could not rename back sits beside its
+    # path under a probe name. Without this the retry found nothing at
+    # the path, skipped both removals and printed `forgotten`, leaving
+    # the clone with no record naming it.
+    for stranded in "$WORKTREE".removing.* "$VERIFY_WT".removing.*; do
+        [ -e "$stranded" ] || continue
+        die "$stranded is a removal of this surface that did not finish - move it back to its name, then retry. Nothing was removed."
+    done
     if [ -e "$VERIFY_WT" ]; then
         [ -f "$VERIFY_WT/.git" ] \
             && grep -q "$(basename "$WORKTREE")" "$VERIFY_WT/.git" 2>/dev/null \

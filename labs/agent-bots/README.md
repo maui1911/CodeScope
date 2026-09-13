@@ -4033,4 +4033,12 @@ stages it for real (a `cmd.exe` sitting in the tree on Windows, an
 unwritable subdirectory elsewhere) and failed against the previous
 helper with "proof gone".
 
-Sweep is 151.
+A third Opus pass found nothing significant, and two small edges of that
+rename: a probe name that already exists makes `mv` move the tree inside
+it, and a rename back that fails leaves the tree under the probe name,
+where a retry of `bot-forget` found nothing, skipped both removals and
+said `forgotten`. The probe name is checked first, the rename back is
+retried and named if it still fails, and `bot-forget` refuses a surface
+with a stranded removal beside it.
+
+Sweep is 153.
