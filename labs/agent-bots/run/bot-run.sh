@@ -2821,22 +2821,14 @@ run_verify() {
     # the subject changes with what the task produces, the contract
     # ("an executable that must exit 0") does not. See F-19.
     #
-    # BOT_ARTIFACT and BOT_SUBJECT_SHA are the names; BOT_REVIEW and
-    # BOT_REVIEWED_SHA are the same two values under the names the
-    # reviewer role gave them when it was the only role. Both are
-    # exported for exactly one merge, and the shim is not backwards
-    # compatibility - it is provability.
-    #
-    # `verify:` runs inside the verify checkout, so the script that
-    # reads these is the copy at *base*, not the one in the working
-    # tree. Rename both sides in one change and the branch's own sweep
-    # runs the base script, which is still asking for the old names,
-    # and goes red on a change that is correct. Exporting both makes
-    # the intermediate state checkable: the base script gets what it
-    # asks for, the working-tree script gets the new names, and both
-    # paths are green. Once this is at base, a second change deletes
-    # the two BOT_REVIEW* lines below and is green for the mirror
-    # reason. See #348 for the two-step sequence.
+    # BOT_ARTIFACT and BOT_SUBJECT_SHA are named for the job, not for
+    # the reviewer role that had it first. They replaced BOT_REVIEW and
+    # BOT_REVIEWED_SHA across two merges, because `verify:` runs inside
+    # the verify checkout: the script reading these is the copy at
+    # *base*, so a one-step rename runs the new runner against the old
+    # script and goes red on a correct change. Step one exported both
+    # names; this is step two, and it is green because base now reads
+    # only the new ones. See #348 and F-51.
     # BOT_RUN_ACTIVE here as well as around the agent. `verify:` is a
     # shell command sourced from repo content (F-6) and it runs inside
     # this loop, so without the marker a verifier - including one the
@@ -2848,8 +2840,6 @@ run_verify() {
         && export BOT_RUN_ACTIVE="$RUN_TOKEN" \
         && export BOT_ARTIFACT="$ARTIFACT_FILE" \
         && export BOT_SUBJECT_SHA="$sha" \
-        && export BOT_REVIEW="$ARTIFACT_FILE" \
-        && export BOT_REVIEWED_SHA="$sha" \
         && export BOT_TOUCHES="$TASK_TOUCHES" \
         && export BOT_TASK_ID="$TASK_ID" \
         && eval "$TASK_VERIFY" ) </dev/null >>"$RUN_LOG" 2>&1 || VERIFY_EXIT=$?
