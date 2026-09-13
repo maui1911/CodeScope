@@ -1884,6 +1884,15 @@ leaves the branch behind, and 'worktree add -b' then fails too:
     git -C $REPO worktree remove --force $WT
     git -C $REPO branch -D $TASK_BRANCH"
 fi
+# A removal that could not rename its tree back leaves it beside this
+# path under a probe name (live-task.sh, remove_proof_last). Building a
+# new surface here would make "move it back to its name" impossible
+# without moving one tree into the other.
+for stranded in "$WT".removing.* "$VERIFY_WT".removing.*; do
+    [ -e "$stranded" ] || continue
+    refuse "an earlier removal of this surface did not finish: $stranded
+Move it back to its name, or remove it, before re-running."
+done
 if [ -e "$VERIFY_WT" ]; then
     die "verify checkout left over from an earlier run: $VERIFY_WT
 
