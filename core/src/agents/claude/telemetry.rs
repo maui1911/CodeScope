@@ -581,6 +581,7 @@ pub fn process_new_lines(
             turn_count,
             last_turn_duration,
             state,
+            quiet_timeout: false,
         });
     }
 
@@ -692,14 +693,17 @@ impl ClaudeTranscriptTail {
             self.observed_mtime = mtime;
         }
 
-        // Only the state moves: tokens, turns, model and the turn anchor
-        // still describe what the transcript said.
+        // Only the state moves (and says why): tokens, turns, model and
+        // the turn anchor still describe what the transcript said.
         if let Some(snapshot) = self.snapshot.as_mut()
             && snapshot.state == SessionState::Busy
             && self.pending_agents.is_empty()
             && now.saturating_duration_since(self.last_activity) >= BUSY_QUIET_TIMEOUT
         {
             snapshot.state = SessionState::Idle;
+            // Not a finished turn: the app reads this to stay quiet
+            // instead of announcing "Turn complete".
+            snapshot.quiet_timeout = true;
             return true;
         }
         changed
@@ -1579,6 +1583,7 @@ mod tests {
 
         assert!(tail.poll_at(start + past_timeout()));
         assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Idle);
+        assert!(tail.snapshot.as_ref().unwrap().quiet_timeout);
         assert_eq!(tail.poll_interval(), Duration::from_secs(2));
 
         // Already idle: a later poll has nothing to report.
@@ -1690,12 +1695,33 @@ mod tests {
         append_lines(&path, &[PROMPT]);
         assert!(tail.poll_at(resumed));
         assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Busy);
+        // The transcript spoke again, so the timeout no longer explains
+        // the state.
+        assert!(!tail.snapshot.as_ref().unwrap().quiet_timeout);
 
         // The window restarted at the new prompt, not at the old one.
         tail.poll_at(resumed + BUSY_QUIET_TIMEOUT / 2);
         assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Busy);
         tail.poll_at(resumed + past_timeout());
         assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Idle);
+    }
+
+    #[test]
+    fn a_turn_the_transcript_ends_is_not_a_quiet_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(
+            &path,
+            &[
+                r#"{"type":"user","sessionId":"s","timestamp":"2026-04-22T08:00:00Z","message":{"role":"user","content":"hi"}}"#,
+                r#"{"type":"assistant","sessionId":"s","timestamp":"2026-04-22T08:01:00Z","message":{"role":"assistant","model":"claude-opus-4-7[1m]","stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":20,"cache_creation_input_tokens":100,"cache_read_input_tokens":50}}}"#,
+            ],
+        );
+
+        let tail = ClaudeTranscriptTail::new(path);
+        let snap = tail.snapshot.as_ref().unwrap();
+        assert_eq!(snap.state, SessionState::Idle);
+        assert!(!snap.quiet_timeout);
     }
 
     #[test]
@@ -1720,7 +1746,10 @@ mod tests {
 
         assert!(tail.poll_at(start + past_timeout()));
         let after = tail.snapshot.clone().unwrap();
-        assert_eq!(after, TelemetrySnapshot { state: SessionState::Idle, ..before });
+        assert_eq!(
+            after,
+            TelemetrySnapshot { state: SessionState::Idle, quiet_timeout: true, ..before }
+        );
         assert_eq!(tail.last_user_ts, last_user_ts);
     }
 

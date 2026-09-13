@@ -6414,7 +6414,11 @@ impl AppShell {
                 // pinging the OS if the user is already staring at
                 // CodeScope. Matches the C# `IdleNotifier` placement
                 // *before* the SelectedTab suppression check.
+                // Not for an idle the quiet-window fallback produced
+                // (#351): nothing completed, the transcript just
+                // stopped, so "Turn complete" would be a false claim.
                 if !self.window_active_cached
+                    && !snap.quiet_timeout
                     && matches!(
                         (prev, snap.state),
                         (
@@ -9203,6 +9207,9 @@ fn classify_activity_transition(
             "Needs attention",
             "Agent paused on a tool prompt.".to_string(),
         )),
+        // A quiet-window timeout (#351) is not a finished turn; say
+        // nothing rather than "Ready".
+        (Busy | PendingToolUse, Idle) if snap.quiet_timeout => None,
         (Busy | PendingToolUse, Idle) => {
             let detail = match snap.last_turn_duration {
                 Some(d) => format!(
@@ -9722,6 +9729,7 @@ mod tests {
             turn_count: 0,
             last_turn_duration: None,
             state,
+            quiet_timeout: false,
         }
     }
 
@@ -9766,6 +9774,17 @@ mod tests {
         assert_eq!(kind, crate::notifications::NotificationKind::SessionReady);
         assert_eq!(title, "Ready");
         assert_eq!(detail, "Turn complete.");
+    }
+
+    #[test]
+    fn classify_activity_transition_is_silent_for_a_quiet_timeout() {
+        let snap = codescope_core::TelemetrySnapshot {
+            quiet_timeout: true,
+            ..snap_with_state(codescope_core::SessionState::Idle)
+        };
+        assert!(
+            classify_activity_transition(codescope_core::SessionState::Busy, &snap).is_none()
+        );
     }
 
     #[test]

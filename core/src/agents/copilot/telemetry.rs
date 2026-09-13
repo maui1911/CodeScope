@@ -290,6 +290,7 @@ pub fn process_new_lines(
             turn_count,
             last_turn_duration,
             state,
+            quiet_timeout: false,
         });
     }
 
