@@ -51,13 +51,18 @@ pub(crate) struct BotsInboxState {
     /// Id of the task shown in the detail pane.
     pub selected: Option<String>,
     pub error: Option<String>,
-    /// Sequence stamp of the newest read; an older result that lands
-    /// late is dropped.
+    /// Sequence stamp of the newest read started.
     pub request_id: u64,
+    /// Stamp of the read currently shown; an older result that lands
+    /// late is dropped, but a slow read is never starved by newer ones
+    /// still in flight.
+    pub applied_id: u64,
 }
 
 /// One background read of a control plane.
 struct BotsSnapshot {
+    /// The project root the read was for.
+    root: Option<String>,
     plane: Option<PathBuf>,
     items: Result<Vec<InboxItem>, String>,
     events: Vec<BoardEvent>,
@@ -68,12 +73,17 @@ fn read_snapshot(project_root: Option<String>) -> BotsSnapshot {
         .as_deref()
         .and_then(|root| codescope_core::bots::lab_control_plane(Path::new(root)));
     let Some(dir) = plane.as_deref() else {
-        return BotsSnapshot { plane, items: Ok(Vec::new()), events: Vec::new() };
+        return BotsSnapshot {
+            root: project_root,
+            plane,
+            items: Ok(Vec::new()),
+            events: Vec::new(),
+        };
     };
     let items = codescope_core::bots::load_inbox(dir).map_err(|e| e.to_string());
     let board = std::fs::read_to_string(dir.join("board.md")).unwrap_or_default();
     let events = codescope_core::bots::parse_board(&board);
-    BotsSnapshot { plane, items, events }
+    BotsSnapshot { root: project_root, plane, items, events }
 }
 
 /// Tasks that are blocked or waiting for review.
@@ -146,11 +156,19 @@ fn open_with_default_app(path: &Path) {
 
 impl AppShell {
     /// Start the control-plane poll. Called once from the constructor.
+    ///
+    /// The loop waits for each read before scheduling the next, so a
+    /// slow disk slows the poll down instead of stacking reads.
     pub(crate) fn start_bots_poll(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             loop {
+                let Ok((request_id, root)) = this.update(cx, |this, cx| this.begin_bots_read(cx))
+                else {
+                    break;
+                };
+                let snapshot = cx.background_spawn(async move { read_snapshot(root) }).await;
                 let Ok(visible) = this.update(cx, |this, cx| {
-                    this.refresh_bots(cx);
+                    this.finish_bots_read(request_id, snapshot, cx);
                     this.show_bots
                 }) else {
                     break;
@@ -162,21 +180,32 @@ impl AppShell {
         .detach();
     }
 
-    /// Re-read the selected project's control plane in the background
-    /// and fold the result in, unless a newer read has started since.
+    /// Read the selected project's control plane once, now, outside
+    /// the poll (opening the panel).
     pub(crate) fn refresh_bots(&mut self, cx: &mut Context<Self>) {
-        self.bots.request_id += 1;
-        let request_id = self.bots.request_id;
-        let root = self.active_project_path(cx);
+        let (request_id, root) = self.begin_bots_read(cx);
         cx.spawn(async move |this, cx| {
             let snapshot = cx.background_spawn(async move { read_snapshot(root) }).await;
-            let _ = this.update(cx, |this, cx| {
-                if this.bots.request_id == request_id {
-                    this.apply_bots_snapshot(snapshot, cx);
-                }
-            });
+            let _ = this.update(cx, |this, cx| this.finish_bots_read(request_id, snapshot, cx));
         })
         .detach();
+    }
+
+    fn begin_bots_read(&mut self, cx: &mut Context<Self>) -> (u64, Option<String>) {
+        self.bots.request_id += 1;
+        (self.bots.request_id, self.active_project_path(cx))
+    }
+
+    /// Apply a finished read unless something newer is already shown,
+    /// or the selected project changed while it ran (that project's
+    /// result would otherwise fill the panel and badge until the next
+    /// read).
+    fn finish_bots_read(&mut self, request_id: u64, snapshot: BotsSnapshot, cx: &mut Context<Self>) {
+        if request_id <= self.bots.applied_id || snapshot.root != self.active_project_path(cx) {
+            return;
+        }
+        self.bots.applied_id = request_id;
+        self.apply_bots_snapshot(snapshot, cx);
     }
 
     fn apply_bots_snapshot(&mut self, snapshot: BotsSnapshot, cx: &mut Context<Self>) {
