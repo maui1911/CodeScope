@@ -4002,4 +4002,25 @@ folder is there and has no repository in it; anything else refuses and
 asks for `--repo`. A failed lookup is not a folder any more than it is a
 dead process.
 
-Sweep is 150.
+An Opus review then showed that fallback could never have worked: the
+runner stamps the *git dir*, `<project>/.git`, so "a folder with no
+`.git` in it" is always true of an unreadable repository — and the
+sweep's fixtures stamped the work tree, a shape the runner never
+writes, so they passed. Three fallbacks in a row had reconstructed
+provenance from the disk and each was wrong in a new case. The rule now
+is only what is certain: the runner cuts from the stamp or from
+`snapshot.git`, and the snapshot exists only if a folder was imported.
+No snapshot, the stamp; a snapshot, refuse and ask for `--repo`. The
+fixtures stamp what the runner stamps.
+
+The same review found two more. A removal a Windows file lock stops
+halfway had already deleted `.git` — `rm -rf` goes in name order — so
+every retry refused the tree as not a bot surface; removals now take the
+ownership proof last and keep it if anything else failed. And a task
+whose frontmatter was never closed still runs, but `set_field` never
+inserts `worktree:` into it, so `--surface` skipped its block and deleted
+the only record naming the clone and the pin. The runner reads its
+fields back and rolls back if they did not take; `--surface` refuses a
+record without `worktree:`. The partial-removal path has no sweep case.
+
+Sweep is 149.

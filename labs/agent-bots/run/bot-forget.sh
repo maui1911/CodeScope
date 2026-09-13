@@ -213,7 +213,17 @@ fi
 REMOVED_SURFACE=""
 REMOVED_VERIFY=""
 REMOVED_PIN=""
-if [ "$SURFACE" -eq 1 ] && [ -n "$WORKTREE" ]; then
+# --surface on a record that names no surface cannot do what it was
+# asked, and used to say `forgotten` anyway: the whole block below was
+# skipped, and the record - the only thing naming the clone and the
+# pin - went. A task whose frontmatter was never closed is one way to
+# get there; the runner checks for it now, but records from before it
+# did can still be on disk.
+if [ "$SURFACE" -eq 1 ] && [ -z "$WORKTREE" ]; then
+    die "$TASK_ID's record has no worktree: field, so --surface cannot find what to remove. Look at $LIVE, and forget without --surface once the surface is dealt with. Nothing was removed."
+fi
+
+if [ "$SURFACE" -eq 1 ]; then
     # Which repository holds the pin, established before anything is
     # removed. The first version worked it out last, after the clone
     # was gone, and for a plain-folder project it worked it out wrong:
@@ -234,36 +244,25 @@ if [ "$SURFACE" -eq 1 ] && [ -n "$WORKTREE" ]; then
     # pin still in the project.
     #
     # A record from before the field existed has no provenance, and
-    # nothing on disk *now* can stand in for it with certainty. The
-    # runner's rule is a probe of the project, not the task's `base:` -
-    # a git repository with a branch called `folder` is cut from the
-    # project, and the first fallback sent it to the snapshot. So the
-    # fallback asks the runner's question (bot-run.sh, SURFACE), and
-    # where the answer could have changed since - the project is a work
-    # tree now *and* a snapshot repository exists, so it may have been a
-    # folder then - it refuses and asks for --repo rather than guessing
-    # which of two repositories to delete a ref from.
+    # three successive fallbacks tried to reconstruct it from the disk -
+    # from `base:`, then from a probe of the project, then from whether
+    # the stamp looked like a folder - and each was wrong in a new case
+    # (the stamp is a git dir, so it never looks like a folder). What is
+    # actually certain is smaller: the runner only ever cuts from the
+    # stamped project or from `$STATE/snapshot.git`, and the snapshot
+    # exists only if a folder was imported. No snapshot, so the stamp -
+    # and if the snapshot was deleted since, its pins went with it and
+    # removing from the stamp is a harmless no-op. A snapshot, so it
+    # could be either, and this refuses rather than guessing which
+    # repository to delete a ref from.
     PIN_REPO="$REPO"
     [ -n "$PIN_REPO" ] || PIN_REPO="$(live_task_field origin_repo "$LIVE_TEXT")"
     if [ -z "$PIN_REPO" ]; then
-        STAMP="$(cat "$STATE/REPO" 2>/dev/null || true)"
-        [ -n "$STAMP" ] \
+        [ ! -d "$STATE/snapshot.git" ] \
+            || die "this record predates origin_repo:, and this plane has imported a folder, so its pin could be in the project or in $STATE/snapshot.git. Pass --repo with the one it was cut from. Nothing was removed."
+        PIN_REPO="$(cat "$STATE/REPO" 2>/dev/null || true)"
+        [ -n "$PIN_REPO" ] \
             || die "no project to remove refs/bot-base/$TASK_ID from - $STATE/REPO is missing, so pass --repo. Nothing was removed."
-        if git -C "$STAMP" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-            [ ! -d "$STATE/snapshot.git" ] \
-                || die "this record predates origin_repo:, and its pin could be in $STAMP or in $STATE/snapshot.git - the project is a repository now, but this plane also imported a folder once. Pass --repo with the one it was cut from. Nothing was removed."
-            PIN_REPO="$STAMP"
-        elif [ -d "$STAMP" ] && [ ! -e "$STAMP/.git" ]; then
-            # A failed probe is only a folder when the folder is there
-            # and has no repository in it - the runner's own second
-            # condition. A project that moved, or one git will not read
-            # (ownership, permissions), fails the probe too, and sending
-            # that to an old snapshot deleted the record and left the
-            # real pin wherever the project went.
-            PIN_REPO="$STATE/snapshot.git"
-        else
-            die "this record predates origin_repo:, and $STAMP is neither a repository git can read nor a plain folder - it may have moved. Pass --repo with the repository the surface was cut from. Nothing was removed."
-        fi
     fi
     git -C "$PIN_REPO" rev-parse --git-dir >/dev/null 2>&1 \
         || die "$PIN_REPO is not a git repository, so whether refs/bot-base/$TASK_ID exists cannot be established. Nothing was removed."
@@ -289,8 +288,9 @@ if [ "$SURFACE" -eq 1 ] && [ -n "$WORKTREE" ]; then
     # like me" - two branches whose leaf names collide would each find a
     # marked surface at that path. A hijacked surface whose `.git` was
     # replaced has no marker and is refused, which is right: that is a
-    # thing to look at. The verify checkout's own proof is only its
-    # parent's leaf name, so this marker is what vouches for both.
+    # thing to look at. The verify checkout's proof is weaker - its
+    # parent's leaf name - and when the surface is already gone, a
+    # retry after a partial removal, that is all it has.
     if [ -d "$WORKTREE" ]; then
         grep -q "surface for $TASK_ID\$" "$WORKTREE/.git/bot-surface" 2>/dev/null \
             || die "$WORKTREE has no .git/bot-surface marker for $TASK_ID - refusing to remove it. Nothing was removed."
@@ -324,20 +324,22 @@ stop() {
     die "$@"
 }
 
-if [ "$SURFACE" -eq 1 ] && [ -n "$WORKTREE" ]; then
+if [ "$SURFACE" -eq 1 ]; then
     # Ownership was settled before the mark; what is left can only fail
     # to happen. Each removal answers through `stop` rather than letting
     # `set -e` end the script, which would leave `forgotten` as the
     # board's last word on a record that is still here - a Windows file
-    # lock inside a checkout is enough.
+    # lock inside a checkout is enough. And each removes its proof last
+    # (live-task.sh), so that a retry after that lock is released still
+    # finds the tree it is allowed to remove.
     if [ -e "$VERIFY_WT" ]; then
-        rm -rf "$VERIFY_WT" 2>/dev/null || true
-        [ ! -e "$VERIFY_WT" ] || stop "could not remove $VERIFY_WT"
+        remove_proof_last "$VERIFY_WT" .git \
+            || stop "could not remove $VERIFY_WT - its .git is kept, so this can be retried"
         REMOVED_VERIFY="$VERIFY_WT"
     fi
     if [ -d "$WORKTREE" ]; then
-        rm -rf "$WORKTREE" 2>/dev/null || true
-        [ ! -e "$WORKTREE" ] || stop "could not remove $WORKTREE"
+        remove_proof_last "$WORKTREE" .git/bot-surface \
+            || stop "could not remove $WORKTREE - its marker is kept, so this can be retried"
         REMOVED_SURFACE="$WORKTREE"
     fi
 

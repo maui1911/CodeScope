@@ -140,3 +140,39 @@ live_task_settled() {
         printf 'unfinished\n'
     fi
 }
+
+# remove_proof_last <dir> <proof> - remove a tree, its ownership proof last
+#
+# <proof> is the path, relative to <dir>, of what says whose the tree is:
+# `.git` for a verify checkout, `.git/bot-surface` for a surface. Plain
+# `rm -rf` walks in name order, so `.git` goes early - and when a file
+# deeper down will not go (a Windows lock on a built binary, an editor
+# handle), the removal failed with the proof already gone. Every retry
+# then refused the tree as "not a bot surface" and the only way out was
+# by hand. So: everything else first, the proof's own directory next,
+# the proof last, and only once nothing before it failed - a tree that
+# could not be removed keeps what identifies it. Fails if anything is
+# left.
+remove_proof_last() {
+    local dir="$1" proof="$2" head rest e ok=1
+    head="${proof%%/*}"
+    rest=""
+    [ "$head" = "$proof" ] || rest="${proof#*/}"
+    for e in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+        [ -e "$e" ] || [ -L "$e" ] || continue
+        [ "${e##*/}" != "$head" ] || continue
+        rm -rf "$e" 2>/dev/null || true
+        [ ! -e "$e" ] || ok=0
+    done
+    if [ -n "$rest" ] && [ -d "$dir/$head" ]; then
+        for e in "$dir/$head"/* "$dir/$head"/.[!.]* "$dir/$head"/..?*; do
+            [ -e "$e" ] || [ -L "$e" ] || continue
+            [ "${e##*/}" != "$rest" ] || continue
+            rm -rf "$e" 2>/dev/null || true
+            [ ! -e "$e" ] || ok=0
+        done
+    fi
+    [ "$ok" -eq 1 ] || return 1
+    rm -rf "$dir" 2>/dev/null || true
+    [ ! -e "$dir" ]
+}

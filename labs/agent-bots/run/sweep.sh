@@ -989,10 +989,8 @@ rm -f "$STATE/tasks/T-0994.md"
 # repository and stop, leaving the record and the pin and nothing that
 # showed what they belonged to. F-50.
 #
-# This record has no `origin_repo:`, like one written before the runner
-# recorded it, so it also covers the fallback: a stamp that is not a
-# repository is what sends the lookup to the snapshot - the runner's own
-# probe, not the task's `base:`.
+# The record says so in `origin_repo:`, as the runner writes it. Older
+# records without it are the next block.
 FOLDER_PLANE="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-folder.$$")"
 mkdir -p "$FOLDER_PLANE/tasks" "$FOLDER_PLANE/project"
 : > "$FOLDER_PLANE/board.md"
@@ -1012,6 +1010,7 @@ owner: fixer
 base: folder
 status: done
 worktree: $FOLDER_PLANE/surface
+origin_repo: $FOLDER_PLANE/snapshot.git
 ---
 
 # Objective
@@ -1036,30 +1035,26 @@ rm -rf "$FOLDER_PLANE"
 # its pin looked for in that repository. Three variants: the recorded
 # `origin_repo:` finds it; an older record on a plane that also has a
 # snapshot cannot know which one it was, and refuses; the same record
-# without a snapshot follows the runner's probe to the project. Each
-# record has `base: folder` on a real repository, the case where the
-# base name and the provenance disagree.
+# without a snapshot can only have come from the stamp. Each record has
+# `base: folder` on a real repository, the case where the base name and
+# the provenance disagree.
+#
+# The stamp is the git dir, `<project>/.git`, because that is what the
+# runner writes. These fixtures used to stamp the work tree instead, and
+# a fallback that tested the stamp for a `.git` inside it passed here
+# and could never have worked on a real plane.
 STRAY_PLANE="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-stray.$$")"
 mkdir -p "$STRAY_PLANE/tasks"
 : > "$STRAY_PLANE/board.md"
 git init --quiet --bare "$STRAY_PLANE/snapshot.git"
-# A work tree, because that is what the runner's probe asks for.
 git init --quiet "$STRAY_PLANE/project"
-printf '%s\n' "$STRAY_PLANE/project" > "$STRAY_PLANE/REPO"
+printf '%s\n' "$STRAY_PLANE/project/.git" > "$STRAY_PLANE/REPO"
 PROJECT_COMMIT="$(git -C "$STRAY_PLANE/project" \
     -c user.name=sweep -c user.email=sweep@bots.invalid \
     commit-tree "$(git -C "$STRAY_PLANE/project" mktree </dev/null)" -m "project")"
-for variant in recorded ambiguous moved legacy; do
+for variant in recorded ambiguous legacy; do
     git -C "$STRAY_PLANE/project" update-ref refs/bot-base/T-0994 "$PROJECT_COMMIT"
-    # moved: the stamp points at a project that is no longer there, and
-    # a snapshot from an older folder task is. A failed probe is not a
-    # folder; the pin is wherever the project went.
-    [ "$variant" != moved ] \
-        || printf '%s\n' "$STRAY_PLANE/project-moved-away" > "$STRAY_PLANE/REPO"
-    [ "$variant" != legacy ] || {
-        rm -rf "$STRAY_PLANE/snapshot.git"
-        printf '%s\n' "$STRAY_PLANE/project" > "$STRAY_PLANE/REPO"
-    }
+    [ "$variant" != legacy ] || rm -rf "$STRAY_PLANE/snapshot.git"
     {
         printf -- '---\nid: T-0994\nowner: fixer\nbase: folder\nstatus: done\n'
         printf 'worktree: %s/surface\n' "$STRAY_PLANE"
@@ -1068,7 +1063,7 @@ for variant in recorded ambiguous moved legacy; do
     } > "$STRAY_PLANE/tasks/T-0994.md"
     FORGET_RC=0
     bash "$FORGET" T-0994 --state "$STRAY_PLANE" --surface >/dev/null 2>&1 || FORGET_RC=$?
-    if [ "$variant" = ambiguous ] || [ "$variant" = moved ]; then
+    if [ "$variant" = ambiguous ]; then
         check "stray snapshot, $variant" 1 "$FORGET_RC"
         check "pin kept, $variant" no \
             "$(pin_absent "$STRAY_PLANE/project" refs/bot-base/T-0994 && printf yes || printf no)"
@@ -1081,6 +1076,18 @@ for variant in recorded ambiguous moved legacy; do
     fi
 done
 rm -rf "$STRAY_PLANE"
+
+# --surface on a record that names no surface. A task whose frontmatter
+# was never closed runs, but set_field never inserts `worktree:` into it,
+# and --surface then skipped its whole block and printed `forgotten` -
+# deleting the one record that named the clone and the pin.
+printf -- '---\nid: T-0994\nowner: fixer\nstatus: done\n---\n' > "$STATE/tasks/T-0994.md"
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$STATE" --surface >/dev/null 2>&1 || FORGET_RC=$?
+check "--surface needs a worktree" 1 "$FORGET_RC"
+check "and keeps the record" yes \
+    "$([ -f "$STATE/tasks/T-0994.md" ] && printf yes || printf no)"
+rm -f "$STATE/tasks/T-0994.md"
 
 # A board that cannot be appended to stops *every* removal, the surface
 # included. The mark used to go down after the surface and before the

@@ -2039,12 +2039,15 @@ drop_surface() {
     # here - so a removal that fails does not stop anything, and has to
     # be looked at. A verify checkout that survived while its parent
     # went would be a worktree pointing at nothing, reported as clean.
+    #
+    # Proof last, for the reason remove_proof_last gives: a removal a
+    # file lock stops halfway must leave the next attempt something to
+    # recognise.
     if [ -e "$VERIFY_WT" ]; then
-        rm -rf "$VERIFY_WT" 2>/dev/null
-        [ ! -e "$VERIFY_WT" ] || { say "  could not remove $VERIFY_WT"; return 1; }
+        remove_proof_last "$VERIFY_WT" .git \
+            || { say "  could not remove $VERIFY_WT"; return 1; }
     fi
-    rm -rf "$WT" 2>/dev/null
-    [ ! -e "$WT" ] || return 1
+    remove_proof_last "$WT" .git/bot-surface || return 1
     # Nothing borrows the base objects any more. Last, so that a removal
     # that refused above still leaves the pin in place.
     git -C "$ORIGIN_REPO" update-ref -d "refs/bot-base/$TASK_ID" >/dev/null 2>&1 || true
@@ -2097,6 +2100,16 @@ set_field base_sha "$BASE_SHA"
 # `snapshot.git` left by an earlier folder task says nothing about this
 # one. Provenance is recorded, not inferred.
 set_field origin_repo "$ORIGIN_REPO"
+# And that they are there. set_field inserts a missing key at the closing
+# fence, so a task whose frontmatter was never closed still runs - its
+# status is replaced in place - but never gets these three, and a record
+# with no `worktree:` is one bot-forget --surface cannot clean up after.
+# Read back rather than trust; this is inside the rollback, so a refusal
+# here takes the surface with it.
+LIVE_RECORDED="$(cat "$LIVE_TASK")"
+[ "$(live_task_field worktree "$LIVE_RECORDED")" = "$WT" ] \
+    && [ "$(live_task_field origin_repo "$LIVE_RECORDED")" = "$ORIGIN_REPO" ] \
+    || die "$TASK_ID's live task did not take its worktree:/origin_repo: fields - is the task's frontmatter closed with a second '---'?"
 
 # Last thing before this run becomes visible to everyone else: are we
 # still the lock holder? If the lock was broken while we were inside
