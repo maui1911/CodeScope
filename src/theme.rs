@@ -129,6 +129,11 @@ pub fn signal_ok() -> Hsla { rgb_to_hsla(Rgb::from_hex(0x4BD87B)) }
 /// and the notifications popover's `SessionWaiting` kind dot.
 pub fn signal_warn() -> Hsla { rgb_to_hsla(Rgb::from_hex(0xFF5A5A)) }
 
+/// Amber (#FFE6B450) for "waiting on a human, nothing is wrong" — the
+/// bots inbox's `needs-review` stripe, distinct from `signal_warn`'s
+/// blocked red. Hard-coded like the other signal colours.
+pub fn signal_review() -> Hsla { rgb_to_hsla(Rgb::from_hex(0xE6B450)) }
+
 // ─── Font accessors ─────────────────────────────────────────────────
 //
 // Mirror the `Fig.Font.Sans` / `Fig.Font.Mono` resources from the C#

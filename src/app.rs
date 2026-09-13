@@ -955,6 +955,14 @@ pub struct AppShell {
     /// exclusive — opening one closes the other). See
     /// [`crate::diff_viewer`].
     pub(crate) diff_viewer: Option<crate::diff_viewer::DiffViewerState>,
+    /// Bots inbox visibility; shares the work-area slot with the
+    /// Overview and the diff viewer (opening one closes the others).
+    /// See [`crate::bots_inbox`].
+    pub(crate) show_bots: bool,
+    /// What the bots inbox last read from the selected project's
+    /// control plane. Kept fresh by the poll loop whether or not the
+    /// panel is visible, so the sidebar badge stays current.
+    pub(crate) bots: crate::bots_inbox::BotsInboxState,
     /// Monotonic sequence for diff-viewer background requests, so a
     /// stale `git diff` result can never clobber a newer one.
     pub(crate) diff_request_seq: u64,
@@ -1251,6 +1259,10 @@ impl AppShell {
                     // `MainViewModel.ToggleOverview` command.
                     let next = !this.show_overview;
                     this.set_show_overview(next, cx);
+                }
+                SidebarEvent::OpenBots => {
+                    let next = !this.show_bots;
+                    this.set_show_bots(next, cx);
                 }
                 SidebarEvent::ReopenSession { session_id } => {
                     this.reopen_session(session_id.clone(), window, cx);
@@ -1661,6 +1673,8 @@ impl AppShell {
             agent_registry,
             command_palette: None,
             show_overview: false,
+            show_bots: false,
+            bots: crate::bots_inbox::BotsInboxState::default(),
             diff_viewer: None,
             diff_request_seq: 0,
             settings_dialog: None,
@@ -1673,6 +1687,7 @@ impl AppShell {
             update_progress_toast_id: None,
         };
         shell.start_telemetry_poll(cx);
+        shell.start_bots_poll(cx);
         shell.start_agent_discovery_poll(cx);
         shell.schedule_taskbar_badge_init(cx);
         shell.start_text_blink(cx);
@@ -3456,6 +3471,7 @@ impl AppShell {
         // flipping the Overview on dismisses an open diff viewer.
         if value {
             self.close_diff_viewer(cx);
+            self.set_show_bots(false, cx);
         }
         self.show_overview = value;
         // Push the new state into the sidebar so its footer
@@ -6931,6 +6947,7 @@ impl AppShell {
         //   Ctrl+Shift+P            command palette (toggle)
         //   Ctrl+Shift+O            overview pane (toggle)
         //   Ctrl+Shift+D            diff viewer (toggle)
+        //   Ctrl+Shift+I            bots inbox (toggle)
         //   Ctrl+Shift+\            split right
         //   Ctrl+Shift+G            open active tab's remote in browser
         //   Ctrl+Shift+R            open active tab's PR in browser
@@ -7023,6 +7040,13 @@ impl AppShell {
             "d" if mods.shift => {
                 cx.stop_propagation();
                 self.toggle_diff_viewer(cx);
+            }
+            // Ctrl+Shift+I — toggle the bots inbox. Plain Ctrl+I is
+            // Tab to the terminal.
+            "i" if mods.shift => {
+                cx.stop_propagation();
+                let next = !self.show_bots;
+                self.set_show_bots(next, cx);
             }
             // Ctrl+Shift+G — open the active tab's worktree origin
             // remote in the browser. Plain Ctrl+G is "abort" /
@@ -7603,7 +7627,8 @@ impl Render for AppShell {
         // target (the group grid below) is hidden. Render an empty
         // placeholder so the caption row keeps the same layout
         // footprint but doesn't surface stale tab affordances.
-        let tab_strip_inline = if self.show_overview || self.diff_viewer.is_some() {
+        let tab_strip_inline = if self.show_overview || self.show_bots || self.diff_viewer.is_some()
+        {
             div()
                 .flex()
                 .flex_row()
@@ -7679,6 +7704,8 @@ impl Render for AppShell {
             self.render_diff_viewer(&theme, cx).into_any_element()
         } else if self.show_overview {
             self.render_overview(&theme, cx).into_any_element()
+        } else if self.show_bots {
+            self.render_bots_inbox(&theme, cx).into_any_element()
         } else if projects_empty {
             // First-run hero takes over the work area whenever no
             // projects are registered. Mirrors the C# `Sidebar.IsEmpty`
@@ -8040,6 +8067,10 @@ impl AppShell {
                     // the worktree menu's "View changes" row.
                     self.toggle_diff_viewer(cx);
                 }
+                BuiltInCommand::ToggleBotsInbox => {
+                    let next = !self.show_bots;
+                    self.set_show_bots(next, cx);
+                }
                 BuiltInCommand::ToggleSidebar => {
                     self.toggle_sidebar(cx);
                 }
@@ -8111,6 +8142,7 @@ impl AppShell {
             BuiltInCommand::ToggleSidebar,
             BuiltInCommand::ToggleOverview,
             BuiltInCommand::ToggleDiffViewer,
+            BuiltInCommand::ToggleBotsInbox,
             BuiltInCommand::NewProject,
             BuiltInCommand::OpenSettings,
             BuiltInCommand::ReloadTheme,
@@ -8287,13 +8319,25 @@ impl AppShell {
         );
     }
 
+    /// Push the footer "Bots" button state into the sidebar. Thin
+    /// accessor so `bots_inbox` does not reach into the private
+    /// `sidebar` entity.
+    pub(crate) fn set_sidebar_bots_footer(
+        &mut self,
+        footer: crate::sidebar::BotsFooter,
+        cx: &mut Context<Self>,
+    ) {
+        self.sidebar.update(cx, |sidebar, cx| sidebar.set_bots_footer(footer, cx));
+    }
+
     /// Active project's working directory, if any. Used by the agent
-    /// action to pick `cwd` for the spawn. Returns `None` when no
+    /// action to pick `cwd` for the spawn, and by the bots inbox to find
+    /// the control plane. Returns `None` when no
     /// project is selected, or when it's a remote-shell project (#323)
     /// / has an empty path — those carry no local cwd, so the palette
     /// agent launch falls back to the default cwd instead of passing
     /// `Some("")` (which would reach `-WorkingDirectory ""` and fail).
-    fn active_project_path(&self, cx: &Context<Self>) -> Option<String> {
+    pub(crate) fn active_project_path(&self, cx: &Context<Self>) -> Option<String> {
         self.sidebar
             .read(cx)
             .active_project()

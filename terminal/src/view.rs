@@ -1027,6 +1027,11 @@ pub(crate) fn is_app_level_shortcut(key: &str, mods: &gpui::Modifiers) -> bool {
     if key == "d" && mods.shift {
         return true;
     }
+    // Ctrl+Shift+I — bots inbox. Plain Ctrl+I is Tab in a terminal
+    // and stays there.
+    if key == "i" && mods.shift {
+        return true;
+    }
     // Ctrl+Shift+B — toggle sidebar. Plain Ctrl+B stays with the
     // terminal (readline backward-char).
     if key == "b" && mods.shift {
@@ -1389,6 +1394,13 @@ mod tests {
     fn ctrl_shift_o_bubbles_for_overview() {
         assert!(is_app_level_shortcut("o", &ctrl_shift()));
         assert!(!is_app_level_shortcut("o", &ctrl()));
+    }
+
+    #[test]
+    fn ctrl_shift_i_bubbles_for_bots_inbox() {
+        // Plain Ctrl+I is Tab to the shell and stays with the terminal.
+        assert!(is_app_level_shortcut("i", &ctrl_shift()));
+        assert!(!is_app_level_shortcut("i", &ctrl()));
     }
 
     #[test]
