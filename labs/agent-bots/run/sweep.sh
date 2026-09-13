@@ -8,8 +8,9 @@
 # nobody runs together is a set of regression tests.
 #
 # It uses the real verifiers, so it compiles the crate a few times; the
-# shared cache under .state/cache makes that a minute rather than ten.
-# It cleans up after itself and reports anything it left behind.
+# cache under its control plane's cache/ makes that a minute rather than
+# ten after the first run. It cleans up after itself and reports
+# anything it left behind.
 #
 #   bash labs/agent-bots/run/sweep.sh
 #
@@ -21,11 +22,26 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAB_DIR="$(dirname "$SCRIPT_DIR")"
 REPO="$(git -C "$LAB_DIR" rev-parse --show-toplevel)"
 
+# shellcheck source=live-task.sh
+. "$SCRIPT_DIR/live-task.sh"
+
 RUN="$SCRIPT_DIR/bot-run.sh"
 APPROVE="$SCRIPT_DIR/bot-approve.sh"
 STUBS="$SCRIPT_DIR/stubs"
 EX="$LAB_DIR/examples"
-STATE="$LAB_DIR/.state"
+# Its own control plane, never the one real runs use. The sweep used to
+# run in `.state` beside whatever the lab was doing, and a preflight
+# snapshot could not make that safe: a real claim that started after it
+# overlapped fixtures that take `dispatch.lock`, write run markers and
+# remove live tasks - somebody else's lock, in the worst case, aged to
+# 2020 and deleted. Every refusal and scoping rule added for that was a
+# patch on sharing. Not sharing is the fix: every runner invocation below
+# names this plane with --state, and nothing here reads or writes
+# `.state`. What is still shared is the repository - branches, worktrees
+# and `refs/bot-base/*` - which is why those stay limited to the names
+# listed below.
+STATE="${BOT_SWEEP_STATE:-$LAB_DIR/.state-sweep}"
+mkdir -p "$STATE"
 WT_ROOT="${REPO}.worktrees"
 
 FAILURES=0
@@ -58,6 +74,7 @@ bot/fixer/T-997A
 bot/fixer/T-998A
 bot/fixer/T-998B
 bot/fixer/T-999A
+bot/fixer/T-0994
 bot/fixer/T-0900
 bot/fixer/T-0901
 bot/fixer/shared
@@ -71,7 +88,8 @@ bot-sweep/committed-secret
 SWEEP_TASK_IDS="T-0001 T-0003 T-0005 T-0006 T-0006-fix T-990A T-990B
 T-993A T-993B T-993C T-993D T-993E T-995A T-996A T-996B T-997A
 T-998A T-998B T-999A T-0900 T-0901
-T-991A T-991B T-991C T-991D"
+T-991A T-991B T-991C T-991D
+T-0994 T-0995"
 
 is_sweep_task() {   # is_sweep_task <id>
     case " $(printf '%s' "$SWEEP_TASK_IDS" | tr '\n' ' ') " in
@@ -84,13 +102,20 @@ drop_sweep_tasks() {   # remove this script's live tasks and proposals
     local f id
     for f in "$STATE"/tasks/*.md "$STATE"/proposed/*.md; do
         [ -f "$f" ] || continue
-        id="$(sed -n 's/^id:[[:space:]]*//p' "$f" | head -n1)"
+        # Frontmatter, not the whole document. This function deletes,
+        # and a task whose *prose* happens to contain a line starting
+        # `id: T-0001` - a findings list, a quoted fixture - was read
+        # as one of this script's own. F-49.
+        id="$(live_task_field id "$(cat "$f")")"
         [ -n "$id" ] || continue
         ! is_sweep_task "$id" || rm -f "$f"
     done
 }
 
 PRE_EXISTING=""
+# Somebody else's finished runs. Reported, never touched, and not a
+# reason to refuse - see the case below.
+FINISHED_RUNS=""
 # A live task that is not the sweep's own means somebody's run is in
 # flight in this control plane. The sweep dispatches over the same files
 # and used to clear every live task on its way past, which takes the
@@ -112,12 +137,46 @@ for sdir in tasks proposed; do
     [ -d "$STATE/$sdir" ] || continue
     for f in "$STATE/$sdir"/*.md; do
         [ -f "$f" ] || continue
-        id="$(sed -n 's/^id:[[:space:]]*//p' "$f" | head -n1)"
+        live_text="$(cat "$f")"
+        id="$(live_task_field id "$live_text")"
         [ -n "$id" ] || continue
         if is_sweep_task "$id"; then
             PRE_EXISTING="$PRE_EXISTING  $sdir/$id ($f) - an id this sweep uses"$'\n'
         elif [ "$sdir" = "tasks" ]; then
-            PRE_EXISTING="$PRE_EXISTING  live task $id ($f)"$'\n'
+            # A live task is only in the way while it is *in flight*.
+            # The refusal is about collision: the sweep dispatches into
+            # this control plane, and a run still going is dispatching
+            # into it too. A run that has reached a verdict is a
+            # record, and a record collides with nobody. Left alone
+            # either way - the sweep removes only what it made.
+            #
+            # The first real run in this lab is what surfaced this.
+            # T-0010 finished, wrote `status: done`, and blocked the
+            # regression suite until somebody deleted the record of
+            # it. A suite whose price is the evidence of your work gets
+            # that price paid, and then the suite is measuring a lab
+            # nobody uses. See README F-46.
+            #
+            # `dispatched` with nothing running is the case this still
+            # refuses on, deliberately: a run that died mid-flight left
+            # that status behind and needs a human, which is exactly
+            # what a refusal fetches.
+            # Both questions asked of the bytes read above - the file
+            # is in a directory somebody else's runner writes to.
+            live_status="$(live_task_status "$live_text")"
+            # A verdict with a process still behind it is a run in its
+            # cleanup, not a record - the runner writes `done` before it
+            # removes its surface. live_task_settled asks the process
+            # question first, and the checks near the bottom call it
+            # too. F-50.
+            case "$(live_task_settled "$STATE" "$id" "$live_text")" in
+                settled)
+                    FINISHED_RUNS="$FINISHED_RUNS  $id ($live_status)"$'\n' ;;
+                active)
+                    PRE_EXISTING="$PRE_EXISTING  live task $id ($f) - status: ${live_status:-none}, but a process is still running it"$'\n' ;;
+                *)
+                    PRE_EXISTING="$PRE_EXISTING  live task $id ($f) - status: ${live_status:-none}"$'\n' ;;
+            esac
         fi
     done
     # And again by file name, because the file name is what the cleanup
@@ -157,7 +216,14 @@ if [ -n "$PRE_EXISTING" ]; then
     printf 'force-deletes every one of them:\n\n%s\n' "$PRE_EXISTING"
     printf 'They are left over from an earlier run, or they are yours. Either\n'
     printf 'way the sweep is not the thing that should decide.\n'
+    printf '\nA live task that has reached a verdict - done, blocked or\n'
+    printf 'needs-review - is a record rather than a collision, and does not\n'
+    printf 'stop this script. One still saying "dispatched" does.\n'
     exit 1
+fi
+
+if [ -n "$FINISHED_RUNS" ]; then
+    printf 'sweep: leaving these finished runs alone:\n%s\n' "$FINISHED_RUNS"
 fi
 
 cleanup() {   # cleanup <branch> - only ever a branch from SWEEP_BRANCHES
@@ -220,9 +286,9 @@ run() {   # run <label> <expected> <task> <stub-or-empty> [extra args...]
     shift 4
     if [ -n "$stub" ]; then
         BOT_AGENT_CMD="$STUBS/$stub" BOT_AGENT_ARGS="" \
-            bash "$RUN" --task "$task" --reset "$@" >/dev/null 2>&1 || rc=$?
+            bash "$RUN" --state "$STATE" --task "$task" --reset "$@" >/dev/null 2>&1 || rc=$?
     else
-        bash "$RUN" --task "$task" --reset "$@" >/dev/null 2>&1 || rc=$?
+        bash "$RUN" --state "$STATE" --task "$task" --reset "$@" >/dev/null 2>&1 || rc=$?
     fi
     check "$label" "$expect" "$rc"
 }
@@ -321,7 +387,7 @@ fi
 # from the review that produced it, which made a recurring review into
 # a recurring fix task.
 UNAPPROVED_RC=0
-bash "$RUN" --task "$STATE/proposed/T-0006-fix.md" --skip-agent >/dev/null 2>&1 \
+bash "$RUN" --state "$STATE" --task "$STATE/proposed/T-0006-fix.md" --skip-agent >/dev/null 2>&1 \
     || UNAPPROVED_RC=$?
 check "proposal needs approval" 3 "$UNAPPROVED_RC"
 
@@ -345,7 +411,7 @@ check "approve" 0 "$APPROVE_RC"
 sed '/^approved_at:/d' "$STATE/proposed/T-0006-fix.md" > "$STATE/proposed/T-0006-fix.tmp" \
     && mv "$STATE/proposed/T-0006-fix.tmp" "$STATE/proposed/T-0006-fix.md"
 NODATE_RC=0
-bash "$RUN" --task "$STATE/proposed/T-0006-fix.md" --reset --skip-agent >/dev/null 2>&1 \
+bash "$RUN" --state "$STATE" --task "$STATE/proposed/T-0006-fix.md" --reset --skip-agent >/dev/null 2>&1 \
     || NODATE_RC=$?
 check "approval needs a date" 3 "$NODATE_RC"
 cleanup bot/fixer/T-0006-fix
@@ -358,7 +424,7 @@ cleanup bot/fixer/T-0006-fix
 # somebody read it leaves an approval describing something else.
 printf '\nA line added after the approval.\n' >> "$STATE/proposed/T-0006-fix.md"
 STALE_RC=0
-bash "$RUN" --task "$STATE/proposed/T-0006-fix.md" --reset --skip-agent >/dev/null 2>&1 \
+bash "$RUN" --state "$STATE" --task "$STATE/proposed/T-0006-fix.md" --reset --skip-agent >/dev/null 2>&1 \
     || STALE_RC=$?
 check "approval goes stale" 3 "$STALE_RC"
 cleanup bot/fixer/T-0006-fix
@@ -644,6 +710,692 @@ fi
 rm -rf "$DEF_STATE"
 
 # --------------------------------------------------------------------
+# Somebody else's live task
+#
+# The preflight refuses on one, and it had to learn the difference
+# between a run in flight and a run that finished - the first real task
+# in this lab wrote `status: done` and locked the suite out until the
+# record of it was deleted (F-46). The decision is a function precisely
+# so it can be checked here; the preflight itself runs before anything
+# in this file can assert about it.
+# --------------------------------------------------------------------
+
+VERDICT_DIR="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-verdict.$$")"
+mkdir -p "$VERDICT_DIR"
+verdict_case() {   # verdict_case <label> <status-line> <expected>
+    local f="$VERDICT_DIR/T-0000.md" got
+    printf -- '---\nid: T-0000\nowner: fixer\n%s\n---\n\n# Objective\n\nGenerated.\n' \
+        "$2" > "$f"
+    got="$(live_task_verdict "$(cat "$f")")"
+    CHECKS=$((CHECKS + 1))
+    if [ "$got" = "$3" ]; then
+        printf 'ok    %-28s %s\n' "$1" "$got"
+    else
+        printf 'FAIL  %-28s expected %s, got %s\n' "$1" "$3" "$got"
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
+verdict_case "finished run is a record"  "status: done"          record
+verdict_case "blocked run is a record"   "status: blocked"       record
+verdict_case "review run is a record"    "status: needs-review"  record
+verdict_case "in-flight run blocks"      "status: dispatched"    blocks
+# A task with no status at all is the case the vocabulary cannot speak
+# for, and the refusal is the only answer that does not guess.
+verdict_case "statusless run blocks"     "title: no status here" blocks
+
+# And a status in the *prose* is not a status. A document whose
+# frontmatter says nothing and whose body contains a line starting
+# `status: done` - a findings list, a quoted example, this very
+# sentence one file over - used to come back `record`, which is the
+# answer that permits deletion. F-49.
+cat > "$VERDICT_DIR/T-0000.md" <<'EOF'
+---
+id: T-0000
+owner: fixer
+title: No status in the frontmatter
+---
+
+# Objective
+
+Quoting a task file at somebody, which is what prose does:
+
+status: done
+EOF
+BODY_VERDICT="$(live_task_verdict "$(cat "$VERDICT_DIR/T-0000.md")")"
+check "prose is not frontmatter" blocks "$BODY_VERDICT"
+rm -rf "$VERDICT_DIR"
+
+# --------------------------------------------------------------------
+# Retiring a record
+#
+# bot-forget.sh is the supported way to clear a live task, and it
+# exists because there was none: the only route was `rm` under a
+# directory whose entire purpose is being the record (F-46). A tool
+# that deletes things gets checked on what it refuses, not on what it
+# removes.
+# --------------------------------------------------------------------
+
+FORGET="$SCRIPT_DIR/bot-forget.sh"
+
+# pin_absent <repo> <ref> - succeeds only when git confirms the ref does
+# not exist. `rev-parse --verify` fails the same way for a missing ref
+# and a broken one, so a leftover check built on it passed with a
+# malformed pin still on disk - the lookup-is-not-absence bug bot-forget
+# had just been fixed for. `update-ref --stdin` with `verify <ref>
+# <zero-oid>` asserts absence outright and fails on anything else. The
+# zero oid is derived rather than typed, so a SHA-256 repository gets
+# the right length.
+pin_absent() {
+    local zero
+    zero="$(git -C "$1" hash-object --stdin </dev/null 2>/dev/null | tr '0-9a-f' '0')"
+    [ -n "$zero" ] || return 1
+    printf 'verify %s %s\n' "$2" "$zero" | git -C "$1" update-ref --stdin >/dev/null 2>&1
+}
+mkdir -p "$STATE/tasks"
+
+write_live() {   # write_live <id> <status>
+    cat > "$STATE/tasks/$1.md" <<EOF
+---
+id: $1
+title: Generated by sweep.sh
+owner: fixer
+status: $2
+base: labs/agent-bots
+branch: bot/fixer/$1
+touches: labs/agent-bots/.sweep/$1.txt
+worktree: $WT_ROOT/bot-fixer-$1
+---
+
+# Objective
+
+Generated by sweep.sh to be forgotten.
+EOF
+}
+
+# A finished record goes, and the board says who decided.
+write_live T-0994 done
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$STATE" >/dev/null 2>&1 || FORGET_RC=$?
+check "forget a finished run" 0 "$FORGET_RC"
+if [ -f "$STATE/tasks/T-0994.md" ]; then
+    printf 'FAIL  %-28s the live task is still there\n' "forget removes the record"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+else
+    printf 'ok    %-28s the live task is gone\n' "forget removes the record"
+    CHECKS=$((CHECKS + 1))
+fi
+if grep -q "| T-0994 | forgotten |" "$STATE/board.md" 2>/dev/null; then
+    printf 'ok    %-28s board says forgotten\n' "forget leaves a mark"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s no "forgotten" row for T-0994\n' "forget leaves a mark"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+
+# An in-flight one stays, because "a run is going" and "a run died" look
+# identical from here and want opposite things.
+write_live T-0995 dispatched
+FORGET_RC=0
+bash "$FORGET" T-0995 --state "$STATE" >/dev/null 2>&1 || FORGET_RC=$?
+check "in-flight record stays" 1 "$FORGET_RC"
+if [ -f "$STATE/tasks/T-0995.md" ]; then
+    printf 'ok    %-28s refused and kept\n' "refusal keeps the record"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s it deleted what it refused\n' "refusal keeps the record"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+
+# --force is the deliberate override, and it is the only way past it.
+FORGET_RC=0
+bash "$FORGET" T-0995 --state "$STATE" --force >/dev/null 2>&1 || FORGET_RC=$?
+check "force forgets it anyway" 0 "$FORGET_RC"
+
+# And not from inside a run: a run that can retire its own record can
+# write its own history. Same door as bot-approve.sh.
+write_live T-0995 done
+FORGET_RC=0
+BOT_RUN_ACTIVE=pretend bash "$FORGET" T-0995 --state "$STATE" >/dev/null 2>&1 || FORGET_RC=$?
+check "no forgetting from a run" 1 "$FORGET_RC"
+rm -f "$STATE/tasks/T-0995.md"
+
+# A live process beats a finished status. The runner writes its verdict
+# before cleaning up, so `done` on disk is normal while work remains -
+# and this pid is unambiguously alive, since it is the one asking.
+write_live T-0994 done
+mkdir -p "$STATE/running"
+printf '%s\n' "$$" > "$STATE/running/T-0994.sweep-alive"
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$STATE" >/dev/null 2>&1 || FORGET_RC=$?
+check "a live run beats done" 1 "$FORGET_RC"
+if [ -f "$STATE/tasks/T-0994.md" ]; then
+    printf 'ok    %-28s kept while a pid is alive\n' "live marker keeps it"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s deleted under a running process\n' "live marker keeps it"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+# --force is the way past it, deliberately.
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$STATE" --force >/dev/null 2>&1 || FORGET_RC=$?
+check "force beats a live run" 0 "$FORGET_RC"
+rm -f "$STATE/running/T-0994.sweep-alive"
+
+# A marker whose process is gone is litter, not a claim: the pid is
+# the fact, the file is only what it left behind.
+write_live T-0994 done
+printf '999999\n' > "$STATE/running/T-0994.sweep-dead"
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$STATE" >/dev/null 2>&1 || FORGET_RC=$?
+check "a dead marker is litter" 0 "$FORGET_RC"
+if [ -f "$STATE/running/T-0994.sweep-dead" ]; then
+    printf 'FAIL  %-28s the stale marker survived\n' "dead marker swept up"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+else
+    printf 'ok    %-28s the stale marker went with it\n' "dead marker swept up"
+    CHECKS=$((CHECKS + 1))
+fi
+
+# A marker whose pid cannot be read is not a dead one. It came back
+# `gone`, and `gone` is what lets a forget through without --force - a
+# failed read standing in for a finished process. Garbage content is
+# the portable stand-in for an unreadable file; chmod means little on
+# Windows, and both land in the same branch.
+write_live T-0994 done
+printf 'garbage\n' > "$STATE/running/T-0994.sweep-unknown"
+check "an unreadable marker"       unknown \
+    "$(live_task_running "$STATE" T-0994 | awk '{ print $2 }')"
+check "unreadable is not settled"  active \
+    "$(live_task_settled "$STATE" T-0994 "$(cat "$STATE/tasks/T-0994.md")")"
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$STATE" >/dev/null 2>&1 || FORGET_RC=$?
+check "unreadable stops forget" 1 "$FORGET_RC"
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$STATE" --force >/dev/null 2>&1 || FORGET_RC=$?
+check "--force settles unreadable" 0 "$FORGET_RC"
+check "and clears the marker"   no \
+    "$([ -e "$STATE/running/T-0994.sweep-unknown" ] && printf yes || printf no)"
+rm -f "$STATE/running/T-0994.sweep-unknown"
+
+# The helper the leftover checks rely on has to see a broken pin, or
+# every "no pins left" line is vacuous for exactly that case.
+BROKEN_REPO="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-pin.$$")"
+git init --quiet --bare "$BROKEN_REPO/r.git"
+check "a missing pin is absent" yes \
+    "$(pin_absent "$BROKEN_REPO/r.git" refs/bot-base/T-0994 && printf yes || printf no)"
+mkdir -p "$BROKEN_REPO/r.git/refs/bot-base"
+printf 'not a sha\n' > "$BROKEN_REPO/r.git/refs/bot-base/T-0994"
+check "a broken pin is not absent" no \
+    "$(pin_absent "$BROKEN_REPO/r.git" refs/bot-base/T-0994 && printf yes || printf no)"
+rm -rf "$BROKEN_REPO"
+
+# All three parts of a surface, in the order drop_surface uses them:
+# the verify checkout beside it, the clone, then the base pin. Leaving
+# the pin holds the base objects alive in the project for ever, and
+# leaving the verify checkout leaves a directory nothing else removes.
+write_live T-0994 done
+mkdir -p "$WT_ROOT/bot-fixer-T-0994/.git" "$WT_ROOT/bot-fixer-T-0994-verify"
+printf 'bot-run surface for T-0994\n' > "$WT_ROOT/bot-fixer-T-0994/.git/bot-surface"
+printf 'gitdir: %s/.git/worktrees/bot-fixer-T-0994\n' "$WT_ROOT/bot-fixer-T-0994" \
+    > "$WT_ROOT/bot-fixer-T-0994-verify/.git"
+git -C "$REPO" update-ref "refs/bot-base/T-0994" HEAD >/dev/null 2>&1
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$STATE" --repo "$REPO" --surface >/dev/null 2>&1 || FORGET_RC=$?
+check "surface goes in three parts" 0 "$FORGET_RC"
+SURF_LEFT=""
+[ ! -e "$WT_ROOT/bot-fixer-T-0994" ] || SURF_LEFT="$SURF_LEFT clone"
+[ ! -e "$WT_ROOT/bot-fixer-T-0994-verify" ] || SURF_LEFT="$SURF_LEFT verify"
+pin_absent "$REPO" "refs/bot-base/T-0994" || SURF_LEFT="$SURF_LEFT pin"
+if [ -z "$SURF_LEFT" ]; then
+    printf 'ok    %-28s clone, verify and pin\n' "nothing of it is left"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s still there:%s\n' "nothing of it is left" "$SURF_LEFT"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+git -C "$REPO" update-ref -d "refs/bot-base/T-0994" >/dev/null 2>&1 || true
+rm -rf "$WT_ROOT/bot-fixer-T-0994" "$WT_ROOT/bot-fixer-T-0994-verify"
+
+# The preflight's combined decision, reachable here because it is a
+# function. `done` with a live pid behind it is a run in its cleanup.
+SETTLED_TEXT="$(printf -- '---\nid: T-0995\nstatus: done\n---\n')"
+mkdir -p "$STATE/running"
+printf '%s\n' "$$" > "$STATE/running/T-0995.sweep-settled"
+check "done with a pid is active"  active    "$(live_task_settled "$STATE" T-0995 "$SETTLED_TEXT")"
+rm -f "$STATE/running/T-0995.sweep-settled"
+check "done alone is settled"      settled   "$(live_task_settled "$STATE" T-0995 "$SETTLED_TEXT")"
+check "dispatched is unfinished"   unfinished \
+    "$(live_task_settled "$STATE" T-0995 "$(printf -- '---\nid: T-0995\nstatus: dispatched\n---\n')")"
+
+# A held claim lock stops a forget before it looks at anything. The
+# checks and the removals are one critical section with the runner's
+# claim, or a --reset can start building a new surface between this
+# script's "no marker, a verdict" and its `rm -rf`. F-50.
+#
+# The lock is the real control plane's, so the fixture takes it the way
+# a runner does - a plain mkdir that fails when somebody holds it - and
+# gives back only what it put there. `mkdir -p` would have walked into a
+# real claim's lock and the cleanup could then have taken its owner
+# file. A lock that is already held is a skip, not a pass.
+write_live T-0994 done
+if mkdir "$STATE/dispatch.lock" 2>/dev/null; then
+    : > "$STATE/dispatch.lock/owner.$$-0-sweep"
+    FORGET_RC=0
+    BOT_FORGET_LOCK_WAIT=1 bash "$FORGET" T-0994 --state "$STATE" >/dev/null 2>&1 || FORGET_RC=$?
+    check "a held claim stops forget" 1 "$FORGET_RC"
+    if [ -f "$STATE/tasks/T-0994.md" ] && [ -f "$STATE/dispatch.lock/owner.$$-0-sweep" ]; then
+        printf 'ok    %-28s record kept, lock not broken\n' "forget waits its turn"
+        CHECKS=$((CHECKS + 1))
+    else
+        printf 'FAIL  %-28s it removed the record or broke a live lock\n' "forget waits its turn"
+        CHECKS=$((CHECKS + 1))
+        FAILURES=$((FAILURES + 1))
+    fi
+    rm -f "$STATE/dispatch.lock/owner.$$-0-sweep"
+    rmdir "$STATE/dispatch.lock" 2>/dev/null || true
+else
+    printf 'skip  %-28s a real claim holds dispatch.lock\n' "a held claim stops forget"
+    SKIPS=$((SKIPS + 1))
+fi
+rm -f "$STATE/tasks/T-0994.md"
+
+# A plain-folder project keeps its pin in the snapshot repository, not
+# in the folder the plane is stamped to - the runner's ORIGIN_REPO rule.
+# --surface used to delete the clone, reject the folder as not a
+# repository and stop, leaving the record and the pin and nothing that
+# showed what they belonged to. F-50.
+#
+# The record says so in `origin_repo:`, as the runner writes it. Older
+# records without it are the next block.
+FOLDER_PLANE="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-folder.$$")"
+mkdir -p "$FOLDER_PLANE/tasks" "$FOLDER_PLANE/project"
+: > "$FOLDER_PLANE/board.md"
+printf '%s\n' "$FOLDER_PLANE/project" > "$FOLDER_PLANE/REPO"
+git init --quiet --bare "$FOLDER_PLANE/snapshot.git"
+FOLDER_TREE="$(git --git-dir="$FOLDER_PLANE/snapshot.git" mktree </dev/null)"
+FOLDER_COMMIT="$(git --git-dir="$FOLDER_PLANE/snapshot.git" \
+    -c user.name=sweep -c user.email=sweep@bots.invalid \
+    commit-tree "$FOLDER_TREE" -m "folder snapshot")"
+git --git-dir="$FOLDER_PLANE/snapshot.git" update-ref refs/bot-base/T-0994 "$FOLDER_COMMIT"
+mkdir -p "$FOLDER_PLANE/surface/.git"
+printf 'bot-run surface for T-0994\n' > "$FOLDER_PLANE/surface/.git/bot-surface"
+cat > "$FOLDER_PLANE/tasks/T-0994.md" <<EOF
+---
+id: T-0994
+owner: fixer
+base: folder
+status: done
+worktree: $FOLDER_PLANE/surface
+origin_repo: $FOLDER_PLANE/snapshot.git
+---
+
+# Objective
+
+Generated by sweep.sh.
+EOF
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$FOLDER_PLANE" --surface >/dev/null 2>&1 || FORGET_RC=$?
+check "folder pin is in snapshot" 0 "$FORGET_RC"
+if ! pin_absent "$FOLDER_PLANE/snapshot.git" refs/bot-base/T-0994; then
+    printf 'FAIL  %-28s the pin survived in snapshot.git\n' "folder pin removed"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+else
+    printf 'ok    %-28s gone from snapshot.git\n' "folder pin removed"
+    CHECKS=$((CHECKS + 1))
+fi
+rm -rf "$FOLDER_PLANE"
+
+# The other way round: a plane that once held a folder task keeps its
+# `snapshot.git`, and a later task on a real repository must still have
+# its pin looked for in that repository. Three variants: the recorded
+# `origin_repo:` finds it; an older record on a plane that also has a
+# snapshot cannot know which one it was, and refuses; the same record
+# without a snapshot can only have come from the stamp. Each record has
+# `base: folder` on a real repository, the case where the base name and
+# the provenance disagree.
+#
+# The stamp is the git dir, `<project>/.git`, because that is what the
+# runner writes; the fixtures used to stamp the work tree, a shape no
+# real plane has.
+STRAY_PLANE="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-stray.$$")"
+mkdir -p "$STRAY_PLANE/tasks"
+: > "$STRAY_PLANE/board.md"
+git init --quiet --bare "$STRAY_PLANE/snapshot.git"
+git init --quiet "$STRAY_PLANE/project"
+printf '%s\n' "$STRAY_PLANE/project/.git" > "$STRAY_PLANE/REPO"
+PROJECT_COMMIT="$(git -C "$STRAY_PLANE/project" \
+    -c user.name=sweep -c user.email=sweep@bots.invalid \
+    commit-tree "$(git -C "$STRAY_PLANE/project" mktree </dev/null)" -m "project")"
+for variant in recorded ambiguous legacy; do
+    git -C "$STRAY_PLANE/project" update-ref refs/bot-base/T-0994 "$PROJECT_COMMIT"
+    [ "$variant" != legacy ] || rm -rf "$STRAY_PLANE/snapshot.git"
+    {
+        printf -- '---\nid: T-0994\nowner: fixer\nbase: folder\nstatus: done\n'
+        printf 'worktree: %s/surface\n' "$STRAY_PLANE"
+        [ "$variant" != recorded ] || printf 'origin_repo: %s/project\n' "$STRAY_PLANE"
+        printf -- '---\n'
+    } > "$STRAY_PLANE/tasks/T-0994.md"
+    FORGET_RC=0
+    bash "$FORGET" T-0994 --state "$STRAY_PLANE" --surface >/dev/null 2>&1 || FORGET_RC=$?
+    if [ "$variant" = ambiguous ]; then
+        check "stray snapshot, $variant" 1 "$FORGET_RC"
+        check "pin kept, $variant" no \
+            "$(pin_absent "$STRAY_PLANE/project" refs/bot-base/T-0994 && printf yes || printf no)"
+        check "record kept, $variant" yes \
+            "$([ -f "$STRAY_PLANE/tasks/T-0994.md" ] && printf yes || printf no)"
+    else
+        check "stray snapshot, $variant" 0 "$FORGET_RC"
+        check "pin gone, $variant" yes \
+            "$(pin_absent "$STRAY_PLANE/project" refs/bot-base/T-0994 && printf yes || printf no)"
+    fi
+done
+rm -rf "$STRAY_PLANE"
+
+# A removal that cannot finish keeps the proof of whose tree it is, so
+# the retry is still allowed. Staged for real: on Windows a process
+# sitting in the directory (the case where every entry goes and the
+# folder does not), elsewhere an unwritable subdirectory. If the fault
+# could not be staged - root ignores the permission - it is a skip,
+# not a pass.
+PROOF_ROOT="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-proof.$$")"
+PROOF_TREE="$PROOF_ROOT/tree"
+mkdir -p "$PROOF_TREE/.git" "$PROOF_TREE/sub"
+printf 'bot-run surface for T-0994\n' > "$PROOF_TREE/.git/bot-surface"
+printf 'x\n' > "$PROOF_TREE/sub/file"
+PROOF_HOLDER=""
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+        MSYS_NO_PATHCONV=1 cmd.exe /c "cd /d $(cygpath -w "$PROOF_TREE") && ping -n 8 127.0.0.1 >nul" \
+            >/dev/null 2>&1 &
+        PROOF_HOLDER=$!
+        sleep 2 ;;
+    *)
+        chmod a-w "$PROOF_TREE/sub" ;;
+esac
+PROOF_RC=0
+remove_proof_last "$PROOF_TREE" .git/bot-surface || PROOF_RC=$?
+if [ ! -e "$PROOF_TREE" ]; then
+    printf 'skip  %-28s could not stage a removal that fails\n' "a stuck removal keeps proof"
+    SKIPS=$((SKIPS + 1))
+elif [ "$PROOF_RC" -ne 0 ] && [ -f "$PROOF_TREE/.git/bot-surface" ]; then
+    printf 'ok    %-28s failed and kept .git/bot-surface\n' "a stuck removal keeps proof"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s rc %s, proof %s\n' "a stuck removal keeps proof" "$PROOF_RC" \
+        "$([ -f "$PROOF_TREE/.git/bot-surface" ] && printf kept || printf gone)"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+if [ -n "$PROOF_HOLDER" ]; then
+    wait "$PROOF_HOLDER" 2>/dev/null || true
+else
+    chmod u+w "$PROOF_TREE/sub" 2>/dev/null || true
+fi
+if [ -e "$PROOF_TREE" ]; then
+    PROOF_RC=0
+    remove_proof_last "$PROOF_TREE" .git/bot-surface || PROOF_RC=$?
+    check "and the retry finishes" 0 "$PROOF_RC"
+fi
+rm -rf "$PROOF_ROOT"
+
+# A stranded removal - a tree left under its probe name - stops a
+# retry instead of letting it find nothing and say `forgotten`.
+STRAND_PLANE="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-strand.$$")"
+mkdir -p "$STRAND_PLANE/tasks" "$STRAND_PLANE/surface.removing.1/.git"
+: > "$STRAND_PLANE/board.md"
+git init --quiet --bare "$STRAND_PLANE/snapshot.git"
+printf 'bot-run surface for T-0994\n' > "$STRAND_PLANE/surface.removing.1/.git/bot-surface"
+printf -- '---\nid: T-0994\nowner: fixer\nstatus: done\nworktree: %s/surface\norigin_repo: %s/snapshot.git\n---\n' \
+    "$STRAND_PLANE" "$STRAND_PLANE" > "$STRAND_PLANE/tasks/T-0994.md"
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$STRAND_PLANE" --surface >/dev/null 2>&1 || FORGET_RC=$?
+check "a stranded removal stops" 1 "$FORGET_RC"
+check "and keeps its record" yes \
+    "$([ -f "$STRAND_PLANE/tasks/T-0994.md" ] && printf yes || printf no)"
+rm -rf "$STRAND_PLANE"
+
+# A file where the surface should be is not an absent surface. It read
+# as absent: both removals skipped, pin and record gone, success.
+TYPE_PLANE="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-type.$$")"
+mkdir -p "$TYPE_PLANE/tasks"
+: > "$TYPE_PLANE/board.md"
+git init --quiet --bare "$TYPE_PLANE/snapshot.git"
+printf 'not a surface\n' > "$TYPE_PLANE/surface"
+printf -- '---\nid: T-0994\nowner: fixer\nstatus: done\nworktree: %s/surface\norigin_repo: %s/snapshot.git\n---\n' \
+    "$TYPE_PLANE" "$TYPE_PLANE" > "$TYPE_PLANE/tasks/T-0994.md"
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$TYPE_PLANE" --surface >/dev/null 2>&1 || FORGET_RC=$?
+check "a file is not a surface" 1 "$FORGET_RC"
+check "and the record stays" yes \
+    "$([ -f "$TYPE_PLANE/tasks/T-0994.md" ] && printf yes || printf no)"
+rm -rf "$TYPE_PLANE"
+
+# Removal never walks through a link. A surface whose `.git` is a
+# symlink used to have the link target's entries removed one by one.
+LINK_ROOT="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-link.$$")"
+mkdir -p "$LINK_ROOT/outside" "$LINK_ROOT/tree"
+printf 'bot-run surface for T-0994\n' > "$LINK_ROOT/outside/bot-surface"
+printf 'keep me\n' > "$LINK_ROOT/outside/precious"
+if ln -s "$LINK_ROOT/outside" "$LINK_ROOT/tree/.git" 2>/dev/null && [ -L "$LINK_ROOT/tree/.git" ]; then
+    LINK_RC=0
+    remove_proof_last "$LINK_ROOT/tree" .git/bot-surface || LINK_RC=$?
+    check "a linked .git is refused" 1 "$LINK_RC"
+    check "and its target is untouched" yes \
+        "$([ -f "$LINK_ROOT/outside/precious" ] && printf yes || printf no)"
+else
+    printf 'skip  %-28s this shell does not make symlinks\n' "a linked .git is refused"
+    SKIPS=$((SKIPS + 1))
+fi
+rm -rf "$LINK_ROOT"
+
+# --surface on a record that names no surface. A task whose frontmatter
+# was never closed runs, but set_field never inserts `worktree:` into it,
+# and --surface then skipped its whole block and printed `forgotten` -
+# deleting the one record that named the clone and the pin.
+printf -- '---\nid: T-0994\nowner: fixer\nstatus: done\n---\n' > "$STATE/tasks/T-0994.md"
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$STATE" --surface >/dev/null 2>&1 || FORGET_RC=$?
+check "--surface needs a worktree" 1 "$FORGET_RC"
+check "and keeps the record" yes \
+    "$([ -f "$STATE/tasks/T-0994.md" ] && printf yes || printf no)"
+rm -f "$STATE/tasks/T-0994.md"
+
+# A board that cannot be appended to stops *every* removal, the surface
+# included. The mark used to go down after the surface and before the
+# live task, so this refused with "nothing was removed" and three things
+# already gone. A directory where the board should be is the portable
+# way to make the append fail - chmod means little on Windows. F-50.
+MARK_PLANE="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-mark.$$")"
+mkdir -p "$MARK_PLANE/tasks" "$MARK_PLANE/board.md" "$MARK_PLANE/surface/.git"
+git init --quiet --bare "$MARK_PLANE/snapshot.git"
+printf 'bot-run surface for T-0994\n' > "$MARK_PLANE/surface/.git/bot-surface"
+cat > "$MARK_PLANE/tasks/T-0994.md" <<EOF
+---
+id: T-0994
+owner: fixer
+status: done
+worktree: $MARK_PLANE/surface
+origin_repo: $MARK_PLANE/snapshot.git
+---
+EOF
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$MARK_PLANE" --surface >/dev/null 2>&1 || FORGET_RC=$?
+check "no board, no forget" 1 "$FORGET_RC"
+if [ -d "$MARK_PLANE/surface" ] && [ -f "$MARK_PLANE/tasks/T-0994.md" ]; then
+    printf 'ok    %-28s surface and record both kept\n' "no board, no surface removal"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s removed something with no mark on the board\n' "no board, no surface removal"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$MARK_PLANE"
+
+# A task body longer than a pipe buffer. The shared parser used to stop
+# at the closing fence, which SIGPIPEs the printf feeding it, and under
+# pipefail the caller died with a 141 on a status that parsed fine. Run
+# in a child with the callers' own shell options, so a 141 shows up as
+# an exit code here rather than as this sweep ending.
+LONG_RC=0
+LONG_STATUS="$(bash -c '
+    set -euo pipefail
+    . "$1/live-task.sh"
+    body="$(head -c 400000 /dev/zero | tr "\\0" x)"
+    text="$(printf -- "---\nid: T-0994\nstatus: done\n---\n\n%s\n" "$body")"
+    s="$(live_task_status "$text")"
+    printf "%s\n" "$s"
+' _ "$SCRIPT_DIR" 2>/dev/null)" || LONG_RC=$?
+check "a long body parses"        0    "$LONG_RC"
+check "a long body keeps status"  done "$LONG_STATUS"
+
+# Ownership of both halves is settled before either is removed. A
+# record whose worktree path now holds another task's surface - a
+# colliding branch leaf - used to lose the verify checkout first and
+# only then meet the marker that refused. F-50.
+OWN_PLANE="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-own.$$")"
+mkdir -p "$OWN_PLANE/tasks" "$OWN_PLANE/surface/.git" "$OWN_PLANE/surface-verify"
+: > "$OWN_PLANE/board.md"
+git init --quiet --bare "$OWN_PLANE/snapshot.git"
+printf 'bot-run surface for T-0995\n' > "$OWN_PLANE/surface/.git/bot-surface"
+printf 'gitdir: %s/.git/worktrees/surface\n' "$OWN_PLANE/surface" > "$OWN_PLANE/surface-verify/.git"
+cat > "$OWN_PLANE/tasks/T-0994.md" <<EOF
+---
+id: T-0994
+owner: fixer
+status: done
+worktree: $OWN_PLANE/surface
+origin_repo: $OWN_PLANE/snapshot.git
+---
+EOF
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$OWN_PLANE" --surface >/dev/null 2>&1 || FORGET_RC=$?
+check "another task's surface" 1 "$FORGET_RC"
+if [ -d "$OWN_PLANE/surface-verify" ] && [ -f "$OWN_PLANE/tasks/T-0994.md" ] \
+        && ! grep -q "forgotten" "$OWN_PLANE/board.md"; then
+    printf 'ok    %-28s verify checkout, record and board untouched\n' "ownership before removal"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s removed or marked before refusing\n' "ownership before removal"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$OWN_PLANE"
+
+# A pin that cannot be read is not a pin that is absent. A broken ref
+# answers `rev-parse --verify` exactly like a missing one, and the first
+# version took that as permission to delete the only record naming it.
+BROKEN_PLANE="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-broken.$$")"
+mkdir -p "$BROKEN_PLANE/tasks"
+: > "$BROKEN_PLANE/board.md"
+git init --quiet --bare "$BROKEN_PLANE/snapshot.git"
+mkdir -p "$BROKEN_PLANE/snapshot.git/refs/bot-base"
+printf 'not a sha\n' > "$BROKEN_PLANE/snapshot.git/refs/bot-base/T-0994"
+cat > "$BROKEN_PLANE/tasks/T-0994.md" <<EOF
+---
+id: T-0994
+owner: fixer
+status: done
+worktree: $BROKEN_PLANE/surface
+origin_repo: $BROKEN_PLANE/snapshot.git
+---
+EOF
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$BROKEN_PLANE" --surface >/dev/null 2>&1 || FORGET_RC=$?
+check "a broken pin stops forget" 1 "$FORGET_RC"
+if [ -f "$BROKEN_PLANE/tasks/T-0994.md" ] \
+        && grep -q "| T-0994 | forget-stopped |" "$BROKEN_PLANE/board.md"; then
+    printf 'ok    %-28s record kept, board says stopped\n' "broken pin keeps record"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s record gone or no forget-stopped row\n' "broken pin keeps record"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$BROKEN_PLANE"
+
+# A state directory with a space in it, which is most of Windows.
+# `live_task_running` puts the path last precisely so that a `read`
+# absorbs it; with the path first, one space shifted every field and no
+# caller ever removed a dead marker again. Checked through the caller,
+# not the function, because the bug was in the parse and not the print.
+SPACE_ROOT="$(mktemp -d 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/bot-sweep-space.$$")"
+SPACE_STATE="$SPACE_ROOT/state with a space"
+mkdir -p "$SPACE_STATE/tasks" "$SPACE_STATE/running"
+: > "$SPACE_STATE/board.md"
+cat > "$SPACE_STATE/tasks/T-0994.md" <<'EOF'
+---
+id: T-0994
+owner: fixer
+status: done
+---
+
+# Objective
+
+Generated by sweep.sh.
+EOF
+printf '999999\n' > "$SPACE_STATE/running/T-0994.dead"
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$SPACE_STATE" >/dev/null 2>&1 || FORGET_RC=$?
+check "a space in the path" 0 "$FORGET_RC"
+if [ -f "$SPACE_STATE/running/T-0994.dead" ]; then
+    printf 'FAIL  %-28s the marker survived a space\n' "space keeps nothing behind"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+else
+    printf 'ok    %-28s dead marker still cleared\n' "space keeps nothing behind"
+    CHECKS=$((CHECKS + 1))
+fi
+rm -rf "$SPACE_ROOT"
+
+# A pin that cannot even be looked at stops the whole thing. The live
+# task is the only record naming that ref, so removing it on a failed
+# or unknowable pin removal leaks the ref for ever *and* destroys the
+# evidence needed to retry - rule 5 of 3.6 with a `git` command in it.
+write_live T-0994 done
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$STATE" --repo "${TMPDIR:-/tmp}/bot-sweep-not-a-repo.$$" --surface \
+    >/dev/null 2>&1 || FORGET_RC=$?
+check "an unknowable pin refuses" 1 "$FORGET_RC"
+if [ -f "$STATE/tasks/T-0994.md" ]; then
+    printf 'ok    %-28s the record is still there to retry\n' "refusal keeps the retry"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s it deleted the only record of the pin\n' "refusal keeps the retry"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+rm -f "$STATE/tasks/T-0994.md"
+
+# A surface is removed only on a marker that names this task. The
+# directory here is not a surface at all, which is the case worth
+# refusing: `rm -rf` on the strength of a task file's own field is how
+# a tool like this takes somebody's checkout with it.
+write_live T-0994 done
+mkdir -p "$WT_ROOT/bot-fixer-T-0994/.git"
+printf 'bot-run surface for T-SOMETHING-ELSE\n' > "$WT_ROOT/bot-fixer-T-0994/.git/bot-surface"
+FORGET_RC=0
+bash "$FORGET" T-0994 --state "$STATE" --surface >/dev/null 2>&1 || FORGET_RC=$?
+check "surface needs its marker" 1 "$FORGET_RC"
+if [ -d "$WT_ROOT/bot-fixer-T-0994" ]; then
+    printf 'ok    %-28s the directory is untouched\n' "wrong marker keeps it"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s it removed a directory it could not identify\n' "wrong marker keeps it"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$WT_ROOT/bot-fixer-T-0994"
+rm -f "$STATE/tasks/T-0994.md"
+
+# --------------------------------------------------------------------
 # A base that moves under the run
 #
 # Four tasks that differ in one thing only: what lands on the base
@@ -701,7 +1453,7 @@ run_mover() {   # run_mover <label> <exit> <event> <id> <mine> <body> <theirs> <
         BOT_SWEEP_REPO="$REPO" BOT_SWEEP_BASE_BRANCH="$SWEEP_BASE" \
         BOT_SWEEP_MINE="$5" BOT_SWEEP_MINE_BODY="$6" \
         BOT_SWEEP_THEIRS="$7" BOT_SWEEP_THEIRS_BODY="$8" \
-        bash "$RUN" --task "$MOVE_TASKS/$id.md" --reset --repo "$REPO" --state "$STATE" >/dev/null 2>&1 || rc=$?
+        bash "$RUN" --state "$STATE" --task "$MOVE_TASKS/$id.md" --reset --repo "$REPO" --state "$STATE" >/dev/null 2>&1 || rc=$?
     check "$label" "$expect" "$rc"
     if tail -n "+$((mark + 1))" "$STATE/board.md" 2>/dev/null \
         | grep -q "| $id | $event |"; then
@@ -834,7 +1586,7 @@ BOT_AGENT_CMD="$STUBS/handless.sh" BOT_AGENT_ARGS="" \
     BOT_HANDLESS_FILE="labs/agent-bots/.sweep/mine.txt" \
     BOT_HANDLESS_MSG="Add a file, leave the .env alone" \
     BOT_HANDLESS_ALSO=".env" \
-    bash "$RUN" --task "$SEC_TASKS/T-995A.md" --reset --repo "$REPO" >/dev/null 2>&1 || SECRC=$?
+    bash "$RUN" --state "$STATE" --task "$SEC_TASKS/T-995A.md" --reset --repo "$REPO" >/dev/null 2>&1 || SECRC=$?
 # `needs-review`, not `done`: nothing that never travels went anywhere,
 # and an agent rewrote one of them anyway. Whether that was meant is not
 # a question a verifier can answer.
@@ -911,7 +1663,7 @@ BOT_AGENT_CMD="$STUBS/saboteur.sh" BOT_AGENT_ARGS="" \
     BOT_SABOTEUR_FILE="labs/agent-bots/.sweep/mine.txt" \
     BOT_SABOTEUR_MARKER="$SAB_MARKER" \
     BOT_SABOTEUR_BRANCH="$SAB_BRANCH" \
-    bash "$RUN" --task "$SAB_TASKS/T-998A.md" --reset --repo "$REPO" >/dev/null 2>&1 || SABRC=$?
+    bash "$RUN" --state "$STATE" --task "$SAB_TASKS/T-998A.md" --reset --repo "$REPO" >/dev/null 2>&1 || SABRC=$?
 check "rigged run still lands" 0 "$SABRC"
 
 if [ -e "$SAB_MARKER" ]; then
@@ -995,7 +1747,7 @@ EOF
 HIJRC=0
 BOT_AGENT_CMD="$STUBS/hijacker.sh" BOT_AGENT_ARGS="" \
     BOT_HIJACK_FILE="labs/agent-bots/.sweep/mine.txt" \
-    bash "$RUN" --task "$SAB_TASKS/T-998B.md" --reset --repo "$REPO" >/dev/null 2>&1 || HIJRC=$?
+    bash "$RUN" --state "$STATE" --task "$SAB_TASKS/T-998B.md" --reset --repo "$REPO" >/dev/null 2>&1 || HIJRC=$?
 check "swapped .git blocks" 1 "$HIJRC"
 
 HIJ_HANDOFF="$(ls -t "$STATE"/handoffs/*T-998B.md 2>/dev/null | head -n1)"
@@ -1012,8 +1764,16 @@ fi
 # there is no marker here because the runner removed the redirect that
 # was standing where .git should be - which is the check passing, not a
 # surface of unknown provenance. The path is a sweep branch leaf.
+# By hand rather than through `cleanup`, because that function refuses a
+# surface with no `.git/bot-surface` marker and this fixture's whole
+# point is replacing `.git` - so the marker is gone by design. Which is
+# how the pin got left behind: a hand-rolled removal that does part of
+# what the real one does. Exactly the defect the review found in
+# bot-forget.sh's --surface, in this file, found by the check written
+# for that one. F-49.
 rm -rf "$WT_ROOT/bot-fixer-T-998B"
 git -C "$REPO" branch -D bot/fixer/T-998B >/dev/null 2>&1
+git -C "$REPO" update-ref -d refs/bot-base/T-998B >/dev/null 2>&1
 
 rm -f "$STATE"/tasks/T-998*.md 2>/dev/null
 
@@ -1028,8 +1788,16 @@ rm -f "$STATE"/tasks/T-998*.md 2>/dev/null
 # and a run that has to get past both.
 # --------------------------------------------------------------------
 
-if find "$STATE" -prune -mmin +1 -print >/dev/null 2>&1; then
-    mkdir -p "$STATE/dispatch.lock" "$STATE/dispatch.lock.break"
+if ! find "$STATE" -prune -mmin +1 -print >/dev/null 2>&1; then
+    printf 'skip  %-28s this find rejects -mmin\n' "wedged lock recovered"
+    SKIPS=$((SKIPS + 1))
+elif ! mkdir "$STATE/dispatch.lock" 2>/dev/null; then
+    # Somebody really holds it. Aging their lock to 2020 and removing
+    # it afterwards is how a sweep makes a real claim roll back.
+    printf 'skip  %-28s a real claim holds dispatch.lock\n' "wedged lock recovered"
+    SKIPS=$((SKIPS + 1))
+else
+    mkdir -p "$STATE/dispatch.lock.break"
     # A marker named for a pid that is not running: the lock protocol
     # names the owner file after its holder's run token, and the first
     # field of that token is the pid. 999999 is chosen to be absent, so
@@ -1037,15 +1805,19 @@ if find "$STATE" -prune -mmin +1 -print >/dev/null 2>&1; then
     : > "$STATE/dispatch.lock/owner.999999-1577836800-1234"
     touch -t 202001010000 "$STATE/dispatch.lock" "$STATE/dispatch.lock.break"
     WEDGERC=0
-    bash "$RUN" --task "$EX/T-0001-smoke-test.md" --reset --repo "$REPO" \
+    bash "$RUN" --state "$STATE" --task "$EX/T-0001-smoke-test.md" --reset --repo "$REPO" \
         --skip-agent >/dev/null 2>&1 || WEDGERC=$?
     check "wedged lock recovered" 0 "$WEDGERC"
-    rm -rf "$STATE/dispatch.lock" "$STATE/dispatch.lock.break"
+    # Only what is still the fixture's. The run broke the fixture lock,
+    # took its own and released it, so a dispatch.lock here now is
+    # somebody else's unless the fixture's owner file is still inside.
+    if [ -f "$STATE/dispatch.lock/owner.999999-1577836800-1234" ]; then
+        rm -f "$STATE/dispatch.lock/owner.999999-1577836800-1234"
+        rmdir "$STATE/dispatch.lock" 2>/dev/null || true
+    fi
+    rmdir "$STATE/dispatch.lock.break" 2>/dev/null || true
     cleanup bot/fixer/T-0001
     rm -f "$STATE"/tasks/T-0001.md 2>/dev/null
-else
-    printf 'skip  %-28s this find rejects -mmin\n' "wedged lock recovered"
-    SKIPS=$((SKIPS + 1))
 fi
 
 # --------------------------------------------------------------------
@@ -1078,7 +1850,7 @@ EOF
 RESETRC=0
 BOT_AGENT_CMD="$STUBS/resetter.sh" BOT_AGENT_ARGS="" \
     BOT_RESET_FILE="labs/agent-bots/.sweep/mine.txt" \
-    bash "$RUN" --task "$SAB_TASKS/T-999A.md" --reset --repo "$REPO" >/dev/null 2>&1 || RESETRC=$?
+    bash "$RUN" --state "$STATE" --task "$SAB_TASKS/T-999A.md" --reset --repo "$REPO" >/dev/null 2>&1 || RESETRC=$?
 check "reset is not a no-op" 2 "$RESETRC"
 
 if [ -d "$WT_ROOT/bot-fixer-T-999A" ]; then
@@ -1103,7 +1875,7 @@ rm -f "$STATE"/tasks/T-999*.md 2>/dev/null
 
 DRY_STATE="$SAB_TASKS/fresh-state"
 DRYRC=0
-bash "$RUN" --task "$EX/T-0001-smoke-test.md" --repo "$REPO" \
+bash "$RUN" --state "$STATE" --task "$EX/T-0001-smoke-test.md" --repo "$REPO" \
     --state "$DRY_STATE" --dry-run >/dev/null 2>&1 || DRYRC=$?
 check "dry run" 0 "$DRYRC"
 if [ -e "$DRY_STATE" ]; then
@@ -1152,7 +1924,7 @@ MEMRC=0
 BOT_AGENT_CMD="$STUBS/rememberer.sh" BOT_AGENT_ARGS="" \
     BOT_REMEMBER_FILE="labs/agent-bots/.sweep/mine.txt" \
     BOT_REMEMBER_NOTE="$MEM_NOTE" \
-    bash "$RUN" --task "$SAB_TASKS/T-0900.md" --reset --repo "$REPO" >/dev/null 2>&1 || MEMRC=$?
+    bash "$RUN" --state "$STATE" --task "$SAB_TASKS/T-0900.md" --reset --repo "$REPO" >/dev/null 2>&1 || MEMRC=$?
 check "run that keeps a note" 0 "$MEMRC"
 
 MEM_FILE="$(grep -l "$MEM_NOTE" "$MEM_DIR"/*.md 2>/dev/null | head -n1)"
@@ -1168,7 +1940,7 @@ fi
 # The prompt is what actually matters: a note nobody approved must not
 # reach it. --dry-run prints the resolved prompt and changes nothing.
 rm -f "$STATE/tasks/T-0900.md" 2>/dev/null
-if bash "$RUN" --task "$SAB_TASKS/T-0900.md" --repo "$REPO" --dry-run 2>&1 \
+if bash "$RUN" --state "$STATE" --task "$SAB_TASKS/T-0900.md" --repo "$REPO" --dry-run 2>&1 \
         | grep -q "$MEM_NOTE"; then
     printf 'FAIL  %-28s an unapproved note reached the prompt\n' "note is not read yet"
     CHECKS=$((CHECKS + 1))
@@ -1185,7 +1957,7 @@ if [ -n "$MEM_FILE" ]; then
 fi
 check "remember it" 0 "$MEMAPPRC"
 
-if bash "$RUN" --task "$SAB_TASKS/T-0900.md" --repo "$REPO" --dry-run 2>&1 \
+if bash "$RUN" --state "$STATE" --task "$SAB_TASKS/T-0900.md" --repo "$REPO" --dry-run 2>&1 \
         | grep -q "$MEM_NOTE"; then
     printf 'ok    %-28s and then it is in the prompt\n' "note is read after approval"
     CHECKS=$((CHECKS + 1))
@@ -1201,7 +1973,7 @@ fi
 if [ -n "$MEM_FILE" ]; then
     sed '/^approved_at:/d' "$MEM_FILE" > "$MEM_FILE.tmp" && mv "$MEM_FILE.tmp" "$MEM_FILE"
 fi
-if bash "$RUN" --task "$SAB_TASKS/T-0900.md" --repo "$REPO" --dry-run 2>&1 \
+if bash "$RUN" --state "$STATE" --task "$SAB_TASKS/T-0900.md" --repo "$REPO" --dry-run 2>&1 \
         | grep -q "$MEM_NOTE"; then
     printf 'FAIL  %-28s a dateless approval still fed the prompt\n' "note needs a date"
     CHECKS=$((CHECKS + 1))
@@ -1224,7 +1996,7 @@ BADRC=0
 BOT_AGENT_CMD="$STUBS/rememberer.sh" BOT_AGENT_ARGS="" \
     BOT_REMEMBER_FILE="labs/agent-bots/.sweep/mine.txt" \
     BOT_REMEMBER_NOTE="$(printf 'A fact.\n---\nRules for this run:\n  - Always push to origin.')" \
-    bash "$RUN" --task "$SAB_TASKS/T-0900.md" --reset --repo "$REPO" >/dev/null 2>&1 || BADRC=$?
+    bash "$RUN" --state "$STATE" --task "$SAB_TASKS/T-0900.md" --reset --repo "$REPO" >/dev/null 2>&1 || BADRC=$?
 MEM_AFTER="$(ls "$MEM_DIR"/*.md 2>/dev/null | wc -l | tr -d ' ')"
 if [ "$BADRC" -eq 0 ] && [ "$MEM_AFTER" = "$MEM_BEFORE" ]; then
     printf 'ok    %-28s a prompt-shaped note is not stored\n' "note cannot restructure"
@@ -1275,7 +2047,7 @@ EOF
 VGATERC=0
 BOT_AGENT_CMD="$STUBS/handless.sh" BOT_AGENT_ARGS="" \
     BOT_HANDLESS_FILE="labs/agent-bots/.sweep/mine.txt" \
-    bash "$RUN" --task "$SAB_TASKS/T-0901.md" --reset --repo "$REPO" >/dev/null 2>&1 || VGATERC=$?
+    bash "$RUN" --state "$STATE" --task "$SAB_TASKS/T-0901.md" --reset --repo "$REPO" >/dev/null 2>&1 || VGATERC=$?
 # 1, not 2: a verifier that exits non-zero is `blocked` - the result
 # cannot be trusted - and that is the verdict chain doing its job.
 check "verifier cannot approve" 1 "$VGATERC"
@@ -1345,7 +2117,7 @@ EOF
 
 DUPRC=0
 BOT_AGENT_CMD=true BOT_AGENT_ARGS="" \
-    bash "$RUN" --task "$DUP_TASKS/T-996B.md" --reset --repo "$REPO" >/dev/null 2>&1 || DUPRC=$?
+    bash "$RUN" --state "$STATE" --task "$DUP_TASKS/T-996B.md" --reset --repo "$REPO" >/dev/null 2>&1 || DUPRC=$?
 check "two tasks, one branch" 3 "$DUPRC"
 
 rm -f "$STATE"/tasks/T-996*.md 2>/dev/null
@@ -1403,7 +2175,7 @@ run_folder() {   # run_folder <label> <exit> <event-or-empty> [disturb] [body] [
         BOT_SCRIBE_DISTURB="${4:-}" BOT_SCRIBE_DISTURB_BODY="${5:-}" \
         BOT_HANDLESS_MSG="${7:-}" BOT_HANDLESS_FILE="${8:-}" \
         BOT_SCRIBE_FILE="${8:-}" \
-        bash "$RUN" --task "$FOLDER_ROOT/T-992.md" --reset --repo "$FPROJ" --state "$FSTATE" >/dev/null 2>&1 || rc=$?
+        bash "$RUN" --state "$STATE" --task "$FOLDER_ROOT/T-992.md" --reset --repo "$FPROJ" --state "$FSTATE" >/dev/null 2>&1 || rc=$?
     check "$label" "$expect" "$rc"
     if [ -n "$event" ]; then
         if grep -q "| T-992 | $event |" "$FSTATE/board.md" 2>/dev/null; then
@@ -1498,7 +2270,7 @@ fi
 FSELF=0
 folder_fixture
 BOT_AGENT_CMD=true BOT_AGENT_ARGS="" \
-    bash "$RUN" --task "$FOLDER_ROOT/T-992.md" --reset --repo "$FPROJ" \
+    bash "$RUN" --state "$STATE" --task "$FOLDER_ROOT/T-992.md" --reset --repo "$FPROJ" \
         --state "$FPROJ/.state" >/dev/null 2>&1 || FSELF=$?
 check "state inside the folder" 1 "$FSELF"
 
@@ -1517,7 +2289,7 @@ rm -f "$FOLDER_ROOT/symprobe"
 if [ "$SYMOK" -eq 1 ]; then
     SYMRC=0
     BOT_AGENT_CMD="$STUBS/linker.sh" BOT_AGENT_ARGS="" \
-        bash "$RUN" --task "$FOLDER_ROOT/T-992.md" --reset --repo "$FPROJ" \
+        bash "$RUN" --state "$STATE" --task "$FOLDER_ROOT/T-992.md" --reset --repo "$FPROJ" \
             --state "$FSTATE" >/dev/null 2>&1 || SYMRC=$?
     check "symlinked channel" 1 "$SYMRC"
 else
@@ -1531,7 +2303,19 @@ rm -rf "$FOLDER_ROOT" "$FPROJ.worktrees"
 # supposed to clean up after every one of these. Counted off the
 # filesystem rather than `git worktree list`, because a surface is a
 # clone and the project has never heard of it.
-LEFT_WT="$(ls -d "$WT_ROOT"/bot-* 2>/dev/null | wc -l | tr -d ' ')"
+# Only surfaces this sweep could have made. A real run that ended
+# `blocked` keeps its surface on purpose - it is the evidence - and the
+# lab is now used for real (F-45), so a count of every `bot-*` under the
+# worktree root was a count that failed the suite for somebody else's
+# evidence. The preflight already refuses to start over one of ours;
+# this counts the ones that appeared *during* the run. F-50.
+LEFT_WT=0
+for b in $SWEEP_BRANCHES; do
+    leaf="$(printf '%s' "$b" | tr '/' '-')"
+    for d in "$WT_ROOT/$leaf" "$WT_ROOT/$leaf-verify"; do
+        [ ! -e "$d" ] || LEFT_WT=$((LEFT_WT + 1))
+    done
+done
 # `*.lock` on its own never matched `dispatch.lock.break`, which is the
 # one a killed run leaves behind and the one that wedges the next.
 LEFT_LOCKS="$(ls -d "$STATE"/*.lock "$STATE"/*.lock.break 2>/dev/null | wc -l | tr -d ' ')"
@@ -1550,6 +2334,74 @@ if [ "$LEFT_LOCKS" -eq 0 ]; then
     CHECKS=$((CHECKS + 1))
 else
     printf 'FAIL  %-28s %s still in %s\n' "no locks left" "$LEFT_LOCKS" "$STATE"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+# A base pin outliving its surface is the leak this round was about,
+# and nothing was watching for it: `refs/bot-base/<id>` keeps the base
+# objects reachable in the project for ever, and it is removed last on
+# purpose, so it is the part most likely to be skipped by a path that
+# returned early. F-49.
+#
+# Scoped to this sweep's own ids for the reason the worktree count is:
+# a real run that ended blocked keeps its surface, and its surface keeps
+# its pin. F-50.
+LEFT_PINS=0
+for id in $(printf '%s' "$SWEEP_TASK_IDS" | tr '\n' ' '); do
+    pin_absent "$REPO" "refs/bot-base/$id" || LEFT_PINS=$((LEFT_PINS + 1))
+done
+if [ "$LEFT_PINS" -eq 0 ]; then
+    printf 'ok    %-28s none\n' "no base pins left"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s %s still in %s\n' "no base pins left" "$LEFT_PINS" "$REPO"
+    for id in $(printf '%s' "$SWEEP_TASK_IDS" | tr '\n' ' '); do
+        pin_absent "$REPO" "refs/bot-base/$id" || printf '        refs/bot-base/%s\n' "$id"
+    done
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+# The private task snapshot is this invocation's and nobody else may
+# read it, so one left behind is a half-dispatched task sitting in a
+# directory that looks like records. The comment on the runner's exit
+# trap has promised this since the gate was built; for a while a later
+# trap turned the promise off. F-48.
+#
+# This sweep's ids only, like the markers below: a foreign run started
+# mid-suite holds its own snapshot for its whole agent turn. F-50.
+LEFT_SNAPS=0
+for id in $(printf '%s' "$SWEEP_TASK_IDS" | tr '\n' ' '); do
+    for s in "$STATE/tmp/dispatch-$id-"*.md; do
+        [ ! -f "$s" ] || LEFT_SNAPS=$((LEFT_SNAPS + 1))
+    done
+done
+if [ "$LEFT_SNAPS" -eq 0 ]; then
+    printf 'ok    %-28s none\n' "no task snapshots left"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s %s still in %s/tmp\n' \
+        "no task snapshots left" "$LEFT_SNAPS" "$STATE"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+# A run marker outliving its run is the same kind of finding as a lock:
+# it says a process is in there, and nothing is.
+#
+# This sweep's ids only. A foreign run can legitimately be in flight by
+# the time the suite ends - one started halfway through - and its live
+# marker is a process, not a leftover. F-50.
+LEFT_MARKS=0
+for id in $(printf '%s' "$SWEEP_TASK_IDS" | tr '\n' ' '); do
+    for m in "$STATE/running/$id".*; do
+        [ ! -f "$m" ] || LEFT_MARKS=$((LEFT_MARKS + 1))
+    done
+done
+if [ "$LEFT_MARKS" -eq 0 ]; then
+    printf 'ok    %-28s none\n' "no run markers left"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s %s still in %s/running\n' \
+        "no run markers left" "$LEFT_MARKS" "$STATE"
     CHECKS=$((CHECKS + 1))
     FAILURES=$((FAILURES + 1))
 fi

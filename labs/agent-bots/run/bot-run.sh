@@ -204,6 +204,8 @@ LAB_DIR="$(dirname "$SCRIPT_DIR")"
 . "$SCRIPT_DIR/approval.sh"
 # shellcheck source=memory.sh
 . "$SCRIPT_DIR/memory.sh"
+# shellcheck source=live-task.sh
+. "$SCRIPT_DIR/live-task.sh"
 
 die() { printf 'bot-run: %s\n' "$*" >&2; exit 1; }
 say() { printf '%s\n' "$*"; }
@@ -269,7 +271,15 @@ release_locks() {
 # and only once the gate has passed.
 on_exit() {
     release_locks
-    [ -z "${SNAPSHOT_HELD:-}" ] || rm -f "$SNAPSHOT_HELD"
+    # Each removal on its own, and none of them fatal: this runs under
+    # `set -e`, and a snapshot a Windows file lock keeps in place would
+    # otherwise end the trap before the marker below went too.
+    [ -z "${SNAPSHOT_HELD:-}" ] || rm -f "$SNAPSHOT_HELD" 2>/dev/null || true
+    # The marker says a process is in here, so it goes when the process
+    # does - including on a die, a refusal or a Ctrl-C. What it leaves
+    # behind on a kill -9 is a stale marker, which is why anything
+    # reading it tests the pid rather than the file (live-task.sh).
+    [ -z "${RUNNING_MARK:-}" ] || rm -f "$RUNNING_MARK" 2>/dev/null || true
 }
 trap on_exit EXIT
 
@@ -612,6 +622,19 @@ if [ "$DRY_RUN" -eq 0 ] && approval_is_proposal "$TASK" "$STATE"; then
     # the first then parses and copies bytes nothing checked. The run
     # token is unique to this process, and `set -C` means creating the
     # file is the claim rather than a hope about names.
+    # Snapshots from runs that were killed before their trap
+    # could fire. The run token starts with the pid, so liveness is a
+    # property of the name - and only this id's are touched, because
+    # another task's leftovers are not this run's to judge. F-48.
+    for stale in "$STATE/tmp/dispatch-$SNAP_ID-"*.md; do
+        [ -f "$stale" ] || continue
+        stale_pid="${stale##*dispatch-$SNAP_ID-}"
+        stale_pid="${stale_pid%%-*}"
+        case "$stale_pid" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        kill -0 "$stale_pid" 2>/dev/null || rm -f "$stale"
+    done
     TASK_SNAPSHOT="$STATE/tmp/dispatch-$SNAP_ID-$RUN_TOKEN.md"
     ( set -C; : > "$TASK_SNAPSHOT" ) 2>/dev/null \
         || die "could not create a private copy of the task at $TASK_SNAPSHOT"
@@ -1210,7 +1233,12 @@ fi
 
 EFFECTIVE_STATUS="$TASK_STATUS"
 if [ -f "$LIVE_TASK" ] && [ "$RESET_PENDING" -eq 0 ]; then
-    EFFECTIVE_STATUS="$(sed -n 's/^status:[[:space:]]*//p' "$LIVE_TASK" | head -n1)"
+    # Frontmatter, not the whole document. This decides whether the
+    # task is already in flight, already finished, or free to run, and
+    # a plain `sed -n 's/^status:...'` reads a *body* line too - the
+    # same defect the review found in live-task.sh, one directory over
+    # and with a dispatch hanging off it. F-49.
+    EFFECTIVE_STATUS="$(live_task_field status "$(cat "$LIVE_TASK")")"
 fi
 
 case "$EFFECTIVE_STATUS" in
@@ -1774,6 +1802,30 @@ set_status() { set_field status "$1"; }
 
 take_lock "$STATE/dispatch.lock" "dispatch"
 
+# The run marker goes down the moment the claim is held, not when the
+# task is marked `dispatched`. Everything destructive happens between
+# those two points - the surface is created, the base pin is written,
+# and on --reset the previous live task is discarded - and all of it
+# ran with the *old* record visible, a terminal status on it and no
+# marker anywhere. A reader acting on "no marker and a verdict" could
+# delete the new surface out from under the reset that was building
+# it. Taken here, the marker covers the whole claim; on_exit removes
+# it on every path out, a refusal included. F-50.
+#
+# A marker whose process is gone is litter from a killed run, and this
+# task's own claim is the right place to sweep it: inside the lock,
+# nothing else can be deciding about the same id, and the pid says the
+# run is dead rather than the file's existence. Same judgement take_lock
+# makes before breaking an abandoned break marker.
+mkdir -p "$STATE/running"
+live_task_running "$STATE" "$TASK_ID" | while read -r _pid state mark; do
+    [ "$state" = "gone" ] || continue
+    say "  clearing a run marker whose process is gone: $(basename "$mark")"
+    rm -f "$mark" 2>/dev/null || true
+done
+RUNNING_MARK="$STATE/running/$TASK_ID.$RUN_TOKEN"
+printf '%s\n' "$$" > "$RUNNING_MARK"
+
 if [ -f "$LIVE_TASK" ] && [ "$RESET_PENDING" -eq 0 ]; then
     LOCKED_STATUS="$(field status "$LIVE_TASK")"
     [ "$LOCKED_STATUS" = "todo" ] || die \
@@ -1832,6 +1884,15 @@ leaves the branch behind, and 'worktree add -b' then fails too:
     git -C $REPO worktree remove --force $WT
     git -C $REPO branch -D $TASK_BRANCH"
 fi
+# A removal that could not rename its tree back leaves it beside this
+# path under a probe name (live-task.sh, remove_proof_last). Building a
+# new surface here would make "move it back to its name" impossible
+# without moving one tree into the other.
+for stranded in "$WT".removing.* "$VERIFY_WT".removing.*; do
+    [ -e "$stranded" ] || continue
+    refuse "an earlier removal of this surface did not finish: $stranded
+Move it back to its name, or remove it, before re-running."
+done
 if [ -e "$VERIFY_WT" ]; then
     die "verify checkout left over from an earlier run: $VERIFY_WT
 
@@ -1959,15 +2020,19 @@ say "  created $WT (clone of $ORIGIN_REPO)"
 # else. The marker written at creation is the whole check: a path this
 # script computed is not by itself a reason to delete a directory tree.
 drop_surface() {
+    # Both proofs before either removal. They used to alternate - check
+    # the verify checkout, remove it, then check the surface - so a
+    # surface marker naming another task refused only after that
+    # task's verify checkout was gone. F-50, in the function bot-forget
+    # was written to mirror.
+    #
     # Two separate paths, two separate proofs. $VERIFY_WT is a sibling
     # directory name this script computed, and a linked worktree always
     # has a `.git` *file* pointing back at its parent - so that file
     # both identifies it and says whose it is.
     if [ -e "$VERIFY_WT" ]; then
-        if [ -f "$VERIFY_WT/.git" ] \
-           && grep -q "$(printf '%s' "$WT_LEAF")" "$VERIFY_WT/.git" 2>/dev/null; then
-            rm -rf "$VERIFY_WT"
-        else
+        if ! { [ -f "$VERIFY_WT/.git" ] \
+               && grep -q "$(printf '%s' "$WT_LEAF")" "$VERIFY_WT/.git" 2>/dev/null; }; then
             say "  refusing to remove $VERIFY_WT - not a verify checkout this run made"
             return 1
         fi
@@ -1979,23 +2044,49 @@ drop_surface() {
     # looking at its own. The marker names the task; read it.
     grep -q "surface for $TASK_ID\$" "$WT/.git/bot-surface" 2>/dev/null \
         || { say "  refusing to remove $WT - not a surface this run made"; return 1; }
-    rm -rf "$WT"
-    [ ! -e "$WT" ] || return 1
+    # Every caller runs this under `||`, which switches errexit off in
+    # here - so a removal that fails does not stop anything, and has to
+    # be looked at. A verify checkout that survived while its parent
+    # went would be a worktree pointing at nothing, reported as clean.
+    #
+    # Proof last, for the reason remove_proof_last gives: a removal a
+    # file lock stops halfway must leave the next attempt something to
+    # recognise.
+    if [ -e "$VERIFY_WT" ]; then
+        remove_proof_last "$VERIFY_WT" .git \
+            || { say "  could not remove $VERIFY_WT"; return 1; }
+    fi
+    remove_proof_last "$WT" .git/bot-surface || return 1
     # Nothing borrows the base objects any more. Last, so that a removal
     # that refused above still leaves the pin in place.
     git -C "$ORIGIN_REPO" update-ref -d "refs/bot-base/$TASK_ID" >/dev/null 2>&1 || true
     return 0
 }
 
+# Both exit paths end in on_exit rather than in release_locks, because
+# on_exit is where everything this invocation privately owns is
+# dropped - the locks, the task snapshot, the run marker. Calling only
+# release_locks here is how the snapshot and the marker leaked: the
+# comment on on_exit promises `$STATE/tmp` never fills up with
+# half-dispatched tasks, and 15 of them had accumulated. F-48.
 rollback_dispatch() {
     local rc=$?
-    [ "$rc" -eq 0 ] && return 0
-    say ""
-    say "dispatch failed after the work surface was created - rolling it back"
-    rm -f "$LIVE_TASK" "$LIVE_TASK.tmp"
+    if [ "$rc" -eq 0 ]; then
+        on_exit
+        return 0
+    fi
+    # Everything before on_exit is best-effort, and has to be: this
+    # trap runs under `set -e`, and the failure being rolled back may be
+    # the state directory itself - full or unwritable. A board append
+    # that fails there would end the trap before on_exit, leaking the
+    # lock, the snapshot and the run marker, which is the one cleanup
+    # this path exists to guarantee. F-48.
+    say "" || true
+    say "dispatch failed after the work surface was created - rolling it back" || true
+    rm -f "$LIVE_TASK" "$LIVE_TASK.tmp" 2>/dev/null || true
     drop_surface >/dev/null 2>&1 || true
-    board "dispatch-failed" "rolled back"
-    release_locks
+    board "dispatch-failed" "rolled back" 2>/dev/null || true
+    on_exit
     exit "$rc"
 }
 trap rollback_dispatch EXIT
@@ -2012,6 +2103,22 @@ cp "$TASK" "$LIVE_TASK"
 # claim as a ghost and dispatched straight over it.
 set_field worktree "$WT"
 set_field base_sha "$BASE_SHA"
+# And which repository the surface was cut from, which is where its pin
+# lives. Anything retiring the surface later has to find that pin, and
+# re-deriving it from what the plane looks like *then* was wrong: a
+# `snapshot.git` left by an earlier folder task says nothing about this
+# one. Provenance is recorded, not inferred.
+set_field origin_repo "$ORIGIN_REPO"
+# And that they are there. set_field inserts a missing key at the closing
+# fence, so a task whose frontmatter was never closed still runs - its
+# status is replaced in place - but never gets these three, and a record
+# with no `worktree:` is one bot-forget --surface cannot clean up after.
+# Read back rather than trust; this is inside the rollback, so a refusal
+# here takes the surface with it.
+LIVE_RECORDED="$(cat "$LIVE_TASK")"
+[ "$(live_task_field worktree "$LIVE_RECORDED")" = "$WT" ] \
+    && [ "$(live_task_field origin_repo "$LIVE_RECORDED")" = "$ORIGIN_REPO" ] \
+    || die "$TASK_ID's live task did not take its worktree:/origin_repo: fields - is the task's frontmatter closed with a second '---'?"
 
 # Last thing before this run becomes visible to everyone else: are we
 # still the lock holder? If the lock was broken while we were inside
@@ -2024,6 +2131,15 @@ set_field base_sha "$BASE_SHA"
 "the dispatch lock was broken while this run was inside it - refusing to claim.
 Nothing was dispatched. Re-run once no other run is in flight."
 
+# From here the live task is not the only thing that says a run is
+# happening, and it needed not to be. `status:` records where the run
+# got to; it is written before the cleanup below and rewritten if that
+# cleanup fails, so `done` sits on disk while there is still work to
+# do. Anything outside this process that acts on the live task - the
+# sweep's preflight, bot-forget.sh - was reading a status and calling
+# it a state. The marker is the state: it exists exactly as long as
+# this process, and carries the pid so a reader can tell a live run
+# from a killed one. F-47.
 set_status dispatched
 board "dispatched" "$TASK_BRANCH @ ${BASE_SHA:0:12}"
 
@@ -2034,7 +2150,10 @@ drop_lock "$STATE/dispatch.lock"
 
 # Past the half-dispatch window: from here a failure leaves a worktree
 # a human is meant to look at, which is the whole point of `blocked`.
-trap release_locks EXIT
+# Still on_exit and not release_locks: this trap replaced the one
+# installed at the top, and for a while that quietly turned off the
+# snapshot and marker cleanup for every run that got this far. F-48.
+trap on_exit EXIT
 
 # --------------------------------------------------------------------
 # Agent
