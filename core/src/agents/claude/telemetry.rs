@@ -705,6 +705,17 @@ impl ClaudeTranscriptTail {
         if self.tail.last_pos != pos_before || mtime != self.observed_mtime {
             self.last_activity = now;
             self.observed_mtime = mtime;
+            // Writes the parser does not turn into a snapshot (unknown
+            // entry shapes, an mtime-only rewrite) still mean the turn is
+            // running. A snapshot the parser did produce already cleared
+            // the flag, so an `end_turn` keeps its Idle.
+            if let Some(snapshot) = self.snapshot.as_mut()
+                && snapshot.quiet_timeout
+            {
+                snapshot.state = SessionState::Busy;
+                snapshot.quiet_timeout = false;
+                return true;
+            }
         }
 
         // Only the state moves (and says why): tokens, turns, model and
@@ -1738,6 +1749,25 @@ mod tests {
             &[r#"{"type":"assistant","sessionId":"s","timestamp":"2026-08-09T08:20:00Z","message":{"role":"assistant","stop_reason":null,"usage":{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#],
         );
         tail.poll_at(start + past_timeout() * 2);
+        let snap = tail.snapshot.as_ref().unwrap();
+        assert_eq!(snap.state, SessionState::Busy);
+        assert!(!snap.quiet_timeout);
+    }
+
+    #[test]
+    fn unrecognised_writes_after_timeout_are_busy_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, &[PROMPT]);
+
+        let mut tail = ClaudeTranscriptTail::new(path.clone());
+        let start = Instant::now();
+        tail.poll_at(start + past_timeout());
+        assert!(tail.snapshot.as_ref().unwrap().quiet_timeout);
+
+        // A line no entry kind claims: bytes arrive, no snapshot is built.
+        append_lines(&path, &[r#"{"type":"some-future-shape","sessionId":"s"}"#]);
+        assert!(tail.poll_at(start + past_timeout() * 2));
         let snap = tail.snapshot.as_ref().unwrap();
         assert_eq!(snap.state, SessionState::Busy);
         assert!(!snap.quiet_timeout);
