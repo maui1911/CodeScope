@@ -6398,14 +6398,15 @@ impl AppShell {
                     .get(sid)
                     .copied()
                     .unwrap_or(codescope_core::SessionState::Unknown);
-                if prev == snap.state {
+                let state = notified_state(&snap);
+                if prev == state {
                     continue;
                 }
                 // State changed since last tick — record the update so
                 // the second pass can mutate `last_session_state`
                 // (can't write to it inside this loop without giving up
                 // the immutable `&self.groups` borrow).
-                state_updates.push((sid.to_string(), snap.state));
+                state_updates.push((sid.to_string(), state));
 
                 // OS-level "turn complete" toast: fires on
                 // `(Busy | PendingToolUse) → Idle` regardless of which
@@ -6416,7 +6417,7 @@ impl AppShell {
                 // *before* the SelectedTab suppression check.
                 if !self.window_active_cached
                     && matches!(
-                        (prev, snap.state),
+                        (prev, state),
                         (
                             codescope_core::SessionState::Busy
                                 | codescope_core::SessionState::PendingToolUse,
@@ -9182,6 +9183,16 @@ fn default_agent_launch_for(
     Some((id, auto_type))
 }
 
+/// The state the notification pass tracks and compares for a snapshot.
+///
+/// An idle produced by the quiet-window fallback (#351) counts as the
+/// `Busy` it replaced: nothing completed, so it must not announce
+/// "Turn complete", and when the transcript later ends the turn for
+/// real the `Busy → Idle` step is still there to announce it.
+fn notified_state(snap: &codescope_core::TelemetrySnapshot) -> codescope_core::SessionState {
+    if snap.quiet_timeout { codescope_core::SessionState::Busy } else { snap.state }
+}
+
 /// Pure transition classifier for the bell notification — extracted so
 /// the small state machine can be unit-tested without an `AppShell`.
 ///
@@ -9722,6 +9733,7 @@ mod tests {
             turn_count: 0,
             last_turn_duration: None,
             state,
+            quiet_timeout: false,
         }
     }
 
@@ -9766,6 +9778,28 @@ mod tests {
         assert_eq!(kind, crate::notifications::NotificationKind::SessionReady);
         assert_eq!(title, "Ready");
         assert_eq!(detail, "Turn complete.");
+    }
+
+    #[test]
+    fn a_quiet_timeout_is_tracked_as_the_busy_it_replaced() {
+        use codescope_core::SessionState::*;
+        let busy = snap_with_state(Busy);
+        let timed_out = codescope_core::TelemetrySnapshot {
+            quiet_timeout: true,
+            ..snap_with_state(Idle)
+        };
+        let ended = snap_with_state(Idle);
+
+        // Busy → quiet timeout: no change to notify about.
+        assert_eq!(notified_state(&busy), Busy);
+        assert_eq!(notified_state(&timed_out), Busy);
+        // The transcript then ends the turn: the Busy → Idle step is
+        // still there, so "Ready" fires.
+        let prev = notified_state(&timed_out);
+        assert_ne!(prev, notified_state(&ended));
+        let (kind, _, _) =
+            classify_activity_transition(prev, &ended).expect("should fire SessionReady");
+        assert_eq!(kind, crate::notifications::NotificationKind::SessionReady);
     }
 
     #[test]

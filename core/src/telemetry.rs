@@ -62,6 +62,14 @@ pub struct TelemetrySnapshot {
     pub last_turn_duration: Option<Duration>,
     /// Current activity state of the session.
     pub state: SessionState,
+    /// `true` when `state` is `Idle` only because the transcript went
+    /// quiet for [`crate::agents::claude::telemetry::BUSY_QUIET_TIMEOUT`]
+    /// while `Busy` (issue #351), not because the transcript ended a
+    /// turn. The CLI was killed, the machine slept, or the parser missed
+    /// a shape — so nothing completed, and the app must not announce a
+    /// finished turn. Cleared by the next snapshot the transcript itself
+    /// produces. Always `false` for tails without that fallback.
+    pub quiet_timeout: bool,
 }
 
 /// Nominal context-window capacity for a model id.
