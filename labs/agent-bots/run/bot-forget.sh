@@ -253,8 +253,16 @@ if [ "$SURFACE" -eq 1 ] && [ -n "$WORKTREE" ]; then
             [ ! -d "$STATE/snapshot.git" ] \
                 || die "this record predates origin_repo:, and its pin could be in $STAMP or in $STATE/snapshot.git - the project is a repository now, but this plane also imported a folder once. Pass --repo with the one it was cut from. Nothing was removed."
             PIN_REPO="$STAMP"
-        else
+        elif [ -d "$STAMP" ] && [ ! -e "$STAMP/.git" ]; then
+            # A failed probe is only a folder when the folder is there
+            # and has no repository in it - the runner's own second
+            # condition. A project that moved, or one git will not read
+            # (ownership, permissions), fails the probe too, and sending
+            # that to an old snapshot deleted the record and left the
+            # real pin wherever the project went.
             PIN_REPO="$STATE/snapshot.git"
+        else
+            die "this record predates origin_repo:, and $STAMP is neither a repository git can read nor a plain folder - it may have moved. Pass --repo with the repository the surface was cut from. Nothing was removed."
         fi
     fi
     git -C "$PIN_REPO" rev-parse --git-dir >/dev/null 2>&1 \

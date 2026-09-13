@@ -1049,9 +1049,17 @@ printf '%s\n' "$STRAY_PLANE/project" > "$STRAY_PLANE/REPO"
 PROJECT_COMMIT="$(git -C "$STRAY_PLANE/project" \
     -c user.name=sweep -c user.email=sweep@bots.invalid \
     commit-tree "$(git -C "$STRAY_PLANE/project" mktree </dev/null)" -m "project")"
-for variant in recorded ambiguous legacy; do
+for variant in recorded ambiguous moved legacy; do
     git -C "$STRAY_PLANE/project" update-ref refs/bot-base/T-0994 "$PROJECT_COMMIT"
-    [ "$variant" != legacy ] || rm -rf "$STRAY_PLANE/snapshot.git"
+    # moved: the stamp points at a project that is no longer there, and
+    # a snapshot from an older folder task is. A failed probe is not a
+    # folder; the pin is wherever the project went.
+    [ "$variant" != moved ] \
+        || printf '%s\n' "$STRAY_PLANE/project-moved-away" > "$STRAY_PLANE/REPO"
+    [ "$variant" != legacy ] || {
+        rm -rf "$STRAY_PLANE/snapshot.git"
+        printf '%s\n' "$STRAY_PLANE/project" > "$STRAY_PLANE/REPO"
+    }
     {
         printf -- '---\nid: T-0994\nowner: fixer\nbase: folder\nstatus: done\n'
         printf 'worktree: %s/surface\n' "$STRAY_PLANE"
@@ -1060,7 +1068,7 @@ for variant in recorded ambiguous legacy; do
     } > "$STRAY_PLANE/tasks/T-0994.md"
     FORGET_RC=0
     bash "$FORGET" T-0994 --state "$STRAY_PLANE" --surface >/dev/null 2>&1 || FORGET_RC=$?
-    if [ "$variant" = ambiguous ]; then
+    if [ "$variant" = ambiguous ] || [ "$variant" = moved ]; then
         check "stray snapshot, $variant" 1 "$FORGET_RC"
         check "pin kept, $variant" no \
             "$(pin_absent "$STRAY_PLANE/project" refs/bot-base/T-0994 && printf yes || printf no)"

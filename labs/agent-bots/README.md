@@ -3995,4 +3995,11 @@ the answer could have changed since — the project is a repository now
 and the plane also holds a snapshot — it refuses and asks for `--repo`
 instead of picking one of two repositories to delete a ref from.
 
-Sweep is 147.
+The fifth pass found the other half of that probe: a failed probe was
+read as "a plain folder", but a project that moved, or one git refuses
+to read, fails it too. The snapshot is chosen only when the stamped
+folder is there and has no repository in it; anything else refuses and
+asks for `--repo`. A failed lookup is not a folder any more than it is a
+dead process.
+
+Sweep is 150.
