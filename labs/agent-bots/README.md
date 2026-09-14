@@ -775,7 +775,23 @@ is the contract, not the script.
    branch is now rebased onto a base that moved during the run and
    re-verified there — F-25. A branch that is merely waiting is not
    re-checked, and that window is the longer one.)*
-4. Worktree cleanup works on Windows with a build running.
+4. Worktree cleanup works on Windows with a build running. *(**Done,
+   in the only sense that is honest:** it fails closed and the retry
+   finishes. Tried 2026-09-14 on Windows with `remove_proof_last` from
+   `live-task.sh`, against a `--shared` clone carrying its
+   `.git/bot-surface` marker while `cargo build -p codescope-core` ran
+   inside it with `target/` in the tree - the shape an agent's plain
+   `cargo build` leaves. During the build the removal returned 1 after
+   2 s with the tree still there, the marker still in it, and nothing
+   stranded under a `.removing.*` name; the runner's own path from
+   there is `clean-failed` on the board, `needs-review` on the task and
+   the handoff, and the `rm -rf` line in the handoff. With the build
+   killed the same call returned 0 and the tree was gone - which is
+   what `bot-forget.sh --surface` runs later. The four real runs above
+   all built inside their surface and reported `cleaned`, so the
+   finished-build case is covered by them. A lock that never goes
+   away - rust-analyzer or a terminal opened on the surface - stays a
+   `needs-review` for a person, and no retry policy changes that.)*
 5. `verify:` no longer runs through `eval` on the host, or task files
    are provably trusted input. A product feature cannot ship a shell
    command sourced from repo content. See F-6.
