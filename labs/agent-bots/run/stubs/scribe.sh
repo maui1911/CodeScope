@@ -17,6 +17,7 @@
 set -eu
 
 FILE="${BOT_SCRIBE_FILE:-notes.md}"
+mkdir -p "$(dirname "$FILE")"
 printf '%s\n' "${BOT_SCRIBE_BODY:-Written by a bot.}" > "$FILE"
 # -f on purpose. Point BOT_SCRIBE_FILE at something the surface's
 # exclude file holds back and this stub commits it anyway, which is the

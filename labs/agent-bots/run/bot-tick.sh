@@ -43,6 +43,12 @@
 #                      strings and turning those into epoch seconds
 #                      portably is a worse problem than it looks;
 #                      `find -mmin` is on both GNU and BSD.
+#   still mergeable    git. A finished task's branch waits in the
+#                      project for a human; if its base ref has moved
+#                      past the commit it verified against and the
+#                      branch is not in it yet, the tick dispatches a
+#                      --recheck, which replays and re-verifies it
+#                      (F-52).
 #
 # See README F-23.
 #
@@ -194,6 +200,41 @@ handoff_within() {   # handoff_within <id> <minutes>
     [ -n "$hit" ]
 }
 
+# waiting_branch_stale <live task> - does this finished task's branch
+# still stand on the base it verified against?
+#
+# True when the branch is in the project, its base ref resolves to a
+# different commit than the recorded base_sha, and the branch is not
+# yet part of that ref. A branch that landed is nothing to recheck; a
+# base ref that no longer resolves is (the runner reports it). Reports,
+# folders and records missing a field are never stale here: there is
+# no branch to replay in the first two, and no answer in the third.
+# The reason goes to WAIT_WHY, for the decision table.
+WAIT_WHY=""
+waiting_branch_stale() {
+    local text produces branch base base_sha tip now
+    text="$(cat "$1")"
+    produces="$(field_from produces "$text")"
+    [ "${produces:-commit}" = "commit" ] || return 1
+    branch="$(field_from branch "$text")"
+    base="$(field_from base "$text")"
+    base_sha="$(field_from base_sha "$text")"
+    [ -n "$branch" ] && [ -n "$base" ] && [ -n "$base_sha" ] || return 1
+    [ "$base" != "folder" ] || return 1
+    tip="$(git -C "$REPO" rev-parse --verify --quiet "refs/heads/$branch^{commit}" 2>/dev/null)" \
+        || return 1
+    if ! now="$(git -C "$REPO" rev-parse --verify --quiet "$base^{commit}" 2>/dev/null)"; then
+        WAIT_WHY="base $base no longer resolves; $branch waits on ${base_sha:0:12}"
+        return 0
+    fi
+    [ "$now" != "$base_sha" ] || return 1
+    if git -C "$REPO" merge-base --is-ancestor "$tip" "$now" 2>/dev/null; then
+        return 1
+    fi
+    WAIT_WHY="$base moved ${base_sha:0:12} -> ${now:0:12} while $branch waits"
+    return 0
+}
+
 # If this build of find rejects the age test, every recurrence check
 # silently reads "not run recently" and every routine fires on every
 # tick. Ask once and say so, rather than scheduling on a false answer.
@@ -318,6 +359,12 @@ decide_and_run() {
                 else
                     decision="due"; why="every: $every elapsed"
                 fi
+            elif [ "$status" = "done" ] && [ -f "$live" ] && waiting_branch_stale "$live"; then
+                # Finished, pushed, and waiting on a base that has since
+                # moved: the handoff describes a tree nobody can merge
+                # as it stands. Same replay F-25 runs for a base that
+                # moved during the run, for one that moved after it.
+                decision="stale-base"; why="$WAIT_WHY"
             elif [ "$status" != "todo" ] && [ -n "$status" ]; then
                 decision="$status"; why="terminal, no every:"
             fi
@@ -336,7 +383,14 @@ decide_and_run() {
                 fi
             fi
 
-            if [ "$decision" = "ready" ] || [ "$decision" = "due" ]; then
+            if [ "$decision" = "stale-base" ]; then
+                # Counts against --max like a dispatch: it is a run,
+                # with a verifier in it. Never --reset - the record is
+                # what the recheck is about.
+                reset="--recheck"
+            fi
+            if [ "$decision" = "ready" ] || [ "$decision" = "due" ] \
+                || [ "$decision" = "stale-base" ]; then
                 if [ "$dispatched_this_tick" -ge "$MAX" ]; then
                     decision="queued"; why="--max $MAX reached this tick"
                 else

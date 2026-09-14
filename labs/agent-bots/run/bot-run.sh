@@ -48,6 +48,12 @@
 #                        moved while the run was in flight. Hands off a
 #                        branch verified against a commit that is no
 #                        longer the tip.
+#   --recheck            Replay a finished task's waiting branch onto
+#                        its base ref, which moved after the run, and
+#                        verify it there. No agent runs. The live task
+#                        must be `done` and the branch still in the
+#                        project; the record is kept, the branch moves
+#                        only on a clean, green replay.
 #   -h, --help           This text.
 #
 # Exit codes: 0 done, 1 blocked, 2 needs-review, 3 never started.
@@ -96,6 +102,7 @@ RESET=0
 ALLOW_OVERLAP=0
 CHAIN=0
 NO_REBASE=0
+RECHECK=0
 AGENT_EXIT=0
 
 # Repo-relative, and deliberately a single variable: the prompt points
@@ -394,6 +401,7 @@ while [ $# -gt 0 ]; do
         --allow-overlap) ALLOW_OVERLAP=1; shift ;;
         --chain)         CHAIN=1; shift ;;
         --no-rebase)     NO_REBASE=1; shift ;;
+        --recheck)       RECHECK=1; shift ;;
         -h|--help)       usage; exit 0 ;;
         *)               die "unknown argument: $1 (try --help)" ;;
     esac
@@ -1242,15 +1250,72 @@ if [ -f "$LIVE_TASK" ] && [ "$RESET_PENDING" -eq 0 ]; then
 fi
 
 case "$EFFECTIVE_STATUS" in
-    todo) ;;
+    todo)
+        [ "$RECHECK" -eq 0 ] || die \
+            "task $TASK_ID has never finished, so there is no waiting branch to recheck." ;;
     dispatched)
         refuse "task $TASK_ID is already in flight (live status: dispatched).
 A previous run died before writing a handoff. Inspect $WT, then re-run
 with --reset once the worktree and branch are gone." ;;
+    done)
+        [ "$RECHECK" -eq 1 ] || die "task $TASK_ID is 'done', expected 'todo'.
+Re-run it with --reset to start over, or --recheck to replay its
+branch onto a base that moved." ;;
     *)
+        [ "$RECHECK" -eq 0 ] || die \
+            "task $TASK_ID is '$EFFECTIVE_STATUS'; only a 'done' task has a waiting branch to recheck."
         die "task $TASK_ID is '$EFFECTIVE_STATUS', expected 'todo'.
 Re-run it with --reset to start over." ;;
 esac
+
+# --------------------------------------------------------------------
+# Recheck
+#
+# A branch that finished and is waiting to be merged was verified
+# against the base it was cut from, and the base keeps moving while it
+# waits - for longer, usually, than the run itself took. F-25 replays a
+# run onto a base that moved *during* the run; this is the same replay
+# for a base that moved *after* it, and it is the ordinary run with the
+# agent's turn taken out: a surface at the pushed tip, evidence, the
+# verifier, the rebase step with every verdict it already has, the push
+# and the handoff. The record of the finished run is kept; only its
+# base_sha and worktree change, and only if the branch moves. F-52.
+# --------------------------------------------------------------------
+
+RECHECK_TIP=""
+RECHECK_NOTE=""
+if [ "$RECHECK" -eq 1 ]; then
+    [ "$RESET" -eq 0 ] || die \
+        "--recheck keeps the finished record and --reset discards it; pick one."
+    [ "$TASK_PRODUCES" = "commit" ] || die "a report has no branch to recheck."
+    [ "$SURFACE" = "clone" ] || die \
+        "$REPO is a plain folder; its result is a patch, and a patch has no waiting branch to recheck."
+    RECHECK_LIVE="$(cat "$LIVE_TASK")"
+    RECHECK_BASE="$(live_task_field base_sha "$RECHECK_LIVE")"
+    [ -n "$RECHECK_BASE" ] || die \
+        "$TASK_ID's live task records no base_sha:, so there is nothing to replay from."
+    RECHECK_TIP="$(git -C "$ORIGIN_REPO" rev-parse --verify --quiet \
+        "refs/heads/$TASK_BRANCH^{commit}" 2>/dev/null)" || die \
+"branch '$TASK_BRANCH' is not in $ORIGIN_REPO.
+The result was never pushed, or it has been merged and removed. Either
+way there is no waiting branch; retire the record with bot-forget.sh."
+    git -C "$ORIGIN_REPO" merge-base --is-ancestor "$RECHECK_BASE" "$RECHECK_TIP" 2>/dev/null \
+        || die "$TASK_BRANCH (${RECHECK_TIP:0:12}) does not descend from ${RECHECK_BASE:0:12},
+the base it was verified against. Somebody has rewritten it, and what
+it now stands on is not something this run can guess."
+    if git -C "$ORIGIN_REPO" merge-base --is-ancestor "$RECHECK_TIP" "$BASE_SHA" 2>/dev/null; then
+        refuse "$TASK_BRANCH is already in $TASK_BASE - it landed. Nothing to recheck;
+retire the record with bot-forget.sh."
+    fi
+    [ "$BASE_SHA" != "$RECHECK_BASE" ] || refuse \
+        "$TASK_BASE is still ${BASE_SHA:0:12}, the commit $TASK_BRANCH verified against. Nothing to recheck."
+    # The branch stands on the base it was dispatched at; that is the
+    # commit to replay from. The ref is read again after the (skipped)
+    # agent turn, exactly as an ordinary run reads it.
+    RECHECK_NOTE="waiting branch at ${RECHECK_TIP:0:12}, verified against ${RECHECK_BASE:0:12}; $TASK_BASE is now ${BASE_SHA:0:12}"
+    BASE_SHA="$RECHECK_BASE"
+    SKIP_AGENT=1
+fi
 
 # --------------------------------------------------------------------
 # Overlap
@@ -1828,7 +1893,9 @@ printf '%s\n' "$$" > "$RUNNING_MARK"
 
 if [ -f "$LIVE_TASK" ] && [ "$RESET_PENDING" -eq 0 ]; then
     LOCKED_STATUS="$(field status "$LIVE_TASK")"
-    [ "$LOCKED_STATUS" = "todo" ] || die \
+    LOCKED_WANT="todo"
+    [ "$RECHECK" -eq 0 ] || LOCKED_WANT="done"
+    [ "$LOCKED_STATUS" = "$LOCKED_WANT" ] || die \
         "task $TASK_ID became '$LOCKED_STATUS' while this run was starting.
 Another runner claimed it first."
 fi
@@ -1898,7 +1965,8 @@ if [ -e "$VERIFY_WT" ]; then
 
     rm -rf $VERIFY_WT"
 fi
-if git -C "$ORIGIN_REPO" rev-parse --verify --quiet "refs/heads/$TASK_BRANCH" >/dev/null 2>&1; then
+if [ "$RECHECK" -eq 0 ] \
+    && git -C "$ORIGIN_REPO" rev-parse --verify --quiet "refs/heads/$TASK_BRANCH" >/dev/null 2>&1; then
     # The work happens on a clone and is pushed back here at the end.
     # A branch of this name already in the project is either an earlier
     # run nobody cleaned up or somebody's work, and the push would be
@@ -1921,7 +1989,8 @@ mkdir -p "$WORKTREE_ROOT"
 # the rebase step replay onto a base that moved.
 SURFACE_OK=0
 if git clone --shared --no-checkout --quiet "$ORIGIN_REPO" "$WT" >>"$RUN_LOG" 2>&1; then
-    git -C "$WT" checkout --quiet -b "$TASK_BRANCH" "$BASE_SHA" >>"$RUN_LOG" 2>&1 \
+    # A recheck starts where the branch is; a dispatch starts at the base.
+    git -C "$WT" checkout --quiet -b "$TASK_BRANCH" "${RECHECK_TIP:-$BASE_SHA}" >>"$RUN_LOG" 2>&1 \
         && SURFACE_OK=1
 fi
 if [ "$SURFACE_OK" -eq 0 ]; then
@@ -2095,7 +2164,9 @@ if [ "$RESET_PENDING" -eq 1 ]; then
     rm -f "$LIVE_TASK"
     say "  reset: discarded the previous live task"
 fi
-cp "$TASK" "$LIVE_TASK"
+# A recheck keeps the record of the finished run; only where its surface
+# now is changes below, and its base_sha only once the branch has moved.
+[ "$RECHECK" -eq 1 ] || cp "$TASK" "$LIVE_TASK"
 # Where this run's worktree actually is, rather than where a later run
 # would guess it is. The overlap scan tests that path to decide whether
 # a dispatch is still alive, and it used to recompute it from its *own*
@@ -2140,8 +2211,16 @@ Nothing was dispatched. Re-run once no other run is in flight."
 # it a state. The marker is the state: it exists exactly as long as
 # this process, and carries the pid so a reader can tell a live run
 # from a killed one. F-47.
+# `dispatched` for a recheck too: the overlap scan reads that status to
+# see a surface as in flight, and a replay is editing the files the
+# branch touches. A recheck killed in flight therefore reads as a stale
+# dispatch; its branch in the project is untouched until the push.
 set_status dispatched
-board "dispatched" "$TASK_BRANCH @ ${BASE_SHA:0:12}"
+if [ "$RECHECK" -eq 1 ]; then
+    board "recheck" "$TASK_BRANCH @ ${RECHECK_TIP:0:12} on ${BASE_SHA:0:12}"
+else
+    board "dispatched" "$TASK_BRANCH @ ${BASE_SHA:0:12}"
+fi
 
 # The claim is now visible to every other runner, so the lock has done
 # its job. Holding it through the agent run would serialise the bots
@@ -3592,7 +3671,14 @@ if [ "$TREE_BROKEN" -eq 0 ] && [ "$COMMITS" -gt 0 ] && [ -z "$PUBLISH_REFUSED" ]
     # this push wherever it liked. $ORIGIN_REPO is the runner's own
     # variable and has never been inside the worktree.
     LANDED=""
-    if git -C "$WT" push --quiet "$ORIGIN_REPO" \
+    # A recheck moves a branch the project already has, so the push is
+    # not a fast-forward. The lease is the tip this run started from:
+    # if anything else moved the branch meanwhile, the push is refused
+    # rather than overwriting it.
+    PUSH_LEASE=()
+    [ "$RECHECK" -eq 0 ] \
+        || PUSH_LEASE=("--force-with-lease=refs/heads/$TASK_BRANCH:$RECHECK_TIP")
+    if git -C "$WT" push --quiet ${PUSH_LEASE[@]+"${PUSH_LEASE[@]}"} "$ORIGIN_REPO" \
         "refs/heads/$TASK_BRANCH:refs/heads/$TASK_BRANCH" >>"$RUN_LOG" 2>&1; then
         # Exit 0 says the push succeeded, not that it went here. The
         # disarm unsets `url.*.insteadOf`, but a push is the one place
@@ -3920,7 +4006,8 @@ $(if [ "$TREE_BROKEN" -eq 0 ] && [ "$COMMITS" -gt 0 ]; then git -C "$WT" log --f
     verify:   $TASK_VERIFY -> exit $VERIFY_EXIT
               (ran in a $VERIFY_WHERE, so this is evidence about the
                branch and not about the agent's leftovers)
-    rebase:   $REBASE_STATE
+    rebase:   $REBASE_STATE${RECHECK_NOTE:+
+    recheck:  $RECHECK_NOTE}
     touched:
 $(if [ -n "$TOUCHED" ]; then printf '%s\n' "$TOUCHED" | sed 's/^/      /'; else echo "      (none)"; fi)
     log:      $RUN_LOG
