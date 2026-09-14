@@ -205,12 +205,18 @@ handoff_within() {   # handoff_within <id> <minutes>
 #
 # True when the branch is in the project, its base ref resolves to a
 # different commit than the recorded base_sha, and the branch is not
-# yet part of that ref. A branch that landed is nothing to recheck; a
-# base ref that no longer resolves is (the runner reports it). Reports,
-# folders and records missing a field are never stale here: there is
-# no branch to replay in the first two, and no answer in the third.
-# The reason goes to WAIT_WHY, for the decision table.
+# yet part of that ref. A branch that landed is nothing to recheck.
+# Reports, folders and records missing a field are never stale here:
+# there is no branch to replay in the first two, and no answer in the
+# third. The reason goes to WAIT_WHY, for the decision table.
+#
+# A base ref that no longer resolves is not stale either - it is a
+# question for a person, and WAIT_GONE says so. The runner cannot take
+# it: it resolves the base before it knows it is rechecking, and exits
+# there with nothing written. Dispatching that on every tick would hold
+# a --max slot for ever and record nothing (Codex review on #366).
 WAIT_WHY=""
+WAIT_GONE=""
 waiting_branch_stale() {
     local text produces branch base base_sha tip now
     text="$(cat "$1")"
@@ -224,8 +230,8 @@ waiting_branch_stale() {
     tip="$(git -C "$REPO" rev-parse --verify --quiet "refs/heads/$branch^{commit}" 2>/dev/null)" \
         || return 1
     if ! now="$(git -C "$REPO" rev-parse --verify --quiet "$base^{commit}" 2>/dev/null)"; then
-        WAIT_WHY="base $base no longer resolves; $branch waits on ${base_sha:0:12}"
-        return 0
+        WAIT_GONE="base $base no longer resolves; $branch verified against ${base_sha:0:12} and somebody has to say where it lands"
+        return 1
     fi
     [ "$now" != "$base_sha" ] || return 1
     if git -C "$REPO" merge-base --is-ancestor "$tip" "$now" 2>/dev/null; then
@@ -359,12 +365,15 @@ decide_and_run() {
                 else
                     decision="due"; why="every: $every elapsed"
                 fi
-            elif [ "$status" = "done" ] && [ -f "$live" ] && waiting_branch_stale "$live"; then
+            elif [ "$status" = "done" ] && [ -f "$live" ] \
+                && { WAIT_GONE=""; waiting_branch_stale "$live"; }; then
                 # Finished, pushed, and waiting on a base that has since
                 # moved: the handoff describes a tree nobody can merge
                 # as it stands. Same replay F-25 runs for a base that
                 # moved during the run, for one that moved after it.
                 decision="stale-base"; why="$WAIT_WHY"
+            elif [ "$status" = "done" ] && [ -n "$WAIT_GONE" ]; then
+                decision="base-gone"; why="$WAIT_GONE"
             elif [ "$status" != "todo" ] && [ -n "$status" ]; then
                 decision="$status"; why="terminal, no every:"
             fi

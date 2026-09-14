@@ -4166,7 +4166,21 @@ What it refuses, before the lock and at no cost: a branch already in
 its base (it landed - retire the record with `bot-forget.sh`), a base
 that has not moved, a report, a folder project (its result is a patch,
 not a branch), and a `--reset` on the same command line, since one
-keeps the record and the other discards it.
+keeps the record and the other discards it. And a definition that
+disagrees with the record about `branch:`, `base:` or the repository
+(Codex, reviewing this): the record names the branch that finished,
+the definition is a file anybody may have edited since, and a recheck
+that took the branch from the definition would replay whatever it now
+names and force-push onto it - with a lease taken from that same
+branch, so the lease would hold. The record is the identity.
+
+A base ref that no longer resolves is the one case the tick does not
+dispatch. The runner resolves the base before it knows it is
+rechecking and exits there with nothing written, so a tick that
+dispatched it would hold a `--max` slot on every tick and record
+nothing (the same review). It is reported as `base-gone` instead: the
+branch verified against a commit that has no name any more, and where
+it lands is somebody's decision.
 
 **And the first dry run found three stale branches in the real control
 plane.** T-0010, T-0011 and T-0012 verified against `labs/agent-bots`

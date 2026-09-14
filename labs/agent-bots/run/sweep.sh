@@ -1657,9 +1657,28 @@ BOT_AGENT_CMD="$STUBS/scribe.sh" BOT_AGENT_ARGS="" \
     BOT_SCRIBE_FILE=labs/agent-bots/.sweep/still.txt BOT_SCRIBE_BODY=bot \
     bash "$RUN" --state "$STATE" --task "$MOVE_TASKS/T-991G.md" --reset --repo "$REPO" >/dev/null 2>&1 || RC=$?
 check "waiting, still first run" 0 "$RC"
+G_TIP="$(git -C "$REPO" rev-parse --verify "refs/heads/bot/fixer/T-991G" 2>/dev/null || printf '')"
 RC=0
 bash "$RUN" --state "$STATE" --task "$MOVE_TASKS/T-991G.md" --recheck --repo "$REPO" >/dev/null 2>&1 || RC=$?
 check "waiting, base still" 3 "$RC"
+# The definition edited since the run: the record names the branch that
+# finished, and a recheck that disagreed with it would replay - and
+# force-push - some other branch. Refused before anything is created.
+advance_base labs/agent-bots/.sweep/later.txt base
+sed 's|^branch: .*|branch: bot/fixer/T-991E|' "$MOVE_TASKS/T-991G.md" > "$MOVE_TASKS/T-991G.md.tmp"     && mv "$MOVE_TASKS/T-991G.md.tmp" "$MOVE_TASKS/T-991G.md"
+RC=0
+bash "$RUN" --state "$STATE" --task "$MOVE_TASKS/T-991G.md" --recheck --repo "$REPO" >/dev/null 2>&1 || RC=$?
+check "waiting, edited definition" 1 "$RC"
+if [ "$(git -C "$REPO" rev-parse --verify "refs/heads/bot/fixer/T-991G" 2>/dev/null)" = "$G_TIP" ]     && [ ! -e "$WT_ROOT/bot-fixer-T-991G" ]; then
+    printf 'ok    %-28s branch untouched, nothing created
+' "edited definition surface"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s a surface was created for a refused recheck
+' "edited definition surface"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
 cleanup "bot/fixer/T-991G"
 
 git -C "$REPO" branch -D "$SWEEP_BASE" >/dev/null 2>&1

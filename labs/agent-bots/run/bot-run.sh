@@ -1291,6 +1291,25 @@ if [ "$RECHECK" -eq 1 ]; then
     [ "$SURFACE" = "clone" ] || die \
         "$REPO is a plain folder; its result is a patch, and a patch has no waiting branch to recheck."
     RECHECK_LIVE="$(cat "$LIVE_TASK")"
+    # The record names the branch that finished; the definition is a
+    # file somebody may have edited since. A recheck that read the
+    # branch from the definition would replay whatever branch it now
+    # names - another task's, say - and force-push onto it with a lease
+    # taken from that same branch, so the lease would hold. The record
+    # is the identity; the definition has to agree with it.
+    for want in branch base origin_repo; do
+        case "$want" in
+            branch)      have="$TASK_BRANCH" ;;
+            base)        have="$TASK_BASE" ;;
+            origin_repo) have="$ORIGIN_REPO" ;;
+        esac
+        recorded="$(live_task_field "$want" "$RECHECK_LIVE")"
+        [ "$recorded" = "$have" ] || die \
+"task $TASK_ID's definition says $want: $have, and the run that finished
+recorded $want: ${recorded:-(nothing)}. A recheck replays the branch
+the record names, so the two have to agree. Edit the definition back,
+or retire the record with bot-forget.sh and dispatch it afresh."
+    done
     RECHECK_BASE="$(live_task_field base_sha "$RECHECK_LIVE")"
     [ -n "$RECHECK_BASE" ] || die \
         "$TASK_ID's live task records no base_sha:, so there is nothing to replay from."
