@@ -775,9 +775,13 @@ is the contract, not the script.
    branch is now rebased onto a base that moved during the run and
    re-verified there — F-25. A branch that is merely waiting is not
    re-checked, and that window is the longer one.)*
-4. Worktree cleanup works on Windows with a build running. *(**Done,
-   in the only sense that is honest:** it fails closed and the retry
-   finishes. Tried 2026-09-14 on Windows with `remove_proof_last` from
+4. Worktree cleanup on Windows with a build running fails closed and
+   the retry finishes. *(**Done.** As first written this said "works",
+   and a removal cannot work against a file another process holds
+   open; what it can do is refuse without losing the marker that lets
+   the next attempt recognise the tree, and that is what the criterion
+   now asks for - Copilot, reviewing the claim. Tried 2026-09-14 on
+   Windows with `remove_proof_last` from
    `live-task.sh`, against a `--shared` clone carrying its
    `.git/bot-surface` marker while `cargo build -p codescope-core` ran
    inside it with `target/` in the tree - the shape an agent's plain
