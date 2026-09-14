@@ -807,6 +807,9 @@ pub struct AppShell {
     /// reach `paths.layout_file()` without us having to pull it from
     /// the sidebar every time.
     paths: Arc<AppPaths>,
+    /// Latest window geometry not yet written by the debounce loop.
+    /// Shared with that loop so Restart can flush it before quitting.
+    pending_window_save: Arc<Mutex<Option<PendingWindowSave>>>,
     /// In-memory copy of `layout.json` — kept in sync as group
     /// weights / focus / counts change so a save-on-change writes the
     /// full struct instead of the field we touched.
@@ -1650,6 +1653,7 @@ impl AppShell {
             toasts: std::collections::VecDeque::new(),
             next_toast_id: 0,
             paths: paths.clone(),
+            pending_window_save,
             layout,
             next_group_id: group_count as u64,
             next_tab_id: 0,
@@ -6335,13 +6339,23 @@ impl AppShell {
                 crate::update::start_install(self.update_state.clone(), info);
             }
             ToastActionKind::RestartForUpdate => {
+                // The new instance reads window.json on boot, so write
+                // geometry still sitting in the debounce (a move or
+                // resize in the last 500 ms) instead of dropping it.
+                if let Some(p) = self.pending_window_save.lock().take()
+                    && let Err(err) = p.state.save(&self.paths)
+                {
+                    eprintln!("warning: failed to save window state: {err:#}");
+                }
+                // Spawn the swapped binary first (#341); it waits for this
+                // pid to exit. If the spawn fails we still quit, so the
+                // user never keeps an old binary that thinks it updated;
+                // the reason is in update.log.
+                let _ = crate::update::relaunch();
                 // Graceful quit rather than process::exit(0): runs
-                // gpui's normal shutdown so the user can relaunch into
+                // gpui's normal shutdown so the new instance starts on
                 // the freshly-swapped binary. layout.json / projects.json
-                // are already flushed synchronously on mutation; pending
-                // window geometry is debounced and treated as droppable
-                // at shutdown by design (see the window-save debounce
-                // loop in AppShell::new).
+                // are already flushed synchronously on mutation.
                 cx.quit();
             }
             ToastActionKind::OpenReleasesPage => {

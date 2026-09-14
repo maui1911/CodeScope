@@ -172,6 +172,51 @@ pub fn start_install(state: UpdateState, info: ReleaseInfo) {
         .expect("spawn update-install thread");
 }
 
+/// Path of the binary this process was started from, captured at boot by
+/// [`remember_launch_exe`]. Read later rather than at restart time because
+/// on Linux `current_exe()` follows `/proc/self/exe`, which points at the
+/// unlinked old image (`… (deleted)`) once `self_replace` has swapped the
+/// file; the launch path itself holds the new binary on every platform.
+static LAUNCH_EXE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+/// Record the running binary's path. Call once from `main`, before any
+/// update can swap the file.
+pub fn remember_launch_exe() {
+    LAUNCH_EXE.get_or_init(|| std::env::current_exe().ok());
+}
+
+/// Start the freshly-swapped binary as the next instance (#341). The
+/// child waits for this process to exit before taking the single-instance
+/// lock, so the caller must quit right after a successful return.
+pub fn relaunch() -> Result<(), String> {
+    let exe = LAUNCH_EXE
+        .get()
+        .cloned()
+        .flatten()
+        .ok_or_else(|| "launch path unknown".to_string())?;
+    let dev = std::env::var_os("CODESCOPE_DEV");
+    let mut cmd =
+        codescope_core::relaunch::relaunch_command(&exe, std::process::id(), dev.as_deref());
+    let spawned = match cmd.spawn() {
+        // An enclosing job that forbids breakaway rejects the spawn.
+        #[cfg(windows)]
+        Err(err) => {
+            log_update(&format!("restart: spawn with job breakaway failed ({err}), retrying"));
+            codescope_core::relaunch::without_job_breakaway(&mut cmd);
+            cmd.spawn()
+        }
+        other => other,
+    };
+    let result = spawned
+        .map(|_| ())
+        .map_err(|err| format!("spawn {}: {err}", exe.display()));
+    match &result {
+        Ok(()) => log_update(&format!("restart: spawned {}", exe.display())),
+        Err(message) => log_update(&format!("restart failed: {message}")),
+    }
+    result
+}
+
 /// Dev-only override for the download URL (`CODESCOPE_DEV_UPDATE_URL`),
 /// used by the RELEASE-VALIDATION.md end-to-end loop to point the
 /// installer at a locally-served archive. Compiled out of release

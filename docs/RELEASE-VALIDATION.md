@@ -111,12 +111,14 @@ cargo run --bin codescope
       then "Update installed". (A failure here with "unsupported
       extraction method" means a `self_update` compression feature is
       missing for that archive format — fix `Cargo.toml`, do not ship.)
-- [ ] Restart prompt appears; clicking "Restart" closes the app
-      (`cx.quit()`).
-- [ ] Re-launch — the dev binary was self-replaced and the entire flow
-      ran through without crashing. Run `cargo build --bin codescope`
-      afterward to relink a proper debug binary (self_replace left a
-      release binary at `target/debug/`).
+- [ ] Restart prompt appears; clicking "Restart" closes the window and
+      a new one opens by itself within a few seconds (#341). If it does
+      not, `update.log` has the `restart:` line and `boot.log` shows how
+      far the new instance got (`relaunch:waited … gone=true` first).
+- [ ] The relaunched instance is the self-replaced binary and the entire
+      flow ran through without crashing. Run `cargo build --bin
+      codescope` afterward to relink a proper debug binary (self_replace
+      left a release binary at `target/debug/`).
 
 > Repeat the extraction check on Linux with a real `.tar.gz` (the
 > `compression-flate2` feature) whenever the `self_update` feature set

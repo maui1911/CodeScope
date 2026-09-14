@@ -28,7 +28,8 @@ mod imp {
     use anyhow::{Context, Result};
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JobObjectExtendedLimitInformation, SetInformationJobObject,
     };
@@ -57,16 +58,23 @@ mod imp {
     impl ProcessGroup {
         /// Create a fresh, unnamed job object flagged
         /// `KILL_ON_JOB_CLOSE`. Mirrors the C# constructor.
-        fn new() -> Result<Self> {
+        ///
+        /// `allow_breakaway` adds `BREAKAWAY_OK`, which lets a child that
+        /// asks for it (`CREATE_BREAKAWAY_FROM_JOB`) leave the job.
+        fn new(allow_breakaway: bool) -> Result<Self> {
             // SAFETY: `CreateJobObjectW(None, None)` is the standard
             // way to allocate an anonymous job object. The returned
             // handle is owned by us until process exit.
             let job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
                 .context("CreateJobObjectW failed")?;
 
+            let mut flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if allow_breakaway {
+                flags |= JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+            }
             let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
                 BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION {
-                    LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                    LimitFlags: flags,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -107,17 +115,23 @@ mod imp {
     // process; an explicit close here would never be reached on the
     // crash paths we most want to cover.
 
-    static PROCESS_GROUP: OnceLock<ProcessGroup> = OnceLock::new();
+    // Two jobs, both `KILL_ON_JOB_CLOSE`. CodeScope itself sits in
+    // `APP_GROUP`, which allows breakaway so the restart after an update
+    // (#341) can outlive this process. PTY children are additionally put
+    // in `PTY_GROUP`, which does not: breakaway needs every job in the
+    // chain to allow it, so nothing started from a terminal can escape.
+    static APP_GROUP: OnceLock<ProcessGroup> = OnceLock::new();
+    static PTY_GROUP: OnceLock<ProcessGroup> = OnceLock::new();
 
-    /// Eagerly create the process-wide job object and adopt the
+    /// Eagerly create the app job object and adopt the
     /// current process into it. Safe to call multiple times — only
     /// the first call performs work. Mirrors the C# startup pair
     /// (`new ProcessTreeKiller()` + `Adopt(GetCurrentProcess())`).
     pub fn ensure() -> Result<()> {
-        let group = match PROCESS_GROUP.get() {
+        let group = match APP_GROUP.get() {
             Some(g) => g,
             None => {
-                let group = ProcessGroup::new()?;
+                let group = ProcessGroup::new(true)?;
                 // SAFETY: `GetCurrentProcess` returns a pseudo-handle
                 // that does not need to be closed.
                 let me = unsafe { GetCurrentProcess() };
@@ -130,24 +144,24 @@ mod imp {
                 // we still return success and let `adopt_handle`
                 // continue assigning children.
                 let _ = group.adopt(me);
-                let _ = PROCESS_GROUP.set(group);
-                PROCESS_GROUP.get().expect("just inserted")
+                let _ = APP_GROUP.set(group);
+                APP_GROUP.get().expect("just inserted")
             }
         };
         let _ = group;
         Ok(())
     }
 
-    /// Assign the given child-process handle to the process-wide job.
+    /// Assign the given child-process handle to the PTY job.
     /// The job is created on first call. Mirrors the per-pty
     /// `Adopt(child.Handle)` pattern in the C# session manager.
     pub fn adopt_handle(process: HANDLE) -> Result<()> {
-        let group = match PROCESS_GROUP.get() {
+        let group = match PTY_GROUP.get() {
             Some(g) => g,
             None => {
-                let group = ProcessGroup::new()?;
-                let _ = PROCESS_GROUP.set(group);
-                PROCESS_GROUP.get().expect("just inserted")
+                let group = ProcessGroup::new(false)?;
+                let _ = PTY_GROUP.set(group);
+                PTY_GROUP.get().expect("just inserted")
             }
         };
         group.adopt(process)
@@ -164,12 +178,68 @@ mod imp {
             // created and the current process can be assigned to it
             // (or fails with a recoverable error if we are already
             // inside a non-nestable parent job).
-            let group = ProcessGroup::new().expect("create job");
+            let group = ProcessGroup::new(true).expect("create job");
             let me = unsafe { GetCurrentProcess() };
             // Either succeeds, or fails because we are already in a
             // restrictive parent job — both outcomes prove the API
             // bindings are wired correctly.
             let _ = group.adopt(me);
+        }
+
+        const PROBE_ENV: &str = "CODESCOPE_BREAKAWAY_PROBE";
+        const PROBE_DENIED: i32 = 3;
+
+        /// Runs as a helper when re-executed by [`breakaway_exit_code`]:
+        /// waits until the parent has assigned it to a job, then tries to
+        /// start a child that breaks away. Does nothing in a normal run.
+        #[test]
+        fn breakaway_probe_helper() {
+            use std::os::windows::process::CommandExt;
+            if std::env::var_os(PROBE_ENV).is_none() {
+                return;
+            }
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+            let spawned = std::process::Command::new("cmd")
+                .args(["/C", "exit 0"])
+                .creation_flags(0x0100_0000) // CREATE_BREAKAWAY_FROM_JOB
+                .status();
+            std::process::exit(if spawned.is_ok() { 0 } else { PROBE_DENIED });
+        }
+
+        /// Re-run this test binary as [`breakaway_probe_helper`] inside a
+        /// fresh job and return its exit code.
+        fn breakaway_exit_code(allow_breakaway: bool) -> i32 {
+            use std::io::Write as _;
+            use std::os::windows::io::AsRawHandle;
+            let group = ProcessGroup::new(allow_breakaway).expect("create job");
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "process_group::imp::tests::breakaway_probe_helper",
+                    "--test-threads=1",
+                ])
+                .env(PROBE_ENV, "1")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn probe");
+            group
+                .adopt(HANDLE(child.as_raw_handle() as *mut _))
+                .expect("adopt probe");
+            child.stdin.take().unwrap().write_all(b"go\n").unwrap();
+            child.wait().unwrap().code().unwrap()
+        }
+
+        #[test]
+        fn only_the_app_job_lets_a_child_break_away() {
+            if breakaway_exit_code(true) != 0 {
+                // A job this test runs inside forbids breakaway, so the
+                // difference between our two jobs cannot be observed.
+                return;
+            }
+            assert_eq!(breakaway_exit_code(false), PROBE_DENIED);
         }
 
         #[test]

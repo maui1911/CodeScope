@@ -80,9 +80,19 @@ A tab hosts a shell (`pwsh.exe` on Windows; user's `SHELL` on Unix),
 which spawns agent children (`claude.exe`, `codex`, etc.). Killing the
 parent does not reliably kill its children.
 
-- **Windows:** the spawned process is associated with a Win32 **job
-  object** flagged `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Closing the
-  job handle on tab dispose terminates the whole tree.
+- **Windows:** every PTY shell is assigned to one process-wide Win32
+  **job object** flagged `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Its
+  handle is held for the life of the process and closed by the OS when
+  CodeScope exits — normally or by a crash — which terminates every
+  shell and descendant at once. Closing a tab does not touch the job;
+  it ends that tab's shell through the PTY. The PTY job does not allow
+  breakaway, so nothing started from a terminal can leave it. (The
+  shell is assigned right after the PTY creates it; until then it is
+  only in the app job below, so a shell that requested breakaway for a
+  child during those first milliseconds could keep it alive.)
+  CodeScope itself sits in a separate kill-on-close job that *does*
+  allow breakaway, only so the restart after an update (#341) can
+  outlive the old instance.
 - **Unix:** each tab is its own process group via `setpgid`; tab close
   calls `killpg(SIGTERM)` followed by `SIGKILL` on timeout.
 
