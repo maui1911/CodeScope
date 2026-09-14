@@ -317,6 +317,16 @@ base has emptied all go to a human with the branch put back exactly
 where it was. `--no-rebase` turns it off. See F-25, and F-16 for what
 the dispatch-time check cannot see.
 
+That covers a base that moves *during* the run. The longer window is
+after it: a branch that finished, was pushed and cleaned up, and then
+waits for a human while the base moves on. The tick reads that too -
+a `done` task whose branch is in the project, not yet in its base ref,
+and whose base ref no longer points at the recorded `base_sha` is
+`stale-base` - and dispatches `--recheck`: the same run with the
+agent's turn taken out, started from the pushed tip, ending in the
+same rebase step and the same four verdicts. The record is kept; the
+branch and its `base_sha` move only on a clean, green replay. See F-52.
+
 Crash recovery is *cheap*, not free. Nothing lives in memory, so the
 state is all on disk — but there is no resume path: a run that dies
 mid-flight leaves the live task at `dispatched`, and the runner refuses
@@ -450,8 +460,8 @@ list; the sites do not.
 
 | | |
 |---|---|
-| Covered | plain-folder projects as well as git ones; the file contract; **two bots** (`fixer`, `reviewer`), two deliverables (`produces: commit`, `produces: report`), the handoff between them and a scheduler that reads the board; contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the report channel (`artifact:`, `shape:`, harvested into `.state/artifacts/`) with citations *and* quotes checked against the blob; verifier, in a clean checkout of the branch tip; the surface disarm (hooks, command-naming config, `core.worktree`, and the identity of `.git` itself); the approval gate on derived tasks *and* on per-bot memory, hashed over the body, with `--chain` as a recorded bypass; per-bot memory itself - one fact per run, capped, refused if it would restructure the prompt it is quoted in; evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup; rebase onto a base that moved, re-verified there; retiring a finished record (`bot-forget.sh`), which appends to the board rather than editing it and leaves the handoff alone |
-| **Not** covered | re-verifying a branch that is *waiting* rather than running, resume after a crash, any trigger other than "someone ran a tick", pushing, opening PRs, any GPUI surface |
+| Covered | plain-folder projects as well as git ones; the file contract; **two bots** (`fixer`, `reviewer`), two deliverables (`produces: commit`, `produces: report`), the handoff between them and a scheduler that reads the board; contract-read-at-base (existence *and* argv); a serialised dispatch claim with a cross-task `touches:` overlap refusal; worktree create; agent run; the `.bot-blocked` refusal channel; the report channel (`artifact:`, `shape:`, harvested into `.state/artifacts/`) with citations *and* quotes checked against the blob; verifier, in a clean checkout of the branch tip; the surface disarm (hooks, command-naming config, `core.worktree`, and the identity of `.git` itself); the approval gate on derived tasks *and* on per-bot memory, hashed over the body, with `--chain` as a recorded bypass; per-bot memory itself - one fact per run, capped, refused if it would restructure the prompt it is quoted in; evidence capture incl. scope and TODO checks; handoff write; append-only board; no-op cleanup; rebase onto a base that moved, re-verified there; retiring a finished record (`bot-forget.sh`), which appends to the board rather than editing it and leaves the handoff alone; re-verifying a branch that is *waiting* to be merged when its base moves (`--recheck`, dispatched by the tick) |
+| **Not** covered | resume after a crash, any trigger other than "someone ran a tick", pushing, opening PRs, any GPUI surface |
 
 Two deliberate omissions:
 
@@ -768,10 +778,14 @@ is the contract, not the script.
    F-30 are what those took.)*
 2. The verifier catches at least one agent run that *claimed* success
    and was wrong. If that never happens, the verifier is not verifying.
-3. A handoff between two bots survives a rebase. *(Half done: a
-   branch is now rebased onto a base that moved during the run and
-   re-verified there — F-25. A branch that is merely waiting is not
-   re-checked, and that window is the longer one.)*
+3. A handoff between two bots survives a rebase. *(**Done.** A branch
+   is rebased onto a base that moved during the run and re-verified
+   there — F-25 — and a branch that is merely waiting is now re-read
+   by the tick and replayed the same way when its base moves — F-52.
+   Both halves are in the sweep: four in-flight cases, four waiting
+   ones through the runner — clean, conflict, nothing moved, edited
+   definition — and one through the tick, which has to read the branch
+   as stale, replay it, and leave it alone on the next tick.)*
 4. Worktree cleanup works on Windows with a build running.
 5. `verify:` no longer runs through `eval` on the host, or task files
    are provably trusted input. A product feature cannot ship a shell
@@ -4083,3 +4097,110 @@ the intermediate state made verifiable. What generalises: **when the
 checker runs at a different commit from the change, a rename has to
 pass through a state both commits accept** — and that state is worth
 one merge, not a note saying it cannot be proven.
+
+---
+
+### F-52 · The longer window was the one after the run
+
+*2026-09-14, graduation criterion 3.*
+
+F-25 closed the window between dispatch and handoff: a base that moves
+while the agent works is read again, and the work is replayed and
+re-verified there. It left the other window open and said so. A
+finished branch is pushed, its surface is removed, and then it waits -
+for a review, for a merge, for somebody's afternoon - and the base
+keeps moving the whole time. Every day of that wait the handoff's
+"verified against *X*" describes a commit further from the tip, and
+nothing in the loop looked at it again. In a repository with one
+person merging, the wait is the longer of the two windows by a margin
+that makes the first one look like a rounding error.
+
+The tick now asks the question, because the tick is the thing that
+reads the world on a schedule. For a `done` task with no `every:` it
+reads three facts from git: is the branch still in the project, has
+the base ref left the recorded `base_sha`, and is the branch already
+part of that ref. Landed branches and branches on a base that has not
+moved are nothing to do. The rest are `stale-base`, and the tick
+dispatches the runner with `--recheck`.
+
+**What `--recheck` is, is the ordinary run with the agent's turn taken
+out.** That was the design decision, and it was made against the
+alternative of a separate script. A recheck needs a surface, the
+evidence read, the verifier in a clean checkout, the rebase step with
+its four verdicts, the push, the handoff and the cleanup - which is
+every step the runner already has, each of them carrying a finding
+that was paid for once. A second script doing "just the rebase" would
+have been a second copy of F-25's verdict table, free to disagree with
+the first (the argument of F-43, one level up). So the runner takes a
+flag: the surface is cut at the pushed tip instead of the base, the
+recorded `base_sha` is the commit to replay from, the agent is skipped,
+and everything from Evidence on runs unchanged. The rebase step does
+not know it is in a recheck.
+
+Three things had to be different, and each is small.
+
+**The push is not a fast-forward.** An ordinary run pushes a branch the
+project has never seen. A recheck moves one it has, so the push carries
+`--force-with-lease` pinned to the tip the run started from: if
+anything else moved the branch meanwhile, the push is refused and the
+run says so, rather than overwriting somebody's work with a replay of
+an older version of it.
+
+**The record is kept.** An ordinary run copies the task definition over
+the live task. A recheck must not - the live task *is* the record of
+the run that finished, and its `base_sha` is the only thing that says
+what the branch stands on. The recheck writes the new surface path into
+it and, only when the branch moves, the new `base_sha`. That last
+sentence is what stops the tick from rechecking the same branch on
+every tick: the sweep checks that the record follows the branch,
+because without it the loop would replay forever and every replay
+would be green.
+
+**A recheck is `dispatched` while it runs.** It was tempting to leave
+the status at `done`, since that is what is true of the work. But the
+overlap scan reads `dispatched` plus a worktree on disk as "somebody is
+editing these files", and a replay is exactly that. So a recheck claims
+like any run, and a recheck killed mid-flight reads as a stale dispatch
+- with its branch in the project untouched, because nothing moves
+before the push.
+
+What it refuses - exit 3, before the lock, nothing created: a branch
+already in its base (it landed - retire the record with
+`bot-forget.sh`), a base that has not moved, a report, a folder
+project (its result is a patch, not a branch; checked before the
+snapshot would move the folder's ref, because a refusal that has
+already changed something is not one - Copilot), `--reset` on the same
+command line, since one keeps the record and the other discards it,
+and `--no-rebase`, since the rebase is the whole run and without it
+the branch would be pushed back where it was, finish `done`, and be
+scheduled again next tick (Copilot). And a definition that disagrees
+with the record about `branch:`, `base:` or the repository (Codex):
+the record names the branch that finished, the definition is a file
+anybody may have edited since, and a recheck that took the branch from
+the definition would replay whatever it now names and force-push onto
+it - with a lease taken from that same branch, so the lease would
+hold. The record is the identity.
+
+Three cases the tick reports and does not dispatch, because the
+runner would refuse each before changing anything and a refusal
+dispatched every tick holds a `--max` slot for ever and records nothing
+(the same two reviews): `base-gone` - the base ref no longer resolves;
+`rewritten` - the branch no longer descends from the base it verified
+against; `edited` - the definition disagrees with the record. Each is
+a line for a person, with the reason in the WHY column.
+
+**And the first dry run found three stale branches in the real control
+plane.** T-0010, T-0011 and T-0012 verified against `labs/agent-bots`
+and their work landed on `main`, not on that ref, so by the tick's
+reading they are waiting on a base that moved - which is true, and
+also not what anybody would want replayed. That is not a defect in the
+question; it is the answer to a question nobody had asked in a month.
+Those records want retiring, and `bot-forget.sh` is what that is for.
+The rule the runner cannot know is "landed somewhere other than its
+base", and it is a rule for a person.
+
+What generalises: **a claim about a commit ages at the rate its base
+moves, and a loop that only checks at the moment of writing has
+verified the past tense.** The re-read costs a verifier run per moved
+base; the alternative is a handoff that is quietly less true every
+morning.

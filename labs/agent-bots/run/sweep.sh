@@ -69,6 +69,10 @@ bot/fixer/T-991A
 bot/fixer/T-991B
 bot/fixer/T-991C
 bot/fixer/T-991D
+bot/fixer/T-991E
+bot/fixer/T-991F
+bot/fixer/T-991G
+bot/fixer/T-991H
 bot/fixer/T-995A
 bot/fixer/T-997A
 bot/fixer/T-998A
@@ -88,7 +92,7 @@ bot-sweep/committed-secret
 SWEEP_TASK_IDS="T-0001 T-0003 T-0005 T-0006 T-0006-fix T-990A T-990B
 T-993A T-993B T-993C T-993D T-993E T-995A T-996A T-996B T-997A
 T-998A T-998B T-999A T-0900 T-0901
-T-991A T-991B T-991C T-991D
+T-991A T-991B T-991C T-991D T-991E T-991F T-991G T-991H
 T-0994 T-0995"
 
 is_sweep_task() {   # is_sweep_task <id>
@@ -1530,6 +1534,228 @@ run_mover "base moved, now red"  2 rebase-red      T-991C \
 run_mover "base moved, emptied"  2 rebase-emptied  T-991D \
     labs/agent-bots/.sweep/same.txt identical \
     labs/agent-bots/.sweep/same.txt identical kept
+
+# --------------------------------------------------------------------
+# A base that moves while the branch waits
+#
+# The cases above move the base *during* the run. The longer window is
+# after it: a branch that finished, was pushed and cleaned up, and then
+# waited for a human while the base moved on. Nothing in the loop
+# re-read it (README §6, criterion 3). `--recheck` is that re-read: the
+# same replay, started from the pushed tip with no agent in the run.
+#
+# Each fixture is two runs - an ordinary one that ends `done` and
+# cleaned, then the base advanced by plumbing, then the recheck - and
+# the same three checks as run_mover: exit, board row, and where the
+# branch ref actually is.
+# --------------------------------------------------------------------
+
+# advance_base <path> <body> - one commit on $SWEEP_BASE adding <path>.
+# Plumbing against a temporary index, as mover.sh does it, so nothing
+# here touches a working tree.
+advance_base() {
+    local ref="refs/heads/$SWEEP_BASE" parent blob tree commit idx
+    parent="$(git -C "$REPO" rev-parse --verify "$ref")"
+    idx="$STATE/tmp/sweep-advance-$$.idx"
+    mkdir -p "$STATE/tmp"
+    rm -f "$idx"
+    GIT_INDEX_FILE="$idx" git -C "$REPO" read-tree "$parent"
+    blob="$(printf '%s\n' "$2" | git -C "$REPO" hash-object -w --stdin)"
+    GIT_INDEX_FILE="$idx" git -C "$REPO" update-index --add --cacheinfo "100644,$blob,$1"
+    tree="$(GIT_INDEX_FILE="$idx" git -C "$REPO" write-tree)"
+    rm -f "$idx"
+    commit="$(GIT_AUTHOR_NAME=sweep GIT_AUTHOR_EMAIL=sweep@example.invalid \
+        GIT_COMMITTER_NAME=sweep GIT_COMMITTER_EMAIL=sweep@example.invalid \
+        git -C "$REPO" commit-tree "$tree" -p "$parent" -m "sweep: the base moved while the branch waited")"
+    git -C "$REPO" update-ref "$ref" "$commit" "$parent"
+}
+
+run_recheck() {   # run_recheck <label> <exit> <event> <id> <mine> <theirs> <body> <moved|kept>
+    local label="$1" expect="$2" event="$3" id="$4" mine="$5" theirs="$6" body="$7" want="$8"
+    local rc=0 mark=0 first_tip="" tip="" newbase="" ok=0 desc="" rec=""
+    git -C "$REPO" update-ref "refs/heads/$SWEEP_BASE" "$SWEEP_BASE_COMMIT"
+    # The ordinary run first. It has to end done, pushed and cleaned,
+    # or there is no waiting branch to speak of.
+    BOT_AGENT_CMD="$STUBS/scribe.sh" BOT_AGENT_ARGS="" \
+        BOT_SCRIBE_FILE="$mine" BOT_SCRIBE_BODY="bot" \
+        bash "$RUN" --state "$STATE" --task "$MOVE_TASKS/$id.md" --reset --repo "$REPO" >/dev/null 2>&1 || rc=$?
+    check "$label first run" 0 "$rc"
+    first_tip="$(git -C "$REPO" rev-parse --verify "refs/heads/bot/fixer/$id" 2>/dev/null || printf '')"
+
+    advance_base "$theirs" "$body"
+
+    rc=0
+    mark="$(wc -l < "$STATE/board.md" 2>/dev/null || printf 0)"
+    bash "$RUN" --state "$STATE" --task "$MOVE_TASKS/$id.md" --recheck --repo "$REPO" >/dev/null 2>&1 || rc=$?
+    check "$label" "$expect" "$rc"
+    if tail -n "+$((mark + 1))" "$STATE/board.md" 2>/dev/null \
+        | grep -q "| $id | $event |"; then
+        printf 'ok    %-28s board says %s\n' "$label event" "$event"
+        CHECKS=$((CHECKS + 1))
+    else
+        printf 'FAIL  %-28s no "%s" row for %s\n' "$label event" "$event" "$id"
+        CHECKS=$((CHECKS + 1))
+        FAILURES=$((FAILURES + 1))
+    fi
+
+    newbase="$(git -C "$REPO" rev-parse --verify "refs/heads/$SWEEP_BASE" 2>/dev/null || printf '')"
+    tip="$(git -C "$REPO" rev-parse --verify "refs/heads/bot/fixer/$id" 2>/dev/null || printf '')"
+    if [ "$want" = moved ]; then
+        desc="branch sits on the moved base, carrying the work"
+        [ -n "$tip" ] && [ -n "$newbase" ] && [ "$tip" != "$first_tip" ] \
+            && git -C "$REPO" merge-base --is-ancestor "$newbase" "$tip" 2>/dev/null \
+            && git -C "$REPO" cat-file -e "$tip:$mine" 2>/dev/null \
+            && ok=1
+    else
+        desc="branch is exactly where the first run left it"
+        [ -n "$tip" ] && [ "$tip" = "$first_tip" ] && ok=1
+    fi
+    if [ "$ok" = 1 ]; then
+        printf 'ok    %-28s %s\n' "$label ref" "$desc"
+        CHECKS=$((CHECKS + 1))
+    else
+        printf 'FAIL  %-28s expected %s; tip %s, was %s, base %s\n' \
+            "$label ref" "$want" "${tip:-(none)}" "${first_tip:-(none)}" "${newbase:-(none)}"
+        CHECKS=$((CHECKS + 1))
+        FAILURES=$((FAILURES + 1))
+    fi
+
+    # And the record: a recheck that moved the branch must say which
+    # base it now stands on, or the next tick rechecks it again.
+    if [ "$want" = moved ]; then
+        rec="$(sed -n 's/^base_sha:[[:space:]]*//p' "$STATE/tasks/$id.md" | head -n1)"
+        if [ "$rec" = "$newbase" ]; then
+            printf 'ok    %-28s base_sha follows the branch\n' "$label record"
+            CHECKS=$((CHECKS + 1))
+        else
+            printf 'FAIL  %-28s base_sha still %s\n' "$label record" "${rec:-(none)}"
+            CHECKS=$((CHECKS + 1))
+            FAILURES=$((FAILURES + 1))
+        fi
+    fi
+
+    cleanup "bot/fixer/$id"
+}
+
+move_task T-991E true
+move_task T-991F true
+move_task T-991G true
+
+# Different files: clean replay, still green, the branch moves and the
+# record follows it.
+run_recheck "waiting, base moved"  0 rebased         T-991E \
+    labs/agent-bots/.sweep/mine.txt labs/agent-bots/.sweep/theirs.txt base moved
+
+# Same file, different content: the branch stays exactly where it was
+# and the task goes to a human.
+run_recheck "waiting, conflict"    2 rebase-conflict T-991F \
+    labs/agent-bots/.sweep/contested.txt labs/agent-bots/.sweep/contested.txt base kept
+
+# Nothing moved: a recheck with nothing to do is a refusal, not a run.
+git -C "$REPO" update-ref "refs/heads/$SWEEP_BASE" "$SWEEP_BASE_COMMIT"
+RC=0
+BOT_AGENT_CMD="$STUBS/scribe.sh" BOT_AGENT_ARGS="" \
+    BOT_SCRIBE_FILE=labs/agent-bots/.sweep/still.txt BOT_SCRIBE_BODY=bot \
+    bash "$RUN" --state "$STATE" --task "$MOVE_TASKS/T-991G.md" --reset --repo "$REPO" >/dev/null 2>&1 || RC=$?
+check "waiting, still first run" 0 "$RC"
+G_TIP="$(git -C "$REPO" rev-parse --verify "refs/heads/bot/fixer/T-991G" 2>/dev/null || printf '')"
+RC=0
+bash "$RUN" --state "$STATE" --task "$MOVE_TASKS/T-991G.md" --recheck --repo "$REPO" >/dev/null 2>&1 || RC=$?
+check "waiting, base still" 3 "$RC"
+# The definition edited since the run: the record names the branch that
+# finished, and a recheck that disagreed with it would replay - and
+# force-push - some other branch. Refused before anything is created.
+advance_base labs/agent-bots/.sweep/later.txt base
+sed 's|^branch: .*|branch: bot/fixer/T-991E|' "$MOVE_TASKS/T-991G.md" > "$MOVE_TASKS/T-991G.md.tmp"     && mv "$MOVE_TASKS/T-991G.md.tmp" "$MOVE_TASKS/T-991G.md"
+RC=0
+bash "$RUN" --state "$STATE" --task "$MOVE_TASKS/T-991G.md" --recheck --repo "$REPO" >/dev/null 2>&1 || RC=$?
+check "waiting, edited definition" 3 "$RC"
+if [ "$(git -C "$REPO" rev-parse --verify "refs/heads/bot/fixer/T-991G" 2>/dev/null)" = "$G_TIP" ]     && [ ! -e "$WT_ROOT/bot-fixer-T-991G" ]; then
+    printf 'ok    %-28s branch untouched, nothing created
+' "edited definition surface"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s a surface was created for a refused recheck
+' "edited definition surface"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+cleanup "bot/fixer/T-991G"
+
+# And through the tick, which is where a waiting branch is actually
+# noticed: a `schedule: auto` task that finished and was cleaned, its
+# base advanced, one tick. The tick has to read it as stale-base,
+# dispatch --recheck, and read it as plain done on the next tick - or
+# the loop would recheck it every interval.
+cat > "$MOVE_TASKS/T-991H.md" <<EOF
+---
+id: T-991H
+title: Base-moves fixture T-991H, via the tick
+owner: fixer
+status: todo
+base: $SWEEP_BASE
+branch: bot/fixer/T-991H
+touches: labs/agent-bots/.sweep/*
+verify: true
+schedule: auto
+---
+
+# Objective
+
+Generated by sweep.sh. The base ref moves after this has finished.
+EOF
+git -C "$REPO" update-ref "refs/heads/$SWEEP_BASE" "$SWEEP_BASE_COMMIT"
+RC=0
+BOT_AGENT_CMD="$STUBS/scribe.sh" BOT_AGENT_ARGS="" \
+    BOT_SCRIBE_FILE=labs/agent-bots/.sweep/mine-h.txt BOT_SCRIBE_BODY=bot \
+    bash "$RUN" --state "$STATE" --task "$MOVE_TASKS/T-991H.md" --reset --repo "$REPO" >/dev/null 2>&1 || RC=$?
+check "tick recheck first run" 0 "$RC"
+H_TIP="$(git -C "$REPO" rev-parse --verify "refs/heads/bot/fixer/T-991H" 2>/dev/null || printf '')"
+advance_base labs/agent-bots/.sweep/theirs-h.txt base
+MARK="$(wc -l < "$STATE/board.md" 2>/dev/null || printf 0)"
+RC=0
+bash "$SCRIPT_DIR/bot-tick.sh" --tasks "$MOVE_TASKS" --state "$STATE" --repo "$REPO" \
+    > "$MOVE_TASKS/tick.out" 2>&1 || RC=$?
+check "tick recheck" 0 "$RC"
+if grep -q '^T-991H .* stale-base ' "$MOVE_TASKS/tick.out"; then
+    printf 'ok    %-28s the tick read it as stale-base\n' "tick recheck decision"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s no stale-base row (see %s)\n' "tick recheck decision" "$MOVE_TASKS/tick.out"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+if tail -n "+$((MARK + 1))" "$STATE/board.md" 2>/dev/null | grep -q '| T-991H | rebased |'; then
+    printf 'ok    %-28s board says rebased\n' "tick recheck event"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s no rebased row for T-991H\n' "tick recheck event"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+H_NOW="$(git -C "$REPO" rev-parse --verify "refs/heads/bot/fixer/T-991H" 2>/dev/null || printf '')"
+H_BASE="$(git -C "$REPO" rev-parse --verify "refs/heads/$SWEEP_BASE" 2>/dev/null || printf '')"
+if [ -n "$H_NOW" ] && [ "$H_NOW" != "$H_TIP" ] \
+    && git -C "$REPO" merge-base --is-ancestor "$H_BASE" "$H_NOW" 2>/dev/null \
+    && git -C "$REPO" cat-file -e "$H_NOW:labs/agent-bots/.sweep/mine-h.txt" 2>/dev/null; then
+    printf 'ok    %-28s branch sits on the moved base, carrying the work\n' "tick recheck ref"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s tip %s, was %s, base %s\n' "tick recheck ref" "${H_NOW:-(none)}" "${H_TIP:-(none)}" "${H_BASE:-(none)}"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+bash "$SCRIPT_DIR/bot-tick.sh" --dry-run --tasks "$MOVE_TASKS" --state "$STATE" --repo "$REPO" \
+    > "$MOVE_TASKS/tick2.out" 2>&1 || true
+if grep -q '^T-991H .* done ' "$MOVE_TASKS/tick2.out"; then
+    printf 'ok    %-28s the next tick leaves it alone\n' "tick recheck converges"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s still scheduled (see %s)\n' "tick recheck converges" "$MOVE_TASKS/tick2.out"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+cleanup "bot/fixer/T-991H"
 
 git -C "$REPO" branch -D "$SWEEP_BASE" >/dev/null 2>&1
 rm -f "$STATE"/tasks/T-991*.md 2>/dev/null
