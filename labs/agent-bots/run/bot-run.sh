@@ -409,6 +409,15 @@ done
 
 [ -n "$TASK" ] || die "--task is required (try --help)"
 [ -f "$TASK" ] || die "task file not found: $TASK"
+# `refuse`, not `die`, for everything a recheck turns down: nothing has
+# run, so a scheduler must not count it as a failed run.
+if [ "$RECHECK" -eq 1 ]; then
+    [ "$RESET" -eq 0 ] || refuse \
+        "--recheck keeps the finished record and --reset discards it; pick one."
+    [ "$NO_REBASE" -eq 0 ] || refuse \
+"--recheck is the rebase. With --no-rebase it would push the branch back
+where it was, finish 'done', and be scheduled again on the next tick."
+fi
 TASK="$(cd "$(dirname "$TASK")" && pwd)/$(basename "$TASK")"
 
 if [ -z "$REPO" ]; then
@@ -438,6 +447,13 @@ fi
 # --------------------------------------------------------------------
 
 SURFACE="clone"
+if git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    :
+elif [ "$RECHECK" -eq 1 ]; then
+    # Before the snapshot below moves the folder's ref: a refusal that
+    # has already changed something is not a refusal.
+    refuse "$REPO is a plain folder; its result is a patch, and a patch has no waiting branch to recheck."
+fi
 if git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     # Canonical, so that "the same project" is one string rather than
     # three spellings of one path. The state directory is keyed on it.
@@ -1251,7 +1267,7 @@ fi
 
 case "$EFFECTIVE_STATUS" in
     todo)
-        [ "$RECHECK" -eq 0 ] || die \
+        [ "$RECHECK" -eq 0 ] || refuse \
             "task $TASK_ID has never finished, so there is no waiting branch to recheck." ;;
     dispatched)
         refuse "task $TASK_ID is already in flight (live status: dispatched).
@@ -1262,7 +1278,7 @@ with --reset once the worktree and branch are gone." ;;
 Re-run it with --reset to start over, or --recheck to replay its
 branch onto a base that moved." ;;
     *)
-        [ "$RECHECK" -eq 0 ] || die \
+        [ "$RECHECK" -eq 0 ] || refuse \
             "task $TASK_ID is '$EFFECTIVE_STATUS'; only a 'done' task has a waiting branch to recheck."
         die "task $TASK_ID is '$EFFECTIVE_STATUS', expected 'todo'.
 Re-run it with --reset to start over." ;;
@@ -1285,11 +1301,7 @@ esac
 RECHECK_TIP=""
 RECHECK_NOTE=""
 if [ "$RECHECK" -eq 1 ]; then
-    [ "$RESET" -eq 0 ] || die \
-        "--recheck keeps the finished record and --reset discards it; pick one."
-    [ "$TASK_PRODUCES" = "commit" ] || die "a report has no branch to recheck."
-    [ "$SURFACE" = "clone" ] || die \
-        "$REPO is a plain folder; its result is a patch, and a patch has no waiting branch to recheck."
+    [ "$TASK_PRODUCES" = "commit" ] || refuse "a report has no branch to recheck."
     RECHECK_LIVE="$(cat "$LIVE_TASK")"
     # The record names the branch that finished; the definition is a
     # file somebody may have edited since. A recheck that read the
@@ -1304,22 +1316,28 @@ if [ "$RECHECK" -eq 1 ]; then
             origin_repo) have="$ORIGIN_REPO" ;;
         esac
         recorded="$(live_task_field "$want" "$RECHECK_LIVE")"
-        [ "$recorded" = "$have" ] || die \
+        # The repository as the filesystem sees it: the record may spell
+        # the path as it was typed on another day.
+        if [ "$want" = origin_repo ] && [ -n "$recorded" ]; then
+            recorded="$(cd "$recorded" 2>/dev/null && pwd || printf '%s' "$recorded")"
+            have="$(cd "$have" && pwd)"
+        fi
+        [ "$recorded" = "$have" ] || refuse \
 "task $TASK_ID's definition says $want: $have, and the run that finished
 recorded $want: ${recorded:-(nothing)}. A recheck replays the branch
 the record names, so the two have to agree. Edit the definition back,
 or retire the record with bot-forget.sh and dispatch it afresh."
     done
     RECHECK_BASE="$(live_task_field base_sha "$RECHECK_LIVE")"
-    [ -n "$RECHECK_BASE" ] || die \
+    [ -n "$RECHECK_BASE" ] || refuse \
         "$TASK_ID's live task records no base_sha:, so there is nothing to replay from."
     RECHECK_TIP="$(git -C "$ORIGIN_REPO" rev-parse --verify --quiet \
-        "refs/heads/$TASK_BRANCH^{commit}" 2>/dev/null)" || die \
+        "refs/heads/$TASK_BRANCH^{commit}" 2>/dev/null)" || refuse \
 "branch '$TASK_BRANCH' is not in $ORIGIN_REPO.
 The result was never pushed, or it has been merged and removed. Either
 way there is no waiting branch; retire the record with bot-forget.sh."
     git -C "$ORIGIN_REPO" merge-base --is-ancestor "$RECHECK_BASE" "$RECHECK_TIP" 2>/dev/null \
-        || die "$TASK_BRANCH (${RECHECK_TIP:0:12}) does not descend from ${RECHECK_BASE:0:12},
+        || refuse "$TASK_BRANCH (${RECHECK_TIP:0:12}) does not descend from ${RECHECK_BASE:0:12},
 the base it was verified against. Somebody has rewritten it, and what
 it now stands on is not something this run can guess."
     if git -C "$ORIGIN_REPO" merge-base --is-ancestor "$RECHECK_TIP" "$BASE_SHA" 2>/dev/null; then

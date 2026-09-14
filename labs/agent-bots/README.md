@@ -782,8 +782,10 @@ is the contract, not the script.
    is rebased onto a base that moved during the run and re-verified
    there — F-25 — and a branch that is merely waiting is now re-read
    by the tick and replayed the same way when its base moves — F-52.
-   Both halves are in the sweep: four in-flight cases, and three
-   waiting ones — clean, conflict, and nothing moved.)*
+   Both halves are in the sweep: four in-flight cases, four waiting
+   ones through the runner — clean, conflict, nothing moved, edited
+   definition — and one through the tick, which has to read the branch
+   as stale, replay it, and leave it alone on the next tick.)*
 4. Worktree cleanup works on Windows with a build running.
 5. `verify:` no longer runs through `eval` on the host, or task files
    are provably trusted input. A product feature cannot ship a shell
@@ -4162,25 +4164,30 @@ like any run, and a recheck killed mid-flight reads as a stale dispatch
 - with its branch in the project untouched, because nothing moves
 before the push.
 
-What it refuses, before the lock and at no cost: a branch already in
-its base (it landed - retire the record with `bot-forget.sh`), a base
-that has not moved, a report, a folder project (its result is a patch,
-not a branch), and a `--reset` on the same command line, since one
-keeps the record and the other discards it. And a definition that
-disagrees with the record about `branch:`, `base:` or the repository
-(Codex, reviewing this): the record names the branch that finished,
-the definition is a file anybody may have edited since, and a recheck
-that took the branch from the definition would replay whatever it now
-names and force-push onto it - with a lease taken from that same
-branch, so the lease would hold. The record is the identity.
+What it refuses - exit 3, before the lock, nothing created: a branch
+already in its base (it landed - retire the record with
+`bot-forget.sh`), a base that has not moved, a report, a folder
+project (its result is a patch, not a branch; checked before the
+snapshot would move the folder's ref, because a refusal that has
+already changed something is not one - Copilot), `--reset` on the same
+command line, since one keeps the record and the other discards it,
+and `--no-rebase`, since the rebase is the whole run and without it
+the branch would be pushed back where it was, finish `done`, and be
+scheduled again next tick (Copilot). And a definition that disagrees
+with the record about `branch:`, `base:` or the repository (Codex):
+the record names the branch that finished, the definition is a file
+anybody may have edited since, and a recheck that took the branch from
+the definition would replay whatever it now names and force-push onto
+it - with a lease taken from that same branch, so the lease would
+hold. The record is the identity.
 
-A base ref that no longer resolves is the one case the tick does not
-dispatch. The runner resolves the base before it knows it is
-rechecking and exits there with nothing written, so a tick that
-dispatched it would hold a `--max` slot on every tick and record
-nothing (the same review). It is reported as `base-gone` instead: the
-branch verified against a commit that has no name any more, and where
-it lands is somebody's decision.
+Three cases the tick reports and does not dispatch, because the
+runner would refuse each before changing anything and a refusal
+dispatched every tick holds a `--max` slot for ever and records nothing
+(the same two reviews): `base-gone` - the base ref no longer resolves;
+`rewritten` - the branch no longer descends from the base it verified
+against; `edited` - the definition disagrees with the record. Each is
+a line for a person, with the reason in the WHY column.
 
 **And the first dry run found three stale branches in the real control
 plane.** T-0010, T-0011 and T-0012 verified against `labs/agent-bots`

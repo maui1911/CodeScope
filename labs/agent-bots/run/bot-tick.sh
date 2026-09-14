@@ -200,8 +200,8 @@ handoff_within() {   # handoff_within <id> <minutes>
     [ -n "$hit" ]
 }
 
-# waiting_branch_stale <live task> - does this finished task's branch
-# still stand on the base it verified against?
+# waiting_branch_stale <live task> <definition> - does this finished
+# task's branch still stand on the base it verified against?
 #
 # True when the branch is in the project, its base ref resolves to a
 # different commit than the recorded base_sha, and the branch is not
@@ -210,15 +210,18 @@ handoff_within() {   # handoff_within <id> <minutes>
 # there is no branch to replay in the first two, and no answer in the
 # third. The reason goes to WAIT_WHY, for the decision table.
 #
-# A base ref that no longer resolves is not stale either - it is a
-# question for a person, and WAIT_GONE says so. The runner cannot take
-# it: it resolves the base before it knows it is rechecking, and exits
-# there with nothing written. Dispatching that on every tick would hold
-# a --max slot for ever and record nothing (Codex review on #366).
+# Three more are not stale but are not nothing either: a base ref that
+# no longer resolves, a branch rewritten so that it no longer descends
+# from its recorded base, and a definition that has been edited to
+# disagree with the record. The runner refuses each before it changes
+# anything, so dispatching them would hold a --max slot on every tick
+# and record nothing (Codex and Copilot reviews on #366). They are
+# reported as WAIT_HUMAN, a decision word for a person, with the reason
+# in WAIT_WHY.
 WAIT_WHY=""
-WAIT_GONE=""
+WAIT_HUMAN=""
 waiting_branch_stale() {
-    local text produces branch base base_sha tip now
+    local text produces branch base base_sha tip now def_branch def_base recorded_repo
     text="$(cat "$1")"
     produces="$(field_from produces "$text")"
     [ "${produces:-commit}" = "commit" ] || return 1
@@ -229,8 +232,28 @@ waiting_branch_stale() {
     [ "$base" != "folder" ] || return 1
     tip="$(git -C "$REPO" rev-parse --verify --quiet "refs/heads/$branch^{commit}" 2>/dev/null)" \
         || return 1
+    def_branch="$(field branch "$2")"
+    def_base="$(field base "$2")"
+    recorded_repo="$(field_from origin_repo "$text")"
+    if [ "$def_branch" != "$branch" ] || [ "$def_base" != "$base" ]; then
+        WAIT_HUMAN="edited"
+        WAIT_WHY="definition says $def_branch on $def_base, the run that finished recorded $branch on $base"
+        return 1
+    fi
+    if [ -n "$recorded_repo" ] \
+        && [ "$(cd "$recorded_repo" 2>/dev/null && pwd)" != "$(cd "$REPO" && pwd)" ]; then
+        WAIT_HUMAN="edited"
+        WAIT_WHY="the run that finished recorded origin_repo: $recorded_repo, not this repository"
+        return 1
+    fi
+    if ! git -C "$REPO" merge-base --is-ancestor "$base_sha" "$tip" 2>/dev/null; then
+        WAIT_HUMAN="rewritten"
+        WAIT_WHY="$branch no longer descends from ${base_sha:0:12}, the base it verified against"
+        return 1
+    fi
     if ! now="$(git -C "$REPO" rev-parse --verify --quiet "$base^{commit}" 2>/dev/null)"; then
-        WAIT_GONE="base $base no longer resolves; $branch verified against ${base_sha:0:12} and somebody has to say where it lands"
+        WAIT_HUMAN="base-gone"
+        WAIT_WHY="base $base no longer resolves; $branch verified against ${base_sha:0:12} and somebody has to say where it lands"
         return 1
     fi
     [ "$now" != "$base_sha" ] || return 1
@@ -277,6 +300,11 @@ decide_and_run() {
 
             id="$(field id "$file")"
             [ -n "$id" ] || continue
+            # Per task, before anything can set them: a reason left over
+            # from the previous task would otherwise be reported against
+            # this one (Copilot review on #366).
+            WAIT_HUMAN=""
+            WAIT_WHY=""
             owner="$(field owner "$file")"
             every="$(field every "$file")"
             schedule="$(field schedule "$file")"
@@ -366,14 +394,14 @@ decide_and_run() {
                     decision="due"; why="every: $every elapsed"
                 fi
             elif [ "$status" = "done" ] && [ -f "$live" ] \
-                && { WAIT_GONE=""; waiting_branch_stale "$live"; }; then
+                && waiting_branch_stale "$live" "$file"; then
                 # Finished, pushed, and waiting on a base that has since
                 # moved: the handoff describes a tree nobody can merge
                 # as it stands. Same replay F-25 runs for a base that
                 # moved during the run, for one that moved after it.
                 decision="stale-base"; why="$WAIT_WHY"
-            elif [ "$status" = "done" ] && [ -n "$WAIT_GONE" ]; then
-                decision="base-gone"; why="$WAIT_GONE"
+            elif [ "$status" = "done" ] && [ -n "$WAIT_HUMAN" ]; then
+                decision="$WAIT_HUMAN"; why="$WAIT_WHY"
             elif [ "$status" != "todo" ] && [ -n "$status" ]; then
                 decision="$status"; why="terminal, no every:"
             fi
