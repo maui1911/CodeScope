@@ -759,13 +759,16 @@ is the contract, not the script.
 ## 6. What would have to be true to graduate this
 
 1. The loop runs unattended and green three times on a real issue in
-   this repo. *(**One of three, and the first on a real issue.**
-   T-0010 — a scheduler tick, no babysitting — produced the fix for
-   issue #343, verifier green in a clean checkout, one commit inside
-   `touches:`, and that commit is now on `main` as part of #354. Two
-   to go, and F-45 is what the first one actually proved. Earlier runs
-   under Claude Code and Codex completed on fixtures: F-26, F-27 and
-   F-30 are what those took.)*
+   this repo. *(**Done: four unattended green runs, three of them on
+   real issues.** T-0010 fixed #343 (on `main` via #354), T-0011 fixed
+   #351 (on `main` via #359), T-0012 wrote the relaunch module for #341
+   (its commit is on `main` via #364, with the wiring done by hand),
+   and T-0013 wrote the bots-inbox reader from a spec without an issue
+   (on `main` via #361). Each was a scheduler tick with no babysitting,
+   verifier green in a clean checkout, and one commit inside
+   `touches:`. F-45 is what the first one proved. Earlier runs under
+   Claude Code and Codex completed on fixtures: F-26, F-27 and F-30
+   are what those took.)*
 2. The verifier catches at least one agent run that *claimed* success
    and was wrong. If that never happens, the verifier is not verifying.
 3. A handoff between two bots survives a rebase. *(Half done: a
