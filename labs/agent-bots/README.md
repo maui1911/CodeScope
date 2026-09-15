@@ -4144,7 +4144,11 @@ project has never seen. A recheck moves one it has, so the push carries
 `--force-with-lease` pinned to the tip the run started from: if
 anything else moved the branch meanwhile, the push is refused and the
 run says so, rather than overwriting somebody's work with a replay of
-an older version of it.
+an older version of it. The sweep proves the refusal with a verifier
+that moves the project's branch between the tip being read and the
+push (Copilot asked for it to be deterministic, and the verifier is
+the one thing that runs in exactly that window): `push-failed`,
+`needs-review`, and the concurrent tip untouched.
 
 **The record is kept.** An ordinary run copies the task definition over
 the live task. A recheck must not - the live task *is* the record of
@@ -4173,7 +4177,9 @@ already changed something is not one - Copilot), `--reset` on the same
 command line, since one keeps the record and the other discards it,
 and `--no-rebase`, since the rebase is the whole run and without it
 the branch would be pushed back where it was, finish `done`, and be
-scheduled again next tick (Copilot). And a definition that disagrees
+scheduled again next tick (Copilot). And a task with no live record -
+a definition that says `done` on its own is not a run that finished
+here (Copilot again). And a definition that disagrees
 with the record about `branch:`, `base:` or the repository (Codex):
 the record names the branch that finished, the definition is a file
 anybody may have edited since, and a recheck that took the branch from
@@ -4186,8 +4192,10 @@ runner would refuse each before changing anything and a refusal
 dispatched every tick holds a `--max` slot for ever and records nothing
 (the same two reviews): `base-gone` - the base ref no longer resolves;
 `rewritten` - the branch no longer descends from the base it verified
-against; `edited` - the definition disagrees with the record. Each is
-a line for a person, with the reason in the WHY column.
+against; `edited` - the definition disagrees with the record, or the
+record predates `origin_repo:` and cannot say which repository its
+branch came from. Each is a line for a person, with the reason in the
+WHY column.
 
 **And the first dry run found three stale branches in the real control
 plane.** T-0010, T-0011 and T-0012 verified against `labs/agent-bots`

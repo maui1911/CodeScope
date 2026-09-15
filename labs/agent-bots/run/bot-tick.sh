@@ -240,8 +240,14 @@ waiting_branch_stale() {
         WAIT_WHY="definition says $def_branch on $def_base, the run that finished recorded $branch on $base"
         return 1
     fi
-    if [ -n "$recorded_repo" ] \
-        && [ "$(cd "$recorded_repo" 2>/dev/null && pwd)" != "$(cd "$REPO" && pwd)" ]; then
+    # A record with no origin_repo is from before the runner wrote one;
+    # the runner refuses to recheck it, so the tick must not offer it.
+    if [ -z "$recorded_repo" ]; then
+        WAIT_HUMAN="edited"
+        WAIT_WHY="the record has no origin_repo:, so which repository $branch came from is not written down"
+        return 1
+    fi
+    if [ "$(cd "$recorded_repo" 2>/dev/null && pwd)" != "$(cd "$REPO" && pwd)" ]; then
         WAIT_HUMAN="edited"
         WAIT_WHY="the run that finished recorded origin_repo: $recorded_repo, not this repository"
         return 1

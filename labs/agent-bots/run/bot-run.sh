@@ -1302,7 +1302,13 @@ RECHECK_TIP=""
 RECHECK_NOTE=""
 if [ "$RECHECK" -eq 1 ]; then
     [ "$TASK_PRODUCES" = "commit" ] || refuse "a report has no branch to recheck."
-    RECHECK_LIVE="$(cat "$LIVE_TASK")"
+    # The status above may have come from the definition - a task file
+    # that says `done` with no live record behind it - and the record
+    # can go between that read and this one. Neither is a run.
+    [ -f "$LIVE_TASK" ] || refuse \
+        "task $TASK_ID has no live record under $STATE/tasks, so no run of it has finished here."
+    RECHECK_LIVE="$(cat "$LIVE_TASK" 2>/dev/null)" || refuse \
+        "task $TASK_ID's live record could not be read: $LIVE_TASK"
     # The record names the branch that finished; the definition is a
     # file somebody may have edited since. A recheck that read the
     # branch from the definition would replay whatever branch it now

@@ -73,6 +73,7 @@ bot/fixer/T-991E
 bot/fixer/T-991F
 bot/fixer/T-991G
 bot/fixer/T-991H
+bot/fixer/T-991I
 bot/fixer/T-995A
 bot/fixer/T-997A
 bot/fixer/T-998A
@@ -92,7 +93,7 @@ bot-sweep/committed-secret
 SWEEP_TASK_IDS="T-0001 T-0003 T-0005 T-0006 T-0006-fix T-990A T-990B
 T-993A T-993B T-993C T-993D T-993E T-995A T-996A T-996B T-997A
 T-998A T-998B T-999A T-0900 T-0901
-T-991A T-991B T-991C T-991D T-991E T-991F T-991G T-991H
+T-991A T-991B T-991C T-991D T-991E T-991F T-991G T-991H T-991I
 T-0994 T-0995"
 
 is_sweep_task() {   # is_sweep_task <id>
@@ -1756,6 +1757,46 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 cleanup "bot/fixer/T-991H"
+
+# The lease. Between the tick's read of the branch and the recheck's
+# push, something else can move the branch in the project; the push
+# carries --force-with-lease pinned to the tip the run started from so
+# that it is refused rather than overwriting that. Made deterministic
+# by the verifier: it runs after the tip is captured and before the
+# push, and this one moves the project's branch to the base commit
+# whenever the branch exists - so the first, ordinary run (no branch
+# yet) is untouched and the recheck's push finds the branch moved.
+I_VERIFY="sh -c 'git -C $REPO rev-parse -q --verify refs/heads/bot/fixer/T-991I >/dev/null && git -C $REPO update-ref refs/heads/bot/fixer/T-991I $SWEEP_BASE_COMMIT; true'"
+move_task T-991I "$I_VERIFY"
+git -C "$REPO" update-ref "refs/heads/$SWEEP_BASE" "$SWEEP_BASE_COMMIT"
+RC=0
+BOT_AGENT_CMD="$STUBS/scribe.sh" BOT_AGENT_ARGS="" \
+    BOT_SCRIBE_FILE=labs/agent-bots/.sweep/mine-i.txt BOT_SCRIBE_BODY=bot \
+    bash "$RUN" --state "$STATE" --task "$MOVE_TASKS/T-991I.md" --reset --repo "$REPO" >/dev/null 2>&1 || RC=$?
+check "lease first run" 0 "$RC"
+advance_base labs/agent-bots/.sweep/theirs-i.txt base
+MARK="$(wc -l < "$STATE/board.md" 2>/dev/null || printf 0)"
+RC=0
+bash "$RUN" --state "$STATE" --task "$MOVE_TASKS/T-991I.md" --recheck --repo "$REPO" >/dev/null 2>&1 || RC=$?
+check "lease refused" 2 "$RC"
+if tail -n "+$((MARK + 1))" "$STATE/board.md" 2>/dev/null | grep -q '| T-991I | push-failed |'; then
+    printf 'ok    %-28s board says push-failed\n' "lease refused event"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s no push-failed row for T-991I\n' "lease refused event"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+I_NOW="$(git -C "$REPO" rev-parse --verify "refs/heads/bot/fixer/T-991I" 2>/dev/null || printf '')"
+if [ "$I_NOW" = "$SWEEP_BASE_COMMIT" ]; then
+    printf 'ok    %-28s the concurrent move survived\n' "lease refused ref"
+    CHECKS=$((CHECKS + 1))
+else
+    printf 'FAIL  %-28s branch is %s, expected the concurrent tip %s\n' "lease refused ref" "${I_NOW:-(none)}" "$SWEEP_BASE_COMMIT"
+    CHECKS=$((CHECKS + 1))
+    FAILURES=$((FAILURES + 1))
+fi
+cleanup "bot/fixer/T-991I"
 
 git -C "$REPO" branch -D "$SWEEP_BASE" >/dev/null 2>&1
 rm -f "$STATE"/tasks/T-991*.md 2>/dev/null
