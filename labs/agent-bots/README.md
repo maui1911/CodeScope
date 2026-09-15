@@ -759,20 +759,43 @@ is the contract, not the script.
 ## 6. What would have to be true to graduate this
 
 1. The loop runs unattended and green three times on a real issue in
-   this repo. *(**One of three, and the first on a real issue.**
-   T-0010 — a scheduler tick, no babysitting — produced the fix for
-   issue #343, verifier green in a clean checkout, one commit inside
-   `touches:`, and that commit is now on `main` as part of #354. Two
-   to go, and F-45 is what the first one actually proved. Earlier runs
-   under Claude Code and Codex completed on fixtures: F-26, F-27 and
-   F-30 are what those took.)*
+   this repo. *(**Done: four unattended green runs, three of them on
+   real issues.** T-0010 fixed #343 (on `main` via #354), T-0011 fixed
+   #351 (on `main` via #359), T-0012 wrote the relaunch module for #341
+   (its commit is on `main` via #364, with the wiring done by hand),
+   and T-0013 wrote the bots-inbox reader from a spec without an issue
+   (on `main` via #361). Each was a scheduler tick with no babysitting,
+   verifier green in a clean checkout, and one commit inside
+   `touches:`. F-45 is what the first one proved. Earlier runs under
+   Claude Code and Codex completed on fixtures: F-26, F-27 and F-30
+   are what those took.)*
 2. The verifier catches at least one agent run that *claimed* success
    and was wrong. If that never happens, the verifier is not verifying.
 3. A handoff between two bots survives a rebase. *(Half done: a
    branch is now rebased onto a base that moved during the run and
    re-verified there — F-25. A branch that is merely waiting is not
    re-checked, and that window is the longer one.)*
-4. Worktree cleanup works on Windows with a build running.
+4. Worktree cleanup on Windows with a build running fails closed and
+   the retry finishes. *(**Done.** As first written this said "works",
+   and a removal cannot work against a file another process holds
+   open; what it can do is refuse without losing the marker that lets
+   the next attempt recognise the tree, and that is what the criterion
+   now asks for - Copilot, reviewing the claim. Tried 2026-09-14 on
+   Windows with `remove_proof_last` from
+   `live-task.sh`, against a `--shared` clone carrying its
+   `.git/bot-surface` marker while `cargo build -p codescope-core` ran
+   inside it with `target/` in the tree - the shape an agent's plain
+   `cargo build` leaves. During the build the removal returned 1 after
+   2 s with the tree still there, the marker still in it, and nothing
+   stranded under a `.removing.*` name; the runner's own path from
+   there is `clean-failed` on the board, `needs-review` on the task and
+   the handoff, and the `rm -rf` line in the handoff. With the build
+   killed the same call returned 0 and the tree was gone - which is
+   what `bot-forget.sh --surface` runs later. The four real runs above
+   all built inside their surface and reported `cleaned`, so the
+   finished-build case is covered by them. A lock that never goes
+   away - rust-analyzer or a terminal opened on the surface - stays a
+   `needs-review` for a person, and no retry policy changes that.)*
 5. `verify:` no longer runs through `eval` on the host, or task files
    are provably trusted input. A product feature cannot ship a shell
    command sourced from repo content. See F-6.
