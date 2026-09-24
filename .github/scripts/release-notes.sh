@@ -17,10 +17,13 @@
 # Where the data comes from:
 #
 #   1. previous release tag  -> the commit range this release covers
-#   2. `compare` API         -> the commits in that range. Every commit on
-#                               `main` is a squash merge, so each subject is
-#                               exactly "<pr title> (#<pr number>)" — both
-#                               blocks come out of that one call.
+#   2. `compare` API         -> the commits in that range, walked along the
+#                               first-parent chain of `main` and turned into
+#                               "<pr title> (#<pr number>)" subjects. A squash
+#                               merge already reads that way; a merge commit
+#                               ("Merge pull request #N from …") carries the
+#                               PR title on its next line. Both blocks come
+#                               out of that one call.
 #   3. `closingIssuesReferences` (GraphQL) -> the issues each PR closes
 #   4. issue author, minus the repo owner and bots -> the credit lines
 #
@@ -115,8 +118,23 @@ echo "generating notes for $prev_tag..$TAG"
 
 # --- 2. commits in range -> "<title> (#<pr>)" subjects ------------------------
 
-gh api "repos/$REPO/compare/$prev_tag...$TAG" \
-    --jq '.commits[].commit.message | split("\n")[0]' > "$work/subjects"
+# `main` takes both squash merges and merge commits. With merge commits,
+# `.commits` also holds every commit *inside* each merged PR, and some of those
+# end in an issue number ("… (#341)") that would pass for a PR below. So walk
+# the first-parent chain back from the newest commit (compare lists oldest
+# first), and rewrite a merge commit as "<its PR title> (#N)", the shape a
+# squash merge already has. Compare returns at most 250 commits; a longer range
+# would start the walk short of the tag.
+gh api "repos/$REPO/compare/$prev_tag...$TAG" --jq '
+    (.commits | map({key: .sha, value: .}) | from_entries) as $by
+    | [.commits[-1].sha | recurse($by[.].parents[0].sha // empty | select($by[.] != null))]
+    | reverse[]
+    | $by[.].commit.message | split("\n") as $lines
+    | if ($lines[0] | test("^Merge pull request #[0-9]+ from "))
+      then (($lines[1:] | map(select(test("\\S"))) | first) // $lines[0])
+          + " (#" + ($lines[0] | capture("#(?<n>[0-9]+)").n) + ")"
+      else $lines[0]
+      end' > "$work/subjects"
 
 # Match `(#N)` only at the end of the subject: a squash merge always puts it
 # there, while a subject that *mentions* other PRs mid-sentence (e.g. the
@@ -125,7 +143,7 @@ gh api "repos/$REPO/compare/$prev_tag...$TAG" \
 sed -nE 's/.*\(#([0-9]+)\)$/\1/p' "$work/subjects" | sort -un > "$work/prs"
 
 if [[ ! -s "$work/prs" ]]; then
-    echo "no squash-merged PRs in range — skipping"
+    echo "no merged PRs in range — skipping"
     exit 0
 fi
 
