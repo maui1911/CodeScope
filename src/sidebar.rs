@@ -32,7 +32,8 @@ use std::time::{Duration, Instant};
 use codescope_core::{
     AgentProfile, AgentRegistry, AppPaths, LayoutState, Project, ProjectsConfig, Theme,
 };
-use codescope_core::git::GitStatus;
+use codescope_core::git::{GitStatus, WorktreeInfo};
+use codescope_core::projects::{PathOnDisk, WorktreeSync};
 use codescope_core::pr::{CiStatus, PullRequestInfo};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -62,6 +63,16 @@ const DIRTY_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// enough that a `git init` in that folder shows up without a
 /// restart (#338).
 const NON_REPO_REPROBE: Duration = Duration::from_secs(60);
+
+/// How often the worktree-discovery poller asks git for each
+/// project's worktree list. Same 5 s cadence as the dirty and
+/// git-status polls, so a worktree created or removed outside the app
+/// (`git worktree add` / `remove` in a terminal, an agent, another
+/// tool) shows up or goes away about as fast as an edit gets its
+/// dirty dot. One `git worktree list` per repository project per
+/// tick, against the three calls per *worktree* the git-status poll
+/// already makes.
+const WORKTREE_DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How often the PR-status poller wakes up. 60 s matches the C# build's
 /// `PullRequestStatusPoller.Interval` baseline (the C# build then layers
@@ -567,6 +578,14 @@ pub struct Sidebar {
     /// later, so the git-status poller re-probes entries older than
     /// [`NON_REPO_REPROBE`] and drops them once git says yes (#338).
     non_repo_paths: HashMap<String, Instant>,
+    /// Bumped each time an in-app flow adds or drops a worktree row
+    /// ("New worktree", "Delete worktree"). The discovery poll reads
+    /// it before scanning and throws the scan away if it moved: a list
+    /// taken while `git worktree remove` was still running can name
+    /// the tree the user just deleted (adopting it would put the row
+    /// straight back), and a row created mid-scan has no disk facts
+    /// yet to match git's spelling of its path against.
+    worktree_edits: u64,
     /// Cached "open PR URL for this worktree" lookup, keyed by the
     /// worktree's absolute path. The value tracks both the branch
     /// the lookup ran against (so a branch switch invalidates the
@@ -713,6 +732,7 @@ impl Sidebar {
             remote_live_project_ids: HashSet::new(),
             git_status: HashMap::new(),
             non_repo_paths: HashMap::new(),
+            worktree_edits: 0,
             pr_urls: HashMap::new(),
             collapsed_projects,
             expanded_worktrees: HashSet::new(),
@@ -1346,6 +1366,167 @@ impl Sidebar {
             }
         })
         .detach();
+    }
+
+    /// Spawn the worktree-discovery loop. Every
+    /// [`WORKTREE_DISCOVERY_INTERVAL`] it runs `git worktree list`
+    /// for each repository project, probes every stored path on disk,
+    /// and syncs the rows with what it found (see
+    /// [`ProjectsConfig::sync_worktrees`]): a worktree created outside
+    /// the app gets a row, and one removed outside the app loses its
+    /// row once git has forgotten it and its folder is gone. The first
+    /// tick runs straight away, which covers changes made while the
+    /// app was closed.
+    ///
+    /// Called from `AppShell::new` alongside the other pollers. Same
+    /// lifetime — dies when the entity drops.
+    pub fn start_worktree_discovery_poll(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let mut first_tick = true;
+            loop {
+                if !first_tick {
+                    cx.background_executor()
+                        .timer(WORKTREE_DISCOVERY_INTERVAL)
+                        .await;
+                }
+                first_tick = false;
+                if this.upgrade().is_none() {
+                    break;
+                }
+                // `targets` is (project id, repo path) for every
+                // project that can have worktrees: remote-shell
+                // projects have no path, plain folders (#338) nothing
+                // to list. `stored` is every path any project tracks,
+                // probed below for the sync's disk facts.
+                let snapshot = this.update(cx, |this, _| {
+                    let targets: Vec<(String, String)> = this
+                        .projects
+                        .projects
+                        .iter()
+                        .filter(|p| !p.is_remote_shell() && !p.path.is_empty())
+                        .filter(|p| !this.non_repo_paths.contains_key(&p.path))
+                        .map(|p| (p.id.clone(), p.path.clone()))
+                        .collect();
+                    let stored: HashSet<String> = this
+                        .projects
+                        .projects
+                        .iter()
+                        .flat_map(|p| {
+                            std::iter::once(p.path.clone())
+                                .chain(p.worktrees.iter().map(|wt| wt.path.clone()))
+                        })
+                        .filter(|path| !path.is_empty())
+                        .collect();
+                    (this.worktree_edits, targets, stored)
+                });
+                let Ok((edits, targets, stored)) = snapshot else {
+                    break;
+                };
+                if targets.is_empty() {
+                    continue;
+                }
+                let (listed, on_disk) = cx
+                    .background_spawn(async move {
+                        let listed: Vec<(String, Vec<WorktreeInfo>)> = targets
+                            .into_iter()
+                            .filter_map(|(id, path)| {
+                                // Fail-soft: `git` missing or the path
+                                // no longer a repo skips the project
+                                // (nothing added, nothing dropped); the
+                                // next tick retries.
+                                codescope_core::git::list_worktrees(std::path::Path::new(&path))
+                                    .ok()
+                                    .map(|wts| (id, wts))
+                            })
+                            .collect();
+                        let on_disk: HashMap<String, PathOnDisk> = stored
+                            .into_iter()
+                            .map(|path| {
+                                let disk = PathOnDisk::probe(&path);
+                                (path, disk)
+                            })
+                            .collect();
+                        (listed, on_disk)
+                    })
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        this.sync_discovered_worktrees(edits, &listed, &on_disk, cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Apply one discovery scan. `edits` is the
+    /// [`Self::worktree_edits`] value read before the scan started.
+    fn sync_discovered_worktrees(
+        &mut self,
+        edits: u64,
+        listed: &[(String, Vec<WorktreeInfo>)],
+        on_disk: &HashMap<String, PathOnDisk>,
+        cx: &mut Context<Self>,
+    ) {
+        if edits != self.worktree_edits {
+            // A worktree was added or deleted in-app while the scan
+            // ran, so it may be stale. The next tick scans afresh.
+            return;
+        }
+        let sync = |cfg: &mut ProjectsConfig| {
+            let mut total = WorktreeSync::default();
+            for (project_id, wts) in listed {
+                let one = cfg.sync_worktrees(project_id, wts, on_disk);
+                total.added += one.added;
+                total.dropped += one.dropped;
+            }
+            total
+        };
+        // Dry run on a copy of what we hold: nearly every tick finds
+        // nothing to change, and those must not touch disk.
+        if !sync(&mut self.projects.clone()).changed() {
+            return;
+        }
+        // Something changed. Redo it on a fresh read of
+        // `projects.json`: AppShell writes that file too (session
+        // rows, agent session ids) without mirroring every write
+        // here, so saving our copy could drop its changes. Same
+        // reload-then-mutate rule AppShell follows.
+        let mut next = match ProjectsConfig::load(&self.paths) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to reload projects.json before syncing worktrees: {err:#}"
+                );
+                return;
+            }
+        };
+        let total = sync(&mut next);
+        if total.changed() {
+            if let Err(err) = next.save(&self.paths) {
+                eprintln!("warning: failed to save projects.json after syncing worktrees: {err:#}");
+                return;
+            }
+            eprintln!(
+                "info: synced worktrees changed outside CodeScope: {} added, {} dropped",
+                total.added, total.dropped
+            );
+        }
+        // Commit the fresh read even when it already matched: it is
+        // newer than our copy, and keeping ours would repeat this
+        // reload every tick.
+        self.replace_projects(next);
+        cx.notify();
+    }
+
+    /// Record that an in-app flow added or dropped a worktree row, so
+    /// an in-flight discovery scan is discarded (see
+    /// [`Self::worktree_edits`]).
+    pub(crate) fn note_worktree_edit(&mut self) {
+        self.worktree_edits += 1;
     }
 
     /// Return the cached [`GitStatus`] for the given worktree path.
@@ -5647,6 +5828,9 @@ async fn commit_worktree_removal(
     cx: &mut gpui::AsyncApp,
 ) {
     let _ = this.update(cx, |this, cx| {
+        // Git no longer lists the tree; void any discovery scan that
+        // listed it before the remove landed.
+        this.note_worktree_edit();
         let mut next = this.projects.clone();
         let Some(project) = next.projects.iter_mut().find(|p| p.id == ctx.project_id) else {
             return;

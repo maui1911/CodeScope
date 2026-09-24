@@ -536,6 +536,7 @@ impl Sidebar {
                     return;
                 }
                 self.replace_projects(next);
+                self.note_worktree_edit();
                 self.cancel_new_worktree_dialog(cx);
                 // Spawn a session pinned to the new worktree only when
                 // the toggle is on. Mirrors the C# dialog's
