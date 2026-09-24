@@ -33,7 +33,7 @@ use codescope_core::{
     AgentProfile, AgentRegistry, AppPaths, LayoutState, Project, ProjectsConfig, Theme,
 };
 use codescope_core::git::{GitStatus, WorktreeInfo};
-use codescope_core::projects::{PathOnDisk, WorktreeSync};
+use codescope_core::projects::{PathOnDisk, WorktreeSync, worktree_is_listed};
 use codescope_core::pr::{CiStatus, PullRequestInfo};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -5733,9 +5733,11 @@ struct WorktreeRemoveContext {
 /// On success, rewrites `projects.json`. On failure, fires a follow-
 /// up [`SidebarEvent::OpenConfirmDialog`] with
 /// [`ConfirmAction::RemoveWorktreeForce`] so the user can opt in
-/// to `--force`. Lives outside the `Sidebar` impl because the
-/// `cx.spawn` task gets a `WeakEntity<Sidebar>`, not `&mut Sidebar`
-/// — keeping the borrow shape explicit.
+/// to `--force` — unless git has already forgotten the worktree
+/// (removed outside the app), in which case the row just goes.
+/// Lives outside the `Sidebar` impl because the `cx.spawn` task gets
+/// a `WeakEntity<Sidebar>`, not `&mut Sidebar` — keeping the borrow
+/// shape explicit.
 async fn run_remove_worktree_flow(
     this: gpui::WeakEntity<Sidebar>,
     ctx: WorktreeRemoveContext,
@@ -5757,6 +5759,12 @@ async fn run_remove_worktree_flow(
 
     match first_attempt {
         Ok(()) => {
+            commit_worktree_removal(this, &ctx, cx).await;
+        }
+        Err(_) if git_has_forgotten(&ctx, cx).await => {
+            // Removed or pruned outside the app: git rejects the path
+            // ("is not a working tree") and `--force` would too. Only
+            // the row is left to remove.
             commit_worktree_removal(this, &ctx, cx).await;
         }
         Err(err) => {
@@ -5807,7 +5815,9 @@ async fn run_remove_worktree_force_flow(
         cx.background_spawn(async move { git::remove_worktree(&repo, &wt_path, true) })
             .await
     };
-    if let Err(err) = forced {
+    if let Err(err) = forced
+        && !git_has_forgotten(&ctx, cx).await
+    {
         eprintln!(
             "warning: force-remove of worktree '{}' failed: {err:#}",
             ctx.display_label
@@ -5815,6 +5825,25 @@ async fn run_remove_worktree_force_flow(
         return;
     }
     commit_worktree_removal(this, &ctx, cx).await;
+}
+
+/// After `git worktree remove` failed: `true` when git no longer
+/// lists the worktree at all, i.e. it was removed or pruned outside
+/// the app, so there is nothing left for git to do and only the row
+/// should go. A folder still at the path is no worktree any more and
+/// is left alone. `false` while git still lists it (dirty, locked:
+/// the force retry applies) or when the listing itself fails.
+async fn git_has_forgotten(ctx: &WorktreeRemoveContext, cx: &mut gpui::AsyncApp) -> bool {
+    let repo = std::path::PathBuf::from(&ctx.project_path);
+    let worktree = ctx.worktree_path.clone();
+    cx.background_spawn(async move {
+        let Ok(listed) = codescope_core::git::list_worktrees(&repo) else {
+            return false;
+        };
+        let disk = PathOnDisk::probe(&worktree);
+        !worktree_is_listed(&listed, &worktree, Some(&disk))
+    })
+    .await
 }
 
 /// Rewrite `projects.json` to drop the just-removed worktree. Shared
