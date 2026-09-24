@@ -232,40 +232,6 @@ impl Project {
             .unwrap_or_else(|| format!("{}.worktrees", self.path))
     }
 
-    /// Discover existing git worktrees under this project's primary
-    /// `path` and adopt any that aren't already tracked in
-    /// `self.worktrees`. Errors (path isn't a git repo, `git` missing,
-    /// path doesn't exist on disk, etc.) are swallowed — the project
-    /// still ends up added with just its primary row, same as before.
-    ///
-    /// Called once at project-add time so users who already have
-    /// worktrees on disk see them in the sidebar immediately, without
-    /// having to re-register each one through the "New worktree"
-    /// dialog. Idempotent: re-running on an already-up-to-date
-    /// project is a no-op via path-equality dedup.
-    ///
-    /// Primary worktree (the one git's porcelain marks first) is
-    /// skipped — `Project::new` already seeded that row; the branch
-    /// backfill is the `WorktreeStatusPoller`'s job, not ours.
-    ///
-    /// Worktrees made *after* the project was added are picked up by
-    /// [`ProjectsConfig::sync_worktrees`], which the sidebar's
-    /// discovery poll drives.
-    pub fn adopt_existing_worktrees(&mut self) {
-        if self.is_remote_shell() {
-            return;
-        }
-        let Ok(found) = crate::git::list_worktrees(Path::new(&self.path)) else {
-            return;
-        };
-        let mut tracked: HashSet<String> = self
-            .worktrees
-            .iter()
-            .map(|wt| normalise_project_path(&wt.path))
-            .collect();
-        self.adopt_worktrees(&found, &mut tracked);
-    }
-
     /// Append a non-primary row for each entry of `found` worth
     /// tracking. Skips the primary tree (the project's own row), a
     /// prunable one (its folder is gone, so the row could never
@@ -508,6 +474,20 @@ impl ProjectsConfig {
         self.projects.iter().find(|p| p.id == id)
     }
 
+    /// Every non-empty path a project tracks, as its root or as one of
+    /// its worktrees. These are the paths a discovery scan probes
+    /// ([`PathOnDisk::probe`]) before calling [`Self::sync_worktrees`].
+    pub fn stored_paths(&self) -> HashSet<String> {
+        self.projects
+            .iter()
+            .flat_map(|p| {
+                std::iter::once(p.path.clone())
+                    .chain(p.worktrees.iter().map(|wt| wt.path.clone()))
+            })
+            .filter(|path| !path.is_empty())
+            .collect()
+    }
+
     /// Bring project `project_id`'s worktree rows in line with
     /// `listed` (one `git worktree list` run against it), so worktrees
     /// created or removed outside CodeScope (a terminal, an agent,
@@ -539,13 +519,8 @@ impl ProjectsConfig {
         on_disk: &HashMap<String, PathOnDisk>,
     ) -> WorktreeSync {
         let mut tracked: HashSet<String> = self
-            .projects
+            .stored_paths()
             .iter()
-            .flat_map(|p| {
-                std::iter::once(p.path.as_str())
-                    .chain(p.worktrees.iter().map(|wt| wt.path.as_str()))
-            })
-            .filter(|path| !path.is_empty())
             .flat_map(|path| path_keys(path, on_disk.get(path)))
             .collect();
         let Some(project) = self.projects.iter_mut().find(|p| p.id == project_id) else {
@@ -732,41 +707,7 @@ mod tests {
         Some((dir, repo))
     }
 
-    #[test]
-    fn adopt_existing_worktrees_picks_up_non_primary_rows() {
-        let Some((_guard, repo)) = init_repo_with_commit() else {
-            return;
-        };
-        let wt_path = repo.parent().unwrap().join("repo.worktrees").join("feat-x");
-        crate::git::add_worktree(&repo, &wt_path, "feat/x", None)
-            .expect("git worktree add succeeds");
 
-        let mut project = Project::new(repo.to_string_lossy().to_string());
-        assert_eq!(project.worktrees.len(), 1, "fresh project = primary only");
-
-        project.adopt_existing_worktrees();
-        assert_eq!(project.worktrees.len(), 2, "feat/x should be adopted");
-        let feat = &project.worktrees[1];
-        assert!(!feat.is_primary, "discovered worktree is non-primary");
-        assert!(feat.path.ends_with("feat-x"), "path: {}", feat.path);
-        assert_eq!(feat.branch.as_deref(), Some("feat/x"));
-        assert!(!feat.id.is_empty() && feat.id != "primary", "real uuid id");
-
-        // Idempotent: a second call must not duplicate the entry.
-        project.adopt_existing_worktrees();
-        assert_eq!(project.worktrees.len(), 2, "second pass no-ops");
-    }
-
-    #[test]
-    fn adopt_existing_worktrees_swallows_non_git_path() {
-        // Path that isn't a git repo at all — must not panic, must not
-        // mutate the worktrees list.
-        let dir = tempfile::tempdir().unwrap();
-        let mut project = Project::new(dir.path().to_string_lossy().to_string());
-        let before = project.worktrees.len();
-        project.adopt_existing_worktrees();
-        assert_eq!(project.worktrees.len(), before, "no change on non-git path");
-    }
 
     /// A `git worktree list` row, for the pure `sync_worktrees` tests.
     fn listed(path: &str, branch: Option<&str>) -> WorktreeInfo {
@@ -870,6 +811,41 @@ mod tests {
 
         assert!(!cfg.sync_worktrees(&id, &found, &on_disk).changed());
         assert_eq!(cfg.projects[0].worktrees.len(), 2);
+    }
+
+    #[test]
+    fn sync_worktrees_does_not_adopt_a_project_that_is_itself_a_worktree() {
+        // The project is one of the repo's linked worktrees, added
+        // through a symlinked path. Git lists it under its real path
+        // as a non-primary entry; it must not come back as a second
+        // row of its own project.
+        let mut cfg = config_of(vec![Project::new("/link/repo.worktrees/feat".into())]);
+        let id = cfg.projects[0].id.clone();
+        let on_disk = HashMap::from([(
+            "/link/repo.worktrees/feat".to_string(),
+            PathOnDisk { real: Some("/real/repo.worktrees/feat".into()), missing: false },
+        )]);
+        let found = [
+            primary_listed("/real/repo"),
+            listed("/real/repo.worktrees/feat", Some("feat")),
+            listed("/real/repo.worktrees/other", Some("other")),
+        ];
+
+        assert_eq!(cfg.sync_worktrees(&id, &found, &on_disk).added, 1);
+        let paths: Vec<&str> =
+            cfg.projects[0].worktrees.iter().map(|wt| wt.path.as_str()).collect();
+        assert_eq!(paths, ["/link/repo.worktrees/feat", "/real/repo.worktrees/other"]);
+    }
+
+    #[test]
+    fn stored_paths_lists_every_root_and_worktree_once() {
+        let mut repo = Project::new("/src/repo".into());
+        repo.worktrees.push(row("wt-1", "/src/repo.worktrees/a"));
+        let shell = Project::new_remote_shell("box".into(), "ssh box".into(), None);
+        let cfg = config_of(vec![repo, shell]);
+        let mut paths: Vec<String> = cfg.stored_paths().into_iter().collect();
+        paths.sort();
+        assert_eq!(paths, ["/src/repo", "/src/repo.worktrees/a"]);
     }
 
     #[test]
@@ -1008,7 +984,6 @@ mod tests {
             PathOnDisk::probe(&absent),
             PathOnDisk { real: Some(expected.to_string_lossy().into()), missing: true }
         );
-
     }
 
     /// Probe every stored path the way the sidebar's scan does.
@@ -1484,12 +1459,6 @@ mod tests {
         assert!(cfg.projects[0].is_remote_shell());
     }
 
-    #[test]
-    fn adopt_existing_worktrees_is_a_no_op_for_remote_shell() {
-        let mut p = Project::new_remote_shell("box".into(), "ssh box".into(), None);
-        p.adopt_existing_worktrees();
-        assert!(p.worktrees.is_empty());
-    }
 
     #[test]
     fn remote_shell_project_round_trips_with_camelcase_kind() {

@@ -693,12 +693,17 @@ repository project's rows in step with git
   already tracks the path, whether as its root or as a worktree. Paths
   compare normalised *and* by resolved real path, because git lists
   paths with symlinks resolved and the New-worktree dialog stores what
-  was typed.
+  was typed. A folder that is gone resolves through its nearest
+  existing ancestor, so it still matches its prunable entry.
 * **Dropping:** a non-primary row goes only when git no longer lists
   it at all (a prunable entry still counts as listed, for an unplugged
   drive) *and* its folder is confirmed gone. That is the same edit the
   in-app delete makes: the row goes, and its session history stays in
   `projects.json`.
+* **Add project:** runs the same sync once, synchronously, instead of
+  its own adoption, so the same rules apply. A worktree another
+  project already owns, or the new project's own path reached through
+  a symlink, is not adopted a second time.
 * **Writes:** a tick that changes nothing does not touch disk. A tick
   that does reloads `projects.json` first, the rule AppShell already
   follows, because the sidebar's copy can lag AppShell's session

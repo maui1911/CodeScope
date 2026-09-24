@@ -1407,17 +1407,7 @@ impl Sidebar {
                         .filter(|p| !this.non_repo_paths.contains_key(&p.path))
                         .map(|p| (p.id.clone(), p.path.clone()))
                         .collect();
-                    let stored: HashSet<String> = this
-                        .projects
-                        .projects
-                        .iter()
-                        .flat_map(|p| {
-                            std::iter::once(p.path.clone())
-                                .chain(p.worktrees.iter().map(|wt| wt.path.clone()))
-                        })
-                        .filter(|path| !path.is_empty())
-                        .collect();
-                    (this.worktree_edits, targets, stored)
+                    (this.worktree_edits, targets, this.projects.stored_paths())
                 });
                 let Ok((edits, targets, stored)) = snapshot else {
                     break;
@@ -2809,14 +2799,7 @@ impl Sidebar {
             self.select(idx, cx);
             return;
         }
-        let mut project = Project::new(path);
-        // If the user already has worktrees on disk for this repo
-        // (typical for anyone who adds a project they've been working
-        // in for a while), pull them into the project record now so
-        // they show up in the sidebar immediately. Swallows errors —
-        // a non-git folder, missing `git` binary, or a permission
-        // hiccup just lands the project with its primary row alone,
-        // matching the pre-existing behaviour.
+        let project = Project::new(path);
         // Probe once, synchronously, so the new row renders with its
         // `no git` slug and trimmed menu immediately instead of after
         // the poller's next tick. One `rev-parse`, a few ms; an
@@ -2829,19 +2812,41 @@ impl Sidebar {
             Ok(false)
         )
         .then(|| project.path.clone());
-        if non_repo_path.is_none() {
-            project.adopt_existing_worktrees();
-        }
         let new_id = project.id.clone();
+        let repo_path = project.path.clone();
         // Clone-then-save: failure leaves `self.projects` untouched.
         let mut next = self.projects.clone();
         next.projects.push(project);
+        // If the user already has worktrees on disk for this repo
+        // (typical for anyone who adds a project they've been working
+        // in for a while), pull them in now so they show up at once
+        // rather than on the discovery poll's next tick. Same sync
+        // and same rules as that poll, so a worktree another project
+        // already tracks, or the project's own symlinked spelling,
+        // isn't adopted twice. Errors (missing `git`, permissions)
+        // just land the project with its primary row alone.
+        if non_repo_path.is_none()
+            && let Ok(listed) =
+                codescope_core::git::list_worktrees(std::path::Path::new(&repo_path))
+        {
+            let on_disk: HashMap<String, PathOnDisk> = next
+                .stored_paths()
+                .into_iter()
+                .map(|path| {
+                    let disk = PathOnDisk::probe(&path);
+                    (path, disk)
+                })
+                .collect();
+            next.sync_worktrees(&new_id, &listed, &on_disk);
+        }
         if let Err(err) = next.save(&self.paths) {
             eprintln!("warning: failed to save projects.json: {err:#}");
             return;
         }
-        // Disk is committed; now mirror the change in memory.
+        // Disk is committed; now mirror the change in memory. The new
+        // rows had no disk facts in any scan already running.
         self.projects = next;
+        self.note_worktree_edit();
         if let Some(path) = non_repo_path {
             self.non_repo_paths.insert(path, Instant::now());
         }
@@ -5895,7 +5900,7 @@ pub(crate) fn reveal_path_in_file_browser(path: &str) {
     // explorer.exe silently opens the Documents folder when handed a
     // path with forward slashes — which is exactly what `git worktree
     // list --porcelain` emits on Windows, and what
-    // `adopt_existing_worktrees` stores verbatim (issue #292).
+    // the worktree sync stores verbatim (issue #292).
     #[cfg(target_os = "windows")]
     let result = Command::new("explorer.exe")
         .arg(path.replace('/', "\\"))
