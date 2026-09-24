@@ -664,3 +664,56 @@ control plane of the selected project and never writes to it.
   matching change there.
 * Moving the control plane out of `labs/` (a product path or a setting)
   is a later decision, when the bots graduate from the lab.
+
+## ADR-0024 — Sidebar worktree rows follow `git worktree list`
+
+**Date:** 2026-09-24
+**Status:** Accepted
+
+Worktree rows used to change only through the app: "Add project"
+adopted what `git worktree list` showed at that moment, "New worktree"
+added a row, "Delete worktree" dropped one. A worktree created
+afterwards in a terminal, by an agent (Claude Code `--worktree`,
+subagent isolation) or by the bots lab never showed up, not even after
+a restart. A worktree removed outside the app left a row behind that
+the in-app delete couldn't clear either: git answers
+`is not a working tree`, and `--force` too.
+
+**Decision:** the sidebar runs a discovery poll that keeps each
+repository project's rows in step with git
+(`ProjectsConfig::sync_worktrees`, driven by
+`Sidebar::start_worktree_discovery_poll`).
+
+* **Cadence:** first tick at launch, then every 5 s, the same interval
+  as the dirty and git-status polls. One `git worktree list` per
+  repository project, plus a stat of each stored path, all on the
+  background executor. No file watcher, same as the other pollers.
+* **Adding:** a listed worktree gets a row unless it is the primary,
+  is prunable (folder deleted by hand, never pruned), or any project
+  already tracks the path, whether as its root or as a worktree. Paths
+  compare normalised *and* by resolved real path, because git lists
+  paths with symlinks resolved and the New-worktree dialog stores what
+  was typed.
+* **Dropping:** a non-primary row goes only when git no longer lists
+  it at all (a prunable entry still counts as listed, for an unplugged
+  drive) *and* its folder is confirmed gone. That is the same edit the
+  in-app delete makes: the row goes, and its session history stays in
+  `projects.json`.
+* **Writes:** a tick that changes nothing does not touch disk. A tick
+  that does reloads `projects.json` first, the rule AppShell already
+  follows, because the sidebar's copy can lag AppShell's session
+  writes.
+* **In-app delete:** when `git worktree remove` fails and git has
+  already forgotten the worktree, the row is dropped without a force
+  prompt. A folder still at that path is left alone.
+
+**Consequences:**
+
+* Short-lived agent and bot worktrees show up as rows while they
+  exist, then disappear.
+* An in-app add or delete that lands during a scan throws that scan
+  away (`Sidebar::worktree_edits`). Otherwise a list taken before the
+  delete finished would put the deleted row straight back.
+* Stored paths stay as git prints them (forward slashes on Windows),
+  as the add-time adoption already did. Consumers that need native
+  separators convert them, as with the reveal helper (#298).
