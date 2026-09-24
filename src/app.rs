@@ -1102,6 +1102,11 @@ impl AppShell {
                 // and the data changes much less frequently than the
                 // working tree.
                 sidebar.start_pr_poll(cx);
+                // Worktree discovery: adopts worktrees created outside
+                // the app (terminal `git worktree add`, agents). First
+                // tick runs at once so ones made while we were closed
+                // appear on launch; then every 5 s.
+                sidebar.start_worktree_discovery_poll(cx);
                 // Dialog-input caret blink (Add project, New worktree).
                 // Independent timer; same 530 ms cadence as AppShell's
                 // so paired inputs across the two entities still feel

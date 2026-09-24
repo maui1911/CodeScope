@@ -32,7 +32,8 @@ use std::time::{Duration, Instant};
 use codescope_core::{
     AgentProfile, AgentRegistry, AppPaths, LayoutState, Project, ProjectsConfig, Theme,
 };
-use codescope_core::git::GitStatus;
+use codescope_core::git::{GitStatus, WorktreeInfo};
+use codescope_core::projects::{PathOnDisk, WorktreeSync, worktree_is_listed};
 use codescope_core::pr::{CiStatus, PullRequestInfo};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -62,6 +63,16 @@ const DIRTY_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// enough that a `git init` in that folder shows up without a
 /// restart (#338).
 const NON_REPO_REPROBE: Duration = Duration::from_secs(60);
+
+/// How often the worktree-discovery poller asks git for each
+/// project's worktree list. Same 5 s cadence as the dirty and
+/// git-status polls, so a worktree created or removed outside the app
+/// (`git worktree add` / `remove` in a terminal, an agent, another
+/// tool) shows up or goes away about as fast as an edit gets its
+/// dirty dot. One `git worktree list` per repository project per
+/// tick, against the three calls per *worktree* the git-status poll
+/// already makes.
+const WORKTREE_DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How often the PR-status poller wakes up. 60 s matches the C# build's
 /// `PullRequestStatusPoller.Interval` baseline (the C# build then layers
@@ -567,6 +578,14 @@ pub struct Sidebar {
     /// later, so the git-status poller re-probes entries older than
     /// [`NON_REPO_REPROBE`] and drops them once git says yes (#338).
     non_repo_paths: HashMap<String, Instant>,
+    /// Bumped each time an in-app flow adds or drops a worktree row
+    /// ("New worktree", "Delete worktree"). The discovery poll reads
+    /// it before scanning and throws the scan away if it moved: a list
+    /// taken while `git worktree remove` was still running can name
+    /// the tree the user just deleted (adopting it would put the row
+    /// straight back), and a row created mid-scan has no disk facts
+    /// yet to match git's spelling of its path against.
+    worktree_edits: u64,
     /// Cached "open PR URL for this worktree" lookup, keyed by the
     /// worktree's absolute path. The value tracks both the branch
     /// the lookup ran against (so a branch switch invalidates the
@@ -713,6 +732,7 @@ impl Sidebar {
             remote_live_project_ids: HashSet::new(),
             git_status: HashMap::new(),
             non_repo_paths: HashMap::new(),
+            worktree_edits: 0,
             pr_urls: HashMap::new(),
             collapsed_projects,
             expanded_worktrees: HashSet::new(),
@@ -1346,6 +1366,157 @@ impl Sidebar {
             }
         })
         .detach();
+    }
+
+    /// Spawn the worktree-discovery loop. Every
+    /// [`WORKTREE_DISCOVERY_INTERVAL`] it runs `git worktree list`
+    /// for each repository project, probes every stored path on disk,
+    /// and syncs the rows with what it found (see
+    /// [`ProjectsConfig::sync_worktrees`]): a worktree created outside
+    /// the app gets a row, and one removed outside the app loses its
+    /// row once git has forgotten it and its folder is gone. The first
+    /// tick runs straight away, which covers changes made while the
+    /// app was closed.
+    ///
+    /// Called from `AppShell::new` alongside the other pollers. Same
+    /// lifetime — dies when the entity drops.
+    pub fn start_worktree_discovery_poll(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let mut first_tick = true;
+            loop {
+                if !first_tick {
+                    cx.background_executor()
+                        .timer(WORKTREE_DISCOVERY_INTERVAL)
+                        .await;
+                }
+                first_tick = false;
+                if this.upgrade().is_none() {
+                    break;
+                }
+                // `targets` is (project id, repo path) for every
+                // project that can have worktrees: remote-shell
+                // projects have no path, plain folders (#338) nothing
+                // to list. `stored` is every path any project tracks,
+                // probed below for the sync's disk facts.
+                let snapshot = this.update(cx, |this, _| {
+                    let targets: Vec<(String, String)> = this
+                        .projects
+                        .projects
+                        .iter()
+                        .filter(|p| !p.is_remote_shell() && !p.path.is_empty())
+                        .filter(|p| !this.non_repo_paths.contains_key(&p.path))
+                        .map(|p| (p.id.clone(), p.path.clone()))
+                        .collect();
+                    (this.worktree_edits, targets, this.projects.stored_paths())
+                });
+                let Ok((edits, targets, stored)) = snapshot else {
+                    break;
+                };
+                if targets.is_empty() {
+                    continue;
+                }
+                let (listed, on_disk) = cx
+                    .background_spawn(async move {
+                        let listed: Vec<(String, Vec<WorktreeInfo>)> = targets
+                            .into_iter()
+                            .filter_map(|(id, path)| {
+                                // Fail-soft: `git` missing or the path
+                                // no longer a repo skips the project
+                                // (nothing added, nothing dropped); the
+                                // next tick retries.
+                                codescope_core::git::list_worktrees(std::path::Path::new(&path))
+                                    .ok()
+                                    .map(|wts| (id, wts))
+                            })
+                            .collect();
+                        let on_disk: HashMap<String, PathOnDisk> = stored
+                            .into_iter()
+                            .map(|path| {
+                                let disk = PathOnDisk::probe(&path);
+                                (path, disk)
+                            })
+                            .collect();
+                        (listed, on_disk)
+                    })
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        this.sync_discovered_worktrees(edits, &listed, &on_disk, cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Apply one discovery scan. `edits` is the
+    /// [`Self::worktree_edits`] value read before the scan started.
+    fn sync_discovered_worktrees(
+        &mut self,
+        edits: u64,
+        listed: &[(String, Vec<WorktreeInfo>)],
+        on_disk: &HashMap<String, PathOnDisk>,
+        cx: &mut Context<Self>,
+    ) {
+        if edits != self.worktree_edits {
+            // A worktree was added or deleted in-app while the scan
+            // ran, so it may be stale. The next tick scans afresh.
+            return;
+        }
+        let sync = |cfg: &mut ProjectsConfig| {
+            let mut total = WorktreeSync::default();
+            for (project_id, wts) in listed {
+                let one = cfg.sync_worktrees(project_id, wts, on_disk);
+                total.added += one.added;
+                total.dropped += one.dropped;
+            }
+            total
+        };
+        // Dry run on a copy of what we hold: nearly every tick finds
+        // nothing to change, and those must not touch disk.
+        if !sync(&mut self.projects.clone()).changed() {
+            return;
+        }
+        // Something changed. Redo it on a fresh read of
+        // `projects.json`: AppShell writes that file too (session
+        // rows, agent session ids) without mirroring every write
+        // here, so saving our copy could drop its changes. Same
+        // reload-then-mutate rule AppShell follows.
+        let mut next = match ProjectsConfig::load(&self.paths) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to reload projects.json before syncing worktrees: {err:#}"
+                );
+                return;
+            }
+        };
+        let total = sync(&mut next);
+        if total.changed() {
+            if let Err(err) = next.save(&self.paths) {
+                eprintln!("warning: failed to save projects.json after syncing worktrees: {err:#}");
+                return;
+            }
+            eprintln!(
+                "info: synced worktrees changed outside CodeScope: {} added, {} dropped",
+                total.added, total.dropped
+            );
+        }
+        // Commit the fresh read even when it already matched: it is
+        // newer than our copy, and keeping ours would repeat this
+        // reload every tick.
+        self.replace_projects(next);
+        cx.notify();
+    }
+
+    /// Record that an in-app flow added or dropped a worktree row, so
+    /// an in-flight discovery scan is discarded (see
+    /// [`Self::worktree_edits`]).
+    pub(crate) fn note_worktree_edit(&mut self) {
+        self.worktree_edits += 1;
     }
 
     /// Return the cached [`GitStatus`] for the given worktree path.
@@ -2628,14 +2799,7 @@ impl Sidebar {
             self.select(idx, cx);
             return;
         }
-        let mut project = Project::new(path);
-        // If the user already has worktrees on disk for this repo
-        // (typical for anyone who adds a project they've been working
-        // in for a while), pull them into the project record now so
-        // they show up in the sidebar immediately. Swallows errors —
-        // a non-git folder, missing `git` binary, or a permission
-        // hiccup just lands the project with its primary row alone,
-        // matching the pre-existing behaviour.
+        let project = Project::new(path);
         // Probe once, synchronously, so the new row renders with its
         // `no git` slug and trimmed menu immediately instead of after
         // the poller's next tick. One `rev-parse`, a few ms; an
@@ -2648,19 +2812,41 @@ impl Sidebar {
             Ok(false)
         )
         .then(|| project.path.clone());
-        if non_repo_path.is_none() {
-            project.adopt_existing_worktrees();
-        }
         let new_id = project.id.clone();
+        let repo_path = project.path.clone();
         // Clone-then-save: failure leaves `self.projects` untouched.
         let mut next = self.projects.clone();
         next.projects.push(project);
+        // If the user already has worktrees on disk for this repo
+        // (typical for anyone who adds a project they've been working
+        // in for a while), pull them in now so they show up at once
+        // rather than on the discovery poll's next tick. Same sync
+        // and same rules as that poll, so a worktree another project
+        // already tracks, or the project's own symlinked spelling,
+        // isn't adopted twice. Errors (missing `git`, permissions)
+        // just land the project with its primary row alone.
+        if non_repo_path.is_none()
+            && let Ok(listed) =
+                codescope_core::git::list_worktrees(std::path::Path::new(&repo_path))
+        {
+            let on_disk: HashMap<String, PathOnDisk> = next
+                .stored_paths()
+                .into_iter()
+                .map(|path| {
+                    let disk = PathOnDisk::probe(&path);
+                    (path, disk)
+                })
+                .collect();
+            next.sync_worktrees(&new_id, &listed, &on_disk);
+        }
         if let Err(err) = next.save(&self.paths) {
             eprintln!("warning: failed to save projects.json: {err:#}");
             return;
         }
-        // Disk is committed; now mirror the change in memory.
+        // Disk is committed; now mirror the change in memory. The new
+        // rows had no disk facts in any scan already running.
         self.projects = next;
+        self.note_worktree_edit();
         if let Some(path) = non_repo_path {
             self.non_repo_paths.insert(path, Instant::now());
         }
@@ -5552,9 +5738,11 @@ struct WorktreeRemoveContext {
 /// On success, rewrites `projects.json`. On failure, fires a follow-
 /// up [`SidebarEvent::OpenConfirmDialog`] with
 /// [`ConfirmAction::RemoveWorktreeForce`] so the user can opt in
-/// to `--force`. Lives outside the `Sidebar` impl because the
-/// `cx.spawn` task gets a `WeakEntity<Sidebar>`, not `&mut Sidebar`
-/// — keeping the borrow shape explicit.
+/// to `--force` — unless git has already forgotten the worktree
+/// (removed outside the app), in which case the row just goes.
+/// Lives outside the `Sidebar` impl because the `cx.spawn` task gets
+/// a `WeakEntity<Sidebar>`, not `&mut Sidebar` — keeping the borrow
+/// shape explicit.
 async fn run_remove_worktree_flow(
     this: gpui::WeakEntity<Sidebar>,
     ctx: WorktreeRemoveContext,
@@ -5576,6 +5764,12 @@ async fn run_remove_worktree_flow(
 
     match first_attempt {
         Ok(()) => {
+            commit_worktree_removal(this, &ctx, cx).await;
+        }
+        Err(_) if git_has_forgotten(&ctx, cx).await => {
+            // Removed or pruned outside the app: git rejects the path
+            // ("is not a working tree") and `--force` would too. Only
+            // the row is left to remove.
             commit_worktree_removal(this, &ctx, cx).await;
         }
         Err(err) => {
@@ -5626,7 +5820,9 @@ async fn run_remove_worktree_force_flow(
         cx.background_spawn(async move { git::remove_worktree(&repo, &wt_path, true) })
             .await
     };
-    if let Err(err) = forced {
+    if let Err(err) = forced
+        && !git_has_forgotten(&ctx, cx).await
+    {
         eprintln!(
             "warning: force-remove of worktree '{}' failed: {err:#}",
             ctx.display_label
@@ -5634,6 +5830,25 @@ async fn run_remove_worktree_force_flow(
         return;
     }
     commit_worktree_removal(this, &ctx, cx).await;
+}
+
+/// After `git worktree remove` failed: `true` when git no longer
+/// lists the worktree at all, i.e. it was removed or pruned outside
+/// the app, so there is nothing left for git to do and only the row
+/// should go. A folder still at the path is no worktree any more and
+/// is left alone. `false` while git still lists it (dirty, locked:
+/// the force retry applies) or when the listing itself fails.
+async fn git_has_forgotten(ctx: &WorktreeRemoveContext, cx: &mut gpui::AsyncApp) -> bool {
+    let repo = std::path::PathBuf::from(&ctx.project_path);
+    let worktree = ctx.worktree_path.clone();
+    cx.background_spawn(async move {
+        let Ok(listed) = codescope_core::git::list_worktrees(&repo) else {
+            return false;
+        };
+        let disk = PathOnDisk::probe(&worktree);
+        !worktree_is_listed(&listed, &worktree, Some(&disk))
+    })
+    .await
 }
 
 /// Rewrite `projects.json` to drop the just-removed worktree. Shared
@@ -5647,6 +5862,9 @@ async fn commit_worktree_removal(
     cx: &mut gpui::AsyncApp,
 ) {
     let _ = this.update(cx, |this, cx| {
+        // Git no longer lists the tree; void any discovery scan that
+        // listed it before the remove landed.
+        this.note_worktree_edit();
         let mut next = this.projects.clone();
         let Some(project) = next.projects.iter_mut().find(|p| p.id == ctx.project_id) else {
             return;
@@ -5682,7 +5900,7 @@ pub(crate) fn reveal_path_in_file_browser(path: &str) {
     // explorer.exe silently opens the Documents folder when handed a
     // path with forward slashes — which is exactly what `git worktree
     // list --porcelain` emits on Windows, and what
-    // `adopt_existing_worktrees` stores verbatim (issue #292).
+    // the worktree sync stores verbatim (issue #292).
     #[cfg(target_os = "windows")]
     let result = Command::new("explorer.exe")
         .arg(path.replace('/', "\\"))

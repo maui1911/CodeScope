@@ -13,11 +13,13 @@
 //! because users can rename or relocate a worktree without breaking
 //! cross-references.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::git::WorktreeInfo;
 use crate::paths::AppPaths;
 
 /// Latest schema version we write. Bump when the on-disk shape needs
@@ -230,47 +232,30 @@ impl Project {
             .unwrap_or_else(|| format!("{}.worktrees", self.path))
     }
 
-    /// Discover existing git worktrees under this project's primary
-    /// `path` and adopt any that aren't already tracked in
-    /// `self.worktrees`. Errors (path isn't a git repo, `git` missing,
-    /// path doesn't exist on disk, etc.) are swallowed — the project
-    /// still ends up added with just its primary row, same as before.
-    ///
-    /// Called once at project-add time so users who already have
-    /// worktrees on disk see them in the sidebar immediately, without
-    /// having to re-register each one through the "New worktree"
-    /// dialog. Idempotent: re-running on an already-up-to-date
-    /// project is a no-op via path-equality dedup.
-    ///
-    /// Primary worktree (the one git's porcelain marks first) is
-    /// skipped — `Project::new` already seeded that row; the branch
-    /// backfill is the `WorktreeStatusPoller`'s job, not ours.
-    pub fn adopt_existing_worktrees(&mut self) {
-        if self.is_remote_shell() {
-            return;
-        }
-        let Ok(found) = crate::git::list_worktrees(Path::new(&self.path)) else {
-            return;
-        };
+    /// Append a non-primary row for each entry of `found` worth
+    /// tracking. Skips the primary tree (the project's own row), a
+    /// prunable one (its folder is gone, so the row could never
+    /// open), and any whose normalised path is already in `tracked`.
+    /// Adopted paths join `tracked`, so an entry listed twice lands
+    /// once. Returns the number of rows added.
+    fn adopt_worktrees(&mut self, found: &[WorktreeInfo], tracked: &mut HashSet<String>) -> usize {
+        let mut added = 0;
         for info in found {
-            if info.is_primary {
-                continue;
-            }
-            let needle = normalise_project_path(&info.path);
-            if self
-                .worktrees
-                .iter()
-                .any(|wt| normalise_project_path(&wt.path) == needle)
+            if info.is_primary
+                || info.prunable
+                || !tracked.insert(normalise_project_path(&info.path))
             {
                 continue;
             }
             self.worktrees.push(Worktree {
                 id: uuid::Uuid::new_v4().to_string(),
-                path: info.path,
-                branch: info.branch,
+                path: info.path.clone(),
+                branch: info.branch.clone(),
                 is_primary: false,
             });
+            added += 1;
         }
+        added
     }
 }
 
@@ -489,6 +474,73 @@ impl ProjectsConfig {
         self.projects.iter().find(|p| p.id == id)
     }
 
+    /// Every non-empty path a project tracks, as its root or as one of
+    /// its worktrees. These are the paths a discovery scan probes
+    /// ([`PathOnDisk::probe`]) before calling [`Self::sync_worktrees`].
+    pub fn stored_paths(&self) -> HashSet<String> {
+        self.projects
+            .iter()
+            .flat_map(|p| {
+                std::iter::once(p.path.clone())
+                    .chain(p.worktrees.iter().map(|wt| wt.path.clone()))
+            })
+            .filter(|path| !path.is_empty())
+            .collect()
+    }
+
+    /// Bring project `project_id`'s worktree rows in line with
+    /// `listed` (one `git worktree list` run against it), so worktrees
+    /// created or removed outside CodeScope (a terminal, an agent,
+    /// another tool) show up or go away without re-adding the
+    /// project. The sidebar's discovery poll feeds this every few
+    /// seconds and once at startup. `on_disk` is what that scan found
+    /// at each stored path; a path it doesn't cover counts as present
+    /// under its stored spelling.
+    ///
+    /// **Adds** a row for each listed worktree that isn't the primary,
+    /// isn't prunable (folder gone), and isn't tracked by *any*
+    /// project yet, as a root or as a worktree. Paths compare both
+    /// normalised and by resolved real path, because git lists paths
+    /// with symlinks resolved. A worktree the user added as a project
+    /// of its own therefore doesn't also appear under its parent repo.
+    ///
+    /// **Drops** a non-primary row only when git no longer lists it at
+    /// all (not even as prunable) *and* the scan confirmed its folder
+    /// is gone: what `git worktree remove` or a prune outside the app
+    /// leaves behind. Such a row can't open, and the in-app delete
+    /// can't clear it either (git rejects a path it doesn't know). The
+    /// edit matches that delete: the row goes, its sessions stay.
+    ///
+    /// Unknown ids and remote-shell projects are left alone.
+    pub fn sync_worktrees(
+        &mut self,
+        project_id: &str,
+        listed: &[WorktreeInfo],
+        on_disk: &HashMap<String, PathOnDisk>,
+    ) -> WorktreeSync {
+        let mut tracked: HashSet<String> = self
+            .stored_paths()
+            .iter()
+            .flat_map(|path| path_keys(path, on_disk.get(path)))
+            .collect();
+        let Some(project) = self.projects.iter_mut().find(|p| p.id == project_id) else {
+            return WorktreeSync::default();
+        };
+        if project.is_remote_shell() {
+            return WorktreeSync::default();
+        }
+        let before = project.worktrees.len();
+        project.worktrees.retain(|wt| {
+            let disk = on_disk.get(&wt.path);
+            wt.is_primary
+                || !disk.is_some_and(|d| d.missing)
+                || worktree_is_listed(listed, &wt.path, disk)
+        });
+        let dropped = before - project.worktrees.len();
+        let added = project.adopt_worktrees(listed, &mut tracked);
+        WorktreeSync { added, dropped }
+    }
+
     /// Return the index of the first project whose path normalises to
     /// the same value as `path`. Used by the "Add project" dialog to
     /// reject duplicates before mutating state. The match is path-
@@ -505,6 +557,100 @@ impl ProjectsConfig {
         self.projects
             .iter()
             .position(|p| normalise_project_path(&p.path) == needle)
+    }
+}
+
+/// Rows one [`ProjectsConfig::sync_worktrees`] call added and dropped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorktreeSync {
+    pub added: usize,
+    pub dropped: usize,
+}
+
+impl WorktreeSync {
+    pub fn changed(&self) -> bool {
+        self.added > 0 || self.dropped > 0
+    }
+}
+
+/// What the discovery scan found at one stored worktree path.
+/// Gathered off the UI thread by [`PathOnDisk::probe`] so that
+/// [`ProjectsConfig::sync_worktrees`] itself does no I/O.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PathOnDisk {
+    /// The path with symlinks, junctions and `subst` drives resolved,
+    /// which is how `git worktree list` spells it. For a folder that
+    /// is gone, this is its nearest existing ancestor resolved, with
+    /// the rest appended. That way a checkout deleted from under a
+    /// symlinked parent still matches the prunable entry git keeps for
+    /// it. `None` when not even an ancestor resolves.
+    pub real: Option<String>,
+    /// `true` only when the folder is confirmed gone. A path the probe
+    /// couldn't check (permissions, I/O error) counts as present, so a
+    /// row is never dropped on a guess.
+    pub missing: bool,
+}
+
+impl PathOnDisk {
+    pub fn probe(path: &str) -> Self {
+        let path = Path::new(path);
+        Self {
+            real: resolve_real(path).map(|real| strip_verbatim_prefix(&real.to_string_lossy())),
+            missing: matches!(path.try_exists(), Ok(false)),
+        }
+    }
+}
+
+/// `path` with links resolved, like `realpath -m`: when `path` itself
+/// doesn't resolve, resolve its nearest ancestor that does and append
+/// the remaining components unchanged.
+fn resolve_real(path: &Path) -> Option<std::path::PathBuf> {
+    let mut rest = Vec::new();
+    let mut cursor = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(cursor) {
+            return Some(rest.iter().rev().fold(real, |acc, name| acc.join(name)));
+        }
+        rest.push(cursor.file_name()?);
+        cursor = cursor.parent()?;
+    }
+}
+
+/// Whether `listed` (one `git worktree list`) names the worktree
+/// stored at `path`, prunable entries included. Compares normalised
+/// paths and, when `on_disk` resolved one, the real path, since git
+/// lists paths with symlinks resolved. Shared by
+/// [`ProjectsConfig::sync_worktrees`] and the in-app delete, which
+/// uses it to tell "git refused" from "git has already forgotten it".
+pub fn worktree_is_listed(
+    listed: &[WorktreeInfo],
+    path: &str,
+    on_disk: Option<&PathOnDisk>,
+) -> bool {
+    let keys: Vec<String> = path_keys(path, on_disk).collect();
+    listed
+        .iter()
+        .any(|info| keys.contains(&normalise_project_path(&info.path)))
+}
+
+/// Every normalised spelling a stored path answers to: as stored, and
+/// as resolved on disk when the scan could resolve it.
+fn path_keys(path: &str, on_disk: Option<&PathOnDisk>) -> impl Iterator<Item = String> {
+    let real = on_disk.and_then(|d| d.real.as_deref());
+    std::iter::once(normalise_project_path(path)).chain(real.map(normalise_project_path))
+}
+
+/// `std::fs::canonicalize` returns verbatim paths on Windows
+/// (`\\?\C:\src`, `\\?\UNC\host\share`) where git prints the plain
+/// form. Strip the prefix so the two compare equal; other paths pass
+/// through unchanged.
+fn strip_verbatim_prefix(path: &str) -> String {
+    if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(local) = path.strip_prefix(r"\\?\") {
+        local.to_string()
+    } else {
+        path.to_string()
     }
 }
 
@@ -561,40 +707,442 @@ mod tests {
         Some((dir, repo))
     }
 
-    #[test]
-    fn adopt_existing_worktrees_picks_up_non_primary_rows() {
-        let Some((_guard, repo)) = init_repo_with_commit() else {
-            return;
-        };
-        let wt_path = repo.parent().unwrap().join("repo.worktrees").join("feat-x");
-        crate::git::add_worktree(&repo, &wt_path, "feat/x", None)
-            .expect("git worktree add succeeds");
 
-        let mut project = Project::new(repo.to_string_lossy().to_string());
-        assert_eq!(project.worktrees.len(), 1, "fresh project = primary only");
 
-        project.adopt_existing_worktrees();
-        assert_eq!(project.worktrees.len(), 2, "feat/x should be adopted");
-        let feat = &project.worktrees[1];
-        assert!(!feat.is_primary, "discovered worktree is non-primary");
-        assert!(feat.path.ends_with("feat-x"), "path: {}", feat.path);
-        assert_eq!(feat.branch.as_deref(), Some("feat/x"));
-        assert!(!feat.id.is_empty() && feat.id != "primary", "real uuid id");
+    /// A `git worktree list` row, for the pure `sync_worktrees` tests.
+    fn listed(path: &str, branch: Option<&str>) -> WorktreeInfo {
+        WorktreeInfo {
+            path: path.into(),
+            head: "abc1234".into(),
+            branch: branch.map(Into::into),
+            is_primary: false,
+            locked: false,
+            prunable: false,
+        }
+    }
 
-        // Idempotent: a second call must not duplicate the entry.
-        project.adopt_existing_worktrees();
-        assert_eq!(project.worktrees.len(), 2, "second pass no-ops");
+    fn primary_listed(path: &str) -> WorktreeInfo {
+        WorktreeInfo { is_primary: true, ..listed(path, Some("main")) }
+    }
+
+    fn config_of(projects: Vec<Project>) -> ProjectsConfig {
+        ProjectsConfig { version: CURRENT_VERSION, agents: Vec::new(), projects }
+    }
+
+    fn row(id: &str, path: &str) -> Worktree {
+        Worktree { id: id.into(), path: path.into(), branch: None, is_primary: false }
+    }
+
+    fn gone() -> PathOnDisk {
+        PathOnDisk { real: None, missing: true }
+    }
+
+    fn no_disk_facts() -> HashMap<String, PathOnDisk> {
+        HashMap::new()
     }
 
     #[test]
-    fn adopt_existing_worktrees_swallows_non_git_path() {
-        // Path that isn't a git repo at all — must not panic, must not
-        // mutate the worktrees list.
+    fn sync_worktrees_adds_untracked_rows_to_the_named_project() {
+        let mut cfg = config_of(vec![Project::new("/src/repo".into())]);
+        let id = cfg.projects[0].id.clone();
+        let found = [
+            primary_listed("/src/repo"),
+            listed("/src/repo.worktrees/feat-x", Some("feat/x")),
+            listed("/elsewhere/spike", None),
+        ];
+
+        let sync = cfg.sync_worktrees(&id, &found, &no_disk_facts());
+        assert_eq!(sync, WorktreeSync { added: 2, dropped: 0 });
+        let wts = &cfg.projects[0].worktrees;
+        assert_eq!(wts.len(), 3, "primary + two adopted");
+        assert_eq!(wts[1].path, "/src/repo.worktrees/feat-x");
+        assert_eq!(wts[1].branch.as_deref(), Some("feat/x"));
+        assert!(!wts[1].is_primary);
+        // Detached HEAD carries no branch; the git-status poll labels it.
+        assert_eq!(wts[2].path, "/elsewhere/spike");
+        assert_eq!(wts[2].branch, None);
+        assert_ne!(wts[1].id, wts[2].id, "each row gets its own id");
+        assert!(wts[1..].iter().all(|wt| wt.id != "primary"));
+
+        // Idempotent: the same listing again changes nothing.
+        let again = cfg.sync_worktrees(&id, &found, &no_disk_facts());
+        assert!(!again.changed());
+        assert_eq!(cfg.projects[0].worktrees.len(), 3);
+    }
+
+    #[test]
+    fn sync_worktrees_matches_tracked_paths_across_spellings() {
+        // The New-worktree dialog stores the typed (backslash) path;
+        // git lists the same folder with forward slashes and, here, a
+        // trailing separator. Same folder, so no second row.
+        let mut project = Project::new("C:\\src\\repo".into());
+        project.worktrees.push(row("wt-1", "C:\\src\\repo.worktrees\\feat-x"));
+        let mut cfg = config_of(vec![project]);
+        let id = cfg.projects[0].id.clone();
+        let found = [
+            primary_listed("C:/src/repo"),
+            listed("C:/src/repo.worktrees/feat-x/", Some("feat/x")),
+        ];
+
+        assert!(!cfg.sync_worktrees(&id, &found, &no_disk_facts()).changed());
+        assert_eq!(cfg.projects[0].worktrees.len(), 2);
+    }
+
+    #[test]
+    fn sync_worktrees_matches_a_symlinked_row_by_its_real_path() {
+        // The row was created through a symlinked folder; git resolves
+        // symlinks and lists the real path. The scan's resolved path
+        // ties the two together, so no duplicate row.
+        let mut project = Project::new("/link/repo".into());
+        project.worktrees.push(row("wt-1", "/link/repo.worktrees/x"));
+        let mut cfg = config_of(vec![project]);
+        let id = cfg.projects[0].id.clone();
+        let on_disk = HashMap::from([
+            ("/link/repo".to_string(), PathOnDisk {
+                real: Some("/real/repo".into()),
+                missing: false,
+            }),
+            ("/link/repo.worktrees/x".to_string(), PathOnDisk {
+                real: Some("/real/repo.worktrees/x".into()),
+                missing: false,
+            }),
+        ]);
+        let found = [primary_listed("/real/repo"), listed("/real/repo.worktrees/x", Some("x"))];
+
+        assert!(!cfg.sync_worktrees(&id, &found, &on_disk).changed());
+        assert_eq!(cfg.projects[0].worktrees.len(), 2);
+    }
+
+    #[test]
+    fn sync_worktrees_does_not_adopt_a_project_that_is_itself_a_worktree() {
+        // The project is one of the repo's linked worktrees, added
+        // through a symlinked path. Git lists it under its real path
+        // as a non-primary entry; it must not come back as a second
+        // row of its own project.
+        let mut cfg = config_of(vec![Project::new("/link/repo.worktrees/feat".into())]);
+        let id = cfg.projects[0].id.clone();
+        let on_disk = HashMap::from([(
+            "/link/repo.worktrees/feat".to_string(),
+            PathOnDisk { real: Some("/real/repo.worktrees/feat".into()), missing: false },
+        )]);
+        let found = [
+            primary_listed("/real/repo"),
+            listed("/real/repo.worktrees/feat", Some("feat")),
+            listed("/real/repo.worktrees/other", Some("other")),
+        ];
+
+        assert_eq!(cfg.sync_worktrees(&id, &found, &on_disk).added, 1);
+        let paths: Vec<&str> =
+            cfg.projects[0].worktrees.iter().map(|wt| wt.path.as_str()).collect();
+        assert_eq!(paths, ["/link/repo.worktrees/feat", "/real/repo.worktrees/other"]);
+    }
+
+    #[test]
+    fn stored_paths_lists_every_root_and_worktree_once() {
+        let mut repo = Project::new("/src/repo".into());
+        repo.worktrees.push(row("wt-1", "/src/repo.worktrees/a"));
+        let shell = Project::new_remote_shell("box".into(), "ssh box".into(), None);
+        let cfg = config_of(vec![repo, shell]);
+        let mut paths: Vec<String> = cfg.stored_paths().into_iter().collect();
+        paths.sort();
+        assert_eq!(paths, ["/src/repo", "/src/repo.worktrees/a"]);
+    }
+
+    #[test]
+    fn sync_worktrees_skips_prunable_and_repeated_entries() {
+        let mut cfg = config_of(vec![Project::new("/src/repo".into())]);
+        let id = cfg.projects[0].id.clone();
+        let found = [
+            primary_listed("/src/repo"),
+            // Folder deleted by hand, never `git worktree prune`d:
+            // adopting it would add a row that can't open.
+            WorktreeInfo { prunable: true, ..listed("/src/repo.worktrees/gone", Some("gone")) },
+            listed("/src/repo.worktrees/twice", Some("twice")),
+            listed("/src/repo.worktrees/twice/", Some("twice")),
+        ];
+
+        assert_eq!(cfg.sync_worktrees(&id, &found, &no_disk_facts()).added, 1);
+        let paths: Vec<&str> =
+            cfg.projects[0].worktrees.iter().map(|wt| wt.path.as_str()).collect();
+        assert_eq!(paths, ["/src/repo", "/src/repo.worktrees/twice"]);
+    }
+
+    #[test]
+    fn sync_worktrees_leaves_paths_another_project_tracks() {
+        // The user added one of the repo's worktrees as a project of
+        // its own, and another project already tracks a second one.
+        // Neither may reappear under the repo project.
+        let repo = Project::new("/src/repo".into());
+        let own = Project::new("/src/repo.worktrees/own".into());
+        let mut other = Project::new("/src/other".into());
+        other.worktrees.push(row("wt-o", "/src/repo.worktrees/claimed"));
+        let mut cfg = config_of(vec![repo, own, other]);
+        let id = cfg.projects[0].id.clone();
+        let found = [
+            primary_listed("/src/repo"),
+            listed("/src/repo.worktrees/own", Some("own")),
+            listed("/src/repo.worktrees/claimed", Some("claimed")),
+            listed("/src/repo.worktrees/new", Some("new")),
+        ];
+
+        assert_eq!(cfg.sync_worktrees(&id, &found, &no_disk_facts()).added, 1);
+        let wts = &cfg.projects[0].worktrees;
+        assert_eq!(wts.len(), 2);
+        assert_eq!(wts[1].path, "/src/repo.worktrees/new");
+    }
+
+    #[test]
+    fn sync_worktrees_drops_only_rows_git_forgot_whose_folder_is_gone() {
+        let mut project = Project::new("/src/repo".into());
+        for (id, path) in [
+            ("removed", "/src/repo.worktrees/removed"),
+            ("unlisted-but-present", "/src/repo.worktrees/present"),
+            ("prunable", "/src/repo.worktrees/prunable"),
+            ("unprobed", "/src/repo.worktrees/unprobed"),
+        ] {
+            project.worktrees.push(row(id, path));
+        }
+        let mut cfg = config_of(vec![project]);
+        let id = cfg.projects[0].id.clone();
+        let found = [
+            primary_listed("/src/repo"),
+            WorktreeInfo { prunable: true, ..listed("/src/repo.worktrees/prunable", None) },
+        ];
+        let on_disk = HashMap::from([
+            // Primary gone and unlisted by spelling: still never dropped.
+            ("/src/repo".to_string(), gone()),
+            // `git worktree remove` ran outside the app.
+            ("/src/repo.worktrees/removed".to_string(), gone()),
+            // Git doesn't know it, but the folder is still there.
+            ("/src/repo.worktrees/present".to_string(), PathOnDisk::default()),
+            // Folder gone, git still lists it (unplugged drive?).
+            ("/src/repo.worktrees/prunable".to_string(), gone()),
+            // "unprobed": created after the scan, no facts → present.
+        ]);
+
+        let sync = cfg.sync_worktrees(&id, &found, &on_disk);
+        assert_eq!(sync, WorktreeSync { added: 0, dropped: 1 });
+        let ids: Vec<&str> = cfg.projects[0].worktrees.iter().map(|wt| wt.id.as_str()).collect();
+        assert_eq!(ids, ["primary", "unlisted-but-present", "prunable", "unprobed"]);
+    }
+
+    #[test]
+    fn sync_worktrees_ignores_unknown_ids_and_remote_shells() {
+        let mut cfg = config_of(vec![Project::new_remote_shell(
+            "dev box".into(),
+            "ssh dev".into(),
+            None,
+        )]);
+        let id = cfg.projects[0].id.clone();
+        let found = [listed("/src/repo.worktrees/feat-x", Some("feat/x"))];
+
+        assert!(!cfg.sync_worktrees("no-such-project", &found, &no_disk_facts()).changed());
+        assert!(!cfg.sync_worktrees(&id, &found, &no_disk_facts()).changed());
+        assert!(cfg.projects[0].worktrees.is_empty());
+    }
+
+    #[test]
+    fn worktree_is_listed_includes_prunable_and_real_paths() {
+        let found = [
+            primary_listed("/real/repo"),
+            WorktreeInfo { prunable: true, ..listed("/real/repo.worktrees/gone", None) },
+        ];
+        assert!(worktree_is_listed(&found, "/real/repo.worktrees/gone/", None));
+        assert!(!worktree_is_listed(&found, "/link/repo.worktrees/gone", None));
+        let resolved =
+            PathOnDisk { real: Some("/real/repo.worktrees/gone".into()), missing: false };
+        assert!(worktree_is_listed(&found, "/link/repo.worktrees/gone", Some(&resolved)));
+        assert!(!worktree_is_listed(&found, "/real/repo.worktrees/other", None));
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_yields_the_path_git_prints() {
+        assert_eq!(strip_verbatim_prefix(r"\\?\C:\src\repo"), r"C:\src\repo");
+        assert_eq!(strip_verbatim_prefix(r"\\?\UNC\host\share\repo"), r"\\host\share\repo");
+        assert_eq!(strip_verbatim_prefix("/home/me/repo"), "/home/me/repo");
+        assert_eq!(strip_verbatim_prefix(r"C:\src\repo"), r"C:\src\repo");
+    }
+
+    #[test]
+    fn path_on_disk_probe_resolves_and_detects_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let mut project = Project::new(dir.path().to_string_lossy().to_string());
-        let before = project.worktrees.len();
-        project.adopt_existing_worktrees();
-        assert_eq!(project.worktrees.len(), before, "no change on non-git path");
+        let here = dir.path().to_string_lossy().to_string();
+        let probe = PathOnDisk::probe(&here);
+        assert!(!probe.missing);
+        let real = probe.real.expect("an existing folder resolves");
+        assert_eq!(
+            normalise_project_path(&real),
+            normalise_project_path(&strip_verbatim_prefix(
+                &std::fs::canonicalize(dir.path()).unwrap().to_string_lossy()
+            ))
+        );
+
+        // A missing folder still resolves through its parent.
+        let absent = dir.path().join("absent").to_string_lossy().to_string();
+        let expected = std::path::Path::new(&real).join("absent");
+        assert_eq!(
+            PathOnDisk::probe(&absent),
+            PathOnDisk { real: Some(expected.to_string_lossy().into()), missing: true }
+        );
+    }
+
+    /// Probe every stored path the way the sidebar's scan does.
+    fn probe_all(cfg: &ProjectsConfig) -> HashMap<String, PathOnDisk> {
+        cfg.projects
+            .iter()
+            .flat_map(|p| {
+                std::iter::once(p.path.clone()).chain(p.worktrees.iter().map(|wt| wt.path.clone()))
+            })
+            .map(|path| {
+                let disk = PathOnDisk::probe(&path);
+                (path, disk)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sync_worktrees_follows_worktrees_made_and_removed_outside_the_app() {
+        // End to end against real git: the project exists first, then
+        // worktrees are created and removed outside CodeScope.
+        let Some((_guard, repo)) = init_repo_with_commit() else {
+            return;
+        };
+        let mut cfg = config_of(vec![Project::new(repo.to_string_lossy().to_string())]);
+        let id = cfg.projects[0].id.clone();
+        let list = || crate::git::list_worktrees(&repo).expect("git worktree list");
+        let sync = |cfg: &mut ProjectsConfig| {
+            let on_disk = probe_all(cfg);
+            cfg.sync_worktrees(&id, &list(), &on_disk)
+        };
+        assert!(!sync(&mut cfg).changed(), "nothing to adopt yet");
+
+        let root = repo.parent().unwrap().join("repo.worktrees");
+        crate::git::add_worktree(&repo, &root.join("outside"), "outside", None)
+            .expect("git worktree add succeeds");
+        assert_eq!(sync(&mut cfg), WorktreeSync { added: 1, dropped: 0 });
+        let adopted = &cfg.projects[0].worktrees[1];
+        assert!(adopted.path.ends_with("outside"), "path: {}", adopted.path);
+        assert_eq!(adopted.branch.as_deref(), Some("outside"));
+
+        // Folder deleted by hand without a prune: git calls it
+        // prunable, so it is neither adopted nor, once adopted, dropped.
+        crate::git::add_worktree(&repo, &root.join("by-hand"), "by-hand", None)
+            .expect("git worktree add succeeds");
+        std::fs::remove_dir_all(root.join("by-hand")).expect("delete worktree folder");
+        assert!(list().iter().any(|wt| wt.prunable), "git lists it as prunable");
+        assert!(!sync(&mut cfg).changed(), "prunable worktree stays out");
+
+        crate::git::remove_worktree(&repo, &root.join("outside"), false)
+            .expect("git worktree remove succeeds");
+        assert_eq!(sync(&mut cfg), WorktreeSync { added: 0, dropped: 1 });
+        assert_eq!(cfg.projects[0].worktrees.len(), 1, "back to the primary row");
+    }
+
+    #[test]
+    fn worktree_is_listed_tells_a_forgotten_worktree_from_a_refused_one() {
+        // What the in-app delete leans on when `git worktree remove`
+        // fails: a dirty worktree is refused but still listed (the
+        // force retry applies), one removed outside the app is gone
+        // from the list (only the row is left to drop).
+        let Some((_guard, repo)) = init_repo_with_commit() else {
+            return;
+        };
+        let root = repo.parent().unwrap().join("repo.worktrees");
+        let listed_now = |path: &std::path::Path| {
+            let listed = crate::git::list_worktrees(&repo).expect("git worktree list");
+            let path = path.to_string_lossy();
+            worktree_is_listed(&listed, &path, Some(&PathOnDisk::probe(&path)))
+        };
+
+        let dirty = root.join("dirty");
+        crate::git::add_worktree(&repo, &dirty, "dirty", None).expect("git worktree add");
+        std::fs::write(dirty.join("scratch.txt"), "wip").expect("write untracked file");
+        assert!(crate::git::remove_worktree(&repo, &dirty, false).is_err(), "dirty is refused");
+        assert!(listed_now(&dirty), "refused worktree is still listed");
+
+        let outside = root.join("outside");
+        crate::git::add_worktree(&repo, &outside, "outside", None).expect("git worktree add");
+        crate::git::remove_worktree(&repo, &outside, false).expect("removed outside the app");
+        assert!(crate::git::remove_worktree(&repo, &outside, true).is_err(), "even --force");
+        assert!(!listed_now(&outside), "git has forgotten it");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_resolves_a_missing_folder_through_its_existing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let gone = link.join("repo.worktrees").join("x");
+        let probe = PathOnDisk::probe(&gone.to_string_lossy());
+        assert!(probe.missing);
+        let expected = std::fs::canonicalize(&real).unwrap().join("repo.worktrees").join("x");
+        assert_eq!(probe.real.as_deref(), Some(expected.to_string_lossy().as_ref()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_worktrees_keeps_a_symlinked_worktree_deleted_by_hand() {
+        // Stored through a symlinked parent, folder then deleted by
+        // hand without a prune. Git still lists it (prunable) under
+        // its real path; that must count as listed, so the row stays
+        // and the in-app delete doesn't take it for forgotten.
+        let Some((guard, repo)) = init_repo_with_commit() else {
+            return;
+        };
+        let link = guard.path().join("link");
+        std::os::unix::fs::symlink(guard.path(), &link).expect("symlink");
+        let linked_repo = link.join("repo");
+        let linked_wt = link.join("repo.worktrees").join("by-hand");
+        crate::git::add_worktree(&linked_repo, &linked_wt, "by-hand", None)
+            .expect("git worktree add succeeds");
+        let stored = linked_wt.to_string_lossy().to_string();
+        let mut project = Project::new(linked_repo.to_string_lossy().to_string());
+        project.worktrees.push(row("dialog", &stored));
+        let mut cfg = config_of(vec![project]);
+        let id = cfg.projects[0].id.clone();
+
+        std::fs::remove_dir_all(&linked_wt).expect("delete worktree folder");
+        let found = crate::git::list_worktrees(&repo).expect("git worktree list");
+        assert!(found.iter().any(|wt| wt.prunable), "git lists it as prunable");
+
+        let on_disk = probe_all(&cfg);
+        assert!(on_disk[&stored].missing);
+        assert!(worktree_is_listed(&found, &stored, on_disk.get(&stored)));
+        assert!(!cfg.sync_worktrees(&id, &found, &on_disk).changed());
+        assert_eq!(cfg.projects[0].worktrees.len(), 2, "row stays");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_worktrees_does_not_duplicate_a_worktree_made_through_a_symlink() {
+        let Some((guard, repo)) = init_repo_with_commit() else {
+            return;
+        };
+        // Reach the repo through a symlinked parent, the way the
+        // project and the New-worktree dialog would store it.
+        let link = guard.path().join("link");
+        std::os::unix::fs::symlink(guard.path(), &link).expect("symlink");
+        let linked_repo = link.join("repo");
+        let linked_wt = link.join("repo.worktrees").join("via-link");
+        crate::git::add_worktree(&linked_repo, &linked_wt, "via-link", None)
+            .expect("git worktree add succeeds");
+        let mut project = Project::new(linked_repo.to_string_lossy().to_string());
+        project.worktrees.push(row("dialog", &linked_wt.to_string_lossy()));
+        let mut cfg = config_of(vec![project]);
+        let id = cfg.projects[0].id.clone();
+        let found = crate::git::list_worktrees(&repo).expect("git worktree list");
+        assert!(
+            !found.iter().any(|wt| wt.path.contains("/link/")),
+            "git lists symlink-free paths: {found:?}"
+        );
+
+        let on_disk = probe_all(&cfg);
+        assert!(!cfg.sync_worktrees(&id, &found, &on_disk).changed());
+        assert_eq!(cfg.projects[0].worktrees.len(), 2);
     }
 
     #[test]
@@ -911,12 +1459,6 @@ mod tests {
         assert!(cfg.projects[0].is_remote_shell());
     }
 
-    #[test]
-    fn adopt_existing_worktrees_is_a_no_op_for_remote_shell() {
-        let mut p = Project::new_remote_shell("box".into(), "ssh box".into(), None);
-        p.adopt_existing_worktrees();
-        assert!(p.worktrees.is_empty());
-    }
 
     #[test]
     fn remote_shell_project_round_trips_with_camelcase_kind() {

@@ -63,6 +63,11 @@ pub struct WorktreeInfo {
     /// can't be removed without `--force` and we surface the flag
     /// so the UI can warn before destructive ops.
     pub locked: bool,
+    /// `true` when git would prune this worktree — typically its
+    /// folder was deleted by hand without `git worktree prune`, so
+    /// the admin entry outlives the checkout. Auto-adoption skips
+    /// these: there is nothing on disk to open.
+    pub prunable: bool,
 }
 
 /// `git worktree list --porcelain` for `repo`. The repo is *any*
@@ -644,6 +649,7 @@ pub(crate) fn run_git(cwd: &Path, args: &[&str]) -> Result<Output> {
 /// HEAD <sha>
 /// branch refs/heads/<name>   ← OR `bare` OR `detached`
 /// [locked [reason]]
+/// [prunable [reason]]
 ///
 /// worktree /path/to/wt2
 /// ...
@@ -657,11 +663,13 @@ pub fn parse_worktree_porcelain(stdout: &str) -> Vec<WorktreeInfo> {
     let mut head: Option<String> = None;
     let mut branch: Option<String> = None;
     let mut locked = false;
+    let mut prunable = false;
 
     let flush = |path: &mut Option<String>,
                      head: &mut Option<String>,
                      branch: &mut Option<String>,
                      locked: &mut bool,
+                     prunable: &mut bool,
                      out: &mut Vec<WorktreeInfo>| {
         if let (Some(p), Some(h)) = (path.take(), head.take()) {
             let is_primary = out.is_empty();
@@ -671,6 +679,7 @@ pub fn parse_worktree_porcelain(stdout: &str) -> Vec<WorktreeInfo> {
                 branch: branch.take(),
                 is_primary,
                 locked: std::mem::replace(locked, false),
+                prunable: std::mem::replace(prunable, false),
             });
         } else {
             // Reset if we hit a malformed stanza.
@@ -678,13 +687,14 @@ pub fn parse_worktree_porcelain(stdout: &str) -> Vec<WorktreeInfo> {
             head.take();
             branch.take();
             *locked = false;
+            *prunable = false;
         }
     };
 
     for raw in stdout.lines() {
         let line = raw.trim_end_matches('\r');
         if line.is_empty() {
-            flush(&mut path, &mut head, &mut branch, &mut locked, &mut out);
+            flush(&mut path, &mut head, &mut branch, &mut locked, &mut prunable, &mut out);
             continue;
         }
         if let Some(rest) = line.strip_prefix("worktree ") {
@@ -697,13 +707,15 @@ pub fn parse_worktree_porcelain(stdout: &str) -> Vec<WorktreeInfo> {
             // No branch — leave `branch` as None.
         } else if line == "locked" || line.starts_with("locked ") {
             locked = true;
+        } else if line == "prunable" || line.starts_with("prunable ") {
+            prunable = true;
         }
         // Unknown lines are ignored — porcelain v1 is documented to
         // be append-only, so a future field can show up here without
         // breaking us.
     }
     // Trailing stanza without a blank line.
-    flush(&mut path, &mut head, &mut branch, &mut locked, &mut out);
+    flush(&mut path, &mut head, &mut branch, &mut locked, &mut prunable, &mut out);
     out
 }
 
@@ -746,6 +758,34 @@ detached\n";
     #[test]
     fn empty_input_yields_no_rows() {
         assert!(parse_worktree_porcelain("").is_empty());
+    }
+
+    #[test]
+    fn prunable_is_parsed_with_or_without_a_reason() {
+        let stdout = "worktree /repo\n\
+HEAD abc\n\
+branch refs/heads/main\n\
+\n\
+worktree /repo.worktrees/gone\n\
+HEAD def\n\
+branch refs/heads/gone\n\
+prunable gitdir file points to non-existent location\n\
+\n\
+worktree /repo.worktrees/bare-flag\n\
+HEAD 123\n\
+detached\n\
+prunable\n\
+\n\
+worktree /repo.worktrees/live\n\
+HEAD 456\n\
+branch refs/heads/live\n";
+        let wts = parse_worktree_porcelain(stdout);
+        assert_eq!(wts.len(), 4);
+        assert!(!wts[0].prunable);
+        assert!(wts[1].prunable);
+        assert!(wts[2].prunable);
+        // The flag resets per stanza, like `locked`.
+        assert!(!wts[3].prunable);
     }
 
     #[test]
