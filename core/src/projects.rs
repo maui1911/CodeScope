@@ -604,8 +604,11 @@ impl WorktreeSync {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PathOnDisk {
     /// The path with symlinks, junctions and `subst` drives resolved,
-    /// which is how `git worktree list` spells it. `None` when it
-    /// couldn't be resolved (folder gone, no permission).
+    /// which is how `git worktree list` spells it. For a folder that
+    /// is gone, this is its nearest existing ancestor resolved, with
+    /// the rest appended. That way a checkout deleted from under a
+    /// symlinked parent still matches the prunable entry git keeps for
+    /// it. `None` when not even an ancestor resolves.
     pub real: Option<String>,
     /// `true` only when the folder is confirmed gone. A path the probe
     /// couldn't check (permissions, I/O error) counts as present, so a
@@ -617,11 +620,24 @@ impl PathOnDisk {
     pub fn probe(path: &str) -> Self {
         let path = Path::new(path);
         Self {
-            real: std::fs::canonicalize(path)
-                .ok()
-                .map(|real| strip_verbatim_prefix(&real.to_string_lossy())),
+            real: resolve_real(path).map(|real| strip_verbatim_prefix(&real.to_string_lossy())),
             missing: matches!(path.try_exists(), Ok(false)),
         }
+    }
+}
+
+/// `path` with links resolved, like `realpath -m`: when `path` itself
+/// doesn't resolve, resolve its nearest ancestor that does and append
+/// the remaining components unchanged.
+fn resolve_real(path: &Path) -> Option<std::path::PathBuf> {
+    let mut rest = Vec::new();
+    let mut cursor = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(cursor) {
+            return Some(rest.iter().rev().fold(real, |acc, name| acc.join(name)));
+        }
+        rest.push(cursor.file_name()?);
+        cursor = cursor.parent()?;
     }
 }
 
@@ -985,8 +1001,14 @@ mod tests {
             ))
         );
 
+        // A missing folder still resolves through its parent.
         let absent = dir.path().join("absent").to_string_lossy().to_string();
-        assert_eq!(PathOnDisk::probe(&absent), PathOnDisk { real: None, missing: true });
+        let expected = std::path::Path::new(&real).join("absent");
+        assert_eq!(
+            PathOnDisk::probe(&absent),
+            PathOnDisk { real: Some(expected.to_string_lossy().into()), missing: true }
+        );
+
     }
 
     /// Probe every stored path the way the sidebar's scan does.
@@ -1068,6 +1090,55 @@ mod tests {
         crate::git::remove_worktree(&repo, &outside, false).expect("removed outside the app");
         assert!(crate::git::remove_worktree(&repo, &outside, true).is_err(), "even --force");
         assert!(!listed_now(&outside), "git has forgotten it");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_resolves_a_missing_folder_through_its_existing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let gone = link.join("repo.worktrees").join("x");
+        let probe = PathOnDisk::probe(&gone.to_string_lossy());
+        assert!(probe.missing);
+        let expected = std::fs::canonicalize(&real).unwrap().join("repo.worktrees").join("x");
+        assert_eq!(probe.real.as_deref(), Some(expected.to_string_lossy().as_ref()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_worktrees_keeps_a_symlinked_worktree_deleted_by_hand() {
+        // Stored through a symlinked parent, folder then deleted by
+        // hand without a prune. Git still lists it (prunable) under
+        // its real path; that must count as listed, so the row stays
+        // and the in-app delete doesn't take it for forgotten.
+        let Some((guard, repo)) = init_repo_with_commit() else {
+            return;
+        };
+        let link = guard.path().join("link");
+        std::os::unix::fs::symlink(guard.path(), &link).expect("symlink");
+        let linked_repo = link.join("repo");
+        let linked_wt = link.join("repo.worktrees").join("by-hand");
+        crate::git::add_worktree(&linked_repo, &linked_wt, "by-hand", None)
+            .expect("git worktree add succeeds");
+        let stored = linked_wt.to_string_lossy().to_string();
+        let mut project = Project::new(linked_repo.to_string_lossy().to_string());
+        project.worktrees.push(row("dialog", &stored));
+        let mut cfg = config_of(vec![project]);
+        let id = cfg.projects[0].id.clone();
+
+        std::fs::remove_dir_all(&linked_wt).expect("delete worktree folder");
+        let found = crate::git::list_worktrees(&repo).expect("git worktree list");
+        assert!(found.iter().any(|wt| wt.prunable), "git lists it as prunable");
+
+        let on_disk = probe_all(&cfg);
+        assert!(on_disk[&stored].missing);
+        assert!(worktree_is_listed(&found, &stored, on_disk.get(&stored)));
+        assert!(!cfg.sync_worktrees(&id, &found, &on_disk).changed());
+        assert_eq!(cfg.projects[0].worktrees.len(), 2, "row stays");
     }
 
     #[cfg(unix)]
