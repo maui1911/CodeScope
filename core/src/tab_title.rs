@@ -71,6 +71,28 @@ pub fn rebuild_title(current_title: &str, new_branch: &str) -> Option<String> {
     Some(out)
 }
 
+/// Title for a tab restored at startup: `"{project} · {label}"`, the
+/// same shape a sidebar worktree click produces.
+///
+/// `label` is the persisted branch when there is one, else the
+/// worktree's folder leaf (else the whole path). The primary checkout
+/// persists `branch: None`, so the fallback is common — and it has to
+/// keep the project name in front: titling it after the agent made
+/// every project's primary checkout come back as `"Claude Code · …"`,
+/// and after the git poll swapped in the branch, several identical
+/// `"Claude Code · main"` tabs. The fallback keeps the two-segment
+/// shape so [`rebuild_title`] swaps the real branch in once the poll
+/// reports it.
+pub fn restored_title(project: &str, branch: Option<&str>, worktree_path: &str) -> String {
+    let label = branch.filter(|b| !b.is_empty()).map(str::to_owned).unwrap_or_else(|| {
+        std::path::Path::new(worktree_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| worktree_path.to_owned())
+    });
+    format!("{project}{TAB_TITLE_SEPARATOR}{label}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +152,38 @@ mod tests {
             rebuild_title("acme · main", "release/1.2").as_deref(),
             Some("acme · release/1.2"),
         );
+    }
+
+    #[test]
+    fn restored_title_leads_with_project_and_branch() {
+        assert_eq!(restored_title("acme", Some("feature/x"), "/dev/acme-x"), "acme · feature/x");
+    }
+
+    #[test]
+    fn restored_title_without_branch_falls_back_to_folder_leaf() {
+        // A primary checkout persists `branch: None`. The project name
+        // still leads — never the agent name — so two projects that
+        // both sit on `main` stay tellable apart.
+        assert_eq!(restored_title("acme", None, "/dev/acme-checkout"), "acme · acme-checkout");
+    }
+
+    #[test]
+    fn restored_title_treats_empty_branch_as_unknown() {
+        assert_eq!(restored_title("acme", Some(""), "/dev/acme"), "acme · acme");
+    }
+
+    #[test]
+    fn restored_title_without_leaf_uses_whole_path() {
+        assert_eq!(restored_title("acme", None, "/"), "acme · /");
+    }
+
+    #[test]
+    fn restored_fallback_title_is_one_the_branch_poll_can_fix() {
+        // The folder-leaf fallback only holds until the git poll
+        // reports the branch; `rebuild_title` must then produce the
+        // same title a sidebar click would.
+        let restored = restored_title("acme", None, "/dev/acme");
+        assert_eq!(rebuild_title(&restored, "main").as_deref(), Some("acme · main"));
     }
 
     #[test]

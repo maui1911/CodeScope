@@ -72,7 +72,7 @@ pub use session::{
 };
 pub use settings::{CursorSettings, CursorShape, DEFAULT_AGENT_ID, FontSettings, Settings};
 pub use tab_drag::{TabRect, compute_drop_index};
-pub use tab_title::{TAB_TITLE_SEPARATOR, rebuild_title};
+pub use tab_title::{TAB_TITLE_SEPARATOR, rebuild_title, restored_title};
 pub use telemetry::{
     SessionState, TelemetrySnapshot, context_window_for_model, format_context_pct, format_tokens,
 };
