@@ -2672,32 +2672,18 @@ impl AppShell {
                 })
                 .map(SharedString::from);
 
-            // Title mirrors C# `MainViewModel.HydrateFromLoaded`
-            // (`legacy:CodeScope.Ui/ViewModels/MainViewModel.cs:1126-1133`):
-            // when the worktree has a branch we override the
-            // descriptor title with `{project} · {branch}`, otherwise
-            // we fall back to the descriptor's own title — which
-            // `CreateAgentSession` builds as `{agent.DisplayName} ·
-            // {folderName}` and `CreateShellSession` builds as just
-            // `Path.GetFileName(workingDirectory)`. `displayNameOverride`
-            // is explicitly `null` at hydrate time in C#, so the
-            // user-set `Session.DisplayName` does NOT participate in
-            // the tab title here — it only flows into the sidebar
-            // row title (a separate projection). Mirroring that
-            // exactly avoids the asymmetry where a renamed session
-            // with a branch would lose its rename on restart while
-            // the same rename without a branch would survive.
-            let folder_name = std::path::Path::new(&entry.worktree_path)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| entry.worktree_path.clone());
-            let title: SharedString = if let Some(branch) = entry.branch.as_deref() {
-                SharedString::from(format!("{} · {}", entry.project_name, branch))
-            } else if let Some(profile) = agent_profile {
-                SharedString::from(format!("{} · {}", profile.display_name, folder_name))
-            } else {
-                SharedString::from(folder_name)
-            };
+            // Always `{project} · {branch}`, falling back to the folder
+            // leaf when no branch is persisted (the primary checkout
+            // never has one) — see `restored_title` for why the
+            // project name has to lead. The user-set
+            // `Session.display_name` does NOT participate here; it
+            // only flows into the sidebar row title (a separate
+            // projection), matching C# `MainViewModel.HydrateFromLoaded`.
+            let title = SharedString::from(codescope_core::restored_title(
+                &entry.project_name,
+                entry.branch.as_deref(),
+                &entry.worktree_path,
+            ));
 
             self.spawn_tab_in(
                 Some(path),
