@@ -141,6 +141,17 @@ struct Entry {
     /// No model turn follows, so nothing else would unlatch the `Busy`
     /// its invocation entry set (issue #343).
     local_command_answer: bool,
+    /// True when this is the summary a compacted conversation continues
+    /// from: a `user` entry carrying `isCompactSummary: true`. Nobody
+    /// prompted it — Claude Code also writes one when it auto-compacts a
+    /// session that sits idle — so it says nothing about whether the
+    /// agent is working, and its text recaps old turns (agent launches
+    /// and task notifications included) rather than reporting new ones.
+    compact_summary: bool,
+    /// True when the entry's `type` is one Claude Code writes for its own
+    /// bookkeeping (titles, modes, ledgers, …) — on its own schedule and
+    /// without any turn running. See [`is_bookkeeping_type`].
+    bookkeeping: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -167,11 +178,15 @@ fn parse_line(line: &str) -> Option<Entry> {
     };
     let obj = v.as_object()?;
 
-    let kind = match obj.get("type").and_then(Value::as_str) {
+    let entry_type = obj.get("type").and_then(Value::as_str);
+    let kind = match entry_type {
         Some("user") => EntryKind::User,
         Some("assistant") => EntryKind::Assistant,
         _ => EntryKind::Other,
     };
+    let compact_summary = kind == EntryKind::User
+        && obj.get("isCompactSummary").and_then(Value::as_bool) == Some(true);
+    let bookkeeping = entry_type.is_some_and(is_bookkeeping_type);
 
     // Client-side slash command answers. See the field doc on
     // `Entry::local_command_answer`. A `user` entry carries the
@@ -289,7 +304,34 @@ fn parse_line(line: &str) -> Option<Entry> {
         user_carries_tool_result,
         awaiting_user_input,
         local_command_answer,
+        compact_summary,
+        bookkeeping,
     })
+}
+
+/// True for the entry types Claude Code appends for its own bookkeeping.
+/// They arrive on its own schedule — `last-prompt`, `ai-title` and `mode`
+/// land minutes after a turn ended or a session was compacted — so they
+/// are no evidence that a turn is running.
+///
+/// Deliberately a list of known names: a type not on it (a future shape
+/// included) still counts as the transcript moving, so an unrecognised
+/// write keeps re-arming a timed-out `Busy` (issue #351).
+fn is_bookkeeping_type(entry_type: &str) -> bool {
+    matches!(
+        entry_type,
+        "last-prompt"
+            | "ai-title"
+            | "mode"
+            | "permission-mode"
+            | "atis-latch"
+            | "agent-name"
+            | "cost-state"
+            | "artifact-comment-monitor"
+            | "file-history-snapshot"
+            | "queue-operation"
+            | "attachment"
+    ) || (entry_type.starts_with("artifact-") && entry_type.ends_with("-ledger"))
 }
 
 /// True when `content` *is* a `<local-command-stdout>` envelope, not
@@ -363,11 +405,24 @@ fn tagged_value(hay: &str, prefix: &str, accept: impl Fn(char) -> bool) -> Optio
 // Incremental reader
 // ---------------------------------------------------------------------------
 
+/// What one [`process_new_lines`] call saw.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReadOutcome {
+    /// At least one parseable entry was found and the snapshot was
+    /// mutated.
+    pub changed: bool,
+    /// At least one line read was something other than Claude Code's own
+    /// bookkeeping (`is_bookkeeping_type`) — the transcript moved in a
+    /// way that may mean a turn is running. Lines that fail to parse
+    /// count, so an unrecognised write is never mistaken for silence.
+    pub activity: bool,
+}
+
 /// Process new bytes appended to a JSONL file, updating `snapshot`
 /// in place.
 ///
-/// Returns `true` when at least one parseable entry was found and the
-/// snapshot was mutated.
+/// Returns whether the snapshot was mutated and whether any of the lines
+/// read was activity rather than bookkeeping (see [`ReadOutcome`]).
 ///
 /// `tail` tracks the read position across calls so re-reads are
 /// cheap — only newly-appended bytes are processed. If the file
@@ -387,21 +442,21 @@ pub fn process_new_lines(
     snapshot: &mut Option<TelemetrySnapshot>,
     last_user_ts: &mut Option<f64>,
     pending_agents: &mut HashSet<String>,
-) -> bool {
+) -> ReadOutcome {
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
-        Err(_) => return false,
+        Err(_) => return ReadOutcome::default(),
     };
     let file_len = meta.len();
     if file_len == tail.last_pos {
-        return false;
+        return ReadOutcome::default();
     }
 
     let mut f = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(err) => {
             eprintln!("[claude_telemetry] cannot open {path:?}: {err}");
-            return false;
+            return ReadOutcome::default();
         }
     };
 
@@ -429,7 +484,7 @@ pub fn process_new_lines(
 
     if let Err(err) = f.seek(SeekFrom::Start(tail.last_pos)) {
         eprintln!("[claude_telemetry] seek failed for {path:?}: {err}");
-        return false;
+        return ReadOutcome::default();
     }
 
     let mut reader = BufReader::new(&mut f);
@@ -448,6 +503,7 @@ pub fn process_new_lines(
     });
     let mut model: Option<String> = snapshot.as_ref().and_then(|s| s.model.clone());
     let mut changed = false;
+    let mut activity = false;
 
     let mut line = String::new();
     let mut clean_eof = false;
@@ -471,10 +527,24 @@ pub fn process_new_lines(
         }
         let entry = match parse_line(&line) {
             Some(e) => e,
-            None => continue,
+            None => {
+                activity = true;
+                continue;
+            }
         };
+        if !entry.bookkeeping {
+            activity = true;
+        }
 
         match entry.kind {
+            // A compacted conversation's summary (see the field doc on
+            // `Entry::compact_summary`). Claude Code's idle auto-compact
+            // writes it after the turn ended and nothing follows that
+            // would end a turn again, so reading it as a prompt left the
+            // session `Busy` for good. A `/compact` the user typed is
+            // already `Busy` from its invocation and goes `Idle` on its
+            // local-command answer (issue #343 rule below).
+            _ if entry.compact_summary => {}
             // The CLI answered a client-side slash command by itself
             // (issue #343): no model turn follows, so this is the only
             // entry that will ever release the `Busy` its invocation
@@ -592,7 +662,7 @@ pub fn process_new_lines(
         });
     }
 
-    changed
+    ReadOutcome { changed, activity }
 }
 
 // ---------------------------------------------------------------------------
@@ -686,25 +756,37 @@ impl ClaudeTranscriptTail {
     ///
     /// Any sign the file is being written — bytes read (entries, a
     /// partial line, lines that change nothing) or a moved mtime —
-    /// restarts the window. Once it lapses a `Busy` snapshot becomes
-    /// `Idle`; `PendingToolUse` is exempt (a running tool or a permission
-    /// prompt writes nothing until it resolves), and so is a session with
-    /// background agents pending (they write to their own transcripts).
+    /// restarts the window, with one exception: when every line read is
+    /// Claude Code's own bookkeeping ([`is_bookkeeping_type`]) it does
+    /// not, since those arrive on their own schedule while nothing runs.
+    /// Their mtime bump is discounted with them; an mtime that moves with
+    /// no bytes to read still counts. Once the window lapses a `Busy`
+    /// snapshot becomes `Idle`; `PendingToolUse` is exempt (a running
+    /// tool or a permission prompt writes nothing until it resolves), and
+    /// so is a session with background agents pending (they write to
+    /// their own transcripts).
     pub fn poll_at(&mut self, now: Instant) -> bool {
         let pos_before = self.tail.last_pos;
         let mtime = std::fs::metadata(&self.path)
             .ok()
             .and_then(|m| crate::telemetry::modified_or_none(&m));
-        let changed = process_new_lines(
+        let ReadOutcome { changed, activity } = process_new_lines(
             &self.path,
             &mut self.tail,
             &mut self.snapshot,
             &mut self.last_user_ts,
             &mut self.pending_agents,
         );
-        if self.tail.last_pos != pos_before || mtime != self.observed_mtime {
+        // Bytes were read: the lines decide. None were (a same-length
+        // rewrite, or a read that bailed): the mtime alone does.
+        let moved = if self.tail.last_pos != pos_before {
+            activity
+        } else {
+            mtime != self.observed_mtime
+        };
+        self.observed_mtime = mtime;
+        if moved {
             self.last_activity = now;
-            self.observed_mtime = mtime;
             // Writes the parser does not turn into a snapshot (unknown
             // entry shapes, an mtime-only rewrite) still mean the turn is
             // running. A snapshot the parser did produce already cleared
@@ -812,7 +894,7 @@ mod tests {
         snapshot: &mut Option<TelemetrySnapshot>,
         last_user_ts: &mut Option<f64>,
     ) -> bool {
-        process_new_lines(path, tail, snapshot, last_user_ts, &mut HashSet::new())
+        process_new_lines(path, tail, snapshot, last_user_ts, &mut HashSet::new()).changed
     }
 
     // --- parse_line ---
@@ -1624,9 +1706,11 @@ mod tests {
         let mut tail = ClaudeTranscriptTail::new(path.clone());
         let start = Instant::now();
 
-        // An entry that does not change the state still counts.
+        // An entry that does not change the state still counts (unless it
+        // is known bookkeeping — see
+        // `bookkeeping_writes_do_not_restart_the_quiet_window`).
         let half = start + BUSY_QUIET_TIMEOUT / 2;
-        append_lines(&path, &[r#"{"type":"file-history-snapshot","messageId":"x","snapshot":{}}"#]);
+        append_lines(&path, &[r#"{"type":"system","subtype":"turn_duration","sessionId":"s"}"#]);
         tail.poll_at(half);
 
         tail.poll_at(start + past_timeout());
@@ -1839,6 +1923,231 @@ mod tests {
             TelemetrySnapshot { state: SessionState::Idle, quiet_timeout: true, ..before }
         );
         assert_eq!(tail.last_user_ts, last_user_ts);
+    }
+
+    // --- conversation compaction ---
+    //
+    // Synthetic fixtures with the key layout Claude Code writes around a
+    // compaction; uuids, prose and metadata values are elided with `…`.
+
+    /// `compact_boundary` for Claude Code's idle auto-compact (it compacts a
+    /// session that has sat idle long enough, without a prompt).
+    const COMPACT_BOUNDARY_AUTO: &str = r#"{"parentUuid":null,"logicalParentUuid":"…","isSidechain":false,"type":"system","subtype":"compact_boundary","content":"Conversation compacted","isMeta":false,"timestamp":"2026-08-09T09:00:00.000Z","uuid":"…","level":"info","compactMetadata":{"trigger":"auto"},"sessionId":"s"}"#;
+    /// Same boundary for a `/compact` the user typed.
+    const COMPACT_BOUNDARY_MANUAL: &str = r#"{"parentUuid":null,"logicalParentUuid":"…","isSidechain":false,"type":"system","subtype":"compact_boundary","content":"Conversation compacted","isMeta":false,"timestamp":"2026-08-09T09:00:00.000Z","uuid":"…","level":"info","compactMetadata":{"trigger":"manual"},"sessionId":"s"}"#;
+    /// The summary the compacted conversation continues from. A `user`
+    /// entry by type, but nobody prompted anything.
+    const COMPACT_SUMMARY: &str = r#"{"parentUuid":"…","isSidechain":false,"type":"user","message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context. …"},"isVisibleInTranscriptOnly":true,"isCompactSummary":true,"uuid":"…","timestamp":"2026-08-09T09:00:01.000Z","sessionId":"s"}"#;
+    const COMPACT_ATTACHMENT: &str = r#"{"parentUuid":"…","isSidechain":false,"type":"attachment","attachment":{"type":"…"},"uuid":"…","timestamp":"2026-08-09T09:00:01.000Z","sessionId":"s"}"#;
+    const COMPACT_NOTICE: &str = r#"{"parentUuid":"…","isSidechain":false,"type":"system","subtype":"informational","content":"…","level":"notice","isMeta":false,"uuid":"…","timestamp":"2026-08-09T09:00:02.000Z","sessionId":"s"}"#;
+    /// Bookkeeping Claude Code appends on its own schedule, minutes after
+    /// the last real entry. No timestamp.
+    const LAST_PROMPT: &str = r#"{"type":"last-prompt","lastPrompt":"…","sessionId":"s"}"#;
+    const AI_TITLE: &str = r#"{"type":"ai-title","aiTitle":"…","sessionId":"s"}"#;
+    const MODE: &str = r#"{"type":"mode","mode":"…","sessionId":"s"}"#;
+
+    /// `/compact` as typed: a plain-string prompt.
+    const COMPACT_INVOCATION: &str = r#"{"parentUuid":"…","isSidechain":false,"type":"user","message":{"role":"user","content":"/compact"},"uuid":"…","timestamp":"2026-08-09T08:59:00.000Z","sessionId":"s"}"#;
+    const COMPACT_CAVEAT: &str = r#"{"parentUuid":"…","isSidechain":false,"type":"user","message":{"role":"user","content":"<local-command-caveat>Caveat: …</local-command-caveat>"},"isMeta":true,"uuid":"…","timestamp":"2026-08-09T09:00:01.000Z","sessionId":"s"}"#;
+    const COMPACT_COMMAND_NAME: &str = r#"{"parentUuid":"…","isSidechain":false,"type":"user","message":{"role":"user","content":"<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>"},"uuid":"…","timestamp":"2026-08-09T09:00:01.000Z","sessionId":"s"}"#;
+    const COMPACT_STDOUT: &str = r#"{"parentUuid":"…","isSidechain":false,"type":"user","message":{"role":"user","content":"<local-command-stdout>Compacted …</local-command-stdout>"},"uuid":"…","timestamp":"2026-08-09T09:00:01.000Z","sessionId":"s"}"#;
+
+    /// Everything the idle auto-compact writes, in order.
+    const IDLE_AUTO_COMPACT: [&str; 7] = [
+        COMPACT_BOUNDARY_AUTO,
+        COMPACT_SUMMARY,
+        COMPACT_ATTACHMENT,
+        COMPACT_NOTICE,
+        LAST_PROMPT,
+        AI_TITLE,
+        MODE,
+    ];
+
+    #[test]
+    fn parse_compact_summary_and_bookkeeping() {
+        assert!(parse_line(COMPACT_SUMMARY).unwrap().compact_summary);
+        for line in [PROMPT, COMPACT_INVOCATION, COMPACT_CAVEAT, COMPACT_BOUNDARY_AUTO] {
+            assert!(!parse_line(line).unwrap().compact_summary, "{line}");
+        }
+
+        for line in [LAST_PROMPT, AI_TITLE, MODE, COMPACT_ATTACHMENT] {
+            assert!(parse_line(line).unwrap().bookkeeping, "{line}");
+        }
+        assert!(is_bookkeeping_type("artifact-autoreact-ledger"));
+        // Compaction itself, real turns and unknown shapes are not.
+        for line in [COMPACT_BOUNDARY_AUTO, COMPACT_SUMMARY, COMPACT_NOTICE, PROMPT, END_TURN] {
+            assert!(!parse_line(line).unwrap().bookkeeping, "{line}");
+        }
+        assert!(!is_bookkeeping_type("artifact-something-new"));
+        assert!(!is_bookkeeping_type("some-future-shape"));
+    }
+
+    #[test]
+    fn idle_auto_compact_stays_idle() {
+        // The session finished its turn; Claude Code compacts it while it
+        // waits for the user. Nothing is working, so the dot stays green.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let mut lines = vec![PROMPT, END_TURN];
+        lines.extend(IDLE_AUTO_COMPACT);
+        write_lines(&path, &lines);
+
+        let mut tail = ClaudeTranscriptTail::new(path);
+        let start = Instant::now();
+        let snap = tail.snapshot.as_ref().unwrap();
+        assert_eq!(snap.state, SessionState::Idle);
+        assert!(!snap.quiet_timeout);
+        assert_eq!(tail.poll_interval(), Duration::from_secs(2));
+
+        // And it is the transcript's idle, not the fallback's.
+        assert!(!tail.poll_at(start + past_timeout()));
+        assert!(!tail.snapshot.as_ref().unwrap().quiet_timeout);
+    }
+
+    #[test]
+    fn idle_auto_compact_appended_to_an_idle_tail_stays_idle() {
+        // The live shape: the tail already showed the finished turn, and
+        // the compaction arrives in a later poll.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, &[PROMPT, END_TURN]);
+
+        let mut tail = ClaudeTranscriptTail::new(path.clone());
+        let start = Instant::now();
+        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Idle);
+
+        append_lines(&path, &IDLE_AUTO_COMPACT);
+        tail.poll_at(start);
+        let snap = tail.snapshot.as_ref().unwrap();
+        assert_eq!(snap.state, SessionState::Idle);
+        assert!(!snap.quiet_timeout);
+
+        assert!(!tail.poll_at(start + past_timeout()));
+        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Idle);
+        assert!(!tail.snapshot.as_ref().unwrap().quiet_timeout);
+    }
+
+    #[test]
+    fn manual_compact_goes_idle() {
+        // `/compact` is work while it runs, and its local-command answer
+        // ends it (the issue #343 rule) — the summary in between must not
+        // get in the way.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, &[PROMPT, END_TURN, COMPACT_INVOCATION]);
+
+        let mut tail = FileTail::default();
+        let mut snap: Option<TelemetrySnapshot> = None;
+        let mut last_user_ts = None;
+        read_lines(&path, &mut tail, &mut snap, &mut last_user_ts);
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Busy);
+
+        append_lines(&path, &[COMPACT_BOUNDARY_MANUAL, COMPACT_SUMMARY]);
+        read_lines(&path, &mut tail, &mut snap, &mut last_user_ts);
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Busy);
+
+        append_lines(&path, &[COMPACT_CAVEAT, COMPACT_COMMAND_NAME, COMPACT_STDOUT]);
+        read_lines(&path, &mut tail, &mut snap, &mut last_user_ts);
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Idle);
+    }
+
+    #[test]
+    fn compact_summary_does_not_reset_turn_anchor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, &[COMPACT_SUMMARY]);
+
+        let mut tail = FileTail::default();
+        let mut snap: Option<TelemetrySnapshot> = None;
+        let mut last_user_ts = Some(1.0);
+        read_lines(&path, &mut tail, &mut snap, &mut last_user_ts);
+        assert_eq!(last_user_ts, Some(1.0));
+    }
+
+    #[test]
+    fn compact_summary_does_not_touch_background_agents() {
+        // The summary recaps the old conversation, so it can quote a
+        // launch or a task notification. Neither is live.
+        let quoting = COMPACT_SUMMARY.replace(
+            "ran out of context. …",
+            r#"ran out of context. Async agent launched successfully.\nagentId: bbb222 … <task-notification>\n<task-id>aaa111</task-id>"#,
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, &[PROMPT]);
+
+        let mut tail = FileTail::default();
+        let mut snap: Option<TelemetrySnapshot> = None;
+        let mut last_user_ts = None;
+        let mut pending = HashSet::new();
+        // Catch-up read first, so the summary below is read live.
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
+        pending.insert("aaa111".to_string());
+
+        append_lines(&path, &[&quoting]);
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
+        assert_eq!(pending, HashSet::from(["aaa111".to_string()]));
+    }
+
+    #[test]
+    fn bookkeeping_writes_after_timeout_stay_idle() {
+        // Claude Code keeps appending bookkeeping lines to a session nobody
+        // is using. They must not flip a timed-out session back to red.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, &[PROMPT]);
+
+        let mut tail = ClaudeTranscriptTail::new(path.clone());
+        let start = Instant::now();
+        tail.poll_at(start + past_timeout());
+        assert!(tail.snapshot.as_ref().unwrap().quiet_timeout);
+
+        append_lines(&path, &[LAST_PROMPT, AI_TITLE, MODE]);
+        assert!(!tail.poll_at(start + past_timeout() * 2));
+        let snap = tail.snapshot.as_ref().unwrap();
+        assert_eq!(snap.state, SessionState::Idle);
+        assert!(snap.quiet_timeout);
+
+        // An unknown shape is still read as the turn running.
+        append_lines(&path, &[r#"{"type":"some-future-shape","sessionId":"s"}"#]);
+        assert!(tail.poll_at(start + past_timeout() * 3));
+        let snap = tail.snapshot.as_ref().unwrap();
+        assert_eq!(snap.state, SessionState::Busy);
+        assert!(!snap.quiet_timeout);
+    }
+
+    #[test]
+    fn bookkeeping_writes_do_not_restart_the_quiet_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, &[PROMPT]);
+
+        let mut tail = ClaudeTranscriptTail::new(path.clone());
+        let start = Instant::now();
+
+        append_lines(
+            &path,
+            &[
+                LAST_PROMPT,
+                AI_TITLE,
+                MODE,
+                r#"{"type":"permission-mode","sessionId":"s"}"#,
+                r#"{"type":"atis-latch","sessionId":"s"}"#,
+                r#"{"type":"agent-name","sessionId":"s"}"#,
+                r#"{"type":"cost-state","sessionId":"s"}"#,
+                r#"{"type":"artifact-autoreact-ledger","sessionId":"s"}"#,
+                r#"{"type":"artifact-comment-monitor","sessionId":"s"}"#,
+                r#"{"type":"file-history-snapshot","messageId":"x","snapshot":{}}"#,
+                r#"{"type":"queue-operation","sessionId":"s"}"#,
+                COMPACT_ATTACHMENT,
+            ],
+        );
+        tail.poll_at(start + BUSY_QUIET_TIMEOUT / 2);
+        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Busy);
+
+        // Timed from the prompt, not from the bookkeeping.
+        assert!(tail.poll_at(start + past_timeout()));
+        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Idle);
     }
 
     // --- model_display_name ---
