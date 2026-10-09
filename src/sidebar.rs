@@ -35,7 +35,7 @@ use codescope_core::{
 };
 use codescope_core::git::{GitStatus, WorktreeInfo};
 use codescope_core::layout::OTHER_PROJECT_GROUP_KEY;
-use codescope_core::project_groups::{self, OTHER_SECTION_LABEL};
+use codescope_core::project_groups::{self, OTHER_SECTION_LABEL, ProjectDropTarget};
 use codescope_core::projects::{PathOnDisk, WorktreeSync, worktree_is_listed};
 use codescope_core::pr::{CiStatus, PullRequestInfo};
 use gpui::prelude::FluentBuilder as _;
@@ -145,6 +145,59 @@ struct GroupHeaderData {
     collapsed: bool,
     /// Live-session dots, only filled while collapsed.
     dots: Vec<SessionDot>,
+}
+
+/// Drag payload: a project row being dragged (#374).
+#[derive(Clone, Debug)]
+struct ProjectDrag {
+    project_id: String,
+}
+
+/// Drag payload: a user group's header being dragged (#374).
+#[derive(Clone, Debug)]
+struct GroupDrag {
+    group_id: String,
+}
+
+/// Where the in-flight sidebar drag would land, for the drop
+/// indicator. Set by `on_drag_move`, consumed by `on_drop`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DropHover {
+    /// A project drag over a project block: above or below it.
+    Project { project_id: String, after: bool },
+    /// A drag over a section header, keyed like
+    /// `collapsed_project_groups`. A project drag (`group_drag: false`)
+    /// lands in that section; a group drag lands before that group —
+    /// or, on "Other", after the last one.
+    Header { key: String, group_drag: bool },
+}
+
+/// The chip that follows the cursor while dragging a sidebar row.
+struct SidebarDragChip {
+    label: SharedString,
+    theme: Arc<Theme>,
+}
+
+impl Render for SidebarDragChip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let accent = theme::accent(&self.theme);
+        div()
+            .h(px(28.0))
+            .min_w(px(120.0))
+            .max_w(px(220.0))
+            .px_3()
+            .flex()
+            .items_center()
+            .bg(theme::elevated(&self.theme))
+            .border_1()
+            .border_color(accent)
+            .rounded_md()
+            .shadow_lg()
+            .text_size(px(13.0))
+            .text_color(theme::ink(&self.theme))
+            .font(theme::font_sans())
+            .child(div().truncate().child(self.label.clone()))
+    }
 }
 
 impl GroupHeaderData {
@@ -676,6 +729,10 @@ pub struct Sidebar {
     /// and project rows (#374). Pushed with `busy_paths` /
     /// `active_paths` by [`Sidebar::set_session_paths`].
     session_dots: HashMap<String, Vec<SessionDot>>,
+    /// Drop slot under the cursor during a project / group drag
+    /// (#374). Stale once the drag ends without a drop — render only
+    /// trusts it while `cx.has_active_drag()`.
+    drop_hover: Option<DropHover>,
     /// Worktree rows whose closed-session history disclosure is
     /// expanded. Keyed by `"{project_id}/{worktree_id}"` so primary
     /// rows from different projects don't collide. Defaults to
@@ -815,6 +872,7 @@ impl Sidebar {
             collapsed_projects,
             collapsed_project_groups,
             session_dots: HashMap::new(),
+            drop_hover: None,
             expanded_worktrees: HashSet::new(),
             busy_paths: HashSet::new(),
             active_paths: HashSet::new(),
@@ -3312,15 +3370,39 @@ impl Render for Sidebar {
         // rows are different element shapes and need to be flattened
         // into a single `.children(...)` call.
         let items = self.sidebar_list_items(rows);
+        // Only trust the drop slot while a drag is actually running; a
+        // drag released outside every target leaves it behind.
+        let drop_hover = if cx.has_active_drag() { self.drop_hover.clone() } else { None };
         let mut project_and_worktree_rows: Vec<gpui::AnyElement> = Vec::new();
+        // Each project's rows (project, worktrees, history) are wrapped
+        // into one block once the next item starts, so the whole block
+        // is a single drop target (#374). `(first row index, id)`.
+        let mut open_block: Option<(usize, String)> = None;
         for item in items {
+            if let Some((start, project_id)) = open_block.take() {
+                let block_rows: Vec<gpui::AnyElement> =
+                    project_and_worktree_rows.drain(start..).collect();
+                project_and_worktree_rows.push(self.render_project_block(
+                    project_id,
+                    block_rows,
+                    drop_hover.as_ref(),
+                    &theme,
+                    cx,
+                ));
+            }
             let (idx, id, name, project_name, worktrees) = match item {
                 SidebarListItem::GroupHeader(header) => {
-                    project_and_worktree_rows.push(self.render_group_header(header, &theme, cx));
+                    project_and_worktree_rows.push(self.render_group_header(
+                        header,
+                        drop_hover.as_ref(),
+                        &theme,
+                        cx,
+                    ));
                     continue;
                 }
                 SidebarListItem::Project(row) => row,
             };
+            open_block = Some((project_and_worktree_rows.len(), id.clone()));
             let active = selected == Some(idx);
             // Issue #248: does the currently focused tab live in one of
             // this project's worktrees? If so the project row carries a
@@ -3401,8 +3483,18 @@ impl Render for Sidebar {
                 )
                 .child(chevron_glyph);
 
+            // Drag source (#374): the row drags a chip with the
+            // project's name; the drop lands via its block / headers.
+            let drag_payload = ProjectDrag { project_id: id.clone() };
+            let drag_label = name.clone();
+            let drag_theme = theme.clone();
             let project_row = div()
                 .id(("project", id_hash(&id)))
+                .on_drag(drag_payload, move |_payload, _offset, _window, cx| {
+                    let label = drag_label.clone();
+                    let theme = drag_theme.clone();
+                    cx.new(|_| SidebarDragChip { label, theme })
+                })
                 .h(px(32.0))
                 .flex()
                 .flex_row()
@@ -4112,6 +4204,17 @@ impl Render for Sidebar {
                 }
             }
         }
+        if let Some((start, project_id)) = open_block.take() {
+            let block_rows: Vec<gpui::AnyElement> =
+                project_and_worktree_rows.drain(start..).collect();
+            project_and_worktree_rows.push(self.render_project_block(
+                project_id,
+                block_rows,
+                drop_hover.as_ref(),
+                &theme,
+                cx,
+            ));
+        }
 
         // `flex_grow` + `min_h(0)` + `overflow_y_scroll` so the
         // project/worktree tree absorbs remaining height in the
@@ -4359,13 +4462,11 @@ impl Render for Sidebar {
             // `add_project` entry point the `+ New Project` button uses.
             // Files / non-existent paths are silently skipped — matches
             // C# `PayloadFolders` filtering on `Directory.Exists`.
+            // Dropped on a section header or a project block instead,
+            // the folder joins that section (#374) — those targets stop
+            // propagation, so this only sees drops elsewhere ("Other").
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                for path in paths.paths() {
-                    if path.is_dir() {
-                        let path_str = path.to_string_lossy().into_owned();
-                        this.add_project(path_str, None, cx);
-                    }
-                }
+                this.add_dropped_folders(paths, None, cx);
             }))
             .child(heading)
             .child(filter_input)
@@ -6337,6 +6438,14 @@ fn is_live_group_key(projects: &ProjectsConfig, key: &str) -> bool {
     key == OTHER_PROJECT_GROUP_KEY || projects.project_groups.iter().any(|g| g.id == key)
 }
 
+/// The 2 px accent insert line for a sidebar drag (#374), laid over
+/// the top (`at_bottom: false`) or bottom edge of a `relative()` parent
+/// so showing it never shifts the rows under the cursor.
+fn drop_line(theme: &Arc<Theme>, at_bottom: bool) -> gpui::Div {
+    let line = div().absolute().left_0().right_0().h(px(2.0)).bg(theme::accent(theme));
+    if at_bottom { line.bottom(px(-1.0)) } else { line.top(px(-1.0)) }
+}
+
 /// A row of session dots (red busy, green idle), capped at
 /// [`MAX_SESSION_DOTS`] with a "+N" tail (#374). `None` for no dots.
 fn render_session_dots(dots: Vec<SessionDot>, theme: &Arc<Theme>) -> Option<gpui::Div> {
@@ -6441,10 +6550,28 @@ impl Sidebar {
     fn render_group_header(
         &self,
         header: GroupHeaderData,
+        drop_hover: Option<&DropHover>,
         theme: &Arc<Theme>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let key = header.collapse_key();
+        // A project drag over a header means "into this section" → wash
+        // the header; a group drag means "before this group" → a line
+        // above it (on "Other": after the last group).
+        let (project_into_here, group_before_here) = match drop_hover {
+            Some(DropHover::Header { key: k, group_drag }) if *k == key => {
+                (!group_drag, *group_drag)
+            }
+            _ => (false, false),
+        };
+        let key_for_move = key.clone();
+        let key_for_drop = key.clone();
+        let group_for_project_drop = header.group_id.clone();
+        let group_for_group_drop = header.group_id.clone();
+        let group_for_paths = header.group_id.clone();
+        let drag_source = header.group_id.clone().map(|group_id| {
+            (GroupDrag { group_id }, header.name.clone(), self.theme.clone())
+        });
         let hover_group = SharedString::from(format!("group-header-{key}"));
         let chevron_glyph = if header.collapsed { "\u{25B8}" } else { "\u{25BE}" };
         let key_for_toggle = key.clone();
@@ -6479,9 +6606,10 @@ impl Sidebar {
             )
             .child("+");
 
-        div()
+        let mut header_row = div()
             .id(("group-header", id_hash(&key)))
             .group(hover_group)
+            .relative()
             .h(px(28.0))
             .mt(px(4.0))
             .flex()
@@ -6491,13 +6619,43 @@ impl Sidebar {
             .pr_3()
             .text_size(px(11.0))
             .text_color(theme::ink_muted(theme))
+            .when(project_into_here, |s| s.bg(theme::active_context_wash_dim(theme)))
             .cursor_pointer()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    this.toggle_project_group_collapsed(&key_for_toggle, cx);
-                }),
-            )
+            // Click, not mouse-down: a press that turns into a header
+            // drag must not also toggle the section.
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_project_group_collapsed(&key_for_toggle, cx);
+            }))
+            .on_drag_move(cx.listener(
+                move |this, event: &gpui::DragMoveEvent<ProjectDrag>, _, cx| {
+                    if event.bounds.contains(&event.event.position) {
+                        let key = key_for_move.clone();
+                        this.set_drop_hover(Some(DropHover::Header { key, group_drag: false }), cx);
+                    }
+                },
+            ))
+            .on_drag_move(cx.listener({
+                let key = key_for_drop.clone();
+                move |this, event: &gpui::DragMoveEvent<GroupDrag>, _, cx| {
+                    if event.bounds.contains(&event.event.position) {
+                        let key = key.clone();
+                        this.set_drop_hover(Some(DropHover::Header { key, group_drag: true }), cx);
+                    }
+                }
+            }))
+            .on_drop(cx.listener(move |this, payload: &ProjectDrag, _, cx| {
+                cx.stop_propagation();
+                let target = ProjectDropTarget::IntoGroup(group_for_project_drop.clone());
+                this.drop_project(&payload.project_id, target, cx);
+            }))
+            .on_drop(cx.listener(move |this, payload: &GroupDrag, _, cx| {
+                cx.stop_propagation();
+                this.drop_group(&payload.group_id, group_for_group_drop.clone(), cx);
+            }))
+            .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                cx.stop_propagation();
+                this.add_dropped_folders(paths, group_for_paths.clone(), cx);
+            }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -6534,8 +6692,123 @@ impl Sidebar {
             .child(add_button)
             // Dots last, so they sit flush right like the dots on a
             // collapsed project row below.
-            .children(render_session_dots(header.dots, theme))
+            .children(render_session_dots(header.dots, theme));
+        if let Some((payload, label, chip_theme)) = drag_source {
+            header_row = header_row.on_drag(payload, move |_payload, _offset, _window, cx| {
+                let label = label.clone();
+                let theme = chip_theme.clone();
+                cx.new(|_| SidebarDragChip { label, theme })
+            });
+        }
+        if group_before_here {
+            header_row = header_row.child(drop_line(theme, false));
+        }
+        header_row.into_any_element()
+    }
+
+    /// Wrap one project's rows (project row, worktree rows, history)
+    /// into a block that is a single drop target (#374): the top half
+    /// of the project row means "above this project", anything lower
+    /// "below it". An OS folder dropped on it joins this project's
+    /// section.
+    fn render_project_block(
+        &self,
+        project_id: String,
+        rows: Vec<gpui::AnyElement>,
+        drop_hover: Option<&DropHover>,
+        theme: &Arc<Theme>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let line = match drop_hover {
+            Some(DropHover::Project { project_id: p, after }) if *p == project_id => Some(*after),
+            _ => None,
+        };
+        let group = self
+            .projects
+            .project(&project_id)
+            .and_then(|p| self.existing_group(p.group_id.clone()));
+        let id_for_move = project_id.clone();
+        let id_for_drop = project_id.clone();
+        div()
+            .id(("project-block", id_hash(&project_id)))
+            .relative()
+            .flex()
+            .flex_col()
+            .on_drag_move(cx.listener(
+                move |this, event: &gpui::DragMoveEvent<ProjectDrag>, _, cx| {
+                    let pos = event.event.position;
+                    if !event.bounds.contains(&pos) {
+                        return;
+                    }
+                    // Half of the 32 px project row.
+                    let after = pos.y > event.bounds.origin.y + px(16.0);
+                    let project_id = id_for_move.clone();
+                    this.set_drop_hover(Some(DropHover::Project { project_id, after }), cx);
+                },
+            ))
+            .on_drop(cx.listener(move |this, payload: &ProjectDrag, _, cx| {
+                cx.stop_propagation();
+                // The hover from the last move says above or below;
+                // with none (no move event landed here) go below.
+                let after = !matches!(
+                    &this.drop_hover,
+                    Some(DropHover::Project { project_id, after: false }) if *project_id == id_for_drop
+                );
+                let anchor = id_for_drop.clone();
+                let target = if after {
+                    ProjectDropTarget::After(anchor)
+                } else {
+                    ProjectDropTarget::Before(anchor)
+                };
+                this.drop_project(&payload.project_id, target, cx);
+            }))
+            .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                cx.stop_propagation();
+                this.add_dropped_folders(paths, group.clone(), cx);
+            }))
+            .children(rows)
+            .children(line.map(|after| drop_line(theme, after)))
             .into_any_element()
+    }
+
+    fn set_drop_hover(&mut self, hover: Option<DropHover>, cx: &mut Context<Self>) {
+        if self.drop_hover != hover {
+            self.drop_hover = hover;
+            cx.notify();
+        }
+    }
+
+    /// Finish a project drag (#374).
+    fn drop_project(&mut self, project_id: &str, target: ProjectDropTarget, cx: &mut Context<Self>) {
+        self.drop_hover = None;
+        self.commit_projects_edit(
+            "Could not move project",
+            |cfg| project_groups::move_project(cfg, project_id, &target),
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// Finish a group-header drag (#374): dropped on another group's
+    /// header it lands before that group; on "Other" (`None`) it goes
+    /// last.
+    fn drop_group(&mut self, group_id: &str, before: Option<String>, cx: &mut Context<Self>) {
+        self.drop_hover = None;
+        self.commit_projects_edit(
+            "Could not move group",
+            |cfg| project_groups::move_group(cfg, group_id, before.as_deref()),
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// Add every directory in an OS drop as a project in `group`.
+    fn add_dropped_folders(&mut self, paths: &ExternalPaths, group: Option<String>, cx: &mut Context<Self>) {
+        for path in paths.paths() {
+            if path.is_dir() {
+                self.add_project(path.to_string_lossy().into_owned(), group.clone(), cx);
+            }
+        }
     }
 
     /// Right-click menu on a user group's header (#374).
