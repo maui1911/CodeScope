@@ -91,6 +91,11 @@ pub struct Project {
     /// that don't have one yet.
     #[serde(default)]
     pub worktrees: Vec<Worktree>,
+    /// Id of the [`ProjectGroup`] this project sits in, `None` for the
+    /// fixed "Other" section (#374). An id naming no existing group is
+    /// treated as `None` — see [`crate::project_groups::sidebar_sections`].
+    #[serde(default)]
+    pub group_id: Option<String>,
 }
 
 fn default_branch() -> String { "main".to_string() }
@@ -133,6 +138,7 @@ impl Project {
             default_agent_id: None,
             sessions: Vec::new(),
             worktrees: vec![primary],
+            group_id: None,
         }
     }
 
@@ -155,6 +161,7 @@ impl Project {
             default_agent_id: None,
             sessions: Vec::new(),
             worktrees: Vec::new(),
+            group_id: None,
         }
     }
 
@@ -384,6 +391,10 @@ pub struct ProjectsConfig {
     pub version: u32,
     pub agents: Vec<serde_json::Value>,
     pub projects: Vec<Project>,
+    /// User-defined sidebar groups, in display order (#374). Empty =
+    /// the flat, headerless sidebar. Additive field: files without it
+    /// load with no groups.
+    pub project_groups: Vec<ProjectGroup>,
 }
 
 impl Default for ProjectsConfig {
@@ -392,8 +403,19 @@ impl Default for ProjectsConfig {
             version: CURRENT_VERSION,
             agents: Vec::new(),
             projects: Vec::new(),
+            project_groups: Vec::new(),
         }
     }
+}
+
+/// A named sidebar group of projects (#374). Membership lives on
+/// [`Project::group_id`]; order is the position in
+/// [`ProjectsConfig::project_groups`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGroup {
+    pub id: String,
+    pub name: String,
 }
 
 impl ProjectsConfig {
@@ -726,7 +748,7 @@ mod tests {
     }
 
     fn config_of(projects: Vec<Project>) -> ProjectsConfig {
-        ProjectsConfig { version: CURRENT_VERSION, agents: Vec::new(), projects }
+        ProjectsConfig { version: CURRENT_VERSION, agents: Vec::new(), projects, project_groups: Vec::new() }
     }
 
     fn row(id: &str, path: &str) -> Worktree {
@@ -1188,7 +1210,9 @@ mod tests {
                     branch: Some("main".into()),
                     is_primary: true,
                 }],
+                group_id: None,
             }],
+            project_groups: Vec::new(),
         };
         cfg.save_to(&path).unwrap();
         let loaded = ProjectsConfig::load_from(&path).unwrap();
@@ -1198,6 +1222,32 @@ mod tests {
         assert_eq!(p.sessions.len(), 1);
         assert_eq!(p.worktrees.len(), 1);
         assert!(p.worktrees[0].is_primary);
+    }
+
+    #[test]
+    fn project_groups_round_trip_and_older_files_load_without_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.json");
+        let mut p = Project::new("/dev/acme".into());
+        p.group_id = Some("g1".into());
+        let cfg = ProjectsConfig {
+            projects: vec![p],
+            project_groups: vec![ProjectGroup { id: "g1".into(), name: "Code".into() }],
+            ..ProjectsConfig::default()
+        };
+        cfg.save_to(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"projectGroups\"") && raw.contains("\"groupId\""), "{raw}");
+        let loaded = ProjectsConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.project_groups, cfg.project_groups);
+        assert_eq!(loaded.projects[0].group_id.as_deref(), Some("g1"));
+
+        // A file written before #374 has neither field.
+        std::fs::write(&path, r#"{"version":1,"projects":[{"id":"p","name":"p","path":"/p"}]}"#)
+            .unwrap();
+        let old = ProjectsConfig::load_from(&path).unwrap();
+        assert!(old.project_groups.is_empty());
+        assert_eq!(old.projects[0].group_id, None);
     }
 
     #[test]
@@ -1287,6 +1337,7 @@ mod tests {
             version: CURRENT_VERSION,
             agents: Vec::new(),
             projects: vec![Project::new("/home/me/repo".into())],
+            project_groups: Vec::new(),
         };
         let before_len = cfg.projects[0].worktrees.len();
         cfg.migrate();
@@ -1314,7 +1365,9 @@ mod tests {
                 default_agent_id: None,
                 sessions: Vec::new(),
                 worktrees: Vec::new(),
+                group_id: None,
             }],
+            project_groups: Vec::new(),
         };
         cfg.migrate();
         assert!(cfg.projects[0].worktrees.is_empty());
@@ -1356,7 +1409,7 @@ mod tests {
     fn set_remote_shell_command_updates_and_reports_change() {
         let p = Project::new_remote_shell("dev".into(), "ssh old".into(), None);
         let id = p.id.clone();
-        let mut cfg = ProjectsConfig { version: 1, agents: vec![], projects: vec![p] };
+        let mut cfg = ProjectsConfig { version: 1, agents: vec![], projects: vec![p], project_groups: Vec::new() };
 
         assert!(set_remote_shell_command(&mut cfg, &id, "  ssh new-box  ").expect("update"));
         assert_eq!(cfg.projects[0].remote_shell_command(), Some("ssh new-box"));
@@ -1371,7 +1424,7 @@ mod tests {
         let local = Project::new("C:\\repo".into());
         let local_id = local.id.clone();
         let mut cfg =
-            ProjectsConfig { version: 1, agents: vec![], projects: vec![remote, local] };
+            ProjectsConfig { version: 1, agents: vec![], projects: vec![remote, local], project_groups: Vec::new() };
 
         // Each rejection names its actual cause — a multi-line paste
         // must not be reported as "empty".
@@ -1453,6 +1506,7 @@ mod tests {
             version: CURRENT_VERSION,
             agents: Vec::new(),
             projects: vec![Project::new_remote_shell("box".into(), "ssh box".into(), None)],
+            project_groups: Vec::new(),
         };
         cfg.migrate();
         assert!(cfg.projects[0].worktrees.is_empty());
@@ -1468,6 +1522,7 @@ mod tests {
             version: CURRENT_VERSION,
             agents: Vec::new(),
             projects: vec![Project::new_remote_shell("box".into(), "ssh box -t claude".into(), None)],
+            project_groups: Vec::new(),
         };
         cfg.save_to(&path).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
@@ -1617,7 +1672,9 @@ mod tests {
                     branch: None,
                     is_primary: true,
                 }],
+                group_id: None,
             }],
+            project_groups: Vec::new(),
         };
         cfg.save_to(&path).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
@@ -1711,6 +1768,7 @@ mod tests {
             version: CURRENT_VERSION,
             agents: Vec::new(),
             projects: vec![Project::new("C:\\repos\\repo".into())],
+            project_groups: Vec::new(),
         };
         // Trailing slash and forward-slash variants resolve to the
         // same project; case-insensitive on Windows.

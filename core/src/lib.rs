@@ -29,6 +29,7 @@ pub mod path_canon;
 pub mod paths;
 pub mod pr;
 pub mod process;
+pub mod project_groups;
 pub mod projects;
 pub mod relaunch;
 pub mod session;
@@ -62,9 +63,10 @@ pub use overview::{
     build_rows_for_live as build_overview_rows_for_live,
 };
 pub use paths::AppPaths;
+pub use project_groups::{SessionDot, SidebarSection};
 pub use projects::{
-    Project, ProjectKind, ProjectsConfig, Session, Worktree, is_valid_remote_shell_command,
-    remote_command_with_agent,
+    Project, ProjectGroup, ProjectKind, ProjectsConfig, Session, Worktree,
+    is_valid_remote_shell_command, remote_command_with_agent,
 };
 pub use session::{
     RetentionPolicy, SessionDescriptor, SessionManager, build_agent_shell_args,
