@@ -251,6 +251,7 @@ mod tests {
                 branch: None,
                 is_primary: true,
             }],
+            group_id: None,
         }
     }
 
@@ -277,6 +278,7 @@ mod tests {
                 mk_project("p1", "alpha", vec![mk_session("s1", Some("2026-05-11T12:00:00Z"), None)]),
                 mk_project("p2", "beta", vec![mk_session("s2", Some("2026-05-11T11:00:00Z"), None)]),
             ],
+            project_groups: Vec::new(),
         };
 
         let rows = build_rows(&cfg);
@@ -300,6 +302,7 @@ mod tests {
                     mk_session("live_old", Some("2026-05-01T08:00:00Z"), None),
                 ],
             )],
+            project_groups: Vec::new(),
         };
 
         let rows = build_rows(&cfg);
@@ -322,6 +325,7 @@ mod tests {
                     mk_session("c3", None, Some("2026-05-10T09:00:00Z")),
                 ],
             )],
+            project_groups: Vec::new(),
         };
 
         let rows = build_rows(&cfg);
@@ -341,6 +345,7 @@ mod tests {
                     mk_session("with_ts", Some("2026-05-11T10:00:00Z"), None),
                 ],
             )],
+            project_groups: Vec::new(),
         };
 
         let rows = build_rows(&cfg);
@@ -364,7 +369,7 @@ mod tests {
             is_primary: false,
         });
         p.sessions = vec![s];
-        let cfg = ProjectsConfig { version: 1, agents: vec![], projects: vec![p] };
+        let cfg = ProjectsConfig { version: 1, agents: vec![], projects: vec![p], project_groups: Vec::new() };
 
         let rows = build_rows(&cfg);
         assert_eq!(rows[0].branch_label, "profit-wt-1");
@@ -383,7 +388,7 @@ mod tests {
             is_primary: false,
         });
         p.sessions = vec![s];
-        let cfg = ProjectsConfig { version: 1, agents: vec![], projects: vec![p] };
+        let cfg = ProjectsConfig { version: 1, agents: vec![], projects: vec![p], project_groups: Vec::new() };
 
         let rows = build_rows(&cfg);
         assert_eq!(rows[0].branch_label, "feat/x");
@@ -401,6 +406,7 @@ mod tests {
             version: 1,
             agents: vec![],
             projects: vec![mk_project("p1", "alpha", vec![s])],
+            project_groups: Vec::new(),
         };
 
         let rows = build_rows(&cfg);

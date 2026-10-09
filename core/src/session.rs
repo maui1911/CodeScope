@@ -814,6 +814,7 @@ mod tests {
                 branch: None,
                 is_primary: true,
             }],
+            group_id: None,
         }
     }
 

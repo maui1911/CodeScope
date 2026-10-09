@@ -95,6 +95,9 @@ pub struct NewProjectDialogState {
     /// as a bare shell. Seeded to the global default agent when the
     /// dialog opens; the user can switch it or pick "No agent".
     pub remote_agent_id: Option<String>,
+    /// Sidebar group the new project lands in — set when the dialog
+    /// was opened from a section header's "+" (#374). `None` = "Other".
+    pub target_group: Option<String>,
     /// `true` while a `git clone` task is in flight.
     pub busy: bool,
     /// "Cloning <name>…" caption while busy.
@@ -118,6 +121,7 @@ impl NewProjectDialogState {
             remote_name: TextField::new(),
             remote_command: TextField::new(),
             remote_agent_id: None,
+            target_group: None,
             busy: false,
             busy_text: None,
             error: None,
@@ -461,6 +465,17 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_new_project_dialog_in_group(None, window, cx);
+    }
+
+    /// [`Self::open_new_project_dialog`], landing the new project in
+    /// `target_group` — the "+" on a sidebar section header (#374).
+    pub fn open_new_project_dialog_in_group(
+        &mut self,
+        target_group: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.new_project_dialog().is_some() || self.dialog().is_some() {
             return;
         }
@@ -485,6 +500,7 @@ impl Sidebar {
         // agent so "Remote shell" mode lands you in Claude Code out of
         // the box (#323).
         state.remote_agent_id = self.agent_registry().get_default().map(|p| p.id.clone());
+        state.target_group = target_group;
         self.set_new_project_dialog(Some(state));
         self.close_menu_no_notify();
         cx.notify();
@@ -613,6 +629,7 @@ impl Sidebar {
             return;
         }
         let mode = state.mode;
+        let group = state.target_group.clone();
         match mode {
             DialogMode::Existing => {
                 let path = state.existing_path.trim().to_string();
@@ -633,7 +650,7 @@ impl Sidebar {
                     return;
                 }
                 self.cancel_new_project_dialog(cx);
-                self.add_project(path, cx);
+                self.add_project(path, group, cx);
             }
             DialogMode::Clone => {
                 let url = state.url.text().trim().to_string();
@@ -676,7 +693,7 @@ impl Sidebar {
                     let _ = this.update(cx, |this, cx| match result {
                         Ok(target) => {
                             this.cancel_new_project_dialog(cx);
-                            this.add_project(target.to_string_lossy().into_owned(), cx);
+                            this.add_project(target.to_string_lossy().into_owned(), group, cx);
                         }
                         Err(err) => {
                             if let Some(state) = this.new_project_dialog_mut() {
@@ -711,7 +728,7 @@ impl Sidebar {
                 }
                 let agent_id = state.remote_agent_id.clone();
                 self.cancel_new_project_dialog(cx);
-                self.add_remote_shell_project(name, command, agent_id, cx);
+                self.add_remote_shell_project(name, command, agent_id, group, cx);
             }
         }
     }

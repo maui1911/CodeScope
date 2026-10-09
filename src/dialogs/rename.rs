@@ -74,6 +74,8 @@ impl RenameDialogState {
             RenameRequest::Project { .. } => "Rename project".into(),
             RenameRequest::Session { .. } => "Rename session".into(),
             RenameRequest::RemoteCommand { .. } => "Edit remote command".into(),
+            RenameRequest::ProjectGroup { .. } => "Rename group".into(),
+            RenameRequest::NewProjectGroup { .. } => "New group".into(),
         };
         Self {
             focus_handle,
@@ -119,6 +121,12 @@ impl RenameDialogState {
                  Open tabs keep the old command; the next session uses the new one.",
                 "COMMAND",
                 "Save",
+            ),
+            RenameRequest::NewProjectGroup { .. } => (
+                "NEW",
+                "Name the sidebar group. Press Enter to create it.",
+                "NAME",
+                "Create",
             ),
             _ => (
                 "RENAME",
@@ -255,6 +263,33 @@ impl AppShell {
                     return;
                 }
             }
+            RenameRequest::ProjectGroup { group_id } => {
+                let result = codescope_core::project_groups::rename_group(
+                    &mut self.projects,
+                    &group_id,
+                    &trimmed,
+                );
+                if !self.commit_group_dialog_edit(result, cx) {
+                    return;
+                }
+            }
+            RenameRequest::NewProjectGroup { project_id } => {
+                // Create, then move the project the dialog was opened
+                // for (if any) into it — one save for both.
+                let result = codescope_core::project_groups::create_group(&mut self.projects, &trimmed)
+                    .and_then(|group_id| match project_id.as_deref() {
+                        Some(pid) => codescope_core::project_groups::move_project_to_group(
+                            &mut self.projects,
+                            pid,
+                            Some(&group_id),
+                        )
+                        .map(|_| true),
+                        None => Ok(true),
+                    });
+                if !self.commit_group_dialog_edit(result, cx) {
+                    return;
+                }
+            }
             RenameRequest::Session { session_id } => {
                 // SessionManager::rename normalises whitespace → None
                 // internally; we pass `Some(trimmed)` so empty strings
@@ -286,6 +321,35 @@ impl AppShell {
         self.rename_dialog = None;
         self.mirror_projects_to_sidebar(cx);
         cx.notify();
+    }
+
+    /// Finish a group edit made on `self.projects` (#374): `Ok(true)`
+    /// saves, `Ok(false)` closes as a no-op. On a validation or save
+    /// error the dialog stays open with the message, and the config is
+    /// reloaded from disk so a half-applied edit can't ride along with
+    /// the next unrelated save. Returns `true` when the caller should
+    /// go on to close the dialog and mirror to the sidebar.
+    fn commit_group_dialog_edit(&mut self, result: anyhow::Result<bool>, cx: &mut Context<Self>) -> bool {
+        let error = match result {
+            Ok(false) => {
+                self.rename_dialog = None;
+                cx.notify();
+                return false;
+            }
+            Ok(true) => match self.projects.save(self.paths_ref().as_ref()) {
+                Ok(()) => return true,
+                Err(err) => format!("Failed to save: {err:#}"),
+            },
+            Err(err) => format!("{err:#}"),
+        };
+        if let Ok(cfg) = codescope_core::ProjectsConfig::load(self.paths_ref().as_ref()) {
+            self.projects = cfg;
+        }
+        if let Some(state) = self.rename_dialog.as_mut() {
+            state.error = Some(error);
+        }
+        cx.notify();
+        false
     }
 
     /// Render the dialog overlay. Returns `None` when no dialog is

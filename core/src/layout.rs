@@ -72,7 +72,16 @@ pub struct LayoutState {
     /// longer match a known project before saving so the file
     /// can't grow stale entries across many sessions.
     pub collapsed_projects: Vec<String>,
+    /// Sidebar project-group ids the user has collapsed (#374), plus
+    /// [`OTHER_PROJECT_GROUP_KEY`] for the fixed "Other" section. Same
+    /// shape and pruning rules as `collapsed_projects`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub collapsed_project_groups: Vec<String>,
 }
+
+/// Key standing in for the "Other" section (no group id of its own) in
+/// [`LayoutState::collapsed_project_groups`].
+pub const OTHER_PROJECT_GROUP_KEY: &str = "__other__";
 
 /// Where a single live session rehydrates on next launch. The
 /// session row itself lives in `projects.json`; this just tells the
@@ -143,6 +152,7 @@ impl Default for LayoutState {
             session_placements: Vec::new(),
             open_tabs: Vec::new(),
             collapsed_projects: Vec::new(),
+            collapsed_project_groups: Vec::new(),
         }
     }
 }
@@ -249,6 +259,7 @@ mod tests {
             }],
             open_tabs: Vec::new(),
             collapsed_projects: vec!["proj-2".into(), "proj-3".into()],
+            collapsed_project_groups: vec![OTHER_PROJECT_GROUP_KEY.into(), "grp-1".into()],
         };
         state.save_to(&path).unwrap();
         let loaded = LayoutState::load_from(&path).unwrap();
@@ -261,6 +272,7 @@ mod tests {
         assert!(loaded.session_placements[0].active_in_group);
         assert!(loaded.open_tabs.is_empty());
         assert_eq!(loaded.collapsed_projects, vec!["proj-2", "proj-3"]);
+        assert_eq!(loaded.collapsed_project_groups, vec![OTHER_PROJECT_GROUP_KEY, "grp-1"]);
     }
 
     #[test]
