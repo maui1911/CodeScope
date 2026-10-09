@@ -3330,9 +3330,11 @@ impl AppShell {
         let working_directory = std::path::PathBuf::from(&descriptor.working_directory);
 
         // Prefer the same `<Project> · <branch>` convention plain
-        // worktree clicks produce — falling back to the descriptor's
-        // own title (display_name → branch → id) only when the
-        // project / branch pair can't be resolved. An explicit
+        // worktree clicks produce, with the folder name standing in
+        // for the branch when there is none (a project without git) —
+        // see `restored_title`. The descriptor's own title
+        // (display_name → branch → folder) is only the fallback when
+        // the owning project can't be resolved. An explicit
         // `display_name` override on the persisted row still wins
         // (descriptor's `for_session` already tries that first), so
         // user-renamed sessions come back with their custom name.
@@ -3356,9 +3358,14 @@ impl AppShell {
                 .git_status_for(&descriptor.working_directory)
                 .and_then(|g| g.branch_name().map(str::to_string))
                 .or_else(|| restored.branch.clone());
-            match (project_name, branch_label) {
-                (Some(p), Some(b)) => format!("{p} · {b}").into(),
-                _ => descriptor.title.clone().into(),
+            match project_name {
+                Some(p) => codescope_core::restored_title(
+                    &p,
+                    branch_label.as_deref(),
+                    &descriptor.working_directory,
+                )
+                .into(),
+                None => descriptor.title.clone().into(),
             }
         };
 
