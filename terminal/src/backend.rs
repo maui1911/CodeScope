@@ -736,85 +736,131 @@ struct PathCandidate {
     /// The bare path text: wrapping punctuation and any `:line:col`
     /// suffix stripped.
     path: String,
+    /// Longer `(end, path)` readings that run on across the following
+    /// whitespace-separated words, longest first. Only absolute paths
+    /// get these (`D:\Sync\Shared Docs\Project Alpha\`): a folder
+    /// name with a space is routine on Windows, and an absolute start
+    /// is a strong enough anchor to justify the extra stats. The caller
+    /// links the first reading that exists, falling back to `path`.
+    spanning: Vec<(usize, String)>,
 }
+
+/// How many following words an absolute path may run on across. Each
+/// one costs a (memoised) stat per candidate, so keep it small.
+const MAX_SPANNED_WORDS: usize = 8;
 
 /// Scan one line of text for tokens that look like file paths.
 ///
-/// Deliberately conservative: whitespace-delimited tokens only (paths
-/// with spaces are undetectable without quoting context), wrapping
+/// Deliberately conservative: whitespace-delimited tokens, wrapping
 /// punctuation peeled, URLs and CLI flags rejected. A token qualifies
-/// when it contains a path separator or looks like `stem.ext`. Whether
-/// the path actually exists is the caller's job — shape alone would
-/// produce far too many false positives (`and/or`, version strings).
+/// when it contains a path separator or looks like `stem.ext`. An
+/// absolute token additionally offers readings that span the next few
+/// words (see [`PathCandidate::spanning`]); relative paths with spaces
+/// stay undetectable without quoting context. Whether the path actually
+/// exists is the caller's job — shape alone would produce far too many
+/// false positives (`and/or`, version strings).
 fn file_path_candidates(text: &str) -> Vec<PathCandidate> {
-    const LEADING_TRIM: &[char] = &['(', '[', '{', '<', '"', '\'', '`'];
-    const TRAILING_TRIM: &[char] = &[')', ']', '}', '>', '"', '\'', '`', '.', ',', ';', ':', '!', '?'];
-    /// Tokens longer than this are never paths worth stat-ing.
-    const MAX_TOKEN_LEN: usize = 512;
-
-    let mut out = Vec::new();
-    let mut tokens: Vec<(usize, &str)> = Vec::new();
+    let mut tokens: Vec<(usize, usize)> = Vec::new();
     let mut start: Option<usize> = None;
     for (i, ch) in text.char_indices() {
         if ch.is_whitespace() {
             if let Some(s) = start.take() {
-                tokens.push((s, &text[s..i]));
+                tokens.push((s, i));
             }
         } else if start.is_none() {
             start = Some(i);
         }
     }
     if let Some(s) = start {
-        tokens.push((s, &text[s..]));
+        tokens.push((s, text.len()));
     }
 
-    for (tok_start, raw) in tokens {
-        let mut span_start = tok_start;
-        let mut tok = raw;
-        while let Some(ch) = tok.chars().next() {
-            if !LEADING_TRIM.contains(&ch) {
-                break;
-            }
-            span_start += ch.len_utf8();
-            tok = &tok[ch.len_utf8()..];
-        }
-        while let Some(ch) = tok.chars().last() {
-            if !TRAILING_TRIM.contains(&ch) {
-                break;
-            }
-            tok = &tok[..tok.len() - ch.len_utf8()];
-        }
-        if tok.len() < 2 || tok.len() > MAX_TOKEN_LEN {
+    let mut out = Vec::new();
+    for (i, &(tok_start, tok_end)) in tokens.iter().enumerate() {
+        let Some((start, end, path)) = shape_path_span(text, tok_start, tok_end) else {
             continue;
-        }
-        // URLs belong to `inject_url_hyperlinks`; flags are never paths.
-        if tok.contains("://") || tok.starts_with('-') {
-            continue;
-        }
-        // Strip up to two trailing `:digits` groups — the `path:line`
-        // and `path:line:col` shapes every compiler/grepper emits.
-        let mut path = tok;
-        for _ in 0..2 {
-            match path.rfind(':') {
-                Some(idx)
-                    if !path[idx + 1..].is_empty()
-                        && path[idx + 1..].bytes().all(|b| b.is_ascii_digit()) =>
-                {
-                    path = &path[..idx];
+        };
+        let mut spanning = Vec::new();
+        if starts_absolute(path) {
+            for &(next_start, next_end) in tokens.iter().skip(i + 1).take(MAX_SPANNED_WORDS) {
+                // Two absolute paths side by side (`copy C:\a C:\b`)
+                // are two paths, not one with a space in it.
+                if starts_absolute(trim_leading(&text[next_start..next_end]).1) {
+                    break;
                 }
-                _ => break,
+                if let Some((_, end, longer)) = shape_path_span(text, tok_start, next_end)
+                    && longer.len() > path.len()
+                    && spanning.last().is_none_or(|(_, p): &(usize, String)| p != longer)
+                {
+                    spanning.push((end, longer.to_string()));
+                }
             }
+            spanning.reverse();
         }
-        if !looks_like_path(path) {
-            continue;
-        }
-        out.push(PathCandidate {
-            start: span_start,
-            end: span_start + tok.len(),
-            path: path.to_string(),
-        });
+        out.push(PathCandidate { start, end, path: path.to_string(), spanning });
     }
     out
+}
+
+/// Peel wrapping punctuation off the front of `tok`, returning how many
+/// bytes were dropped and what is left.
+fn trim_leading(tok: &str) -> (usize, &str) {
+    const LEADING_TRIM: &[char] = &['(', '[', '{', '<', '"', '\'', '`'];
+    let rest = tok.trim_start_matches(LEADING_TRIM);
+    (tok.len() - rest.len(), rest)
+}
+
+/// Shape the raw span `text[raw_start..raw_end]` into a path reading:
+/// wrapping punctuation peeled, URLs and flags rejected, a trailing
+/// `:line[:col]` suffix kept in the span but stripped from the path.
+/// Returns `(start, end, path)`, or `None` when it isn't path-shaped.
+fn shape_path_span(text: &str, raw_start: usize, raw_end: usize) -> Option<(usize, usize, &str)> {
+    const TRAILING_TRIM: &[char] = &[')', ']', '}', '>', '"', '\'', '`', '.', ',', ';', ':', '!', '?'];
+    /// Spans longer than this are never paths worth stat-ing.
+    const MAX_TOKEN_LEN: usize = 512;
+
+    let (peeled, tok) = trim_leading(&text[raw_start..raw_end]);
+    // Whitespace too: a span that runs on into a lone `.` must not end
+    // on the space before it.
+    let tok = tok.trim_end_matches(|c: char| TRAILING_TRIM.contains(&c) || c.is_whitespace());
+    if tok.len() < 2 || tok.len() > MAX_TOKEN_LEN {
+        return None;
+    }
+    // URLs belong to `inject_url_hyperlinks`; flags are never paths.
+    if tok.contains("://") || tok.starts_with('-') {
+        return None;
+    }
+    // Strip up to two trailing `:digits` groups — the `path:line`
+    // and `path:line:col` shapes every compiler/grepper emits.
+    let mut path = tok;
+    for _ in 0..2 {
+        match path.rfind(':') {
+            Some(idx)
+                if !path[idx + 1..].is_empty()
+                    && path[idx + 1..].bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                path = &path[..idx];
+            }
+            _ => break,
+        }
+    }
+    if !looks_like_path(path) {
+        return None;
+    }
+    let start = raw_start + peeled;
+    Some((start, start + tok.len(), path))
+}
+
+/// Whether `token` is rooted: `/…`, `\…` (incl. UNC `\\server`), or a
+/// drive path `X:\…` / `X:/…`. Shape only — Windows drive paths count on
+/// every platform, the resolver decides what they mean.
+fn starts_absolute(token: &str) -> bool {
+    let b = token.as_bytes();
+    match b {
+        [b'/' | b'\\', ..] => true,
+        [drive, b':', b'\\' | b'/', ..] => drive.is_ascii_alphabetic(),
+        _ => false,
+    }
 }
 
 /// Shape gate for [`file_path_candidates`]: a separator anywhere, or a
@@ -875,17 +921,36 @@ fn inject_file_path_hyperlinks(
             continue;
         }
         let text = line_text(line);
+        // End of the last link placed: a path that ran on across spaces
+        // swallowed the words after it, and those words must not be
+        // linked again as paths of their own.
+        let mut linked_until = 0;
         for cand in file_path_candidates(&text) {
-            let Some(resolved) = resolve_candidate(&cand.path, base_dir) else {
-                continue;
-            };
-            if !exists(&resolved) {
+            if cand.start < linked_until {
                 continue;
             }
+            let readings = cand
+                .spanning
+                .iter()
+                .map(|(end, path)| (*end, path.as_str()))
+                .chain(std::iter::once((cand.end, cand.path.as_str())));
+            let mut hit = None;
+            for (end, path) in readings {
+                if let Some(resolved) = resolve_candidate(path, base_dir)
+                    && exists(&resolved)
+                {
+                    hit = Some((end, resolved));
+                    break;
+                }
+            }
+            let Some((end, resolved)) = hit else {
+                continue;
+            };
             let col_start = byte_to_col(&text, cand.start);
-            let col_end = byte_to_col(&text, cand.end);
+            let col_end = byte_to_col(&text, end);
             let uri: Arc<str> = Arc::from(resolved.to_string_lossy().as_ref());
             apply_url_to_line(line, col_start, col_end, uri);
+            linked_until = end;
         }
     }
 }
@@ -1229,6 +1294,82 @@ mod tests {
             lines[0][0].hyperlink.as_deref(),
             Some("https://example.com")
         );
+    }
+
+    #[test]
+    fn candidates_offer_longer_spans_for_absolute_paths_with_spaces() {
+        let text = r"saved to D:\Sync\Shared Docs\Project Alpha\ today";
+        let cands = file_path_candidates(text);
+        let first = &cands[0];
+        assert_eq!(first.path, r"D:\Sync\Shared");
+        // Longest first, so the deepest existing path wins.
+        let spans: Vec<&str> = first.spanning.iter().map(|(_, p)| p.as_str()).collect();
+        assert_eq!(
+            spans,
+            vec![
+                r"D:\Sync\Shared Docs\Project Alpha\ today",
+                r"D:\Sync\Shared Docs\Project Alpha\",
+                r"D:\Sync\Shared Docs\Project",
+            ]
+        );
+        // Relative tokens never grow across spaces.
+        assert!(file_path_candidates("edit src/main.rs now").iter().all(|c| c.spanning.is_empty()));
+    }
+
+    #[test]
+    fn candidates_stop_spanning_at_the_next_absolute_path() {
+        let text = r"copy C:\a b C:\c d";
+        let first = &file_path_candidates(text)[0];
+        let spans: Vec<&str> = first.spanning.iter().map(|(_, p)| p.as_str()).collect();
+        assert_eq!(spans, vec![r"C:\a b"]);
+    }
+
+    // Drive paths are only absolute on Windows; elsewhere they would be
+    // joined onto the base and never match the probe.
+    #[cfg(windows)]
+    #[test]
+    fn inject_links_an_absolute_path_containing_spaces() {
+        let text = r"saved to D:\Sync\Shared Docs\Project Alpha\ today";
+        let mut lines = vec![single_run_line(text)];
+        let target = PathBuf::from(r"D:\Sync\Shared Docs\Project Alpha\");
+        let mut exists = |p: &Path| p == target;
+        inject_file_path_hyperlinks(&mut lines, Some(Path::new(r"C:\repo")), &mut exists);
+
+        let linked: Vec<_> = lines[0].iter().filter(|r| r.hyperlink.is_some()).collect();
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].text, r"D:\Sync\Shared Docs\Project Alpha\");
+        assert_eq!(
+            linked[0].hyperlink.as_deref(),
+            Some(target.to_string_lossy().as_ref())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inject_prefers_the_longest_existing_span() {
+        // `D:\Sync` exists too, but the full folder is what was printed.
+        let mut lines = vec![single_run_line(r"D:\Sync\Shared Docs\x.pdf:12")];
+        let mut exists = |p: &Path| {
+            p == Path::new(r"D:\Sync\Shared") || p == Path::new(r"D:\Sync\Shared Docs\x.pdf")
+        };
+        inject_file_path_hyperlinks(&mut lines, None, &mut exists);
+
+        let linked: Vec<_> = lines[0].iter().filter(|r| r.hyperlink.is_some()).collect();
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].text, r"D:\Sync\Shared Docs\x.pdf:12");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inject_links_an_absolute_unix_path_containing_spaces() {
+        let mut lines = vec![single_run_line("open /home/me/My Notes/todo.md now")];
+        let target = PathBuf::from("/home/me/My Notes/todo.md");
+        let mut exists = |p: &Path| p == target;
+        inject_file_path_hyperlinks(&mut lines, None, &mut exists);
+
+        let linked: Vec<_> = lines[0].iter().filter(|r| r.hyperlink.is_some()).collect();
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].text, "/home/me/My Notes/todo.md");
     }
 
     #[test]
