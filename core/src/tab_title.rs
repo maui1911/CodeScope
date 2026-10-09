@@ -173,6 +173,13 @@ mod tests {
     }
 
     #[test]
+    fn restored_title_for_non_git_folder_names_the_folder() {
+        // A project without git never reports a branch, so the folder
+        // label is permanent — it must be the folder, not an id.
+        assert_eq!(restored_title("notes", None, "/dev/notes"), "notes · notes");
+    }
+
+    #[test]
     fn restored_title_without_leaf_uses_whole_path() {
         assert_eq!(restored_title("acme", None, "/"), "acme · /");
     }

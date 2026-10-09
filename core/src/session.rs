@@ -105,11 +105,22 @@ impl SessionDescriptor {
     /// caller hands us the system shell + the persisted row, we hand
     /// back the data the pty layer needs. Matches C#
     /// `SessionManager.BuildDescriptorForSession`.
+    ///
+    /// Title: `display_name`, else the branch, else the worktree's
+    /// folder name. A project without git never has a branch, and
+    /// titling its tab after the session's uuid told the user nothing;
+    /// the id is only the last resort when the path has no leaf.
     pub fn for_session(session: &Session, shell: String, shell_args: Vec<String>) -> Self {
         let title = session
             .display_name
             .clone()
-            .unwrap_or_else(|| session.branch.clone().unwrap_or_else(|| session.id.clone()));
+            .or_else(|| session.branch.clone())
+            .or_else(|| {
+                std::path::Path::new(&session.worktree_path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| session.id.clone());
         Self {
             id: session.id.clone(),
             working_directory: session.worktree_path.clone(),
@@ -1230,16 +1241,16 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_for_session_uses_display_name_then_branch_then_id() {
+    fn descriptor_for_session_uses_display_name_then_branch_then_folder() {
         let mut s = make_session("s1", Some("primary"));
-        s.worktree_path = "C:\\repo\\feat-x".into();
+        s.worktree_path = "/repo/notes".into();
 
         // 1. With display_name set, that wins.
         s.display_name = Some("Pretty name".into());
         s.branch = Some("feat-x".into());
         let d = SessionDescriptor::for_session(&s, "pwsh.exe".into(), Vec::new());
         assert_eq!(d.id, "s1");
-        assert_eq!(d.working_directory, "C:\\repo\\feat-x");
+        assert_eq!(d.working_directory, "/repo/notes");
         assert_eq!(d.shell, "pwsh.exe");
         assert_eq!(d.title, "Pretty name");
 
@@ -1248,8 +1259,14 @@ mod tests {
         let d = SessionDescriptor::for_session(&s, "pwsh.exe".into(), Vec::new());
         assert_eq!(d.title, "feat-x");
 
-        // 3. No display_name, no branch, falls back to id.
+        // 3. No display_name, no branch (a project without git):
+        //    the folder name, never the session's uuid.
         s.branch = None;
+        let d = SessionDescriptor::for_session(&s, "pwsh.exe".into(), Vec::new());
+        assert_eq!(d.title, "notes");
+
+        // 4. Nothing to name it after at all: the id is the last resort.
+        s.worktree_path = String::new();
         let d = SessionDescriptor::for_session(&s, "pwsh.exe".into(), Vec::new());
         assert_eq!(d.title, "s1");
     }
