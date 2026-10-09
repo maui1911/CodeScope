@@ -154,6 +154,87 @@ pub fn move_project_to_group(
     Ok(true)
 }
 
+/// Where a dragged project lands (#374).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectDropTarget {
+    /// Directly above this project, in its section.
+    Before(String),
+    /// Directly below this project, in its section.
+    After(String),
+    /// At the bottom of this section (`None` = "Other") — a drop on a
+    /// section header.
+    IntoGroup(Option<String>),
+}
+
+/// Move `project_id` to `target`. Dropping next to a project adopts
+/// that project's section; dropping on a header behaves like
+/// [`move_project_to_group`]. `Ok(false)` when nothing moved (dropped
+/// on itself, or into the section it is already in). Shifts project
+/// indices — see the module docs.
+pub fn move_project(cfg: &mut ProjectsConfig, project_id: &str, target: &ProjectDropTarget) -> Result<bool> {
+    let (anchor, after) = match target {
+        ProjectDropTarget::IntoGroup(group) => {
+            return move_project_to_group(cfg, project_id, group.as_deref());
+        }
+        ProjectDropTarget::Before(anchor) => (anchor.as_str(), false),
+        ProjectDropTarget::After(anchor) => (anchor.as_str(), true),
+    };
+    let Some(from) = cfg.projects.iter().position(|p| p.id == project_id) else {
+        bail!("project '{project_id}' not found");
+    };
+    if anchor == project_id {
+        return Ok(false);
+    }
+    let Some(anchor_idx) = cfg.projects.iter().position(|p| p.id == anchor) else {
+        bail!("project '{anchor}' not found");
+    };
+    // The anchor's *effective* section: a dangling group id renders in
+    // "Other", so the dragged project joins "Other" too.
+    let group = cfg.projects[anchor_idx]
+        .group_id
+        .clone()
+        .filter(|gid| cfg.project_groups.iter().any(|g| &g.id == gid));
+    let mut to = if after { anchor_idx + 1 } else { anchor_idx };
+    if from < to {
+        to -= 1;
+    }
+    if from == to && cfg.projects[from].group_id == group {
+        return Ok(false);
+    }
+    let mut project = cfg.projects.remove(from);
+    project.group_id = group;
+    cfg.projects.insert(to, project);
+    Ok(true)
+}
+
+/// Move group `group_id` so it renders directly before `before`, or
+/// last (just above "Other") when `before` is `None`. `Ok(false)` when
+/// the order doesn't change.
+pub fn move_group(cfg: &mut ProjectsConfig, group_id: &str, before: Option<&str>) -> Result<bool> {
+    let Some(from) = cfg.project_groups.iter().position(|g| g.id == group_id) else {
+        bail!("group '{group_id}' not found");
+    };
+    if before == Some(group_id) {
+        return Ok(false);
+    }
+    let mut to = match before {
+        Some(b) => match cfg.project_groups.iter().position(|g| g.id == b) {
+            Some(idx) => idx,
+            None => bail!("group '{b}' not found"),
+        },
+        None => cfg.project_groups.len(),
+    };
+    if from < to {
+        to -= 1;
+    }
+    if from == to {
+        return Ok(false);
+    }
+    let group = cfg.project_groups.remove(from);
+    cfg.project_groups.insert(to, group);
+    Ok(true)
+}
+
 /// State of one live session, as a dot on a collapsed sidebar row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionDot {
@@ -320,6 +401,92 @@ mod tests {
         assert_eq!(c.projects[0].id, "a", "a no-op must not reorder");
         assert!(move_project_to_group(&mut c, "a", Some("nope")).is_err());
         assert!(move_project_to_group(&mut c, "nope", None).is_err());
+    }
+
+    fn order(cfg: &ProjectsConfig) -> Vec<Vec<String>> {
+        sidebar_sections(cfg).iter().map(|s| names(cfg, s)).collect()
+    }
+
+    fn drag_cfg() -> ProjectsConfig {
+        cfg(
+            vec![group("g1", "Code"), group("g2", "Admin")],
+            vec![
+                project("a", Some("g1")),
+                project("b", Some("g1")),
+                project("c", Some("g2")),
+                project("d", None),
+            ],
+        )
+    }
+
+    #[test]
+    fn drop_before_or_after_a_project_in_the_same_section_reorders() {
+        let mut c = drag_cfg();
+        assert!(move_project(&mut c, "b", &ProjectDropTarget::Before("a".into())).unwrap());
+        assert_eq!(order(&c), [vec!["b", "a"], vec!["c"], vec!["d"]]);
+        assert!(move_project(&mut c, "b", &ProjectDropTarget::After("a".into())).unwrap());
+        assert_eq!(order(&c), [vec!["a", "b"], vec!["c"], vec!["d"]]);
+    }
+
+    #[test]
+    fn drop_next_to_a_project_in_another_section_joins_that_section() {
+        let mut c = drag_cfg();
+        assert!(move_project(&mut c, "d", &ProjectDropTarget::Before("b".into())).unwrap());
+        assert_eq!(order(&c), [vec!["a", "d", "b"], vec!["c"], vec![]]);
+        assert_eq!(c.projects.iter().find(|p| p.id == "d").unwrap().group_id.as_deref(), Some("g1"));
+
+        assert!(move_project(&mut c, "a", &ProjectDropTarget::After("c".into())).unwrap());
+        assert_eq!(order(&c), [vec!["d", "b"], vec!["c", "a"], vec![]]);
+    }
+
+    #[test]
+    fn drop_onto_itself_or_its_current_slot_is_a_no_op() {
+        let mut c = drag_cfg();
+        assert!(!move_project(&mut c, "a", &ProjectDropTarget::Before("a".into())).unwrap());
+        // "a" already sits right above "b".
+        assert!(!move_project(&mut c, "a", &ProjectDropTarget::Before("b".into())).unwrap());
+        assert!(!move_project(&mut c, "b", &ProjectDropTarget::After("a".into())).unwrap());
+        assert_eq!(order(&c), [vec!["a", "b"], vec!["c"], vec!["d"]]);
+    }
+
+    #[test]
+    fn drop_on_a_header_lands_at_the_bottom_of_that_section() {
+        let mut c = drag_cfg();
+        assert!(move_project(&mut c, "a", &ProjectDropTarget::IntoGroup(Some("g2".into()))).unwrap());
+        assert!(move_project(&mut c, "c", &ProjectDropTarget::IntoGroup(None)).unwrap());
+        assert_eq!(order(&c), [vec!["b"], vec!["a"], vec!["d", "c"]]);
+    }
+
+    #[test]
+    fn drop_next_to_a_project_with_a_dangling_group_joins_other() {
+        let mut c = drag_cfg();
+        c.projects[3].group_id = Some("gone".into());
+        assert!(move_project(&mut c, "a", &ProjectDropTarget::After("d".into())).unwrap());
+        let a = c.projects.iter().find(|p| p.id == "a").unwrap();
+        assert_eq!(a.group_id, None);
+        assert_eq!(order(&c), [vec!["b"], vec!["c"], vec!["d", "a"]]);
+    }
+
+    #[test]
+    fn move_project_rejects_unknown_ids() {
+        let mut c = drag_cfg();
+        assert!(move_project(&mut c, "nope", &ProjectDropTarget::Before("a".into())).is_err());
+        assert!(move_project(&mut c, "a", &ProjectDropTarget::Before("nope".into())).is_err());
+    }
+
+    #[test]
+    fn move_group_reorders_and_reports_no_ops() {
+        let mut c = cfg(vec![group("g1", "A"), group("g2", "B"), group("g3", "C")], vec![]);
+        let ids = |c: &ProjectsConfig| c.project_groups.iter().map(|g| g.id.clone()).collect::<Vec<_>>();
+        assert!(move_group(&mut c, "g3", Some("g1")).unwrap());
+        assert_eq!(ids(&c), ["g3", "g1", "g2"]);
+        assert!(move_group(&mut c, "g3", None).unwrap());
+        assert_eq!(ids(&c), ["g1", "g2", "g3"]);
+        assert!(!move_group(&mut c, "g1", Some("g2")).unwrap());
+        assert!(!move_group(&mut c, "g3", None).unwrap());
+        assert!(!move_group(&mut c, "g2", Some("g2")).unwrap());
+        assert!(move_group(&mut c, "nope", None).is_err());
+        assert!(move_group(&mut c, "g1", Some("nope")).is_err());
     }
 
     #[test]
