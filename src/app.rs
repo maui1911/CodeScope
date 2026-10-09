@@ -5968,6 +5968,9 @@ impl AppShell {
     fn push_sidebar_session_paths(&self, cx: &mut Context<Self>) {
         let mut busy: HashSet<String> = HashSet::new();
         let mut active: HashSet<String> = HashSet::new();
+        // One dot per adopted session, per path, in tab order — the
+        // collapsed group / project rows render these (#374).
+        let mut dots: HashMap<String, Vec<codescope_core::SessionDot>> = HashMap::new();
         for group in &self.groups {
             for tab in &group.tabs {
                 let Some(ref wd) = tab.working_directory else { continue };
@@ -5984,14 +5987,21 @@ impl AppShell {
                 // subset whose telemetry state is `Busy` or
                 // `PendingToolUse`.
                 active.insert(canon.clone());
-                if let Some(snap) = self.telemetry_for(sid)
-                    && matches!(
+                let is_busy = self.telemetry_for(sid).is_some_and(|snap| {
+                    matches!(
                         snap.state,
                         codescope_core::SessionState::Busy
                             | codescope_core::SessionState::PendingToolUse
-                    ) {
-                        busy.insert(canon);
-                    }
+                    )
+                });
+                dots.entry(canon.clone()).or_default().push(if is_busy {
+                    codescope_core::SessionDot::Busy
+                } else {
+                    codescope_core::SessionDot::Idle
+                });
+                if is_busy {
+                    busy.insert(canon);
+                }
             }
         }
         // Remote-shell projects (#323) have no path, so they can't ride
@@ -6004,7 +6014,7 @@ impl AppShell {
             .filter_map(|t| t.remote_project_id.clone())
             .collect();
         self.sidebar.update(cx, |sidebar, cx| {
-            sidebar.set_session_paths(busy, active, cx);
+            sidebar.set_session_paths(busy, active, dots, cx);
             sidebar.set_remote_live_project_ids(remote_live, cx);
         });
     }

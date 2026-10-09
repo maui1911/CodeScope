@@ -30,9 +30,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use codescope_core::{
-    AgentProfile, AgentRegistry, AppPaths, LayoutState, Project, ProjectsConfig, Theme,
+    AgentProfile, AgentRegistry, AppPaths, LayoutState, Project, ProjectGroup, ProjectsConfig,
+    SessionDot, Theme,
 };
 use codescope_core::git::{GitStatus, WorktreeInfo};
+use codescope_core::layout::OTHER_PROJECT_GROUP_KEY;
+use codescope_core::project_groups::{self, OTHER_SECTION_LABEL};
 use codescope_core::projects::{PathOnDisk, WorktreeSync, worktree_is_listed};
 use codescope_core::pr::{CiStatus, PullRequestInfo};
 use gpui::prelude::FluentBuilder as _;
@@ -107,6 +110,50 @@ const NEW_SESSION_ROW_OFFSET_PROJECT: f32 = 45.0;
 /// (e.g. PR badge) in a future iteration.
 const NEW_SESSION_ROW_OFFSET_WORKTREE: f32 = NEW_SESSION_ROW_OFFSET_PROJECT;
 
+/// Vertical offset of the "Move to group ▸" row inside the project
+/// context menus (#374): it sits directly under the 28 px
+/// "New session ▸" row.
+const MOVE_TO_GROUP_ROW_OFFSET: f32 = NEW_SESSION_ROW_OFFSET_PROJECT + 28.0;
+
+/// Same row in the remote-shell project menu, which puts it under its
+/// two 28 px "Open session" / "New session" rows.
+const MOVE_TO_GROUP_ROW_OFFSET_REMOTE: f32 = NEW_SESSION_ROW_OFFSET_PROJECT + 56.0;
+
+/// Most session dots a collapsed group / project row shows before the
+/// rest fold into a "+N" label (#374). Six 6 px dots plus gaps fit the
+/// 160 px minimum sidebar width next to a short name.
+const MAX_SESSION_DOTS: usize = 6;
+
+/// One project's snapshot for the sidebar list: index into
+/// `ProjectsConfig::projects`, id, display name (shared + owned), and
+/// its worktree rows.
+type ProjectRowData = (usize, String, SharedString, String, Vec<WorktreeRowData>);
+
+/// What the sidebar list renders, top to bottom (#374): project rows,
+/// preceded by a header per section once the user has made groups.
+enum SidebarListItem {
+    GroupHeader(GroupHeaderData),
+    Project(ProjectRowData),
+}
+
+/// Snapshot of one section header (a user group, or "Other").
+struct GroupHeaderData {
+    /// Group id, or `None` for "Other".
+    group_id: Option<String>,
+    name: SharedString,
+    project_count: usize,
+    collapsed: bool,
+    /// Live-session dots, only filled while collapsed.
+    dots: Vec<SessionDot>,
+}
+
+impl GroupHeaderData {
+    /// Key in `Sidebar::collapsed_project_groups` / `layout.json`.
+    fn collapse_key(&self) -> String {
+        self.group_id.clone().unwrap_or_else(|| OTHER_PROJECT_GROUP_KEY.to_owned())
+    }
+}
+
 /// Compute where a submenu's top-left should anchor in window coords.
 ///
 /// `parent_pos` is the parent menu's anchored top-left (already in
@@ -167,6 +214,9 @@ enum OpenMenu {
         label: String,
         position: Point<Pixels>,
     },
+    /// Right-click on a user group's section header (#374): Rename…,
+    /// Delete. "Other" has no menu — it can't be renamed or removed.
+    ProjectGroup { group_id: String, position: Point<Pixels> },
 }
 
 /// One-of submenu identifier. The parent context menu opens at most one
@@ -185,6 +235,9 @@ enum SubmenuKind {
     /// `agent_registry.get_all()` with the default first. Mirrors C#
     /// `BuildAgentChoices`.
     NewSession,
+    /// Project "Move to group ▸" picker (#374) — every group, "Other",
+    /// then "New group…".
+    MoveToGroup,
 }
 
 /// Live submenu state. Position is derived from the parent menu's
@@ -425,6 +478,12 @@ pub enum RenameRequest {
     /// Reuses the rename dialog as the single-input editor; submit
     /// goes through `codescope_core::projects::set_remote_shell_command`.
     RemoteCommand { project_id: String },
+    /// Rename a sidebar project group (#374).
+    ProjectGroup { group_id: String },
+    /// Name a new sidebar project group (#374) and, when `project_id`
+    /// is set, move that project into it — the project menu's
+    /// "Move to group ▸ New group…" row.
+    NewProjectGroup { project_id: Option<String> },
 }
 
 /// Toast severity emitted by the sidebar. AppShell maps these to its
@@ -608,6 +667,15 @@ pub struct Sidebar {
     /// flushed back via `save_layout` whenever the user toggles a
     /// chevron, so the disclosure state survives a restart.
     collapsed_projects: HashSet<String>,
+    /// Section headers the user has collapsed (#374): group ids, plus
+    /// [`OTHER_PROJECT_GROUP_KEY`] for "Other". Persisted to
+    /// `layout.collapsed_project_groups` like `collapsed_projects`.
+    collapsed_project_groups: HashSet<String>,
+    /// One dot per live adopted session, keyed by canonicalised
+    /// worktree path, in tab order. Feeds the dots on collapsed group
+    /// and project rows (#374). Pushed with `busy_paths` /
+    /// `active_paths` by [`Sidebar::set_session_paths`].
+    session_dots: HashMap<String, Vec<SessionDot>>,
     /// Worktree rows whose closed-session history disclosure is
     /// expanded. Keyed by `"{project_id}/{worktree_id}"` so primary
     /// rows from different projects don't collide. Defaults to
@@ -718,6 +786,16 @@ impl Sidebar {
         let mut filtered: Vec<String> = collapsed_projects.iter().cloned().collect();
         filtered.sort();
         layout.collapsed_projects = filtered;
+        // Same restore-and-prune for collapsed section headers (#374).
+        let collapsed_project_groups: HashSet<String> = layout
+            .collapsed_project_groups
+            .iter()
+            .filter(|key| is_live_group_key(&projects, key))
+            .cloned()
+            .collect();
+        let mut filtered: Vec<String> = collapsed_project_groups.iter().cloned().collect();
+        filtered.sort();
+        layout.collapsed_project_groups = filtered;
         Self {
             projects,
             selected,
@@ -735,6 +813,8 @@ impl Sidebar {
             worktree_edits: 0,
             pr_urls: HashMap::new(),
             collapsed_projects,
+            collapsed_project_groups,
+            session_dots: HashMap::new(),
             expanded_worktrees: HashSet::new(),
             busy_paths: HashSet::new(),
             active_paths: HashSet::new(),
@@ -838,13 +918,15 @@ impl Sidebar {
         &mut self,
         busy: HashSet<String>,
         active: HashSet<String>,
+        dots: HashMap<String, Vec<SessionDot>>,
         cx: &mut Context<Self>,
     ) {
-        if busy == self.busy_paths && active == self.active_paths {
+        if busy == self.busy_paths && active == self.active_paths && dots == self.session_dots {
             return;
         }
         self.busy_paths = busy;
         self.active_paths = active;
+        self.session_dots = dots;
         cx.notify();
     }
 
@@ -905,6 +987,20 @@ impl Sidebar {
         let mut ids: Vec<String> = self.collapsed_projects.iter().cloned().collect();
         ids.sort();
         self.layout.collapsed_projects = ids;
+        let mut keys: Vec<String> = self.collapsed_project_groups.iter().cloned().collect();
+        keys.sort();
+        self.layout.collapsed_project_groups = keys;
+    }
+
+    /// Flip a section header's collapse state (#374). `key` is the
+    /// group id or [`OTHER_PROJECT_GROUP_KEY`].
+    fn toggle_project_group_collapsed(&mut self, key: &str, cx: &mut Context<Self>) {
+        if !self.collapsed_project_groups.remove(key) {
+            self.collapsed_project_groups.insert(key.to_owned());
+        }
+        self.sync_layout_collapsed_projects();
+        self.save_layout();
+        cx.notify();
     }
 
     /// Drop any `collapsed_projects` entries that no longer exist in
@@ -914,13 +1010,15 @@ impl Sidebar {
     /// (project removed → its id sat there forever; same id later
     /// re-added would inherit the stale collapsed flag).
     fn prune_collapsed_projects(&mut self) {
-        if self.collapsed_projects.is_empty() {
+        if self.collapsed_projects.is_empty() && self.collapsed_project_groups.is_empty() {
             return;
         }
         let live: HashSet<&str> = self.projects.projects.iter().map(|p| p.id.as_str()).collect();
-        let before = self.collapsed_projects.len();
+        let before = self.collapsed_projects.len() + self.collapsed_project_groups.len();
         self.collapsed_projects.retain(|id| live.contains(id.as_str()));
-        if self.collapsed_projects.len() != before {
+        let projects = &self.projects;
+        self.collapsed_project_groups.retain(|key| is_live_group_key(projects, key));
+        if self.collapsed_projects.len() + self.collapsed_project_groups.len() != before {
             // Pruning ran before persistence existed, so callers got
             // away with leaving the on-disk copy alone. Now that we
             // persist, mirror the cleaned set back into `layout` so
@@ -1702,10 +1800,86 @@ impl Sidebar {
     pub(crate) fn replace_projects(&mut self, next: ProjectsConfig) {
         self.projects = next;
         let prev_collapsed = self.layout.collapsed_projects.clone();
+        let prev_collapsed_groups = self.layout.collapsed_project_groups.clone();
         self.prune_collapsed_projects();
-        if self.layout.collapsed_projects != prev_collapsed {
+        // Indices may have moved (a group change reorders projects);
+        // the selection follows the id.
+        self.reselect_by_id();
+        if self.layout.collapsed_projects != prev_collapsed
+            || self.layout.collapsed_project_groups != prev_collapsed_groups
+        {
             self.save_layout();
         }
+    }
+
+    /// Re-point `selected` at the project `layout.selected_project_id`
+    /// names. Needed after anything that reorders
+    /// `ProjectsConfig::projects` — moving a project between groups
+    /// moves its row (#374).
+    fn reselect_by_id(&mut self) {
+        if let Some(id) = self.layout.selected_project_id.as_deref()
+            && let Some(idx) = self.projects.projects.iter().position(|p| p.id == id)
+        {
+            self.selected = Some(idx);
+        }
+    }
+
+    /// Commit a group edit made by `edit` on a copy of the config:
+    /// save first, swap in only on success (the clone-then-save rule
+    /// every sidebar mutator follows), then re-resolve the selection.
+    /// Errors surface as a toast.
+    fn commit_projects_edit(
+        &mut self,
+        failure_title: &'static str,
+        edit: impl FnOnce(&mut ProjectsConfig) -> anyhow::Result<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut next = self.projects.clone();
+        let result = edit(&mut next).and_then(|changed| {
+            if changed {
+                next.save(&self.paths)?;
+            }
+            Ok(changed)
+        });
+        match result {
+            Ok(true) => {
+                self.replace_projects(next);
+                cx.notify();
+            }
+            Ok(false) => {}
+            Err(err) => cx.emit(SidebarEvent::Toast {
+                kind: ToastSeverity::Err,
+                title: failure_title.into(),
+                detail: Some(format!("{err:#}").into()),
+            }),
+        }
+    }
+
+    /// Move a project into `group_id` (`None` = "Other") — the
+    /// "Move to group ▸" submenu (#374).
+    fn move_project_to_group(
+        &mut self,
+        project_id: &str,
+        group_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_menu(cx);
+        self.commit_projects_edit(
+            "Could not move project",
+            |cfg| project_groups::move_project_to_group(cfg, project_id, group_id.as_deref()),
+            cx,
+        );
+    }
+
+    /// Delete a group; its projects fall back to "Other" (#374). No
+    /// confirmation: nothing is lost.
+    fn delete_project_group(&mut self, group_id: &str, cx: &mut Context<Self>) {
+        self.close_menu(cx);
+        self.commit_projects_edit(
+            "Could not delete group",
+            |cfg| project_groups::delete_group(cfg, group_id).map(|()| true),
+            cx,
+        );
     }
 
     /// Dialog accessors used by the dialog module's helpers. Kept
@@ -1784,6 +1958,7 @@ impl Sidebar {
         };
         on_disk.selected_project_id = self.layout.selected_project_id.clone();
         on_disk.collapsed_projects = self.layout.collapsed_projects.clone();
+        on_disk.collapsed_project_groups = self.layout.collapsed_project_groups.clone();
         if let Err(err) = on_disk.save(&self.paths) {
             eprintln!("warning: failed to save layout.json: {err:#}");
         }
@@ -2741,6 +2916,7 @@ impl Sidebar {
         }
         let prev_selected_id = self.layout.selected_project_id.clone();
         let prev_collapsed = self.layout.collapsed_projects.clone();
+        let prev_collapsed_groups = self.layout.collapsed_project_groups.clone();
         let mut next = self.projects.clone();
         next.projects.remove(idx);
         if let Err(err) = next.save(&self.paths) {
@@ -2770,6 +2946,7 @@ impl Sidebar {
         // leaves both intact and skips the write.
         if self.layout.selected_project_id != prev_selected_id
             || self.layout.collapsed_projects != prev_collapsed
+            || self.layout.collapsed_project_groups != prev_collapsed_groups
         {
             self.save_layout();
         }
@@ -2787,7 +2964,10 @@ impl Sidebar {
     /// previous consistent state, instead of producing an in-memory
     /// row that disappears on relaunch — and (worse) a `layout.json`
     /// pointing at a project id that never made it to `projects.json`.
-    pub fn add_project(&mut self, path: String, cx: &mut Context<Self>) {
+    /// `group_id` places the new project in that group (the "+" on a
+    /// section header, #374); `None` — or a group deleted meanwhile —
+    /// lands it at the bottom of "Other".
+    pub fn add_project(&mut self, path: String, group_id: Option<String>, cx: &mut Context<Self>) {
         // Refuse duplicates. Normalising-aware lookup (slash style,
         // trailing separators, ASCII case) so different spellings of
         // the same folder route to the same existing row instead of
@@ -2799,7 +2979,8 @@ impl Sidebar {
             self.select(idx, cx);
             return;
         }
-        let project = Project::new(path);
+        let mut project = Project::new(path);
+        project.group_id = self.existing_group(group_id);
         // Probe once, synchronously, so the new row renders with its
         // `no git` slug and trimmed menu immediately instead of after
         // the poller's next tick. One `rev-parse`, a few ms; an
@@ -2857,6 +3038,11 @@ impl Sidebar {
         cx.notify();
     }
 
+    /// `group_id` if it still names a group, else `None` ("Other").
+    fn existing_group(&self, group_id: Option<String>) -> Option<String> {
+        group_id.filter(|gid| self.projects.project_groups.iter().any(|g| &g.id == gid))
+    }
+
     /// Add a [`codescope_core::ProjectKind::RemoteShell`] project
     /// (#323). Same clone-then-save discipline as [`Self::add_project`];
     /// no path dedup because there is no path — the dialog rejects a
@@ -2866,9 +3052,11 @@ impl Sidebar {
         name: String,
         command: String,
         agent_id: Option<String>,
+        group_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let project = Project::new_remote_shell(name, command, agent_id);
+        let mut project = Project::new_remote_shell(name, command, agent_id);
+        project.group_id = self.existing_group(group_id);
         let new_id = project.id.clone();
         let mut next = self.projects.clone();
         next.projects.push(project);
@@ -3123,23 +3311,17 @@ impl Render for Sidebar {
         // rather than a single iterator because the project + child
         // rows are different element shapes and need to be flattened
         // into a single `.children(...)` call.
+        let items = self.sidebar_list_items(rows);
         let mut project_and_worktree_rows: Vec<gpui::AnyElement> = Vec::new();
-        for (idx, id, name, project_name, worktrees) in rows.into_iter() {
+        for item in items {
+            let (idx, id, name, project_name, worktrees) = match item {
+                SidebarListItem::GroupHeader(header) => {
+                    project_and_worktree_rows.push(self.render_group_header(header, &theme, cx));
+                    continue;
+                }
+                SidebarListItem::Project(row) => row,
+            };
             let active = selected == Some(idx);
-            // Compute the "any child worktree currently has a busy
-            // agent session" propagation flag up-front so the project
-            // row (rendered before the child rows) can pull it in.
-            // Mirrors C# `ProjectViewModel.HasBusyChild` — surfaces
-            // as a small `signal_warn` dot next to the count badge so
-            // a collapsed project still tells the user something is
-            // running underneath. Uses the per-row cached
-            // `canonical_path` (computed once when `rows` was built)
-            // so the busy halo's per-frame redraw doesn't keep
-            // canonicalising paths from raw strings every tick.
-            let any_busy_child = worktrees.iter().any(|wt| {
-                !wt.canonical_path.is_empty()
-                    && self.busy_paths.contains(&wt.canonical_path)
-            });
             // Issue #248: does the currently focused tab live in one of
             // this project's worktrees? If so the project row carries a
             // faint accent wash — which is the *only* active-context cue
@@ -3255,23 +3437,20 @@ impl Render for Sidebar {
                 )
                 .child(chevron)
                 .child(div().flex_grow().truncate().child(name));
-            // C# `SidebarView.xaml` lines 553-561: collapsed (or just
-            // expanded) project surfaces a small `Signal.Warn` (red)
-            // dot when any child worktree's adopted session is busy.
-            // The C# template gates this on `HasBusyChild` regardless
-            // of collapse state — the dot is "attention propagates"
-            // signalling, not a collapsed-only affordance.
-            let project_row = if any_busy_child {
-                project_row.child(
-                    div()
-                        .ml(px(6.0))
-                        .w(px(6.0))
-                        .h(px(6.0))
-                        .rounded_full()
-                        .bg(theme::signal_warn()),
-                )
+            // A collapsed project shows one dot per live session (red
+            // busy, green idle), in worktree-row order, so the hidden
+            // rows still report "3 working, 1 done" (#374). Expanded,
+            // the worktree rows carry their own dots, so the project
+            // row stays bare. This replaced the single busy dot the C#
+            // template showed regardless of collapse state.
+            let collapsed_dots = if collapsed {
+                self.project_session_dots(&id, &worktrees)
             } else {
-                project_row
+                Vec::new()
+            };
+            let project_row = match render_session_dots(collapsed_dots, &theme) {
+                Some(dots) => project_row.child(dots),
+                None => project_row,
             };
             project_and_worktree_rows.push(project_row.into_any_element());
 
@@ -4184,7 +4363,7 @@ impl Render for Sidebar {
                 for path in paths.paths() {
                     if path.is_dir() {
                         let path_str = path.to_string_lossy().into_owned();
-                        this.add_project(path_str, cx);
+                        this.add_project(path_str, None, cx);
                     }
                 }
             }))
@@ -4226,6 +4405,31 @@ impl Render for Sidebar {
                             .into_any_element()
                     };
                     root = root.child(overlay);
+                    if let Some(sub) = self.open_submenu.as_ref()
+                        && sub.kind == SubmenuKind::MoveToGroup
+                    {
+                        let row_top = if project.is_remote_shell() {
+                            MOVE_TO_GROUP_ROW_OFFSET_REMOTE
+                        } else {
+                            MOVE_TO_GROUP_ROW_OFFSET
+                        };
+                        let submenu_pos = submenu_open_position(
+                            project_pos,
+                            px(PROJECT_MENU_WIDTH_PX),
+                            px(row_top),
+                        );
+                        let body = self.render_move_to_group_submenu(&project, cx);
+                        root = root.child(
+                            deferred(
+                                anchored()
+                                    .position(submenu_pos)
+                                    .anchor(Corner::TopLeft)
+                                    .snap_to_window_with_margin(px(8.0))
+                                    .child(body),
+                            )
+                            .into_any_element(),
+                        );
+                    }
                     if let Some(sub) = self.open_submenu.as_ref()
                         && sub.kind == SubmenuKind::NewSession
                     {
@@ -4317,6 +4521,16 @@ impl Render for Sidebar {
                     )
                     .into_any_element();
                 root = root.child(overlay);
+            }
+            Some(OpenMenu::ProjectGroup { group_id, position }) => {
+                if let Some(group) =
+                    self.projects.project_groups.iter().find(|g| &g.id == group_id).cloned()
+                {
+                    let overlay = self
+                        .render_project_group_menu(&group, *position, &theme, cx)
+                        .into_any_element();
+                    root = root.child(overlay);
+                }
             }
             None => {}
         }
@@ -4737,6 +4951,8 @@ impl Sidebar {
         let ink_ghost = theme::ink_ghost(theme);
         let frost = theme::frost_10(theme);
         let danger = theme::danger();
+        // Built before `item` borrows `cx` (#374).
+        let move_to_group_row = self.build_move_to_group_parent_row(cx);
 
         let item = |id: &'static str,
                     label: &'static str,
@@ -4833,6 +5049,7 @@ impl Sidebar {
                     this.close_menu(cx);
                 }),
             ))
+            .child(move_to_group_row)
             .child(div().h_px().bg(divider).my_1())
             .child(item(
                 "remote-menu-copy-command",
@@ -4925,6 +5142,7 @@ impl Sidebar {
             "proj-menu-new-session",
             cx,
         );
+        let move_to_group_row = self.build_move_to_group_parent_row(cx);
 
         let item = |id: &'static str,
                     label: &'static str,
@@ -4996,6 +5214,10 @@ impl Sidebar {
             // project scope. Clicking the parent fires the default
             // agent on the project's primary worktree path.
             .child(new_session_parent_row)
+            // "Move to group ▸" (#374) — directly under "New session ▸"
+            // so the submenu anchor is one row lower
+            // (`MOVE_TO_GROUP_ROW_OFFSET`).
+            .child(move_to_group_row)
             // Worktree + Git rows only make sense on a repository; a
             // plain-folder project (#338) goes straight to Reveal.
             .when(is_repo, |menu| {
@@ -6106,6 +6328,460 @@ pub(crate) fn reveal_in_file_browser_label() -> &'static str {
         "Reveal in Finder"
     } else {
         "Reveal in File Manager"
+    }
+}
+
+/// Whether a `collapsed_project_groups` key still names something:
+/// "Other" always does, a group id only while that group exists.
+fn is_live_group_key(projects: &ProjectsConfig, key: &str) -> bool {
+    key == OTHER_PROJECT_GROUP_KEY || projects.project_groups.iter().any(|g| g.id == key)
+}
+
+/// A row of session dots (red busy, green idle), capped at
+/// [`MAX_SESSION_DOTS`] with a "+N" tail (#374). `None` for no dots.
+fn render_session_dots(dots: Vec<SessionDot>, theme: &Arc<Theme>) -> Option<gpui::Div> {
+    if dots.is_empty() {
+        return None;
+    }
+    let (shown, overflow) = project_groups::cap_dots(dots, MAX_SESSION_DOTS);
+    let row = div()
+        .flex_shrink_0()
+        .ml(px(6.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(3.0))
+        .children(shown.into_iter().map(|dot| {
+            let color = match dot {
+                SessionDot::Busy => theme::signal_warn(),
+                SessionDot::Idle => theme::signal_ok(),
+            };
+            div().w(px(6.0)).h(px(6.0)).rounded_full().bg(color)
+        }))
+        .when(overflow > 0, |row| {
+            row.child(
+                div()
+                    .ml(px(2.0))
+                    .text_size(px(10.0))
+                    .text_color(theme::ink_ghost(theme))
+                    .child(format!("+{overflow}")),
+            )
+        });
+    Some(row)
+}
+
+impl Sidebar {
+    /// Order the (already filtered) project rows into sections (#374).
+    /// Without groups this is the plain list, untouched. With groups
+    /// every section gets a header; a collapsed section contributes
+    /// only its header. While the filter has text, sections without a
+    /// match are dropped and the rest render expanded, so a match is
+    /// never hidden behind a collapsed header.
+    fn sidebar_list_items(&self, rows: Vec<ProjectRowData>) -> Vec<SidebarListItem> {
+        if self.projects.project_groups.is_empty() {
+            return rows.into_iter().map(SidebarListItem::Project).collect();
+        }
+        let filtering = !self.filter.trim().is_empty();
+        let mut by_idx: HashMap<usize, ProjectRowData> =
+            rows.into_iter().map(|row| (row.0, row)).collect();
+        let mut items = Vec::new();
+        for section in project_groups::sidebar_sections(&self.projects) {
+            let project_count = section.projects.len();
+            let section_rows: Vec<ProjectRowData> =
+                section.projects.iter().filter_map(|idx| by_idx.remove(idx)).collect();
+            if filtering && section_rows.is_empty() {
+                continue;
+            }
+            let group_id = section.group.map(|g| g.id.clone());
+            let key = group_id.clone().unwrap_or_else(|| OTHER_PROJECT_GROUP_KEY.to_owned());
+            let collapsed = !filtering && self.collapsed_project_groups.contains(&key);
+            let dots = if collapsed {
+                section_rows
+                    .iter()
+                    .flat_map(|(_, id, _, _, worktrees)| self.project_session_dots(id, worktrees))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let name: SharedString = section
+                .group
+                .map_or(OTHER_SECTION_LABEL, |g| g.name.as_str())
+                .to_owned()
+                .into();
+            items.push(SidebarListItem::GroupHeader(GroupHeaderData {
+                group_id,
+                name,
+                project_count,
+                collapsed,
+                dots,
+            }));
+            if !collapsed {
+                items.extend(section_rows.into_iter().map(SidebarListItem::Project));
+            }
+        }
+        items
+    }
+
+    /// Live-session dots for one project, in worktree-row order (#374).
+    /// A remote-shell project has no paths; its live tab counts as one
+    /// idle dot (there is no remote telemetry to say "busy").
+    fn project_session_dots(&self, project_id: &str, worktrees: &[WorktreeRowData]) -> Vec<SessionDot> {
+        if self.remote_live_project_ids.contains(project_id) {
+            return vec![SessionDot::Idle];
+        }
+        project_groups::collect_session_dots(
+            worktrees.iter().map(|wt| wt.canonical_path.as_str()),
+            &self.session_dots,
+        )
+    }
+
+    /// One section header: chevron, name, project count, the session
+    /// dots while collapsed, and a hover "+" that adds a project into
+    /// this section. Right-click opens the group menu (not on "Other").
+    fn render_group_header(
+        &self,
+        header: GroupHeaderData,
+        theme: &Arc<Theme>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let key = header.collapse_key();
+        let hover_group = SharedString::from(format!("group-header-{key}"));
+        let chevron_glyph = if header.collapsed { "\u{25B8}" } else { "\u{25BE}" };
+        let key_for_toggle = key.clone();
+        let group_for_add = header.group_id.clone();
+        let group_for_menu = header.group_id.clone();
+        let ink = theme::ink(theme);
+        let ink_ghost = theme::ink_ghost(theme);
+        let frost = theme::frost_10(theme);
+
+        let add_button = div()
+            .id(("group-add", id_hash(&key)))
+            .flex_shrink_0()
+            .ml(px(4.0))
+            .w(px(20.0))
+            .h(px(20.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_sm()
+            // Invisible until the header is hovered, so a stack of
+            // headers doesn't read as a column of "+" glyphs.
+            .text_color(gpui::transparent_black())
+            .group_hover(hover_group.clone(), move |s| s.text_color(ink_ghost))
+            .hover(move |s| s.bg(frost).text_color(ink))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.open_new_project_dialog_in_group(group_for_add.clone(), window, cx);
+                }),
+            )
+            .child("+");
+
+        div()
+            .id(("group-header", id_hash(&key)))
+            .group(hover_group)
+            .h(px(28.0))
+            .mt(px(4.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .pl(px(4.0))
+            .pr_3()
+            .text_size(px(11.0))
+            .text_color(theme::ink_muted(theme))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.toggle_project_group_collapsed(&key_for_toggle, cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    if let Some(group_id) = group_for_menu.clone() {
+                        this.menu = Some(OpenMenu::ProjectGroup {
+                            group_id,
+                            position: event.position,
+                        });
+                        this.open_submenu = None;
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(
+                div()
+                    .w(px(24.0))
+                    .h(px(24.0))
+                    .mr(px(6.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(12.0))
+                    .child(chevron_glyph),
+            )
+            .child(div().flex_shrink().truncate().child(header.name))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .ml(px(6.0))
+                    .text_color(ink_ghost)
+                    .child(header.project_count.to_string()),
+            )
+            .child(div().flex_grow())
+            .child(add_button)
+            // Dots last, so they sit flush right like the dots on a
+            // collapsed project row below.
+            .children(render_session_dots(header.dots, theme))
+            .into_any_element()
+    }
+
+    /// Right-click menu on a user group's header (#374).
+    fn render_project_group_menu(
+        &self,
+        group: &ProjectGroup,
+        position: Point<Pixels>,
+        theme: &Arc<Theme>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let elevated = theme::elevated(theme);
+        let divider = theme::divider(theme);
+        let ink = theme::ink(theme);
+        let ink_dim = theme::ink_dim(theme);
+        let ink_ghost = theme::ink_ghost(theme);
+        let frost = theme::frost_10(theme);
+        let danger = theme::danger();
+
+        let item = |id: &'static str, label: &'static str, danger_row: bool, on_click: MenuItemAction| {
+            let base_color = if danger_row { danger } else { ink_dim };
+            let hover_color = if danger_row { danger } else { ink };
+            div()
+                .id(id)
+                .h(px(28.0))
+                .px_3()
+                .flex()
+                .flex_row()
+                .items_center()
+                .text_size(px(12.5))
+                .text_color(base_color)
+                .cursor_pointer()
+                .hover(move |s| s.bg(frost).text_color(hover_color))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        on_click(this, window, cx);
+                    }),
+                )
+                .child(label)
+        };
+
+        let rename_id = group.id.clone();
+        let rename_name = group.name.clone();
+        let delete_id = group.id.clone();
+        let menu_body = div()
+            .flex()
+            .flex_col()
+            .py_1()
+            .min_w(px(200.0))
+            .bg(elevated)
+            .border_1()
+            .border_color(divider)
+            .rounded_md()
+            .shadow_lg()
+            .font(theme::font_sans())
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(10.0))
+                    .text_color(ink_ghost)
+                    .child(
+                        div()
+                            .text_color(ink)
+                            .font(theme::font_mono())
+                            .text_size(px(11.0))
+                            .truncate()
+                            .child(SharedString::from(group.name.clone())),
+                    )
+                    .child(div().child("group")),
+            )
+            .child(div().h_px().bg(divider).my_1())
+            .child(item(
+                "group-menu-rename",
+                "Rename group…",
+                false,
+                Box::new(move |this, _window, cx| {
+                    cx.emit(SidebarEvent::OpenRenameDialog {
+                        target: RenameRequest::ProjectGroup { group_id: rename_id.clone() },
+                        current_name: rename_name.clone(),
+                    });
+                    this.close_menu(cx);
+                }),
+            ))
+            // No confirmation: deleting only ungroups — every project
+            // and session stays (#374).
+            .child(item(
+                "group-menu-delete",
+                "Delete group",
+                true,
+                Box::new(move |this, _window, cx| this.delete_project_group(&delete_id, cx)),
+            ))
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_menu(cx)));
+
+        deferred(
+            anchored()
+                .position(point(position.x, position.y))
+                .anchor(Corner::TopLeft)
+                .snap_to_window_with_margin(px(8.0))
+                .child(menu_body),
+        )
+    }
+
+    /// "Move to group ▸" parent row for the project menus (#374).
+    /// Hover opens the submenu; there is no click action of its own.
+    fn build_move_to_group_parent_row(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = self.theme.clone();
+        let ink = theme::ink(&theme);
+        let ink_dim = theme::ink_dim(&theme);
+        let ink_ghost = theme::ink_ghost(&theme);
+        let frost = theme::frost_10(&theme);
+        div()
+            .id("proj-menu-move-to-group")
+            .h(px(28.0))
+            .px_3()
+            .flex()
+            .flex_row()
+            .items_center()
+            .text_size(px(12.5))
+            .text_color(ink_dim)
+            .cursor_pointer()
+            .hover(move |s| s.bg(frost).text_color(ink))
+            .on_hover(cx.listener(|this, hovering, _window, cx| {
+                this.set_submenu_parent_hover(SubmenuKind::MoveToGroup, *hovering, cx);
+                if *hovering {
+                    this.open_submenu(SubmenuKind::MoveToGroup, cx);
+                }
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.open_submenu(SubmenuKind::MoveToGroup, cx);
+                }),
+            )
+            .child(div().flex_grow().child("Move to group"))
+            .child(div().ml(px(8.0)).text_size(px(12.0)).text_color(ink_ghost).child("▸"))
+            .into_any_element()
+    }
+
+    /// The "Move to group ▸" submenu: every group, "Other" (once any
+    /// group exists), then "New group…". The project's current section
+    /// is marked and inert.
+    fn render_move_to_group_submenu(&self, project: &Project, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = self.theme.clone();
+        let elevated = theme::elevated(&theme);
+        let divider = theme::divider(&theme);
+        let ink = theme::ink(&theme);
+        let ink_dim = theme::ink_dim(&theme);
+        let ink_ghost = theme::ink_ghost(&theme);
+        let frost = theme::frost_10(&theme);
+        let accent = theme::accent(&theme);
+        let current = self.existing_group(project.group_id.clone());
+
+        let mut targets: Vec<(Option<String>, String)> = self
+            .projects
+            .project_groups
+            .iter()
+            .map(|g| (Some(g.id.clone()), g.name.clone()))
+            .collect();
+        if !targets.is_empty() {
+            targets.push((None, OTHER_SECTION_LABEL.to_owned()));
+        }
+
+        let mut body = div()
+            .id("submenu-move-to-group")
+            .flex()
+            .flex_col()
+            .py_1()
+            .min_w(px(180.0))
+            .bg(elevated)
+            .border_1()
+            .border_color(divider)
+            .rounded_md()
+            .shadow_lg()
+            .font(theme::font_sans())
+            .on_hover(cx.listener(|this, hovering, _window, cx| {
+                this.set_submenu_self_hover(*hovering, cx);
+            }))
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()));
+
+        let has_targets = !targets.is_empty();
+        for (group_id, name) in targets {
+            let is_current = group_id == current;
+            let row_key = group_id.clone().unwrap_or_else(|| OTHER_PROJECT_GROUP_KEY.to_owned());
+            let mut row = div()
+                .id(("submenu-move-group", id_hash(&row_key)))
+                .h(px(28.0))
+                .px_3()
+                .flex()
+                .flex_row()
+                .items_center()
+                .text_size(px(12.5))
+                .text_color(if is_current { ink_ghost } else { ink_dim })
+                .child(div().flex_grow().truncate().child(name));
+            if is_current {
+                row = row.child(div().ml(px(6.0)).w(px(6.0)).h(px(6.0)).rounded_full().bg(accent));
+            } else {
+                let project_id = project.id.clone();
+                row = row
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(frost).text_color(ink))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.move_project_to_group(&project_id, group_id.clone(), cx);
+                        }),
+                    );
+            }
+            body = body.child(row);
+        }
+        if has_targets {
+            body = body.child(div().h_px().bg(divider).my_1());
+        }
+        let project_id = project.id.clone();
+        body.child(
+            div()
+                .id("submenu-new-group")
+                .h(px(28.0))
+                .px_3()
+                .flex()
+                .flex_row()
+                .items_center()
+                .text_size(px(12.5))
+                .text_color(ink_dim)
+                .cursor_pointer()
+                .hover(move |s| s.bg(frost).text_color(ink))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.emit(SidebarEvent::OpenRenameDialog {
+                            target: RenameRequest::NewProjectGroup {
+                                project_id: Some(project_id.clone()),
+                            },
+                            current_name: String::new(),
+                        });
+                        this.close_menu(cx);
+                    }),
+                )
+                .child("New group…"),
+        )
+        .into_any_element()
     }
 }
 
