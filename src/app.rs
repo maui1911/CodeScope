@@ -719,7 +719,9 @@ impl Render for DraggedTab {
 /// agent-agnostic.
 enum AgentTail {
     Claude(codescope_core::ClaudeTranscriptTail),
+    Codex(codescope_core::CodexRolloutTail),
     Copilot(codescope_core::CopilotTranscriptTail),
+    Gemini(codescope_core::GeminiChatTail),
     OpenCode(codescope_core::OpenCodeMessageTail),
     Pi(codescope_core::PiTranscriptTail),
 }
@@ -728,7 +730,9 @@ impl AgentTail {
     fn poll(&mut self) -> bool {
         match self {
             AgentTail::Claude(t) => t.poll(),
+            AgentTail::Codex(t) => t.poll(),
             AgentTail::Copilot(t) => t.poll(),
+            AgentTail::Gemini(t) => t.poll(),
             AgentTail::OpenCode(t) => t.poll(),
             AgentTail::Pi(t) => t.poll(),
         }
@@ -737,7 +741,9 @@ impl AgentTail {
     fn snapshot(&self) -> Option<codescope_core::TelemetrySnapshot> {
         match self {
             AgentTail::Claude(t) => t.snapshot.clone(),
+            AgentTail::Codex(t) => t.snapshot.clone(),
             AgentTail::Copilot(t) => t.snapshot.clone(),
+            AgentTail::Gemini(t) => t.snapshot.clone(),
             AgentTail::OpenCode(t) => t.snapshot.clone(),
             AgentTail::Pi(t) => t.snapshot.clone(),
         }
@@ -1990,17 +1996,34 @@ impl AppShell {
                     session_id.clone(),
                 ))
             }
-            codescope_core::AgentId::Codex | codescope_core::AgentId::Gemini => {
-                // Codex / Gemini telemetry isn't wired in the Rust
-                // port yet (the AgentRegistry entries exist ahead of
-                // the discovery layer); skip registration so the rest
-                // of the agent surface keeps working until the
-                // dedicated discovery / telemetry modules land.
-                eprintln!(
-                    "[telemetry] {} telemetry not yet wired — skipping registration for {session_id}",
-                    agent_id.as_str()
-                );
-                return;
+            codescope_core::AgentId::Codex => {
+                let Some(home) = codescope_core::agents::codex::telemetry::default_codex_home()
+                else {
+                    eprintln!(
+                        "[telemetry] no CODEX_HOME / USERPROFILE / HOME — skipping codex registration for {session_id}"
+                    );
+                    return;
+                };
+                // The rollout is created lazily on the first turn; the
+                // tail keeps looking for it, so register regardless.
+                AgentTail::Codex(codescope_core::CodexRolloutTail::for_session(
+                    &home,
+                    &session_id,
+                ))
+            }
+            codescope_core::AgentId::Gemini => {
+                let Some(home) = codescope_core::agents::gemini::discovery::default_gemini_home()
+                else {
+                    eprintln!(
+                        "[telemetry] no GEMINI_CLI_HOME / USERPROFILE / HOME — skipping gemini registration for {session_id}"
+                    );
+                    return;
+                };
+                AgentTail::Gemini(codescope_core::GeminiChatTail::for_session(
+                    &home,
+                    working_directory,
+                    &session_id,
+                ))
             }
             codescope_core::AgentId::Pi => {
                 let Some(root) = codescope_core::agents::pi::telemetry::default_sessions_root() else {
@@ -2350,21 +2373,6 @@ impl AppShell {
                         for (t_idx, tab) in group.tabs.iter().enumerate() {
                             let Some(agent_id) = tab.agent_id else { continue };
                             let Some(ref wd) = tab.working_directory else { continue };
-                            // Codex / Gemini have no discovery wired
-                            // in the Rust port yet — skip before
-                            // flipping `any_active`, otherwise a
-                            // workspace of only Codex/Gemini tabs
-                            // would pin the poll at the 350 ms active
-                            // rate while the loop does no work. Drop
-                            // them through with the same "no agent"
-                            // handling so the cadence relaxes to the
-                            // 5 s idle interval.
-                            if matches!(
-                                agent_id,
-                                codescope_core::AgentId::Codex | codescope_core::AgentId::Gemini
-                            ) {
-                                continue;
-                            }
                             any_active = true;
                             let exact = this
                                 .claude_procs
@@ -2439,16 +2447,42 @@ impl AppShell {
                                     .map(|c| (c.session_id, c.session_dir))
                                     .collect()
                                 }
-                                codescope_core::AgentId::Codex
-                                | codescope_core::AgentId::Gemini => {
-                                    // Unreachable: short-circuited
-                                    // above so the active-poll rate
-                                    // doesn't stay pinned for a
-                                    // Codex/Gemini-only workspace.
-                                    // Kept as a belt-and-braces
-                                    // fallback in case someone
-                                    // removes the early skip.
-                                    continue;
+                                // Codex and Gemini also take the tab's
+                                // adopted id: a resumed session keeps
+                                // writing to a file created before this
+                                // tab spawned, outside the since-spawn
+                                // window the scan otherwise covers.
+                                codescope_core::AgentId::Codex => {
+                                    let Some(home) =
+                                        codescope_core::agents::codex::telemetry::default_codex_home()
+                                    else {
+                                        continue;
+                                    };
+                                    codescope_core::agents::codex::discovery::scan(
+                                        &codescope_core::agents::codex::telemetry::sessions_root(&home),
+                                        &wd_str,
+                                        tab.spawned_at,
+                                        tab.adopted_session_id.as_deref(),
+                                    )
+                                    .into_iter()
+                                    .map(|c| (c.session_id, c.path))
+                                    .collect()
+                                }
+                                codescope_core::AgentId::Gemini => {
+                                    let Some(home) =
+                                        codescope_core::agents::gemini::discovery::default_gemini_home()
+                                    else {
+                                        continue;
+                                    };
+                                    codescope_core::agents::gemini::discovery::scan(
+                                        &home,
+                                        &wd_str,
+                                        tab.spawned_at,
+                                        tab.adopted_session_id.as_deref(),
+                                    )
+                                    .into_iter()
+                                    .map(|c| (c.session_id, c.path))
+                                    .collect()
                                 }
                             };
                             let hits: Vec<(String, SystemTime)> = hits
