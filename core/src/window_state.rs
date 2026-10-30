@@ -78,7 +78,7 @@ impl WindowState {
         let mut json = serde_json::to_string_pretty(self)
             .context("serialise window state")?;
         json.push('\n');
-        std::fs::write(path, json)
+        crate::atomic_write::write_atomic(path, json.as_bytes())
             .with_context(|| format!("write {}", path.display()))?;
         Ok(())
     }

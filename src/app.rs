@@ -1903,7 +1903,7 @@ impl AppShell {
     /// stamping a stale in-memory `self.projects` would clobber any
     /// changes the sidebar wrote between two AppShell mutations.
     /// Mirrors the discipline used in `allocate_session_id`,
-    /// `soft_close_session`, `reopen_session`, and `open_rename_dialog`.
+    /// `soft_close_session`, `reopen_session`, and `submit_rename_dialog`.
     /// On reload failure we leave `self.projects` untouched and bail
     /// out without writing — same rule the other persist sites use, so
     /// a transient I/O hiccup doesn't end with a stale snapshot landing
@@ -3228,7 +3228,11 @@ impl AppShell {
             match ProjectsConfig::load(&self.paths) {
                 Ok(cfg) => self.projects = cfg,
                 Err(err) => {
+                    // Never save our copy over a file we couldn't
+                    // read (#391): the tab runs, it just isn't
+                    // persisted.
                     eprintln!("warning: failed to reload projects.json before SessionManager::open: {err:#}");
+                    return new_id;
                 }
             }
             let session = Session {
@@ -3271,7 +3275,10 @@ impl AppShell {
                 self.projects = cfg;
             }
             Err(err) => {
+                // Same as the remote branch above: no save over an
+                // unreadable file (#391).
                 eprintln!("warning: failed to reload projects.json before SessionManager::open: {err:#}");
+                return new_id;
             }
         }
         let Some((project_id, worktree_id)) = self.locate_project_for_path(wd) else {
@@ -3347,7 +3354,10 @@ impl AppShell {
                 self.projects = cfg;
             }
             Err(err) => {
+                // Saving our copy over a file we couldn't read could
+                // drop the sidebar's writes (#391); skip the close.
                 eprintln!("warning: failed to reload projects.json before soft_close: {err:#}");
+                return;
             }
         }
         match SessionManager::soft_close(&mut self.projects, session_id, &now_iso8601()) {
@@ -3392,7 +3402,9 @@ impl AppShell {
         match ProjectsConfig::load(&self.paths) {
             Ok(cfg) => self.projects = cfg,
             Err(err) => {
+                // No save over an unreadable file (#391).
                 eprintln!("warning: failed to reload projects.json before hard_remove: {err:#}");
+                return;
             }
         }
         match SessionManager::hard_remove(&mut self.projects, session_id) {
@@ -6478,19 +6490,28 @@ impl AppShell {
 
         if !to_persist.is_empty() {
             // Reload-then-mutate, like every other AppShell write: the
-            // sidebar writes `projects.json` too.
-            match ProjectsConfig::load(&self.paths) {
-                Ok(cfg) => self.projects = cfg,
-                Err(err) => {
-                    eprintln!("warning: failed to reload projects.json before saving titles: {err:#}")
+            // sidebar writes `projects.json` too. On a failed reload
+            // skip the save, never write our copy over the file
+            // (#391); the tab titles below still update.
+            let reloaded = match ProjectsConfig::load(&self.paths) {
+                Ok(cfg) => {
+                    self.projects = cfg;
+                    true
                 }
-            }
+                Err(err) => {
+                    eprintln!("warning: failed to reload projects.json before saving titles: {err:#}");
+                    false
+                }
+            };
             let mut changed = false;
-            for (session_id, title) in &to_persist {
-                // A row the reload no longer has (closed or removed
-                // meanwhile) has nothing to keep the title on.
-                changed |= SessionManager::set_title(&mut self.projects, session_id, title)
-                    .unwrap_or(false);
+            if reloaded {
+                for (session_id, title) in &to_persist {
+                    // A row the reload no longer has (closed or
+                    // removed meanwhile) has nothing to keep the
+                    // title on.
+                    changed |= SessionManager::set_title(&mut self.projects, session_id, title)
+                        .unwrap_or(false);
+                }
             }
             if changed {
                 if let Err(err) = self.projects.save(&self.paths) {
