@@ -160,8 +160,9 @@ struct Entry {
     /// until the first `ai-title` lands).
     title: Option<(String, TitleSource)>,
     /// The `<task-notification>` a queued message carries: the `content`
-    /// of a `queue-operation` line or the `prompt` of a `queued_command`
-    /// attachment. Current Claude Code delivers a finished background
+    /// of any `queue-operation` line whose `content` carries the marker
+    /// (`enqueue`, `remove`, `popAll`; a `dequeue` has none) or the
+    /// `prompt` of a `queued_command` attachment. Current Claude Code delivers a finished background
     /// agent's completion only there, never in a `user` entry (issue
     /// #379). `None` for every other entry, and for queued messages
     /// that are not a notification.
@@ -474,6 +475,25 @@ fn tagged_value(hay: &str, prefix: &str, accept: impl Fn(char) -> bool) -> Optio
     (!value.is_empty()).then_some(value)
 }
 
+/// Background-agent bookkeeping a transcript tail carries across reads.
+/// See [`process_new_lines`].
+#[derive(Debug, Default)]
+pub struct BackgroundAgents {
+    /// Ids of agents launched (or resumed) from this session that have
+    /// not reported back yet.
+    pub pending: HashSet<String>,
+    /// A queued notification retired an agent, and the `user` entry that
+    /// hands its result to the main agent has not arrived yet (issue
+    /// #379). The notification is queued while a turn may still be
+    /// running; if that turn ends first, its `end_turn` is not the end
+    /// of the work, because a turn on the hand-back follows within
+    /// seconds.
+    ///
+    /// Unlike `pending`, this does not exempt the session from the quiet
+    /// window: a notification that is never handed back still goes idle.
+    pub handback_due: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Incremental reader
 // ---------------------------------------------------------------------------
@@ -504,11 +524,13 @@ pub struct ReadOutcome {
 /// shrinks (truncated / replaced) `tail.last_pos` is reset to 0 and
 /// the file is re-read from the beginning.
 ///
-/// `pending_agents` accumulates the ids of background subagents that
+/// `agents.pending` accumulates the ids of background subagents that
 /// were launched but have not reported back yet; while it is
 /// non-empty an otherwise-`Idle` session stays [`SessionState::Busy`]
 /// (issue #284 — the main agent finishes its turn while its
-/// background agents keep working, and the green dot lied).
+/// background agents keep working, and the green dot lied). So does
+/// a session whose finished agent is still to be handed back
+/// ([`BackgroundAgents::handback_due`]).
 ///
 /// Mirrors `ClaudeTelemetryService.TryRead` from the C# build.
 pub fn process_new_lines(
@@ -516,7 +538,7 @@ pub fn process_new_lines(
     tail: &mut FileTail,
     snapshot: &mut Option<TelemetrySnapshot>,
     last_user_ts: &mut Option<f64>,
-    pending_agents: &mut HashSet<String>,
+    agents: &mut BackgroundAgents,
 ) -> ReadOutcome {
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
@@ -624,11 +646,13 @@ pub fn process_new_lines(
         // bookkeeping, but one that retires an agent means a turn on its
         // hand-back is about to run, so it restarts the quiet window
         // rather than letting an agent that outlived it drop the session
-        // straight to `Idle`.
+        // straight to `Idle`, and it holds off an `end_turn` that lands
+        // before that hand-back does.
         if let Some(text) = &entry.queued_notification
-            && retire_notified_agents(text, pending_agents)
+            && retire_notified_agents(text, &mut agents.pending)
         {
             activity = true;
+            agents.handback_due = true;
         }
 
         match entry.kind {
@@ -656,10 +680,14 @@ pub fn process_new_lines(
                 if !entry.user_carries_tool_result {
                     *last_user_ts = entry.timestamp_secs;
                 }
-                apply_agent_markers(&line, pending_agents);
+                apply_agent_markers(&line, &mut agents.pending);
                 if let Some(id) = &entry.resumed_agent {
-                    pending_agents.insert(id.clone());
+                    agents.pending.insert(id.clone());
                 }
+                // Either the hand-back itself, or a tool result that
+                // carried the queued notification into the running turn.
+                // In both cases the next `end_turn` really ends the work.
+                agents.handback_due = false;
                 changed = true;
             }
             EntryKind::Assistant => {
@@ -730,15 +758,16 @@ pub fn process_new_lines(
     }
 
     if catch_up {
-        pending_agents.clear();
+        agents.pending.clear();
+        agents.handback_due = false;
     }
 
     // The main agent ending its turn does not mean the session is
     // done — background subagents outlive it. Their completion arrives
     // later as a queued `<task-notification>`, followed by a user entry
     // with the agent's hand-back (which flips the state back to `Busy`
-    // on its own).
-    if state == SessionState::Idle && !pending_agents.is_empty() {
+    // on its own). Until that entry lands the turn is not over either.
+    if state == SessionState::Idle && (!agents.pending.is_empty() || agents.handback_due) {
         state = SessionState::Busy;
     }
 
@@ -818,9 +847,9 @@ pub struct ClaudeTranscriptTail {
     /// seconds since the Unix epoch (from the transcript, not wall
     /// clock). Used to compute `last_turn_duration`.
     last_user_ts: Option<f64>,
-    /// Ids of background subagents launched from this session that
-    /// have not reported back yet. See [`process_new_lines`].
-    pending_agents: HashSet<String>,
+    /// Background subagents launched from this session that have not
+    /// reported back yet. See [`process_new_lines`].
+    agents: BackgroundAgents,
     /// Latest computed snapshot, or `None` if no entries have been
     /// parsed yet.
     pub snapshot: Option<TelemetrySnapshot>,
@@ -843,7 +872,7 @@ impl ClaudeTranscriptTail {
             path,
             tail: FileTail::default(),
             last_user_ts: None,
-            pending_agents: HashSet::new(),
+            agents: BackgroundAgents::default(),
             snapshot: None,
             last_activity: now,
             observed_mtime: None,
@@ -891,7 +920,7 @@ impl ClaudeTranscriptTail {
             &mut self.tail,
             &mut self.snapshot,
             &mut self.last_user_ts,
-            &mut self.pending_agents,
+            &mut self.agents,
         );
         // Bytes were read: the lines decide. None were (a same-length
         // rewrite, or a read that bailed): the mtime alone does.
@@ -920,7 +949,7 @@ impl ClaudeTranscriptTail {
         // the turn anchor still describe what the transcript said.
         if let Some(snapshot) = self.snapshot.as_mut()
             && snapshot.state == SessionState::Busy
-            && self.pending_agents.is_empty()
+            && self.agents.pending.is_empty()
             && now.saturating_duration_since(self.last_activity) >= BUSY_QUIET_TIMEOUT
         {
             snapshot.state = SessionState::Idle;
@@ -1010,7 +1039,7 @@ mod tests {
         snapshot: &mut Option<TelemetrySnapshot>,
         last_user_ts: &mut Option<f64>,
     ) -> bool {
-        process_new_lines(path, tail, snapshot, last_user_ts, &mut HashSet::new()).changed
+        process_new_lines(path, tail, snapshot, last_user_ts, &mut BackgroundAgents::default()).changed
     }
 
     // --- parse_line ---
@@ -1534,21 +1563,21 @@ mod tests {
         let mut tail = FileTail::default();
         let mut snap: Option<TelemetrySnapshot> = None;
         let mut last_user_ts = None;
-        let mut pending = HashSet::new();
+        let mut agents = BackgroundAgents::default();
         // Catch-up read first, so the launch below is seen live.
-        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
 
         // Main agent spawns a background subagent and then wraps up
         // its own turn — the state must not go green yet.
         append_lines(&path, &[LAUNCH, END_TURN]);
-        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
         assert_eq!(snap.as_ref().unwrap().state, SessionState::Busy);
 
         // Subagent reports back; the main agent's next end_turn is
         // the real idle.
         append_lines(&path, &[NOTIFICATION, END_TURN]);
-        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
-        assert!(pending.is_empty());
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
+        assert!(agents.pending.is_empty());
         assert_eq!(snap.as_ref().unwrap().state, SessionState::Idle);
     }
 
@@ -1564,10 +1593,10 @@ mod tests {
         let mut tail = FileTail::default();
         let mut snap: Option<TelemetrySnapshot> = None;
         let mut last_user_ts = None;
-        let mut pending = HashSet::new();
-        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
+        let mut agents = BackgroundAgents::default();
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
 
-        assert!(pending.is_empty());
+        assert!(agents.pending.is_empty());
         assert_eq!(snap.as_ref().unwrap().state, SessionState::Idle);
     }
 
@@ -1627,24 +1656,24 @@ mod tests {
     /// appends next is read live.
     fn live_tail(
         path: &std::path::Path,
-    ) -> (FileTail, Option<TelemetrySnapshot>, Option<f64>, HashSet<String>) {
+    ) -> (FileTail, Option<TelemetrySnapshot>, Option<f64>, BackgroundAgents) {
         write_lines(path, &[PROMPT]);
         let mut tail = FileTail::default();
         let mut snap = None;
         let mut last_user_ts = None;
-        let mut pending = HashSet::new();
-        process_new_lines(path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
-        (tail, snap, last_user_ts, pending)
+        let mut agents = BackgroundAgents::default();
+        process_new_lines(path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
+        (tail, snap, last_user_ts, agents)
     }
 
     #[test]
     fn agent_completion_via_queue_operation_goes_idle() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("session.jsonl");
-        let (mut tail, mut snap, mut last_user_ts, mut pending) = live_tail(&path);
+        let (mut tail, mut snap, mut last_user_ts, mut agents) = live_tail(&path);
 
         append_lines(&path, &[LAUNCH, END_TURN]);
-        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
         assert_eq!(snap.as_ref().unwrap().state, SessionState::Busy);
 
         append_lines(
@@ -1657,8 +1686,8 @@ mod tests {
                 END_TURN,
             ],
         );
-        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
-        assert!(pending.is_empty());
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
+        assert!(agents.pending.is_empty());
         assert_eq!(snap.as_ref().unwrap().state, SessionState::Idle);
     }
 
@@ -1666,15 +1695,15 @@ mod tests {
     fn agent_completion_via_queued_command_attachment_goes_idle() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("session.jsonl");
-        let (mut tail, mut snap, mut last_user_ts, mut pending) = live_tail(&path);
+        let (mut tail, mut snap, mut last_user_ts, mut agents) = live_tail(&path);
 
         append_lines(&path, &[LAUNCH, END_TURN]);
-        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
-        assert!(!pending.is_empty());
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
+        assert!(!agents.pending.is_empty());
 
         append_lines(&path, &[QUEUED_COMMAND_NOTIFICATION, USER_AGENT_MESSAGE, END_TURN]);
-        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
-        assert!(pending.is_empty());
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
+        assert!(agents.pending.is_empty());
         assert_eq!(snap.as_ref().unwrap().state, SessionState::Idle);
     }
 
@@ -1686,12 +1715,12 @@ mod tests {
         // other agent still running.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("session.jsonl");
-        let (mut tail, mut snap, mut last_user_ts, mut pending) = live_tail(&path);
+        let (mut tail, mut snap, mut last_user_ts, mut agents) = live_tail(&path);
 
         let second = LAUNCH.replace("a02e36f821d048123", "bbb222ccc333");
         append_lines(&path, &[LAUNCH, &second, END_TURN]);
-        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
-        assert_eq!(pending.len(), 2);
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
+        assert_eq!(agents.pending.len(), 2);
 
         append_lines(
             &path,
@@ -1705,9 +1734,9 @@ mod tests {
                 END_TURN,
             ],
         );
-        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
-        assert_eq!(pending.len(), 1);
-        assert!(pending.contains("bbb222ccc333"));
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
+        assert_eq!(agents.pending.len(), 1);
+        assert!(agents.pending.contains("bbb222ccc333"));
         assert_eq!(snap.as_ref().unwrap().state, SessionState::Busy);
     }
 
@@ -1715,20 +1744,20 @@ mod tests {
     fn background_bash_notification_in_a_user_entry_still_counts() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("session.jsonl");
-        let (mut tail, mut snap, mut last_user_ts, mut pending) = live_tail(&path);
+        let (mut tail, mut snap, mut last_user_ts, mut agents) = live_tail(&path);
 
         // A Bash task the tail never tracked reports back: harmless to
         // the agent that is still running.
         append_lines(&path, &[LAUNCH, BASH_NOTIFICATION, END_TURN]);
-        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
-        assert!(pending.contains("a02e36f821d048123"));
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
+        assert!(agents.pending.contains("a02e36f821d048123"));
         assert_eq!(snap.as_ref().unwrap().state, SessionState::Busy);
 
         // And the `user` entry route still retires an id it names.
         let bash_for_agent = BASH_NOTIFICATION.replace("b7x2k9q4", "a02e36f821d048123");
         append_lines(&path, &[&bash_for_agent, END_TURN]);
-        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
-        assert!(pending.is_empty());
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
+        assert!(agents.pending.is_empty());
         assert_eq!(snap.as_ref().unwrap().state, SessionState::Idle);
     }
 
@@ -1744,20 +1773,101 @@ mod tests {
         let mut tail = FileTail::default();
         let mut snap = None;
         let mut last_user_ts = None;
-        let mut pending = HashSet::new();
-        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
-        assert!(pending.is_empty());
+        let mut agents = BackgroundAgents::default();
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
+        assert!(agents.pending.is_empty());
         assert_eq!(snap.as_ref().unwrap().state, SessionState::Idle);
 
         // Resumed live: it is working again in the background.
         append_lines(&path, &[PROMPT, RESUME, END_TURN]);
-        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
-        assert!(pending.contains("a02e36f821d048123"));
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
+        assert!(agents.pending.contains("a02e36f821d048123"));
         assert_eq!(snap.as_ref().unwrap().state, SessionState::Busy);
 
         append_lines(&path, &[QUEUED_RESUMED_NOTIFICATION, USER_AGENT_MESSAGE, END_TURN]);
-        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
-        assert!(pending.is_empty());
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
+        assert!(agents.pending.is_empty());
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Idle);
+    }
+
+    const TOOL_USE: &str = r#"{"type":"assistant","sessionId":"s","timestamp":"2026-08-09T08:00:15Z","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_4","name":"Bash","input":{}}],"usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#;
+    const TOOL_RESULT: &str = r#"{"type":"user","sessionId":"s","timestamp":"2026-08-09T08:00:16Z","message":{"role":"user","content":[{"tool_use_id":"toolu_4","type":"tool_result","content":"ok"}]}}"#;
+    /// Claude Code takes the queued notification to hand it back. No
+    /// `content`: only the `enqueue` says what was queued.
+    const DEQUEUE: &str = r#"{"type":"queue-operation","operation":"dequeue","timestamp":"2026-08-09T08:05:01Z","sessionId":"s"}"#;
+
+    #[test]
+    fn agent_finishing_as_the_turn_ends_stays_busy_until_the_handback_turn_ends() {
+        // The notification is queued while the main agent writes its
+        // last reply, and that turn ends before Claude Code hands the
+        // result back. That `end_turn` must not flash "Turn complete"
+        // seconds before the hand-back turn starts.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let (mut tail, mut snap, mut last_user_ts, mut agents) = live_tail(&path);
+
+        append_lines(&path, &[LAUNCH, TOOL_USE, TOOL_RESULT, QUEUED_NOTIFICATION]);
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
+        assert!(agents.pending.is_empty());
+
+        append_lines(&path, &[END_TURN]);
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Busy);
+
+        append_lines(
+            &path,
+            &[DEQUEUE, r#"{"type":"system","subtype":"stop_hook_summary","sessionId":"s"}"#],
+        );
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Busy);
+
+        append_lines(&path, &[USER_AGENT_MESSAGE]);
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Busy);
+
+        append_lines(&path, &[END_TURN]);
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Idle);
+    }
+
+    #[test]
+    fn notification_absorbed_mid_turn_lets_that_turn_end_idle() {
+        // Queued while a tool ran: the next tool result carries it into
+        // the running turn, so no hand-back turn follows its `end_turn`.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let (mut tail, mut snap, mut last_user_ts, mut agents) = live_tail(&path);
+
+        append_lines(
+            &path,
+            &[
+                LAUNCH,
+                TOOL_USE,
+                QUEUED_NOTIFICATION,
+                TOOL_RESULT,
+                QUEUED_COMMAND_NOTIFICATION,
+                END_TURN,
+            ],
+        );
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
+        assert!(agents.pending.is_empty());
+        assert!(!agents.handback_due);
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Idle);
+    }
+
+    #[test]
+    fn replayed_handback_is_not_due() {
+        // History ending on a queued notification is as dead as an
+        // agent launched in it.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, &[PROMPT, LAUNCH, TOOL_USE, TOOL_RESULT, QUEUED_NOTIFICATION, END_TURN]);
+        let mut tail = FileTail::default();
+        let mut snap = None;
+        let mut last_user_ts = None;
+        let mut agents = BackgroundAgents::default();
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
+        assert!(!agents.handback_due);
         assert_eq!(snap.as_ref().unwrap().state, SessionState::Idle);
     }
 
@@ -1768,7 +1878,7 @@ mod tests {
         // the request history in `api-request-blob` lines.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("session.jsonl");
-        let (mut tail, mut snap, mut last_user_ts, mut pending) = live_tail(&path);
+        let (mut tail, mut snap, mut last_user_ts, mut agents) = live_tail(&path);
 
         append_lines(
             &path,
@@ -1779,8 +1889,8 @@ mod tests {
                 r#"{"type":"api-request-blob","sessionId":"s","message":{"content":[{"type":"text","text":"<task-notification><task-id>a02e36f821d048123</task-id></task-notification>"}]}}"#,
             ],
         );
-        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
-        assert!(pending.contains("a02e36f821d048123"));
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
+        assert!(agents.pending.contains("a02e36f821d048123"));
         assert_eq!(snap.as_ref().unwrap().state, SessionState::Busy);
     }
 
@@ -2082,7 +2192,7 @@ mod tests {
         // Launched live, after the catch-up read.
         append_lines(&path, &[LAUNCH, END_TURN]);
         tail.poll_at(start);
-        assert!(!tail.pending_agents.is_empty());
+        assert!(!tail.agents.pending.is_empty());
         assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Busy);
 
         assert!(!tail.poll_at(start + past_timeout()));
@@ -2107,11 +2217,32 @@ mod tests {
         let reported = start + past_timeout() * 2;
         append_lines(&path, &[QUEUED_NOTIFICATION]);
         tail.poll_at(reported);
-        assert!(tail.pending_agents.is_empty());
+        assert!(tail.agents.pending.is_empty());
         assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Busy);
 
         // Should the turn never come, the fallback still applies.
         assert!(tail.poll_at(reported + past_timeout()));
+        let snap = tail.snapshot.as_ref().unwrap();
+        assert_eq!(snap.state, SessionState::Idle);
+        assert!(snap.quiet_timeout);
+    }
+
+    #[test]
+    fn handback_that_never_comes_still_times_out() {
+        // A due hand-back holds an `end_turn` at Busy, but unlike a
+        // running agent it is no exemption from the quiet window.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, &[PROMPT]);
+
+        let mut tail = ClaudeTranscriptTail::new(path.clone());
+        let start = Instant::now();
+        append_lines(&path, &[LAUNCH, TOOL_USE, TOOL_RESULT, QUEUED_NOTIFICATION, END_TURN]);
+        tail.poll_at(start);
+        assert!(tail.agents.handback_due);
+        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Busy);
+
+        assert!(tail.poll_at(start + past_timeout()));
         let snap = tail.snapshot.as_ref().unwrap();
         assert_eq!(snap.state, SessionState::Idle);
         assert!(snap.quiet_timeout);
@@ -2407,14 +2538,14 @@ mod tests {
         let mut tail = FileTail::default();
         let mut snap: Option<TelemetrySnapshot> = None;
         let mut last_user_ts = None;
-        let mut pending = HashSet::new();
+        let mut agents = BackgroundAgents::default();
         // Catch-up read first, so the summary below is read live.
-        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
-        pending.insert("aaa111".to_string());
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
+        agents.pending.insert("aaa111".to_string());
 
         append_lines(&path, &[&quoting]);
-        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
-        assert_eq!(pending, HashSet::from(["aaa111".to_string()]));
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut agents);
+        assert_eq!(agents.pending, HashSet::from(["aaa111".to_string()]));
     }
 
     #[test]
