@@ -722,3 +722,54 @@ repository project's rows in step with git
 * Stored paths stay as git prints them (forward slashes on Windows),
   as the add-time adoption already did. Consumers that need native
   separators convert them, as with the reveal helper (#298).
+
+## ADR-0025 — Read OpenCode's `opencode.db` with `rusqlite` (bundled)
+
+**Date:** 2026-10-30
+**Status:** Accepted
+
+OpenCode 1.x stopped writing one JSON file per message under
+`storage/.../message/<sid>/` and keeps sessions, messages and message
+parts in a WAL-mode SQLite database, `~/.local/share/opencode/opencode.db`.
+The reader still walked the old layout, so OpenCode tabs got no
+adoption, no status dot, no tokens and no title (#381). Every other
+agent CodeScope tails writes plain files; this is the first one that
+needs SQLite.
+
+**Decision:** read the database in-process with `rusqlite`, `bundled`
+feature, in `codescope-core` (`agents::opencode::db`).
+
+* **Why not the `sqlite3` CLI:** shelling out is how CodeScope talks to
+  `git`, but `git` is a prerequisite and `sqlite3` is not: most
+  machines don't have it (Windows never ships it). A missing binary
+  would silently disable OpenCode support. Spawning a process per
+  query would also blow the poll budget below.
+* **Why `bundled`:** no system SQLite to find or version-match on any
+  of the three platforms; the library is compiled into the binary.
+  The readers need WAL and the JSON functions, both in the bundled
+  build.
+* **Read-only, never blocking:** connections open with
+  `SQLITE_OPEN_READ_ONLY` (no create, no URI parsing) and a zero busy
+  timeout. `SQLITE_BUSY` / `SQLITE_LOCKED` and a missing database both
+  mean "nothing new this tick"; a busy read is retried on the next
+  tick. CodeScope never writes to the file.
+* **Stat before query:** both the adoption scan (every ~350 ms per
+  OpenCode tab) and the session tail (250 ms – 2 s) first stat
+  `opencode.db` and `opencode.db-wal` (mtime + length) and only query
+  when either moved. Discovery caches the session list per database
+  path, shared by all tabs; each tail keeps its own connection.
+* **Adoption recency:** there is no per-session file to stat, so
+  discovery returns the session's `time_updated` and the adoption tick
+  compares candidates by it.
+
+**Consequences:**
+
+* `codescope-core` gains its first C dependency (`libsqlite3-sys`
+  builds SQLite with the platform C compiler, which the GPUI build
+  already requires).
+* The reader follows OpenCode's schema (`session`, `message`, `part`
+  and the JSON inside `data`), not a published API. A schema change in
+  OpenCode reads as "no data" and logs once per database change, not a
+  crash, and needs a matching change in `agents::opencode`.
+* OpenCode versions older than the database (the JSON-file layout) are
+  no longer read; that reader was removed.
