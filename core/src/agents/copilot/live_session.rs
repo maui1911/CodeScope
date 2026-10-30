@@ -13,7 +13,7 @@
 //! The lock outlives a `copilot` that was killed, so a holder only
 //! counts while its pid is still running.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -80,6 +80,13 @@ pub const LOCK_GRACE: Duration = Duration::from_secs(3);
 /// under `session_state_root` — by its lock files, at `now`. One
 /// `read_dir` per candidate; callers only do this when a tab is about
 /// to adopt one.
+///
+/// `hits` are expected from [`super::discovery::scan`], which only
+/// returns sessions whose `workspace.yaml` cwd is the tab's working
+/// directory — the guard Claude's pid files get from their `cwd`. A
+/// stale lock whose pid the OS has handed to a process in the tab can
+/// still pass for the tab's own, but only on a session started in that
+/// same folder since the tab opened.
 pub fn ownership(
     session_state_root: &Path,
     hits: &[(String, SystemTime)],
@@ -102,9 +109,11 @@ pub fn ownership(
             (Some(own), _) if own != sid => out.foreign.push(sid.clone()),
             (Some(_), _) => {}
             (None, Holder::Other) => out.foreign.push(sid.clone()),
-            // A directory dated ahead of `now` counts as fresh too.
+            // Not one dated ahead of `now` (a clock stepped back): it
+            // would stay "fresh", and keep the caller walking the
+            // process tree, until the clock caught up.
             (None, Holder::Nobody)
-                if now.duration_since(mtime).map_or(true, |age| age < LOCK_GRACE) =>
+                if now.duration_since(mtime).is_ok_and(|age| age < LOCK_GRACE) =>
             {
                 out.undecided.push(sid.clone())
             }
@@ -112,6 +121,36 @@ pub fn ownership(
         }
     }
     out
+}
+
+/// What a tab has learned about its candidates from [`ownership`], each
+/// verdict valid while the candidate's directory mtime stays what it
+/// was. Adding or removing a lock file changes that mtime (appends to
+/// the session's files don't), so a lock that lands late — or a
+/// holder that exits — makes the tab look again, and nothing else does.
+#[derive(Debug, Default, Clone)]
+pub struct Verdicts(HashMap<String, (SystemTime, bool)>);
+
+impl Verdicts {
+    /// Remember the verdict on every candidate in `hits` except the
+    /// undecided ones, which must be judged again.
+    pub fn record(&mut self, hits: &[(String, SystemTime)], owned: &Ownership) {
+        for (sid, mtime) in hits {
+            if !owned.undecided.contains(sid) {
+                self.0.insert(sid.clone(), (*mtime, owned.foreign.contains(sid)));
+            }
+        }
+    }
+
+    /// The candidate was judged at this mtime.
+    pub fn is_known(&self, sid: &str, mtime: SystemTime) -> bool {
+        self.0.get(sid).is_some_and(|(at, _)| *at == mtime)
+    }
+
+    /// The candidate was judged not the tab's at this mtime.
+    pub fn is_foreign(&self, sid: &str, mtime: SystemTime) -> bool {
+        self.0.get(sid).is_some_and(|(at, foreign)| *at == mtime && *foreign)
+    }
 }
 
 #[cfg(test)]
@@ -273,5 +312,67 @@ mod tests {
         session(dir.path(), SID_B, &[99]);
         let hits = vec![(SID_A.to_owned(), at(10)), (SID_B.to_owned(), at(20))];
         assert_eq!(judge(dir.path(), &hits, &[11], &live(&[11])), Ownership::default());
+    }
+
+    #[test]
+    fn a_directory_dated_in_the_future_is_not_fresh() {
+        // After the clock steps back, a session dir can carry an mtime
+        // ahead of `now`. Taking it for fresh would keep it undecided —
+        // and the process walk running — every tick until the clock
+        // catches up.
+        let dir = tempfile::tempdir().unwrap();
+        session(dir.path(), SID_A, &[]);
+        let hits = vec![(SID_A.to_owned(), at(500))];
+        let got = ownership(dir.path(), &hits, &[11], &live(&[11]), at(100));
+        assert_eq!(got, Ownership::default());
+    }
+
+    #[test]
+    fn verdicts_hold_until_the_directory_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        session(dir.path(), SID_A, &[40]);
+        session(dir.path(), SID_B, &[]);
+        let hits = vec![(SID_A.to_owned(), at(10)), (SID_B.to_owned(), at(20))];
+        let mut verdicts = Verdicts::default();
+        verdicts.record(&hits, &judge(dir.path(), &hits, &[11], &live(&[11, 40])));
+        assert!(verdicts.is_foreign(SID_A, at(10)));
+        assert!(verdicts.is_known(SID_A, at(10)));
+        assert!(!verdicts.is_foreign(SID_B, at(20)));
+        assert!(verdicts.is_known(SID_B, at(20)));
+        // A lock added or removed moves the directory's mtime.
+        assert!(!verdicts.is_foreign(SID_A, at(11)));
+        assert!(!verdicts.is_known(SID_B, at(21)));
+    }
+
+    #[test]
+    fn verdicts_skip_undecided_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        session(dir.path(), SID_B, &[]);
+        let hits = vec![(SID_B.to_owned(), at(100))];
+        let owned = ownership(dir.path(), &hits, &[11], &live(&[11]), at(100));
+        let mut verdicts = Verdicts::default();
+        verdicts.record(&hits, &owned);
+        assert!(!verdicts.is_known(SID_B, at(100)));
+    }
+
+    #[test]
+    fn a_lock_that_lands_after_the_grace_is_still_noticed() {
+        // The lock is slower than `LOCK_GRACE`: both tabs judge the
+        // session unheld and remember that; the heuristic hands it to
+        // the neighbour. When the owner's lock lands, the directory's
+        // mtime moves, the verdict lapses, and the owner's next look
+        // finds it exact — which takes it back from the neighbour.
+        let dir = tempfile::tempdir().unwrap();
+        session(dir.path(), SID_B, &[]);
+        let before = vec![(SID_B.to_owned(), at(10))];
+        let owner_pids = [12];
+        let mut owner = Verdicts::default();
+        owner.record(&before, &judge(dir.path(), &before, &owner_pids, &live(&[11, 12])));
+        assert!(owner.is_known(SID_B, at(10)));
+        std::fs::write(dir.path().join(SID_B).join("inuse.12.lock"), "12").unwrap();
+        let after = vec![(SID_B.to_owned(), at(15))];
+        assert!(!owner.is_known(SID_B, at(15)));
+        let got = judge(dir.path(), &after, &owner_pids, &live(&[11, 12]));
+        assert_eq!(got.exact.as_deref(), Some(SID_B));
     }
 }
