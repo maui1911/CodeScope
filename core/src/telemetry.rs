@@ -333,7 +333,7 @@ mod tests {
         bump_mtime(&path, 10);
         assert_eq!(read_events(&path, &mut tail), ["two"]);
         assert!(read_events(&path, &mut tail).is_empty(), "nothing new");
-        write!(f, "ee\n").unwrap();
+        writeln!(f, "ee").unwrap();
         bump_mtime(&path, 20);
         assert_eq!(read_events(&path, &mut tail), ["three"]);
     }
