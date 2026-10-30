@@ -73,7 +73,9 @@ pub use session::{
     RetentionPolicy, SessionDescriptor, SessionManager, build_agent_shell_args,
     build_remote_shell_args, now_iso8601,
 };
-pub use session_title::{SessionTitle, TitleSource, normalize_title, session_label};
+pub use session_title::{
+    SessionTitle, TitleSource, normalize_title, session_label, terminal_title_candidate,
+};
 pub use settings::{CursorSettings, CursorShape, DEFAULT_AGENT_ID, FontSettings, Settings};
 pub use tab_drag::{TabRect, compute_drop_index};
 pub use tab_title::{TAB_TITLE_SEPARATOR, rebuild_title, restored_title, titled_tab_title};

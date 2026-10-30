@@ -570,6 +570,10 @@ const TELEMETRY_POLL_ACTIVE: Duration = Duration::from_millis(250);
 /// (avoids a wakeup/teardown dance per tab) but throttle to a
 /// 30 s heartbeat so an idle CodeScope doesn't burn cycles.
 const TELEMETRY_POLL_IDLE: Duration = Duration::from_secs(30);
+/// Cadence with no tails but an agent tab open: nothing to read from
+/// disk, only terminal titles to pick up (see
+/// `AppShell::content_title_for`), so a couple of seconds is plenty.
+const TELEMETRY_POLL_UNTAILED_AGENT: Duration = Duration::from_secs(2);
 /// Cap on simultaneously-visible toasts. Mirrors the C# build's
 /// ToastService visible-cap. When the user fires a flurry of
 /// actions (or hits a recurring error) we evict the oldest so the
@@ -2079,6 +2083,10 @@ impl AppShell {
                 }
                 let result = this.update(cx, |this, cx| {
                     if this.telemetry_tails.is_empty() {
+                        // Agent tabs without a tail (transcript saving
+                        // off, or not adopted yet) can still be titled
+                        // from their terminal title.
+                        this.apply_session_titles(cx);
                         // Even with zero tails, the sidebar might
                         // still be holding stale busy/active sets
                         // from a session that just closed. Push
@@ -2087,7 +2095,19 @@ impl AppShell {
                         // Same logic for the taskbar overlay: a tab
                         // that just closed should clear the badge.
                         this.refresh_taskbar_badge();
-                        return TELEMETRY_POLL_IDLE;
+                        // Those terminal titles change on the agent's
+                        // schedule; a 30 s heartbeat would leave the
+                        // sidebar a topic behind.
+                        let agent_tab_open = this
+                            .groups
+                            .iter()
+                            .flat_map(|g| g.tabs.iter())
+                            .any(|t| t.agent_id.is_some());
+                        return if agent_tab_open {
+                            TELEMETRY_POLL_UNTAILED_AGENT
+                        } else {
+                            TELEMETRY_POLL_IDLE
+                        };
                     }
                     for tail in this.telemetry_tails.values_mut() {
                         tail.poll();
@@ -6054,7 +6074,7 @@ impl AppShell {
             .flat_map(|g| g.tabs.iter())
             .filter_map(|t| t.remote_project_id.clone())
             .collect();
-        let live_rows = self.sidebar_live_session_rows();
+        let live_rows = self.sidebar_live_session_rows(cx);
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.set_session_paths(busy, active, dots, cx);
             sidebar.set_remote_live_project_ids(remote_live, cx);
@@ -6065,7 +6085,10 @@ impl AppShell {
     /// One sidebar row per open local tab, keyed by canonicalised
     /// worktree path, in tab order — so two sessions in one worktree
     /// show as two rows under it instead of one shared worktree row.
-    fn sidebar_live_session_rows(&self) -> HashMap<String, Vec<crate::sidebar::LiveSessionRow>> {
+    fn sidebar_live_session_rows(
+        &self,
+        cx: &App,
+    ) -> HashMap<String, Vec<crate::sidebar::LiveSessionRow>> {
         let focused_tab_id = self
             .groups
             .get(self.focused_group)
@@ -6096,7 +6119,8 @@ impl AppShell {
                 .agent_id
                 .and_then(|id| self.agent_registry.get_by_id(id.as_str()))
                 .map(|p| p.display_name.clone());
-            let label = self.session_label_for(tab, snapshot.as_ref()).or(agent_label);
+            let content = self.content_title_for(tab, snapshot.as_ref(), cx);
+            let label = self.session_label_for(tab, content.as_deref()).or(agent_label);
             rows.entry(canon).or_default().push(crate::sidebar::LiveSessionRow {
                 tab_id: tab.id,
                 label: codescope_core::session_label(None, label.as_deref(), None).into(),
@@ -6107,14 +6131,33 @@ impl AppShell {
         rows
     }
 
-    /// The name a tab's session goes by: the user's rename, else the
-    /// content title its telemetry reports, else the title persisted
-    /// from an earlier run. `None` while none of those is known.
-    fn session_label_for(
+    /// What a tab's session is about, live: the title its transcript
+    /// reports, else — for an agent tab — the topic the agent put in
+    /// the terminal title. The latter still works with the agent's
+    /// transcript saving switched off, when there is no tail to read.
+    fn content_title_for(
         &self,
         tab: &Tab,
         snapshot: Option<&codescope_core::TelemetrySnapshot>,
+        cx: &App,
     ) -> Option<String> {
+        if let Some(title) = snapshot.and_then(|s| s.title.as_ref()) {
+            return Some(title.text.clone());
+        }
+        let agent = tab.agent_id?;
+        let raw = tab.terminal.read(cx).title()?.to_owned();
+        let display_name = self
+            .agent_registry
+            .get_by_id(agent.as_str())
+            .map(|p| p.display_name.clone())
+            .unwrap_or_default();
+        codescope_core::terminal_title_candidate(&raw, &[&display_name, agent.as_str()])
+    }
+
+    /// The name a tab's session goes by: the user's rename, else its
+    /// live content title, else the title persisted from an earlier
+    /// run. `None` while none of those is known.
+    fn session_label_for(&self, tab: &Tab, content_title: Option<&str>) -> Option<String> {
         let session = self
             .projects
             .projects
@@ -6124,7 +6167,7 @@ impl AppShell {
         let non_blank = |s: &&str| !s.trim().is_empty();
         session
             .and_then(|s| s.display_name.as_deref().filter(non_blank))
-            .or_else(|| snapshot.and_then(|s| s.title.as_ref()).map(|t| t.text.as_str()))
+            .or(content_title)
             .or_else(|| session.and_then(|s| s.title.as_deref().filter(non_blank)))
             .map(str::to_owned)
     }
@@ -6141,7 +6184,8 @@ impl AppShell {
             for (t_idx, tab) in group.tabs.iter().enumerate() {
                 let snapshot =
                     tab.adopted_session_id.as_deref().and_then(|sid| self.telemetry_for(sid));
-                if let Some(title) = snapshot.as_ref().and_then(|s| s.title.as_ref()) {
+                let content = self.content_title_for(tab, snapshot.as_ref(), cx);
+                if let Some(title) = content.as_deref() {
                     let persisted = self
                         .projects
                         .projects
@@ -6151,12 +6195,12 @@ impl AppShell {
                         .map(|s| s.title.as_deref());
                     // `None` = free-floating tab with no row to write to.
                     if let Some(persisted) = persisted
-                        && persisted != Some(title.text.as_str())
+                        && persisted != Some(title)
                     {
-                        to_persist.push((tab.session_id.clone(), title.text.clone()));
+                        to_persist.push((tab.session_id.clone(), title.to_owned()));
                     }
                 }
-                let Some(label) = self.session_label_for(tab, snapshot.as_ref()) else {
+                let Some(label) = self.session_label_for(tab, content.as_deref()) else {
                     continue;
                 };
                 if tab.applied_label.as_deref() != Some(label.as_str()) {

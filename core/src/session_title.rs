@@ -81,6 +81,37 @@ pub fn normalize_title(raw: &str) -> Option<String> {
     Some(out)
 }
 
+/// Turn a terminal title (OSC 0 / OSC 2) an agent set into a session
+/// title, or `None` when it says nothing about the session.
+///
+/// Claude Code titles its terminal with the session topic behind a
+/// status glyph (`✳ Topic`, a braille spinner while busy). That works
+/// even with transcript saving off, so it is the fallback source when
+/// no transcript title exists. Rejected as uninformative:
+///
+/// * anything matching one of `generic` (case-insensitive) — the
+///   agent's own name, which it shows before there is a topic;
+/// * shell / path titles (`C:\…\pwsh.exe`, `~/repo`, `PowerShell`),
+///   left behind by the shell the agent runs in.
+pub fn terminal_title_candidate(raw: &str, generic: &[&str]) -> Option<String> {
+    // Status glyphs, spinners and separators lead; the topic starts at
+    // the first letter or digit.
+    let start = raw.find(char::is_alphanumeric)?;
+    let text = normalize_title(&raw[start..])?;
+    let lower = text.to_lowercase();
+    if generic.iter().any(|g| g.trim().to_lowercase() == lower) {
+        return None;
+    }
+    let looks_like_path = text.contains('\\')
+        || text.contains(":/")
+        || raw.trim_start().starts_with(['/', '~'])
+        || lower.ends_with(".exe");
+    let is_shell = ["powershell", "windows powershell", "pwsh", "cmd", "bash", "zsh", "sh"]
+        .contains(&lower.as_str())
+        || lower.starts_with("administrator:");
+    (!looks_like_path && !is_shell).then_some(text)
+}
+
 /// The label a session shows in the sidebar: the user's rename, else
 /// the content title, else the agent's display name, else `"shell"`.
 pub fn session_label(
@@ -181,6 +212,42 @@ mod tests {
         assert_eq!(session_label(None, Some("Title"), Some("Claude Code")), "Title");
         assert_eq!(session_label(None, None, Some("Claude Code")), "Claude Code");
         assert_eq!(session_label(None, None, None), "shell");
+    }
+
+    const GENERIC: &[&str] = &["Claude Code", "claude"];
+
+    #[test]
+    fn terminal_title_strips_status_glyphs() {
+        assert_eq!(
+            terminal_title_candidate("✳ Sessieopslag en titels", GENERIC).as_deref(),
+            Some("Sessieopslag en titels")
+        );
+        assert_eq!(
+            terminal_title_candidate("⠂ Fix resize bug", GENERIC).as_deref(),
+            Some("Fix resize bug")
+        );
+    }
+
+    #[test]
+    fn terminal_title_rejects_the_agent_name() {
+        assert_eq!(terminal_title_candidate("✳ Claude Code", GENERIC), None);
+        assert_eq!(terminal_title_candidate("claude", GENERIC), None);
+    }
+
+    #[test]
+    fn terminal_title_rejects_shell_and_path_titles() {
+        for raw in [
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+            "Administrator: Windows PowerShell",
+            "PowerShell",
+            "~/dev/repo",
+            "/usr/bin/bash",
+            "C:/dev/repo",
+            "",
+            "✳ ",
+        ] {
+            assert_eq!(terminal_title_candidate(raw, GENERIC), None, "{raw:?}");
+        }
     }
 
     #[test]

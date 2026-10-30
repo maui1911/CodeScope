@@ -108,6 +108,8 @@ pub struct TerminalView {
     /// clipboard images under this root and inserts a relative path
     /// into the prompt.
     working_directory: Option<PathBuf>,
+    /// Latest OSC 0 / OSC 2 title — see [`Self::title`].
+    title: Option<String>,
     focus_handle: FocusHandle,
     /// Last grid size we sent to the Backend, so we don't trigger a
     /// resize on every render.
@@ -187,6 +189,11 @@ impl TerminalView {
                         // running in the terminal silently read the
                         // user's clipboard.
                         BackendEvent::ClipboardLoad => {}
+                        // Kept for the host to read (agents put the
+                        // session topic there); nothing on screen
+                        // changes, so no redraw.
+                        BackendEvent::Title(title) => view.title = Some(title),
+                        BackendEvent::ResetTitle => view.title = None,
                         _ => {
                             view.snapshot = view.backend.snapshot(&view.palette);
                             cx.notify();
@@ -263,7 +270,15 @@ impl TerminalView {
             blink_phase,
             hovered_link: None,
             link_click_consumed: false,
+            title: None,
         }
+    }
+
+    /// The title the program running in the terminal last set via
+    /// OSC 0 / OSC 2, as sent (spinner glyphs and all). `None` before
+    /// any was set and after a reset.
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
     }
 
     /// Write raw bytes to the pty as if the user had typed them.
