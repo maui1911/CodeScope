@@ -497,6 +497,38 @@ impl ProjectsConfig {
         Ok(())
     }
 
+    /// Reload-then-mutate in one step: read `projects.json` fresh,
+    /// apply `edit` to that copy, and save it when `edit` returns
+    /// `Ok(true)`. AppShell and the sidebar each hold their own copy
+    /// of the config and neither mirrors every write of the other, so
+    /// saving an edit of one's own copy can drop a change the other
+    /// made meanwhile (#391).
+    ///
+    /// Returns the fresh config — edited or not, it is newer than the
+    /// caller's copy, so the caller should adopt it — and whether it
+    /// was saved. When the read, `edit` or the save fails, nothing is
+    /// written and the error comes back; the caller keeps its copy.
+    pub fn reload_and_edit(
+        paths: &AppPaths,
+        edit: impl FnOnce(&mut Self) -> Result<bool>,
+    ) -> Result<(Self, bool)> {
+        paths.ensure_dirs()?;
+        Self::reload_and_edit_at(&paths.projects_file(), edit)
+    }
+
+    /// [`Self::reload_and_edit`] against an explicit file.
+    pub fn reload_and_edit_at(
+        path: &Path,
+        edit: impl FnOnce(&mut Self) -> Result<bool>,
+    ) -> Result<(Self, bool)> {
+        let mut config = Self::load_from(path)?;
+        let changed = edit(&mut config)?;
+        if changed {
+            config.save_to(path)?;
+        }
+        Ok((config, changed))
+    }
+
     /// Look up a project by its stable id. `None` if unknown.
     pub fn project(&self, id: &str) -> Option<&Project> {
         self.projects.iter().find(|p| p.id == id)
@@ -1255,6 +1287,85 @@ mod tests {
         let old = ProjectsConfig::load_from(&path).unwrap();
         assert!(old.project_groups.is_empty());
         assert_eq!(old.projects[0].group_id, None);
+    }
+
+    /// The sidebar edits while AppShell has written since the sidebar
+    /// last read the file (#391): the edit lands on what is on disk,
+    /// so the other writer's change survives it.
+    #[test]
+    fn reload_and_edit_keeps_a_concurrent_writers_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.json");
+        let mut seed = Project::new("/repo/alpha".into());
+        seed.worktrees.push(Worktree {
+            id: "w-feat".into(),
+            path: "/repo/alpha-feat".into(),
+            branch: Some("feat".into()),
+            is_primary: false,
+        });
+        let pid = seed.id.clone();
+        ProjectsConfig { projects: vec![seed], ..ProjectsConfig::default() }
+            .save_to(&path)
+            .unwrap();
+        // Another writer saves a change the caller has not seen.
+        let mut other = ProjectsConfig::load_from(&path).unwrap();
+        rename_project(&mut other, &pid, "renamed").unwrap();
+        other.save_to(&path).unwrap();
+
+        let (fresh, saved) = ProjectsConfig::reload_and_edit_at(&path, |cfg| {
+            let project = cfg.projects.iter_mut().find(|p| p.id == pid).unwrap();
+            project.worktrees.retain(|wt| wt.id != "w-feat");
+            Ok(true)
+        })
+        .unwrap();
+        assert!(saved);
+        let on_disk = ProjectsConfig::load_from(&path).unwrap();
+        for cfg in [&fresh, &on_disk] {
+            assert_eq!(cfg.projects[0].name, "renamed");
+            assert!(cfg.projects[0].worktrees.iter().all(|wt| wt.id != "w-feat"));
+        }
+    }
+
+    #[test]
+    fn reload_and_edit_without_a_change_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.json");
+        let body = r#"{"version":1,"projects":[{"id":"p","name":"p","path":"/p"}]}"#;
+        std::fs::write(&path, body).unwrap();
+        let (fresh, saved) = ProjectsConfig::reload_and_edit_at(&path, |_| Ok(false)).unwrap();
+        assert!(!saved);
+        assert_eq!(fresh.projects[0].id, "p");
+        // Still the compact hand-written body, not a pretty re-save.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+    }
+
+    #[test]
+    fn reload_and_edit_writes_nothing_when_the_edit_or_the_read_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.json");
+        let body = r#"{"version":1,"projects":[{"id":"p","name":"p","path":"/p"}]}"#;
+        std::fs::write(&path, body).unwrap();
+        let err = ProjectsConfig::reload_and_edit_at(&path, |cfg| {
+            cfg.projects.clear();
+            anyhow::bail!("rejected")
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "rejected");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+
+        // A file that doesn't parse is never replaced by an edit of
+        // an empty config.
+        std::fs::write(&path, "{ invalid").unwrap();
+        let mut ran = false;
+        assert!(
+            ProjectsConfig::reload_and_edit_at(&path, |_| {
+                ran = true;
+                Ok(true)
+            })
+            .is_err()
+        );
+        assert!(!ran);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ invalid");
     }
 
     #[test]

@@ -1878,7 +1878,7 @@ impl AppShell {
     /// stamping a stale in-memory `self.projects` would clobber any
     /// changes the sidebar wrote between two AppShell mutations.
     /// Mirrors the discipline used in `allocate_session_id`,
-    /// `soft_close_session`, `reopen_session`, and `open_rename_dialog`.
+    /// `soft_close_session`, `reopen_session`, and `submit_rename_dialog`.
     /// On reload failure we leave `self.projects` untouched and bail
     /// out without writing — same rule the other persist sites use, so
     /// a transient I/O hiccup doesn't end with a stale snapshot landing

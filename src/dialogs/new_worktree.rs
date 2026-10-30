@@ -18,7 +18,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use codescope_core::{Project, Theme, git::BranchInfo, projects::Worktree};
+use anyhow::Context as _;
+use codescope_core::{Project, ProjectsConfig, Theme, git::BranchInfo, projects::Worktree};
 use gpui::{
     Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
     MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window,
@@ -518,23 +519,35 @@ impl Sidebar {
                     branch: Some(branch.clone()),
                     is_primary: false,
                 };
-                // Clone-then-save: a write failure leaves the in-
-                // memory model untouched, matching the rest of
-                // `Sidebar`'s mutators.
-                let mut next = self.projects().clone();
-                if let Some(project) = next.projects.get_mut(idx) {
-                    project.worktrees.push(new_wt);
-                } else {
+                // Reload-then-mutate (#391): append to a fresh read
+                // of `projects.json`, found by id, so session rows
+                // AppShell saved meanwhile survive. A write failure
+                // leaves the in-memory model untouched, matching the
+                // rest of `Sidebar`'s mutators.
+                let Some(project_id) = self.projects().projects.get(idx).map(|p| p.id.clone())
+                else {
                     self.cancel_new_worktree_dialog(cx);
                     return;
-                }
-                if let Err(err) = next.save(self.paths_ref()) {
-                    if let Some(state) = self.dialog_mut() {
-                        state.error = Some(format!("save failed: {err:#}"));
+                };
+                let result = ProjectsConfig::reload_and_edit(self.paths_ref(), |next| {
+                    let project = next
+                        .projects
+                        .iter_mut()
+                        .find(|p| p.id == project_id)
+                        .context("the project was removed")?;
+                    project.worktrees.push(new_wt);
+                    Ok(true)
+                });
+                let next = match result {
+                    Ok((next, _)) => next,
+                    Err(err) => {
+                        if let Some(state) = self.dialog_mut() {
+                            state.error = Some(format!("save failed: {err:#}"));
+                        }
+                        cx.notify();
+                        return;
                     }
-                    cx.notify();
-                    return;
-                }
+                };
                 self.replace_projects(next);
                 self.note_worktree_edit();
                 self.cancel_new_worktree_dialog(cx);

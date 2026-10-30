@@ -205,6 +205,21 @@ impl AppShell {
             return;
         }
 
+        // Reload-then-mutate (#391), like every other AppShell write:
+        // the sidebar saves without mirroring into our copy (a new
+        // project, a removed worktree), and the dialog may have been
+        // open a while. Saving our copy would drop those changes.
+        match codescope_core::ProjectsConfig::load(self.paths_ref().as_ref()) {
+            Ok(cfg) => self.projects = cfg,
+            Err(err) => {
+                if let Some(state) = self.rename_dialog.as_mut() {
+                    state.error = Some(format!("Failed to read projects.json: {err:#}"));
+                }
+                cx.notify();
+                return;
+            }
+        }
+
         match target {
             RenameRequest::Project { project_id } => {
                 let changed = match codescope_core::projects::rename_project(

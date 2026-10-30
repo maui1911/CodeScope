@@ -1921,29 +1921,21 @@ impl Sidebar {
         }
     }
 
-    /// Commit a group edit made by `edit` on a copy of the config:
-    /// save first, swap in only on success (the clone-then-save rule
-    /// every sidebar mutator follows), then re-resolve the selection.
-    /// Errors surface as a toast.
+    /// Commit a group edit made by `edit` on a fresh read of
+    /// `projects.json` (reload-then-mutate, #391): save first, swap in
+    /// only on success, then re-resolve the selection. Errors surface
+    /// as a toast and leave our copy as it was.
     fn commit_projects_edit(
         &mut self,
         failure_title: &'static str,
         edit: impl FnOnce(&mut ProjectsConfig) -> anyhow::Result<bool>,
         cx: &mut Context<Self>,
     ) {
-        let mut next = self.projects.clone();
-        let result = edit(&mut next).and_then(|changed| {
-            if changed {
-                next.save(&self.paths)?;
-            }
-            Ok(changed)
-        });
-        match result {
-            Ok(true) => {
+        match ProjectsConfig::reload_and_edit(&self.paths, edit) {
+            Ok((next, _)) => {
                 self.replace_projects(next);
                 cx.notify();
             }
-            Ok(false) => {}
             Err(err) => cx.emit(SidebarEvent::Toast {
                 kind: ToastSeverity::Err,
                 title: failure_title.into(),
@@ -3014,12 +3006,32 @@ impl Sidebar {
         let prev_selected_id = self.layout.selected_project_id.clone();
         let prev_collapsed = self.layout.collapsed_projects.clone();
         let prev_collapsed_groups = self.layout.collapsed_project_groups.clone();
-        let mut next = self.projects.clone();
-        next.projects.remove(idx);
-        if let Err(err) = next.save(&self.paths) {
-            eprintln!("warning: failed to save projects.json: {err:#}");
+        // Remove by id from a fresh read (#391), not from our copy:
+        // AppShell may have saved session rows since we last looked.
+        // Only the sidebar adds, removes or reorders projects, so the
+        // row sits at the same index on disk.
+        let project_id = self.projects.projects[idx].id.clone();
+        let mut removed_at = None;
+        let result = ProjectsConfig::reload_and_edit(&self.paths, |cfg| {
+            removed_at = cfg.projects.iter().position(|p| p.id == project_id);
+            if let Some(at) = removed_at {
+                cfg.projects.remove(at);
+            }
+            Ok(removed_at.is_some())
+        });
+        let next = match result {
+            Ok((next, _)) => next,
+            Err(err) => {
+                eprintln!("warning: failed to save projects.json: {err:#}");
+                return;
+            }
+        };
+        let Some(idx) = removed_at else {
+            // Already gone on disk: just catch up with the file.
+            self.replace_projects(next);
+            self.close_menu(cx);
             return;
-        }
+        };
         self.projects = next;
         self.prune_collapsed_projects();
         // Selection housekeeping: if we just removed the selected
@@ -3091,10 +3103,6 @@ impl Sidebar {
         )
         .then(|| project.path.clone());
         let new_id = project.id.clone();
-        let repo_path = project.path.clone();
-        // Clone-then-save: failure leaves `self.projects` untouched.
-        let mut next = self.projects.clone();
-        next.projects.push(project);
         // If the user already has worktrees on disk for this repo
         // (typical for anyone who adds a project they've been working
         // in for a while), pull them in now so they show up at once
@@ -3103,24 +3111,36 @@ impl Sidebar {
         // already tracks, or the project's own symlinked spelling,
         // isn't adopted twice. Errors (missing `git`, permissions)
         // just land the project with its primary row alone.
-        if non_repo_path.is_none()
-            && let Ok(listed) =
-                codescope_core::git::list_worktrees(std::path::Path::new(&repo_path))
-        {
-            let on_disk: HashMap<String, PathOnDisk> = next
-                .stored_paths()
-                .into_iter()
-                .map(|path| {
-                    let disk = PathOnDisk::probe(&path);
-                    (path, disk)
-                })
-                .collect();
-            next.sync_worktrees(&new_id, &listed, &on_disk);
-        }
-        if let Err(err) = next.save(&self.paths) {
-            eprintln!("warning: failed to save projects.json: {err:#}");
-            return;
-        }
+        let listed = if non_repo_path.is_none() {
+            codescope_core::git::list_worktrees(std::path::Path::new(&project.path)).ok()
+        } else {
+            None
+        };
+        // Reload-then-mutate (#391): append to a fresh read so session
+        // rows AppShell saved meanwhile survive. Save-then-commit:
+        // failure leaves `self.projects` untouched.
+        let result = ProjectsConfig::reload_and_edit(&self.paths, |next| {
+            next.projects.push(project);
+            if let Some(listed) = &listed {
+                let on_disk: HashMap<String, PathOnDisk> = next
+                    .stored_paths()
+                    .into_iter()
+                    .map(|path| {
+                        let disk = PathOnDisk::probe(&path);
+                        (path, disk)
+                    })
+                    .collect();
+                next.sync_worktrees(&new_id, listed, &on_disk);
+            }
+            Ok(true)
+        });
+        let next = match result {
+            Ok((next, _)) => next,
+            Err(err) => {
+                eprintln!("warning: failed to save projects.json: {err:#}");
+                return;
+            }
+        };
         // Disk is committed; now mirror the change in memory. The new
         // rows had no disk facts in any scan already running.
         self.projects = next;
@@ -3141,9 +3161,9 @@ impl Sidebar {
     }
 
     /// Add a [`codescope_core::ProjectKind::RemoteShell`] project
-    /// (#323). Same clone-then-save discipline as [`Self::add_project`];
-    /// no path dedup because there is no path — the dialog rejects a
-    /// duplicate *name* before it gets here.
+    /// (#323). Same reload-then-mutate, save-then-commit discipline as
+    /// [`Self::add_project`]; no path dedup because there is no path —
+    /// the dialog rejects a duplicate *name* before it gets here.
     pub fn add_remote_shell_project(
         &mut self,
         name: String,
@@ -3155,12 +3175,17 @@ impl Sidebar {
         let mut project = Project::new_remote_shell(name, command, agent_id);
         project.group_id = self.existing_group(group_id);
         let new_id = project.id.clone();
-        let mut next = self.projects.clone();
-        next.projects.push(project);
-        if let Err(err) = next.save(&self.paths) {
-            eprintln!("warning: failed to save projects.json: {err:#}");
-            return;
-        }
+        let result = ProjectsConfig::reload_and_edit(&self.paths, |next| {
+            next.projects.push(project);
+            Ok(true)
+        });
+        let next = match result {
+            Ok((next, _)) => next,
+            Err(err) => {
+                eprintln!("warning: failed to save projects.json: {err:#}");
+                return;
+            }
+        };
         self.projects = next;
         let new_idx = self.projects.projects.len() - 1;
         self.selected = Some(new_idx);
@@ -6270,6 +6295,8 @@ async fn git_has_forgotten(ctx: &WorktreeRemoveContext, cx: &mut gpui::AsyncApp)
 /// worktree id) so a concurrent edit that reordered the list still
 /// hits the right row. If the project / worktree is already gone
 /// (e.g. another window beat us to it), the rewrite is a no-op.
+/// Edits a fresh read of the file, not our copy: AppShell may have
+/// saved session rows since we last looked (#391).
 async fn commit_worktree_removal(
     this: gpui::WeakEntity<Sidebar>,
     ctx: &WorktreeRemoveContext,
@@ -6279,22 +6306,25 @@ async fn commit_worktree_removal(
         // Git no longer lists the tree; void any discovery scan that
         // listed it before the remove landed.
         this.note_worktree_edit();
-        let mut next = this.projects.clone();
-        let Some(project) = next.projects.iter_mut().find(|p| p.id == ctx.project_id) else {
-            return;
-        };
-        let before = project.worktrees.len();
-        project.worktrees.retain(|wt| wt.id != ctx.worktree_id);
-        if project.worktrees.len() == before {
-            // Nothing to persist — the row was already gone.
-            return;
+        let result = ProjectsConfig::reload_and_edit(this.paths.as_ref(), |cfg| {
+            let Some(project) = cfg.projects.iter_mut().find(|p| p.id == ctx.project_id)
+            else {
+                return Ok(false);
+            };
+            let before = project.worktrees.len();
+            project.worktrees.retain(|wt| wt.id != ctx.worktree_id);
+            // Unchanged: nothing to persist, the row was already gone.
+            Ok(project.worktrees.len() != before)
+        });
+        match result {
+            Ok((next, _)) => {
+                this.replace_projects(next);
+                cx.notify();
+            }
+            Err(err) => {
+                eprintln!("warning: failed to save projects.json after worktree removal: {err:#}");
+            }
         }
-        if let Err(err) = next.save(this.paths.as_ref()) {
-            eprintln!("warning: failed to save projects.json after worktree removal: {err:#}");
-            return;
-        }
-        this.projects = next;
-        cx.notify();
     });
 
     // Note: `git worktree remove` already deletes the worktree
