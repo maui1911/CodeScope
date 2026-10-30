@@ -28,7 +28,7 @@ Split the focused group to the right with `Ctrl+Shift+\`, then drag a tab across
 
 Projects → Worktrees → Sessions.
 
-- **One row per live session**, with a busy / idle dot, titled by its content rather than the agent's name: a name you gave it, else the title the agent generated, else one of your prompts (Claude, Copilot, Pi), else the agent's own terminal title. Click a row to jump to its tab. Tabs read `<project> · <title>`.
+- **One row per live session**, with a busy / idle dot, titled by its content rather than the agent's name: a name you gave it, else the title the agent generated, else the topic the agent puts in its terminal title, else your first prompt (Claude, Copilot, Pi). Click a row to jump to its tab. Tabs read `<project> · <title>`.
 - **Worktrees follow `git worktree list`** — polled every 5 s, so worktrees created or removed outside CodeScope appear and disappear on their own.
 - **Project groups** — right-click a project → *Move to group ▸*, or drag projects and group headers to reorder them. Collapsed groups and projects show one dot per live session.
 - **Session history** — closed sessions stay under their worktree; reopening one resumes the same conversation for Claude, Copilot, OpenCode and Pi. A closed row whose agent transcript is gone is dropped.
@@ -95,7 +95,7 @@ Every asset has a matching `.sha256` file, and `sha256.sum` lists them all. `Cod
 ### Requirements
 
 - `git` on `PATH`
-- At least one agent CLI on `PATH` (`claude`, `codex`, `copilot`, `opencode`, `pi`, `gemini`, etc.)
+- At least one agent CLI on `PATH` (`claude`, `codex`, `copilot`, `opencode` (`opencode-cli` on Windows), `pi`, `gemini`, etc.)
 - Optional: the GitHub CLI (`gh`), signed in, for the PR and CI status on worktree rows
 - **Windows only:** PowerShell 7+ (`pwsh.exe`) on `PATH`. CodeScope spawns `pwsh.exe` for every terminal tab and for the `-Command "& { <agent> }"` wrapper that auto-types the agent CLI — legacy `powershell.exe` (Windows PowerShell 5.1) is not used. Override with the `CODESCOPE_SHELL` env var if you want a different shell.
 

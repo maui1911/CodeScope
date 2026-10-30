@@ -228,7 +228,7 @@ curl.exe -sL -H "Accept: application/octet-stream" -o $env:TEMP\rv.zip `
 
 ### 7. README still current (minor releases)
 
-The README drifted three minor versions once (#344): a stale keyboard
+The README drifted two minor versions once (#344): a stale keyboard
 table and features that shipped without a mention. On every minor
 release (`vX.Y.0`):
 
