@@ -174,7 +174,7 @@ In the terminal:
 | `Ctrl+V` | Paste an image (see above); paste text when the running program has bracketed paste on (Claude Code, vim, modern shells), otherwise sent to the program as `Ctrl+V` |
 | `Ctrl+click` | Open a URL or file path |
 
-A focused terminal currently keeps `Alt+1`…`Alt+9` for the program running in it, so the group-index chord only works from an empty group or with focus outside the terminal.
+`Alt+1`…`Alt+9` switches groups even with a terminal focused, so the program running in it never receives those chords. When group N doesn't exist the chord does nothing.
 
 ## Repository layout
 
