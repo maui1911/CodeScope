@@ -17,14 +17,32 @@
 //! * `part` — the pieces of a message; a tool call is
 //!   `data.type == "tool"` with `data.state.status`.
 //!
-//! # Polling — stamp gate
+//! # Polling — `data_version` gate
 //!
-//! [`OpenCodeMessageTail::poll`] stats the database and its WAL and
-//! returns at once when neither moved. Only then does it run its
-//! handful of indexed queries, on a connection it keeps open.
+//! [`OpenCodeMessageTail::poll`] asks its kept connection for
+//! `PRAGMA data_version` ([`db::DbHandle::probe`]) and returns at once
+//! when nothing was committed since its last read. Only then does it run
+//! its handful of indexed queries.
 //!
 //! Adaptive poll cadence: 250 ms while busy / pending tool, 2 s while
 //! idle — same as Claude / Copilot.
+//!
+//! # Quiet timeouts
+//!
+//! Two ways a session reads Busy with nothing left running, both bounded
+//! on the tail's clock by "no change to this session since":
+//!
+//! * a completed `tool-calls` step with no step after it. OpenCode
+//!   starts the next step within milliseconds, so after
+//!   [`TOOL_STEP_SETTLE`] the loop has stopped — a denied permission or
+//!   a rejected question ends a turn exactly like this, without marking
+//!   the step as an error;
+//! * anything else Busy (OpenCode killed mid-step) after
+//!   [`BUSY_QUIET_TIMEOUT`], as for Claude.
+//!
+//! Either reports Idle with `quiet_timeout` set, so the app doesn't
+//! announce a finished turn. The check is a comparison against the
+//! cached snapshot, made on every poll whether or not the database moved.
 //!
 //! # Tokens
 //!
@@ -33,12 +51,13 @@
 //! last step, not a running sum.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 
-use crate::agents::opencode::db::{self, DbStamp};
+use crate::agents::claude::telemetry::BUSY_QUIET_TIMEOUT;
+use crate::agents::opencode::db::{self, DbHandle, Probe};
 use crate::session_title::{SessionTitle, TitleSource};
 use crate::telemetry::{SessionState, TelemetrySnapshot, context_window_for_model};
 
@@ -128,7 +147,9 @@ fn u64_field(obj: &serde_json::Map<String, Value>, key: &str) -> u64 {
 /// * a completed step that ended in `tool-calls` → Busy. OpenCode's
 ///   prompt loop starts the next step right after (its loop only exits
 ///   on a finish other than `tool-calls`), so reporting Idle in that gap
-///   would flash a finished turn between every tool call;
+///   would flash a finished turn between every tool call. When no next
+///   step follows, [`quiet_window`] turns this Idle after
+///   [`TOOL_STEP_SETTLE`];
 /// * any other completed step → Idle;
 /// * a step still streaming → Busy.
 pub fn derive_state(latest: &MessageEntry, pending_tool: bool) -> SessionState {
@@ -136,7 +157,7 @@ pub fn derive_state(latest: &MessageEntry, pending_tool: bool) -> SessionState {
         Some("user") => SessionState::Busy,
         Some("assistant") if pending_tool => SessionState::PendingToolUse,
         Some("assistant") if latest.completed_ms.is_some() => {
-            if latest.finish.as_deref() == Some("tool-calls") && !latest.has_error {
+            if is_open_tool_step(latest) {
                 SessionState::Busy
             } else {
                 SessionState::Idle
@@ -144,6 +165,35 @@ pub fn derive_state(latest: &MessageEntry, pending_tool: bool) -> SessionState {
         }
         Some("assistant") => SessionState::Busy,
         _ => SessionState::Unknown,
+    }
+}
+
+/// A completed step that hands over to a next one: `finish:
+/// "tool-calls"` and no error.
+fn is_open_tool_step(latest: &MessageEntry) -> bool {
+    latest.role.as_deref() == Some("assistant")
+        && latest.completed_ms.is_some()
+        && latest.finish.as_deref() == Some("tool-calls")
+        && !latest.has_error
+}
+
+/// How long a completed `tool-calls` step may stand with no change to the
+/// session before the turn counts as over. OpenCode creates the next
+/// step's message within a few milliseconds of finishing the last (1–4 ms
+/// between steps in a real session), so nothing following for seconds
+/// means the loop stopped: a denied permission or a rejected question
+/// errors the tool part and ends the turn without marking the step.
+pub const TOOL_STEP_SETTLE: Duration = Duration::from_secs(5);
+
+/// How long a Busy snapshot may go without any change to the session
+/// before it reads as Idle with `quiet_timeout`. `None` for states that
+/// never time out (PendingToolUse: a running tool or a question waiting
+/// on the user writes nothing until it resolves).
+pub fn quiet_window(latest: &MessageEntry, state: SessionState) -> Option<Duration> {
+    match state {
+        SessionState::Busy if is_open_tool_step(latest) => Some(TOOL_STEP_SETTLE),
+        SessionState::Busy => Some(BUSY_QUIET_TIMEOUT),
+        _ => None,
     }
 }
 
@@ -159,6 +209,19 @@ struct SessionRead {
     pending_tool: bool,
     last_usage: Option<MessageEntry>,
     prompts: PromptTally,
+    activity: Activity,
+}
+
+/// Fingerprint of where the session is: its latest message and how much
+/// of that message's parts exist. Streamed text grows a part, a tool
+/// changes status in one, a new step is a new message — any of those
+/// restarts the quiet window. Writes to *other* sessions leave it alone.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Activity {
+    latest_id: Option<String>,
+    latest_data: String,
+    part_count: i64,
+    part_bytes: i64,
 }
 
 /// Running count of the session's user messages, advanced from a
@@ -205,19 +268,21 @@ impl PromptTally {
     }
 }
 
-/// Every query rides the `(session_id, time_created, id)` index on
-/// `message` or the `(message_id, id)` index on `part`; the `json_extract`
-/// filters only touch the rows those ranges return.
+/// One read, inside one read transaction so every query sees the same
+/// commit. Every query rides the `(session_id, time_created, id)` index
+/// on `message` or the `(message_id, id)` index on `part`; the
+/// `json_extract` filters only touch the rows those ranges return.
 fn read_session(
     conn: &Connection,
     session_id: &str,
     prompts: &PromptTally,
 ) -> rusqlite::Result<SessionRead> {
-    let title: Option<String> = conn
+    let tx = conn.unchecked_transaction()?;
+    let title: Option<String> = tx
         .prepare_cached("SELECT title FROM session WHERE id = ?1")?
         .query_row([session_id], |r| r.get(0))
         .optional()?;
-    let latest: Option<(String, String)> = conn
+    let latest: Option<(String, String)> = tx
         .prepare_cached(
             "SELECT id, data FROM message WHERE session_id = ?1
              ORDER BY time_created DESC, id DESC LIMIT 1",
@@ -228,15 +293,17 @@ fn read_session(
         return Ok(SessionRead { title, ..SessionRead::default() });
     };
     let latest = parse_message(&latest_data);
-    let pending_tool = latest.as_ref().is_some_and(|m| m.role.as_deref() == Some("assistant"))
-        && conn
-            .prepare_cached(
-                "SELECT EXISTS (SELECT 1 FROM part WHERE message_id = ?1
-                    AND json_extract(data, '$.type') = 'tool'
-                    AND json_extract(data, '$.state.status') IN ('pending', 'running'))",
-            )?
-            .query_row([&latest_id], |r| r.get::<_, bool>(0))?;
-    let last_usage: Option<String> = conn
+    let (part_count, part_bytes, any_pending): (i64, i64, bool) = tx
+        .prepare_cached(
+            "SELECT count(*), coalesce(sum(length(data)), 0),
+                coalesce(max(json_extract(data, '$.type') = 'tool'
+                    AND json_extract(data, '$.state.status') IN ('pending', 'running')), 0)
+             FROM part WHERE message_id = ?1",
+        )?
+        .query_row([&latest_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    let pending_tool =
+        any_pending && latest.as_ref().is_some_and(|m| m.role.as_deref() == Some("assistant"));
+    let last_usage: Option<String> = tx
         .prepare_cached(
             "SELECT data FROM message WHERE session_id = ?1
                 AND json_extract(data, '$.role') = 'assistant'
@@ -249,12 +316,19 @@ fn read_session(
         )?
         .query_row([session_id], |r| r.get(0))
         .optional()?;
+    let prompts = prompts.advance(&tx, session_id)?;
     Ok(SessionRead {
         title,
         latest,
         pending_tool,
         last_usage: last_usage.as_deref().and_then(parse_message),
-        prompts: prompts.advance(conn, session_id)?,
+        prompts,
+        activity: Activity {
+            latest_id: Some(latest_id),
+            latest_data,
+            part_count,
+            part_bytes,
+        },
     })
 }
 
@@ -301,19 +375,27 @@ fn build_snapshot(read: &SessionRead, title: Option<SessionTitle>) -> Option<Tel
 // ---------------------------------------------------------------------------
 
 /// Handle to a watched OpenCode session. Keeps its own read-only
-/// connection and the last [`DbStamp`] it read at, so a `poll()` with
-/// nothing new is a stamp comparison (two `stat`s, shared with the
-/// other tabs polled in the same tick — see [`db::shared_stamp`]).
+/// connection ([`DbHandle`]), so a `poll()` with nothing committed is a
+/// `PRAGMA data_version` plus the quiet-window comparison.
 #[derive(Debug)]
 pub struct OpenCodeMessageTail {
     pub data_root: PathBuf,
     session_id: String,
-    db_path: PathBuf,
-    conn: Option<Connection>,
-    /// Stamp of the last completed read; `None` before the first.
-    last_stamp: Option<DbStamp>,
+    db: DbHandle,
     title: Option<SessionTitle>,
     prompts: PromptTally,
+    /// The snapshot as the database describes it, before any quiet
+    /// timeout is applied.
+    base: Option<TelemetrySnapshot>,
+    /// How long `base` may stay unchanged before it times out; see
+    /// [`quiet_window`].
+    quiet_after: Option<Duration>,
+    activity: Option<Activity>,
+    /// Tail clock at the last read that saw this session change. Starts
+    /// at construction.
+    last_activity: Instant,
+    /// Whether `snapshot` currently carries a quiet-timeout Idle.
+    timed_out: bool,
     /// Reads run against the database — lets the tests prove a quiet
     /// poll never touches SQLite.
     queries: u64,
@@ -327,54 +409,51 @@ impl OpenCodeMessageTail {
     /// Construct a tail for `(data_root, session_id)` and poll once so
     /// existing content is read before the first poll interval fires.
     pub fn for_session(data_root: &Path, session_id: impl Into<String>) -> Self {
+        let now = Instant::now();
         let mut tail = Self {
             data_root: data_root.to_path_buf(),
             session_id: session_id.into(),
-            db_path: db::db_path(data_root),
-            conn: None,
-            last_stamp: None,
+            db: DbHandle::new(db::db_path(data_root)),
             title: None,
             prompts: PromptTally::default(),
+            base: None,
+            quiet_after: None,
+            activity: None,
+            last_activity: now,
+            timed_out: false,
             queries: 0,
             snapshot: None,
         };
-        tail.poll();
+        tail.poll_at(now);
         tail
     }
 
-    /// Re-read the session if the database moved since the last read.
-    /// Returns `true` when the snapshot changed.
+    /// Re-read the session if anything was committed since the last
+    /// read, then apply the quiet timeouts. Returns `true` when the
+    /// snapshot changed.
     pub fn poll(&mut self) -> bool {
-        // Stat before reading: a commit landing between the stat and the
-        // queries is read now *and* moves the stamp, so the next poll
-        // reads again rather than missing it.
-        let stamp = db::shared_stamp(&self.db_path);
-        if self.last_stamp == Some(stamp) {
+        self.poll_at(Instant::now())
+    }
+
+    /// [`Self::poll`] with the tail clock passed in, so the quiet
+    /// timeouts can be tested without waiting for them.
+    pub fn poll_at(&mut self, now: Instant) -> bool {
+        let read_changed = self.refresh(now);
+        let timed_out = self.base.as_ref().is_some_and(|s| s.state == SessionState::Busy)
+            && self
+                .quiet_after
+                .is_some_and(|window| now.saturating_duration_since(self.last_activity) >= window);
+        if !read_changed && timed_out == self.timed_out {
             return false;
         }
-        if !stamp.db_exists() {
-            self.conn = None;
-            self.last_stamp = Some(stamp);
-            return false;
+        self.timed_out = timed_out;
+        let mut snap = self.base.clone();
+        if timed_out && let Some(s) = snap.as_mut() {
+            s.state = SessionState::Idle;
+            // Not a finished turn: the app reads this to stay quiet
+            // instead of announcing "Turn complete".
+            s.quiet_timeout = true;
         }
-        self.queries += 1;
-        let read = match self.read() {
-            Ok(read) => read,
-            // Locked mid-write: retry next poll, stamp unrecorded.
-            Err(err) if db::is_busy(&err) => return false,
-            Err(err) => {
-                eprintln!("[opencode_telemetry] reading {}: {err}", self.db_path.display());
-                self.conn = None;
-                self.last_stamp = Some(stamp);
-                return false;
-            }
-        };
-        self.last_stamp = Some(stamp);
-        self.prompts = read.prompts.clone();
-        if let Some(raw) = read.title.as_deref().filter(|t| !db::is_placeholder_title(t)) {
-            SessionTitle::offer(&mut self.title, raw, TitleSource::Generated);
-        }
-        let snap = build_snapshot(&read, self.title.clone());
         if snap == self.snapshot {
             return false;
         }
@@ -382,14 +461,48 @@ impl OpenCodeMessageTail {
         true
     }
 
-    fn read(&mut self) -> rusqlite::Result<SessionRead> {
-        let conn = match self.conn.take() {
-            Some(conn) => conn,
-            None => db::open_read_only(&self.db_path)?,
+    /// Read the session when the database has a commit we haven't seen.
+    /// Returns `true` when `base` changed.
+    fn refresh(&mut self, now: Instant) -> bool {
+        let version = match self.db.probe() {
+            Ok(Probe::Changed(version)) => version,
+            Ok(Probe::Unchanged | Probe::Missing) => return false,
+            Err(err) if db::is_busy(&err) => return false,
+            Err(err) => {
+                self.db.log_error("opencode_telemetry", &err);
+                return false;
+            }
         };
-        let read = read_session(&conn, &self.session_id, &self.prompts);
-        self.conn = Some(conn);
-        read
+        self.queries += 1;
+        let Some(conn) = self.db.conn() else { return false };
+        let read = match read_session(conn, &self.session_id, &self.prompts) {
+            Ok(read) => read,
+            // Locked mid-read: leave the version unmarked, retry next poll.
+            Err(err) if db::is_busy(&err) => return false,
+            Err(err) => {
+                // Not a schema we know: wait for the next commit.
+                self.db.log_error("opencode_telemetry", &err);
+                self.db.mark_read(version);
+                return false;
+            }
+        };
+        self.db.mark_read(version);
+        if self.activity.as_ref() != Some(&read.activity) {
+            self.activity = Some(read.activity.clone());
+            self.last_activity = now;
+        }
+        self.prompts = read.prompts.clone();
+        if let Some(raw) = read.title.as_deref().filter(|t| !db::is_placeholder_title(t)) {
+            SessionTitle::offer(&mut self.title, raw, TitleSource::Generated);
+        }
+        let base = build_snapshot(&read, self.title.clone());
+        self.quiet_after =
+            read.latest.as_ref().zip(base.as_ref()).and_then(|(m, s)| quiet_window(m, s.state));
+        if base == self.base {
+            return false;
+        }
+        self.base = base;
+        true
     }
 
     /// Suggested poll interval for the next wake-up. 250 ms while
@@ -701,7 +814,147 @@ mod tests {
         );
     }
 
-    // ---- stamp gate ----
+    // ---- quiet timeouts ----
+
+    /// The step shape a denied permission or rejected question leaves
+    /// behind: completed, `finish: "tool-calls"`, no error, its tool
+    /// part errored, and no next step.
+    fn denied_turn(fx: &Fixture) {
+        fx.put_message("msg_1", SID, &user(1_000));
+        let step = assistant(2_000, Some((3_000, "tool-calls")), (1, 1, 0, 0), MODEL);
+        fx.put_message("msg_2", SID, &step);
+        fx.put_tool_part("prt_1", "msg_2", SID, "error");
+    }
+
+    #[test]
+    fn denied_permission_settles_to_quiet_idle() {
+        let fx = fixture();
+        denied_turn(&fx);
+        let mut t = tail(&fx);
+        let start = Instant::now();
+        assert_eq!(state(&t), SessionState::Busy);
+
+        assert!(!t.poll_at(start + TOOL_STEP_SETTLE / 2));
+        assert_eq!(state(&t), SessionState::Busy);
+
+        assert!(t.poll_at(start + TOOL_STEP_SETTLE + Duration::from_secs(1)));
+        let snap = t.snapshot.as_ref().unwrap();
+        assert_eq!(snap.state, SessionState::Idle);
+        assert!(snap.quiet_timeout, "not a finished turn: no toast");
+        assert_eq!(t.queries, 1, "the timeout needs no query");
+    }
+
+    #[test]
+    fn next_step_cancels_the_settle_timeout() {
+        let fx = fixture();
+        denied_turn(&fx);
+        let mut t = tail(&fx);
+        let start = Instant::now();
+        assert!(t.poll_at(start + TOOL_STEP_SETTLE * 2));
+        assert!(t.snapshot.as_ref().unwrap().quiet_timeout);
+
+        // The loop did go on after all: back to Busy, flag cleared.
+        fx.put_message("msg_3", SID, &assistant(9_000, None, (0, 0, 0, 0), MODEL));
+        assert!(t.poll_at(start + TOOL_STEP_SETTLE * 2 + Duration::from_millis(250)));
+        let snap = t.snapshot.as_ref().unwrap();
+        assert_eq!(snap.state, SessionState::Busy);
+        assert!(!snap.quiet_timeout);
+    }
+
+    #[test]
+    fn crashed_mid_step_goes_quiet_idle_after_busy_timeout() {
+        let fx = fixture();
+        fx.put_message("msg_1", SID, &user(1_000));
+        fx.put_message("msg_2", SID, &assistant(2_000, None, (0, 0, 0, 0), MODEL));
+        let mut t = tail(&fx);
+        let start = Instant::now();
+
+        // A streaming step is not a settled tool step: the short window
+        // doesn't apply.
+        assert!(!t.poll_at(start + TOOL_STEP_SETTLE * 2));
+        assert!(!t.poll_at(start + BUSY_QUIET_TIMEOUT / 2));
+        assert_eq!(state(&t), SessionState::Busy);
+
+        assert!(t.poll_at(start + BUSY_QUIET_TIMEOUT + Duration::from_secs(1)));
+        let snap = t.snapshot.as_ref().unwrap();
+        assert_eq!(snap.state, SessionState::Idle);
+        assert!(snap.quiet_timeout);
+    }
+
+    #[test]
+    fn streaming_output_restarts_the_quiet_window() {
+        let fx = fixture();
+        fx.put_message("msg_1", SID, &user(1_000));
+        fx.put_message("msg_2", SID, &assistant(2_000, None, (0, 0, 0, 0), MODEL));
+        let mut t = tail(&fx);
+        let start = Instant::now();
+
+        // A part changing on the latest step is activity, even though
+        // the snapshot itself stays the same.
+        let later = start + BUSY_QUIET_TIMEOUT / 2;
+        fx.put_tool_part("prt_1", "msg_2", SID, "completed");
+        assert!(!t.poll_at(later));
+        assert!(!t.poll_at(start + BUSY_QUIET_TIMEOUT + Duration::from_secs(1)));
+        assert_eq!(state(&t), SessionState::Busy);
+        assert!(t.poll_at(later + BUSY_QUIET_TIMEOUT + Duration::from_secs(1)));
+        assert_eq!(state(&t), SessionState::Idle);
+    }
+
+    #[test]
+    fn writes_to_other_sessions_do_not_hold_off_the_timeout() {
+        let fx = fixture();
+        fx.add_session("ses_other", None, "C:/repo/beta", "Other", 1);
+        denied_turn(&fx);
+        let mut t = tail(&fx);
+        let start = Instant::now();
+        fx.put_message("msg_x", "ses_other", &user(5_000));
+        assert!(!t.poll_at(start + TOOL_STEP_SETTLE / 2));
+        assert!(t.poll_at(start + TOOL_STEP_SETTLE + Duration::from_secs(1)));
+        assert!(t.snapshot.as_ref().unwrap().quiet_timeout);
+    }
+
+    #[test]
+    fn pending_tool_never_times_out() {
+        let fx = fixture();
+        fx.put_message("msg_1", SID, &user(1_000));
+        fx.put_message("msg_2", SID, &assistant(2_000, None, (0, 0, 0, 0), MODEL));
+        fx.put_tool_part("prt_1", "msg_2", SID, "running");
+        let mut t = tail(&fx);
+        let start = Instant::now();
+        assert!(!t.poll_at(start + BUSY_QUIET_TIMEOUT * 3));
+        assert_eq!(state(&t), SessionState::PendingToolUse);
+    }
+
+    #[test]
+    fn a_stopped_turn_is_a_real_idle() {
+        let fx = fixture();
+        fx.put_message("msg_1", SID, &user(1_000));
+        fx.put_message("msg_2", SID, &assistant(2_000, Some((3_000, "stop")), (1, 1, 0, 0), MODEL));
+        let mut t = tail(&fx);
+        assert!(!t.poll_at(Instant::now() + BUSY_QUIET_TIMEOUT * 2));
+        assert!(!t.snapshot.as_ref().unwrap().quiet_timeout);
+    }
+
+    // ---- change detection ----
+
+    #[test]
+    fn the_last_commit_of_a_burst_is_read() {
+        // OpenCode ends a turn with a burst of commits, inside one
+        // mtime tick and after checkpoints that keep the WAL length
+        // fixed. Each poll must see the newest one.
+        let fx = fixture();
+        fx.conn.pragma_update(None, "wal_autocheckpoint", 1).unwrap();
+        fx.put_message("msg_1", SID, &user(1_000));
+        let mut t = tail(&fx);
+        for n in 0..50i64 {
+            let created = 2_000 + n * 10;
+            let data = assistant(created, Some((created + 5, "stop")), (1, n as u64, 0, 0), MODEL);
+            fx.put_message(&format!("msg_s{n:02}"), SID, &data);
+            t.poll();
+            assert_eq!(t.snapshot.as_ref().unwrap().tokens_used, 1 + n as u64, "commit {n}");
+        }
+        assert_eq!(state(&t), SessionState::Idle);
+    }
 
     #[test]
     fn quiet_polls_do_not_query() {
@@ -757,13 +1010,13 @@ mod tests {
 
     /// Per-tick cost of 10 OpenCode tabs: each tab's tail `poll()` plus
     /// its discovery `scan()`, against 10 sessions of 300 messages.
-    /// Run with `cargo test -p codescope-core --release opencode_tick_cost
-    /// -- --ignored --nocapture`.
+    /// Run with `cargo test -p codescope-core opencode_tick_cost --
+    /// --ignored --nocapture`.
     #[test]
     #[ignore = "benchmark; prints timings"]
     fn opencode_tick_cost() {
         use crate::agents::opencode::discovery;
-        use std::time::{Instant, SystemTime};
+        use std::time::SystemTime;
 
         const TABS: usize = 10;
         let fx = Fixture::new();
@@ -788,9 +1041,9 @@ mod tests {
             (0..TABS).map(|i| OpenCodeMessageTail::for_session(fx.root(), sid(i))).collect();
         // One telemetry tick (every tail polls) plus one adoption tick
         // (every tab scans). Ticks are >= 250 ms apart in the app, so
-        // each starts with the shared stamp expired.
+        // each starts with the shared file stat expired.
         let tick = |tails: &mut Vec<OpenCodeMessageTail>| {
-            db::forget_shared_stamps();
+            db::forget_shared_file_ids();
             let start = Instant::now();
             for (i, t) in tails.iter_mut().enumerate() {
                 t.poll();
@@ -816,7 +1069,7 @@ mod tests {
             println!("{TABS} tabs, {label}: quiet tick {quiet:?}; tick after a commit {active:?}");
         };
         measure(&mut tails, "stat per call");
-        db::TEST_STAMP_REUSE.with(|w| w.set(db::STAMP_REUSE_WINDOW));
-        measure(&mut tails, "shared stamp (production)");
+        db::TEST_FILE_ID_REUSE.with(|w| w.set(db::FILE_ID_REUSE_WINDOW));
+        measure(&mut tails, "shared stat (production)");
     }
 }

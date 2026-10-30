@@ -3,22 +3,23 @@
 //! OpenCode 1.x keeps every session, message and message part in one
 //! WAL-mode SQLite database (it used to write one JSON file per
 //! message). Both the adoption scan ([`super::discovery`]) and the
-//! per-tab tail ([`super::telemetry`]) read it under the same rules
-//! (ADR-0025):
+//! per-tab tail ([`super::telemetry`]) read it through a [`DbHandle`],
+//! under the same rules (ADR-0025):
 //!
 //! * **Read-only.** Connections open with `SQLITE_OPEN_READ_ONLY` and a
 //!   zero busy timeout. A locked database is "nothing new this tick",
 //!   never a wait on the UI thread.
-//! * **Stat before query.** [`DbStamp`] is the mtime and length of
-//!   `opencode.db` and `opencode.db-wal`. Every commit OpenCode makes
-//!   lands in the WAL, and a checkpoint rewrites the main file, so a
-//!   stamp that hasn't moved means there is nothing new to read.
-//!   [`shared_stamp`] lets every tab in one tick share a single stat.
+//! * **Probe before query.** `PRAGMA data_version` on the kept
+//!   connection changes whenever another connection commits. It reads
+//!   the WAL-index header only, no table pages, so a tick with nothing
+//!   new costs a few µs. File stats can't do this job: after a
+//!   checkpoint SQLite rewrites the WAL from offset 0, so its length
+//!   stops moving, and two commits often share one mtime tick.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, ErrorCode, OpenFlags};
 
@@ -30,90 +31,86 @@ pub fn db_path(data_root: &Path) -> PathBuf {
     data_root.join(DB_FILE_NAME)
 }
 
-/// What a `stat` of the database and its WAL says, compared tick to
-/// tick to decide whether a query is worth running. The length is
-/// carried next to the mtime so two commits inside one mtime tick
-/// still differ: each one grows the WAL.
+/// Identity of the database file between ticks: that it exists, and on
+/// Unix which inode it is, so a file deleted and recreated under the
+/// same name is reopened instead of read through the old, unlinked
+/// inode forever. Windows needs only existence: while a connection holds
+/// the file open, deleting or renaming it fails with a sharing
+/// violation, so it can't be replaced underneath us.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DbStamp {
-    db: Option<(Option<SystemTime>, u64)>,
-    wal: Option<(Option<SystemTime>, u64)>,
+pub struct FileId {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
 }
 
-impl DbStamp {
-    /// Stat `db_path` and `<db_path>-wal`. Two `metadata` calls, no
-    /// file is opened for reading.
-    pub fn read(db_path: &Path) -> Self {
-        let mut wal = db_path.as_os_str().to_owned();
-        wal.push("-wal");
-        Self {
-            db: file_stamp(db_path),
-            wal: file_stamp(Path::new(&wal)),
-        }
-    }
-
-    /// `false` when `opencode.db` itself is missing (OpenCode never
-    /// ran, or an older version that predates the database).
-    pub fn db_exists(&self) -> bool {
-        self.db.is_some()
-    }
-}
-
-fn file_stamp(path: &Path) -> Option<(Option<SystemTime>, u64)> {
+fn file_id(path: &Path) -> Option<FileId> {
     let meta = std::fs::metadata(path).ok()?;
-    Some((meta.modified().ok(), meta.len()))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(FileId { dev: meta.dev(), ino: meta.ino() })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        Some(FileId {})
+    }
 }
 
-/// How long one caller's stamp is reused by the next. All OpenCode
+/// How long one caller's [`FileId`] is reused by the next. All OpenCode
 /// tails poll in the same telemetry tick and all OpenCode tabs scan in
-/// the same adoption tick, so within a tick the database is stat'ed
-/// once rather than once per tab (a `stat` is ~20 µs on Windows). A
-/// commit landing inside the window is picked up one poll later.
-pub const STAMP_REUSE_WINDOW: Duration = Duration::from_millis(50);
+/// the same adoption tick, so within a tick the file is stat'ed once
+/// rather than once per tab (a `stat` is ~20 µs on Windows). Only
+/// existence and identity ride on it; change detection is
+/// `data_version`, per connection, every time.
+pub const FILE_ID_REUSE_WINDOW: Duration = Duration::from_millis(50);
 
-static RECENT_STAMPS: LazyLock<Mutex<HashMap<PathBuf, (Instant, DbStamp)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// When each path was last stat'ed, and what that found.
+type RecentIds = HashMap<PathBuf, (Instant, Option<FileId>)>;
 
-/// [`DbStamp::read`], reusing a stamp of the same file read less than
-/// [`stamp_reuse`] ago.
-pub fn shared_stamp(db_path: &Path) -> DbStamp {
+static RECENT_IDS: LazyLock<Mutex<RecentIds>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// [`file_id`], reusing one read for the same path less than
+/// [`file_id_reuse`] ago.
+fn shared_file_id(path: &Path) -> Option<FileId> {
     let now = Instant::now();
-    let mut recent = RECENT_STAMPS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some((at, stamp)) = recent.get_mut(db_path) {
-        if now.duration_since(*at) < stamp_reuse() {
-            return *stamp;
+    let mut recent = RECENT_IDS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((at, id)) = recent.get_mut(path) {
+        if now.duration_since(*at) >= file_id_reuse() {
+            *id = file_id(path);
+            *at = now;
         }
-        *stamp = DbStamp::read(db_path);
-        *at = now;
-        return *stamp;
+        return *id;
     }
-    let stamp = DbStamp::read(db_path);
-    recent.insert(db_path.to_path_buf(), (now, stamp));
-    stamp
+    let id = file_id(path);
+    recent.insert(path.to_path_buf(), (now, id));
+    id
 }
 
 #[cfg(not(test))]
-fn stamp_reuse() -> Duration {
-    STAMP_REUSE_WINDOW
+fn file_id_reuse() -> Duration {
+    FILE_ID_REUSE_WINDOW
 }
 
-// Tests write and poll back to back, so they stat every time unless a
-// test opts into the window.
+// Tests create and delete files back to back, so they stat every time
+// unless a test opts into the window.
 #[cfg(test)]
 thread_local! {
-    pub(crate) static TEST_STAMP_REUSE: std::cell::Cell<Duration> =
+    pub(crate) static TEST_FILE_ID_REUSE: std::cell::Cell<Duration> =
         const { std::cell::Cell::new(Duration::ZERO) };
 }
 
 #[cfg(test)]
-fn stamp_reuse() -> Duration {
-    TEST_STAMP_REUSE.with(|w| w.get())
+fn file_id_reuse() -> Duration {
+    TEST_FILE_ID_REUSE.with(|w| w.get())
 }
 
-/// Expire every shared stamp, as the gap between two real ticks does.
+/// Expire every shared [`FileId`], as the gap between two real ticks does.
 #[cfg(test)]
-pub(crate) fn forget_shared_stamps() {
-    RECENT_STAMPS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+pub(crate) fn forget_shared_file_ids() {
+    RECENT_IDS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
 }
 
 /// Open `path` strictly read-only. No URI parsing, no create, and a
@@ -130,12 +127,131 @@ pub fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
 
 /// `SQLITE_BUSY` / `SQLITE_LOCKED`: OpenCode is mid-write (or mid
 /// recovery). Callers retry on the next tick without recording the
-/// stamp, so the retry isn't gated away.
+/// version they probed, so the retry isn't gated away.
 pub fn is_busy(err: &rusqlite::Error) -> bool {
     matches!(
         err.sqlite_error_code(),
         Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
     )
+}
+
+/// How long to wait before retrying an open that failed for a reason
+/// other than a lock (unreadable file, not a database).
+pub const OPEN_RETRY: Duration = Duration::from_secs(2);
+
+/// What [`DbHandle::probe`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Probe {
+    /// `opencode.db` doesn't exist.
+    Missing,
+    /// Nothing committed since the last [`DbHandle::mark_read`].
+    Unchanged,
+    /// Something was committed; read, then `mark_read` this version.
+    Changed(i64),
+}
+
+/// One kept read-only connection plus the change detector around it.
+///
+/// The loop each tick: [`probe`](Self::probe); on
+/// [`Probe::Changed`] run the queries through [`conn`](Self::conn) and,
+/// once they succeed (or fail for good), [`mark_read`](Self::mark_read)
+/// the probed version. A busy read leaves it unmarked, so the next
+/// probe says `Changed` again.
+#[derive(Debug)]
+pub struct DbHandle {
+    path: PathBuf,
+    conn: Option<Connection>,
+    /// Identity of the file `conn` was opened on.
+    file: Option<FileId>,
+    /// `data_version` the last completed read saw.
+    read_version: Option<i64>,
+    open_failed_at: Option<Instant>,
+    /// Last error printed, so a persistent one is printed once rather
+    /// than on every commit OpenCode makes.
+    last_logged: Option<String>,
+}
+
+impl DbHandle {
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            conn: None,
+            file: None,
+            read_version: None,
+            open_failed_at: None,
+            last_logged: None,
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Has anything been committed since the last read? One shared
+    /// `stat` per tick (existence, and the inode on Unix), opening the
+    /// connection if needed, then `PRAGMA data_version`.
+    pub fn probe(&mut self) -> rusqlite::Result<Probe> {
+        let Some(id) = shared_file_id(&self.path) else {
+            self.conn = None;
+            self.file = None;
+            self.read_version = None;
+            return Ok(Probe::Missing);
+        };
+        if self.file != Some(id) {
+            // Replaced (or first sight): whatever we read came from
+            // another file.
+            self.conn = None;
+            self.read_version = None;
+        }
+        let conn = match self.conn.take() {
+            Some(conn) => conn,
+            None => {
+                if self.open_failed_at.is_some_and(|at| at.elapsed() < OPEN_RETRY) {
+                    return Ok(Probe::Unchanged);
+                }
+                match open_read_only(&self.path) {
+                    Ok(conn) => {
+                        self.open_failed_at = None;
+                        conn
+                    }
+                    Err(err) => {
+                        self.open_failed_at = Some(Instant::now());
+                        return Err(err);
+                    }
+                }
+            }
+        };
+        let version = conn
+            .prepare_cached("PRAGMA data_version")
+            .and_then(|mut stmt| stmt.query_row([], |r| r.get::<_, i64>(0)));
+        self.conn = Some(conn);
+        self.file = Some(id);
+        let version = version?;
+        Ok(if self.read_version == Some(version) {
+            Probe::Unchanged
+        } else {
+            Probe::Changed(version)
+        })
+    }
+
+    /// The open connection, after a [`Probe::Changed`].
+    pub fn conn(&self) -> Option<&Connection> {
+        self.conn.as_ref()
+    }
+
+    /// Record that everything up to `version` has been read.
+    pub fn mark_read(&mut self, version: i64) {
+        self.read_version = Some(version);
+    }
+
+    /// Print `err` unless it is the same error printed last time.
+    pub fn log_error(&mut self, tag: &str, err: &rusqlite::Error) {
+        let msg = err.to_string();
+        if self.last_logged.as_deref() != Some(msg.as_str()) {
+            eprintln!("[{tag}] reading {}: {msg}", self.path.display());
+            self.last_logged = Some(msg);
+        }
+    }
 }
 
 /// `true` for the title OpenCode gives a session before it has
@@ -324,6 +440,7 @@ pub(crate) mod fixture {
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,38 +461,93 @@ mod tests {
         assert!(!is_placeholder_title("New session handling in the router"));
     }
 
+    /// Probe, and mark whatever changed as read.
+    fn probe_and_mark(handle: &mut DbHandle) -> Probe {
+        let probe = handle.probe().unwrap();
+        if let Probe::Changed(v) = probe {
+            handle.mark_read(v);
+        }
+        probe
+    }
+
     #[test]
-    fn stamp_of_missing_db_reports_absent() {
+    fn missing_db_probes_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        let stamp = DbStamp::read(&db_path(tmp.path()));
-        assert!(!stamp.db_exists());
-        assert_eq!(stamp, DbStamp::read(&db_path(tmp.path())));
+        let mut handle = DbHandle::new(db_path(tmp.path()));
+        assert_eq!(handle.probe().unwrap(), Probe::Missing);
+        assert!(handle.conn().is_none());
+        assert!(!db_path(tmp.path()).exists(), "probing must not create the db");
     }
 
     #[test]
-    fn stamp_moves_on_every_commit() {
+    fn probe_is_unchanged_until_a_commit() {
         let fx = fixture::Fixture::new();
-        let path = db_path(fx.root());
-        let before = DbStamp::read(&path);
-        assert!(before.db_exists());
-        assert_eq!(before, DbStamp::read(&path), "no write, no change");
+        let mut handle = DbHandle::new(db_path(fx.root()));
+        assert!(matches!(probe_and_mark(&mut handle), Probe::Changed(_)), "first sight");
+        assert_eq!(probe_and_mark(&mut handle), Probe::Unchanged);
+        assert_eq!(probe_and_mark(&mut handle), Probe::Unchanged);
         fx.add_session("ses_1", None, "C:/repo/alpha", "t", 1);
-        assert_ne!(before, DbStamp::read(&path));
+        assert!(matches!(probe_and_mark(&mut handle), Probe::Changed(_)));
+        assert_eq!(probe_and_mark(&mut handle), Probe::Unchanged);
     }
 
     #[test]
-    fn shared_stamp_is_reused_only_inside_the_window() {
+    fn probe_sees_every_commit_even_after_a_checkpoint() {
+        // The case file stats miss: after a checkpoint the WAL is
+        // rewritten from offset 0 at a constant length, and commits a
+        // millisecond apart share an mtime.
         let fx = fixture::Fixture::new();
-        let path = db_path(fx.root());
-        TEST_STAMP_REUSE.with(|w| w.set(Duration::from_secs(60)));
-        let first = shared_stamp(&path);
-        fx.add_session("ses_1", None, "C:/repo/alpha", "t", 1);
-        assert_eq!(shared_stamp(&path), first, "inside the window: no stat");
+        fx.conn.pragma_update(None, "wal_autocheckpoint", 1).unwrap();
+        let mut handle = DbHandle::new(db_path(fx.root()));
+        probe_and_mark(&mut handle);
+        for n in 0..300 {
+            fx.add_session(&format!("ses_{n}"), None, "C:/repo/alpha", "t", n);
+            assert!(matches!(probe_and_mark(&mut handle), Probe::Changed(_)), "commit {n}");
+        }
+    }
 
-        TEST_STAMP_REUSE.with(|w| w.set(Duration::ZERO));
-        let fresh = shared_stamp(&path);
-        assert_ne!(fresh, first, "window over: stat again");
-        assert_eq!(fresh, DbStamp::read(&path));
+    #[test]
+    fn unmarked_change_is_reported_again() {
+        // A busy read never calls `mark_read`; the next probe retries.
+        let fx = fixture::Fixture::new();
+        let mut handle = DbHandle::new(db_path(fx.root()));
+        probe_and_mark(&mut handle);
+        fx.add_session("ses_1", None, "C:/repo/alpha", "t", 1);
+        assert!(matches!(handle.probe().unwrap(), Probe::Changed(_)));
+        assert!(matches!(handle.probe().unwrap(), Probe::Changed(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_file_is_reopened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = db_path(tmp.path());
+        let first = rusqlite::Connection::open(&path).unwrap();
+        first.execute_batch("CREATE TABLE t (v text); INSERT INTO t VALUES ('old');").unwrap();
+        let mut handle = DbHandle::new(path.clone());
+        probe_and_mark(&mut handle);
+        drop(first);
+
+        std::fs::remove_file(&path).unwrap();
+        let second = rusqlite::Connection::open(&path).unwrap();
+        second.execute_batch("CREATE TABLE t (v text); INSERT INTO t VALUES ('new');").unwrap();
+        assert!(matches!(probe_and_mark(&mut handle), Probe::Changed(_)));
+        let v: String =
+            handle.conn().unwrap().query_row("SELECT v FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, "new");
+    }
+
+    #[test]
+    fn shared_file_id_is_reused_only_inside_the_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = db_path(tmp.path());
+        TEST_FILE_ID_REUSE.with(|w| w.set(Duration::from_secs(60)));
+        assert_eq!(shared_file_id(&path), None);
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(shared_file_id(&path), None, "inside the window: no stat");
+
+        TEST_FILE_ID_REUSE.with(|w| w.set(Duration::ZERO));
+        assert!(shared_file_id(&path).is_some(), "window over: stat again");
     }
 
     #[test]

@@ -20,10 +20,9 @@
 //!
 //! The adoption tick calls [`scan`] for every OpenCode tab every
 //! ~350 ms. The session list is cached per database path behind a
-//! [`DbStamp`]: a scan whose stamp hasn't moved costs a filter over the
-//! cached rows, plus two `stat`s shared by every tab scanned in the same
-//! tick ([`db::shared_stamp`]). Only a moved stamp re-runs the query,
-//! once, for every tab sharing the database.
+//! [`DbHandle`]: a scan with nothing committed since the last read costs
+//! a `PRAGMA data_version` and a filter over the cached rows. Only a
+//! commit re-runs the query, once, for every tab sharing the database.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -32,7 +31,7 @@ use std::time::{Duration, SystemTime};
 
 use rusqlite::Connection;
 
-use crate::agents::opencode::db::{self, DbStamp};
+use crate::agents::opencode::db::{self, DbHandle, Probe};
 use crate::path_canon::canonicalize_path;
 
 /// Suggested poll interval — 400 ms matches the C#
@@ -59,11 +58,8 @@ struct SessionRow {
 }
 
 /// Cached session list for one database.
-#[derive(Default)]
 struct DbCache {
-    /// Stamp the rows were read at; `None` until the first read.
-    stamp: Option<DbStamp>,
-    conn: Option<Connection>,
+    db: DbHandle,
     rows: Vec<SessionRow>,
     /// Queries run against this database — lets the tests prove a
     /// quiet scan never touches SQLite.
@@ -87,10 +83,13 @@ pub fn scan(
     since: SystemTime,
 ) -> Vec<AdoptionCandidate> {
     let path = db::db_path(data_root);
-    let stamp = db::shared_stamp(&path);
     let mut caches = CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let cache = caches.entry(path.clone()).or_default();
-    refresh(cache, &path, stamp);
+    let cache = caches.entry(path).or_insert_with_key(|path| DbCache {
+        db: DbHandle::new(path.clone()),
+        rows: Vec::new(),
+        queries: 0,
+    });
+    refresh(cache);
 
     let canon_cwd = canonicalize_path(working_directory);
     let since_ms = since
@@ -108,59 +107,55 @@ pub fn scan(
         .collect()
 }
 
-/// Re-read the session list when `stamp` moved since the last read.
-fn refresh(cache: &mut DbCache, path: &Path, stamp: DbStamp) {
-    if cache.stamp == Some(stamp) {
-        return;
-    }
-    if !stamp.db_exists() {
-        // Deleted (or never created): drop the handle to the old file.
-        cache.conn = None;
-        cache.rows.clear();
-        cache.stamp = Some(stamp);
-        return;
-    }
+/// Re-read the session list when something was committed since the
+/// last read.
+fn refresh(cache: &mut DbCache) {
+    let version = match cache.db.probe() {
+        Ok(Probe::Changed(version)) => version,
+        Ok(Probe::Unchanged) => return,
+        Ok(Probe::Missing) => {
+            cache.rows.clear();
+            return;
+        }
+        // Locked: keep the old rows, try again next tick.
+        Err(err) if db::is_busy(&err) => return,
+        Err(err) => {
+            cache.db.log_error("opencode_discovery", &err);
+            return;
+        }
+    };
     cache.queries += 1;
-    match read_sessions(cache, path) {
+    let Some(conn) = cache.db.conn() else { return };
+    match read_sessions(conn) {
         Ok(rows) => {
             cache.rows = rows;
-            cache.stamp = Some(stamp);
+            cache.db.mark_read(version);
         }
-        // Locked mid-write: keep the old rows and leave the stamp
-        // unrecorded so the next tick tries again.
+        // Locked mid-read: keep the old rows and the connection, and
+        // leave the version unmarked so the next tick reads again.
         Err(err) if db::is_busy(&err) => {}
         Err(err) => {
-            // Not an OpenCode schema we know, or a broken file. Record
-            // the stamp so this doesn't re-run every tick, and reopen
-            // once the file changes.
-            eprintln!("[opencode_discovery] reading {}: {err}", path.display());
-            cache.conn = None;
+            // Not an OpenCode schema we know. Mark the version so this
+            // only re-runs on the next commit.
+            cache.db.log_error("opencode_discovery", &err);
             cache.rows.clear();
-            cache.stamp = Some(stamp);
+            cache.db.mark_read(version);
         }
     }
 }
 
-fn read_sessions(cache: &mut DbCache, path: &Path) -> rusqlite::Result<Vec<SessionRow>> {
-    let conn = match cache.conn.take() {
-        Some(conn) => conn,
-        None => db::open_read_only(path)?,
-    };
-    let rows = {
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, directory, time_updated FROM session WHERE parent_id IS NULL",
-        )?;
-        stmt.query_map([], |row| {
-            Ok(SessionRow {
-                id: row.get(0)?,
-                canon_dir: canonicalize_path(&row.get::<_, String>(1)?),
-                updated_ms: row.get(2)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    cache.conn = Some(conn);
-    Ok(rows)
+fn read_sessions(conn: &Connection) -> rusqlite::Result<Vec<SessionRow>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, directory, time_updated FROM session WHERE parent_id IS NULL",
+    )?;
+    stmt.query_map([], |row| {
+        Ok(SessionRow {
+            id: row.get(0)?,
+            canon_dir: canonicalize_path(&row.get::<_, String>(1)?),
+            updated_ms: row.get(2)?,
+        })
+    })?
+    .collect()
 }
 
 #[cfg(test)]
@@ -263,8 +258,7 @@ mod tests {
         }
         assert_eq!(query_count(fx.root()), 1);
 
-        // A commit moves the WAL: exactly one re-read, and it sees the
-        // new row.
+        // A commit: exactly one re-read, and it sees the new row.
         fx.add_session("ses_b", None, "C:/repo/alpha", "t", 2_000);
         assert_eq!(
             ids(&scan(fx.root(), "C:/repo/alpha", SystemTime::UNIX_EPOCH)),
@@ -288,10 +282,23 @@ mod tests {
         let fx = Fixture::new();
         fx.add_session("ses_a", None, "C:/repo/alpha", "t", 1_000);
         let path = db::db_path(fx.root());
-        let before = std::fs::read(&path).unwrap();
-        let stamp = DbStamp::read(&path);
+        let wal = fx.root().join("opencode.db-wal");
+        let before = (std::fs::read(&path).unwrap(), std::fs::read(&wal).unwrap());
         scan(fx.root(), "C:/repo/alpha", SystemTime::UNIX_EPOCH);
-        assert_eq!(DbStamp::read(&path), stamp);
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!((std::fs::read(&path).unwrap(), std::fs::read(&wal).unwrap()), before);
+    }
+
+    #[test]
+    fn back_to_back_commits_are_all_seen() {
+        // Commits inside one mtime tick, and after checkpoints that
+        // rewrite the WAL at the same length, must each show up.
+        let fx = Fixture::new();
+        fx.conn.pragma_update(None, "wal_autocheckpoint", 1).unwrap();
+        for n in 0..50 {
+            let sid = format!("ses_{n:02}");
+            fx.add_session(&sid, None, "C:/repo/alpha", "t", 1_000);
+            let found = scan(fx.root(), "C:/repo/alpha", SystemTime::UNIX_EPOCH);
+            assert!(found.iter().any(|c| c.session_id == sid), "commit {n} missed");
+        }
     }
 }
