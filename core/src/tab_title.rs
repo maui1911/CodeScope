@@ -33,10 +33,12 @@ pub enum TabTitle {
         /// Project name; always the leading part.
         project: String,
         /// Branch, or the folder leaf while the branch is unknown.
-        /// `None` for a tab opened on the project itself, which never
-        /// had a location to follow.
+        /// `None` for a tab opened on the project itself until the
+        /// first branch report fills it (see [`TabTitle::set_branch`]).
         location: Option<String>,
-        /// Qualifier picked at spawn (`claude`, `shell`).
+        /// Qualifier picked at spawn (`claude`, `shell`). On a tab
+        /// opened on the project itself it only stands in for the
+        /// location and goes when that is filled.
         suffix: Option<String>,
         /// The session's label: the user's rename, else its content
         /// title. When set it stands in for location and suffix.
@@ -50,8 +52,9 @@ impl TabTitle {
         Self::Plain(text.into())
     }
 
-    /// A tab opened on a project, with no worktree location:
-    /// `"{project}"`, or `"{project} · {label}"` once labelled.
+    /// A tab opened on a project (its primary checkout) before the
+    /// branch is known: `"{project}"` until the first branch report
+    /// fills the location, `"{project} · {label}"` once labelled.
     pub fn project(project: impl Into<String>) -> Self {
         Self::Project { project: project.into(), location: None, suffix: None, label: None }
     }
@@ -123,17 +126,23 @@ impl TabTitle {
         matches!(self, Self::Project { .. })
     }
 
-    /// Follow a branch change (the user ran `git checkout other` in the
-    /// worktree's pty). Replaces the location; the project and suffix
-    /// are untouched whatever they contain.
+    /// Follow a branch report (the git poll's first look, or the user
+    /// ran `git checkout other` in the worktree's pty). Replaces the
+    /// location; the project is untouched whatever it contains.
+    ///
+    /// A tab opened on the project itself has no location yet: it sits
+    /// in the primary checkout, so the first report fills the location
+    /// and drops the spawn qualifier, which only stood in for it —
+    /// `"acme · claude"` reads `"acme · main"`, the same title the tab
+    /// gets when it is restored after a restart. A worktree tab keeps
+    /// its qualifier (`"acme · feature/x · claude"`).
     ///
     /// Returns whether the parts changed. That is `false` for a blank
     /// branch (detached HEAD — better to keep the old label than render
-    /// `"acme ·  · claude"`), an unchanged one, a plain title, and a
-    /// project tab that never had a location (its suffix is not a
-    /// branch). A label shadows the location, so the parts can change
-    /// while the rendered text does not; the branch is kept for when
-    /// the label goes away.
+    /// `"acme ·  · claude"`), an unchanged one, and a plain title. A
+    /// label shadows the location, so the parts can change while the
+    /// rendered text does not; the branch is kept for when the label
+    /// goes away.
     pub fn set_branch(&mut self, branch: &str) -> bool {
         if branch.is_empty() {
             return false;
@@ -141,6 +150,11 @@ impl TabTitle {
         match self {
             Self::Project { location: Some(location), .. } if location != branch => {
                 *location = branch.to_owned();
+                true
+            }
+            Self::Project { location: location @ None, suffix, .. } => {
+                *location = Some(branch.to_owned());
+                *suffix = None;
                 true
             }
             _ => false,
@@ -306,13 +320,38 @@ mod tests {
     }
 
     #[test]
-    fn project_tab_does_not_grow_a_branch() {
-        // Opened on the project itself (with or without an agent
-        // qualifier): there is no branch part to replace, and the
-        // qualifier is not one.
-        assert!(after_branch(TabTitle::project("acme"), "feature/x").is_none());
+    fn project_tab_takes_the_branch_on_first_report() {
+        // Opened on the project itself, the tab sits in the primary
+        // checkout: the first branch report fills the location and the
+        // agent qualifier, which only stood in for it, goes.
         let with_agent = TabTitle::project("acme").with_suffix("claude");
-        assert!(after_branch(with_agent, "feature/x").is_none());
+        assert_eq!(with_agent.render(), "acme · claude");
+        assert_eq!(after_branch(with_agent, "main").as_deref(), Some("acme · main"));
+        assert_eq!(
+            after_branch(TabTitle::project("acme"), "main").as_deref(),
+            Some("acme · main"),
+        );
+    }
+
+    #[test]
+    fn project_tab_reads_the_same_live_and_after_restart() {
+        // Live: opened from the project menu, then the first poll.
+        // Restart: restored with the primary checkout's `branch: None`,
+        // then the first poll. Both must land on the same title.
+        let mut live = TabTitle::project("acme").with_suffix("claude");
+        let mut restored = TabTitle::restored("acme", None, "/dev/acme");
+        for branch in ["main", "feature/x"] {
+            live.set_branch(branch);
+            restored.set_branch(branch);
+            assert_eq!(live.render(), restored.render());
+        }
+        assert_eq!(live.render(), "acme · feature/x");
+    }
+
+    #[test]
+    fn project_tab_with_separator_takes_the_branch() {
+        let title = TabTitle::project("alpha · beta").with_suffix("shell");
+        assert_eq!(after_branch(title, "main").as_deref(), Some("alpha · beta · main"));
     }
 
     #[test]

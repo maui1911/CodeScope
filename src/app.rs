@@ -3102,8 +3102,10 @@ impl AppShell {
     /// matches `path` at `new_branch`.
     ///
     /// [`codescope_core::TabTitle::set_branch`] decides what follows:
-    /// plain titles and project tabs without a location are left
-    /// alone, and a tab showing a session label (the user's rename or
+    /// plain titles are left alone, a tab opened on the project itself
+    /// takes the primary checkout's branch on the first report (the
+    /// sidebar emits one for the primary path too), and a tab showing
+    /// a session label (the user's rename or
     /// a content title) keeps showing it — its branch part still
     /// updates, for when the label goes away.
     ///
@@ -4168,9 +4170,24 @@ impl AppShell {
         });
         let id = self.next_tab_id;
         self.next_tab_id += 1;
-        let title_parts = title_override
+        let mut title_parts = title_override
             .or_else(|| active_project.map(|(_, name)| codescope_core::TabTitle::project(name)))
             .unwrap_or_else(|| codescope_core::TabTitle::plain(format!("Terminal {}", id + 1)));
+        // Take the branch the git poll already knows for this folder.
+        // The poll only reports a branch when it changes, so without
+        // this a tab opened on the project itself after the first poll
+        // would read `acme · claude` until the next checkout, while
+        // the same tab restored after a restart reads `acme · main`.
+        // `branch_name()` skips a detached HEAD's short-SHA stand-in.
+        let known_branch = working_directory_for_tab.as_ref().and_then(|wd| {
+            self.sidebar
+                .read(cx)
+                .git_status_for(&wd.to_string_lossy())
+                .and_then(|g| g.branch_name().map(str::to_owned))
+        });
+        if let Some(branch) = known_branch {
+            title_parts.set_branch(&branch);
+        }
         let title = SharedString::from(title_parts.render());
         // Allocate / adopt the persisted session id. `restore_session_id`
         // is `Some` only on the rehydrate path (a session row that was
