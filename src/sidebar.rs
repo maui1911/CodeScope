@@ -1936,12 +1936,20 @@ impl Sidebar {
                 self.replace_projects(next);
                 cx.notify();
             }
-            Err(err) => cx.emit(SidebarEvent::Toast {
-                kind: ToastSeverity::Err,
-                title: failure_title.into(),
-                detail: Some(format!("{err:#}").into()),
-            }),
+            Err(err) => Self::report_save_failure(failure_title, &err, cx),
         }
+    }
+
+    /// Log a failed `projects.json` edit and toast it: the user's
+    /// action did not happen, and an unreadable file would otherwise
+    /// make it fail silently (#391).
+    fn report_save_failure(title: &'static str, err: &anyhow::Error, cx: &mut Context<Self>) {
+        eprintln!("warning: {title}: {err:#}");
+        cx.emit(SidebarEvent::Toast {
+            kind: ToastSeverity::Err,
+            title: title.into(),
+            detail: Some(format!("{err:#}").into()),
+        });
     }
 
     /// Move a project into `group_id` (`None` = "Other") — the
@@ -3008,43 +3016,34 @@ impl Sidebar {
         let prev_collapsed_groups = self.layout.collapsed_project_groups.clone();
         // Remove by id from a fresh read (#391), not from our copy:
         // AppShell may have saved session rows since we last looked.
-        // Only the sidebar adds, removes or reorders projects, so the
-        // row sits at the same index on disk.
+        // A row already gone on disk is fine — we just catch up.
         let project_id = self.projects.projects[idx].id.clone();
-        let mut removed_at = None;
+        let selected_id =
+            self.selected.and_then(|i| self.projects.projects.get(i)).map(|p| p.id.clone());
         let result = ProjectsConfig::reload_and_edit(&self.paths, |cfg| {
-            removed_at = cfg.projects.iter().position(|p| p.id == project_id);
-            if let Some(at) = removed_at {
-                cfg.projects.remove(at);
-            }
-            Ok(removed_at.is_some())
+            let before = cfg.projects.len();
+            cfg.projects.retain(|p| p.id != project_id);
+            Ok(cfg.projects.len() != before)
         });
         let next = match result {
             Ok((next, _)) => next,
             Err(err) => {
-                eprintln!("warning: failed to save projects.json: {err:#}");
+                Self::report_save_failure("Could not remove project", &err, cx);
                 return;
             }
         };
-        let Some(idx) = removed_at else {
-            // Already gone on disk: just catch up with the file.
-            self.replace_projects(next);
-            self.close_menu(cx);
-            return;
-        };
         self.projects = next;
         self.prune_collapsed_projects();
-        // Selection housekeeping: if we just removed the selected
-        // project, fall back to the previous row (or `None` when the
-        // list is empty). Otherwise shift the cursor left when an
-        // earlier row was removed so it keeps pointing at the same
-        // project.
-        self.selected = match self.selected {
-            Some(sel) if sel == idx => {
-                if self.projects.projects.is_empty() { None } else { Some(sel.min(self.projects.projects.len() - 1)) }
-            }
-            Some(sel) if sel > idx => Some(sel - 1),
-            other => other,
+        // Selection housekeeping, by id: the fresh read's indices
+        // need not match our copy's. If we just removed the selected
+        // project, fall back to the row now at its position (the
+        // previous row when it was last), or `None` when the list is
+        // empty. Otherwise keep pointing at the same project.
+        let len = self.projects.projects.len();
+        self.selected = match selected_id {
+            Some(id) if id == project_id => (len > 0).then(|| idx.min(len - 1)),
+            Some(id) => self.projects.projects.iter().position(|p| p.id == id),
+            None => None,
         };
         self.layout.selected_project_id =
             self.selected.and_then(|i| self.projects.projects.get(i).map(|p| p.id.clone()));
@@ -3137,7 +3136,7 @@ impl Sidebar {
         let next = match result {
             Ok((next, _)) => next,
             Err(err) => {
-                eprintln!("warning: failed to save projects.json: {err:#}");
+                Self::report_save_failure("Could not add project", &err, cx);
                 return;
             }
         };
@@ -3182,7 +3181,7 @@ impl Sidebar {
         let next = match result {
             Ok((next, _)) => next,
             Err(err) => {
-                eprintln!("warning: failed to save projects.json: {err:#}");
+                Self::report_save_failure("Could not add project", &err, cx);
                 return;
             }
         };
@@ -6322,7 +6321,7 @@ async fn commit_worktree_removal(
                 cx.notify();
             }
             Err(err) => {
-                eprintln!("warning: failed to save projects.json after worktree removal: {err:#}");
+                Sidebar::report_save_failure("Could not update the worktree list", &err, cx);
             }
         }
     });
