@@ -7378,7 +7378,12 @@ impl AppShell {
                     }
                     return;
                 }
-                d if d.len() == 1 => {
+                // Exactly Alt+1..9, the same guard as the terminal's
+                // `is_app_level_shortcut` (#385): with a terminal
+                // focused this chord only arrives here because the
+                // terminal let it bubble, and Alt+Shift+digit stays
+                // with the PTY there.
+                d if d.len() == 1 && !mods.shift => {
                     if let Some(n) = d.chars().next().and_then(|c| c.to_digit(10))
                         && (1..=9).contains(&n)
                     {

@@ -948,13 +948,18 @@ fn to_mouse_button(button: MouseButton) -> Option<mouse::MouseButton> {
 /// often mapped to history selection, …). Plain Ctrl+letter falls
 /// through to the PTY untouched.
 ///
-/// Three documented exceptions to that rule:
+/// Documented exceptions to that rule:
 ///
 /// * Ctrl+Tab / Ctrl+Shift+Tab — tab cycling. No shell binds Ctrl+Tab,
 ///   and shift is intrinsic to "prev" tab.
 /// * Alt+Left / Alt+Right — group-focus cycling. Alt-only, because
 ///   `AppShell` has always bound it there; shells and agents use
 ///   Alt+B / Alt+F for word motion, not Alt+arrow.
+/// * Alt+1..9 — focus group N, the rest of the same Alt family (#385).
+///   It costs the shell readline / PSReadLine digit-argument, which is
+///   cheaper than moving the binding: Ctrl+Shift+1..9 is already
+///   focus-tab-N, and every other free digit chord is either AltGr on
+///   some layouts (Ctrl+Alt) or a bound readline key (Alt+Shift).
 /// * Everything else with Alt held falls through to the PTY, including
 ///   Alt+**Shift**+arrow — that's a different chord, nothing binds it,
 ///   and swallowing it would cost the PTY its `CSI 1;4D`.
@@ -975,6 +980,19 @@ pub(crate) fn is_app_level_shortcut(key: &str, mods: &gpui::Modifiers) -> bool {
         && !mods.control
         && !mods.platform
         && matches!(key, "left" | "right")
+    {
+        return true;
+    }
+    // Alt+1..9 — AppShell focus group N (#385), same exactly-Alt
+    // rule as the arrows, and the same guard on `AppShell`'s arm.
+    // The cost is readline's / PSReadLine's digit-argument
+    // (`ESC <digit>`); Claude Code and Codex bind no Alt+digit.
+    // Alt+0 stays with the PTY, it has no app binding.
+    if mods.alt
+        && !mods.shift
+        && !mods.control
+        && !mods.platform
+        && matches!(key, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
     {
         return true;
     }
@@ -1385,6 +1403,37 @@ mod tests {
         assert!(!is_app_level_shortcut("left", &ctrl_alt()));
         assert!(!is_app_level_shortcut("left", &alt_shift()));
         assert!(!is_app_level_shortcut("right", &alt_shift()));
+    }
+
+    #[test]
+    fn alt_digit_bubbles_for_focus_group_n() {
+        // #385: Alt+1..9 focuses group N. Without the opt-out the
+        // terminal swallows it and sends `ESC <digit>` to the PTY, so
+        // the chord only worked from an empty group.
+        for d in '1'..='9' {
+            let key = d.to_string();
+            assert!(is_app_level_shortcut(&key, &alt()), "Alt+{d}");
+        }
+        // Alt+0 is unbound in AppShell, so it keeps reaching the PTY.
+        assert!(!is_app_level_shortcut("0", &alt()));
+    }
+
+    #[test]
+    fn alt_digit_variants_stay_with_terminal() {
+        // Exactly Alt+digit, same rule as Alt+arrow. Ctrl+Alt+digit is
+        // AltGr on layouts gpui doesn't flag as AltGr layouts, and
+        // Alt+Shift+digit is a different chord the app doesn't bind;
+        // both must reach the PTY.
+        for d in '1'..='9' {
+            let key = d.to_string();
+            assert!(!is_app_level_shortcut(&key, &ctrl_alt()), "Ctrl+Alt+{d}");
+            assert!(!is_app_level_shortcut(&key, &alt_shift()), "Alt+Shift+{d}");
+        }
+        // US-Windows folds Alt+Shift+1 into "!" with shift cleared —
+        // `ESC !` (bash complete-command) has to keep reaching the PTY.
+        for glyph in ["!", "@", "#", "$", "%", "^", "&", "*", "("] {
+            assert!(!is_app_level_shortcut(glyph, &alt()), "Alt+{glyph}");
+        }
     }
 
     #[test]
