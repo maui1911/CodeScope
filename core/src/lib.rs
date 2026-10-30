@@ -43,6 +43,7 @@ pub mod theme;
 pub mod time;
 pub mod update_check;
 pub mod window_state;
+pub mod worktree_create;
 
 pub use agent::{AgentId, agent_id_from_auto_type};
 pub use agent_registry::{
