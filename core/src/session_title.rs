@@ -81,6 +81,24 @@ pub fn normalize_title(raw: &str) -> Option<String> {
     Some(out)
 }
 
+/// Names agents put in the terminal title before there is a topic.
+/// Checked on top of the caller's `generic` list, which carries the
+/// registry's display name — and that one can be overridden in
+/// settings (`"Claude"`), while the CLI keeps writing its own name.
+const AGENT_PRODUCT_NAMES: &[&str] = &[
+    "Claude Code",
+    "Claude",
+    "Codex",
+    "OpenAI Codex",
+    "GitHub Copilot",
+    "Copilot",
+    "Copilot CLI",
+    "OpenCode",
+    "Pi",
+    "Gemini",
+    "Gemini CLI",
+];
+
 /// Turn a terminal title (OSC 0 / OSC 2) an agent set into a session
 /// title, or `None` when it says nothing about the session.
 ///
@@ -99,7 +117,7 @@ pub fn terminal_title_candidate(raw: &str, generic: &[&str]) -> Option<String> {
     let start = raw.find(char::is_alphanumeric)?;
     let text = normalize_title(&raw[start..])?;
     let lower = text.to_lowercase();
-    if generic.iter().any(|g| g.trim().to_lowercase() == lower) {
+    if generic.iter().chain(AGENT_PRODUCT_NAMES).any(|g| g.trim().to_lowercase() == lower) {
         return None;
     }
     let looks_like_path = text.contains('\\')
@@ -232,6 +250,13 @@ mod tests {
     fn terminal_title_rejects_the_agent_name() {
         assert_eq!(terminal_title_candidate("✳ Claude Code", GENERIC), None);
         assert_eq!(terminal_title_candidate("claude", GENERIC), None);
+    }
+
+    #[test]
+    fn terminal_title_rejects_product_names_when_display_name_is_overridden() {
+        // Settings renamed the agent to "Claude"; the CLI still says its own name.
+        assert_eq!(terminal_title_candidate("✳ Claude Code", &["Claude"]), None);
+        assert_eq!(terminal_title_candidate("GitHub Copilot", &[]), None);
     }
 
     #[test]
