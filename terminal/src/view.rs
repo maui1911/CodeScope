@@ -281,6 +281,11 @@ impl TerminalView {
         self.title.as_deref()
     }
 
+    /// OS process id of the shell running in this terminal.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.backend.child_pid()
+    }
+
     /// Write raw bytes to the pty as if the user had typed them.
     /// Lets app shells inject startup commands (e.g. auto-type
     /// `claude\r` after opening a tab) without going through the

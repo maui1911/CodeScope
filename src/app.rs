@@ -319,21 +319,23 @@ struct Tab {
 /// first — so a tab that already owns a transcript can't rotate onto
 /// the one its neighbour just minted.
 ///
-/// Remaining ceilings. The first two are the same gap — the rounds
-/// separate adopted tabs from unadopted ones, but *within* a round
-/// nothing distinguishes same-cwd tabs, so iteration order decides.
-/// Closing either needs the agent to report its own session id back to
-/// us:
+/// `exact` short-circuits all of that: it is the session the agent
+/// process running in this tab reports itself (Claude Code's
+/// `~/.claude/sessions/<pid>.json`, see
+/// `codescope_core::agents::claude::live_session`). It is the only
+/// candidate — adopted once its transcript is on disk, whoever else
+/// claimed it — and the caller keeps it out of every other tab's
+/// reach. Without it the heuristic has ceilings, all one gap: within a
+/// round nothing distinguishes same-cwd tabs, so iteration order
+/// decides.
 ///
 /// * Same-cwd tabs that *all* already own a transcript: a `/clear`
 ///   rotation in one of them goes to whichever comes first.
 /// * Same-cwd tabs that *none* of which have adopted yet: the first
-///   transcript to appear goes to the first tab, which is only right
-///   because tab order follows spawn order and an agent normally
-///   writes its transcript at startup. If the second tab's agent
-///   writes first, the two tabs end up holding each other's ids.
-///   Both still get exactly one transcript — this crosses the mapping,
-///   it does not starve a tab.
+///   transcript to appear goes to the first tab. Claude Code writes its
+///   transcript on the first prompt, not at startup, so prompting the
+///   second tab first crosses the two tabs' ids — titles, status dots
+///   and resume all land on the neighbour.
 /// * The dev build and the installed build share
 ///   `~/.claude/projects/` but keep separate `projects.json` stores,
 ///   so neither sees the other's claims. A tab in one instance can
@@ -343,7 +345,12 @@ fn select_adoption(
     fired: &HashSet<String>,
     adopted: Option<&str>,
     claimed: &HashSet<String>,
+    exact: Option<&str>,
 ) -> Option<String> {
+    if let Some(own) = exact {
+        let on_disk = hits.iter().any(|(sid, _)| sid == own);
+        return (on_disk && !fired.contains(own)).then(|| own.to_owned());
+    }
     let mut newest: Option<(SystemTime, &str)> = None;
     for (sid, mtime) in hits {
         if fired.contains(sid) {
@@ -2196,7 +2203,7 @@ impl AppShell {
                 if this.upgrade().is_none() {
                     break;
                 }
-                let result = this.update(cx, |this, _cx| {
+                let result = this.update(cx, |this, cx| {
                     // Two-pass scan/mutate so we can't deadlock on
                     // `register_telemetry`'s `&mut self` borrow:
                     // collect candidates first, then perform the
@@ -2245,9 +2252,18 @@ impl AppShell {
                         has_adoption: bool,
                         /// `(agent session id, transcript mtime)`.
                         hits: Vec<(String, SystemTime)>,
+                        /// The session the agent in this tab reports
+                        /// it is in — see `select_adoption`.
+                        exact: Option<String>,
                     }
                     let mut scans: Vec<Scan> = Vec::new();
                     let mut any_active = false;
+                    // Taken once per tick, and only when a Claude tab
+                    // needs it.
+                    let mut process_table: Option<codescope_core::process_tree::ProcessTable> =
+                        None;
+                    let claude_sessions_dir =
+                        codescope_core::agents::claude::live_session::default_sessions_dir();
                     for (g_idx, group) in this.groups.iter().enumerate() {
                         for (t_idx, tab) in group.tabs.iter().enumerate() {
                             let Some(agent_id) = tab.agent_id else { continue };
@@ -2349,12 +2365,30 @@ impl AppShell {
                                     (sid, mtime)
                                 })
                                 .collect();
+                            let exact = match (agent_id, &claude_sessions_dir) {
+                                (codescope_core::AgentId::Claude, Some(dir)) => tab
+                                    .terminal
+                                    .read(cx)
+                                    .child_pid()
+                                    .and_then(|shell| {
+                                        let table = process_table.get_or_insert_with(
+                                            codescope_core::process_tree::process_table,
+                                        );
+                                        let pids =
+                                            codescope_core::process_tree::descendants(shell, table);
+                                        codescope_core::agents::claude::live_session::session_for_pids(
+                                            dir, &pids, &wd_str,
+                                        )
+                                    }),
+                                _ => None,
+                            };
                             scans.push(Scan {
                                 group_idx: g_idx,
                                 tab_idx: t_idx,
                                 agent_id,
                                 has_adoption: tab.adopted_session_id.is_some(),
                                 hits,
+                                exact,
                             });
                         }
                     }
@@ -2387,9 +2421,12 @@ impl AppShell {
                     // — stealing the conversation *and*, now that
                     // claims are exclusive, locking the rightful tab
                     // out for good. Stable sort, so iteration order
-                    // still decides within each class.
+                    // still decides within each class. Ahead of both:
+                    // tabs whose agent named its own session, and
+                    // those sessions are off-limits to every guess.
+                    claimed.extend(scans.iter().filter_map(|s| s.exact.clone()));
                     let mut order: Vec<usize> = (0..scans.len()).collect();
-                    order.sort_by_key(|&i| scans[i].has_adoption);
+                    order.sort_by_key(|&i| (scans[i].exact.is_none(), scans[i].has_adoption));
                     let mut found = Vec::new();
                     for i in order {
                         let s = &scans[i];
@@ -2409,6 +2446,7 @@ impl AppShell {
                             &tab.fired_session_ids,
                             tab.adopted_session_id.as_deref(),
                             &claimed,
+                            s.exact.as_deref(),
                         ) else {
                             continue;
                         };
@@ -2427,9 +2465,27 @@ impl AppShell {
                             codescope_session_id: tab.session_id.clone(),
                         });
                     }
+                    // An exact adoption can take a transcript a
+                    // neighbour guessed wrong; that neighbour lets go
+                    // (and re-adopts its own on a later tick) instead of
+                    // both tabs showing one conversation.
+                    let taken: HashSet<String> =
+                        found.iter().map(|f| f.new_agent_session_id.clone()).collect();
+                    for (g_idx, group) in this.groups.iter_mut().enumerate() {
+                        for (t_idx, tab) in group.tabs.iter_mut().enumerate() {
+                            let adopts_now =
+                                found.iter().any(|f| f.group_idx == g_idx && f.tab_idx == t_idx);
+                            if !adopts_now
+                                && tab.adopted_session_id.as_ref().is_some_and(|s| taken.contains(s))
+                            {
+                                tab.adopted_session_id = None;
+                            }
+                        }
+                    }
                     for f in found {
                         if let Some(prev) = f.previous_agent_session_id.as_deref()
-                            && prev != f.new_agent_session_id {
+                            && prev != f.new_agent_session_id
+                            && !taken.contains(prev) {
                                 this.unregister_telemetry(prev);
                             }
                         this.register_telemetry(
@@ -9703,7 +9759,7 @@ mod tests {
     fn select_adoption_takes_newest_unclaimed() {
         let hits = vec![(SID_A.to_owned(), at(10)), (SID_B.to_owned(), at(20))];
         assert_eq!(
-            select_adoption(&hits, &ids(&[]), None, &ids(&[])),
+            select_adoption(&hits, &ids(&[]), None, &ids(&[]), None),
             Some(SID_B.to_owned())
         );
     }
@@ -9715,11 +9771,11 @@ mod tests {
         // than steal it.
         let hits = vec![(SID_A.to_owned(), at(10)), (SID_B.to_owned(), at(20))];
         assert_eq!(
-            select_adoption(&hits, &ids(&[]), None, &ids(&[SID_B])),
+            select_adoption(&hits, &ids(&[]), None, &ids(&[SID_B]), None),
             Some(SID_A.to_owned())
         );
         assert_eq!(
-            select_adoption(&hits, &ids(&[]), None, &ids(&[SID_A, SID_B])),
+            select_adoption(&hits, &ids(&[]), None, &ids(&[SID_A, SID_B]), None),
             None
         );
     }
@@ -9732,7 +9788,7 @@ mod tests {
         // telemetry tail never registers.
         let hits = vec![(SID_A.to_owned(), at(10))];
         assert_eq!(
-            select_adoption(&hits, &ids(&[]), Some(SID_A), &ids(&[SID_A])),
+            select_adoption(&hits, &ids(&[]), Some(SID_A), &ids(&[SID_A]), None),
             Some(SID_A.to_owned())
         );
     }
@@ -9749,13 +9805,13 @@ mod tests {
         let mut claimed = ids(&[SID_A]);
 
         // Round 1 — tabs with no adoption yet.
-        let picked = select_adoption(&hits, &ids(&[]), None, &claimed);
+        let picked = select_adoption(&hits, &ids(&[]), None, &claimed, None);
         assert_eq!(picked, Some(SID_B.to_owned()));
         claimed.insert(picked.unwrap());
 
         // Round 2 — A, which already fired SID_A, finds nothing left.
         assert_eq!(
-            select_adoption(&hits, &ids(&[SID_A]), Some(SID_A), &claimed),
+            select_adoption(&hits, &ids(&[SID_A]), Some(SID_A), &claimed, None),
             None
         );
     }
@@ -9764,7 +9820,35 @@ mod tests {
     fn select_adoption_skips_already_fired_ids() {
         let hits = vec![(SID_A.to_owned(), at(10))];
         assert_eq!(
-            select_adoption(&hits, &ids(&[SID_A]), Some(SID_A), &ids(&[SID_A])),
+            select_adoption(&hits, &ids(&[SID_A]), Some(SID_A), &ids(&[SID_A]), None),
+            None
+        );
+    }
+
+    #[test]
+    fn exact_session_wins_over_the_newest_transcript_and_claims() {
+        // Two fresh tabs in one folder; the *second* tab's agent was
+        // prompted first, so its transcript (SID_A) is the older one.
+        // The first tab's agent reports SID_B — it gets SID_B, even
+        // though a wrong guess on an earlier tick already claimed it.
+        let hits = vec![(SID_A.to_owned(), at(10)), (SID_B.to_owned(), at(20))];
+        assert_eq!(
+            select_adoption(&hits, &ids(&[SID_A]), Some(SID_A), &ids(&[SID_A, SID_B]), Some(SID_B)),
+            Some(SID_B.to_owned())
+        );
+    }
+
+    #[test]
+    fn exact_session_waits_for_its_transcript() {
+        // The agent reports its session before it writes the transcript
+        // (Claude Code writes on the first prompt). The tab must wait,
+        // not fall back to guessing a neighbour's file.
+        let hits = vec![(SID_A.to_owned(), at(10))];
+        assert_eq!(select_adoption(&hits, &ids(&[]), None, &ids(&[]), Some(SID_B)), None);
+        // Already adopted — nothing new to fire.
+        let hits = vec![(SID_B.to_owned(), at(10))];
+        assert_eq!(
+            select_adoption(&hits, &ids(&[SID_B]), Some(SID_B), &ids(&[SID_B]), Some(SID_B)),
             None
         );
     }

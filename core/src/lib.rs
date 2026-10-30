@@ -29,6 +29,7 @@ pub mod path_canon;
 pub mod paths;
 pub mod pr;
 pub mod process;
+pub mod process_tree;
 pub mod project_groups;
 pub mod projects;
 pub mod relaunch;

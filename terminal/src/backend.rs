@@ -167,6 +167,9 @@ pub struct Backend {
     /// stays non-clickable until the cache turns over — acceptable for
     /// a hover affordance.
     path_exists_cache: Mutex<HashMap<PathBuf, bool>>,
+    /// OS process id of the PTY child (the shell). `None` only when
+    /// the platform layer couldn't report one.
+    child_pid: Option<u32>,
 }
 
 impl Backend {
@@ -206,6 +209,10 @@ impl Backend {
 
         let pty = tty::new(&tty_options, size, /* window_id */ 0)
             .context("failed to spawn PTY child process")?;
+        #[cfg(windows)]
+        let child_pid = pty.child_watcher().pid().map(|p| p.get());
+        #[cfg(not(windows))]
+        let child_pid = Some(pty.child().id());
 
         // Adopt the freshly-spawned child into the process-wide job
         // object so it (and every grandchild — claude/codex/etc.) is
@@ -273,7 +280,14 @@ impl Backend {
             proxy,
             working_directory: working_directory_for_links,
             path_exists_cache: Mutex::new(HashMap::new()),
+            child_pid,
         })
+    }
+
+    /// OS process id of the PTY child — the shell, whose descendants
+    /// are whatever runs in the terminal.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child_pid
     }
 
     /// Queue input bytes for the child. The bytes are written from the
