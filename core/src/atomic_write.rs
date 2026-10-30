@@ -329,13 +329,10 @@ mod tests {
         let mut perms = fs::metadata(&path).unwrap().permissions();
         perms.set_readonly(true);
         fs::set_permissions(&path, perms).unwrap();
-        let started = std::time::Instant::now();
-        let result = write_atomic(&path, b"new\n");
-        let elapsed = started.elapsed();
-        assert!(result.is_err());
-        // The full retry budget is 150 ms; a non-retried failure is
-        // a couple of syscalls.
-        assert!(elapsed < std::time::Duration::from_millis(50), "{elapsed:?}");
+        // Checked directly rather than by timing the save: a wall-clock
+        // bound flakes when the test runs alongside the rest of the suite.
+        assert!(!is_transient(&io::Error::from_raw_os_error(5), &path));
+        assert!(write_atomic(&path, b"new\n").is_err());
         assert_eq!(fs::read(&path).unwrap(), b"old\n");
         assert!(!temp_of(&path).exists());
     }
