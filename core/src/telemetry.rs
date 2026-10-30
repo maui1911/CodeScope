@@ -1,5 +1,5 @@
 //! Vendor-neutral telemetry primitives shared across every agent
-//! telemetry module (Claude / Copilot / OpenCode / Pi).
+//! telemetry module (Claude / Codex / Copilot / Gemini / OpenCode / Pi).
 //!
 //! Each agent module owns its own format-specific parser
 //! (`claude_telemetry`, `copilot_telemetry`, etc.) but they all
@@ -125,10 +125,123 @@ pub struct FileTail {
     /// Byte offset of the next read. Reset to 0 when the file shrinks
     /// (truncated / rewritten).
     pub last_pos: u64,
-    /// mtime of the last `stat` that produced a read. Unused for
-    /// correctness but handy for debugging; callers can use
-    /// `metadata.len()` instead.
+    /// mtime of the last `stat` that produced a read. [`read_new_lines`]
+    /// takes a new mtime without new bytes as a rewrite; other callers
+    /// only keep it for debugging.
     pub last_mtime: Option<SystemTime>,
+    /// The last bytes [`read_new_lines`] consumed (the tail of the last
+    /// line, at most [`END_MARK_LEN`]). A file that grew but no longer
+    /// has them just before `last_pos` was rewritten, not appended to.
+    pub(crate) end_mark: Vec<u8>,
+}
+
+/// How many bytes of the last consumed line [`FileTail::end_mark`] keeps.
+const END_MARK_LEN: usize = 64;
+
+/// What [`read_new_lines`] hands its callback.
+pub(crate) enum LineRead<'a> {
+    /// The file was rewritten — it shrank, changed without growing, or
+    /// no longer holds the last line read where it was — and is re-read
+    /// from the start. Comes before any of the new lines.
+    Rewritten,
+    /// One complete, non-blank line, trimmed.
+    Line(&'a str),
+}
+
+/// Outcome of one [`read_new_lines`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReadOutcome {
+    /// Bytes were consumed (at least one complete line, blank or not).
+    pub consumed: bool,
+    /// The file's mtime from the call's own `stat` — `None` when the
+    /// file is missing — so callers need no second one.
+    pub mtime: Option<SystemTime>,
+}
+
+/// Feed every complete line appended to a JSONL file since
+/// `tail.last_pos` to `on_read`, advancing the cursor past them. Costs a
+/// single `stat` when the file is untouched.
+///
+/// A rewrite is re-read from the start, after a [`LineRead::Rewritten`]:
+/// the file shrank, its mtime moved without it growing, or it grew but
+/// no longer holds the last line read just before the cursor. Reads
+/// stop at the length the `stat` saw, so a later mtime always means a
+/// later write.
+///
+/// A trailing line without its newline is left for the next call, so a
+/// line caught mid-write is never parsed torn and then skipped. Read
+/// errors stop at the last complete line; the rest is retried later.
+pub(crate) fn read_new_lines(
+    path: &std::path::Path,
+    tail: &mut FileTail,
+    mut on_read: impl FnMut(LineRead<'_>),
+) -> ReadOutcome {
+    use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
+    let Ok(meta) = std::fs::metadata(path) else {
+        return ReadOutcome { consumed: false, mtime: None };
+    };
+    let mtime = modified_or_none(&meta);
+    let unchanged = ReadOutcome { consumed: false, mtime };
+    let len = meta.len();
+    let touched = tail.last_mtime.is_some() && mtime != tail.last_mtime;
+    if len == tail.last_pos && !touched {
+        return unchanged;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else { return unchanged };
+    let rewritten = if len > tail.last_pos {
+        let Some(kept) = ends_with_mark(&mut file, tail) else { return unchanged };
+        !kept
+    } else {
+        true
+    };
+    if rewritten {
+        tail.last_pos = 0;
+        tail.end_mark.clear();
+        on_read(LineRead::Rewritten);
+    }
+    if file.seek(SeekFrom::Start(tail.last_pos)).is_err() {
+        return unchanged;
+    }
+    let mut reader = BufReader::new(file.take(len.saturating_sub(tail.last_pos)));
+    let mut buf = Vec::new();
+    let start = tail.last_pos;
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if buf.last() != Some(&b'\n') {
+                    break;
+                }
+                tail.last_pos += n as u64;
+                tail.end_mark.clear();
+                tail.end_mark.extend_from_slice(&buf[buf.len().saturating_sub(END_MARK_LEN)..]);
+                if let Ok(line) = std::str::from_utf8(&buf) {
+                    let line = line.trim();
+                    if !line.is_empty() {
+                        on_read(LineRead::Line(line));
+                    }
+                }
+            }
+        }
+    }
+    tail.last_mtime = mtime;
+    ReadOutcome { consumed: tail.last_pos != start || rewritten, mtime }
+}
+
+/// Whether `file` still holds `tail.end_mark` just before
+/// `tail.last_pos`. `None` on a read error.
+fn ends_with_mark(file: &mut std::fs::File, tail: &FileTail) -> Option<bool> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mark = &tail.end_mark;
+    if mark.is_empty() {
+        return Some(tail.last_pos == 0);
+    }
+    let at = tail.last_pos.checked_sub(mark.len() as u64)?;
+    file.seek(SeekFrom::Start(at)).ok()?;
+    let mut found = vec![0; mark.len()];
+    file.read_exact(&mut found).ok()?;
+    Some(found == *mark)
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +300,81 @@ pub fn format_context_pct(pct: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- read_new_lines ---
+
+    /// Every event one `read_new_lines` call hands its callback.
+    fn read_events(path: &std::path::Path, tail: &mut FileTail) -> Vec<String> {
+        let mut out = Vec::new();
+        read_new_lines(path, tail, |read| match read {
+            LineRead::Rewritten => out.push("<rewritten>".to_owned()),
+            LineRead::Line(line) => out.push(line.to_owned()),
+        });
+        out
+    }
+
+    /// Move `path`'s mtime away from whatever the last write left, so a
+    /// rewrite is visible on file systems with coarse timestamps.
+    fn bump_mtime(path: &std::path::Path, secs: u64) {
+        let t = SystemTime::now() + std::time::Duration::from_secs(secs);
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(t).unwrap();
+    }
+
+    #[test]
+    fn read_new_lines_follows_appends_without_rereading() {
+        use std::io::Write as _;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("log.jsonl");
+        std::fs::write(&path, "one\n").unwrap();
+        let mut tail = FileTail::default();
+        assert_eq!(read_events(&path, &mut tail), ["one"]);
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(f, "two\nthr").unwrap();
+        bump_mtime(&path, 10);
+        assert_eq!(read_events(&path, &mut tail), ["two"]);
+        assert!(read_events(&path, &mut tail).is_empty(), "nothing new");
+        writeln!(f, "ee").unwrap();
+        bump_mtime(&path, 20);
+        assert_eq!(read_events(&path, &mut tail), ["three"]);
+    }
+
+    #[test]
+    fn read_new_lines_rereads_a_shorter_rewrite() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("log.jsonl");
+        std::fs::write(&path, "first line\nsecond line\n").unwrap();
+        let mut tail = FileTail::default();
+        assert_eq!(read_events(&path, &mut tail).len(), 2);
+        std::fs::write(&path, "kept\n").unwrap();
+        assert_eq!(read_events(&path, &mut tail), ["<rewritten>", "kept"]);
+    }
+
+    #[test]
+    fn read_new_lines_rereads_a_same_length_rewrite() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("log.jsonl");
+        std::fs::write(&path, "name-a\n").unwrap();
+        let mut tail = FileTail::default();
+        assert_eq!(read_events(&path, &mut tail), ["name-a"]);
+        std::fs::write(&path, "name-b\n").unwrap();
+        bump_mtime(&path, 10);
+        assert_eq!(read_events(&path, &mut tail), ["<rewritten>", "name-b"]);
+        assert!(read_events(&path, &mut tail).is_empty(), "settled again");
+    }
+
+    #[test]
+    fn read_new_lines_rereads_a_rewrite_that_grew() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("log.jsonl");
+        std::fs::write(&path, "{\"id\":\"a\"}\n").unwrap();
+        let mut tail = FileTail::default();
+        assert_eq!(read_events(&path, &mut tail).len(), 1);
+        std::fs::write(&path, "{\"id\":\"b\",\"name\":\"x\"}\n{\"id\":\"c\"}\n").unwrap();
+        assert_eq!(
+            read_events(&path, &mut tail),
+            ["<rewritten>", "{\"id\":\"b\",\"name\":\"x\"}", "{\"id\":\"c\"}"]
+        );
+    }
 
     // --- context_window_for_model ---
 

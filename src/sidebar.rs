@@ -362,9 +362,10 @@ pub struct BotsFooter {
 #[derive(Debug, Clone)]
 pub enum SidebarEvent {
     /// Open a session for `working_directory`, using `title` for the
-    /// tab strip. Title is just a label — the host decides what to
-    /// actually show (in practice the worktree branch name suffixed
-    /// with the project name).
+    /// tab strip — the structured parts (project, branch or folder
+    /// label, qualifier) the host renders and later updates, so a
+    /// branch change or a session label never has to re-parse the
+    /// display text (#370).
     ///
     /// Default semantics are *focus-or-open*: the host activates an
     /// existing tab whose working directory matches and only spawns a
@@ -374,7 +375,7 @@ pub enum SidebarEvent {
     /// menu's "New Claude session" row).
     OpenSession {
         working_directory: PathBuf,
-        title: SharedString,
+        title: codescope_core::TabTitle,
         /// Optional command to auto-type at the shell prompt once the
         /// pty has come up. Used by the agent-launch rows ("New
         /// Claude session", and any future agent variants) to fire
@@ -3767,14 +3768,13 @@ impl Render for Sidebar {
                 // the *filtered* (non-primary) view here would mis-map
                 // to the unfiltered `project.worktrees` later.
                 let wt_id_for_menu = wt.id.clone();
-                // Single spaces around `·` to match the C# build's
-                // `$"{project.Name} · {branch}"` convention in
+                // Renders `{project} · {branch}`, matching the C#
+                // build's `$"{project.Name} · {branch}"` convention in
                 // `MainViewModel.RefreshTabTitlesForWorktree`.
-                let title_label = SharedString::from(format!(
-                    "{} · {}",
-                    project_name,
-                    wt_label,
-                ));
+                let title_label = codescope_core::TabTitle::worktree(
+                    project_name.to_string(),
+                    wt_label.to_string(),
+                );
                 // Worktree row hover — same `#141414` fill as project rows.
                 let frost_hover = theme::surface_elev(&theme);
                 let ink_hover = theme::ink(&theme);
@@ -4657,7 +4657,7 @@ impl Render for Sidebar {
                 let project_pos = *position;
                 if let Some(project) = self.projects.projects.get(*project_idx).cloned() {
                     let project_path = project.path.clone();
-                    let project_name: SharedString = project.name.clone().into();
+                    let project_title = codescope_core::TabTitle::project(project.name.clone());
                     let overlay = if project.is_remote_shell() {
                         self.render_remote_project_menu(*project_idx, project_pos, &project, &theme, cx)
                             .into_any_element()
@@ -4701,7 +4701,7 @@ impl Render for Sidebar {
                         );
                         let body = self.render_new_session_submenu(
                             &project_path,
-                            project_name,
+                            project_title,
                             cx,
                         );
                         root = root.child(
@@ -4730,8 +4730,8 @@ impl Render for Sidebar {
                             .map(|s| s.to_string())
                             .unwrap_or_else(|| wt.path.clone())
                     });
-                    let session_title: SharedString =
-                        format!("{} · {}", project.name, branch_label).into();
+                    let session_title =
+                        codescope_core::TabTitle::worktree(project.name.clone(), branch_label);
                     let wt_path = wt.path.clone();
                     let overlay = self
                         .render_worktree_menu(
@@ -4842,7 +4842,7 @@ impl Sidebar {
     fn build_new_session_parent_row(
         &self,
         worktree_path: &str,
-        title_prefix: &SharedString,
+        title_prefix: &codescope_core::TabTitle,
         id_prefix: &'static str,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -4956,7 +4956,7 @@ impl Sidebar {
     fn render_new_session_submenu(
         &self,
         worktree_path: &str,
-        title_prefix: SharedString,
+        title_prefix: codescope_core::TabTitle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = self.theme.clone();
@@ -5014,11 +5014,7 @@ impl Sidebar {
             let label = SharedString::from(format!("New {} session", profile.display_name));
             let row_id = SharedString::from(format!("submenu-new-{}", profile.id));
             let path = PathBuf::from(worktree_path);
-            let title = SharedString::from(format!(
-                "{} · {}",
-                title_prefix.as_ref(),
-                profile.id,
-            ));
+            let title = title_prefix.clone().with_suffix(profile.id.clone());
             // Shared helper keeps the new-session command shape in
             // sync with the double-click handler and Ctrl+Shift+T.
             // Preserves the `Option` semantics: a profile with an
@@ -5093,7 +5089,7 @@ impl Sidebar {
         // emits `auto_type: None`). Users with a default agent had
         // no surfaced path. Explicit row removes the trap.
         let shell_path = PathBuf::from(worktree_path);
-        let shell_title = SharedString::from(format!("{title_prefix} · shell"));
+        let shell_title = title_prefix.with_suffix("shell");
         let frost_hover = frost;
         let shell_row = div()
             .id(SharedString::from("submenu-new-shell"))
@@ -5399,7 +5395,7 @@ impl Sidebar {
         // mutably borrows `cx` mid-chain.
         let new_session_parent_row = self.build_new_session_parent_row(
             &project.path,
-            &project.name.clone().into(),
+            &codescope_core::TabTitle::project(project.name.clone()),
             "proj-menu-new-session",
             cx,
         );
@@ -5640,10 +5636,8 @@ impl Sidebar {
         // Snapshot the open-session payload so the menu row's listener
         // can `move` the values without keeping a borrow on `project`.
         let open_session_path = PathBuf::from(&worktree.path);
-        let open_session_title = SharedString::from(format!(
-            "{} · {}",
-            project.name, branch_label
-        ));
+        let open_session_title =
+            codescope_core::TabTitle::worktree(project.name.clone(), branch_label.to_string());
         let is_primary = worktree.is_primary;
         let is_repo = !self.non_repo_paths.contains_key(&worktree.path);
 

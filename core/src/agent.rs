@@ -57,8 +57,8 @@ impl AgentId {
     /// the canonical ids so first-token parsing of an `auto_type`
     /// command (`agent_id_from_auto_type`) still classifies sessions
     /// correctly when the registry's `command` differs from the id —
-    /// Windows ships OpenCode as `opencode-cli.exe`, for instance,
-    /// because `opencode` clashes with a reserved name. The alias list
+    /// an OpenCode Desktop user who overrides `command` to
+    /// `opencode-cli`, for instance. The alias list
     /// is intentionally small and explicit; unknown binaries still
     /// resolve to `None`.
     // Not `FromStr`: an unknown id is an ordinary `None`, not an `Err`, and callers rely on it.
@@ -71,10 +71,10 @@ impl AgentId {
         } else if s.eq_ignore_ascii_case("copilot") {
             Some(AgentId::Copilot)
         } else if s.eq_ignore_ascii_case("opencode") || s.eq_ignore_ascii_case("opencode-cli") {
-            // `opencode-cli` is the Windows npm-package binary name —
-            // the built-in profile uses it as `command`, and
-            // `agent_id_from_auto_type` would otherwise classify
-            // OpenCode sessions as `None`.
+            // `opencode-cli` is the OpenCode Desktop sidecar name —
+            // Desktop-only users set it as `command` in
+            // `settings.agents`, and `agent_id_from_auto_type` would
+            // otherwise classify their OpenCode sessions as `None`.
             Some(AgentId::OpenCode)
         } else if s.eq_ignore_ascii_case("pi") {
             Some(AgentId::Pi)
@@ -199,10 +199,9 @@ mod tests {
 
     #[test]
     fn opencode_cli_alias_resolves_to_opencode() {
-        // Windows OpenCode npm package ships the binary as
-        // `opencode-cli.exe`; the alias keeps
-        // `agent_id_from_auto_type` honest when the sidebar's
-        // "New OpenCode session" row launches `opencode-cli`.
+        // OpenCode Desktop users override `command` to its
+        // `opencode-cli` sidecar; the alias keeps
+        // `agent_id_from_auto_type` honest when their tabs run it.
         assert_eq!(AgentId::from_str("opencode-cli"), Some(AgentId::OpenCode));
         assert_eq!(AgentId::from_str("OPENCODE-CLI"), Some(AgentId::OpenCode));
         assert_eq!(

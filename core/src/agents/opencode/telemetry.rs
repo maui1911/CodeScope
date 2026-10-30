@@ -1,95 +1,99 @@
-//! OpenCode CLI message-file tail — per-session telemetry derived from
-//! `~/.local/share/opencode/project/<slug>/storage/message/<sessionId>/msg_*.json`.
+//! OpenCode CLI session tail — per-session telemetry read from
+//! `~/.local/share/opencode/opencode.db`.
 //!
-//! Mirrors `OpenCodeTelemetryService` / `OpenCodeMessageParser` from
-//! the C# build (`legacy:CodeScope.Core/Services/`). Data shapes match
-//! [`crate::agents::claude::telemetry`] so the status bar can render OpenCode
-//! sessions through the same code paths.
+//! Data shapes match [`crate::agents::claude::telemetry`] so the status
+//! bar can render OpenCode sessions through the same code paths.
 //!
-//! # Storage shape — different from Claude / Copilot
+//! # Storage shape
 //!
-//! Claude and Copilot both append to a single JSONL file at a known
-//! path. OpenCode persists each message as its own JSON file under a
-//! per-project, per-session directory. The slug between `project/` and
-//! `storage/` is derived from the project path (git slug or `global`
-//! for non-git), so the service searches **recursively** for the
-//! `message/<sessionId>/` directory rather than predicting the slug.
+//! OpenCode 1.x keeps sessions in one SQLite database (see
+//! [`super::db`]). A tail reads three tables:
 //!
-//! # Polling strategy — mtime watermark
+//! * `session` — the generated `title`;
+//! * `message` — one row per user prompt and one per assistant *step*
+//!   (a turn that calls tools is several assistant rows), with the
+//!   message JSON in `data`: `role`, `time.created` /
+//!   `time.completed` (Unix ms), `tokens`, `modelID`, `finish`, `error`;
+//! * `part` — the pieces of a message; a tool call is
+//!   `data.type == "tool"` with `data.state.status`.
 //!
-//! OpenCode never modifies a message file once written, so each file
-//! is parsed at most once. Files are filtered by mtime against a
-//! [`SessionWatch::mtime_watermark`] snapshotted at loop entry;
-//! same-tick siblings are disambiguated by [`SessionWatch::seen_at_watermark`]
-//! holding only files exactly at the watermark instant. The watermark
-//! advances **after** the walk because directory enumeration is not
-//! mtime-ordered: advancing mid-loop would skip an older sibling
-//! returned later. Mirrors the C# implementation comments verbatim.
+//! # Polling — `data_version` gate
+//!
+//! [`OpenCodeMessageTail::poll`] asks its kept connection for
+//! `PRAGMA data_version` ([`db::DbHandle::probe`]) and returns at once
+//! when nothing was committed since its last read. Only then does it run
+//! its handful of indexed queries.
 //!
 //! Adaptive poll cadence: 250 ms while busy / pending tool, 2 s while
 //! idle — same as Claude / Copilot.
 //!
+//! # Quiet timeouts
+//!
+//! Two ways a session reads Busy with nothing left running, both bounded
+//! on the tail's clock by "no change to this session since":
+//!
+//! * a completed `tool-calls` step with no step after it. OpenCode
+//!   starts the next step within milliseconds, so after
+//!   [`TOOL_STEP_SETTLE`] the loop has stopped — a denied permission or
+//!   a rejected question ends a turn exactly like this, without marking
+//!   the step as an error;
+//! * anything else Busy (OpenCode killed mid-step) after
+//!   [`BUSY_QUIET_TIMEOUT`], as for Claude.
+//!
+//! Either reports Idle with `quiet_timeout` set, so the app doesn't
+//! announce a finished turn. The check is a comparison against the
+//! cached snapshot, made on every poll whether or not the database moved.
+//!
 //! # Tokens
 //!
-//! `tokens_used` (mirrors C# `ContextTokens`) is the most-recent
-//! assistant-with-usage's `input + output + reasoning + cache.read +
-//! cache.write` — a snapshot of the last turn, not a running sum.
+//! `tokens_used` is the most recent assistant-with-usage's `input +
+//! output + reasoning + cache.read + cache.write` — a snapshot of the
+//! last step, not a running sum.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant};
 
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 
+use crate::agents::claude::telemetry::BUSY_QUIET_TIMEOUT;
+use crate::agents::opencode::db::{self, DbHandle, Probe};
+use crate::session_title::{SessionTitle, TitleSource};
 use crate::telemetry::{SessionState, TelemetrySnapshot, context_window_for_model};
 
 // ---------------------------------------------------------------------------
-// Per-message parser
+// Message parser
 // ---------------------------------------------------------------------------
 
-/// One parsed OpenCode message file. Mirrors `OpenCodeMessageEntry`
-/// in the C# build.
-///
-/// Unlike Claude / Copilot (append-only JSONL), OpenCode persists each
-/// message as its own JSON file, so the unit of parse is one whole file.
+/// The fields of one `message.data` blob the snapshot needs.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MessageEntry {
-    pub id: Option<String>,
-    pub session_id: Option<String>,
     /// `"user"` or `"assistant"`.
     pub role: Option<String>,
-    /// `metadata.time.created` as Unix seconds (sub-second precision).
-    pub created_at_secs: Option<f64>,
-    /// `metadata.time.completed` as Unix seconds. Only present on
-    /// finished assistant turns.
-    pub completed_at_secs: Option<f64>,
+    /// `time.created`, Unix ms.
+    pub created_ms: Option<i64>,
+    /// `time.completed`, Unix ms. Only set on finished assistant steps.
+    pub completed_ms: Option<i64>,
+    /// Why the step ended: `"stop"`, `"tool-calls"`, `"length"`, …
+    pub finish: Option<String>,
+    /// The step ended in an error (aborted, provider failure).
+    pub has_error: bool,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub reasoning_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub model_id: Option<String>,
-    pub provider_id: Option<String>,
-    pub cwd: Option<String>,
-    /// True when at least one `parts[]` entry is a tool-invocation in
-    /// `state ∈ {"call","partial-call"}` — i.e. the agent is mid-call.
-    pub has_pending_tool_call: bool,
 }
 
 impl MessageEntry {
-    /// True when this is an assistant turn carrying token usage.
-    /// Mirrors C# `OpenCodeMessageEntry.HasUsage`.
+    /// True when this is an assistant step carrying token usage.
     pub fn has_usage(&self) -> bool {
-        self.role.as_deref() == Some("assistant")
-            && (self.input_tokens > 0
-                || self.output_tokens > 0
-                || self.reasoning_tokens > 0
-                || self.cache_read_tokens > 0
-                || self.cache_write_tokens > 0)
+        self.role.as_deref() == Some("assistant") && self.context_tokens() > 0
     }
 
-    /// Total in-context tokens. Mirrors C# `OpenCodeMessageEntry.ContextTokens`:
-    /// `input + output + reasoning + cache.read + cache.write`.
+    /// Total in-context tokens: `input + output + reasoning +
+    /// cache.read + cache.write`.
     pub fn context_tokens(&self) -> u64 {
         self.input_tokens
             + self.output_tokens
@@ -99,104 +103,35 @@ impl MessageEntry {
     }
 }
 
-/// Parse a single OpenCode `msg_*.json` file's contents. Returns
-/// `None` for blank input or unparseable JSON. Mirrors
-/// `OpenCodeMessageParser.ParseContent` in the C# build.
-pub fn parse_content(content: &str) -> Option<MessageEntry> {
-    if content.trim().is_empty() {
-        return None;
-    }
-    let v: Value = match serde_json::from_str(content) {
-        Ok(v) => v,
-        Err(err) => {
-            // OpenCode writes whole files atomically (rename-into-place),
-            // so partial reads are rare but still possible during a save
-            // race. Caller (`process_message_dir`) retries next tick.
-            eprintln!("[opencode_telemetry] skipping malformed JSON: {err}");
-            return None;
-        }
-    };
+/// Parse one `message.data` JSON blob. `None` for blank input,
+/// unparseable JSON or a non-object root.
+pub fn parse_message(data: &str) -> Option<MessageEntry> {
+    let v: Value = serde_json::from_str(data).ok()?;
     let obj = v.as_object()?;
-
-    let id = string_field(obj, "id");
-    let role = string_field(obj, "role");
-
     let mut entry = MessageEntry {
-        id,
-        role: role.clone(),
+        role: string_field(obj, "role"),
+        finish: string_field(obj, "finish"),
+        has_error: obj.get("error").is_some_and(|e| !e.is_null()),
+        model_id: string_field(obj, "modelID"),
         ..MessageEntry::default()
     };
-
-    if let Some(meta) = obj.get("metadata").and_then(Value::as_object) {
-        entry.session_id = string_field(meta, "sessionID");
-
-        if let Some(time) = meta.get("time").and_then(Value::as_object) {
-            entry.created_at_secs = unix_ms_field(time, "created");
-            entry.completed_at_secs = unix_ms_field(time, "completed");
-        }
-
-        if let Some(asst) = meta.get("assistant").and_then(Value::as_object) {
-            entry.model_id = string_field(asst, "modelID");
-            entry.provider_id = string_field(asst, "providerID");
-            if let Some(path) = asst.get("path").and_then(Value::as_object) {
-                entry.cwd = string_field(path, "cwd");
-            }
-            if let Some(tokens) = asst.get("tokens").and_then(Value::as_object) {
-                entry.input_tokens = u64_field(tokens, "input");
-                entry.output_tokens = u64_field(tokens, "output");
-                entry.reasoning_tokens = u64_field(tokens, "reasoning");
-                if let Some(cache) = tokens.get("cache").and_then(Value::as_object) {
-                    entry.cache_read_tokens = u64_field(cache, "read");
-                    entry.cache_write_tokens = u64_field(cache, "write");
-                }
-            }
+    if let Some(time) = obj.get("time").and_then(Value::as_object) {
+        entry.created_ms = time.get("created").and_then(Value::as_i64);
+        entry.completed_ms = time.get("completed").and_then(Value::as_i64);
+    }
+    if let Some(tokens) = obj.get("tokens").and_then(Value::as_object) {
+        entry.input_tokens = u64_field(tokens, "input");
+        entry.output_tokens = u64_field(tokens, "output");
+        entry.reasoning_tokens = u64_field(tokens, "reasoning");
+        if let Some(cache) = tokens.get("cache").and_then(Value::as_object) {
+            entry.cache_read_tokens = u64_field(cache, "read");
+            entry.cache_write_tokens = u64_field(cache, "write");
         }
     }
-
-    // Pending tool detection: any `tool-invocation` part whose
-    // `toolInvocation.state` is not `"result"` means the agent is mid-call.
-    // Conservative: only flag pending if assistant role; user messages can
-    // carry tool parts in some shapes but never wait. Mirrors C# logic.
-    if role.as_deref() == Some("assistant")
-        && let Some(parts) = obj.get("parts").and_then(Value::as_array) {
-            for part in parts {
-                let Some(part_obj) = part.as_object() else {
-                    continue;
-                };
-                if string_field(part_obj, "type").as_deref() != Some("tool-invocation") {
-                    continue;
-                }
-                let Some(inv) = part_obj.get("toolInvocation").and_then(Value::as_object) else {
-                    continue;
-                };
-                match string_field(inv, "state").as_deref() {
-                    Some("call") | Some("partial-call") => {
-                        entry.has_pending_tool_call = true;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
     Some(entry)
 }
 
-/// Pull the message id out of a filename like `msg_<id>.json`.
-/// Returns `None` for non-conforming names. Mirrors C#
-/// `OpenCodeMessageParser.ExtractMessageIdFromFileName`.
-pub fn extract_message_id_from_file_name(file_name: &str) -> Option<String> {
-    let stem = Path::new(file_name).file_stem()?.to_str()?;
-    if stem.len() <= 4 || !stem.starts_with("msg_") {
-        return None;
-    }
-    Some(stem[4..].to_owned())
-}
-
-fn string_field(
-    obj: &serde_json::Map<String, Value>,
-    key: &str,
-) -> Option<String> {
+fn string_field(obj: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
     obj.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
@@ -204,327 +139,215 @@ fn u64_field(obj: &serde_json::Map<String, Value>, key: &str) -> u64 {
     obj.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
 
-/// Read a Unix-ms numeric field and convert to seconds (sub-second
-/// precision). Mirrors `OpenCodeMessageParser.ReadUnixMs`.
-fn unix_ms_field(
-    obj: &serde_json::Map<String, Value>,
-    key: &str,
-) -> Option<f64> {
-    let v = obj.get(key)?;
-    if !v.is_number() {
-        return None;
-    }
-    v.as_i64().map(|ms| ms as f64 / 1_000.0)
-}
-
-// ---------------------------------------------------------------------------
-// Recursive locate: project/<slug>/storage/message/<sessionId>
-// ---------------------------------------------------------------------------
-
-/// Walk `data_root` recursively looking for a directory named `session_id`
-/// whose **parent directory is named `message`** — guards against a
-/// sibling project's directory that happens to embed the session id in
-/// its name. Mirrors C# `OpenCodeTelemetryService.TryLocateMessageDir`.
+/// Activity state from the session's latest message:
 ///
-/// Returns `None` when the directory doesn't exist (yet). Caller is
-/// expected to throttle retries — the default service applies a 2 s TTL
-/// on misses.
-pub fn try_locate_message_dir(data_root: &Path, session_id: &str) -> Option<PathBuf> {
-    if !data_root.is_dir() {
-        return None;
-    }
-    locate_recursive(data_root, session_id).ok().flatten()
-}
-
-fn locate_recursive(dir: &Path, session_id: &str) -> std::io::Result<Option<PathBuf>> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        // ACL / transient deletion mid-walk — same swallow-and-continue
-        // posture as the C# version.
-        Err(_) => return Ok(None),
-    };
-    for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else { continue };
-        if !ft.is_dir() {
-            continue;
-        }
-        let path = entry.path();
-        let name = match path.file_name().and_then(|s| s.to_str()) {
-            Some(n) => n,
-            None => continue,
-        };
-        if name == session_id {
-            // Verify the parent segment is "message" — same path-segment
-            // guard as the C# locate.
-            if let Some(parent) = path.parent()
-                && parent
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .map(|n| n.eq_ignore_ascii_case("message"))
-                    .unwrap_or(false)
-                {
-                    return Ok(Some(path));
-                }
-        }
-        if let Some(found) = locate_recursive(&path, session_id)? {
-            return Ok(Some(found));
-        }
-    }
-    Ok(None)
-}
-
-// ---------------------------------------------------------------------------
-// Per-session watch state
-// ---------------------------------------------------------------------------
-
-/// Mutable state for a single OpenCode session being tailed.
-///
-/// Replaces the C# `Watch` inner class. Three running aggregates
-/// (`last_entry`, `last_user`, `last_assistant_with_usage`) cover the
-/// snapshot — no per-message retention. `turn_count` is incremented
-/// once per newly-parsed `has_usage` entry.
-#[derive(Debug, Default)]
-pub struct SessionWatch {
-    pub session_id: String,
-    /// Resolved `message/<sessionId>/` directory once located.
-    pub message_dir: Option<PathBuf>,
-    /// mtime watermark — files at or below it are skipped on the next
-    /// walk unless they're in `seen_at_watermark`.
-    pub mtime_watermark: Option<SystemTime>,
-    /// Files at exactly `mtime_watermark` (for same-tick disambiguation
-    /// on coarse-resolution clocks). Cleared whenever the watermark
-    /// advances.
-    pub seen_at_watermark: HashSet<PathBuf>,
-    /// Directory mtime captured at the start of the most recent
-    /// successful walk. Quiet-tick short-circuit: if the dir mtime
-    /// hasn't moved and we already have a snapshot, skip the
-    /// per-file enumerate.
-    pub last_walked_dir_mtime: Option<SystemTime>,
-
-    pub last_entry: Option<MessageEntry>,
-    pub last_user: Option<MessageEntry>,
-    pub last_assistant_with_usage: Option<MessageEntry>,
-    pub turn_count: u32,
-
-    pub snapshot: Option<TelemetrySnapshot>,
-}
-
-impl SessionWatch {
-    pub fn new(session_id: impl Into<String>) -> Self {
-        Self {
-            session_id: session_id.into(),
-            ..Self::default()
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Recompute
-// ---------------------------------------------------------------------------
-
-/// Walk the message directory and update `watch` in place. Returns
-/// `true` when the snapshot mutated. Mirrors C# `Recompute`.
-///
-/// Read errors on individual files are skipped (the file is re-tried
-/// next tick because it stays at or above the watermark). This matches
-/// the C# `IOException` mid-write race handling.
-pub fn process_message_dir(watch: &mut SessionWatch) -> bool {
-    let Some(dir) = watch.message_dir.clone() else {
-        return false;
-    };
-    let dir_mtime = std::fs::metadata(&dir)
-        .ok()
-        .as_ref()
-        .and_then(crate::telemetry::modified_or_none);
-
-    // Quiet-tick short-circuit. Capture dir mtime BEFORE the walk so a
-    // file landing between this check and the enumerate is still picked
-    // up on the next tick. Mirrors C# comment verbatim.
-    if let (Some(dm), Some(last)) = (dir_mtime, watch.last_walked_dir_mtime)
-        && dm <= last && watch.snapshot.is_some() {
-            return false;
-        }
-
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => return false,
-    };
-
-    let entry_watermark = watch.mtime_watermark;
-    let mut max_mtime_seen = entry_watermark;
-    let mut new_seen_at_max: Option<HashSet<PathBuf>> = None;
-    let mut any_new_parsed = false;
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = match path.file_name().and_then(|s| s.to_str()) {
-            Some(n) => n.to_owned(),
-            None => continue,
-        };
-        if !name.starts_with("msg_") || !name.ends_with(".json") {
-            continue;
-        }
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let lwt = match meta.modified() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-
-        if let Some(wm) = entry_watermark {
-            if lwt < wm {
-                continue;
-            }
-            if lwt == wm && watch.seen_at_watermark.contains(&path) {
-                continue;
-            }
-        }
-
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            // Mid-write race — leave for the next poll. The file's mtime
-            // hasn't moved past the watermark yet (or we'd have seen it
-            // here), so it'll be re-considered.
-            Err(_) => continue,
-        };
-
-        let parsed = match parse_content(&content) {
-            Some(p) => p,
-            None => continue,
-        };
-
-        // Track post-loop watermark + same-instant set. Files strictly
-        // between entry_watermark and max_mtime_seen don't need
-        // tracking — the next tick filters them by the new watermark.
-        match max_mtime_seen {
-            None => {
-                max_mtime_seen = Some(lwt);
-                let mut s = HashSet::new();
-                s.insert(path.clone());
-                new_seen_at_max = Some(s);
-            }
-            Some(cur) if lwt > cur => {
-                max_mtime_seen = Some(lwt);
-                let mut s = HashSet::new();
-                s.insert(path.clone());
-                new_seen_at_max = Some(s);
-            }
-            Some(cur) if lwt == cur => {
-                new_seen_at_max
-                    .get_or_insert_with(HashSet::new)
-                    .insert(path.clone());
-            }
-            _ => {}
-        }
-
-        // Update the three CreatedAt-keyed running aggregates. Files can
-        // land out of disk-order, so each candidate is "largest CreatedAt
-        // for its slice", not just "last seen".
-        let ec = parsed.created_at_secs.unwrap_or(f64::MIN);
-        let last_entry_ts = watch
-            .last_entry
-            .as_ref()
-            .and_then(|e| e.created_at_secs)
-            .unwrap_or(f64::MIN);
-        if watch.last_entry.is_none() || ec > last_entry_ts {
-            watch.last_entry = Some(parsed.clone());
-        }
-
-        if parsed.role.as_deref() == Some("user") {
-            let last_user_ts = watch
-                .last_user
-                .as_ref()
-                .and_then(|e| e.created_at_secs)
-                .unwrap_or(f64::MIN);
-            if watch.last_user.is_none() || ec > last_user_ts {
-                watch.last_user = Some(parsed.clone());
-            }
-        }
-
-        if parsed.has_usage() {
-            let last_asst_ts = watch
-                .last_assistant_with_usage
-                .as_ref()
-                .and_then(|e| e.created_at_secs)
-                .unwrap_or(f64::MIN);
-            if watch.last_assistant_with_usage.is_none() || ec > last_asst_ts {
-                watch.last_assistant_with_usage = Some(parsed.clone());
-            }
-            watch.turn_count += 1;
-        }
-
-        any_new_parsed = true;
-    }
-
-    // Commit the watermark only after the walk so mid-loop advances
-    // can't filter older siblings returned later. Mirrors C# comment.
-    if let Some(new_set) = new_seen_at_max {
-        if let Some(new_max) = max_mtime_seen {
-            let advance = match entry_watermark {
-                Some(wm) => new_max > wm,
-                None => true,
-            };
-            if advance {
-                watch.mtime_watermark = Some(new_max);
-                watch.seen_at_watermark.clear();
-            }
-        }
-        for f in new_set {
-            watch.seen_at_watermark.insert(f);
-        }
-    }
-
-    // Record dir mtime captured before the walk — next tick can
-    // short-circuit unless the dir has changed again. Done
-    // unconditionally so a no-change tick still advances the gate.
-    if let Some(dm) = dir_mtime {
-        watch.last_walked_dir_mtime = Some(dm);
-    }
-
-    if watch.last_entry.is_none() {
-        return false;
-    }
-    if !any_new_parsed && watch.snapshot.is_some() {
-        return false;
-    }
-
-    let last_entry = watch.last_entry.as_ref().unwrap();
-    let last_assistant = watch.last_assistant_with_usage.as_ref();
-    let last_user = watch.last_user.as_ref();
-
-    // Activity FSM (mirrors C#):
-    //   user is most recent                      → Busy (Composing)
-    //   assistant + pending tool                  → PendingToolUse
-    //   assistant + completed (no pending tools)  → Idle
-    //   assistant + not yet completed             → Busy (streaming)
-    let state = match last_entry.role.as_deref() {
+/// * a user message → Busy (OpenCode is composing the reply);
+/// * an assistant step with a `pending` / `running` tool part →
+///   PendingToolUse;
+/// * a completed step that ended in `tool-calls` → Busy. OpenCode's
+///   prompt loop starts the next step right after (its loop only exits
+///   on a finish other than `tool-calls`), so reporting Idle in that gap
+///   would flash a finished turn between every tool call. When no next
+///   step follows, [`quiet_window`] turns this Idle after
+///   [`TOOL_STEP_SETTLE`];
+/// * any other completed step → Idle;
+/// * a step still streaming → Busy.
+pub fn derive_state(latest: &MessageEntry, pending_tool: bool) -> SessionState {
+    match latest.role.as_deref() {
         Some("user") => SessionState::Busy,
-        Some("assistant") if last_entry.has_pending_tool_call => SessionState::PendingToolUse,
-        Some("assistant") if last_entry.completed_at_secs.is_some() => SessionState::Idle,
+        Some("assistant") if pending_tool => SessionState::PendingToolUse,
+        Some("assistant") if latest.completed_ms.is_some() => {
+            if is_open_tool_step(latest) {
+                SessionState::Busy
+            } else {
+                SessionState::Idle
+            }
+        }
         Some("assistant") => SessionState::Busy,
         _ => SessionState::Unknown,
-    };
+    }
+}
 
-    let tokens_used = last_assistant.map_or(0, MessageEntry::context_tokens);
-    let model = last_assistant.and_then(|e| e.model_id.clone());
+/// A completed step that hands over to a next one: `finish:
+/// "tool-calls"` and no error.
+fn is_open_tool_step(latest: &MessageEntry) -> bool {
+    latest.role.as_deref() == Some("assistant")
+        && latest.completed_ms.is_some()
+        && latest.finish.as_deref() == Some("tool-calls")
+        && !latest.has_error
+}
 
-    let last_turn_duration = match (last_assistant, last_user) {
-        (Some(asst), Some(user)) => {
-            match (user.created_at_secs, asst.created_at_secs) {
-                (Some(u), Some(a)) if a > u => {
-                    let end = asst.completed_at_secs.unwrap_or(a);
-                    let secs = end - u;
-                    if secs >= 0.0 {
-                        Some(Duration::from_secs_f64(secs))
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
+/// How long a completed `tool-calls` step may stand with no change to the
+/// session before the turn counts as over. OpenCode creates the next
+/// step's message within a few milliseconds of finishing the last (1–4 ms
+/// between steps in a real session), so nothing following for seconds
+/// means the loop stopped: a denied permission or a rejected question
+/// errors the tool part and ends the turn without marking the step.
+pub const TOOL_STEP_SETTLE: Duration = Duration::from_secs(5);
+
+/// How long a Busy snapshot may go without any change to the session
+/// before it reads as Idle with `quiet_timeout`. `None` for states that
+/// never time out (PendingToolUse: a running tool or a question waiting
+/// on the user writes nothing until it resolves).
+pub fn quiet_window(latest: &MessageEntry, state: SessionState) -> Option<Duration> {
+    match state {
+        SessionState::Busy if is_open_tool_step(latest) => Some(TOOL_STEP_SETTLE),
+        SessionState::Busy => Some(BUSY_QUIET_TIMEOUT),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Queries
+// ---------------------------------------------------------------------------
+
+/// What one read of the database says about a session.
+#[derive(Debug, Default)]
+struct SessionRead {
+    title: Option<String>,
+    latest: Option<MessageEntry>,
+    pending_tool: bool,
+    last_usage: Option<MessageEntry>,
+    prompts: PromptTally,
+    activity: Activity,
+}
+
+/// Fingerprint of where the session is: its latest message and how much
+/// of that message's parts exist. Streamed text grows a part, a tool
+/// changes status in one, a new step is a new message — any of those
+/// restarts the quiet window. Writes to *other* sessions leave it alone.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Activity {
+    latest_id: Option<String>,
+    latest_data: String,
+    part_count: i64,
+    part_bytes: i64,
+}
+
+/// Running count of the session's user messages, advanced from a
+/// cursor so a re-read only parses messages it hasn't counted yet. A
+/// message's role never changes, so counting each one once is exact.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct PromptTally {
+    /// `(time_created, id)` of the last message counted.
+    cursor: Option<(i64, String)>,
+    count: u32,
+    /// `time_created` of the newest user message.
+    last_user_ms: Option<i64>,
+}
+
+impl PromptTally {
+    fn advance(&self, conn: &Connection, session_id: &str) -> rusqlite::Result<PromptTally> {
+        let mut tally = self.clone();
+        // OpenCode's `/undo` deletes the newest messages. When the
+        // cursor's message is gone, count again from the start.
+        if let Some((_, id)) = &tally.cursor {
+            let still_there: bool = conn
+                .prepare_cached("SELECT EXISTS (SELECT 1 FROM message WHERE id = ?1)")?
+                .query_row([id], |r| r.get(0))?;
+            if !still_there {
+                tally = PromptTally::default();
             }
         }
+        let (after_ms, after_id) = tally.cursor.clone().unwrap_or((i64::MIN, String::new()));
+        let mut stmt = conn.prepare_cached(
+            "SELECT time_created, id, json_extract(data, '$.role') = 'user' FROM message
+             WHERE session_id = ?1 AND (time_created, id) > (?2, ?3)
+             ORDER BY time_created, id",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![session_id, after_ms, after_id])?;
+        while let Some(row) = rows.next()? {
+            let created: i64 = row.get(0)?;
+            if row.get::<_, Option<bool>>(2)? == Some(true) {
+                tally.count += 1;
+                tally.last_user_ms = Some(tally.last_user_ms.map_or(created, |m| m.max(created)));
+            }
+            tally.cursor = Some((created, row.get(1)?));
+        }
+        Ok(tally)
+    }
+}
+
+/// One read, inside one read transaction so every query sees the same
+/// commit. Every query rides the `(session_id, time_created, id)` index
+/// on `message` or the `(message_id, id)` index on `part`; the
+/// `json_extract` filters only touch the rows those ranges return.
+fn read_session(
+    conn: &Connection,
+    session_id: &str,
+    prompts: &PromptTally,
+) -> rusqlite::Result<SessionRead> {
+    let tx = conn.unchecked_transaction()?;
+    let title: Option<String> = tx
+        .prepare_cached("SELECT title FROM session WHERE id = ?1")?
+        .query_row([session_id], |r| r.get(0))
+        .optional()?;
+    let latest: Option<(String, String)> = tx
+        .prepare_cached(
+            "SELECT id, data FROM message WHERE session_id = ?1
+             ORDER BY time_created DESC, id DESC LIMIT 1",
+        )?
+        .query_row([session_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let Some((latest_id, latest_data)) = latest else {
+        return Ok(SessionRead { title, ..SessionRead::default() });
+    };
+    let latest = parse_message(&latest_data);
+    let (part_count, part_bytes, any_pending): (i64, i64, bool) = tx
+        .prepare_cached(
+            "SELECT count(*), coalesce(sum(length(data)), 0),
+                coalesce(max(json_extract(data, '$.type') = 'tool'
+                    AND json_extract(data, '$.state.status') IN ('pending', 'running')), 0)
+             FROM part WHERE message_id = ?1",
+        )?
+        .query_row([&latest_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    let pending_tool =
+        any_pending && latest.as_ref().is_some_and(|m| m.role.as_deref() == Some("assistant"));
+    let last_usage: Option<String> = tx
+        .prepare_cached(
+            "SELECT data FROM message WHERE session_id = ?1
+                AND json_extract(data, '$.role') = 'assistant'
+                AND coalesce(json_extract(data, '$.tokens.input'), 0)
+                  + coalesce(json_extract(data, '$.tokens.output'), 0)
+                  + coalesce(json_extract(data, '$.tokens.reasoning'), 0)
+                  + coalesce(json_extract(data, '$.tokens.cache.read'), 0)
+                  + coalesce(json_extract(data, '$.tokens.cache.write'), 0) > 0
+             ORDER BY time_created DESC, id DESC LIMIT 1",
+        )?
+        .query_row([session_id], |r| r.get(0))
+        .optional()?;
+    let prompts = prompts.advance(&tx, session_id)?;
+    Ok(SessionRead {
+        title,
+        latest,
+        pending_tool,
+        last_usage: last_usage.as_deref().and_then(parse_message),
+        prompts,
+        activity: Activity {
+            latest_id: Some(latest_id),
+            latest_data,
+            part_count,
+            part_bytes,
+        },
+    })
+}
+
+fn build_snapshot(read: &SessionRead, title: Option<SessionTitle>) -> Option<TelemetrySnapshot> {
+    let latest = read.latest.as_ref()?;
+    let state = derive_state(latest, read.pending_tool);
+    let last_usage = read.last_usage.as_ref();
+    let tokens_used = last_usage.map_or(0, MessageEntry::context_tokens);
+    let model = last_usage.and_then(|e| e.model_id.clone());
+
+    // Prompt → end of the latest step that answered it.
+    let last_turn_duration = match (last_usage, read.prompts.last_user_ms) {
+        (Some(asst), Some(user_ms)) => match asst.created_ms {
+            Some(created) if created > user_ms => {
+                let end = asst.completed_ms.unwrap_or(created);
+                u64::try_from(end - user_ms).ok().map(Duration::from_millis)
+            }
+            _ => None,
+        },
         _ => None,
     };
 
@@ -535,110 +358,158 @@ pub fn process_message_dir(watch: &mut SessionWatch) -> bool {
         context_window.map(|cap| (tokens_used as f32 / cap as f32).clamp(0.0, 1.0))
     };
 
-    let snap = TelemetrySnapshot {
+    Some(TelemetrySnapshot {
         model,
         tokens_used,
         context_pct,
-        turn_count: watch.turn_count,
+        turn_count: read.prompts.count,
         last_turn_duration,
         state,
         quiet_timeout: false,
-        title: None,
-    };
-
-    if Some(&snap) == watch.snapshot.as_ref() {
-        return false;
-    }
-    watch.snapshot = Some(snap);
-    true
+        title,
+    })
 }
 
 // ---------------------------------------------------------------------------
 // High-level tail handle
 // ---------------------------------------------------------------------------
 
-/// Handle to a watched OpenCode session. Tracks the resolved message
-/// directory + watermark so repeated `poll()` calls are cheap.
-///
-/// Mirrors the `Watch` inner class of `OpenCodeTelemetryService` plus
-/// its `TryLocateMessageDir` retry throttling.
+/// Handle to a watched OpenCode session. Keeps its own read-only
+/// connection ([`DbHandle`]), so a `poll()` with nothing committed is a
+/// `PRAGMA data_version` plus the quiet-window comparison.
 #[derive(Debug)]
 pub struct OpenCodeMessageTail {
     pub data_root: PathBuf,
-    watch: SessionWatch,
-    /// Last failed locate timestamp; used to throttle the recursive
-    /// scan. Mirrors C# `LastLocateMissAtTicks`.
-    last_locate_miss_at: Option<SystemTime>,
-    /// Latest snapshot, or `None` until at least one message is parsed.
-    /// Mirrored from `watch.snapshot` at the end of each poll so the
-    /// public surface matches sibling tails (ClaudeTranscriptTail,
-    /// CopilotTranscriptTail, PiTranscriptTail all expose a public
-    /// `snapshot` field).
+    session_id: String,
+    db: DbHandle,
+    title: Option<SessionTitle>,
+    prompts: PromptTally,
+    /// The snapshot as the database describes it, before any quiet
+    /// timeout is applied.
+    base: Option<TelemetrySnapshot>,
+    /// How long `base` may stay unchanged before it times out; see
+    /// [`quiet_window`].
+    quiet_after: Option<Duration>,
+    activity: Option<Activity>,
+    /// Tail clock at the last read that saw this session change. Starts
+    /// at construction.
+    last_activity: Instant,
+    /// Whether `snapshot` currently carries a quiet-timeout Idle.
+    timed_out: bool,
+    /// Reads run against the database — lets the tests prove a quiet
+    /// poll never touches SQLite.
+    queries: u64,
+    /// Latest snapshot, or `None` until the session has a message.
+    /// Public to match the sibling tails (`ClaudeTranscriptTail`,
+    /// `CopilotTranscriptTail`, `PiTranscriptTail`).
     pub snapshot: Option<TelemetrySnapshot>,
 }
 
-/// How long to skip `try_locate_message_dir` after a "not found"
-/// result. Mirrors C# `LocateNotFoundTtl`.
-pub const LOCATE_NOT_FOUND_TTL: Duration = Duration::from_secs(2);
-
 impl OpenCodeMessageTail {
-    /// Construct a tail for `(data_root, session_id)` and immediately
-    /// attempt to locate + read the message directory so any existing
-    /// content is consumed before the first poll interval fires.
-    ///
-    /// Matches the sibling-tail shape (`ClaudeTranscriptTail::for_session`,
-    /// `CopilotTranscriptTail::for_session`, etc.) so the AppShell
-    /// registration loop reads uniformly across the four agents.
+    /// Construct a tail for `(data_root, session_id)` and poll once so
+    /// existing content is read before the first poll interval fires.
     pub fn for_session(data_root: &Path, session_id: impl Into<String>) -> Self {
+        let now = Instant::now();
         let mut tail = Self {
             data_root: data_root.to_path_buf(),
-            watch: SessionWatch::new(session_id),
-            last_locate_miss_at: None,
+            session_id: session_id.into(),
+            db: DbHandle::new(db::db_path(data_root)),
+            title: None,
+            prompts: PromptTally::default(),
+            base: None,
+            quiet_after: None,
+            activity: None,
+            last_activity: now,
+            timed_out: false,
+            queries: 0,
             snapshot: None,
         };
-        tail.poll();
+        tail.poll_at(now);
         tail
     }
 
-    /// Read-only view of the resolved directory, if located.
-    pub fn message_dir(&self) -> Option<&Path> {
-        self.watch.message_dir.as_deref()
+    /// Re-read the session if anything was committed since the last
+    /// read, then apply the quiet timeouts. Returns `true` when the
+    /// snapshot changed.
+    pub fn poll(&mut self) -> bool {
+        self.poll_at(Instant::now())
     }
 
-    /// Re-locate (if needed) and walk the message directory.
-    /// Returns `true` when the snapshot changed.
-    pub fn poll(&mut self) -> bool {
-        if self.watch.message_dir.is_none() {
-            // Throttle the recursive scan — the dir only appears once
-            // OpenCode writes its first message file; a 250 ms recursive
-            // walk over the whole data root every tick is wasteful.
-            // Mirrors C# Issue #36.
-            if let Some(missed) = self.last_locate_miss_at
-                && let Ok(elapsed) = SystemTime::now().duration_since(missed)
-                    && elapsed < LOCATE_NOT_FOUND_TTL {
-                        return false;
-                    }
-            match try_locate_message_dir(&self.data_root, &self.watch.session_id) {
-                Some(dir) => {
-                    self.watch.message_dir = Some(dir);
-                    self.last_locate_miss_at = None;
-                }
-                None => {
-                    self.last_locate_miss_at = Some(SystemTime::now());
-                    return false;
-                }
-            }
+    /// [`Self::poll`] with the tail clock passed in, so the quiet
+    /// timeouts can be tested without waiting for them.
+    pub fn poll_at(&mut self, now: Instant) -> bool {
+        let read_changed = self.refresh(now);
+        let timed_out = self.base.as_ref().is_some_and(|s| s.state == SessionState::Busy)
+            && self
+                .quiet_after
+                .is_some_and(|window| now.saturating_duration_since(self.last_activity) >= window);
+        if !read_changed && timed_out == self.timed_out {
+            return false;
         }
-        let changed = process_message_dir(&mut self.watch);
-        self.snapshot = self.watch.snapshot.clone();
-        changed
+        self.timed_out = timed_out;
+        let mut snap = self.base.clone();
+        if timed_out && let Some(s) = snap.as_mut() {
+            s.state = SessionState::Idle;
+            // Not a finished turn: the app reads this to stay quiet
+            // instead of announcing "Turn complete".
+            s.quiet_timeout = true;
+        }
+        if snap == self.snapshot {
+            return false;
+        }
+        self.snapshot = snap;
+        true
+    }
+
+    /// Read the session when the database has a commit we haven't seen.
+    /// Returns `true` when `base` changed.
+    fn refresh(&mut self, now: Instant) -> bool {
+        let version = match self.db.probe() {
+            Ok(Probe::Changed(version)) => version,
+            Ok(Probe::Unchanged | Probe::Missing) => return false,
+            Err(err) if db::is_busy(&err) => return false,
+            Err(err) => {
+                self.db.log_error("opencode_telemetry", &err);
+                return false;
+            }
+        };
+        self.queries += 1;
+        let Some(conn) = self.db.conn() else { return false };
+        let read = match read_session(conn, &self.session_id, &self.prompts) {
+            Ok(read) => read,
+            // Locked mid-read: leave the version unmarked, retry next poll.
+            Err(err) if db::is_busy(&err) => return false,
+            Err(err) => {
+                // Not a schema we know: wait for the next commit.
+                self.db.log_error("opencode_telemetry", &err);
+                self.db.mark_read(version);
+                return false;
+            }
+        };
+        self.db.mark_read(version);
+        if self.activity.as_ref() != Some(&read.activity) {
+            self.activity = Some(read.activity.clone());
+            self.last_activity = now;
+        }
+        self.prompts = read.prompts.clone();
+        if let Some(raw) = read.title.as_deref().filter(|t| !db::is_placeholder_title(t)) {
+            SessionTitle::offer(&mut self.title, raw, TitleSource::Generated);
+        }
+        let base = build_snapshot(&read, self.title.clone());
+        self.quiet_after =
+            read.latest.as_ref().zip(base.as_ref()).and_then(|(m, s)| quiet_window(m, s.state));
+        if base == self.base {
+            return false;
+        }
+        self.base = base;
+        true
     }
 
     /// Suggested poll interval for the next wake-up. 250 ms while
     /// busy / pending tool, 2 s while idle / unknown. Same cadence as
     /// the Claude / Copilot telemetry tails.
     pub fn poll_interval(&self) -> Duration {
-        match self.watch.snapshot.as_ref().map(|s| s.state) {
+        match self.snapshot.as_ref().map(|s| s.state) {
             Some(SessionState::Busy) | Some(SessionState::PendingToolUse) => {
                 Duration::from_millis(250)
             }
@@ -666,652 +537,539 @@ pub fn default_data_root() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use crate::agents::opencode::db::fixture::{Fixture, assistant, user};
 
-    // ---- parse_content ----
+    const SID: &str = "ses_alpha";
+    const MODEL: &str = "claude-sonnet-4-6";
 
-    fn user_msg_json(session: &str, created_ms: i64) -> String {
-        format!(
-            r#"{{
-                "id":"u-1","role":"user",
-                "metadata":{{
-                    "sessionID":"{session}",
-                    "time":{{"created":{created_ms}}}
-                }},
-                "parts":[{{"type":"text","text":"hi"}}]
-            }}"#
-        )
+    fn fixture() -> Fixture {
+        let fx = Fixture::new();
+        fx.add_session(SID, None, "C:/repo/alpha", "New session - 2026-04-17T09:25:15.466Z", 1);
+        fx
     }
 
-    // Test fixture: one argument per JSON field it emits; a params struct would only add noise.
-    #[allow(clippy::too_many_arguments)]
-    fn assistant_msg_json(
-        session: &str,
-        created_ms: i64,
-        completed_ms: Option<i64>,
-        input: u64,
-        output: u64,
-        cache_read: u64,
-        cache_write: u64,
-        model: &str,
-        cwd: &str,
-        pending_tool: bool,
-    ) -> String {
-        let completed = completed_ms
-            .map(|t| format!(r#","completed":{t}"#))
-            .unwrap_or_default();
-        let parts = if pending_tool {
-            r#"[{"type":"tool-invocation","toolInvocation":{"state":"call","toolName":"shell"}}]"#
-        } else {
-            r#"[{"type":"text","text":"ok"}]"#
-        };
-        format!(
-            r#"{{
-                "id":"a-1","role":"assistant",
-                "metadata":{{
-                    "sessionID":"{session}",
-                    "time":{{"created":{created_ms}{completed}}},
-                    "assistant":{{
-                        "modelID":"{model}",
-                        "providerID":"anthropic",
-                        "path":{{"cwd":"{cwd}","root":"{cwd}"}},
-                        "tokens":{{
-                            "input":{input},"output":{output},"reasoning":0,
-                            "cache":{{"read":{cache_read},"write":{cache_write}}}
-                        }},
-                        "cost":0
-                    }}
-                }},
-                "parts":{parts}
-            }}"#
-        )
+    fn tail(fx: &Fixture) -> OpenCodeMessageTail {
+        OpenCodeMessageTail::for_session(fx.root(), SID)
     }
+
+    fn state(t: &OpenCodeMessageTail) -> SessionState {
+        t.snapshot.as_ref().expect("snapshot").state
+    }
+
+    // ---- parse_message ----
 
     #[test]
-    fn parse_user_message_extracts_role_and_session() {
-        let entry = parse_content(&user_msg_json("sess-1", 1_700_000_000_000)).unwrap();
-        assert_eq!(entry.role.as_deref(), Some("user"));
-        assert_eq!(entry.session_id.as_deref(), Some("sess-1"));
-        assert_eq!(entry.created_at_secs, Some(1_700_000_000.0));
-        assert!(!entry.has_usage());
-        assert!(!entry.has_pending_tool_call);
-    }
-
-    #[test]
-    fn parse_assistant_extracts_tokens_and_model() {
-        let entry = parse_content(&assistant_msg_json(
-            "sess-1",
-            1_700_000_010_000,
-            Some(1_700_000_020_000),
-            100,
-            50,
-            10,
-            5,
-            "claude-sonnet-4-6",
-            "C:/dev/x",
-            false,
-        ))
-        .unwrap();
+    fn parse_assistant_reads_top_level_fields() {
+        let data = assistant(10_000, Some((20_000, "stop")), (100, 50, 10, 5), MODEL);
+        let entry = parse_message(&data.to_string()).unwrap();
         assert_eq!(entry.role.as_deref(), Some("assistant"));
-        assert_eq!(entry.input_tokens, 100);
-        assert_eq!(entry.output_tokens, 50);
-        assert_eq!(entry.cache_read_tokens, 10);
-        assert_eq!(entry.cache_write_tokens, 5);
+        assert_eq!(entry.created_ms, Some(10_000));
+        assert_eq!(entry.completed_ms, Some(20_000));
+        assert_eq!(entry.finish.as_deref(), Some("stop"));
         assert_eq!(entry.context_tokens(), 165);
         assert!(entry.has_usage());
-        assert_eq!(entry.model_id.as_deref(), Some("claude-sonnet-4-6"));
-        assert_eq!(entry.cwd.as_deref(), Some("C:/dev/x"));
-        assert_eq!(entry.completed_at_secs, Some(1_700_000_020.0));
+        assert!(!entry.has_error);
+        assert_eq!(entry.model_id.as_deref(), Some(MODEL));
     }
 
     #[test]
-    fn parse_assistant_pending_tool_call_detected() {
-        let entry = parse_content(&assistant_msg_json(
-            "s",
-            1_700_000_000_000,
-            None,
-            10,
-            0,
-            0,
-            0,
-            "claude-sonnet-4-6",
-            "C:/dev/x",
-            true,
-        ))
-        .unwrap();
-        assert!(entry.has_pending_tool_call);
+    fn parse_user_has_no_usage() {
+        let entry = parse_message(&user(1_000).to_string()).unwrap();
+        assert_eq!(entry.role.as_deref(), Some("user"));
+        assert!(!entry.has_usage());
     }
 
     #[test]
-    fn parse_user_with_tool_part_does_not_flag_pending() {
-        // Tool parts on user role must never flag pending — only
-        // assistant role can be mid-call.
-        let json = r#"{
-            "id":"u-1","role":"user",
-            "metadata":{"sessionID":"s","time":{"created":1700000000000}},
-            "parts":[{"type":"tool-invocation","toolInvocation":{"state":"call"}}]
-        }"#;
-        let entry = parse_content(json).unwrap();
-        assert!(!entry.has_pending_tool_call);
+    fn parse_rejects_garbage() {
+        assert!(parse_message("").is_none());
+        assert!(parse_message("{not json").is_none());
+        assert!(parse_message("[]").is_none());
+    }
+
+    // ---- state machine ----
+
+    #[test]
+    fn no_messages_yet_means_no_snapshot() {
+        let fx = fixture();
+        assert!(tail(&fx).snapshot.is_none());
     }
 
     #[test]
-    fn parse_partial_call_state_flags_pending() {
-        let json = r#"{
-            "id":"a-1","role":"assistant",
-            "metadata":{"sessionID":"s","time":{"created":1700000000000}},
-            "parts":[{"type":"tool-invocation","toolInvocation":{"state":"partial-call"}}]
-        }"#;
-        let entry = parse_content(json).unwrap();
-        assert!(entry.has_pending_tool_call);
+    fn missing_db_means_no_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut t = OpenCodeMessageTail::for_session(tmp.path(), SID);
+        assert!(t.snapshot.is_none());
+        assert!(!t.poll());
     }
 
     #[test]
-    fn parse_result_state_does_not_flag_pending() {
-        let json = r#"{
-            "id":"a-1","role":"assistant",
-            "metadata":{"sessionID":"s","time":{"created":1700000000000}},
-            "parts":[{"type":"tool-invocation","toolInvocation":{"state":"result"}}]
-        }"#;
-        let entry = parse_content(json).unwrap();
-        assert!(!entry.has_pending_tool_call);
+    fn user_message_is_busy() {
+        let fx = fixture();
+        fx.put_message("msg_1", SID, &user(1_000));
+        assert_eq!(state(&tail(&fx)), SessionState::Busy);
     }
 
     #[test]
-    fn parse_blank_input_returns_none() {
-        assert!(parse_content("").is_none());
-        assert!(parse_content("   \t").is_none());
+    fn streaming_assistant_is_busy() {
+        let fx = fixture();
+        fx.put_message("msg_1", SID, &user(1_000));
+        fx.put_message("msg_2", SID, &assistant(2_000, None, (0, 0, 0, 0), MODEL));
+        assert_eq!(state(&tail(&fx)), SessionState::Busy);
     }
 
     #[test]
-    fn parse_garbage_returns_none() {
-        assert!(parse_content("{not json").is_none());
-        assert!(parse_content("[]").is_none()); // root must be object
+    fn running_tool_is_pending_tool_use() {
+        for status in ["pending", "running"] {
+            let fx = fixture();
+            fx.put_message("msg_1", SID, &user(1_000));
+            fx.put_message("msg_2", SID, &assistant(2_000, None, (0, 0, 0, 0), MODEL));
+            fx.put_tool_part("prt_1", "msg_2", SID, status);
+            assert_eq!(state(&tail(&fx)), SessionState::PendingToolUse, "{status}");
+        }
     }
 
     #[test]
-    fn extract_message_id_from_well_formed_name() {
-        assert_eq!(
-            extract_message_id_from_file_name("msg_abc-123.json").as_deref(),
-            Some("abc-123")
+    fn finished_tool_is_not_pending() {
+        for status in ["completed", "error"] {
+            let fx = fixture();
+            fx.put_message("msg_1", SID, &user(1_000));
+            fx.put_message("msg_2", SID, &assistant(2_000, None, (0, 0, 0, 0), MODEL));
+            fx.put_tool_part("prt_1", "msg_2", SID, status);
+            assert_eq!(state(&tail(&fx)), SessionState::Busy, "{status}");
+        }
+    }
+
+    #[test]
+    fn completed_step_that_stopped_is_idle() {
+        let fx = fixture();
+        fx.put_message("msg_1", SID, &user(1_000));
+        fx.put_message("msg_2", SID, &assistant(2_000, Some((3_000, "stop")), (1, 1, 0, 0), MODEL));
+        assert_eq!(state(&tail(&fx)), SessionState::Idle);
+    }
+
+    #[test]
+    fn completed_step_that_called_tools_stays_busy() {
+        // OpenCode's loop starts the next step after a `tool-calls`
+        // finish; the gap must not read as a finished turn.
+        let fx = fixture();
+        fx.put_message("msg_1", SID, &user(1_000));
+        fx.put_message(
+            "msg_2",
+            SID,
+            &assistant(2_000, Some((3_000, "tool-calls")), (1, 1, 0, 0), MODEL),
         );
+        assert_eq!(state(&tail(&fx)), SessionState::Busy);
     }
 
     #[test]
-    fn extract_message_id_from_other_names_returns_none() {
-        assert_eq!(extract_message_id_from_file_name("session.json"), None);
-        assert_eq!(extract_message_id_from_file_name("msg_.json"), None);
-        assert_eq!(extract_message_id_from_file_name(""), None);
-    }
-
-    // ---- try_locate_message_dir (recursive) ----
-
-    fn make_session_dir(root: &Path, slug: &str, sid: &str) -> PathBuf {
-        let dir = root
-            .join("project")
-            .join(slug)
-            .join("storage")
-            .join("message")
-            .join(sid);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn errored_step_is_idle_even_after_tool_calls() {
+        let fx = fixture();
+        fx.put_message("msg_1", SID, &user(1_000));
+        let mut data = assistant(2_000, Some((3_000, "tool-calls")), (1, 1, 0, 0), MODEL);
+        data["error"] = serde_json::json!({"name": "MessageAbortedError", "data": {}});
+        fx.put_message("msg_2", SID, &data);
+        assert_eq!(state(&tail(&fx)), SessionState::Idle);
     }
 
     #[test]
-    fn locate_finds_session_under_project_slug() {
-        let tmp = tempfile::tempdir().unwrap();
-        let target = make_session_dir(tmp.path(), "myproj", "sid-1");
-        let found = try_locate_message_dir(tmp.path(), "sid-1").unwrap();
-        assert_eq!(found, target);
-    }
+    fn state_follows_the_session_through_a_turn() {
+        let fx = fixture();
+        let mut t = tail(&fx);
+        assert!(t.snapshot.is_none());
 
-    #[test]
-    fn locate_returns_none_when_session_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        make_session_dir(tmp.path(), "myproj", "sid-1");
-        assert!(try_locate_message_dir(tmp.path(), "other-sid").is_none());
-    }
+        fx.put_message("msg_1", SID, &user(1_000));
+        assert!(t.poll());
+        assert_eq!(state(&t), SessionState::Busy);
 
-    #[test]
-    fn locate_ignores_dirs_whose_parent_is_not_message() {
-        // A stray directory named like a session id but NOT under
-        // `message/` must be ignored — protects against project slugs
-        // that accidentally embed the session id.
-        let tmp = tempfile::tempdir().unwrap();
-        fs::create_dir_all(tmp.path().join("decoy").join("sid-1")).unwrap();
-        let real = make_session_dir(tmp.path(), "real", "sid-1");
-        let found = try_locate_message_dir(tmp.path(), "sid-1").unwrap();
-        assert_eq!(found, real);
-    }
+        fx.put_message("msg_2", SID, &assistant(2_000, None, (0, 0, 0, 0), MODEL));
+        fx.put_tool_part("prt_1", "msg_2", SID, "running");
+        assert!(t.poll());
+        assert_eq!(state(&t), SessionState::PendingToolUse);
 
-    #[test]
-    fn locate_returns_none_for_missing_root() {
-        let path = std::path::PathBuf::from("/nonexistent/opencode/root");
-        assert!(try_locate_message_dir(&path, "sid-1").is_none());
-    }
-
-    // ---- process_message_dir / snapshot ----
-
-    fn write_message(dir: &Path, name: &str, content: &str) -> PathBuf {
-        let p = dir.join(name);
-        fs::write(&p, content).unwrap();
-        p
-    }
-
-    #[test]
-    fn snapshot_after_user_assistant_pair_is_idle_with_tokens() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = make_session_dir(tmp.path(), "p", "sid");
-        write_message(
-            &dir,
-            "msg_001.json",
-            &user_msg_json("sid", 1_700_000_000_000),
+        fx.put_tool_part("prt_1", "msg_2", SID, "completed");
+        fx.put_message(
+            "msg_2",
+            SID,
+            &assistant(2_000, Some((3_000, "tool-calls")), (10, 5, 0, 0), MODEL),
         );
-        write_message(
-            &dir,
-            "msg_002.json",
-            &assistant_msg_json(
-                "sid",
-                1_700_000_010_000,
-                Some(1_700_000_020_000),
-                100,
-                50,
-                10,
-                5,
-                "claude-sonnet-4-6",
-                "C:/dev/x",
-                false,
-            ),
-        );
+        assert!(t.poll());
+        assert_eq!(state(&t), SessionState::Busy);
 
-        let mut watch = SessionWatch::new("sid");
-        watch.message_dir = Some(dir);
-        let changed = process_message_dir(&mut watch);
-        assert!(changed);
+        let stop = assistant(4_000, Some((5_000, "stop")), (20, 7, 0, 0), MODEL);
+        fx.put_message("msg_3", SID, &stop);
+        assert!(t.poll());
+        assert_eq!(state(&t), SessionState::Idle);
+        assert_eq!(t.poll_interval(), Duration::from_secs(2));
 
-        let snap = watch.snapshot.as_ref().unwrap();
-        assert_eq!(snap.state, SessionState::Idle);
+        fx.put_message("msg_4", SID, &user(6_000));
+        assert!(t.poll());
+        assert_eq!(state(&t), SessionState::Busy);
+        assert_eq!(t.poll_interval(), Duration::from_millis(250));
+    }
+
+    // ---- tokens / model / turns ----
+
+    #[test]
+    fn tokens_and_model_come_from_latest_step_with_usage() {
+        let fx = fixture();
+        fx.put_message("msg_1", SID, &user(1_000));
+        let step = assistant(2_000, Some((3_000, "tool-calls")), (10, 5, 0, 0), "gpt-5.4");
+        fx.put_message("msg_2", SID, &step);
+        let last = assistant(4_000, Some((21_000, "stop")), (100, 50, 10, 5), MODEL);
+        fx.put_message("msg_3", SID, &last);
+        // A new step with no usage yet must not zero the counter.
+        fx.put_message("msg_4", SID, &assistant(22_000, None, (0, 0, 0, 0), "gpt-5.4"));
+        let t = tail(&fx);
+        let snap = t.snapshot.as_ref().unwrap();
         assert_eq!(snap.tokens_used, 165);
-        assert_eq!(snap.turn_count, 1);
-        assert_eq!(snap.model.as_deref(), Some("claude-sonnet-4-6"));
-        // 20 s between user.created and assistant.completed.
+        assert_eq!(snap.model.as_deref(), Some(MODEL));
+        let window = context_window_for_model(MODEL).expect("known model");
+        assert_eq!(snap.context_pct, Some(165.0 / window as f32));
+        // Prompt at 1 s → latest step with usage completed at 21 s.
         assert_eq!(snap.last_turn_duration, Some(Duration::from_secs(20)));
     }
 
     #[test]
-    fn pending_tool_state_when_assistant_mid_call() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = make_session_dir(tmp.path(), "p", "sid");
-        write_message(
-            &dir,
-            "msg_001.json",
-            &user_msg_json("sid", 1_700_000_000_000),
-        );
-        write_message(
-            &dir,
-            "msg_002.json",
-            &assistant_msg_json(
-                "sid",
-                1_700_000_010_000,
-                None, // not completed
-                10,
-                0,
-                0,
-                0,
-                "claude-sonnet-4-6",
-                "C:/dev/x",
-                true,
-            ),
-        );
-
-        let mut watch = SessionWatch::new("sid");
-        watch.message_dir = Some(dir);
-        process_message_dir(&mut watch);
-        assert_eq!(watch.snapshot.unwrap().state, SessionState::PendingToolUse);
+    fn turn_count_counts_prompts_not_steps() {
+        let fx = fixture();
+        fx.put_message("msg_1", SID, &user(1_000));
+        let step = assistant(2_000, Some((3_000, "tool-calls")), (1, 1, 0, 0), MODEL);
+        fx.put_message("msg_2", SID, &step);
+        fx.put_message("msg_3", SID, &assistant(4_000, Some((5_000, "stop")), (1, 1, 0, 0), MODEL));
+        fx.put_message("msg_4", SID, &user(6_000));
+        fx.put_message("msg_5", SID, &assistant(7_000, Some((8_000, "stop")), (1, 1, 0, 0), MODEL));
+        assert_eq!(tail(&fx).snapshot.unwrap().turn_count, 2);
     }
 
     #[test]
-    fn streaming_assistant_without_completed_is_busy() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = make_session_dir(tmp.path(), "p", "sid");
-        write_message(
-            &dir,
-            "msg_001.json",
-            &user_msg_json("sid", 1_700_000_000_000),
-        );
-        write_message(
-            &dir,
-            "msg_002.json",
-            &assistant_msg_json(
-                "sid",
-                1_700_000_010_000,
-                None,
-                10,
-                0,
-                0,
-                0,
-                "claude-sonnet-4-6",
-                "C:/dev/x",
-                false,
-            ),
-        );
-        let mut watch = SessionWatch::new("sid");
-        watch.message_dir = Some(dir);
-        process_message_dir(&mut watch);
-        assert_eq!(watch.snapshot.unwrap().state, SessionState::Busy);
+    fn turn_count_keeps_up_across_polls() {
+        let fx = fixture();
+        fx.put_message("msg_1", SID, &user(1_000));
+        let mut t = tail(&fx);
+        assert_eq!(t.snapshot.as_ref().unwrap().turn_count, 1);
+        fx.put_message("msg_2", SID, &assistant(2_000, Some((3_000, "stop")), (1, 1, 0, 0), MODEL));
+        t.poll();
+        assert_eq!(t.snapshot.as_ref().unwrap().turn_count, 1);
+        // Same millisecond as the counted message, later id.
+        fx.put_message("msg_3", SID, &user(3_000));
+        fx.put_message("msg_4", SID, &user(3_000));
+        t.poll();
+        assert_eq!(t.snapshot.as_ref().unwrap().turn_count, 3);
     }
 
     #[test]
-    fn turn_count_advances_only_on_assistant_with_usage() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = make_session_dir(tmp.path(), "p", "sid");
-        // Plain user message — must NOT bump the counter.
-        write_message(
-            &dir,
-            "msg_001.json",
-            &user_msg_json("sid", 1_700_000_000_000),
-        );
-        // Two assistant turns with usage — count = 2.
-        write_message(
-            &dir,
-            "msg_002.json",
-            &assistant_msg_json(
-                "sid",
-                1_700_000_010_000,
-                Some(1_700_000_011_000),
-                10,
-                5,
-                0,
-                0,
-                "claude-sonnet-4-6",
-                "C:/dev/x",
-                false,
-            ),
-        );
-        write_message(
-            &dir,
-            "msg_003.json",
-            &assistant_msg_json(
-                "sid",
-                1_700_000_020_000,
-                Some(1_700_000_021_000),
-                20,
-                7,
-                0,
-                0,
-                "claude-sonnet-4-6",
-                "C:/dev/x",
-                false,
-            ),
-        );
-
-        let mut watch = SessionWatch::new("sid");
-        watch.message_dir = Some(dir);
-        process_message_dir(&mut watch);
-        assert_eq!(watch.snapshot.as_ref().unwrap().turn_count, 2);
-    }
-
-    #[test]
-    fn second_walk_with_no_new_files_is_noop() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = make_session_dir(tmp.path(), "p", "sid");
-        write_message(
-            &dir,
-            "msg_001.json",
-            &user_msg_json("sid", 1_700_000_000_000),
-        );
-        write_message(
-            &dir,
-            "msg_002.json",
-            &assistant_msg_json(
-                "sid",
-                1_700_000_010_000,
-                Some(1_700_000_011_000),
-                10,
-                5,
-                0,
-                0,
-                "claude-sonnet-4-6",
-                "C:/dev/x",
-                false,
-            ),
-        );
-
-        let mut watch = SessionWatch::new("sid");
-        watch.message_dir = Some(dir);
-        let first = process_message_dir(&mut watch);
-        assert!(first);
-        let second = process_message_dir(&mut watch);
-        assert!(!second);
-        // Snapshot unchanged.
-        assert_eq!(watch.snapshot.as_ref().unwrap().turn_count, 1);
-    }
-
-    #[test]
-    fn malformed_message_file_is_skipped_without_panic() {
-        // Mirrors C# IOException-on-mid-write tolerance: a partial /
-        // garbage file leaves the watermark untouched (so the file is
-        // re-tried next tick once it's flushed) and never crashes
-        // the whole walk.
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = make_session_dir(tmp.path(), "p", "sid");
-        write_message(
-            &dir,
-            "msg_001.json",
-            &user_msg_json("sid", 1_700_000_000_000),
-        );
-        // Half-written file dropped between two valid ones.
-        write_message(&dir, "msg_002.json", "{not json");
-        write_message(
-            &dir,
-            "msg_003.json",
-            &assistant_msg_json(
-                "sid",
-                1_700_000_010_000,
-                Some(1_700_000_011_000),
-                10,
-                5,
-                0,
-                0,
-                "claude-sonnet-4-6",
-                "C:/dev/x",
-                false,
-            ),
-        );
-
-        let mut watch = SessionWatch::new("sid");
-        watch.message_dir = Some(dir);
-        let changed = process_message_dir(&mut watch);
-        assert!(changed);
-        let snap = watch.snapshot.as_ref().unwrap();
+    fn undo_recounts_turns() {
+        let fx = fixture();
+        fx.put_message("msg_1", SID, &user(1_000));
+        fx.put_message("msg_2", SID, &assistant(2_000, Some((3_000, "stop")), (1, 1, 0, 0), MODEL));
+        fx.put_message("msg_3", SID, &user(4_000));
+        fx.put_message("msg_4", SID, &assistant(5_000, Some((6_000, "stop")), (1, 1, 0, 0), MODEL));
+        let mut t = tail(&fx);
+        assert_eq!(t.snapshot.as_ref().unwrap().turn_count, 2);
+        fx.delete_message("msg_4");
+        fx.delete_message("msg_3");
+        assert!(t.poll());
+        let snap = t.snapshot.as_ref().unwrap();
         assert_eq!(snap.turn_count, 1);
         assert_eq!(snap.state, SessionState::Idle);
     }
 
     #[test]
-    fn out_of_order_writes_pick_largest_created_at() {
-        // Filesystem enumeration is not mtime-ordered; make sure the
-        // running aggregates pick the entry with the largest CreatedAt
-        // for each slice, regardless of disk order. Same property the
-        // C# build relies on.
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = make_session_dir(tmp.path(), "p", "sid");
-        // Older assistant turn written second (same model).
-        write_message(
-            &dir,
-            "msg_002.json",
-            &assistant_msg_json(
-                "sid",
-                1_700_000_005_000,
-                Some(1_700_000_006_000),
-                10,
-                5,
-                0,
-                0,
-                "claude-sonnet-4-6",
-                "C:/dev/x",
-                false,
-            ),
-        );
-        // Newer assistant turn (larger token total) — should win.
-        write_message(
-            &dir,
-            "msg_003.json",
-            &assistant_msg_json(
-                "sid",
-                1_700_000_020_000,
-                Some(1_700_000_021_000),
-                100,
-                50,
-                10,
-                5,
-                "claude-sonnet-4-6",
-                "C:/dev/x",
-                false,
-            ),
-        );
-        // User message in the middle.
-        write_message(
-            &dir,
-            "msg_001.json",
-            &user_msg_json("sid", 1_700_000_000_000),
-        );
-
-        let mut watch = SessionWatch::new("sid");
-        watch.message_dir = Some(dir);
-        process_message_dir(&mut watch);
-        let snap = watch.snapshot.as_ref().unwrap();
-        // tokens_used reflects the LAST assistant-with-usage by
-        // CreatedAt, not the disk-order last write.
-        assert_eq!(snap.tokens_used, 165);
-        assert_eq!(snap.turn_count, 2);
-    }
-
-    #[test]
-    fn missing_message_dir_returns_false() {
-        let mut watch = SessionWatch::new("sid");
-        watch.message_dir = Some(PathBuf::from("/nonexistent/opencode/sid"));
-        assert!(!process_message_dir(&mut watch));
-        assert!(watch.snapshot.is_none());
-    }
-
-    // ---- OpenCodeMessageTail (high-level handle) ----
-
-    #[test]
-    fn tail_resolves_dir_and_reads_initial_content() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = make_session_dir(tmp.path(), "p", "sid-x");
-        write_message(
-            &dir,
-            "msg_001.json",
-            &user_msg_json("sid-x", 1_700_000_000_000),
-        );
-        write_message(
-            &dir,
-            "msg_002.json",
-            &assistant_msg_json(
-                "sid-x",
-                1_700_000_010_000,
-                Some(1_700_000_011_000),
-                10,
-                5,
-                0,
-                0,
-                "claude-sonnet-4-6",
-                "C:/dev/x",
-                false,
-            ),
-        );
-
-        let tail = OpenCodeMessageTail::for_session(tmp.path(), "sid-x");
-        assert_eq!(tail.message_dir(), Some(dir.as_path()));
-        let snap = tail.snapshot.as_ref().expect("initial poll should produce a snapshot");
-        assert_eq!(snap.turn_count, 1);
+    fn messages_of_other_sessions_are_ignored() {
+        let fx = fixture();
+        fx.add_session("ses_other", None, "C:/repo/alpha", "Other", 1);
+        fx.put_message("msg_1", SID, &user(1_000));
+        fx.put_message("msg_2", SID, &assistant(2_000, Some((3_000, "stop")), (1, 1, 0, 0), MODEL));
+        fx.put_message("msg_3", "ses_other", &user(9_000));
+        fx.put_tool_part("prt_1", "msg_3", "ses_other", "running");
+        let snap = tail(&fx).snapshot.unwrap();
         assert_eq!(snap.state, SessionState::Idle);
+        assert_eq!(snap.turn_count, 1);
+    }
+
+    // ---- title ----
+
+    #[test]
+    fn placeholder_title_never_surfaces() {
+        let fx = fixture();
+        fx.put_message("msg_1", SID, &user(1_000));
+        assert_eq!(tail(&fx).snapshot.unwrap().title, None);
     }
 
     #[test]
-    fn tail_locate_miss_does_not_panic_and_can_recover() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Session dir doesn't exist yet.
-        let mut tail = OpenCodeMessageTail::for_session(tmp.path(), "sid-late");
-        assert!(tail.message_dir().is_none());
-        assert!(tail.snapshot.is_none());
+    fn generated_title_is_offered_once_opencode_writes_it() {
+        let fx = fixture();
+        fx.put_message("msg_1", SID, &user(1_000));
+        let mut t = tail(&fx);
+        assert_eq!(t.snapshot.as_ref().unwrap().title, None);
 
-        // Create the dir + a message and force a re-locate by clearing
-        // the throttle (simulating a poll after the TTL window).
-        let dir = make_session_dir(tmp.path(), "p", "sid-late");
-        write_message(
-            &dir,
-            "msg_001.json",
-            &user_msg_json("sid-late", 1_700_000_000_000),
+        fx.set_title(SID, "Fix the resize bug");
+        assert!(t.poll());
+        assert_eq!(
+            t.snapshot.as_ref().unwrap().title,
+            Some(SessionTitle {
+                text: "Fix the resize bug".into(),
+                source: TitleSource::Generated,
+            })
         );
-        tail.last_locate_miss_at = None;
-        let changed = tail.poll();
-        assert!(changed);
-        assert_eq!(tail.message_dir(), Some(dir.as_path()));
+    }
+
+    // ---- quiet timeouts ----
+
+    /// The step shape a denied permission or rejected question leaves
+    /// behind: completed, `finish: "tool-calls"`, no error, its tool
+    /// part errored, and no next step.
+    fn denied_turn(fx: &Fixture) {
+        fx.put_message("msg_1", SID, &user(1_000));
+        let step = assistant(2_000, Some((3_000, "tool-calls")), (1, 1, 0, 0), MODEL);
+        fx.put_message("msg_2", SID, &step);
+        fx.put_tool_part("prt_1", "msg_2", SID, "error");
     }
 
     #[test]
-    fn tail_poll_interval_matches_state() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = make_session_dir(tmp.path(), "p", "busy");
-        write_message(
-            &dir,
-            "msg_001.json",
-            &user_msg_json("busy", 1_700_000_000_000),
-        );
-        let busy_tail = OpenCodeMessageTail::for_session(tmp.path(), "busy");
-        assert_eq!(busy_tail.poll_interval(), Duration::from_millis(250));
+    fn denied_permission_settles_to_quiet_idle() {
+        let fx = fixture();
+        denied_turn(&fx);
+        let mut t = tail(&fx);
+        let start = Instant::now();
+        assert_eq!(state(&t), SessionState::Busy);
 
-        let idle_dir = make_session_dir(tmp.path(), "p", "idle");
-        write_message(
-            &idle_dir,
-            "msg_001.json",
-            &user_msg_json("idle", 1_700_000_000_000),
-        );
-        write_message(
-            &idle_dir,
-            "msg_002.json",
-            &assistant_msg_json(
-                "idle",
-                1_700_000_010_000,
-                Some(1_700_000_011_000),
-                10,
-                5,
-                0,
-                0,
-                "claude-sonnet-4-6",
-                "C:/dev/x",
-                false,
-            ),
-        );
-        let idle_tail = OpenCodeMessageTail::for_session(tmp.path(), "idle");
-        assert_eq!(idle_tail.poll_interval(), Duration::from_secs(2));
+        assert!(!t.poll_at(start + TOOL_STEP_SETTLE / 2));
+        assert_eq!(state(&t), SessionState::Busy);
+
+        assert!(t.poll_at(start + TOOL_STEP_SETTLE + Duration::from_secs(1)));
+        let snap = t.snapshot.as_ref().unwrap();
+        assert_eq!(snap.state, SessionState::Idle);
+        assert!(snap.quiet_timeout, "not a finished turn: no toast");
+        assert_eq!(t.queries, 1, "the timeout needs no query");
     }
 
     #[test]
-    fn locate_throttle_skips_until_ttl_elapses() {
+    fn next_step_cancels_the_settle_timeout() {
+        let fx = fixture();
+        denied_turn(&fx);
+        let mut t = tail(&fx);
+        let start = Instant::now();
+        assert!(t.poll_at(start + TOOL_STEP_SETTLE * 2));
+        assert!(t.snapshot.as_ref().unwrap().quiet_timeout);
+
+        // The loop did go on after all: back to Busy, flag cleared.
+        fx.put_message("msg_3", SID, &assistant(9_000, None, (0, 0, 0, 0), MODEL));
+        assert!(t.poll_at(start + TOOL_STEP_SETTLE * 2 + Duration::from_millis(250)));
+        let snap = t.snapshot.as_ref().unwrap();
+        assert_eq!(snap.state, SessionState::Busy);
+        assert!(!snap.quiet_timeout);
+    }
+
+    #[test]
+    fn crashed_mid_step_goes_quiet_idle_after_busy_timeout() {
+        let fx = fixture();
+        fx.put_message("msg_1", SID, &user(1_000));
+        fx.put_message("msg_2", SID, &assistant(2_000, None, (0, 0, 0, 0), MODEL));
+        let mut t = tail(&fx);
+        let start = Instant::now();
+
+        // A streaming step is not a settled tool step: the short window
+        // doesn't apply.
+        assert!(!t.poll_at(start + TOOL_STEP_SETTLE * 2));
+        assert!(!t.poll_at(start + BUSY_QUIET_TIMEOUT / 2));
+        assert_eq!(state(&t), SessionState::Busy);
+
+        assert!(t.poll_at(start + BUSY_QUIET_TIMEOUT + Duration::from_secs(1)));
+        let snap = t.snapshot.as_ref().unwrap();
+        assert_eq!(snap.state, SessionState::Idle);
+        assert!(snap.quiet_timeout);
+    }
+
+    #[test]
+    fn streaming_output_restarts_the_quiet_window() {
+        let fx = fixture();
+        fx.put_message("msg_1", SID, &user(1_000));
+        fx.put_message("msg_2", SID, &assistant(2_000, None, (0, 0, 0, 0), MODEL));
+        let mut t = tail(&fx);
+        let start = Instant::now();
+
+        // A part changing on the latest step is activity, even though
+        // the snapshot itself stays the same.
+        let later = start + BUSY_QUIET_TIMEOUT / 2;
+        fx.put_tool_part("prt_1", "msg_2", SID, "completed");
+        assert!(!t.poll_at(later));
+        assert!(!t.poll_at(start + BUSY_QUIET_TIMEOUT + Duration::from_secs(1)));
+        assert_eq!(state(&t), SessionState::Busy);
+        assert!(t.poll_at(later + BUSY_QUIET_TIMEOUT + Duration::from_secs(1)));
+        assert_eq!(state(&t), SessionState::Idle);
+    }
+
+    #[test]
+    fn writes_to_other_sessions_do_not_hold_off_the_timeout() {
+        let fx = fixture();
+        fx.add_session("ses_other", None, "C:/repo/beta", "Other", 1);
+        denied_turn(&fx);
+        let mut t = tail(&fx);
+        let start = Instant::now();
+        fx.put_message("msg_x", "ses_other", &user(5_000));
+        assert!(!t.poll_at(start + TOOL_STEP_SETTLE / 2));
+        assert!(t.poll_at(start + TOOL_STEP_SETTLE + Duration::from_secs(1)));
+        assert!(t.snapshot.as_ref().unwrap().quiet_timeout);
+    }
+
+    #[test]
+    fn pending_tool_never_times_out() {
+        let fx = fixture();
+        fx.put_message("msg_1", SID, &user(1_000));
+        fx.put_message("msg_2", SID, &assistant(2_000, None, (0, 0, 0, 0), MODEL));
+        fx.put_tool_part("prt_1", "msg_2", SID, "running");
+        let mut t = tail(&fx);
+        let start = Instant::now();
+        assert!(!t.poll_at(start + BUSY_QUIET_TIMEOUT * 3));
+        assert_eq!(state(&t), SessionState::PendingToolUse);
+    }
+
+    #[test]
+    fn a_stopped_turn_is_a_real_idle() {
+        let fx = fixture();
+        fx.put_message("msg_1", SID, &user(1_000));
+        fx.put_message("msg_2", SID, &assistant(2_000, Some((3_000, "stop")), (1, 1, 0, 0), MODEL));
+        let mut t = tail(&fx);
+        assert!(!t.poll_at(Instant::now() + BUSY_QUIET_TIMEOUT * 2));
+        assert!(!t.snapshot.as_ref().unwrap().quiet_timeout);
+    }
+
+    // ---- change detection ----
+
+    #[test]
+    fn the_last_commit_of_a_burst_is_read() {
+        // OpenCode ends a turn with a burst of commits, inside one
+        // mtime tick and after checkpoints that keep the WAL length
+        // fixed. Each poll must see the newest one.
+        let fx = fixture();
+        fx.conn.pragma_update(None, "wal_autocheckpoint", 1).unwrap();
+        fx.put_message("msg_1", SID, &user(1_000));
+        let mut t = tail(&fx);
+        for n in 0..50i64 {
+            let created = 2_000 + n * 10;
+            let data = assistant(created, Some((created + 5, "stop")), (1, n as u64, 0, 0), MODEL);
+            fx.put_message(&format!("msg_s{n:02}"), SID, &data);
+            t.poll();
+            assert_eq!(t.snapshot.as_ref().unwrap().tokens_used, 1 + n as u64, "commit {n}");
+        }
+        assert_eq!(state(&t), SessionState::Idle);
+    }
+
+    #[test]
+    fn quiet_polls_do_not_query() {
+        let fx = fixture();
+        fx.put_message("msg_1", SID, &user(1_000));
+        let mut t = tail(&fx);
+        assert_eq!(t.queries, 1);
+        for _ in 0..5 {
+            assert!(!t.poll());
+        }
+        assert_eq!(t.queries, 1, "nothing moved, nothing read");
+
+        fx.put_message("msg_2", SID, &assistant(2_000, Some((3_000, "stop")), (1, 1, 0, 0), MODEL));
+        assert!(t.poll());
+        assert_eq!(t.queries, 2);
+        assert!(!t.poll());
+        assert_eq!(t.queries, 2);
+    }
+
+    #[test]
+    fn a_write_to_another_session_reads_but_reports_no_change() {
+        let fx = fixture();
+        fx.add_session("ses_other", None, "C:/repo/beta", "Other", 1);
+        fx.put_message("msg_1", SID, &user(1_000));
+        let mut t = tail(&fx);
+        fx.put_message("msg_2", "ses_other", &user(2_000));
+        assert!(!t.poll());
+        assert_eq!(t.queries, 2);
+    }
+
+    #[test]
+    fn missing_db_is_not_reopened_every_poll() {
         let tmp = tempfile::tempdir().unwrap();
-        // No session dir — first poll misses + sets the throttle.
-        let mut tail = OpenCodeMessageTail::for_session(tmp.path(), "missing");
-        assert!(tail.message_dir().is_none());
+        let mut t = OpenCodeMessageTail::for_session(tmp.path(), SID);
+        for _ in 0..3 {
+            t.poll();
+        }
+        assert_eq!(t.queries, 0);
+    }
 
-        // Even after creating the dir, a follow-up poll within the TTL
-        // must NOT re-walk the data root (the C# 2 s throttle).
-        let _dir = make_session_dir(tmp.path(), "p", "missing");
-        // Throttle still set — the poll early-returns.
-        assert!(tail.last_locate_miss_at.is_some());
-        let changed = tail.poll();
-        assert!(!changed);
-        assert!(tail.message_dir().is_none());
+    #[test]
+    fn tail_picks_up_a_db_created_after_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut t = OpenCodeMessageTail::for_session(tmp.path(), SID);
+        assert!(t.snapshot.is_none());
+        // OpenCode creates its database on first launch.
+        let fx = Fixture::in_dir(tmp);
+        fx.add_session(SID, None, "C:/repo/alpha", "Title", 1);
+        fx.put_message("msg_1", SID, &user(1_000));
+        assert!(t.poll());
+        assert_eq!(state(&t), SessionState::Busy);
+    }
 
-        // Clear throttle to simulate the TTL expiring.
-        tail.last_locate_miss_at = None;
-        let changed = tail.poll();
-        // Now the dir is found (no message file written yet, so no
-        // snapshot, but the directory resolves).
-        assert!(!changed);
-        assert!(tail.message_dir().is_some());
+    /// Per-tick cost of 10 OpenCode tabs: each tab's tail `poll()` plus
+    /// its discovery `scan()`, against 10 sessions of 300 messages.
+    /// Run with `cargo test -p codescope-core opencode_tick_cost --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark; prints timings"]
+    fn opencode_tick_cost() {
+        use crate::agents::opencode::discovery;
+        use std::time::SystemTime;
+
+        const TABS: usize = 10;
+        let fx = Fixture::new();
+        let sid = |i: usize| format!("ses_{i:02}");
+        let cwd = |i: usize| format!("C:/repo/p{i:02}");
+        for i in 0..TABS {
+            fx.add_session(&sid(i), None, &cwd(i), "A generated title", 1);
+            for m in 0..300i64 {
+                let id = format!("msg_{i:02}_{m:04}");
+                let created = 1_000 + m * 1_000;
+                let data = if m % 10 == 0 {
+                    user(created)
+                } else {
+                    let done = Some((created + 500, "tool-calls"));
+                    assistant(created, done, (300, 50, 9_000, 0), MODEL)
+                };
+                fx.put_message(&id, &sid(i), &data);
+                fx.put_tool_part(&format!("prt_{i:02}_{m:04}"), &id, &sid(i), "completed");
+            }
+        }
+        let mut tails: Vec<_> =
+            (0..TABS).map(|i| OpenCodeMessageTail::for_session(fx.root(), sid(i))).collect();
+        // One telemetry tick (every tail polls) plus one adoption tick
+        // (every tab scans). Ticks are >= 250 ms apart in the app, so
+        // each starts with the shared file stat expired.
+        let tick = |tails: &mut Vec<OpenCodeMessageTail>| {
+            db::forget_shared_file_ids();
+            let start = Instant::now();
+            for (i, t) in tails.iter_mut().enumerate() {
+                t.poll();
+                discovery::scan(fx.root(), &cwd(i), SystemTime::UNIX_EPOCH);
+            }
+            start.elapsed()
+        };
+        let measure = |tails: &mut Vec<OpenCodeMessageTail>, label: &str| {
+            tick(tails);
+            const QUIET: u32 = 2_000;
+            let quiet = (0..QUIET).map(|_| tick(tails)).sum::<Duration>() / QUIET;
+            // One session streaming: a commit before every tick, so
+            // every tail and the discovery cache re-read once.
+            const ACTIVE: u32 = 200;
+            let mut ticking = Duration::ZERO;
+            for n in 0..ACTIVE {
+                let created = 400_000 + i64::from(n);
+                let data = assistant(created, None, (1, 1, 0, 0), MODEL);
+                fx.put_message(&format!("msg_live_{n:04}"), &sid(0), &data);
+                ticking += tick(tails);
+            }
+            let active = ticking / ACTIVE;
+            println!("{TABS} tabs, {label}: quiet tick {quiet:?}; tick after a commit {active:?}");
+        };
+        measure(&mut tails, "stat per call");
+        db::TEST_FILE_ID_REUSE.with(|w| w.set(db::FILE_ID_REUSE_WINDOW));
+        measure(&mut tails, "shared stat (production)");
     }
 }

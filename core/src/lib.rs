@@ -52,8 +52,10 @@ pub use agent_registry::{
 };
 pub use agents::claude::discovery::POLL_INTERVAL_MS as CLAUDE_DISCOVERY_POLL_MS;
 pub use agents::claude::telemetry::{ClaudeTranscriptTail, encode_cwd, model_display_name};
+pub use agents::codex::telemetry::CodexRolloutTail;
 pub use agents::copilot::discovery::POLL_INTERVAL_MS as COPILOT_DISCOVERY_POLL_MS;
 pub use agents::copilot::telemetry::CopilotTranscriptTail;
+pub use agents::gemini::telemetry::GeminiChatTail;
 pub use agents::opencode::discovery::POLL_INTERVAL_MS as OPENCODE_DISCOVERY_POLL_MS;
 pub use agents::opencode::telemetry::OpenCodeMessageTail;
 pub use agents::pi::discovery::POLL_INTERVAL_MS as PI_DISCOVERY_POLL_MS;
@@ -80,7 +82,7 @@ pub use session_title::{
 };
 pub use settings::{CursorSettings, CursorShape, DEFAULT_AGENT_ID, FontSettings, Settings};
 pub use tab_drag::{TabRect, compute_drop_index};
-pub use tab_title::{TAB_TITLE_SEPARATOR, rebuild_title, restored_title, titled_tab_title};
+pub use tab_title::{TAB_TITLE_SEPARATOR, TabTitle};
 pub use telemetry::{
     SessionState, TelemetrySnapshot, context_window_for_model, format_context_pct, format_tokens,
 };
