@@ -12,24 +12,37 @@
 //! file or the new one, never a mix.
 //!
 //! **Leftover temp files.** The temp name is fixed per target, not
-//! per process, so a temp left by a crash is simply truncated and
-//! reused by the next save. Nothing ever reads it. A process-wide
-//! lock keeps two threads of this process from sharing that temp
-//! file; two *processes* never share a store (the single-instance
-//! mutex, and dev builds write to `CodeScope.Dev`).
+//! per process, so a temp left by a crash is deleted and recreated by
+//! the next save — even a read-only one, which would otherwise make
+//! every later save of that file fail. Nothing ever reads it. A
+//! process-wide lock keeps two threads of this process from sharing
+//! that temp file; two *processes* never share a store (the
+//! single-instance mutex, and dev builds write to `CodeScope.Dev`).
+//!
+//! **Symlinks.** The rename replaces the directory entry, so a state
+//! file that is a symlink (say, into a dotfiles repo) becomes a
+//! regular file on the first save; the link's target is left as it
+//! was. That is the price of atomicity — writing through the link
+//! would be the in-place write again.
 //!
 //! **Windows sharing violations.** Replacing a file that another
 //! process holds open without `FILE_SHARE_DELETE` (an antivirus scan
 //! of the fresh temp file is the usual culprit, an editor sometimes)
-//! fails with a sharing violation or access denied. Those holds are
-//! short, so the open and the rename retry a few times with backoff
-//! (150 ms in total). If the file is still held after that, the save
-//! fails *safely*: the temp file is removed, the old target stays
-//! intact, and the caller gets the error — every caller already logs
-//! or toasts a failed save and keeps its in-memory state consistent
-//! with disk. We deliberately do not fall back to an in-place write:
-//! that is exactly the truncate-then-write window this module exists
-//! to close. Rust's own readers (`std::fs::read`) share delete, so
+//! fails with a sharing violation, or access denied while the file is
+//! pending delete. Those holds are short, so the temp-file open and
+//! the rename retry with backoff, drawing on one budget per
+//! [`write_atomic`] call: 150 ms of sleep at most, however the
+//! failures split between the two. Access denied on a *read-only*
+//! file is permanent and fails at once rather than stalling every
+//! save. On other platforms an open handle never blocks a rename and
+//! `EACCES` is permanent (permissions), so nothing is retried there.
+//! If the file is still held when the budget runs out, the save fails
+//! *safely*: the temp file is removed, the old target stays intact,
+//! and the caller gets the error — every caller already logs or
+//! toasts a failed save and keeps its in-memory state consistent with
+//! disk. We deliberately do not fall back to an in-place write: that
+//! is exactly the truncate-then-write window this module exists to
+//! close. Rust's own readers (`std::fs::read`) share delete, so
 //! CodeScope's loads never block a save.
 
 use std::fs::{self, File, OpenOptions};
@@ -38,9 +51,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-/// Sleeps between attempts of an open/rename that hit a transient
-/// sharing violation. One more attempt follows the last sleep.
-const RETRY_DELAYS_MS: [u64; 4] = [10, 20, 40, 80];
+/// Sleeps between attempts that hit a transient sharing violation,
+/// shared by every step of one [`write_atomic`] call (150 ms total).
+static RETRY_DELAYS_MS: [u64; 4] = [10, 20, 40, 80];
 
 /// Serialises writers in this process so two threads saving the same
 /// file never interleave inside its shared temp file.
@@ -64,7 +77,9 @@ fn write_atomic_with(
     // protecting (the temp file is rewritten from scratch), so a
     // poisoned lock is still usable.
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let result = write_temp(&tmp, fill).and_then(|()| retry_transient(|| fs::rename(&tmp, path)));
+    let mut backoff = Backoff::new();
+    let result = write_temp(&tmp, fill, &mut backoff)
+        .and_then(|()| backoff.retry(path, || fs::rename(&tmp, path)));
     if result.is_err() {
         // Best effort: a temp we can't remove is reclaimed by the
         // next save of the same file.
@@ -85,34 +100,90 @@ fn temp_path(path: &Path) -> io::Result<PathBuf> {
     Ok(path.with_file_name(tmp_name))
 }
 
-/// Write the temp file (truncating any leftover) and flush it to disk
-/// before it can be renamed into place.
-fn write_temp(tmp: &Path, fill: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
-    let mut file = retry_transient(|| {
+/// Write the temp file and flush it to disk before it can be renamed
+/// into place.
+fn write_temp(
+    tmp: &Path,
+    fill: impl FnOnce(&mut File) -> io::Result<()>,
+    backoff: &mut Backoff,
+) -> io::Result<()> {
+    remove_leftover(tmp);
+    let mut file = backoff.retry(tmp, || {
         OpenOptions::new().write(true).create(true).truncate(true).open(tmp)
     })?;
     fill(&mut file)?;
     file.sync_all()
 }
 
-/// Run `op`, retrying with backoff while it fails with an error that a
-/// short-lived handle in another process explains.
-fn retry_transient<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
-    for delay in RETRY_DELAYS_MS {
-        match op() {
-            Err(err) if is_transient(&err) => std::thread::sleep(Duration::from_millis(delay)),
-            other => return other,
-        }
+/// Delete a temp file an earlier crash left behind. Deleting rather
+/// than truncating it also gets past a read-only leftover, which no
+/// open-for-write would. Best effort: if it fails, the open reports
+/// the real problem.
+fn remove_leftover(tmp: &Path) {
+    let Ok(meta) = fs::symlink_metadata(tmp) else {
+        return; // The usual case: no leftover.
+    };
+    // Windows refuses to delete a file with the read-only attribute;
+    // Unix only needs the directory to be writable.
+    #[cfg(windows)]
+    if meta.permissions().readonly() {
+        let mut perms = meta.permissions();
+        // Only clears FILE_ATTRIBUTE_READONLY on Windows, so the lint's
+        // "world-writable" concern (a Unix mode) doesn't apply.
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        let _ = fs::set_permissions(tmp, perms);
     }
-    op()
+    #[cfg(not(windows))]
+    let _ = meta;
+    let _ = fs::remove_file(tmp);
 }
 
-/// Access denied, or on Windows `ERROR_SHARING_VIOLATION` (32) /
-/// `ERROR_LOCK_VIOLATION` (33): another process has the file open in
-/// a way that blocks replacing it.
-fn is_transient(err: &io::Error) -> bool {
-    err.kind() == io::ErrorKind::PermissionDenied
-        || (cfg!(windows) && matches!(err.raw_os_error(), Some(32 | 33)))
+/// The retry budget of one [`write_atomic`] call. Each step draws on
+/// the same schedule, so the call as a whole sleeps 150 ms at most.
+struct Backoff {
+    delays: std::slice::Iter<'static, u64>,
+}
+
+impl Backoff {
+    fn new() -> Self {
+        Self { delays: RETRY_DELAYS_MS.iter() }
+    }
+
+    /// Run `op` on `path`, retrying while it fails transiently and the
+    /// budget lasts.
+    fn retry<T>(&mut self, path: &Path, mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+        loop {
+            match op() {
+                Err(err) if is_transient(&err, path) => match self.delays.next() {
+                    Some(&ms) => std::thread::sleep(Duration::from_millis(ms)),
+                    None => return Err(err),
+                },
+                other => return other,
+            }
+        }
+    }
+}
+
+/// Whether `err` from opening or replacing `path` is another process's
+/// short-lived handle: `ERROR_SHARING_VIOLATION` (32),
+/// `ERROR_LOCK_VIOLATION` (33), or `ERROR_ACCESS_DENIED` (5) while the
+/// file is pending delete. Access denied on a read-only file is
+/// permanent.
+#[cfg(windows)]
+fn is_transient(err: &io::Error, path: &Path) -> bool {
+    match err.raw_os_error() {
+        Some(32 | 33) => true,
+        Some(5) => !fs::metadata(path).is_ok_and(|meta| meta.permissions().readonly()),
+        _ => false,
+    }
+}
+
+/// Elsewhere an open handle never blocks a rename, and `EACCES` is a
+/// permission problem no wait fixes.
+#[cfg(not(windows))]
+fn is_transient(_err: &io::Error, _path: &Path) -> bool {
+    false
 }
 
 /// Make the rename itself durable. On Unix the new directory entry
@@ -190,6 +261,24 @@ mod tests {
         assert!(!temp_of(&path).exists());
     }
 
+    /// A leftover temp that ended up read-only (copied from a
+    /// read-only target, restored from a backup) must not block every
+    /// later save of its file.
+    #[test]
+    fn read_only_leftover_temp_does_not_block_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, b"old\n").unwrap();
+        let tmp = temp_of(&path);
+        fs::write(&tmp, b"stale").unwrap();
+        let mut perms = fs::metadata(&tmp).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&tmp, perms).unwrap();
+        write_atomic(&path, b"new\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new\n");
+        assert!(!tmp.exists());
+    }
+
     /// Open `path` the way a scanner or editor that does not allow
     /// delete-sharing would: replacing it fails until the handle goes.
     #[cfg(windows)]
@@ -227,5 +316,45 @@ mod tests {
         drop(holder);
         assert_eq!(fs::read(&path).unwrap(), b"old\n");
         assert!(!temp_of(&path).exists());
+    }
+
+    /// A read-only target refuses the replace with access denied, which
+    /// no wait fixes: fail at once instead of stalling every save.
+    #[cfg(windows)]
+    #[test]
+    fn read_only_target_fails_without_retrying() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.json");
+        fs::write(&path, b"old\n").unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&path, perms).unwrap();
+        let started = std::time::Instant::now();
+        let result = write_atomic(&path, b"new\n");
+        let elapsed = started.elapsed();
+        assert!(result.is_err());
+        // The full retry budget is 150 ms; a non-retried failure is
+        // a couple of syscalls.
+        assert!(elapsed < std::time::Duration::from_millis(50), "{elapsed:?}");
+        assert_eq!(fs::read(&path).unwrap(), b"old\n");
+        assert!(!temp_of(&path).exists());
+    }
+
+    /// One budget per `write_atomic` call: once the open leg used it
+    /// up, the rename leg gets a single attempt, not a fresh 150 ms.
+    #[cfg(windows)]
+    #[test]
+    fn retry_budget_is_shared_across_legs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.json");
+        let mut backoff = Backoff::new();
+        let mut calls = 0;
+        let mut sharing_violation = || -> io::Result<()> {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(32))
+        };
+        assert!(backoff.retry(&path, &mut sharing_violation).is_err());
+        assert!(backoff.retry(&path, &mut sharing_violation).is_err());
+        assert_eq!(calls, RETRY_DELAYS_MS.len() + 2);
     }
 }
