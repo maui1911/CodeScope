@@ -19,14 +19,17 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use codescope_core::{Project, ProjectsConfig, Theme, git::BranchInfo, projects::Worktree};
+use codescope_core::worktree_create::{
+    PendingId, PendingWorktree, RecordOutcome, record_created_worktree,
+};
+use codescope_core::{Project, ProjectsConfig, Theme, git::BranchInfo};
 use gpui::{
-    Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window,
-    anchored, deferred, div, point, px,
+    AppContext, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
+    MouseButton, MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement,
+    Styled, Window, anchored, deferred, div, point, px,
 };
 
-use crate::sidebar::Sidebar;
+use crate::sidebar::{Sidebar, SidebarEvent, ToastSeverity, creating_pulse};
 use crate::text_field::{TextField, focused_caret_style, render_input_content};
 use crate::theme;
 
@@ -92,7 +95,9 @@ pub enum DialogField {
 /// Live state of an open dialog. Created by [`Sidebar::open_new_worktree_dialog`]
 /// and dropped when the user confirms or cancels.
 pub struct NewWorktreeDialogState {
-    pub project_idx: usize,
+    /// Stable id of the project. The create runs in the background
+    /// (#342) and commits by id, since indices can shift meanwhile.
+    pub project_id: String,
     pub project_name: String,
     pub project_path: String,
     pub worktree_root: String,
@@ -129,6 +134,18 @@ pub struct NewWorktreeDialogState {
     /// branch-list failure doesn't clobber a later, more relevant
     /// `git worktree add` error message.
     pub branch_load_error: Option<String>,
+    /// `true` from open until the background `list_branches` lands.
+    /// `for-each-ref` reads every ref's commit, which is slow on a
+    /// repository with many remote branches, so it no longer runs on
+    /// the UI thread (#342). Create stays disabled meanwhile because
+    /// the default base isn't known yet.
+    pub branches_loading: bool,
+    /// Set while this dialog's `git worktree add` runs on the
+    /// background executor (#342). The inputs freeze, Create turns
+    /// into a disabled "Creating…", and closing the dialog leaves the
+    /// create running: the sidebar's pending row carries on, and a
+    /// failure then surfaces as a toast instead of inline.
+    pub creating: Option<PendingId>,
     /// Selected base branch by name. `None` = `(HEAD)` (the current
     /// HEAD of the project's primary worktree). The C# build's
     /// `(HEAD)` row maps to a null `BaseBranch` for the same reason.
@@ -144,7 +161,6 @@ pub struct NewWorktreeDialogState {
 
 impl NewWorktreeDialogState {
     pub fn new(
-        idx: usize,
         project: &Project,
         branches: Vec<BranchInfo>,
         focus_handle: FocusHandle,
@@ -152,7 +168,7 @@ impl NewWorktreeDialogState {
         let worktree_root = project.worktree_root_path();
         let base_branch = resolve_default_base(&branches, &project.default_branch);
         Self {
-            project_idx: idx,
+            project_id: project.id.clone(),
             project_name: project.name.clone(),
             project_path: project.path.clone(),
             worktree_root,
@@ -165,6 +181,8 @@ impl NewWorktreeDialogState {
             focused_field: DialogField::Branch,
             branches,
             branch_load_error: None,
+            branches_loading: false,
+            creating: None,
             base_branch,
             base_popup_open: false,
             base_query: TextField::new(),
@@ -177,9 +195,18 @@ impl NewWorktreeDialogState {
     /// non-empty. Trimming matters now that the FOLDER row is
     /// editable — without it the user could whitespace their way to
     /// an enabled Create button and then watch git fail on the
-    /// resulting nonsense path.
+    /// resulting nonsense path. Never valid while the branch list is
+    /// still loading or a create is already running.
     pub fn is_valid(&self) -> bool {
-        self.branch.text().trim().len() >= 2 && !self.folder.text().trim().is_empty()
+        !self.branches_loading
+            && !self.is_creating()
+            && self.branch.text().trim().len() >= 2
+            && !self.folder.text().trim().is_empty()
+    }
+
+    /// `git worktree add` for this dialog is in flight (#342).
+    pub fn is_creating(&self) -> bool {
+        self.creating.is_some()
     }
 
     fn recompute_folder(&mut self) {
@@ -203,6 +230,11 @@ impl NewWorktreeDialogState {
         &mut self,
         op: F,
     ) -> bool {
+        if self.is_creating() {
+            // Inputs are frozen while git runs: what is on screen is
+            // what is being created.
+            return false;
+        }
         match self.focused_field {
             DialogField::Branch => {
                 let changed = op(&mut self.branch);
@@ -340,28 +372,68 @@ impl Sidebar {
         let Some(project) = self.projects().projects.get(idx) else {
             return;
         };
-        // Load branches once at open. An I/O error here doesn't stop
-        // the dialog — the user can still pick `(HEAD)` and create —
-        // but we stash the message in `branch_load_error` so the
-        // popup can surface it inline instead of showing an empty
-        // row list. Kept separate from `state.error` (submit / git
-        // failures) so a transient list failure doesn't clobber a
-        // later, more relevant message. Cloning the project path so
-        // we don't hold a borrow across the `cx.focus_handle()` call.
-        let project_path = project.path.clone();
+        // Cloning the project so we don't hold a borrow across the
+        // `cx.focus_handle()` call.
         let project_clone = project.clone();
-        let (branches, branch_load_err) =
-            match codescope_core::git::list_branches(Path::new(&project_path)) {
-                Ok(bs) => (bs, None),
-                Err(err) => (Vec::new(), Some(format!("branch list failed: {err:#}"))),
-            };
+        let project_path = project.path.clone();
+        let project_id = project.id.clone();
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
         let mut state =
-            NewWorktreeDialogState::new(idx, &project_clone, branches, focus_handle);
-        state.branch_load_error = branch_load_err;
+            NewWorktreeDialogState::new(&project_clone, Vec::new(), focus_handle);
+        state.branches_loading = true;
         self.set_dialog(Some(state));
         self.close_menu_no_notify();
+        cx.notify();
+        // Load branches once, off the UI thread (#342): on a repo with
+        // many refs `for-each-ref` is slow enough to freeze the window
+        // before the dialog even shows.
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    codescope_core::git::list_branches(Path::new(&project_path))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.apply_loaded_branches(&project_id, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Land the branch list loaded at dialog open. Ignored when the
+    /// dialog was closed (or reopened on another project) meanwhile,
+    /// or already has its list. An I/O error doesn't stop the dialog —
+    /// the user can still pick `(HEAD)` and create — but the message
+    /// goes to `branch_load_error` so the popup can surface it inline
+    /// instead of showing an empty row list. Kept separate from
+    /// `state.error` (submit / git failures) so a transient list
+    /// failure doesn't clobber a later, more relevant message.
+    fn apply_loaded_branches(
+        &mut self,
+        project_id: &str,
+        result: anyhow::Result<Vec<BranchInfo>>,
+        cx: &mut Context<Self>,
+    ) {
+        let default_branch = self
+            .projects()
+            .project(project_id)
+            .map(|p| p.default_branch.clone())
+            .unwrap_or_default();
+        let Some(state) = self.dialog_mut() else { return };
+        if state.project_id != project_id || !state.branches_loading {
+            return;
+        }
+        state.branches_loading = false;
+        match result {
+            Ok(branches) => {
+                state.base_branch = resolve_default_base(&branches, &default_branch);
+                state.branches = branches;
+            }
+            Err(err) => {
+                state.branch_load_error = Some(format!("branch list failed: {err:#}"));
+            }
+        }
         cx.notify();
     }
 
@@ -382,6 +454,9 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         if let Some(state) = self.dialog_mut() {
+            if state.is_creating() {
+                return;
+            }
             state.focused_field = field;
             state.base_popup_open = false;
             state.base_query.set_text("");
@@ -394,6 +469,9 @@ impl Sidebar {
     /// `SpawnTrack` pill.
     pub fn toggle_spawn_session(&mut self, cx: &mut Context<Self>) {
         if let Some(state) = self.dialog_mut() {
+            if state.is_creating() {
+                return;
+            }
             state.spawn_session = !state.spawn_session;
             cx.notify();
         }
@@ -404,6 +482,11 @@ impl Sidebar {
     /// type-to-filter without an extra click.
     pub fn toggle_base_popup(&mut self, cx: &mut Context<Self>) {
         if let Some(state) = self.dialog_mut() {
+            // Nothing to pick from until the list lands, and nothing
+            // may change once the create is running.
+            if !state.base_popup_open && (state.branches_loading || state.is_creating()) {
+                return;
+            }
             state.base_popup_open = !state.base_popup_open;
             if state.base_popup_open {
                 state.focused_field = DialogField::BasePopupSearch;
@@ -483,17 +566,19 @@ impl Sidebar {
         self.select_base_branch(name, cx);
     }
 
-    /// Confirm. Validates, runs `git worktree add`, appends a
-    /// `Worktree` row, persists `projects.json`, and closes the
-    /// dialog. On `git` failure we leave the dialog open with the
-    /// trimmed stderr stashed in `state.error` so the user can see
-    /// what went wrong without losing what they typed.
+    /// Confirm. Validates, registers the create as pending, and runs
+    /// `git worktree add` on the background executor so a big
+    /// checkout doesn't freeze the window (#342). The dialog stays up
+    /// in a busy state meanwhile; [`Self::finish_worktree_create`]
+    /// lands the result.
     pub fn submit_new_worktree_dialog(&mut self, cx: &mut Context<Self>) {
-        let Some(state) = self.dialog_mut() else { return };
+        let Some(state) = self.dialog() else { return };
+        // Also the double-submit guard: `is_valid` is false while a
+        // create is running.
         if !state.is_valid() {
             return;
         }
-        let idx = state.project_idx;
+        let project_id = state.project_id.clone();
         let branch = state.branch.text().trim().to_string();
         // Trim the folder too — the field is user-editable now, so a
         // stray leading/trailing space would otherwise sneak into
@@ -503,61 +588,103 @@ impl Sidebar {
         let project_path = state.project_path.clone();
         let base_branch = state.base_branch.clone();
         let spawn_session = state.spawn_session;
-
         let project_name = state.project_name.clone();
-        let result = codescope_core::git::add_worktree(
-            Path::new(&project_path),
-            Path::new(&folder),
-            &branch,
-            base_branch.as_deref(),
-        );
-        match result {
-            Ok(()) => {
-                let new_wt = Worktree {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    path: folder.clone(),
-                    branch: Some(branch.clone()),
-                    is_primary: false,
-                };
-                // Reload-then-mutate (#391): append to a fresh read
-                // of `projects.json`, found by id, so session rows
-                // AppShell saved meanwhile survive. A write failure
-                // leaves the in-memory model untouched, matching the
-                // rest of `Sidebar`'s mutators.
-                let Some(project_id) = self.projects().projects.get(idx).map(|p| p.id.clone())
-                else {
-                    self.cancel_new_worktree_dialog(cx);
+
+        // A create hidden earlier may still be running for the same
+        // folder or branch; a second `git worktree add` could only
+        // fail, so say why up front.
+        let pending = match self.pending_worktrees_mut().begin(&project_id, &folder, &branch) {
+            Ok(id) => id,
+            Err(err) => {
+                if let Some(state) = self.dialog_mut() {
+                    state.error = Some(err.to_string());
+                }
+                cx.notify();
+                return;
+            }
+        };
+        if let Some(state) = self.dialog_mut() {
+            state.creating = Some(pending);
+            state.error = None;
+        }
+        cx.notify();
+
+        // Closing the dialog doesn't stop this task, and the sidebar
+        // dropping (app closing) only drops the `update` below: then
+        // nothing reaches `projects.json`, and the discovery poll
+        // adopts whatever git finished on disk at the next launch.
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    codescope_core::git::add_worktree(
+                        Path::new(&project_path),
+                        Path::new(&folder),
+                        &branch,
+                        base_branch.as_deref(),
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.finish_worktree_create(pending, result, spawn_session, &project_name, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Land a finished `git worktree add`. On success the row is
+    /// committed to `projects.json`, the dialog closes if it is still
+    /// showing this create, and a session opens when the toggle was
+    /// on — even if the dialog was closed meanwhile — unless the
+    /// project was removed while git ran, which gets an info toast
+    /// instead. A failure goes back into the dialog when it is still
+    /// showing this create — leaving what the user typed in place —
+    /// and to a toast when it was closed meanwhile.
+    fn finish_worktree_create(
+        &mut self,
+        id: PendingId,
+        result: anyhow::Result<()>,
+        spawn_session: bool,
+        project_name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(job) = self.pending_worktrees_mut().finish(id) else {
+            return;
+        };
+        // The tree now exists (or doesn't): void any discovery scan
+        // that ran while it was half made.
+        self.note_worktree_edit();
+        let dialog_owns = self.dialog().is_some_and(|s| s.creating == Some(id));
+        match result.and_then(|()| self.commit_created_worktree(&job)) {
+            Ok(outcome) => {
+                if dialog_owns {
+                    self.take_dialog();
+                }
+                if !outcome.may_open_session() {
+                    // The project was removed while git ran: the
+                    // worktree exists, but nothing in the sidebar owns
+                    // it, so say where it went instead of opening a
+                    // tab that belongs to no project.
+                    cx.emit(SidebarEvent::Toast {
+                        kind: ToastSeverity::Info,
+                        title: format!("Worktree '{}' created", job.branch).into(),
+                        detail: Some(
+                            format!(
+                                "Created at {}, but its project was removed meanwhile.",
+                                job.path
+                            )
+                            .into(),
+                        ),
+                    });
+                    cx.notify();
                     return;
-                };
-                let result = ProjectsConfig::reload_and_edit(self.paths_ref(), |next| {
-                    let project = next
-                        .projects
-                        .iter_mut()
-                        .find(|p| p.id == project_id)
-                        .context("the project was removed")?;
-                    project.worktrees.push(new_wt);
-                    Ok(true)
-                });
-                let next = match result {
-                    Ok((next, _)) => next,
-                    Err(err) => {
-                        if let Some(state) = self.dialog_mut() {
-                            state.error = Some(format!("save failed: {err:#}"));
-                        }
-                        cx.notify();
-                        return;
-                    }
-                };
-                self.replace_projects(next);
-                self.note_worktree_edit();
-                self.cancel_new_worktree_dialog(cx);
+                }
                 // Spawn a session pinned to the new worktree only when
                 // the toggle is on. Mirrors the C# dialog's
                 // `SpawnSession` flag — defaults to `true` so the
                 // common path drops the user inside the new worktree,
                 // but flipping it off lets them create the worktree
-                // without entering it. Single spaces around `·` to
-                // match the C# build's
+                // without entering it. The tab renders
+                // `{project} · {branch}`, matching the C# build's
                 // `$"{project.Name} · {branch}"` convention in
                 // `MainViewModel.RefreshTabTitlesForWorktree`.
                 if spawn_session {
@@ -570,9 +697,9 @@ impl Sidebar {
                     // worktree's folder, e.g. because the user
                     // rebuilt over a path a previous session was
                     // sitting in).
-                    cx.emit(crate::sidebar::SidebarEvent::OpenSession {
-                        working_directory: std::path::PathBuf::from(&folder),
-                        title: format!("{project_name} · {branch}").into(),
+                    cx.emit(SidebarEvent::OpenSession {
+                        working_directory: std::path::PathBuf::from(&job.path),
+                        title: codescope_core::TabTitle::worktree(project_name, &job.branch),
                         auto_type: None,
                         agent_id: None,
                         force_new: true,
@@ -582,12 +709,45 @@ impl Sidebar {
             }
             Err(err) => {
                 let msg = format!("{err:#}");
-                if let Some(state) = self.dialog_mut() {
-                    state.error = Some(msg);
+                match self.dialog_mut() {
+                    Some(state) if dialog_owns => {
+                        state.creating = None;
+                        state.error = Some(msg);
+                    }
+                    _ => cx.emit(SidebarEvent::Toast {
+                        kind: ToastSeverity::Err,
+                        title: format!("Could not create worktree '{}'", job.branch).into(),
+                        detail: Some(msg.into()),
+                    }),
                 }
-                cx.notify();
             }
         }
+        cx.notify();
+    }
+
+    /// Persist the row for a worktree git just created. Reload-then-
+    /// mutate, like every other `projects.json` writer: AppShell
+    /// writes the file too (session rows, agent session ids), and git
+    /// may have run for minutes, so the copy held here is too old to
+    /// save over it. Returns what [`record_created_worktree`] did, so
+    /// the caller knows whether a project still owns the worktree.
+    fn commit_created_worktree(
+        &mut self,
+        job: &PendingWorktree,
+    ) -> anyhow::Result<RecordOutcome> {
+        let mut next =
+            ProjectsConfig::load(self.paths_ref()).context("reload of projects.json failed")?;
+        let outcome =
+            record_created_worktree(&mut next, &job.project_id, &job.path, &job.branch);
+        match outcome {
+            RecordOutcome::Added => next.save(self.paths_ref()).context("save failed")?,
+            // Already tracked (e.g. adopted by discovery) or the
+            // project went away while git ran: nothing to write, but
+            // the fresh read is still newer than ours.
+            RecordOutcome::AlreadyTracked | RecordOutcome::ProjectGone => {}
+        }
+        self.replace_projects(next);
+        Ok(outcome)
     }
 
     /// Render the modal. Returns `None` when no dialog is open.
@@ -640,11 +800,16 @@ impl Sidebar {
         let focused = state.focused_field;
         let spawn_session = state.spawn_session;
         let base_popup_open = state.base_popup_open;
-        let base_label: SharedString = state
-            .base_branch
-            .clone()
-            .unwrap_or_else(|| "(HEAD)".to_string())
-            .into();
+        let base_label: SharedString = if state.branches_loading {
+            SharedString::from("loading branches…")
+        } else {
+            state
+                .base_branch
+                .clone()
+                .unwrap_or_else(|| "(HEAD)".to_string())
+                .into()
+        };
+        let creating = state.creating;
 
         // Header — eyebrow (project name) + title.
         let header = div()
@@ -859,13 +1024,28 @@ impl Sidebar {
         });
 
         // Footer caption — mirrors the C# `FootMeta`:
-        // "git worktree add · <base> → <branch> @ <leaf>"
+        // "git worktree add · <base> → <branch> @ <leaf>". While the
+        // create runs it becomes the busy line instead (the C# build
+        // swaps FootMeta for a busy panel the same way): the sidebar's
+        // pending-row pulse plus a note that closing won't stop it.
         let footer_meta = div()
             .px_5()
             .text_size(px(11.0))
             .text_color(ink_muted)
-            .child(
-                div()
+            .child(match creating {
+                Some(id) => div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(creating_pulse(("nw-creating-pulse", id), accent))
+                    .child(
+                        div()
+                            .text_color(ink_dim)
+                            .child(format!("Creating {footer_leaf}…")),
+                    )
+                    .child("closing this won't stop it"),
+                None => div()
                     .flex()
                     .flex_row()
                     .gap_2()
@@ -875,7 +1055,7 @@ impl Sidebar {
                     .child(div().text_color(ink_dim).child(footer_branch))
                     .child("@")
                     .child(div().text_color(ink_dim).child(footer_leaf)),
-            );
+            });
 
         // Buttons.
         let cancel_btn = div()
@@ -896,7 +1076,9 @@ impl Sidebar {
                     this.cancel_new_worktree_dialog(cx);
                 }),
             )
-            .child("Cancel");
+            // Nothing to cancel once git runs — the button only hides
+            // the dialog, so say so.
+            .child(if creating.is_some() { "Close" } else { "Cancel" });
 
         let create_color = if valid { ink } else { ink_ghost };
         let create_bg = if valid { accent } else { divider };
@@ -920,7 +1102,7 @@ impl Sidebar {
                         }),
                     );
             }
-            btn.child("Create")
+            btn.child(if creating.is_some() { "Creating…" } else { "Create" })
         };
 
         let footer_buttons = div()

@@ -1,269 +1,304 @@
-//! OpenCode session adoption — find the message directory a freshly
-//! launched `opencode` session writes under
-//! `~/.local/share/opencode/project/<slug>/storage/message/<sid>/`.
+//! OpenCode session adoption — find the session a freshly launched
+//! `opencode` writes into `~/.local/share/opencode/opencode.db`.
 //!
-//! Mirrors `OpenCodeSessionDiscovery` from the C# build but uses
-//! polling only (no `notify` crate dep). Same `scan_*` shape as
-//! [`crate::agents::claude::discovery`]: pure logic, the caller drives the
-//! cadence.
+//! Same `scan` shape as [`crate::agents::claude::discovery`]: pure
+//! logic, the caller drives the cadence.
 //!
 //! # Semantics
 //!
-//! Adoption fires once per unique session id discovered when:
+//! A `session` row is a candidate when:
 //!
-//! 1. Some `msg_*.json` file exists under
-//!    `<root>/.../message/<sid>/`.
-//! 2. The file's `created_at` or `last_modified` is at or after
-//!    `since`.
-//! 3. The first parseable message's `cwd` (canonicalised) matches the
-//!    tab's working directory.
+//! 1. it is a top-level session (`parent_id IS NULL`) — subagent
+//!    sessions belong to their parent's tab;
+//! 2. its `time_updated` is at or after `since`;
+//! 3. its `directory` canonicalises to the tab's working directory.
 //!
-//! Tracking already-fired ids is the caller's responsibility (mirrors
-//! `WatchHandle._firedSessions`). Returns *every* eligible candidate
-//! each call so the caller can dedupe by id.
+//! Tracking already-fired ids is the caller's responsibility. Returns
+//! *every* eligible candidate each call so the caller can dedupe by id.
+//!
+//! # Cost
+//!
+//! The adoption tick calls [`scan`] for every OpenCode tab every
+//! ~350 ms. The session list is cached per database path behind a
+//! [`DbHandle`]: a scan with nothing committed since the last read costs
+//! a `PRAGMA data_version` and a filter over the cached rows. Only a
+//! commit re-runs the query, once, for every tab sharing the database.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, SystemTime};
 
-use crate::agents::opencode::telemetry::parse_content;
+use rusqlite::Connection;
+
+use crate::agents::opencode::db::{self, DbHandle, Probe};
 use crate::path_canon::canonicalize_path;
 
 /// Suggested poll interval — 400 ms matches the C#
 /// `OpenCodeSessionDiscovery.PollInterval`.
 pub const POLL_INTERVAL_MS: u64 = 400;
 
-/// Exclusive bound on recursion depth when walking the data root:
-/// `walk` is invoked at depth 0 for the root and the guard rejects
-/// calls at `depth >= MAX_RECURSION_DEPTH`, so the deepest directory
-/// ever read from is `MAX_RECURSION_DEPTH - 1` levels below the root.
-/// The OpenCode layout is
-/// `project/<slug>/storage/message/<sid>/<msg>.json` — 5 levels of
-/// nesting below the root — so 6 covers it cleanly while still
-/// terminating on a stray symlink loop.
-const MAX_RECURSION_DEPTH: usize = 6;
-
-/// One adoption candidate found in a data-root scan.
+/// One adoption candidate found in a scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdoptionCandidate {
-    /// OpenCode session id — the directory name immediately under
-    /// `message/`. Not necessarily a UUID; OpenCode mints its own
-    /// session ids.
+    /// OpenCode session id (`ses_…`).
     pub session_id: String,
-    /// Absolute path to the first matching `msg_*.json` we found.
-    pub message_path: PathBuf,
+    /// The session's `time_updated`: when OpenCode last wrote to it.
+    /// There is no per-session file to stat, so this is the recency
+    /// signal the adoption tick compares candidates by.
+    pub updated_at: SystemTime,
 }
 
-/// Recursively scan `data_root` for OpenCode message files whose
-/// `created_at` or `last_modified` timestamps are at or after `since`,
-/// and whose first parseable message records a `cwd` that
-/// canonicalises to the same string as `working_directory`.
+/// One top-level session, as cached between scans.
+#[derive(Debug, Clone)]
+struct SessionRow {
+    id: String,
+    canon_dir: String,
+    updated_ms: i64,
+}
+
+/// Cached session list for one database.
+struct DbCache {
+    db: DbHandle,
+    rows: Vec<SessionRow>,
+    /// Queries run against this database — lets the tests prove a
+    /// quiet scan never touches SQLite.
+    queries: u64,
+}
+
+/// Process-wide cache, keyed by database path. In the app there is one
+/// entry; tests key theirs by temp dir.
+static CACHE: LazyLock<Mutex<HashMap<PathBuf, DbCache>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Scan `<data_root>/opencode.db` for top-level sessions in
+/// `working_directory` updated at or after `since`.
 ///
-/// Returns an empty vec when the root doesn't exist, can't be read,
-/// or contains no eligible candidates. Callers should treat "empty"
-/// as "keep polling".
+/// Returns an empty vec when the database doesn't exist, is locked, or
+/// holds no eligible session. Callers should treat "empty" as "keep
+/// polling".
 pub fn scan(
     data_root: &Path,
     working_directory: &str,
     since: SystemTime,
 ) -> Vec<AdoptionCandidate> {
-    if !data_root.is_dir() {
-        return Vec::new();
-    }
+    let path = db::db_path(data_root);
+    let mut caches = CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cache = caches.entry(path).or_insert_with_key(|path| DbCache {
+        db: DbHandle::new(path.clone()),
+        rows: Vec::new(),
+        queries: 0,
+    });
+    refresh(cache);
+
     let canon_cwd = canonicalize_path(working_directory);
-    let mut out = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    walk(data_root, since, &canon_cwd, 0, &mut seen, &mut out);
-    out
+    let since_ms = since
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    cache
+        .rows
+        .iter()
+        .filter(|r| r.updated_ms >= since_ms && r.canon_dir == canon_cwd)
+        .map(|r| AdoptionCandidate {
+            session_id: r.id.clone(),
+            updated_at: SystemTime::UNIX_EPOCH
+                + Duration::from_millis(u64::try_from(r.updated_ms).unwrap_or(0)),
+        })
+        .collect()
 }
 
-fn walk(
-    dir: &Path,
-    since: SystemTime,
-    canon_cwd: &str,
-    depth: usize,
-    seen: &mut std::collections::HashSet<String>,
-    out: &mut Vec<AdoptionCandidate>,
-) {
-    if depth >= MAX_RECURSION_DEPTH {
-        return;
-    }
-    let entries = match std::fs::read_dir(dir) {
-        Ok(it) => it,
-        Err(_) => return,
+/// Re-read the session list when something was committed since the
+/// last read.
+fn refresh(cache: &mut DbCache) {
+    let version = match cache.db.probe() {
+        Ok(Probe::Changed(version)) => version,
+        Ok(Probe::Unchanged) => return,
+        Ok(Probe::Missing) => {
+            cache.rows.clear();
+            return;
+        }
+        // Locked: keep the old rows, try again next tick.
+        Err(err) if db::is_busy(&err) => return,
+        Err(err) => {
+            cache.db.log_error("opencode_discovery", &err);
+            return;
+        }
     };
-    for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else { continue };
-        let path = entry.path();
-        if ft.is_dir() {
-            walk(&path, since, canon_cwd, depth + 1, seen, out);
-            continue;
+    cache.queries += 1;
+    let Some(conn) = cache.db.conn() else { return };
+    match read_sessions(conn) {
+        Ok(rows) => {
+            cache.rows = rows;
+            cache.db.mark_read(version);
         }
-        if !ft.is_file() {
-            continue;
+        // Locked mid-read: keep the old rows and the connection, and
+        // leave the version unmarked so the next tick reads again.
+        Err(err) if db::is_busy(&err) => {}
+        Err(err) => {
+            // Not an OpenCode schema we know. Mark the version so this
+            // only re-runs on the next commit.
+            cache.db.log_error("opencode_discovery", &err);
+            cache.rows.clear();
+            cache.db.mark_read(version);
         }
-        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if !is_message_file(name) {
-            continue;
-        }
-        // Path layout: <root>/.../message/<sid>/msg_*.json
-        let Some(parent) = path.parent() else { continue };
-        let Some(grandparent) = parent.parent() else { continue };
-        let parent_name = grandparent.file_name().and_then(|s| s.to_str());
-        if parent_name.map(|n| !n.eq_ignore_ascii_case("message")).unwrap_or(true) {
-            continue;
-        }
-        let Some(sid) = parent.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if sid.is_empty() {
-            continue;
-        }
-        if seen.contains(sid) {
-            continue;
-        }
-        let Ok(meta) = entry.metadata() else { continue };
-        let created = meta.created().ok();
-        let modified = crate::telemetry::modified_or_none(&meta);
-        let eligible = matches!(created, Some(t) if t >= since)
-            || matches!(modified, Some(t) if t >= since);
-        if !eligible {
-            continue;
-        }
-        if !cwd_matches(&path, canon_cwd) {
-            continue;
-        }
-        seen.insert(sid.to_owned());
-        out.push(AdoptionCandidate {
-            session_id: sid.to_owned(),
-            message_path: path,
-        });
     }
 }
 
-fn is_message_file(name: &str) -> bool {
-    if !name.starts_with("msg_") {
-        return false;
-    }
-    // Suffix-match `.json` case-insensitively without allocating a
-    // new lowercase `String` per directory entry — the recursive walk
-    // can hit large data roots, so the per-entry allocation is hot.
-    const EXT: &[u8] = b".json";
-    let bytes = name.as_bytes();
-    if bytes.len() <= EXT.len() {
-        return false;
-    }
-    let tail = &bytes[bytes.len() - EXT.len()..];
-    tail.eq_ignore_ascii_case(EXT)
+fn read_sessions(conn: &Connection) -> rusqlite::Result<Vec<SessionRow>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, directory, time_updated FROM session WHERE parent_id IS NULL",
+    )?;
+    stmt.query_map([], |row| {
+        Ok(SessionRow {
+            id: row.get(0)?,
+            canon_dir: canonicalize_path(&row.get::<_, String>(1)?),
+            updated_ms: row.get(2)?,
+        })
+    })?
+    .collect()
 }
 
-fn cwd_matches(path: &Path, canon_cwd: &str) -> bool {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Some(entry) = parse_content(&content) else {
-        return false;
-    };
-    let Some(cwd) = entry.cwd else {
-        return false;
-    };
-    canonicalize_path(&cwd) == canon_cwd
+#[cfg(test)]
+fn query_count(data_root: &Path) -> u64 {
+    let caches = CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    caches.get(&db::db_path(data_root)).map_or(0, |c| c.queries)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
+    use crate::agents::opencode::db::fixture::Fixture;
 
-    fn write_msg(path: &Path, cwd: &str) {
-        // Mirrors the assistant-message shape `parse_content` reads
-        // `metadata.assistant.path.cwd` from. The discovery scan only
-        // matches messages whose first parseable file records a cwd,
-        // so we always write an assistant message here.
-        let content = format!(
-            r#"{{
-                "id":"msg-1","role":"assistant",
-                "metadata":{{
-                    "sessionID":"x",
-                    "time":{{"created":1700000000000}},
-                    "assistant":{{
-                        "modelID":"m","providerID":"p",
-                        "path":{{"cwd":"{cwd}","root":"{cwd}"}},
-                        "tokens":{{"input":0,"output":0,"reasoning":0,"cache":{{"read":0,"write":0}}}},
-                        "cost":0
-                    }}
-                }},
-                "parts":[{{"type":"text","text":"ok"}}]
-            }}"#
+    fn at(ms: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_millis(ms)
+    }
+
+    fn ids(found: &[AdoptionCandidate]) -> Vec<&str> {
+        let mut ids: Vec<&str> = found.iter().map(|c| c.session_id.as_str()).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn scan_returns_empty_when_db_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(scan(tmp.path(), "C:/repo/alpha", SystemTime::UNIX_EPOCH).is_empty());
+        assert!(scan(&tmp.path().join("nonexistent"), "/x", SystemTime::UNIX_EPOCH).is_empty());
+    }
+
+    #[test]
+    fn scan_finds_session_by_cwd_with_its_update_time() {
+        let fx = Fixture::new();
+        fx.add_session("ses_a", None, "C:/repo/alpha", "t", 1_000);
+        fx.touch_session("ses_a", 5_000);
+        let found = scan(fx.root(), "C:/repo/alpha", SystemTime::UNIX_EPOCH);
+        assert_eq!(
+            found,
+            vec![AdoptionCandidate { session_id: "ses_a".into(), updated_at: at(5_000) }]
         );
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn scan_matches_across_path_spellings() {
+        // OpenCode records the native Windows spelling; the tab's cwd
+        // may be any of the forms `canonicalize_path` folds together.
+        let fx = Fixture::new();
+        fx.add_session("ses_a", None, r"C:\repo\Alpha\", "t", 1_000);
+        for cwd in ["C:/repo/alpha", "c:\\repo\\alpha", "/c/repo/alpha"] {
+            assert_eq!(ids(&scan(fx.root(), cwd, SystemTime::UNIX_EPOCH)), ["ses_a"], "{cwd}");
         }
-        std::fs::write(path, content.as_bytes()).unwrap();
     }
 
     #[test]
-    fn scan_returns_empty_when_root_missing() {
-        let tmp = TempDir::new().unwrap();
-        let res = scan(
-            &tmp.path().join("nonexistent"),
-            "/some/dir",
-            SystemTime::UNIX_EPOCH,
+    fn scan_skips_other_directories() {
+        let fx = Fixture::new();
+        fx.add_session("ses_a", None, "C:/repo/beta", "t", 1_000);
+        assert!(scan(fx.root(), "C:/repo/alpha", SystemTime::UNIX_EPOCH).is_empty());
+    }
+
+    #[test]
+    fn scan_skips_subagent_sessions() {
+        let fx = Fixture::new();
+        fx.add_session("ses_parent", None, "C:/repo/alpha", "t", 1_000);
+        fx.add_session("ses_child", Some("ses_parent"), "C:/repo/alpha", "t", 2_000);
+        assert_eq!(
+            ids(&scan(fx.root(), "C:/repo/alpha", SystemTime::UNIX_EPOCH)),
+            ["ses_parent"]
         );
-        assert!(res.is_empty());
     }
 
     #[test]
-    fn scan_finds_candidate_under_message_dir() {
-        let tmp = TempDir::new().unwrap();
-        let msg_path = tmp
-            .path()
-            .join("project/slug/storage/message/sid-123/msg_001.json");
-        write_msg(&msg_path, "C:/dev/x");
+    fn scan_skips_sessions_untouched_since_spawn() {
+        let fx = Fixture::new();
+        fx.add_session("ses_old", None, "C:/repo/alpha", "t", 1_000);
+        fx.add_session("ses_new", None, "C:/repo/alpha", "t", 9_000);
+        assert_eq!(ids(&scan(fx.root(), "C:/repo/alpha", at(5_000))), ["ses_new"]);
+        // Exactly at `since` still counts.
+        assert_eq!(ids(&scan(fx.root(), "C:/repo/alpha", at(9_000))), ["ses_new"]);
 
-        let res = scan(tmp.path(), "C:/dev/x", SystemTime::UNIX_EPOCH);
-        assert_eq!(res.len(), 1, "got {res:?}");
-        assert_eq!(res[0].session_id, "sid-123");
+        // A resumed session becomes eligible once OpenCode writes to it.
+        fx.touch_session("ses_old", 6_000);
+        assert_eq!(
+            ids(&scan(fx.root(), "C:/repo/alpha", at(5_000))),
+            ["ses_new", "ses_old"]
+        );
     }
 
     #[test]
-    fn scan_skips_files_outside_message_dir() {
-        let tmp = TempDir::new().unwrap();
-        // Wrong grandparent — not "message".
-        let msg_path = tmp
-            .path()
-            .join("project/slug/storage/foo/sid-123/msg_001.json");
-        write_msg(&msg_path, "C:/dev/x");
+    fn quiet_scans_do_not_query() {
+        let fx = Fixture::new();
+        fx.add_session("ses_a", None, "C:/repo/alpha", "t", 1_000);
+        scan(fx.root(), "C:/repo/alpha", SystemTime::UNIX_EPOCH);
+        assert_eq!(query_count(fx.root()), 1);
 
-        let res = scan(tmp.path(), "C:/dev/x", SystemTime::UNIX_EPOCH);
-        assert!(res.is_empty(), "got {res:?}");
+        // Nothing moved: any number of scans, from any tab, are served
+        // from the cache.
+        for cwd in ["C:/repo/alpha", "C:/repo/beta", "C:/repo/alpha"] {
+            scan(fx.root(), cwd, SystemTime::UNIX_EPOCH);
+        }
+        assert_eq!(query_count(fx.root()), 1);
+
+        // A commit: exactly one re-read, and it sees the new row.
+        fx.add_session("ses_b", None, "C:/repo/alpha", "t", 2_000);
+        assert_eq!(
+            ids(&scan(fx.root(), "C:/repo/alpha", SystemTime::UNIX_EPOCH)),
+            ["ses_a", "ses_b"]
+        );
+        scan(fx.root(), "C:/repo/alpha", SystemTime::UNIX_EPOCH);
+        assert_eq!(query_count(fx.root()), 2);
     }
 
     #[test]
-    fn scan_skips_mismatched_cwd() {
-        let tmp = TempDir::new().unwrap();
-        let msg_path = tmp
-            .path()
-            .join("project/slug/storage/message/sid-123/msg_001.json");
-        write_msg(&msg_path, "C:/dev/y");
-
-        let res = scan(tmp.path(), "C:/dev/x", SystemTime::UNIX_EPOCH);
-        assert!(res.is_empty(), "got {res:?}");
+    fn missing_db_is_not_queried_every_tick() {
+        let tmp = tempfile::tempdir().unwrap();
+        for _ in 0..3 {
+            scan(tmp.path(), "C:/repo/alpha", SystemTime::UNIX_EPOCH);
+        }
+        assert_eq!(query_count(tmp.path()), 0);
     }
 
     #[test]
-    fn scan_dedupes_by_session_id() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp
-            .path()
-            .join("project/slug/storage/message/sid-123");
-        std::fs::create_dir_all(&dir).unwrap();
-        write_msg(&dir.join("msg_001.json"), "C:/dev/x");
-        write_msg(&dir.join("msg_002.json"), "C:/dev/x");
+    fn scan_never_writes_to_the_db() {
+        let fx = Fixture::new();
+        fx.add_session("ses_a", None, "C:/repo/alpha", "t", 1_000);
+        let path = db::db_path(fx.root());
+        let wal = fx.root().join("opencode.db-wal");
+        let before = (std::fs::read(&path).unwrap(), std::fs::read(&wal).unwrap());
+        scan(fx.root(), "C:/repo/alpha", SystemTime::UNIX_EPOCH);
+        assert_eq!((std::fs::read(&path).unwrap(), std::fs::read(&wal).unwrap()), before);
+    }
 
-        let res = scan(tmp.path(), "C:/dev/x", SystemTime::UNIX_EPOCH);
-        assert_eq!(res.len(), 1);
-        assert_eq!(res[0].session_id, "sid-123");
+    #[test]
+    fn back_to_back_commits_are_all_seen() {
+        // Commits inside one mtime tick, and after checkpoints that
+        // rewrite the WAL at the same length, must each show up.
+        let fx = Fixture::new();
+        fx.conn.pragma_update(None, "wal_autocheckpoint", 1).unwrap();
+        for n in 0..50 {
+            let sid = format!("ses_{n:02}");
+            fx.add_session(&sid, None, "C:/repo/alpha", "t", 1_000);
+            let found = scan(fx.root(), "C:/repo/alpha", SystemTime::UNIX_EPOCH);
+            assert!(found.iter().any(|c| c.session_id == sid), "commit {n} missed");
+        }
     }
 }

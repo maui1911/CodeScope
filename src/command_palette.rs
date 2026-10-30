@@ -58,7 +58,7 @@ pub enum PaletteActionKind {
     /// is what gets handed to `spawn_tab_in`; `title` is the tab label.
     Worktree {
         working_directory: std::path::PathBuf,
-        title: SharedString,
+        title: codescope_core::TabTitle,
         branch: String,
         project_name: String,
     },

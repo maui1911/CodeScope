@@ -722,3 +722,73 @@ repository project's rows in step with git
 * Stored paths stay as git prints them (forward slashes on Windows),
   as the add-time adoption already did. Consumers that need native
   separators convert them, as with the reveal helper (#298).
+
+## ADR-0025 — Read OpenCode's `opencode.db` with `rusqlite` (bundled)
+
+**Date:** 2026-10-30
+**Status:** Accepted
+
+OpenCode 1.x stopped writing one JSON file per message under
+`storage/.../message/<sid>/` and keeps sessions, messages and message
+parts in a WAL-mode SQLite database, `~/.local/share/opencode/opencode.db`.
+The reader still walked the old layout, so OpenCode tabs got no
+adoption, no status dot, no tokens and no title (#381). Every other
+agent CodeScope tails writes plain files; this is the first one that
+needs SQLite.
+
+**Decision:** read the database in-process with `rusqlite`, `bundled`
+feature, in `codescope-core` (`agents::opencode::db`).
+
+* **Why not the `sqlite3` CLI:** shelling out is how CodeScope talks to
+  `git`, but `git` is a prerequisite and `sqlite3` is not: most
+  machines don't have it (Windows never ships it). A missing binary
+  would silently disable OpenCode support. Spawning a process per
+  query would also blow the poll budget below.
+* **Why `bundled`:** no system SQLite to find or version-match on any
+  of the three platforms; the library is compiled into the binary.
+  The readers need WAL and the JSON functions, both in the bundled
+  build.
+* **Read-only, never blocking:** connections open with
+  `SQLITE_OPEN_READ_ONLY` (no create, no URI parsing) and a zero busy
+  timeout. `SQLITE_BUSY` / `SQLITE_LOCKED` and a missing database both
+  mean "nothing new this tick"; a busy read is retried on the next
+  tick, on the same connection. CodeScope never writes database pages.
+  It does touch the side files the way any WAL reader does: it records
+  read marks in `opencode.db-shm`, and if `-wal` / `-shm` are absent
+  (OpenCode not running, its last connection closed) opening the
+  database creates them and may run WAL recovery into `-shm`.
+* **`data_version` before query:** both the adoption scan (every
+  ~350 ms per OpenCode tab) and the session tail (250 ms – 2 s) keep a
+  connection open and ask it for `PRAGMA data_version`, which changes
+  whenever another connection commits. It reads the WAL-index header,
+  not table pages: a few µs. Only a changed value runs the queries.
+  File stats were tried first and miss commits: after an automatic
+  checkpoint SQLite rewrites the WAL from offset 0, so its length stops
+  changing, and on Windows consecutive commits often share an mtime.
+  Discovery caches the session list per database path, shared by all
+  tabs; each tail keeps its own connection.
+* **One stat per tick, for identity only:** each probe also checks that
+  `opencode.db` exists and, on Unix, that it is the same inode, and
+  reopens if it was replaced. The stat is shared by every tab polled in
+  the same tick (50 ms reuse window). On Windows an open connection
+  stops OpenCode from deleting or renaming the file (sharing violation,
+  error 32). Tails close their connection with their tab, but the
+  discovery cache keeps its connection until CodeScope exits, so once
+  an OpenCode tab has been open, deleting `opencode.db` (an OpenCode
+  reset) fails until CodeScope is closed.
+* **Adoption recency:** there is no per-session file to stat, so
+  discovery returns the session's `time_updated` and the adoption tick
+  compares candidates by it.
+
+**Consequences:**
+
+* `codescope-core` gains its first C dependency (`libsqlite3-sys`
+  builds SQLite with the platform C compiler, which the GPUI build
+  already requires).
+* The reader follows OpenCode's schema (`session`, `message`, `part`
+  and the JSON inside `data`), not a published API. A schema change in
+  OpenCode reads as "no data" and is logged once (repeats of the same
+  error are not printed), not a crash, and needs a matching change in
+  `agents::opencode`.
+* OpenCode versions older than the database (the JSON-file layout) are
+  no longer read; that reader was removed.

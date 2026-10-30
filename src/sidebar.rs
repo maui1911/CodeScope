@@ -37,6 +37,7 @@ use codescope_core::git::{GitStatus, WorktreeInfo};
 use codescope_core::layout::OTHER_PROJECT_GROUP_KEY;
 use codescope_core::project_groups::{self, OTHER_SECTION_LABEL, ProjectDropTarget};
 use codescope_core::projects::{PathOnDisk, WorktreeSync, worktree_is_listed};
+use codescope_core::worktree_create::PendingWorktrees;
 use codescope_core::pr::{CiStatus, PullRequestInfo};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -361,9 +362,10 @@ pub struct BotsFooter {
 #[derive(Debug, Clone)]
 pub enum SidebarEvent {
     /// Open a session for `working_directory`, using `title` for the
-    /// tab strip. Title is just a label — the host decides what to
-    /// actually show (in practice the worktree branch name suffixed
-    /// with the project name).
+    /// tab strip — the structured parts (project, branch or folder
+    /// label, qualifier) the host renders and later updates, so a
+    /// branch change or a session label never has to re-parse the
+    /// display text (#370).
     ///
     /// Default semantics are *focus-or-open*: the host activates an
     /// existing tab whose working directory matches and only spawns a
@@ -373,7 +375,7 @@ pub enum SidebarEvent {
     /// menu's "New Claude session" row).
     OpenSession {
         working_directory: PathBuf,
-        title: SharedString,
+        title: codescope_core::TabTitle,
         /// Optional command to auto-type at the shell prompt once the
         /// pty has come up. Used by the agent-launch rows ("New
         /// Claude session", and any future agent variants) to fire
@@ -718,6 +720,12 @@ pub struct Sidebar {
     /// straight back), and a row created mid-scan has no disk facts
     /// yet to match git's spelling of its path against.
     worktree_edits: u64,
+    /// "New worktree" creations whose `git worktree add` is still
+    /// running on the background executor (#342). Each renders a
+    /// "creating…" row under its project, and the discovery poll skips
+    /// that project (and that path) until it lands: git lists a
+    /// half-made worktree before its checkout is done.
+    pending_worktrees: PendingWorktrees,
     /// Cached "open PR URL for this worktree" lookup, keyed by the
     /// worktree's absolute path. The value tracks both the branch
     /// the lookup ran against (so a branch switch invalidates the
@@ -892,6 +900,7 @@ impl Sidebar {
             git_status: HashMap::new(),
             non_repo_paths: HashMap::new(),
             worktree_edits: 0,
+            pending_worktrees: PendingWorktrees::default(),
             pr_urls: HashMap::new(),
             collapsed_projects,
             collapsed_project_groups,
@@ -1661,6 +1670,19 @@ impl Sidebar {
             // ran, so it may be stale. The next tick scans afresh.
             return;
         }
+        // A "New worktree" still checking out is already listed by
+        // git, so adopting it now would race the in-app create for the
+        // row: its project sits this scan out, and no other project
+        // gets offered its path (see `discovery_view`). Everything
+        // else syncs as usual. The create's completion bumps
+        // `worktree_edits`, voiding any scan that straddled it.
+        let held_back;
+        let listed = if self.pending_worktrees.is_empty() {
+            listed
+        } else {
+            held_back = self.pending_worktrees.discovery_view(listed);
+            &held_back[..]
+        };
         let sync = |cfg: &mut ProjectsConfig| {
             let mut total = WorktreeSync::default();
             for (project_id, wts) in listed {
@@ -1993,6 +2015,11 @@ impl Sidebar {
     }
     pub(crate) fn take_dialog(&mut self) -> Option<NewWorktreeDialogState> {
         self.dialog.take()
+    }
+    /// In-flight "New worktree" creations (#342), for the dialog
+    /// module's submit / completion path.
+    pub(crate) fn pending_worktrees_mut(&mut self) -> &mut PendingWorktrees {
+        &mut self.pending_worktrees
     }
 
     /// Add-project dialog accessors. Mutually exclusive with the
@@ -3705,7 +3732,8 @@ impl Render for Sidebar {
                 project_and_worktree_rows.push(remote_row.into_any_element());
                 continue;
             }
-            if worktrees.is_empty() {
+            let has_pending = self.pending_worktrees.for_project(&id).next().is_some();
+            if worktrees.is_empty() && !has_pending {
                 // Stable id keyed off the project id (same hash
                 // strategy `project_row` and `wt_row` use) so gpui
                 // can track this placeholder across renders without
@@ -3764,14 +3792,13 @@ impl Render for Sidebar {
                 // the *filtered* (non-primary) view here would mis-map
                 // to the unfiltered `project.worktrees` later.
                 let wt_id_for_menu = wt.id.clone();
-                // Single spaces around `·` to match the C# build's
-                // `$"{project.Name} · {branch}"` convention in
+                // Renders `{project} · {branch}`, matching the C#
+                // build's `$"{project.Name} · {branch}"` convention in
                 // `MainViewModel.RefreshTabTitlesForWorktree`.
-                let title_label = SharedString::from(format!(
-                    "{} · {}",
-                    project_name,
-                    wt_label,
-                ));
+                let title_label = codescope_core::TabTitle::worktree(
+                    project_name.to_string(),
+                    wt_label.to_string(),
+                );
                 // Worktree row hover — same `#141414` fill as project rows.
                 let frost_hover = theme::surface_elev(&theme);
                 let ink_hover = theme::ink(&theme);
@@ -4318,6 +4345,48 @@ impl Render for Sidebar {
                     }
                 }
             }
+            // Worktrees whose `git worktree add` is still running
+            // (#342): same row geometry as a real worktree, with an
+            // accent pulse in the dot slot and a `creating…` slug where
+            // the status slug goes. Inert — there is nothing to open
+            // or right-click until git is done; then the real row
+            // replaces it.
+            for pending in self.pending_worktrees.for_project(&id) {
+                let pending_row = div()
+                    .id(("worktree-creating", pending.id))
+                    .h(px(28.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .border_l_2()
+                    .border_color(gpui::transparent_black())
+                    .pl(px(32.0))
+                    .pr_3()
+                    .gap_2()
+                    .text_color(theme::ink_ghost(&theme))
+                    .text_size(px(11.5))
+                    .child(creating_pulse(
+                        ("worktree-creating-pulse", pending.id),
+                        theme::accent(&theme),
+                    ))
+                    .child(
+                        div()
+                            .flex_grow()
+                            .truncate()
+                            .font(theme::font_mono())
+                            .child(SharedString::from(pending.branch.clone())),
+                    )
+                    .child(
+                        div()
+                            .ml(px(8.0))
+                            .mr(px(4.0))
+                            .text_size(px(10.0))
+                            .text_color(theme::text_faint())
+                            .font(theme::font_mono())
+                            .child("creating…"),
+                    );
+                project_and_worktree_rows.push(pending_row.into_any_element());
+            }
         }
         if let Some((start, project_id)) = open_block.take() {
             let block_rows: Vec<gpui::AnyElement> =
@@ -4612,7 +4681,7 @@ impl Render for Sidebar {
                 let project_pos = *position;
                 if let Some(project) = self.projects.projects.get(*project_idx).cloned() {
                     let project_path = project.path.clone();
-                    let project_name: SharedString = project.name.clone().into();
+                    let project_title = codescope_core::TabTitle::project(project.name.clone());
                     let overlay = if project.is_remote_shell() {
                         self.render_remote_project_menu(*project_idx, project_pos, &project, &theme, cx)
                             .into_any_element()
@@ -4656,7 +4725,7 @@ impl Render for Sidebar {
                         );
                         let body = self.render_new_session_submenu(
                             &project_path,
-                            project_name,
+                            project_title,
                             cx,
                         );
                         root = root.child(
@@ -4685,8 +4754,8 @@ impl Render for Sidebar {
                             .map(|s| s.to_string())
                             .unwrap_or_else(|| wt.path.clone())
                     });
-                    let session_title: SharedString =
-                        format!("{} · {}", project.name, branch_label).into();
+                    let session_title =
+                        codescope_core::TabTitle::worktree(project.name.clone(), branch_label);
                     let wt_path = wt.path.clone();
                     let overlay = self
                         .render_worktree_menu(
@@ -4797,7 +4866,7 @@ impl Sidebar {
     fn build_new_session_parent_row(
         &self,
         worktree_path: &str,
-        title_prefix: &SharedString,
+        title_prefix: &codescope_core::TabTitle,
         id_prefix: &'static str,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -4911,7 +4980,7 @@ impl Sidebar {
     fn render_new_session_submenu(
         &self,
         worktree_path: &str,
-        title_prefix: SharedString,
+        title_prefix: codescope_core::TabTitle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = self.theme.clone();
@@ -4969,11 +5038,7 @@ impl Sidebar {
             let label = SharedString::from(format!("New {} session", profile.display_name));
             let row_id = SharedString::from(format!("submenu-new-{}", profile.id));
             let path = PathBuf::from(worktree_path);
-            let title = SharedString::from(format!(
-                "{} · {}",
-                title_prefix.as_ref(),
-                profile.id,
-            ));
+            let title = title_prefix.clone().with_suffix(profile.id.clone());
             // Shared helper keeps the new-session command shape in
             // sync with the double-click handler and Ctrl+Shift+T.
             // Preserves the `Option` semantics: a profile with an
@@ -5048,7 +5113,7 @@ impl Sidebar {
         // emits `auto_type: None`). Users with a default agent had
         // no surfaced path. Explicit row removes the trap.
         let shell_path = PathBuf::from(worktree_path);
-        let shell_title = SharedString::from(format!("{title_prefix} · shell"));
+        let shell_title = title_prefix.with_suffix("shell");
         let frost_hover = frost;
         let shell_row = div()
             .id(SharedString::from("submenu-new-shell"))
@@ -5354,7 +5419,7 @@ impl Sidebar {
         // mutably borrows `cx` mid-chain.
         let new_session_parent_row = self.build_new_session_parent_row(
             &project.path,
-            &project.name.clone().into(),
+            &codescope_core::TabTitle::project(project.name.clone()),
             "proj-menu-new-session",
             cx,
         );
@@ -5595,10 +5660,8 @@ impl Sidebar {
         // Snapshot the open-session payload so the menu row's listener
         // can `move` the values without keeping a borrow on `project`.
         let open_session_path = PathBuf::from(&worktree.path);
-        let open_session_title = SharedString::from(format!(
-            "{} · {}",
-            project.name, branch_label
-        ));
+        let open_session_title =
+            codescope_core::TabTitle::worktree(project.name.clone(), branch_label.to_string());
         let is_primary = worktree.is_primary;
         let is_repo = !self.non_repo_paths.contains_key(&worktree.path);
 
@@ -7176,6 +7239,46 @@ impl Sidebar {
         )
         .into_any_element()
     }
+}
+
+/// 14 px dot slot with a pulsing halo: the "something is running"
+/// marker for a worktree still being created (#342), in the sidebar
+/// row and the dialog footer. Same geometry and 1.4 s keyframes as
+/// the busy-session halo on worktree rows, in `color` instead of
+/// `signal_warn`. `id` must be unique per visible pulse so each
+/// animates on its own clock.
+pub(crate) fn creating_pulse(id: impl Into<gpui::ElementId>, color: gpui::Hsla) -> gpui::Div {
+    let halo = div()
+        .absolute()
+        .top(px(1.0))
+        .left(px(1.0))
+        .w(px(12.0))
+        .h(px(12.0))
+        .rounded_full()
+        .bg(color)
+        .with_animation(
+            id,
+            Animation::new(Duration::from_millis(1400)).repeat(),
+            |this, delta| {
+                let pulse_end = 1.0_f32 / 1.4_f32;
+                let opacity = if delta < pulse_end {
+                    0.55_f32 * (1.0_f32 - delta / pulse_end)
+                } else {
+                    0.0_f32
+                };
+                this.opacity(opacity)
+            },
+        );
+    div()
+        .relative()
+        .flex_shrink_0()
+        .w(px(14.0))
+        .h(px(14.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(halo)
+        .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(color))
 }
 
 /// Cheap hash for use as a gpui element id derived from a string id.

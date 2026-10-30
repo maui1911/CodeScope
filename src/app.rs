@@ -248,7 +248,14 @@ struct Tab {
     /// Mirrors C# `SessionTabViewModel.Descriptor.Id` /
     /// `Models.Session.Id`.
     session_id: String,
+    /// The tab strip text, rendered from `title_parts`. Only written
+    /// through [`Tab::retitle`] (or at spawn) so the two never drift.
     title: SharedString,
+    /// What `title` is rendered from: project, branch or folder label,
+    /// spawn qualifier and session label, kept apart so a branch change
+    /// or a new content title replaces one field instead of re-parsing
+    /// display text (#370).
+    title_parts: codescope_core::TabTitle,
     terminal: Entity<TerminalView>,
     /// Working directory the pty was spawned in. Captured so a
     /// session-restore round-trip can re-spawn the tab in the same
@@ -290,11 +297,23 @@ struct Tab {
     /// dispatch — mirrors the `agentId` string the C#
     /// `MainViewModel.RegisterAgentTelemetry` branches on.
     agent_id: Option<codescope_core::AgentId>,
-    /// The session label (rename, else content title) last written
-    /// into `title` by [`AppShell::apply_session_titles`], so a tick
-    /// that sees the same label again does no work. `None` until one
-    /// is known.
-    applied_label: Option<String>,
+}
+
+impl Tab {
+    /// Edit the title parts and re-render `title` from them. Returns
+    /// whether the rendered text changed, so callers only re-render the
+    /// strip when it actually moved.
+    fn retitle(&mut self, edit: impl FnOnce(&mut codescope_core::TabTitle) -> bool) -> bool {
+        if !edit(&mut self.title_parts) {
+            return false;
+        }
+        let text = self.title_parts.render();
+        if self.title.as_ref() == text {
+            return false;
+        }
+        self.title = SharedString::from(text);
+        true
+    }
 }
 
 /// The `claude` process running in a tab and the session it reported,
@@ -719,7 +738,9 @@ impl Render for DraggedTab {
 /// agent-agnostic.
 enum AgentTail {
     Claude(codescope_core::ClaudeTranscriptTail),
+    Codex(codescope_core::CodexRolloutTail),
     Copilot(codescope_core::CopilotTranscriptTail),
+    Gemini(codescope_core::GeminiChatTail),
     OpenCode(codescope_core::OpenCodeMessageTail),
     Pi(codescope_core::PiTranscriptTail),
 }
@@ -728,7 +749,9 @@ impl AgentTail {
     fn poll(&mut self) -> bool {
         match self {
             AgentTail::Claude(t) => t.poll(),
+            AgentTail::Codex(t) => t.poll(),
             AgentTail::Copilot(t) => t.poll(),
+            AgentTail::Gemini(t) => t.poll(),
             AgentTail::OpenCode(t) => t.poll(),
             AgentTail::Pi(t) => t.poll(),
         }
@@ -737,7 +760,9 @@ impl AgentTail {
     fn snapshot(&self) -> Option<codescope_core::TelemetrySnapshot> {
         match self {
             AgentTail::Claude(t) => t.snapshot.clone(),
+            AgentTail::Codex(t) => t.snapshot.clone(),
             AgentTail::Copilot(t) => t.snapshot.clone(),
+            AgentTail::Gemini(t) => t.snapshot.clone(),
             AgentTail::OpenCode(t) => t.snapshot.clone(),
             AgentTail::Pi(t) => t.snapshot.clone(),
         }
@@ -1990,17 +2015,34 @@ impl AppShell {
                     session_id.clone(),
                 ))
             }
-            codescope_core::AgentId::Codex | codescope_core::AgentId::Gemini => {
-                // Codex / Gemini telemetry isn't wired in the Rust
-                // port yet (the AgentRegistry entries exist ahead of
-                // the discovery layer); skip registration so the rest
-                // of the agent surface keeps working until the
-                // dedicated discovery / telemetry modules land.
-                eprintln!(
-                    "[telemetry] {} telemetry not yet wired — skipping registration for {session_id}",
-                    agent_id.as_str()
-                );
-                return;
+            codescope_core::AgentId::Codex => {
+                let Some(home) = codescope_core::agents::codex::telemetry::default_codex_home()
+                else {
+                    eprintln!(
+                        "[telemetry] no CODEX_HOME / USERPROFILE / HOME — skipping codex registration for {session_id}"
+                    );
+                    return;
+                };
+                // The rollout is created lazily on the first turn; the
+                // tail keeps looking for it, so register regardless.
+                AgentTail::Codex(codescope_core::CodexRolloutTail::for_session(
+                    &home,
+                    &session_id,
+                ))
+            }
+            codescope_core::AgentId::Gemini => {
+                let Some(home) = codescope_core::agents::gemini::discovery::default_gemini_home()
+                else {
+                    eprintln!(
+                        "[telemetry] no GEMINI_CLI_HOME / USERPROFILE / HOME — skipping gemini registration for {session_id}"
+                    );
+                    return;
+                };
+                AgentTail::Gemini(codescope_core::GeminiChatTail::for_session(
+                    &home,
+                    working_directory,
+                    &session_id,
+                ))
             }
             codescope_core::AgentId::Pi => {
                 let Some(root) = codescope_core::agents::pi::telemetry::default_sessions_root() else {
@@ -2220,7 +2262,7 @@ impl AppShell {
     ///
     /// * Claude — `~/.claude/projects/<encoded-cwd>/<sid>.jsonl`
     /// * Pi      — `~/.pi/agent/sessions/.../*_<sid>.jsonl` (recursive)
-    /// * OpenCode — `~/.local/share/opencode/.../message/<sid>/msg_*.json`
+    /// * OpenCode — `session` rows in `~/.local/share/opencode/opencode.db`
     /// * Copilot  — `~/.copilot/session-state/<sid>/`
     ///
     /// All four scans match by canonicalised cwd (Claude uses an
@@ -2350,21 +2392,6 @@ impl AppShell {
                         for (t_idx, tab) in group.tabs.iter().enumerate() {
                             let Some(agent_id) = tab.agent_id else { continue };
                             let Some(ref wd) = tab.working_directory else { continue };
-                            // Codex / Gemini have no discovery wired
-                            // in the Rust port yet — skip before
-                            // flipping `any_active`, otherwise a
-                            // workspace of only Codex/Gemini tabs
-                            // would pin the poll at the 350 ms active
-                            // rate while the loop does no work. Drop
-                            // them through with the same "no agent"
-                            // handling so the cadence relaxes to the
-                            // 5 s idle interval.
-                            if matches!(
-                                agent_id,
-                                codescope_core::AgentId::Codex | codescope_core::AgentId::Gemini
-                            ) {
-                                continue;
-                            }
                             any_active = true;
                             let exact = this
                                 .claude_procs
@@ -2419,12 +2446,27 @@ impl AppShell {
                                     else {
                                         continue;
                                     };
-                                    codescope_core::agents::opencode::discovery::scan(
+                                    // One SQLite file holds every
+                                    // session, so there is no
+                                    // per-session path to stat: the
+                                    // row's `time_updated` is the
+                                    // recency signal, timed here
+                                    // instead of below.
+                                    let hits = codescope_core::agents::opencode::discovery::scan(
                                         &root, &wd_str, tab.spawned_at,
                                     )
                                     .into_iter()
-                                    .map(|c| (c.session_id, c.message_path))
-                                    .collect()
+                                    .map(|c| (c.session_id, c.updated_at))
+                                    .collect();
+                                    scans.push(Scan {
+                                        group_idx: g_idx,
+                                        tab_idx: t_idx,
+                                        agent_id,
+                                        has_adoption: tab.adopted_session_id.is_some(),
+                                        hits,
+                                        exact,
+                                    });
+                                    continue;
                                 }
                                 codescope_core::AgentId::Copilot => {
                                     let Some(root) =
@@ -2439,16 +2481,42 @@ impl AppShell {
                                     .map(|c| (c.session_id, c.session_dir))
                                     .collect()
                                 }
-                                codescope_core::AgentId::Codex
-                                | codescope_core::AgentId::Gemini => {
-                                    // Unreachable: short-circuited
-                                    // above so the active-poll rate
-                                    // doesn't stay pinned for a
-                                    // Codex/Gemini-only workspace.
-                                    // Kept as a belt-and-braces
-                                    // fallback in case someone
-                                    // removes the early skip.
-                                    continue;
+                                // Codex and Gemini also take the tab's
+                                // adopted id: a resumed session keeps
+                                // writing to a file created before this
+                                // tab spawned, outside the since-spawn
+                                // window the scan otherwise covers.
+                                codescope_core::AgentId::Codex => {
+                                    let Some(home) =
+                                        codescope_core::agents::codex::telemetry::default_codex_home()
+                                    else {
+                                        continue;
+                                    };
+                                    codescope_core::agents::codex::discovery::scan(
+                                        &codescope_core::agents::codex::telemetry::sessions_root(&home),
+                                        &wd_str,
+                                        tab.spawned_at,
+                                        tab.adopted_session_id.as_deref(),
+                                    )
+                                    .into_iter()
+                                    .map(|c| (c.session_id, c.path))
+                                    .collect()
+                                }
+                                codescope_core::AgentId::Gemini => {
+                                    let Some(home) =
+                                        codescope_core::agents::gemini::discovery::default_gemini_home()
+                                    else {
+                                        continue;
+                                    };
+                                    codescope_core::agents::gemini::discovery::scan(
+                                        &home,
+                                        &wd_str,
+                                        tab.spawned_at,
+                                        tab.adopted_session_id.as_deref(),
+                                    )
+                                    .into_iter()
+                                    .map(|c| (c.session_id, c.path))
+                                    .collect()
                                 }
                             };
                             let hits: Vec<(String, SystemTime)> = hits
@@ -2627,10 +2695,7 @@ impl AppShell {
                             {
                                 tab.adopted_session_id = None;
                                 tab.fired_session_ids.retain(|s| !taken.contains(s));
-                                tab.applied_label = None;
-                                if let Some((base, _)) = tab.title.split_once(" · ") {
-                                    tab.title = SharedString::from(base.to_owned());
-                                }
+                                tab.retitle(|t| t.clear_label());
                                 released.push(tab.session_id.clone());
                             }
                         }
@@ -2839,7 +2904,7 @@ impl AppShell {
                     .min(group_count.saturating_sub(1));
                 let active_in_group = placement.map(|p| p.active_in_group).unwrap_or(false);
                 self.focused_group = group_idx;
-                let title = SharedString::from(entry.project_name.clone());
+                let title = codescope_core::TabTitle::project(entry.project_name.clone());
                 self.spawn_tab_in(
                     None,
                     Some(title),
@@ -2925,24 +2990,16 @@ impl AppShell {
 
             // Always `{project} · {branch}`, falling back to the folder
             // leaf when no branch is persisted (the primary checkout
-            // never has one) — see `restored_title` for why the
-            // project name has to lead. The user-set
-            // `Session.display_name` does NOT participate here; it
-            // only flows into the sidebar row title (a separate
-            // projection), matching C# `MainViewModel.HydrateFromLoaded`.
-            // A persisted content title replaces the branch segment.
-            let base = codescope_core::restored_title(
+            // never has one) — see `TabTitle::restored` for why the
+            // project name has to lead. A persisted content title is
+            // seeded as the label; the user-set `Session.display_name`
+            // takes over on the first `apply_session_titles` tick.
+            let title = codescope_core::TabTitle::restored(
                 &entry.project_name,
                 entry.branch.as_deref(),
                 &entry.worktree_path,
-            );
-            let title = SharedString::from(
-                entry
-                    .title
-                    .as_deref()
-                    .and_then(|t| codescope_core::titled_tab_title(&base, t))
-                    .unwrap_or(base),
-            );
+            )
+            .with_label(entry.title.as_deref());
 
             self.spawn_tab_in(
                 Some(path),
@@ -3090,17 +3147,16 @@ impl AppShell {
         None
     }
 
-    /// Rewrite the title of every tab whose `working_directory` matches
-    /// `path` so its branch segment reflects `new_branch`.
+    /// Point the branch part of every tab whose `working_directory`
+    /// matches `path` at `new_branch`.
     ///
-    /// Skips:
-    /// * Tabs whose persisted [`Session`] row has an explicit
-    ///   `display_name` (user-renamed via the Rename dialog — the
-    ///   rename always wins, mirroring the "explicit user intent" rule).
-    /// * Tabs whose title doesn't have the standard `Project · Branch`
-    ///   shape — [`codescope_core::rebuild_title`] returns `None`,
-    ///   which we treat as "leave it alone".
-    /// * Tabs whose rebuilt title equals the current one (no work).
+    /// [`codescope_core::TabTitle::set_branch`] decides what follows:
+    /// plain titles are left alone, a tab opened on the project itself
+    /// takes the primary checkout's branch on the first report (the
+    /// sidebar emits one for the primary path too), and a tab showing
+    /// a session label (the user's rename or
+    /// a content title) keeps showing it — its branch part still
+    /// updates, for when the label goes away.
     ///
     /// Path matching uses [`codescope_core::path_canon::paths_match`]
     /// so a `C:\Dev\Repo` tab still matches a `c:/dev/repo` event
@@ -3118,26 +3174,6 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) {
         let event_path = path.to_string_lossy().into_owned();
-        // Snapshot per-session display_name lookup so we don't borrow
-        // `self.projects` across the mutable iteration over groups.
-        // Sessions with an explicit display_name set must not be
-        // overwritten — the user renamed them. Nor may sessions with a
-        // content title: their tab reads `Project · Title` and has no
-        // branch segment left to swap.
-        let renamed_session_ids: HashSet<String> = self
-            .projects
-            .projects
-            .iter()
-            .flat_map(|p| p.sessions.iter())
-            .filter(|s| {
-                [s.display_name.as_deref(), s.title.as_deref()]
-                    .into_iter()
-                    .flatten()
-                    .any(|d| !d.trim().is_empty())
-            })
-            .map(|s| s.id.clone())
-            .collect();
-
         let mut any_changed = false;
         for group in self.groups.iter_mut() {
             for tab in group.tabs.iter_mut() {
@@ -3150,15 +3186,7 @@ impl AppShell {
                 ) {
                     continue;
                 }
-                if renamed_session_ids.contains(&tab.session_id) {
-                    continue;
-                }
-                if let Some(new_title) =
-                    codescope_core::rebuild_title(tab.title.as_ref(), new_branch)
-                {
-                    tab.title = SharedString::from(new_title);
-                    any_changed = true;
-                }
+                any_changed |= tab.retitle(|t| t.set_branch(new_branch));
             }
         }
         if any_changed {
@@ -3607,15 +3635,13 @@ impl AppShell {
         // Prefer the same `<Project> · <branch>` convention plain
         // worktree clicks produce, with the folder name standing in
         // for the branch when there is none (a project without git) —
-        // see `restored_title`. The descriptor's own title
-        // (display_name → branch → folder) is only the fallback when
-        // the owning project can't be resolved. An explicit
-        // `display_name` override on the persisted row still wins
-        // (descriptor's `for_session` already tries that first), so
-        // user-renamed sessions come back with their custom name.
-        let title: SharedString = if restored.display_name.is_some() {
-            descriptor.title.clone().into()
-        } else {
+        // see `TabTitle::restored`. The session's label (an explicit
+        // `display_name`, else its persisted content title) shows in
+        // place of the branch, after the project, exactly as it does
+        // on a live tab. The descriptor's own title (display_name →
+        // branch → folder) is only the fallback when the owning
+        // project can't be resolved.
+        let title = {
             // Single sidebar snapshot for both lookups so they share
             // the same in-memory state and we don't pay the entity
             // borrow twice for one decision.
@@ -3633,23 +3659,20 @@ impl AppShell {
                 .git_status_for(&descriptor.working_directory)
                 .and_then(|g| g.branch_name().map(str::to_string))
                 .or_else(|| restored.branch.clone());
+            let non_blank = |s: &&str| !s.trim().is_empty();
+            let label = restored
+                .display_name
+                .as_deref()
+                .filter(non_blank)
+                .or_else(|| restored.title.as_deref().filter(non_blank));
             match project_name {
-                Some(p) => {
-                    let base = codescope_core::restored_title(
-                        &p,
-                        branch_label.as_deref(),
-                        &descriptor.working_directory,
-                    );
-                    // A session that had a content title comes back
-                    // under it, not under its branch.
-                    restored
-                        .title
-                        .as_deref()
-                        .and_then(|t| codescope_core::titled_tab_title(&base, t))
-                        .unwrap_or(base)
-                        .into()
-                }
-                None => descriptor.title.clone().into(),
+                Some(p) => codescope_core::TabTitle::restored(
+                    &p,
+                    branch_label.as_deref(),
+                    &descriptor.working_directory,
+                )
+                .with_label(label),
+                None => codescope_core::TabTitle::plain(descriptor.title.clone()),
             }
         };
 
@@ -3996,7 +4019,7 @@ impl AppShell {
             .projects
             .iter()
             .find(|p| p.id == project_id)
-            .map(|p| SharedString::from(p.name.clone()));
+            .map(|p| codescope_core::TabTitle::project(p.name.clone()));
         self.spawn_tab_in(None, title, None, None, None, Some(launch), window, cx);
     }
 
@@ -4032,7 +4055,7 @@ impl AppShell {
     fn spawn_tab_in(
         &mut self,
         working_directory: Option<std::path::PathBuf>,
-        title_override: Option<SharedString>,
+        title_override: Option<codescope_core::TabTitle>,
         auto_type: Option<SharedString>,
         // Agent profile id to stamp on the persisted `Session` row.
         // Threaded through from `SidebarEvent::OpenSession` (or
@@ -4208,9 +4231,25 @@ impl AppShell {
         });
         let id = self.next_tab_id;
         self.next_tab_id += 1;
-        let title: SharedString = title_override
-            .or_else(|| active_project.map(|(_, name)| name.into()))
-            .unwrap_or_else(|| format!("Terminal {}", id + 1).into());
+        let mut title_parts = title_override
+            .or_else(|| active_project.map(|(_, name)| codescope_core::TabTitle::project(name)))
+            .unwrap_or_else(|| codescope_core::TabTitle::plain(format!("Terminal {}", id + 1)));
+        // Take the branch the git poll already knows for this folder.
+        // The poll only reports a branch when it changes, so without
+        // this a tab opened on the project itself after the first poll
+        // would read `acme · claude` until the next checkout, while
+        // the same tab restored after a restart reads `acme · main`.
+        // `branch_name()` skips a detached HEAD's short-SHA stand-in.
+        let known_branch = working_directory_for_tab.as_ref().and_then(|wd| {
+            self.sidebar
+                .read(cx)
+                .git_status_for(&wd.to_string_lossy())
+                .and_then(|g| g.branch_name().map(str::to_owned))
+        });
+        if let Some(branch) = known_branch {
+            title_parts.set_branch(&branch);
+        }
+        let title = SharedString::from(title_parts.render());
         // Allocate / adopt the persisted session id. `restore_session_id`
         // is `Some` only on the rehydrate path (a session row that was
         // already on disk and is now being brought back into a Tab);
@@ -4278,13 +4317,13 @@ impl AppShell {
             remote_project_id,
             session_id,
             title,
+            title_parts,
             terminal,
             working_directory: working_directory_for_tab,
             spawned_at: SystemTime::now(),
             adopted_session_id,
             fired_session_ids: std::collections::HashSet::new(),
             agent_id,
-            applied_label: None,
         });
         let new_idx = group.tabs.len() - 1;
         self.activate_tab(group_idx, new_idx, window, cx);
@@ -6409,7 +6448,7 @@ impl AppShell {
     /// them. Runs on the telemetry cadence; a tick where no label moved
     /// touches neither the tabs nor the disk.
     fn apply_session_titles(&mut self, cx: &mut Context<Self>) {
-        let mut retitled: Vec<(usize, usize, String)> = Vec::new();
+        let mut retitled: Vec<(usize, usize, Option<String>)> = Vec::new();
         let mut to_persist: Vec<(String, String)> = Vec::new();
         for (g_idx, group) in self.groups.iter().enumerate() {
             for (t_idx, tab) in group.tabs.iter().enumerate() {
@@ -6431,11 +6470,20 @@ impl AppShell {
                         to_persist.push((tab.session_id.clone(), title.to_owned()));
                     }
                 }
-                let Some(label) = self.session_label_for(tab, content.as_deref()) else {
+                // A plain title ("Terminal 3", a palette agent tab) has
+                // no project to lead a label with.
+                if !tab.title_parts.takes_label() {
                     continue;
-                };
-                if tab.applied_label.as_deref() != Some(label.as_str()) {
-                    retitled.push((g_idx, t_idx, label));
+                }
+                // `None` clears the label: a rename that was cleared (or
+                // a released neighbour's title) must leave the tab.
+                // Compared trimmed and non-blank, the way
+                // `TabTitle::sync_label` stores it, so a padded label
+                // settles after one tick.
+                let label = self.session_label_for(tab, content.as_deref());
+                let label = label.as_deref().map(str::trim).filter(|l| !l.is_empty());
+                if tab.title_parts.label() != label {
+                    retitled.push((g_idx, t_idx, label.map(str::to_owned)));
                 }
             }
         }
@@ -6473,17 +6521,14 @@ impl AppShell {
             }
         }
 
-        if retitled.is_empty() {
-            return;
-        }
+        let mut any_changed = false;
         for (g_idx, t_idx, label) in retitled {
-            let tab = &mut self.groups[g_idx].tabs[t_idx];
-            if let Some(title) = codescope_core::titled_tab_title(tab.title.as_ref(), &label) {
-                tab.title = SharedString::from(title);
-            }
-            tab.applied_label = Some(label);
+            any_changed |=
+                self.groups[g_idx].tabs[t_idx].retitle(|t| t.sync_label(label.as_deref()));
         }
-        cx.notify();
+        if any_changed {
+            cx.notify();
+        }
     }
 
     /// Canonicalised worktree path of the currently focused tab (the
@@ -7399,7 +7444,12 @@ impl AppShell {
                     }
                     return;
                 }
-                d if d.len() == 1 => {
+                // Exactly Alt+1..9, the same guard as the terminal's
+                // `is_app_level_shortcut` (#385): with a terminal
+                // focused this chord only arrives here because the
+                // terminal let it bubble, and Alt+Shift+digit stays
+                // with the PTY there.
+                d if d.len() == 1 && !mods.shift => {
                     if let Some(n) = d.chars().next().and_then(|c| c.to_digit(10))
                         && (1..=9).contains(&n)
                     {
@@ -8519,7 +8569,7 @@ impl AppShell {
                 // persisted `Session.agent_id` is the user's actual
                 // pick even for custom profiles where `id != command`.
                 let cwd = self.active_project_path(cx).map(std::path::PathBuf::from);
-                let title: SharedString = display_name.clone().into();
+                let title = codescope_core::TabTitle::plain(display_name.clone());
                 self.spawn_palette_agent_tab(
                     cwd,
                     title,
@@ -8707,10 +8757,10 @@ impl AppShell {
                 // A plain-folder project has no branch to show; the
                 // `default_branch` fallback would title it `name ·
                 // main` and invent a branch that doesn't exist (#338).
-                let title: SharedString = if sidebar.is_non_repo(&wt.path) {
-                    project.name.clone().into()
+                let title = if sidebar.is_non_repo(&wt.path) {
+                    codescope_core::TabTitle::project(project.name.clone())
                 } else {
-                    format!("{} · {}", project.name, branch).into()
+                    codescope_core::TabTitle::worktree(project.name.clone(), branch.clone())
                 };
                 out.push(PaletteAction {
                     kind: PaletteActionKind::Worktree {
@@ -8737,7 +8787,7 @@ impl AppShell {
     fn open_or_focus_session(
         &mut self,
         working_directory: std::path::PathBuf,
-        title: SharedString,
+        title: codescope_core::TabTitle,
         auto_type: Option<SharedString>,
         force_new: bool,
         window: &mut Window,
@@ -8795,7 +8845,7 @@ impl AppShell {
     fn spawn_palette_agent_tab(
         &mut self,
         working_directory: Option<std::path::PathBuf>,
-        title: SharedString,
+        title: codescope_core::TabTitle,
         agent_id: SharedString,
         auto_type: SharedString,
         window: &mut Window,
