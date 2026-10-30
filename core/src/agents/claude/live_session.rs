@@ -18,9 +18,17 @@ pub fn default_sessions_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".claude").join("sessions"))
 }
 
-/// The session the first of `pids` that is a Claude Code process
-/// running in `working_directory` is in, or `None` when none is (no
-/// `claude` started yet, or a Claude Code too old to write the file).
+/// The file Claude Code keeps for the process `pid`. Its mtime moves
+/// whenever the session changes, so callers that remember a pid can
+/// stat this instead of re-reading it.
+pub fn session_file(sessions_dir: &Path, pid: u32) -> PathBuf {
+    sessions_dir.join(format!("{pid}.json"))
+}
+
+/// The first of `pids` that is a Claude Code process running in
+/// `working_directory`, with the session it is in — `None` when there
+/// is none (no `claude` started yet, or a Claude Code too old to write
+/// the file).
 ///
 /// The cwd check guards against a stale file whose pid the OS has since
 /// handed to an unrelated process in the tab. Only `interactive`
@@ -30,9 +38,9 @@ pub fn session_for_pids(
     sessions_dir: &Path,
     pids: &[u32],
     working_directory: &str,
-) -> Option<String> {
+) -> Option<(u32, String)> {
     pids.iter().find_map(|&pid| {
-        let text = std::fs::read_to_string(sessions_dir.join(format!("{pid}.json"))).ok()?;
+        let text = std::fs::read_to_string(session_file(sessions_dir, pid)).ok()?;
         let entry: serde_json::Value = serde_json::from_str(&text).ok()?;
         let same_pid = entry.get("pid").and_then(serde_json::Value::as_u64) == Some(pid.into());
         let cwd = entry.get("cwd").and_then(serde_json::Value::as_str)?;
@@ -45,7 +53,7 @@ pub fn session_for_pids(
             && interactive
             && !session_id.is_empty()
             && crate::path_canon::paths_match(cwd, working_directory))
-        .then(|| session_id.to_owned())
+        .then(|| (pid, session_id.to_owned()))
     })
 }
 
@@ -68,8 +76,8 @@ mod tests {
         write(dir.path(), 12, &entry(12, "sid-a", r"C:\repo\alpha"));
         // 11 (node / a shim) has no file; 12 is the claude process.
         assert_eq!(
-            session_for_pids(dir.path(), &[11, 12], "C:/repo/alpha").as_deref(),
-            Some("sid-a")
+            session_for_pids(dir.path(), &[11, 12], "C:/repo/alpha"),
+            Some((12, "sid-a".to_owned()))
         );
     }
 
@@ -93,7 +101,10 @@ mod tests {
         let nested = serde_json::json!({ "pid": 12, "sessionId": "sid-p", "cwd": "C:/repo", "kind": "print" });
         write(dir.path(), 12, &nested.to_string());
         write(dir.path(), 14, &entry(14, "sid-a", "C:/repo"));
-        assert_eq!(session_for_pids(dir.path(), &[12, 14], "C:/repo").as_deref(), Some("sid-a"));
+        assert_eq!(
+            session_for_pids(dir.path(), &[12, 14], "C:/repo"),
+            Some((14, "sid-a".to_owned()))
+        );
     }
 
     #[test]

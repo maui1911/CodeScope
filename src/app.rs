@@ -297,6 +297,19 @@ struct Tab {
     applied_label: Option<String>,
 }
 
+/// The `claude` process running in a tab and the session it reported,
+/// remembered so the adoption tick only has to stat one small file per
+/// tab. Walking the process tree to find it costs milliseconds on the
+/// UI thread; it only happens when a tab without one has a transcript
+/// to adopt.
+struct ClaudeProc {
+    pid: u32,
+    /// mtime of `~/.claude/sessions/<pid>.json` when `session_id` was
+    /// read; Claude Code rewrites the file when the session changes.
+    file_mtime: SystemTime,
+    session_id: String,
+}
+
 /// Pick the transcript a tab should adopt this tick: the newest
 /// candidate it hasn't already fired and that no *other* tab has
 /// claimed.
@@ -916,6 +929,9 @@ pub struct AppShell {
     /// `MainViewModel.RegisterAgentTelemetry` / `UnregisterAgentTelemetry`
     /// dispatching to four distinct `*TelemetryService` instances.
     telemetry_tails: HashMap<String, AgentTail>,
+    /// The `claude` process found in each Claude tab, keyed by tab id —
+    /// see [`ClaudeProc`].
+    claude_procs: HashMap<u64, ClaudeProc>,
     /// Placement seen on the previous bounds-observer tick. Feeds
     /// [`unmaximized_by_display_change`]; `None` until the first tick.
     last_window_placement: Option<WindowPlacement>,
@@ -1701,6 +1717,7 @@ impl AppShell {
             idle_notifier: crate::idle_notifier::IdleNotifier::new(),
             window_active_cached: true,
             telemetry_tails: HashMap::new(),
+            claude_procs: HashMap::new(),
             last_window_placement: None,
             last_monitor_change: None,
             maximized_before_minimize: false,
@@ -2286,12 +2303,49 @@ impl AppShell {
                     }
                     let mut scans: Vec<Scan> = Vec::new();
                     let mut any_active = false;
-                    // Taken once per tick, and only when a Claude tab
-                    // needs it.
-                    let mut process_table: Option<codescope_core::process_tree::ProcessTable> =
-                        None;
                     let claude_sessions_dir =
                         codescope_core::agents::claude::live_session::default_sessions_dir();
+                    // Keep each remembered `claude` process current:
+                    // one stat per tab, a re-read only when its session
+                    // file moved, forgotten once the file is gone
+                    // (`claude` exited) or the tab closed.
+                    let live_tabs: HashSet<u64> =
+                        this.groups.iter().flat_map(|g| g.tabs.iter()).map(|t| t.id).collect();
+                    this.claude_procs.retain(|tab_id, proc_| {
+                        let Some(dir) = claude_sessions_dir.as_deref() else { return false };
+                        if !live_tabs.contains(tab_id) {
+                            return false;
+                        }
+                        let path =
+                            codescope_core::agents::claude::live_session::session_file(dir, proc_.pid);
+                        let Some(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()).ok()
+                        else {
+                            return false;
+                        };
+                        if mtime == proc_.file_mtime {
+                            return true;
+                        }
+                        let wd = this
+                            .groups
+                            .iter()
+                            .flat_map(|g| g.tabs.iter())
+                            .find(|t| t.id == *tab_id)
+                            .and_then(|t| t.working_directory.as_ref())
+                            .map(|wd| wd.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        match codescope_core::agents::claude::live_session::session_for_pids(
+                            dir,
+                            &[proc_.pid],
+                            &wd,
+                        ) {
+                            Some((_, session_id)) => {
+                                proc_.file_mtime = mtime;
+                                proc_.session_id = session_id;
+                                true
+                            }
+                            None => false,
+                        }
+                    });
                     for (g_idx, group) in this.groups.iter().enumerate() {
                         for (t_idx, tab) in group.tabs.iter().enumerate() {
                             let Some(agent_id) = tab.agent_id else { continue };
@@ -2312,6 +2366,20 @@ impl AppShell {
                                 continue;
                             }
                             any_active = true;
+                            let exact = this
+                                .claude_procs
+                                .get(&tab.id)
+                                .filter(|_| agent_id == codescope_core::AgentId::Claude)
+                                .map(|p| p.session_id.clone());
+                            // Settled on the session its own `claude`
+                            // reports: nothing to adopt, so skip the
+                            // directory scan too.
+                            if let Some(own) = exact.as_deref()
+                                && tab.adopted_session_id.as_deref() == Some(own)
+                                && tab.fired_session_ids.contains(own)
+                            {
+                                continue;
+                            }
                             let wd_str = wd.to_string_lossy().into_owned();
                             // Each agent scan returns
                             // `(session_id, mtime_source_path)` so we
@@ -2393,23 +2461,6 @@ impl AppShell {
                                     (sid, mtime)
                                 })
                                 .collect();
-                            let exact = match (agent_id, &claude_sessions_dir) {
-                                (codescope_core::AgentId::Claude, Some(dir)) => tab
-                                    .terminal
-                                    .read(cx)
-                                    .child_pid()
-                                    .and_then(|shell| {
-                                        let table = process_table.get_or_insert_with(
-                                            codescope_core::process_tree::process_table,
-                                        );
-                                        let pids =
-                                            codescope_core::process_tree::descendants(shell, table);
-                                        codescope_core::agents::claude::live_session::session_for_pids(
-                                            dir, &pids, &wd_str,
-                                        )
-                                    }),
-                                _ => None,
-                            };
                             scans.push(Scan {
                                 group_idx: g_idx,
                                 tab_idx: t_idx,
@@ -2442,6 +2493,70 @@ impl AppShell {
                                 .cloned()
                         }))
                         .collect();
+                    // A Claude tab whose `claude` isn't known yet and
+                    // that is about to adopt a transcript by guessing:
+                    // look its process up first — one process-table
+                    // snapshot for all of them. Only then, so a quiet
+                    // workspace never pays for the walk.
+                    let unresolved: Vec<usize> = (0..scans.len())
+                        .filter(|&i| {
+                            let s = &scans[i];
+                            s.agent_id == codescope_core::AgentId::Claude
+                                && s.exact.is_none()
+                                && this
+                                    .groups
+                                    .get(s.group_idx)
+                                    .and_then(|g| g.tabs.get(s.tab_idx))
+                                    .is_some_and(|tab| {
+                                        select_adoption(
+                                            &s.hits,
+                                            &tab.fired_session_ids,
+                                            tab.adopted_session_id.as_deref(),
+                                            &claimed,
+                                            None,
+                                        )
+                                        .is_some()
+                                    })
+                        })
+                        .collect();
+                    if !unresolved.is_empty()
+                        && let Some(dir) = claude_sessions_dir.as_deref()
+                    {
+                        let table = codescope_core::process_tree::process_table();
+                        for i in unresolved {
+                            let Some(tab) = this
+                                .groups
+                                .get(scans[i].group_idx)
+                                .and_then(|g| g.tabs.get(scans[i].tab_idx))
+                            else {
+                                continue;
+                            };
+                            let Some(shell) = tab.terminal.read(cx).child_pid() else { continue };
+                            let wd = tab
+                                .working_directory
+                                .as_ref()
+                                .map(|wd| wd.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            let pids = codescope_core::process_tree::descendants(shell, &table);
+                            let Some((pid, session_id)) =
+                                codescope_core::agents::claude::live_session::session_for_pids(
+                                    dir, &pids, &wd,
+                                )
+                            else {
+                                continue;
+                            };
+                            let path =
+                                codescope_core::agents::claude::live_session::session_file(dir, pid);
+                            let Some(file_mtime) =
+                                std::fs::metadata(&path).and_then(|m| m.modified()).ok()
+                            else {
+                                continue;
+                            };
+                            scans[i].exact = Some(session_id.clone());
+                            this.claude_procs
+                                .insert(tab.id, ClaudeProc { pid, file_mtime, session_id });
+                        }
+                    }
                     // Tabs that own nothing yet choose first. A tab
                     // that already has a live transcript would
                     // otherwise "rotate" onto a brand-new one minted by
