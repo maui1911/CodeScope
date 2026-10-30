@@ -16,6 +16,7 @@
 pub mod agent;
 pub mod agent_registry;
 pub mod agents;
+pub mod atomic_write;
 pub mod attachments;
 pub mod bots;
 pub mod command_palette;
