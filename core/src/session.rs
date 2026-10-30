@@ -245,10 +245,10 @@ pub fn format_closed_at_relative(closed_at_iso: Option<&str>, now_iso: &str) -> 
 ///   exist. For Claude that directory is derived from the worktree
 ///   path, so a moved or renamed worktree lands here and keeps its
 ///   rows instead of losing them;
-/// * the agent is Pi, OpenCode, Codex or Gemini. Pi and OpenCode can only be
-///   located by walking their trees (Pi matches `*_<sid>.jsonl`
-///   recursively; OpenCode's `storage/` slug is derived from the
-///   project path and not predictable), and Codex has no layout wired
+/// * the agent is Pi, OpenCode, Codex or Gemini. Pi can only be
+///   located by walking its tree (it matches `*_<sid>.jsonl`
+///   recursively), OpenCode keeps its sessions in a SQLite database
+///   rather than files, and Codex has no layout wired
 ///   in the Rust port at all. Their rows are left to the age / cap
 ///   sweep. Worth revisiting if those rows start piling up — the walk
 ///   is affordable if its result is cached across one sweep.
