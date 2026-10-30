@@ -18,6 +18,7 @@
 //! leaves no trace in `projects.json`, and the worktree discovery poll
 //! adopts whatever git finished on disk at the next launch.
 
+use crate::git::WorktreeInfo;
 use crate::projects::{ProjectsConfig, Worktree, normalise_project_path};
 
 /// Handle for one in-flight creation, unique for the life of a
@@ -122,6 +123,34 @@ impl PendingWorktrees {
     ) -> impl Iterator<Item = &'a PendingWorktree> + 'a {
         self.items.iter().filter(move |p| p.project_id == project_id)
     }
+
+    /// What of one discovery scan (`(project id, git worktree list)`
+    /// per project) may be synced while creations are in flight. Git
+    /// lists a worktree as soon as `git worktree add` registers it,
+    /// long before its checkout is done, so adopting from such a list
+    /// would race the in-app create for the row. A project with a
+    /// create in flight sits the scan out entirely; every other
+    /// project is synced, minus any listed path being created (another
+    /// checkout of the same repository lists it too).
+    pub fn discovery_view(
+        &self,
+        listed: &[(String, Vec<WorktreeInfo>)],
+    ) -> Vec<(String, Vec<WorktreeInfo>)> {
+        let in_flight: Vec<String> =
+            self.items.iter().map(|p| normalise_project_path(&p.path)).collect();
+        listed
+            .iter()
+            .filter(|(project_id, _)| self.for_project(project_id).next().is_none())
+            .map(|(project_id, wts)| {
+                let wts = wts
+                    .iter()
+                    .filter(|w| !in_flight.contains(&normalise_project_path(&w.path)))
+                    .cloned()
+                    .collect();
+                (project_id.clone(), wts)
+            })
+            .collect()
+    }
 }
 
 /// What [`record_created_worktree`] did.
@@ -208,6 +237,54 @@ mod tests {
         assert_eq!(err, BeginError::BranchInFlight { branch: "feat".into() });
         // Another project is another repository: same name is fine.
         assert!(pending.begin("p2", "/other.worktrees/one", "feat").is_ok());
+    }
+
+    fn listed(path: &str) -> WorktreeInfo {
+        WorktreeInfo {
+            path: path.into(),
+            head: "abc".into(),
+            branch: None,
+            is_primary: false,
+            locked: false,
+            prunable: false,
+        }
+    }
+
+    #[test]
+    fn discovery_holds_back_only_projects_with_a_create_in_flight() {
+        let mut pending = PendingWorktrees::default();
+        pending.begin("a", "/a.worktrees/feat", "feat").unwrap();
+        let scan = vec![
+            ("a".to_string(), vec![listed("/a"), listed("/a.worktrees/feat")]),
+            ("b".to_string(), vec![listed("/b"), listed("/b.worktrees/x")]),
+        ];
+        let kept = pending.discovery_view(&scan);
+        let ids: Vec<&str> = kept.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["b"], "project a sits this scan out");
+        assert_eq!(kept[0].1.len(), 2, "project b is synced in full");
+    }
+
+    #[test]
+    fn discovery_never_offers_a_half_made_worktree_to_another_project() {
+        // Project `c` is another checkout of the same repository (a
+        // worktree added as a project of its own), so its listing
+        // names the tree `a` is still creating.
+        let mut pending = PendingWorktrees::default();
+        pending.begin("a", "/a.worktrees/feat", "feat").unwrap();
+        let scan = vec![(
+            "c".to_string(),
+            vec![listed("/a"), listed("/a.worktrees/feat/"), listed("/a.worktrees/old")],
+        )];
+        let kept = pending.discovery_view(&scan);
+        let paths: Vec<&str> = kept[0].1.iter().map(|w| w.path.as_str()).collect();
+        assert_eq!(paths, vec!["/a", "/a.worktrees/old"]);
+    }
+
+    #[test]
+    fn discovery_passes_everything_through_when_nothing_is_pending() {
+        let pending = PendingWorktrees::default();
+        let scan = vec![("a".to_string(), vec![listed("/a"), listed("/a.worktrees/x")])];
+        assert_eq!(pending.discovery_view(&scan), scan);
     }
 
     #[test]

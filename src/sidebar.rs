@@ -721,9 +721,9 @@ pub struct Sidebar {
     worktree_edits: u64,
     /// "New worktree" creations whose `git worktree add` is still
     /// running on the background executor (#342). Each renders a
-    /// "creating…" row under its project, and while any is in flight
-    /// the discovery poll stands down: git lists a half-made worktree
-    /// before its checkout is done.
+    /// "creating…" row under its project, and the discovery poll skips
+    /// that project (and that path) until it lands: git lists a
+    /// half-made worktree before its checkout is done.
     pending_worktrees: PendingWorktrees,
     /// Cached "open PR URL for this worktree" lookup, keyed by the
     /// worktree's absolute path. The value tracks both the branch
@@ -1669,13 +1669,19 @@ impl Sidebar {
             // ran, so it may be stale. The next tick scans afresh.
             return;
         }
-        if !self.pending_worktrees.is_empty() {
-            // A "New worktree" is still checking out. Git already
-            // lists it, so adopting now would race the in-app create
-            // for the row. Its completion bumps `worktree_edits`, and
-            // the first scan after that picks up anything else.
-            return;
-        }
+        // A "New worktree" still checking out is already listed by
+        // git, so adopting it now would race the in-app create for the
+        // row: its project sits this scan out, and no other project
+        // gets offered its path (see `discovery_view`). Everything
+        // else syncs as usual. The create's completion bumps
+        // `worktree_edits`, voiding any scan that straddled it.
+        let held_back;
+        let listed = if self.pending_worktrees.is_empty() {
+            listed
+        } else {
+            held_back = self.pending_worktrees.discovery_view(listed);
+            &held_back[..]
+        };
         let sync = |cfg: &mut ProjectsConfig| {
             let mut total = WorktreeSync::default();
             for (project_id, wts) in listed {
