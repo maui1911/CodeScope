@@ -179,6 +179,16 @@ impl TabTitle {
         }
     }
 
+    /// Make the label match `label`: set it when non-blank, drop it
+    /// otherwise (a rename that was cleared must leave the tab).
+    /// Returns whether the label changed.
+    pub fn sync_label(&mut self, label: Option<&str>) -> bool {
+        match label.map(str::trim).filter(|l| !l.is_empty()) {
+            Some(label) => self.set_label(label),
+            None => self.clear_label(),
+        }
+    }
+
     /// Drop the session label, so location and suffix show again.
     /// Returns whether there was one.
     pub fn clear_label(&mut self) -> bool {
@@ -352,6 +362,31 @@ mod tests {
     fn project_tab_with_separator_takes_the_branch() {
         let title = TabTitle::project("alpha · beta").with_suffix("shell");
         assert_eq!(after_branch(title, "main").as_deref(), Some("alpha · beta · main"));
+    }
+
+    #[test]
+    fn sync_label_sets_and_clears() {
+        let mut title = TabTitle::worktree("acme", "main");
+        assert!(title.sync_label(Some("My name")));
+        assert_eq!(title.render(), "acme · My name");
+        assert!(!title.sync_label(Some(" My name ")));
+        // The rename was cleared and nothing else names the session:
+        // the tab must not keep showing the old rename.
+        assert!(title.sync_label(None));
+        assert_eq!(title.render(), "acme · main");
+        assert!(!title.sync_label(None));
+        // Blank counts as no label.
+        title.sync_label(Some("My name"));
+        assert!(title.sync_label(Some("  ")));
+        assert_eq!(title.label(), None);
+    }
+
+    #[test]
+    fn sync_label_leaves_plain_titles_alone() {
+        let mut title = TabTitle::plain("Terminal 3");
+        assert!(!title.sync_label(Some("My name")));
+        assert!(!title.sync_label(None));
+        assert_eq!(title.render(), "Terminal 3");
     }
 
     #[test]

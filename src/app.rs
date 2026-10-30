@@ -6387,7 +6387,7 @@ impl AppShell {
     /// them. Runs on the telemetry cadence; a tick where no label moved
     /// touches neither the tabs nor the disk.
     fn apply_session_titles(&mut self, cx: &mut Context<Self>) {
-        let mut retitled: Vec<(usize, usize, String)> = Vec::new();
+        let mut retitled: Vec<(usize, usize, Option<String>)> = Vec::new();
         let mut to_persist: Vec<(String, String)> = Vec::new();
         for (g_idx, group) in self.groups.iter().enumerate() {
             for (t_idx, tab) in group.tabs.iter().enumerate() {
@@ -6414,14 +6414,15 @@ impl AppShell {
                 if !tab.title_parts.takes_label() {
                     continue;
                 }
-                let Some(label) = self.session_label_for(tab, content.as_deref()) else {
-                    continue;
-                };
-                // Compared trimmed, the way `TabTitle::set_label`
-                // stores it, so a padded label settles after one tick.
-                let label = label.trim();
-                if !label.is_empty() && tab.title_parts.label() != Some(label) {
-                    retitled.push((g_idx, t_idx, label.to_owned()));
+                // `None` clears the label: a rename that was cleared (or
+                // a released neighbour's title) must leave the tab.
+                // Compared trimmed and non-blank, the way
+                // `TabTitle::sync_label` stores it, so a padded label
+                // settles after one tick.
+                let label = self.session_label_for(tab, content.as_deref());
+                let label = label.as_deref().map(str::trim).filter(|l| !l.is_empty());
+                if tab.title_parts.label() != label {
+                    retitled.push((g_idx, t_idx, label.map(str::to_owned)));
                 }
             }
         }
@@ -6452,7 +6453,8 @@ impl AppShell {
 
         let mut any_changed = false;
         for (g_idx, t_idx, label) in retitled {
-            any_changed |= self.groups[g_idx].tabs[t_idx].retitle(|t| t.set_label(&label));
+            any_changed |=
+                self.groups[g_idx].tabs[t_idx].retitle(|t| t.sync_label(label.as_deref()));
         }
         if any_changed {
             cx.notify();
