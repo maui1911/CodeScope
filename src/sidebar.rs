@@ -7212,9 +7212,6 @@ impl Sidebar {
     }
 }
 
-/// Cheap hash for use as a gpui element id derived from a string id.
-/// `id` itself isn't `Hash` for gpui's id needs but `(static_str, u64)`
-/// is — so we shrink the project id to a u64.
 /// 14 px dot slot with a pulsing halo: the "something is running"
 /// marker for a worktree still being created (#342), in the sidebar
 /// row and the dialog footer. Same geometry and 1.4 s keyframes as
@@ -7255,6 +7252,9 @@ pub(crate) fn creating_pulse(id: impl Into<gpui::ElementId>, color: gpui::Hsla) 
         .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(color))
 }
 
+/// Cheap hash for use as a gpui element id derived from a string id.
+/// `id` itself isn't `Hash` for gpui's id needs but `(static_str, u64)`
+/// is — so we shrink the project id to a u64.
 fn id_hash(id: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
