@@ -52,6 +52,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::session_title::{SessionTitle, TitleSource};
 use crate::telemetry::{FileTail, SessionState, TelemetrySnapshot, context_window_for_model};
 
 // ---------------------------------------------------------------------------
@@ -77,6 +78,8 @@ struct Entry {
     /// `message.model` (on `message`) or root `modelId` (on
     /// `model_change`).
     model: Option<String>,
+    /// Joined `text` parts of a `user` message's `content` — the prompt.
+    prompt: Option<String>,
 }
 
 impl Entry {
@@ -146,6 +149,16 @@ fn parse_line(line: &str) -> Option<Entry> {
                     .and_then(Value::as_str)
                     .filter(|s| !s.is_empty())
                     .map(str::to_owned);
+                if entry.role.as_deref() == Some("user") {
+                    entry.prompt = msg.get("content").and_then(Value::as_array).map(|parts| {
+                        parts
+                            .iter()
+                            .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+                            .filter_map(|p| p.get("text").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    });
+                }
                 if let Some(usage) = msg.get("usage").and_then(Value::as_object) {
                     entry.input_tokens =
                         usage.get("input").and_then(Value::as_u64).unwrap_or(0);
@@ -346,6 +359,7 @@ pub fn process_new_lines(
     let mut last_turn_duration = snapshot.as_ref().and_then(|s| s.last_turn_duration);
     let mut state = snapshot.as_ref().map_or(SessionState::Unknown, |s| s.state);
     let mut model: Option<String> = snapshot.as_ref().and_then(|s| s.model.clone());
+    let mut title: Option<SessionTitle> = snapshot.as_ref().and_then(|s| s.title.clone());
     let mut changed = false;
 
     let mut line = String::new();
@@ -385,6 +399,10 @@ pub fn process_new_lines(
 
         match entry.role.as_deref() {
             Some("user") | Some("toolResult") => {
+                // Pi never names a session, so its first prompt does.
+                if let Some(prompt) = entry.prompt.as_deref() {
+                    SessionTitle::offer(&mut title, prompt, TitleSource::Prompt);
+                }
                 state = SessionState::Busy;
                 // Only fresh user turns anchor `last_user_ts` —
                 // toolResult is mid-turn, resetting would cut the
@@ -459,6 +477,7 @@ pub fn process_new_lines(
             last_turn_duration,
             state,
             quiet_timeout: false,
+            title,
         });
     }
 
@@ -1076,5 +1095,24 @@ mod tests {
         );
         let tail = PiTranscriptTail::new(idle_path);
         assert_eq!(tail.poll_interval(), Duration::from_secs(2));
+    }
+
+    // --- session titles ---
+
+    #[test]
+    fn first_user_prompt_titles_the_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("s.jsonl");
+        write_lines(
+            &path,
+            &[
+                r#"{"type":"message","timestamp":"2026-04-22T08:00:00Z","message":{"role":"user","content":[{"type":"image","data":"…"},{"type":"text","text":"does it work?"}]}}"#,
+                r#"{"type":"message","timestamp":"2026-04-22T08:01:00Z","message":{"role":"user","content":[{"type":"text","text":"second prompt"}]}}"#,
+            ],
+        );
+        let tail = PiTranscriptTail::new(path);
+        let title = tail.snapshot.unwrap().title.unwrap();
+        assert_eq!(title.text, "does it work?");
+        assert_eq!(title.source, TitleSource::Prompt);
     }
 }

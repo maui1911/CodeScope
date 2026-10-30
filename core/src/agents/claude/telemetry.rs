@@ -23,6 +23,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
 
+use crate::session_title::{SessionTitle, TitleSource};
+
 pub use crate::telemetry::{FileTail, SessionState, TelemetrySnapshot, context_window_for_model};
 
 /// Default Claude Code projects root: `<home>/.claude/projects`.
@@ -152,6 +154,11 @@ struct Entry {
     /// bookkeeping (titles, modes, ledgers, …) — on its own schedule and
     /// without any turn running. See [`is_bookkeeping_type`].
     bookkeeping: bool,
+    /// Title text this entry carries, with its source: `custom-title`
+    /// (the user's `/rename`), `ai-title` (Claude Code's own summary
+    /// of the conversation) or `last-prompt` (a prompt, the stand-in
+    /// until the first `ai-title` lands).
+    title: Option<(String, TitleSource)>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -187,6 +194,16 @@ fn parse_line(line: &str) -> Option<Entry> {
     let compact_summary = kind == EntryKind::User
         && obj.get("isCompactSummary").and_then(Value::as_bool) == Some(true);
     let bookkeeping = entry_type.is_some_and(is_bookkeeping_type);
+    let title = match entry_type {
+        Some("custom-title") => Some(("customTitle", TitleSource::User)),
+        Some("ai-title") => Some(("aiTitle", TitleSource::Generated)),
+        Some("last-prompt") => Some(("lastPrompt", TitleSource::Prompt)),
+        _ => None,
+    }
+    .and_then(|(key, source)| {
+        let text = obj.get(key).and_then(Value::as_str)?;
+        Some((text.to_string(), source))
+    });
 
     // Client-side slash command answers. See the field doc on
     // `Entry::local_command_answer`. A `user` entry carries the
@@ -306,6 +323,7 @@ fn parse_line(line: &str) -> Option<Entry> {
         local_command_answer,
         compact_summary,
         bookkeeping,
+        title,
     })
 }
 
@@ -322,6 +340,7 @@ fn is_bookkeeping_type(entry_type: &str) -> bool {
         entry_type,
         "last-prompt"
             | "ai-title"
+            | "custom-title"
             | "mode"
             | "permission-mode"
             | "atis-latch"
@@ -502,7 +521,12 @@ pub fn process_new_lines(
         if s.quiet_timeout { SessionState::Busy } else { s.state }
     });
     let mut model: Option<String> = snapshot.as_ref().and_then(|s| s.model.clone());
+    let mut title: Option<SessionTitle> = snapshot.as_ref().and_then(|s| s.title.clone());
     let mut changed = false;
+    // Kept apart from `changed`: titles are bookkeeping that lands after
+    // a turn, so a new one must not rebuild the snapshot — that would
+    // drop a quiet-timeout idle back to the `Busy` it was seeded from.
+    let mut title_changed = false;
     let mut activity = false;
 
     let mut line = String::new();
@@ -534,6 +558,11 @@ pub fn process_new_lines(
         };
         if !entry.bookkeeping {
             activity = true;
+        }
+        if let Some((text, source)) = &entry.title
+            && SessionTitle::offer(&mut title, text, *source)
+        {
+            title_changed = true;
         }
 
         match entry.kind {
@@ -659,10 +688,27 @@ pub fn process_new_lines(
             last_turn_duration,
             state,
             quiet_timeout: false,
+            title,
         });
+    } else if title_changed {
+        match snapshot.as_mut() {
+            Some(s) => s.title = title,
+            None => {
+                *snapshot = Some(TelemetrySnapshot {
+                    model: None,
+                    tokens_used: 0,
+                    context_pct: None,
+                    turn_count: 0,
+                    last_turn_duration: None,
+                    state: SessionState::Unknown,
+                    quiet_timeout: false,
+                    title,
+                });
+            }
+        }
     }
 
-    ReadOutcome { changed, activity }
+    ReadOutcome { changed: changed || title_changed, activity }
 }
 
 // ---------------------------------------------------------------------------
@@ -2102,11 +2148,16 @@ mod tests {
         tail.poll_at(start + past_timeout());
         assert!(tail.snapshot.as_ref().unwrap().quiet_timeout);
 
+        // The title they carry lands, but the state stays put.
         append_lines(&path, &[LAST_PROMPT, AI_TITLE, MODE]);
-        assert!(!tail.poll_at(start + past_timeout() * 2));
+        assert!(tail.poll_at(start + past_timeout() * 2));
         let snap = tail.snapshot.as_ref().unwrap();
         assert_eq!(snap.state, SessionState::Idle);
         assert!(snap.quiet_timeout);
+        assert!(snap.title.is_some());
+        append_lines(&path, &[MODE]);
+        assert!(!tail.poll_at(start + past_timeout() * 2));
+        assert!(tail.snapshot.as_ref().unwrap().quiet_timeout);
 
         // An unknown shape is still read as the turn running.
         append_lines(&path, &[r#"{"type":"some-future-shape","sessionId":"s"}"#]);
@@ -2179,4 +2230,71 @@ mod tests {
 
     // format_tokens / format_context_pct / context_window_for_model
     // tests live next to the functions in `crate::telemetry`.
+
+    // --- session titles ---
+
+    fn title_of(lines: &[&str]) -> Option<SessionTitle> {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, lines);
+        let mut tail = FileTail::default();
+        let mut snap: Option<TelemetrySnapshot> = None;
+        let mut last_user_ts = None;
+        read_lines(&path.to_path_buf(), &mut tail, &mut snap, &mut last_user_ts);
+        snap.and_then(|s| s.title)
+    }
+
+    #[test]
+    fn ai_title_names_the_session() {
+        let t = title_of(&[
+            PROMPT,
+            END_TURN,
+            r#"{"type":"last-prompt","lastPrompt":"fix the resize bug","sessionId":"s"}"#,
+            r#"{"type":"ai-title","aiTitle":"Terminal resize fix","sessionId":"s"}"#,
+        ])
+        .unwrap();
+        assert_eq!(t.text, "Terminal resize fix");
+        assert_eq!(t.source, TitleSource::Generated);
+    }
+
+    #[test]
+    fn last_prompt_stands_in_until_an_ai_title_lands() {
+        let t = title_of(&[
+            PROMPT,
+            r#"{"type":"last-prompt","lastPrompt":"fix the resize bug\nand more","sessionId":"s"}"#,
+        ])
+        .unwrap();
+        assert_eq!(t.text, "fix the resize bug");
+        assert_eq!(t.source, TitleSource::Prompt);
+    }
+
+    #[test]
+    fn custom_title_beats_a_later_ai_title() {
+        let t = title_of(&[
+            r#"{"type":"custom-title","customTitle":"Mine","sessionId":"s"}"#,
+            r#"{"type":"ai-title","aiTitle":"Claude's","sessionId":"s"}"#,
+        ])
+        .unwrap();
+        assert_eq!(t.text, "Mine");
+    }
+
+    #[test]
+    fn title_survives_later_turns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl").to_path_buf();
+        write_lines(&path, &[PROMPT, r#"{"type":"ai-title","aiTitle":"Named","sessionId":"s"}"#]);
+        let mut tail = FileTail::default();
+        let mut snap: Option<TelemetrySnapshot> = None;
+        let mut last_user_ts = None;
+        read_lines(&path, &mut tail, &mut snap, &mut last_user_ts);
+        append_lines(&path, &[END_TURN]);
+        read_lines(&path, &mut tail, &mut snap, &mut last_user_ts);
+        assert_eq!(snap.unwrap().title.unwrap().text, "Named");
+    }
+
+    #[test]
+    fn custom_title_is_bookkeeping() {
+        let line = r#"{"type":"custom-title","customTitle":"x","sessionId":"s"}"#;
+        assert!(parse_line(line).unwrap().bookkeeping);
+    }
 }

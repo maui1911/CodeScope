@@ -33,6 +33,7 @@ pub mod project_groups;
 pub mod projects;
 pub mod relaunch;
 pub mod session;
+pub mod session_title;
 pub mod settings;
 pub mod tab_drag;
 pub mod tab_title;
@@ -72,9 +73,10 @@ pub use session::{
     RetentionPolicy, SessionDescriptor, SessionManager, build_agent_shell_args,
     build_remote_shell_args, now_iso8601,
 };
+pub use session_title::{SessionTitle, TitleSource, normalize_title, session_label};
 pub use settings::{CursorSettings, CursorShape, DEFAULT_AGENT_ID, FontSettings, Settings};
 pub use tab_drag::{TabRect, compute_drop_index};
-pub use tab_title::{TAB_TITLE_SEPARATOR, rebuild_title, restored_title};
+pub use tab_title::{TAB_TITLE_SEPARATOR, rebuild_title, restored_title, titled_tab_title};
 pub use telemetry::{
     SessionState, TelemetrySnapshot, context_window_for_model, format_context_pct, format_tokens,
 };

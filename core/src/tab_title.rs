@@ -93,9 +93,43 @@ pub fn restored_title(project: &str, branch: Option<&str>, worktree_path: &str) 
     format!("{project}{TAB_TITLE_SEPARATOR}{label}")
 }
 
+/// Retitle a tab after its session's content title: keep the project
+/// segment, replace everything after it with `title` —
+/// `"acme · main"` becomes `"acme · Terminal resize fix"`.
+///
+/// Returns `None` when `title` is blank, when `current_title` lacks the
+/// `Project · …` shape (a renamed tab — same guard as
+/// [`rebuild_title`]), or when nothing would change. A titled tab no
+/// longer carries its branch, so the host must stop feeding it to
+/// [`rebuild_title`] once this has applied.
+pub fn titled_tab_title(current_title: &str, title: &str) -> Option<String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return None;
+    }
+    let (project, _) = current_title.split_once(TAB_TITLE_SEPARATOR)?;
+    let out = format!("{project}{TAB_TITLE_SEPARATOR}{title}");
+    (out != current_title).then_some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn titled_keeps_project_and_drops_branch_and_agent() {
+        assert_eq!(
+            titled_tab_title("acme · main · Claude Code", "Resize fix").as_deref(),
+            Some("acme · Resize fix"),
+        );
+    }
+
+    #[test]
+    fn titled_leaves_renamed_and_unchanged_tabs_alone() {
+        assert!(titled_tab_title("My custom tab", "Resize fix").is_none());
+        assert!(titled_tab_title("acme · Resize fix", "Resize fix").is_none());
+        assert!(titled_tab_title("acme · main", "  ").is_none());
+    }
 
     #[test]
     fn swaps_branch_in_two_segment_title() {

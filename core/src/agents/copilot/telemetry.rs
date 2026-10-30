@@ -44,10 +44,11 @@
 
 use std::io::{BufRead as _, BufReader, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
+use crate::session_title::{SessionTitle, TitleSource};
 use crate::telemetry::{FileTail, SessionState, TelemetrySnapshot, context_window_for_model};
 
 // ---------------------------------------------------------------------------
@@ -66,6 +67,8 @@ struct Entry {
     model: Option<String>,
     /// `true` when `data.toolRequests` is a non-empty array.
     has_tool_requests: bool,
+    /// `data.content` — the prompt text, only set on `user.message`.
+    prompt: Option<String>,
 }
 
 /// Parse a single JSONL line. Returns `None` for whitespace-only lines
@@ -121,6 +124,9 @@ fn parse_line(line: &str) -> Option<Entry> {
                 .get("toolRequests")
                 .and_then(Value::as_array)
                 .is_some_and(|a| !a.is_empty());
+        }
+        Some("user.message") => {
+            entry.prompt = data.get("content").and_then(Value::as_str).map(str::to_owned);
         }
         _ => {}
     }
@@ -184,6 +190,7 @@ pub fn process_new_lines(
     let mut last_turn_duration = snapshot.as_ref().and_then(|s| s.last_turn_duration);
     let mut state = snapshot.as_ref().map_or(SessionState::Unknown, |s| s.state);
     let mut model: Option<String> = snapshot.as_ref().and_then(|s| s.model.clone());
+    let mut title: Option<SessionTitle> = snapshot.as_ref().and_then(|s| s.title.clone());
     let mut changed = false;
 
     let mut line = String::new();
@@ -214,6 +221,9 @@ pub fn process_new_lines(
                 changed = true;
             }
             Some("user.message") => {
+                if let Some(prompt) = entry.prompt.as_deref() {
+                    SessionTitle::offer(&mut title, prompt, TitleSource::Prompt);
+                }
                 state = SessionState::Busy;
                 if let Some(ts) = entry.timestamp_secs {
                     *last_user_ts = Some(ts);
@@ -291,6 +301,7 @@ pub fn process_new_lines(
             last_turn_duration,
             state,
             quiet_timeout: false,
+            title,
         });
     }
 
@@ -311,6 +322,10 @@ pub struct CopilotTranscriptTail {
     tail: FileTail,
     last_user_ts: Option<f64>,
     pub snapshot: Option<TelemetrySnapshot>,
+    /// mtime of the sibling `workspace.yaml` when its title was last
+    /// read. Copilot names the session there, not in `events.jsonl`,
+    /// and does so after the turn — so the file is watched on its own.
+    workspace_mtime: Option<SystemTime>,
 }
 
 impl CopilotTranscriptTail {
@@ -323,6 +338,7 @@ impl CopilotTranscriptTail {
             tail: FileTail::default(),
             last_user_ts: None,
             snapshot: None,
+            workspace_mtime: None,
         };
         tail.poll();
         tail
@@ -341,12 +357,39 @@ impl CopilotTranscriptTail {
     /// Check for new bytes in the file and update `snapshot`.
     /// Returns `true` when the snapshot changed.
     pub fn poll(&mut self) -> bool {
-        process_new_lines(
+        let changed = process_new_lines(
             &self.path,
             &mut self.tail,
             &mut self.snapshot,
             &mut self.last_user_ts,
-        )
+        );
+        self.poll_workspace_title() || changed
+    }
+
+    /// Fold the session name from the sibling `workspace.yaml` into the
+    /// snapshot's title when that file changed. Waits for a snapshot to
+    /// exist (the name never precedes the first prompt anyway), leaving
+    /// the mtime unrecorded so the next poll retries.
+    fn poll_workspace_title(&mut self) -> bool {
+        let Some(snapshot) = self.snapshot.as_mut() else {
+            return false;
+        };
+        let Some(yaml) = self.path.parent().map(|d| d.join("workspace.yaml")) else {
+            return false;
+        };
+        let mtime = std::fs::metadata(&yaml)
+            .ok()
+            .as_ref()
+            .and_then(crate::telemetry::modified_or_none);
+        if mtime.is_none() || mtime == self.workspace_mtime {
+            return false;
+        }
+        let Ok(text) = std::fs::read_to_string(&yaml) else {
+            return false;
+        };
+        self.workspace_mtime = mtime;
+        parse_workspace_title(&text)
+            .is_some_and(|(name, source)| SessionTitle::offer(&mut snapshot.title, &name, source))
     }
 
     /// Suggested poll interval for the next wake-up. 250 ms while the
@@ -360,6 +403,44 @@ impl CopilotTranscriptTail {
             _ => Duration::from_secs(2),
         }
     }
+}
+
+/// The session name from a Copilot `workspace.yaml`: the top-level
+/// `name:` value, sourced as [`TitleSource::User`] when `user_named:
+/// true` says the user picked it, else as a generated title. `None`
+/// while Copilot hasn't named the session yet.
+///
+/// The file is flat `key: value` lines, so this scans lines rather than
+/// pulling in a YAML parser; a block scalar (`name: |`) is skipped.
+fn parse_workspace_title(yaml: &str) -> Option<(String, TitleSource)> {
+    let mut name = None;
+    let mut user_named = false;
+    for line in yaml.lines() {
+        // Top-level keys only — an indented `name:` belongs to a nested map.
+        if line.starts_with(char::is_whitespace) {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("name:") {
+            let value = unquote_yaml(rest.trim());
+            if !value.is_empty() && !value.starts_with(['|', '>']) {
+                name = Some(value.to_owned());
+            }
+        } else if let Some(rest) = line.strip_prefix("user_named:") {
+            user_named = rest.trim() == "true";
+        }
+    }
+    let source = if user_named { TitleSource::User } else { TitleSource::Generated };
+    name.map(|n| (n, source))
+}
+
+/// Strip one pair of matching surrounding quotes from a YAML scalar.
+fn unquote_yaml(value: &str) -> &str {
+    for q in ['"', '\''] {
+        if let Some(inner) = value.strip_prefix(q).and_then(|v| v.strip_suffix(q)) {
+            return inner;
+        }
+    }
+    value
 }
 
 /// Directory Copilot keeps one session's state in:
@@ -801,5 +882,55 @@ mod tests {
         );
         let tail = CopilotTranscriptTail::for_session(tmp.path(), "idle");
         assert_eq!(tail.poll_interval(), Duration::from_secs(2));
+    }
+
+    // --- session titles ---
+
+    const USER_MESSAGE: &str = r#"{"type":"user.message","timestamp":"2026-04-22T08:00:00Z","data":{"content":"add a 10 second delay\nplease","attachments":[]}}"#;
+
+    #[test]
+    fn workspace_title_reads_top_level_name() {
+        let yaml = "id: x\ncwd: C:\\dev\\x\nname: Implement Delay\nuser_named: false\n";
+        assert_eq!(
+            parse_workspace_title(yaml),
+            Some(("Implement Delay".to_string(), TitleSource::Generated))
+        );
+    }
+
+    #[test]
+    fn workspace_title_user_named_is_a_user_title() {
+        let yaml = "name: 'Mine'\nuser_named: true\n";
+        assert_eq!(parse_workspace_title(yaml), Some(("Mine".to_string(), TitleSource::User)));
+    }
+
+    #[test]
+    fn workspace_title_ignores_nested_and_block_names() {
+        assert_eq!(parse_workspace_title("repo:\n  name: nested\n"), None);
+        assert_eq!(parse_workspace_title("name: |\n  multi\n"), None);
+        assert_eq!(parse_workspace_title("cwd: x\n"), None);
+    }
+
+    #[test]
+    fn first_prompt_titles_the_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("s1");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_lines(&dir.join("events.jsonl"), &[USER_MESSAGE]);
+        let tail = CopilotTranscriptTail::for_session(tmp.path(), "s1");
+        let title = tail.snapshot.unwrap().title.unwrap();
+        assert_eq!(title.text, "add a 10 second delay");
+        assert_eq!(title.source, TitleSource::Prompt);
+    }
+
+    #[test]
+    fn workspace_name_replaces_the_prompt_title() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("s1");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_lines(&dir.join("events.jsonl"), &[USER_MESSAGE]);
+        let mut tail = CopilotTranscriptTail::for_session(tmp.path(), "s1");
+        std::fs::write(dir.join("workspace.yaml"), "name: Implement Delay\n").unwrap();
+        assert!(tail.poll());
+        assert_eq!(tail.snapshot.unwrap().title.unwrap().text, "Implement Delay");
     }
 }

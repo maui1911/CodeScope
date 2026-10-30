@@ -375,6 +375,12 @@ pub struct Session {
     pub agent_session_id: Option<String>,
     #[serde(default, alias = "closed_at")]
     pub closed_at: Option<String>,
+    /// Content title the agent gave the session (or its first prompt —
+    /// see [`crate::session_title`]), kept so closed history rows and a
+    /// restored tab still say what the session was about. Distinct from
+    /// `display_name`, the user's own rename, which always wins.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 /// Root object persisted to `%APPDATA%\CodeScope\projects.json`.
@@ -1203,6 +1209,7 @@ mod tests {
                     last_opened: None,
                     agent_session_id: None,
                     closed_at: None,
+                    title: None,
                 }],
                 worktrees: vec![Worktree {
                     id: "w-primary".into(),
@@ -1665,6 +1672,7 @@ mod tests {
                     last_opened: None,
                     agent_session_id: None,
                     closed_at: None,
+                    title: None,
                 }],
                 worktrees: vec![Worktree {
                     id: "primary".into(),
