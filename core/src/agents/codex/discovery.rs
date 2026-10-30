@@ -274,14 +274,17 @@ impl MetaPayload {
     /// like the IDE extension, Codex Desktop and the Claude Code plugin,
     /// so `originator: "codex-tui"` is what identifies it. Older TUIs
     /// wrote `source: "cli"` under a `codex-tui`, `codex_cli_rs` or no
-    /// `originator`, and nothing else ever did. Sub-agent threads carry
-    /// the TUI's originator too; their `source` is a `{"subagent": …}`
-    /// object and, since `thread_source` exists, that is `"subagent"`.
+    /// `originator`, and nothing else ever did. Sub-agent and internal
+    /// threads carry the TUI's originator too; their `source` is an
+    /// object (`{"subagent": …}`, `{"internal": …}`), and `thread_source`,
+    /// when present, is usually not `"user"`, but a `/review` sub-agent
+    /// inherits the parent's `"user"`. So any object `source` rules a
+    /// thread out.
     fn interactive(&self) -> bool {
         let source = self.source.as_ref();
         let tui = self.originator.as_ref().and_then(serde_json::Value::as_str) == Some("codex-tui")
             || source.and_then(serde_json::Value::as_str) == Some("cli");
-        let sub_agent = source.is_some_and(|s| s.get("subagent").is_some());
+        let sub_agent = source.is_some_and(|s| !s.is_string());
         let user_thread = self
             .thread_source
             .as_ref()
@@ -444,7 +447,17 @@ pub(crate) mod tests {
         ),
         (
             "TUI sub-agent 0.121.0",
-            r#""originator":"codex-tui","cli_version":"0.121.0","source":{"subagent":{"thread_spawn":{"parent_thread_id":"01a18c5a-3b93-7e73-b7a8-32a4dd2b8b80","depth":1}}}"#,
+            r#""originator":"codex-tui","cli_version":"0.121.0","source":{"subagent":{"thread_spawn":{"parent_thread_id":"00000000-0000-7000-8000-000000000001","depth":1}}}"#,
+            false,
+        ),
+        (
+            "TUI /review sub-agent, inherited thread_source",
+            r#""originator":"codex-tui","cli_version":"0.160.1","source":{"subagent":"review"},"thread_source":"user""#,
+            false,
+        ),
+        (
+            "TUI internal thread without thread_source",
+            r#""originator":"codex-tui","cli_version":"0.160.1","source":{"internal":"guardian"}"#,
             false,
         ),
         (
