@@ -238,11 +238,13 @@ pub fn built_in_defaults() -> Vec<AgentProfile> {
         AgentProfile {
             id: "opencode".into(),
             display_name: "OpenCode".into(),
-            // Windows ships the binary as `opencode-cli.exe` (npm
-            // `opencode-ai` package installs that name on Win to dodge a
-            // Windows reserved/conflicting name). macOS/Linux use
-            // `opencode`; flip this default if we ever cross-compile.
-            command: "opencode-cli".into(),
+            // `opencode` on every OS (#386): npm `opencode-ai`, scoop,
+            // choco, Homebrew and the install script all put that name
+            // on PATH, Windows included. `opencode-cli` is only the
+            // sidecar the OpenCode Desktop app bundles; Desktop-only
+            // users set `command` to `opencode-cli` in
+            // `settings.agents`. `AgentId::from_str` accepts both names.
+            command: "opencode".into(),
             // `opencode -c` (= `--continue`) resumes the most recent
             // session in the cwd. `opencode --session <id>` (= `-s <id>`)
             // resumes a specific id; we adopt that id from the
@@ -742,14 +744,21 @@ mod tests {
     #[test]
     fn build_resume_auto_type_opencode_with_id() {
         // OpenCode resumes by `--session <id>` (space-separated, no
-        // trailing `=` on the flag). The built-in command is
-        // `opencode-cli` on Windows.
+        // trailing `=` on the flag).
         let profile = registry_profile("opencode");
         let cmd = profile.command.clone();
         assert_eq!(
             build_resume_auto_type(&profile, Some("abc-123")),
             Some(format!("{cmd} --session abc-123")),
         );
+    }
+
+    #[test]
+    fn opencode_command_is_opencode_on_every_os() {
+        // #386: every CLI install (npm, scoop, choco, Homebrew, the
+        // install script) names the binary `opencode`, Windows
+        // included. `opencode-cli` is only the Desktop app's sidecar.
+        assert_eq!(registry_profile("opencode").command, "opencode");
     }
 
     #[test]
