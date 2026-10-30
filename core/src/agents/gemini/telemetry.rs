@@ -28,11 +28,10 @@
 //! | file says                                         | snapshot |
 //! |---------------------------------------------------|----------|
 //! | last message `user`                               | Busy |
-//! | last message `gemini` with `toolCalls`, all `success`/`error` | Busy (results go back to the model) |
-//! | … with a call still `awaiting_approval`/`scheduled`/`validating`/`executing` | PendingToolUse |
+//! | last message `gemini` with `toolCalls`            | Busy (results go back to the model) |
 //! | … with a `cancelled` call                         | Idle (the turn was cancelled) |
 //! | last message `gemini`, no text, no tool calls     | PendingToolUse (0.6x records a tool-call-only reply before the calls run) |
-//! | last message `gemini` with text, no tool calls    | Idle once the file has been quiet for [`IDLE_SETTLE`], Busy until then |
+//! | last message `gemini` with text, no tool calls    | Busy; Idle with `quiet_timeout` once the file has been quiet for [`IDLE_SETTLE`] |
 //! | last message `info` / `error`                     | Idle (`Request cancelled.`, API errors) |
 //! | `tokens.total` of the last `gemini` message       | tokens (overwrites, like Claude) |
 //! | `model` of the last `gemini` message              | model; `gemini-*` ids get a 1,048,576-token window |
@@ -42,11 +41,24 @@
 //!
 //! Why the settle: Gemini records a reply's text when its stream ends,
 //! and attaches the tool calls that reply asked for only once they have
-//! *finished* — after any approval prompt. A narrated "I will read the
-//! file…" followed by a call is indistinguishable from a final answer
-//! until then, so a text reply only counts as the end of the turn once
-//! nothing has been written for a few seconds. A call that waits for
-//! approval or runs longer than that shows Idle meanwhile.
+//! *finished* — after any approval prompt (`recordToolCalls` is only
+//! reached from `recordCompletedToolCalls`, in 0.30 and on main). An
+//! in-flight status (`awaiting_approval`, `executing`, …) therefore
+//! never reaches the file, and a narrated "I will run the tests…"
+//! followed by a call is indistinguishable from a final answer until
+//! the call is done. So a text reply only reads as the end of the turn
+//! once nothing has been written for a few seconds, and even then it is
+//! a guess: a call that waits for approval or runs longer than that
+//! shows Idle meanwhile. That Idle carries `quiet_timeout`, which the
+//! app does not announce.
+//!
+//! **No Ready bell for Gemini.** The settled Idle above is the only end
+//! an ordinary answer gets, and it is silent — otherwise every tool step
+//! longer than [`IDLE_SETTLE`] would ring "Turn complete". Only a turn
+//! ended by a notice (cancelled, API error) rings. For the same reason
+//! an approval prompt shows PendingToolUse ("Needs attention") only
+//! when the reply asking for it had no text — 0.6x records such a reply
+//! before its calls run — and not after a narrated reply.
 //!
 //! Gemini has no in-CLI rename, so there is no [`TitleSource::User`]
 //! title. `summary` is written when a *later* session starts in the
@@ -75,6 +87,10 @@ pub const BUSY_QUIET_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// A legacy `.json` chat is re-parsed at most once per this many times
 /// the duration of its last parse (≤ 2% of the UI thread).
 pub const LEGACY_REPARSE_DUTY: u32 = 50;
+
+/// Shortest wait before a legacy chat that failed to parse (read while
+/// Gemini was rewriting it) is read again.
+pub const LEGACY_TORN_RETRY: Duration = Duration::from_millis(500);
 
 /// How often a tail without a located chat retries, and how often a
 /// legacy tail checks whether its chat moved on to a `.jsonl`.
@@ -152,7 +168,6 @@ struct Msg {
     /// User: a real prompt (not a `/` or `?` command). Gemini: has text.
     text: bool,
     tool_calls: usize,
-    tool_open: bool,
     tool_cancelled: bool,
     tokens: Option<u64>,
     model: Option<String>,
@@ -288,9 +303,6 @@ impl Chat {
             .flatten()
             .map(|c| c.status.as_ref().and_then(Value::as_str).unwrap_or_default())
             .collect();
-        let open = |s: &&str| {
-            matches!(*s, "awaiting_approval" | "scheduled" | "validating" | "executing")
-        };
         let msg = Msg {
             id,
             kind,
@@ -301,7 +313,6 @@ impl Chat {
                 .and_then(crate::time::parse_iso8601_secs),
             text,
             tool_calls: statuses.len(),
-            tool_open: statuses.iter().any(open),
             tool_cancelled: statuses.contains(&"cancelled"),
             tokens: r.tokens.as_ref().and_then(tokens_total),
             model: r
@@ -343,7 +354,6 @@ impl Chat {
             Kind::User => Raw::State(SessionState::Busy),
             Kind::Notice => Raw::State(SessionState::Idle),
             Kind::Gemini if m.tool_cancelled => Raw::State(SessionState::Idle),
-            Kind::Gemini if m.tool_open => Raw::State(SessionState::PendingToolUse),
             Kind::Gemini if m.tool_calls > 0 => Raw::State(SessionState::Busy),
             Kind::Gemini if !m.text => Raw::State(SessionState::PendingToolUse),
             Kind::Gemini => Raw::TextReply,
@@ -473,7 +483,15 @@ impl GeminiChatTail {
         let state = match raw {
             Raw::TextReply => {
                 let age = mtime.and_then(|t| wall.duration_since(t).ok()).unwrap_or_default();
-                if age >= IDLE_SETTLE { SessionState::Idle } else { SessionState::Busy }
+                if age < IDLE_SETTLE {
+                    SessionState::Busy
+                } else {
+                    // A guess — the reply may be waiting on a tool call
+                    // Gemini records only once it is done — so the app
+                    // must not announce "Turn complete" for it.
+                    quiet = true;
+                    SessionState::Idle
+                }
             }
             Raw::State(SessionState::Busy)
                 if now.saturating_duration_since(self.last_activity) >= BUSY_QUIET_TIMEOUT =>
@@ -526,10 +544,18 @@ impl GeminiChatTail {
             return (false, mtime);
         }
         let started = Instant::now();
-        let Ok(bytes) = std::fs::read(path) else { return (false, mtime) };
         // A torn read (Gemini truncates, then writes) fails to parse;
-        // the next poll tries again.
-        let Ok(doc) = serde_json::from_slice::<Record>(&bytes) else { return (false, mtime) };
+        // the retry waits like a re-parse would, and at least
+        // `LEGACY_TORN_RETRY`, so a large chat mid-write is not re-read
+        // on every poll.
+        let parsed = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok());
+        let Some(doc) = parsed else {
+            self.next_legacy_parse =
+                now + (started.elapsed() * LEGACY_REPARSE_DUTY).max(LEGACY_TORN_RETRY);
+            return (false, mtime);
+        };
         let mut chat = Chat { title: self.chat.title.take(), ..Chat::default() };
         chat.apply(doc);
         self.chat = chat;
@@ -645,9 +671,11 @@ mod tests {
     }
 
     #[test]
-    fn open_tool_call_is_pending() {
-        let chat = chat_of(&[user("u1", "fix", T0), with_calls(reply("g1", "", T1), &["awaiting_approval"])]);
-        assert_eq!(chat.raw_state(), Raw::State(SessionState::PendingToolUse));
+    fn any_recorded_call_but_a_cancelled_one_is_busy() {
+        // Gemini records calls once they are done, so an in-flight
+        // status never reaches the file; were one to, the turn goes on.
+        let chat = chat_of(&[user("u1", "fix", T0), with_calls(reply("g1", "", T1), &["executing"])]);
+        assert_eq!(chat.raw_state(), Raw::State(SessionState::Busy));
     }
 
     #[test]
@@ -831,7 +859,8 @@ mod tests {
         assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Busy, "just written");
         assert!(tail.poll_with(later(), wall + IDLE_SETTLE));
         let s = tail.snapshot.clone().unwrap();
-        assert_eq!(s.state, SessionState::Idle);
+        // A guess, not a turn end Gemini wrote: no "Turn complete".
+        assert_eq!((s.state, s.quiet_timeout), (SessionState::Idle, true));
         assert_eq!(s.last_turn_duration, Some(Duration::from_secs(5)));
         assert_eq!(s.title.unwrap().text, "fix it");
     }
@@ -843,15 +872,17 @@ mod tests {
         write_json(&path, &doc(&[user("u1", "fix it", T0)], None));
         let mut tail = GeminiChatTail::for_session(&home_of(&chats), CWD, SID);
         let full = serde_json::to_string_pretty(&doc(
-            &[user("u1", "fix it", T0), with_calls(reply("g1", "", T1), &["awaiting_approval"])],
+            &[user("u1", "fix it", T0), reply("g1", "", T1)],
             None,
         ))
         .unwrap();
         std::fs::write(&path, &full[..full.len() / 2]).unwrap();
-        tail.poll_at(later());
+        let t = later();
+        tail.poll_at(t);
         assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Busy);
         std::fs::write(&path, &full).unwrap();
-        assert!(tail.poll_at(later()));
+        assert!(!tail.poll_at(t + LEGACY_TORN_RETRY / 2), "a failed parse is throttled too");
+        assert!(tail.poll_at(t + LEGACY_TORN_RETRY * 2));
         assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::PendingToolUse);
     }
 
@@ -879,8 +910,40 @@ mod tests {
         tail.poll_with(start, wall);
         assert!(tail.poll_with(start, wall + IDLE_SETTLE));
         let s = tail.snapshot.clone().unwrap();
-        assert_eq!(s.state, SessionState::Idle);
+        assert_eq!((s.state, s.quiet_timeout), (SessionState::Idle, true));
         assert_eq!(s.title.unwrap(), SessionTitle { text: "Fix it".into(), source: TitleSource::Generated });
+    }
+
+    #[test]
+    fn settled_reply_followed_by_a_finished_tool_goes_back_to_busy() {
+        // "I will run the tests." settles to Idle while the command runs;
+        // the call is recorded once it finishes and the turn goes on.
+        let (_tmp, chats) = home_with_project(CWD, "alpha");
+        let path = chats.join("session-2026-10-30T10-00-d1c96a3f.jsonl");
+        std::fs::write(&path, jsonl_head(SID, "main")).unwrap();
+        append_line(&path, &user("u1", "run the tests", T0));
+        append_line(&path, &reply("g1", "I will run the tests.", T1));
+        let start = Instant::now();
+        let mut tail = GeminiChatTail::for_session(&home_of(&chats), CWD, SID);
+        tail.poll_with(start, SystemTime::now() + IDLE_SETTLE);
+        let s = tail.snapshot.clone().unwrap();
+        assert_eq!((s.state, s.quiet_timeout), (SessionState::Idle, true));
+        append_line(&path, &with_calls(reply("g1", "I will run the tests.", T1), &["success"]));
+        assert!(tail.poll_with(start, SystemTime::now()));
+        let s = tail.snapshot.clone().unwrap();
+        assert_eq!((s.state, s.quiet_timeout), (SessionState::Busy, false));
+    }
+
+    #[test]
+    fn a_notice_is_a_real_turn_end() {
+        let (_tmp, chats) = home_with_project(CWD, "alpha");
+        let path = chats.join("session-2026-10-30T10-00-d1c96a3f.jsonl");
+        std::fs::write(&path, jsonl_head(SID, "main")).unwrap();
+        append_line(&path, &user("u1", "fix it", T0));
+        append_line(&path, &json!({"id": "i1", "timestamp": T2, "type": "info", "content": "Request cancelled."}));
+        let tail = GeminiChatTail::for_session(&home_of(&chats), CWD, SID);
+        let s = tail.snapshot.clone().unwrap();
+        assert_eq!((s.state, s.quiet_timeout), (SessionState::Idle, false));
     }
 
     #[test]
