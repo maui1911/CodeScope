@@ -543,8 +543,8 @@ impl Sidebar {
                 // `SpawnSession` flag — defaults to `true` so the
                 // common path drops the user inside the new worktree,
                 // but flipping it off lets them create the worktree
-                // without entering it. Single spaces around `·` to
-                // match the C# build's
+                // without entering it. The tab renders
+                // `{project} · {branch}`, matching the C# build's
                 // `$"{project.Name} · {branch}"` convention in
                 // `MainViewModel.RefreshTabTitlesForWorktree`.
                 if spawn_session {
@@ -559,7 +559,7 @@ impl Sidebar {
                     // sitting in).
                     cx.emit(crate::sidebar::SidebarEvent::OpenSession {
                         working_directory: std::path::PathBuf::from(&folder),
-                        title: format!("{project_name} · {branch}").into(),
+                        title: codescope_core::TabTitle::worktree(project_name, branch),
                         auto_type: None,
                         agent_id: None,
                         force_new: true,
