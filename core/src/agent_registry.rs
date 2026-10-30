@@ -238,15 +238,13 @@ pub fn built_in_defaults() -> Vec<AgentProfile> {
         AgentProfile {
             id: "opencode".into(),
             display_name: "OpenCode".into(),
-            // Picked per target OS at compile time (#386). Windows keeps
-            // `opencode-cli` (the `opencode-cli.exe` the OpenCode Desktop
-            // app bundles), the name this profile has always launched
-            // there. macOS / Linux launch `opencode`, the binary every
-            // CLI install (npm `opencode-ai`, install script, Homebrew)
-            // puts on PATH. Note that npm also installs `opencode` on
-            // Windows; users without `opencode-cli` override `command`
-            // in `settings.agents`. `AgentId::from_str` accepts both.
-            command: if cfg!(windows) { "opencode-cli" } else { "opencode" }.into(),
+            // `opencode` on every OS (#386): npm `opencode-ai`, scoop,
+            // choco, Homebrew and the install script all put that name
+            // on PATH, Windows included. `opencode-cli` is only the
+            // sidecar the OpenCode Desktop app bundles; Desktop-only
+            // users set `command` to `opencode-cli` in
+            // `settings.agents`. `AgentId::from_str` accepts both names.
+            command: "opencode".into(),
             // `opencode -c` (= `--continue`) resumes the most recent
             // session in the cwd. `opencode --session <id>` (= `-s <id>`)
             // resumes a specific id; we adopt that id from the
@@ -746,8 +744,7 @@ mod tests {
     #[test]
     fn build_resume_auto_type_opencode_with_id() {
         // OpenCode resumes by `--session <id>` (space-separated, no
-        // trailing `=` on the flag). The built-in command differs per
-        // OS (`opencode-cli` on Windows, `opencode` elsewhere).
+        // trailing `=` on the flag).
         let profile = registry_profile("opencode");
         let cmd = profile.command.clone();
         assert_eq!(
@@ -756,17 +753,11 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
     #[test]
-    fn opencode_command_is_opencode_cli_on_windows() {
-        assert_eq!(registry_profile("opencode").command, "opencode-cli");
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn opencode_command_is_opencode_off_windows() {
-        // #386: macOS / Linux have no `opencode-cli` on PATH; every
-        // CLI install names the binary `opencode`.
+    fn opencode_command_is_opencode_on_every_os() {
+        // #386: every CLI install (npm, scoop, choco, Homebrew, the
+        // install script) names the binary `opencode`, Windows
+        // included. `opencode-cli` is only the Desktop app's sidecar.
         assert_eq!(registry_profile("opencode").command, "opencode");
     }
 

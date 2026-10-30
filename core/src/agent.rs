@@ -57,8 +57,8 @@ impl AgentId {
     /// the canonical ids so first-token parsing of an `auto_type`
     /// command (`agent_id_from_auto_type`) still classifies sessions
     /// correctly when the registry's `command` differs from the id —
-    /// the built-in OpenCode profile launches `opencode-cli` on
-    /// Windows, for instance. The alias list
+    /// an OpenCode Desktop user who overrides `command` to
+    /// `opencode-cli`, for instance. The alias list
     /// is intentionally small and explicit; unknown binaries still
     /// resolve to `None`.
     // Not `FromStr`: an unknown id is an ordinary `None`, not an `Err`, and callers rely on it.
@@ -72,9 +72,9 @@ impl AgentId {
             Some(AgentId::Copilot)
         } else if s.eq_ignore_ascii_case("opencode") || s.eq_ignore_ascii_case("opencode-cli") {
             // `opencode-cli` is the OpenCode Desktop sidecar name —
-            // the built-in profile uses it as `command` on Windows, and
-            // `agent_id_from_auto_type` would otherwise classify
-            // OpenCode sessions as `None`.
+            // Desktop-only users set it as `command` in
+            // `settings.agents`, and `agent_id_from_auto_type` would
+            // otherwise classify their OpenCode sessions as `None`.
             Some(AgentId::OpenCode)
         } else if s.eq_ignore_ascii_case("pi") {
             Some(AgentId::Pi)
@@ -199,9 +199,9 @@ mod tests {
 
     #[test]
     fn opencode_cli_alias_resolves_to_opencode() {
-        // The built-in OpenCode profile launches `opencode-cli` on
-        // Windows; the alias keeps `agent_id_from_auto_type` honest
-        // when the sidebar's "New OpenCode session" row runs it.
+        // OpenCode Desktop users override `command` to its
+        // `opencode-cli` sidecar; the alias keeps
+        // `agent_id_from_auto_type` honest when their tabs run it.
         assert_eq!(AgentId::from_str("opencode-cli"), Some(AgentId::OpenCode));
         assert_eq!(AgentId::from_str("OPENCODE-CLI"), Some(AgentId::OpenCode));
         assert_eq!(
