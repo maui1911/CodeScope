@@ -2220,7 +2220,7 @@ impl AppShell {
     ///
     /// * Claude — `~/.claude/projects/<encoded-cwd>/<sid>.jsonl`
     /// * Pi      — `~/.pi/agent/sessions/.../*_<sid>.jsonl` (recursive)
-    /// * OpenCode — `~/.local/share/opencode/.../message/<sid>/msg_*.json`
+    /// * OpenCode — `session` rows in `~/.local/share/opencode/opencode.db`
     /// * Copilot  — `~/.copilot/session-state/<sid>/`
     ///
     /// All four scans match by canonicalised cwd (Claude uses an
@@ -2419,12 +2419,27 @@ impl AppShell {
                                     else {
                                         continue;
                                     };
-                                    codescope_core::agents::opencode::discovery::scan(
+                                    // One SQLite file holds every
+                                    // session, so there is no
+                                    // per-session path to stat: the
+                                    // row's `time_updated` is the
+                                    // recency signal, timed here
+                                    // instead of below.
+                                    let hits = codescope_core::agents::opencode::discovery::scan(
                                         &root, &wd_str, tab.spawned_at,
                                     )
                                     .into_iter()
-                                    .map(|c| (c.session_id, c.message_path))
-                                    .collect()
+                                    .map(|c| (c.session_id, c.updated_at))
+                                    .collect();
+                                    scans.push(Scan {
+                                        group_idx: g_idx,
+                                        tab_idx: t_idx,
+                                        agent_id,
+                                        has_adoption: tab.adopted_session_id.is_some(),
+                                        hits,
+                                        exact,
+                                    });
+                                    continue;
                                 }
                                 codescope_core::AgentId::Copilot => {
                                     let Some(root) =
