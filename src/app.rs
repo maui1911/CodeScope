@@ -352,26 +352,51 @@ struct ClaudeProc {
 /// the one its neighbour just minted.
 ///
 /// `exact` short-circuits all of that: it is the session the agent
-/// process running in this tab reports itself (Claude Code's
-/// `~/.claude/sessions/<pid>.json`, see
-/// `codescope_core::agents::claude::live_session`). It is the only
+/// process running in this tab reports itself, found through the tab's
+/// shell process tree (`codescope_core::process_tree`). It is the only
 /// candidate — adopted once its transcript is on disk, whoever else
 /// claimed it — and the caller keeps it out of every other tab's
-/// reach. Without it the heuristic has ceilings, all one gap: within a
-/// round nothing distinguishes same-cwd tabs, so iteration order
-/// decides.
+/// reach. Which agents can name it (#383):
 ///
-/// * Same-cwd tabs that *all* already own a transcript: a `/clear`
-///   rotation in one of them goes to whichever comes first.
-/// * Same-cwd tabs that *none* of which have adopted yet: the first
-///   transcript to appear goes to the first tab. Claude Code writes its
-///   transcript on the first prompt, not at startup, so prompting the
-///   second tab first crosses the two tabs' ids — titles, status dots
-///   and resume all land on the neighbour.
-/// * The dev build and the installed build share
-///   `~/.claude/projects/` but keep separate `projects.json` stores,
-///   so neither sees the other's claims. A tab in one instance can
-///   still adopt a transcript minted in the other.
+/// * **Claude Code** — exact: `~/.claude/sessions/<pid>.json` holds the
+///   session each running `claude` is in, following `/clear`
+///   (`codescope_core::agents::claude::live_session`).
+/// * **Copilot CLI** — exact: every session a running `copilot` has
+///   open carries `inuse.<pid>.lock` in its session directory, written
+///   at startup (`codescope_core::agents::copilot::live_session`).
+///   Sessions only *another* live process holds are dropped from the
+///   tab's guesses, which also keeps out a `copilot` running outside
+///   this CodeScope instance.
+/// * **Codex** — heuristic. Nothing on disk ties a thread to a pid: the
+///   `thread-writer-locks/<id>.lock` files are empty, and since 0.160
+///   the TUI hands its threads to a shared app-server daemon, so even
+///   the process holding a rollout open is the same for every tab.
+/// * **Gemini CLI**, **Pi** — heuristic. No per-process record at all
+///   (gemini-cli 0.30, pi 0.73).
+/// * **OpenCode** — heuristic. `opencode.db` records no process or
+///   port per session.
+///
+/// None of them accepts a caller-chosen id for a *new* session except
+/// Copilot (`--session-id`), which the lock files already cover.
+///
+/// For the heuristic agents the gap is within a round: several same-cwd
+/// tabs can see the same new transcript. The tab the user last pressed
+/// Enter in picks first ([`adoption_rank`]): Codex, Pi and gemini-cli
+/// 0.3x create their record on the first prompt, not at startup, so
+/// the launch time can't tell two tabs apart beyond the `since` filter
+/// the scans already apply. (Later gemini-cli releases create theirs
+/// at startup; there the order is unchanged, iteration order decides
+/// between tabs nobody has typed in.) Left over:
+///
+/// * A tab with no transcript yet still picks before tabs that own
+///   one, so a `/clear` rotation in one of those goes to a fresh
+///   neighbour that sees it.
+/// * Prompting two same-cwd tabs within the time it takes the first
+///   agent to write (Pi waits for the first reply) still crosses them.
+/// * The dev build and the installed build share the agents' data
+///   directories but keep separate `projects.json` stores, so neither
+///   sees the other's claims. A tab in one instance can still adopt a
+///   transcript minted in the other.
 fn select_adoption(
     hits: &[(String, SystemTime)],
     fired: &HashSet<String>,
@@ -970,6 +995,14 @@ pub struct AppShell {
     /// The `claude` process found in each Claude tab, keyed by tab id —
     /// see [`ClaudeProc`].
     claude_procs: HashMap<u64, ClaudeProc>,
+    /// Per Copilot tab: sessions in its folder it must not adopt —
+    /// another live `copilot` holds them, or its own is known to be in a
+    /// different one (`codescope_core::agents::copilot::live_session::Ownership`)
+    /// — with the session directory's mtime when that was found. Kept
+    /// out of the tab's guesses without re-walking the process tree
+    /// every tick; looked at again once the directory changes (a lock
+    /// file added or removed changes it).
+    copilot_foreign: HashMap<u64, HashMap<String, SystemTime>>,
     /// Placement seen on the previous bounds-observer tick. Feeds
     /// [`unmaximized_by_display_change`]; `None` until the first tick.
     last_window_placement: Option<WindowPlacement>,
@@ -1756,6 +1789,7 @@ impl AppShell {
             window_active_cached: true,
             telemetry_tails: HashMap::new(),
             claude_procs: HashMap::new(),
+            copilot_foreign: HashMap::new(),
             last_window_placement: None,
             last_monitor_change: None,
             maximized_before_minimize: false,
@@ -2405,6 +2439,7 @@ impl AppShell {
                             None => false,
                         }
                     });
+                    this.copilot_foreign.retain(|tab_id, _| live_tabs.contains(tab_id));
                     for (g_idx, group) in this.groups.iter().enumerate() {
                         for (t_idx, tab) in group.tabs.iter().enumerate() {
                             let Some(agent_id) = tab.agent_id else { continue };
@@ -2537,6 +2572,7 @@ impl AppShell {
                                     .collect()
                                 }
                             };
+                            let foreign = this.copilot_foreign.get(&tab.id);
                             let hits: Vec<(String, SystemTime)> = hits
                                 .into_iter()
                                 .map(|(sid, path)| {
@@ -2545,6 +2581,11 @@ impl AppShell {
                                         .and_then(|m| m.modified().ok())
                                         .unwrap_or(SystemTime::UNIX_EPOCH);
                                     (sid, mtime)
+                                })
+                                // A session another `copilot` held when
+                                // its directory last looked like this.
+                                .filter(|(sid, mtime)| {
+                                    foreign.is_none_or(|f| f.get(sid) != Some(mtime))
                                 })
                                 .collect();
                             scans.push(Scan {
@@ -2580,16 +2621,20 @@ impl AppShell {
                                 .cloned()
                         }))
                         .collect();
-                    // A Claude tab whose `claude` isn't known yet and
-                    // that is about to adopt a transcript by guessing:
-                    // look its process up first — one process-table
-                    // snapshot for all of them. Only then, so a quiet
-                    // workspace never pays for the walk.
+                    // A tab about to adopt a transcript by guessing,
+                    // whose agent can say exactly which session it is
+                    // in (Claude Code, Copilot CLI — see
+                    // `select_adoption`): ask it first — one
+                    // process-table snapshot for all of them. Only
+                    // then, so a quiet workspace never pays for the
+                    // walk.
                     let unresolved: Vec<usize> = (0..scans.len())
                         .filter(|&i| {
                             let s = &scans[i];
-                            s.agent_id == codescope_core::AgentId::Claude
-                                && s.exact.is_none()
+                            matches!(
+                                s.agent_id,
+                                codescope_core::AgentId::Claude | codescope_core::AgentId::Copilot
+                            ) && s.exact.is_none()
                                 && this
                                     .groups
                                     .get(s.group_idx)
@@ -2606,10 +2651,11 @@ impl AppShell {
                                     })
                         })
                         .collect();
-                    if !unresolved.is_empty()
-                        && let Some(dir) = claude_sessions_dir.as_deref()
-                    {
+                    if !unresolved.is_empty() {
                         let table = codescope_core::process_tree::process_table();
+                        let mut live: Option<HashSet<u32>> = None;
+                        let copilot_root =
+                            codescope_core::agents::copilot::telemetry::default_session_state_root();
                         for i in unresolved {
                             let Some(tab) = this
                                 .groups
@@ -2619,12 +2665,37 @@ impl AppShell {
                                 continue;
                             };
                             let Some(shell) = tab.terminal.read(cx).child_pid() else { continue };
+                            let pids = codescope_core::process_tree::descendants(shell, &table);
+                            if scans[i].agent_id == codescope_core::AgentId::Copilot {
+                                let Some(root) = copilot_root.as_deref() else { continue };
+                                let live = live.get_or_insert_with(|| {
+                                    table.iter().map(|&(pid, _)| pid).collect()
+                                });
+                                let owned = codescope_core::agents::copilot::live_session::ownership(
+                                    root,
+                                    &scans[i].hits,
+                                    &pids,
+                                    live,
+                                );
+                                // Out of this and every later guess
+                                // until the directory changes.
+                                let foreign = this.copilot_foreign.entry(tab.id).or_default();
+                                scans[i].hits.retain(|(sid, mtime)| {
+                                    let theirs = owned.foreign.contains(sid);
+                                    if theirs {
+                                        foreign.insert(sid.clone(), *mtime);
+                                    }
+                                    !theirs
+                                });
+                                scans[i].exact = owned.exact;
+                                continue;
+                            }
+                            let Some(dir) = claude_sessions_dir.as_deref() else { continue };
                             let wd = tab
                                 .working_directory
                                 .as_ref()
                                 .map(|wd| wd.to_string_lossy().into_owned())
                                 .unwrap_or_default();
-                            let pids = codescope_core::process_tree::descendants(shell, &table);
                             let Some((pid, session_id)) =
                                 codescope_core::agents::claude::live_session::session_for_pids(
                                     dir, &pids, &wd,
