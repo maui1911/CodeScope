@@ -402,6 +402,19 @@ fn select_adoption(
     newest.map(|(_, sid)| sid.to_owned())
 }
 
+/// Sort key for the order tabs pick in an adoption pass, lowest first:
+/// tabs whose agent named its own session, then tabs that own nothing
+/// yet, then the rest — see [`select_adoption`]. Within each class the
+/// tab the user last pressed Enter in goes first: an agent that writes
+/// its transcript on the first prompt writes it right after one.
+fn adoption_rank(
+    exact: bool,
+    has_adoption: bool,
+    last_submit: Option<Instant>,
+) -> (bool, bool, std::cmp::Reverse<Option<Instant>>) {
+    (!exact, has_adoption, std::cmp::Reverse(last_submit))
+}
+
 /// One column in the work area: a tab strip + the currently-selected
 /// tab's terminal. Mirrors `EditorGroupViewModel` from the C# build —
 /// flat list, no recursion. The group's identity is its `id` so we can
@@ -2342,6 +2355,10 @@ impl AppShell {
                         /// The session the agent in this tab reports
                         /// it is in — see `select_adoption`.
                         exact: Option<String>,
+                        /// `TerminalView::last_submit` — orders tabs
+                        /// within a selection round, see
+                        /// `adoption_rank`.
+                        last_submit: Option<Instant>,
                     }
                     let mut scans: Vec<Scan> = Vec::new();
                     let mut any_active = false;
@@ -2465,6 +2482,7 @@ impl AppShell {
                                         has_adoption: tab.adopted_session_id.is_some(),
                                         hits,
                                         exact,
+                                        last_submit: tab.terminal.read(cx).last_submit(),
                                     });
                                     continue;
                                 }
@@ -2536,6 +2554,7 @@ impl AppShell {
                                 has_adoption: tab.adopted_session_id.is_some(),
                                 hits,
                                 exact,
+                                last_submit: tab.terminal.read(cx).last_submit(),
                             });
                         }
                     }
@@ -2631,13 +2650,17 @@ impl AppShell {
                     // the neighbour it shares a working directory with
                     // — stealing the conversation *and*, now that
                     // claims are exclusive, locking the rightful tab
-                    // out for good. Stable sort, so iteration order
-                    // still decides within each class. Ahead of both:
-                    // tabs whose agent named its own session, and
-                    // those sessions are off-limits to every guess.
+                    // out for good. Within each class the tab the user
+                    // submitted to last goes first, then iteration
+                    // order (stable sort). Ahead of both: tabs whose
+                    // agent named its own session, and those sessions
+                    // are off-limits to every guess.
                     claimed.extend(scans.iter().filter_map(|s| s.exact.clone()));
                     let mut order: Vec<usize> = (0..scans.len()).collect();
-                    order.sort_by_key(|&i| (scans[i].exact.is_none(), scans[i].has_adoption));
+                    order.sort_by_key(|&i| {
+                        let s = &scans[i];
+                        adoption_rank(s.exact.is_some(), s.has_adoption, s.last_submit)
+                    });
                     let mut found = Vec::new();
                     for i in order {
                         let s = &scans[i];
@@ -10102,6 +10125,70 @@ mod tests {
             select_adoption(&hits, &ids(&[SID_B]), Some(SID_B), &ids(&[SID_B]), Some(SID_B)),
             None
         );
+    }
+
+    // ─── adoption_rank ─────────────────────────────────────────────
+
+    /// One guessing pass over same-folder tabs, the way the adoption
+    /// tick runs it: `(adopted id, last submit)` per tab, all seeing
+    /// `hits`. Returns what each tab adopts.
+    fn guess_round(
+        tabs: &[(Option<&str>, Option<Instant>)],
+        hits: &[(String, SystemTime)],
+    ) -> Vec<Option<String>> {
+        let mut claimed: HashSet<String> =
+            tabs.iter().filter_map(|(adopted, _)| adopted.map(str::to_owned)).collect();
+        let mut order: Vec<usize> = (0..tabs.len()).collect();
+        order.sort_by_key(|&i| adoption_rank(false, tabs[i].0.is_some(), tabs[i].1));
+        let mut out = vec![None; tabs.len()];
+        for i in order {
+            let (adopted, _) = tabs[i];
+            let fired = adopted.map(|a| ids(&[a])).unwrap_or_default();
+            if let Some(sid) = select_adoption(hits, &fired, adopted, &claimed, None) {
+                claimed.insert(sid.clone());
+                out[i] = Some(sid);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_tab_prompted_last_takes_a_new_transcript_first() {
+        // Two fresh tabs in one folder; the user prompts the right-hand
+        // one first and only its agent has written. Iteration order
+        // alone handed that transcript to the left-hand tab.
+        let t0 = Instant::now();
+        let hits = vec![(SID_B.to_owned(), at(20))];
+        let tabs = [(None, None), (None, Some(t0))];
+        assert_eq!(guess_round(&tabs, &hits), vec![None, Some(SID_B.to_owned())]);
+    }
+
+    #[test]
+    fn a_rotation_goes_to_the_tab_that_submitted_it() {
+        // Both tabs own a transcript; `/clear` in the right-hand tab
+        // mints SID_B. The left-hand tab's last prompt was earlier.
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(5);
+        let hits = vec![(SID_A.to_owned(), at(10)), (SID_B.to_owned(), at(20))];
+        let sid_c = "cccccccc-0000-0000-0000-000000000000";
+        let tabs = [(Some(SID_A), Some(t0)), (Some(sid_c), Some(t1))];
+        assert_eq!(guess_round(&tabs, &hits), vec![None, Some(SID_B.to_owned())]);
+    }
+
+    #[test]
+    fn adoption_rank_keeps_exact_then_unadopted_ahead_of_recency() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+        let mut ranks = [
+            (5, adoption_rank(false, true, None)),
+            (4, adoption_rank(false, true, Some(t1))),
+            (3, adoption_rank(false, false, None)),
+            (2, adoption_rank(false, false, Some(t0))),
+            (1, adoption_rank(false, false, Some(t1))),
+            (0, adoption_rank(true, true, None)),
+        ];
+        ranks.sort_by_key(|(_, rank)| *rank);
+        assert_eq!(ranks.map(|(i, _)| i), [0, 1, 2, 3, 4, 5]);
     }
 
     // ─── normalise_group_weights ───────────────────────────────────
