@@ -543,6 +543,7 @@ pub fn process_message_dir(watch: &mut SessionWatch) -> bool {
         last_turn_duration,
         state,
         quiet_timeout: false,
+        title: None,
     };
 
     if Some(&snap) == watch.snapshot.as_ref() {

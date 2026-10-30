@@ -290,6 +290,24 @@ struct Tab {
     /// dispatch — mirrors the `agentId` string the C#
     /// `MainViewModel.RegisterAgentTelemetry` branches on.
     agent_id: Option<codescope_core::AgentId>,
+    /// The session label (rename, else content title) last written
+    /// into `title` by [`AppShell::apply_session_titles`], so a tick
+    /// that sees the same label again does no work. `None` until one
+    /// is known.
+    applied_label: Option<String>,
+}
+
+/// The `claude` process running in a tab and the session it reported,
+/// remembered so the adoption tick only has to stat one small file per
+/// tab. Walking the process tree to find it costs milliseconds on the
+/// UI thread; it only happens when a tab without one has a transcript
+/// to adopt.
+struct ClaudeProc {
+    pid: u32,
+    /// mtime of `~/.claude/sessions/<pid>.json` when `session_id` was
+    /// read; Claude Code rewrites the file when the session changes.
+    file_mtime: SystemTime,
+    session_id: String,
 }
 
 /// Pick the transcript a tab should adopt this tick: the newest
@@ -314,21 +332,23 @@ struct Tab {
 /// first — so a tab that already owns a transcript can't rotate onto
 /// the one its neighbour just minted.
 ///
-/// Remaining ceilings. The first two are the same gap — the rounds
-/// separate adopted tabs from unadopted ones, but *within* a round
-/// nothing distinguishes same-cwd tabs, so iteration order decides.
-/// Closing either needs the agent to report its own session id back to
-/// us:
+/// `exact` short-circuits all of that: it is the session the agent
+/// process running in this tab reports itself (Claude Code's
+/// `~/.claude/sessions/<pid>.json`, see
+/// `codescope_core::agents::claude::live_session`). It is the only
+/// candidate — adopted once its transcript is on disk, whoever else
+/// claimed it — and the caller keeps it out of every other tab's
+/// reach. Without it the heuristic has ceilings, all one gap: within a
+/// round nothing distinguishes same-cwd tabs, so iteration order
+/// decides.
 ///
 /// * Same-cwd tabs that *all* already own a transcript: a `/clear`
 ///   rotation in one of them goes to whichever comes first.
 /// * Same-cwd tabs that *none* of which have adopted yet: the first
-///   transcript to appear goes to the first tab, which is only right
-///   because tab order follows spawn order and an agent normally
-///   writes its transcript at startup. If the second tab's agent
-///   writes first, the two tabs end up holding each other's ids.
-///   Both still get exactly one transcript — this crosses the mapping,
-///   it does not starve a tab.
+///   transcript to appear goes to the first tab. Claude Code writes its
+///   transcript on the first prompt, not at startup, so prompting the
+///   second tab first crosses the two tabs' ids — titles, status dots
+///   and resume all land on the neighbour.
 /// * The dev build and the installed build share
 ///   `~/.claude/projects/` but keep separate `projects.json` stores,
 ///   so neither sees the other's claims. A tab in one instance can
@@ -338,7 +358,15 @@ fn select_adoption(
     fired: &HashSet<String>,
     adopted: Option<&str>,
     claimed: &HashSet<String>,
+    exact: Option<&str>,
 ) -> Option<String> {
+    if let Some(own) = exact {
+        // Fired before but since rotated away from (a guess on a tick
+        // when the exact id wasn't readable) still counts: come back.
+        let on_disk = hits.iter().any(|(sid, _)| sid == own);
+        let current = fired.contains(own) && adopted == Some(own);
+        return (on_disk && !current).then(|| own.to_owned());
+    }
     let mut newest: Option<(SystemTime, &str)> = None;
     for (sid, mtime) in hits {
         if fired.contains(sid) {
@@ -565,6 +593,10 @@ const TELEMETRY_POLL_ACTIVE: Duration = Duration::from_millis(250);
 /// (avoids a wakeup/teardown dance per tab) but throttle to a
 /// 30 s heartbeat so an idle CodeScope doesn't burn cycles.
 const TELEMETRY_POLL_IDLE: Duration = Duration::from_secs(30);
+/// Cadence with no tails but an agent tab open: nothing to read from
+/// disk, only terminal titles to pick up (see
+/// `AppShell::content_title_for`), so a couple of seconds is plenty.
+const TELEMETRY_POLL_UNTAILED_AGENT: Duration = Duration::from_secs(2);
 /// Cap on simultaneously-visible toasts. Mirrors the C# build's
 /// ToastService visible-cap. When the user fires a flurry of
 /// actions (or hits a recurring error) we evict the oldest so the
@@ -897,6 +929,9 @@ pub struct AppShell {
     /// `MainViewModel.RegisterAgentTelemetry` / `UnregisterAgentTelemetry`
     /// dispatching to four distinct `*TelemetryService` instances.
     telemetry_tails: HashMap<String, AgentTail>,
+    /// The `claude` process found in each Claude tab, keyed by tab id —
+    /// see [`ClaudeProc`].
+    claude_procs: HashMap<u64, ClaudeProc>,
     /// Placement seen on the previous bounds-observer tick. Feeds
     /// [`unmaximized_by_display_change`]; `None` until the first tick.
     last_window_placement: Option<WindowPlacement>,
@@ -1274,6 +1309,14 @@ impl AppShell {
                 }
                 SidebarEvent::ReopenSession { session_id } => {
                     this.reopen_session(session_id.clone(), window, cx);
+                }
+                SidebarEvent::FocusTab { tab_id } => {
+                    let found = this.groups.iter().enumerate().find_map(|(g_idx, g)| {
+                        g.tabs.iter().position(|t| t.id == *tab_id).map(|t_idx| (g_idx, t_idx))
+                    });
+                    if let Some((g_idx, t_idx)) = found {
+                        this.activate_tab(g_idx, t_idx, window, cx);
+                    }
                 }
                 SidebarEvent::OpenDiff { worktree_path } => {
                     this.open_diff_viewer(Some(worktree_path.clone()), cx);
@@ -1674,6 +1717,7 @@ impl AppShell {
             idle_notifier: crate::idle_notifier::IdleNotifier::new(),
             window_active_cached: true,
             telemetry_tails: HashMap::new(),
+            claude_procs: HashMap::new(),
             last_window_placement: None,
             last_monitor_change: None,
             maximized_before_minimize: false,
@@ -1866,6 +1910,31 @@ impl AppShell {
                 "warning: failed to persist agent_session_id for {session_id}: {err:#}"
             );
         }
+    }
+
+    /// Persist that the rows of `session_ids` no longer own the agent
+    /// session (and content title) they had adopted — see
+    /// `SessionManager::release_agent_session`. Reload-then-mutate,
+    /// like every other `projects.json` write here.
+    fn release_agent_sessions(&mut self, session_ids: &[String], cx: &mut Context<Self>) {
+        match ProjectsConfig::load(&self.paths) {
+            Ok(cfg) => self.projects = cfg,
+            Err(err) => {
+                eprintln!("warning: failed to reload projects.json before releasing sessions: {err:#}");
+                return;
+            }
+        }
+        let mut changed = false;
+        for id in session_ids {
+            changed |= SessionManager::release_agent_session(&mut self.projects, id);
+        }
+        if !changed {
+            return;
+        }
+        if let Err(err) = self.projects.save(&self.paths) {
+            eprintln!("warning: failed to persist released agent sessions: {err:#}");
+        }
+        self.mirror_projects_to_sidebar(cx);
     }
 
     /// Register a transcript tail for `session_id` under
@@ -2066,6 +2135,10 @@ impl AppShell {
                 }
                 let result = this.update(cx, |this, cx| {
                     if this.telemetry_tails.is_empty() {
+                        // Agent tabs without a tail (transcript saving
+                        // off, or not adopted yet) can still be titled
+                        // from their terminal title.
+                        this.apply_session_titles(cx);
                         // Even with zero tails, the sidebar might
                         // still be holding stale busy/active sets
                         // from a session that just closed. Push
@@ -2074,11 +2147,26 @@ impl AppShell {
                         // Same logic for the taskbar overlay: a tab
                         // that just closed should clear the badge.
                         this.refresh_taskbar_badge();
-                        return TELEMETRY_POLL_IDLE;
+                        // Those terminal titles change on the agent's
+                        // schedule; a 30 s heartbeat would leave the
+                        // sidebar a topic behind.
+                        let agent_tab_open = this
+                            .groups
+                            .iter()
+                            .flat_map(|g| g.tabs.iter())
+                            .any(|t| t.agent_id.is_some());
+                        return if agent_tab_open {
+                            TELEMETRY_POLL_UNTAILED_AGENT
+                        } else {
+                            TELEMETRY_POLL_IDLE
+                        };
                     }
                     for tail in this.telemetry_tails.values_mut() {
                         tail.poll();
                     }
+                    // Titles first, so the sidebar rows pushed below
+                    // already carry this tick's labels.
+                    this.apply_session_titles(cx);
                     // After every poll, recompute the per-path
                     // active/busy snapshot the sidebar uses to colour
                     // its worktree dots and propagate "agent busy" up
@@ -2160,7 +2248,7 @@ impl AppShell {
                 if this.upgrade().is_none() {
                     break;
                 }
-                let result = this.update(cx, |this, _cx| {
+                let result = this.update(cx, |this, cx| {
                     // Two-pass scan/mutate so we can't deadlock on
                     // `register_telemetry`'s `&mut self` borrow:
                     // collect candidates first, then perform the
@@ -2209,9 +2297,55 @@ impl AppShell {
                         has_adoption: bool,
                         /// `(agent session id, transcript mtime)`.
                         hits: Vec<(String, SystemTime)>,
+                        /// The session the agent in this tab reports
+                        /// it is in — see `select_adoption`.
+                        exact: Option<String>,
                     }
                     let mut scans: Vec<Scan> = Vec::new();
                     let mut any_active = false;
+                    let claude_sessions_dir =
+                        codescope_core::agents::claude::live_session::default_sessions_dir();
+                    // Keep each remembered `claude` process current:
+                    // one stat per tab, a re-read only when its session
+                    // file moved, forgotten once the file is gone
+                    // (`claude` exited) or the tab closed.
+                    let live_tabs: HashSet<u64> =
+                        this.groups.iter().flat_map(|g| g.tabs.iter()).map(|t| t.id).collect();
+                    this.claude_procs.retain(|tab_id, proc_| {
+                        let Some(dir) = claude_sessions_dir.as_deref() else { return false };
+                        if !live_tabs.contains(tab_id) {
+                            return false;
+                        }
+                        let path =
+                            codescope_core::agents::claude::live_session::session_file(dir, proc_.pid);
+                        let Some(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()).ok()
+                        else {
+                            return false;
+                        };
+                        if mtime == proc_.file_mtime {
+                            return true;
+                        }
+                        let wd = this
+                            .groups
+                            .iter()
+                            .flat_map(|g| g.tabs.iter())
+                            .find(|t| t.id == *tab_id)
+                            .and_then(|t| t.working_directory.as_ref())
+                            .map(|wd| wd.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        match codescope_core::agents::claude::live_session::session_for_pids(
+                            dir,
+                            &[proc_.pid],
+                            &wd,
+                        ) {
+                            Some((_, session_id)) => {
+                                proc_.file_mtime = mtime;
+                                proc_.session_id = session_id;
+                                true
+                            }
+                            None => false,
+                        }
+                    });
                     for (g_idx, group) in this.groups.iter().enumerate() {
                         for (t_idx, tab) in group.tabs.iter().enumerate() {
                             let Some(agent_id) = tab.agent_id else { continue };
@@ -2232,6 +2366,20 @@ impl AppShell {
                                 continue;
                             }
                             any_active = true;
+                            let exact = this
+                                .claude_procs
+                                .get(&tab.id)
+                                .filter(|_| agent_id == codescope_core::AgentId::Claude)
+                                .map(|p| p.session_id.clone());
+                            // Settled on the session its own `claude`
+                            // reports: nothing to adopt, so skip the
+                            // directory scan too.
+                            if let Some(own) = exact.as_deref()
+                                && tab.adopted_session_id.as_deref() == Some(own)
+                                && tab.fired_session_ids.contains(own)
+                            {
+                                continue;
+                            }
                             let wd_str = wd.to_string_lossy().into_owned();
                             // Each agent scan returns
                             // `(session_id, mtime_source_path)` so we
@@ -2319,6 +2467,7 @@ impl AppShell {
                                 agent_id,
                                 has_adoption: tab.adopted_session_id.is_some(),
                                 hits,
+                                exact,
                             });
                         }
                     }
@@ -2344,6 +2493,70 @@ impl AppShell {
                                 .cloned()
                         }))
                         .collect();
+                    // A Claude tab whose `claude` isn't known yet and
+                    // that is about to adopt a transcript by guessing:
+                    // look its process up first — one process-table
+                    // snapshot for all of them. Only then, so a quiet
+                    // workspace never pays for the walk.
+                    let unresolved: Vec<usize> = (0..scans.len())
+                        .filter(|&i| {
+                            let s = &scans[i];
+                            s.agent_id == codescope_core::AgentId::Claude
+                                && s.exact.is_none()
+                                && this
+                                    .groups
+                                    .get(s.group_idx)
+                                    .and_then(|g| g.tabs.get(s.tab_idx))
+                                    .is_some_and(|tab| {
+                                        select_adoption(
+                                            &s.hits,
+                                            &tab.fired_session_ids,
+                                            tab.adopted_session_id.as_deref(),
+                                            &claimed,
+                                            None,
+                                        )
+                                        .is_some()
+                                    })
+                        })
+                        .collect();
+                    if !unresolved.is_empty()
+                        && let Some(dir) = claude_sessions_dir.as_deref()
+                    {
+                        let table = codescope_core::process_tree::process_table();
+                        for i in unresolved {
+                            let Some(tab) = this
+                                .groups
+                                .get(scans[i].group_idx)
+                                .and_then(|g| g.tabs.get(scans[i].tab_idx))
+                            else {
+                                continue;
+                            };
+                            let Some(shell) = tab.terminal.read(cx).child_pid() else { continue };
+                            let wd = tab
+                                .working_directory
+                                .as_ref()
+                                .map(|wd| wd.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            let pids = codescope_core::process_tree::descendants(shell, &table);
+                            let Some((pid, session_id)) =
+                                codescope_core::agents::claude::live_session::session_for_pids(
+                                    dir, &pids, &wd,
+                                )
+                            else {
+                                continue;
+                            };
+                            let path =
+                                codescope_core::agents::claude::live_session::session_file(dir, pid);
+                            let Some(file_mtime) =
+                                std::fs::metadata(&path).and_then(|m| m.modified()).ok()
+                            else {
+                                continue;
+                            };
+                            scans[i].exact = Some(session_id.clone());
+                            this.claude_procs
+                                .insert(tab.id, ClaudeProc { pid, file_mtime, session_id });
+                        }
+                    }
                     // Tabs that own nothing yet choose first. A tab
                     // that already has a live transcript would
                     // otherwise "rotate" onto a brand-new one minted by
@@ -2351,9 +2564,12 @@ impl AppShell {
                     // — stealing the conversation *and*, now that
                     // claims are exclusive, locking the rightful tab
                     // out for good. Stable sort, so iteration order
-                    // still decides within each class.
+                    // still decides within each class. Ahead of both:
+                    // tabs whose agent named its own session, and
+                    // those sessions are off-limits to every guess.
+                    claimed.extend(scans.iter().filter_map(|s| s.exact.clone()));
                     let mut order: Vec<usize> = (0..scans.len()).collect();
-                    order.sort_by_key(|&i| scans[i].has_adoption);
+                    order.sort_by_key(|&i| (scans[i].exact.is_none(), scans[i].has_adoption));
                     let mut found = Vec::new();
                     for i in order {
                         let s = &scans[i];
@@ -2373,6 +2589,7 @@ impl AppShell {
                             &tab.fired_session_ids,
                             tab.adopted_session_id.as_deref(),
                             &claimed,
+                            s.exact.as_deref(),
                         ) else {
                             continue;
                         };
@@ -2391,9 +2608,40 @@ impl AppShell {
                             codescope_session_id: tab.session_id.clone(),
                         });
                     }
+                    // An exact adoption can take a transcript a
+                    // neighbour guessed wrong; that neighbour lets go
+                    // (and re-adopts its own on a later tick) instead of
+                    // both tabs showing one conversation.
+                    // Its row forgets the id and the title that came
+                    // with it too, or the next launch would resume the
+                    // neighbour's conversation in both tabs.
+                    let taken: HashSet<String> =
+                        found.iter().map(|f| f.new_agent_session_id.clone()).collect();
+                    let mut released: Vec<String> = Vec::new();
+                    for (g_idx, group) in this.groups.iter_mut().enumerate() {
+                        for (t_idx, tab) in group.tabs.iter_mut().enumerate() {
+                            let adopts_now =
+                                found.iter().any(|f| f.group_idx == g_idx && f.tab_idx == t_idx);
+                            if !adopts_now
+                                && tab.adopted_session_id.as_ref().is_some_and(|s| taken.contains(s))
+                            {
+                                tab.adopted_session_id = None;
+                                tab.fired_session_ids.retain(|s| !taken.contains(s));
+                                tab.applied_label = None;
+                                if let Some((base, _)) = tab.title.split_once(" · ") {
+                                    tab.title = SharedString::from(base.to_owned());
+                                }
+                                released.push(tab.session_id.clone());
+                            }
+                        }
+                    }
+                    if !released.is_empty() {
+                        this.release_agent_sessions(&released, cx);
+                    }
                     for f in found {
                         if let Some(prev) = f.previous_agent_session_id.as_deref()
-                            && prev != f.new_agent_session_id {
+                            && prev != f.new_agent_session_id
+                            && !taken.contains(prev) {
                                 this.unregister_telemetry(prev);
                             }
                         this.register_telemetry(
@@ -2491,6 +2739,8 @@ impl AppShell {
             agent_session_id: Option<String>,
             project_name: String,
             branch: Option<String>,
+            /// Persisted content title — the tab comes back under it.
+            title: Option<String>,
             /// `Some` for a remote-shell session (#323) — carries the
             /// project id + command so the tab respawns without a cwd.
             remote: Option<RemoteShellLaunch>,
@@ -2531,6 +2781,7 @@ impl AppShell {
                         agent_session_id: s.agent_session_id.clone(),
                         project_name: project_name.clone(),
                         branch,
+                        title: s.title.clone(),
                         remote,
                     })
                 })
@@ -2679,11 +2930,19 @@ impl AppShell {
             // `Session.display_name` does NOT participate here; it
             // only flows into the sidebar row title (a separate
             // projection), matching C# `MainViewModel.HydrateFromLoaded`.
-            let title = SharedString::from(codescope_core::restored_title(
+            // A persisted content title replaces the branch segment.
+            let base = codescope_core::restored_title(
                 &entry.project_name,
                 entry.branch.as_deref(),
                 &entry.worktree_path,
-            ));
+            );
+            let title = SharedString::from(
+                entry
+                    .title
+                    .as_deref()
+                    .and_then(|t| codescope_core::titled_tab_title(&base, t))
+                    .unwrap_or(base),
+            );
 
             self.spawn_tab_in(
                 Some(path),
@@ -2862,17 +3121,19 @@ impl AppShell {
         // Snapshot per-session display_name lookup so we don't borrow
         // `self.projects` across the mutable iteration over groups.
         // Sessions with an explicit display_name set must not be
-        // overwritten — the user renamed them.
+        // overwritten — the user renamed them. Nor may sessions with a
+        // content title: their tab reads `Project · Title` and has no
+        // branch segment left to swap.
         let renamed_session_ids: HashSet<String> = self
             .projects
             .projects
             .iter()
             .flat_map(|p| p.sessions.iter())
             .filter(|s| {
-                s.display_name
-                    .as_deref()
-                    .map(|d| !d.trim().is_empty())
-                    .unwrap_or(false)
+                [s.display_name.as_deref(), s.title.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|d| !d.trim().is_empty())
             })
             .map(|s| s.id.clone())
             .collect();
@@ -2952,6 +3213,7 @@ impl AppShell {
                 last_opened: None,
                 agent_session_id: None,
                 closed_at: None,
+                title: None,
             };
             match SessionManager::open(&mut self.projects, project_id, session, &now_iso8601()) {
                 Ok(_) => {
@@ -3004,6 +3266,7 @@ impl AppShell {
             last_opened: None,
             agent_session_id: None,
             closed_at: None,
+            title: None,
         };
         match SessionManager::open(&mut self.projects, &project_id, session, &now_iso8601()) {
             Ok(_) => {
@@ -3359,12 +3622,21 @@ impl AppShell {
                 .and_then(|g| g.branch_name().map(str::to_string))
                 .or_else(|| restored.branch.clone());
             match project_name {
-                Some(p) => codescope_core::restored_title(
-                    &p,
-                    branch_label.as_deref(),
-                    &descriptor.working_directory,
-                )
-                .into(),
+                Some(p) => {
+                    let base = codescope_core::restored_title(
+                        &p,
+                        branch_label.as_deref(),
+                        &descriptor.working_directory,
+                    );
+                    // A session that had a content title comes back
+                    // under it, not under its branch.
+                    restored
+                        .title
+                        .as_deref()
+                        .and_then(|t| codescope_core::titled_tab_title(&base, t))
+                        .unwrap_or(base)
+                        .into()
+                }
                 None => descriptor.title.clone().into(),
             }
         };
@@ -4000,6 +4272,7 @@ impl AppShell {
             adopted_session_id,
             fired_session_ids: std::collections::HashSet::new(),
             agent_id,
+            applied_label: None,
         });
         let new_idx = group.tabs.len() - 1;
         self.activate_tab(group_idx, new_idx, window, cx);
@@ -6013,10 +6286,183 @@ impl AppShell {
             .flat_map(|g| g.tabs.iter())
             .filter_map(|t| t.remote_project_id.clone())
             .collect();
+        let live_rows = self.sidebar_live_session_rows(cx);
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.set_session_paths(busy, active, dots, cx);
             sidebar.set_remote_live_project_ids(remote_live, cx);
+            sidebar.set_live_sessions(live_rows, cx);
         });
+    }
+
+    /// One sidebar row per open local tab, keyed by canonicalised
+    /// worktree path, in tab order — so two sessions in one worktree
+    /// show as two rows under it instead of one shared worktree row.
+    fn sidebar_live_session_rows(
+        &self,
+        cx: &App,
+    ) -> HashMap<String, Vec<crate::sidebar::LiveSessionRow>> {
+        let focused_tab_id = self
+            .groups
+            .get(self.focused_group)
+            .and_then(|g| g.tabs.get(g.active_tab))
+            .map(|t| t.id);
+        let mut rows: HashMap<String, Vec<crate::sidebar::LiveSessionRow>> = HashMap::new();
+        for tab in self.groups.iter().flat_map(|g| g.tabs.iter()) {
+            if tab.remote_project_id.is_some() {
+                continue;
+            }
+            let Some(wd) = tab.working_directory.as_ref() else { continue };
+            let canon = codescope_core::path_canon::canonicalize_path(&wd.to_string_lossy());
+            if canon.is_empty() {
+                continue;
+            }
+            let snapshot = tab.adopted_session_id.as_deref().and_then(|sid| self.telemetry_for(sid));
+            let dot = tab.adopted_session_id.as_ref().map(|_| {
+                let busy = snapshot.as_ref().is_some_and(|s| {
+                    matches!(
+                        s.state,
+                        codescope_core::SessionState::Busy
+                            | codescope_core::SessionState::PendingToolUse
+                    )
+                });
+                if busy { codescope_core::SessionDot::Busy } else { codescope_core::SessionDot::Idle }
+            });
+            let agent_label = tab
+                .agent_id
+                .and_then(|id| self.agent_registry.get_by_id(id.as_str()))
+                .map(|p| p.display_name.clone());
+            let content = self.content_title_for(tab, snapshot.as_ref(), cx);
+            let label = self.session_label_for(tab, content.as_deref()).or(agent_label);
+            rows.entry(canon).or_default().push(crate::sidebar::LiveSessionRow {
+                tab_id: tab.id,
+                label: codescope_core::session_label(None, label.as_deref(), None).into(),
+                dot,
+                focused: Some(tab.id) == focused_tab_id,
+            });
+        }
+        rows
+    }
+
+    /// What a tab's session is about, live: a title its transcript
+    /// reports the agent or user gave it, else — for an agent tab — the
+    /// topic the agent put in the terminal title, else the transcript's
+    /// first-prompt stand-in. The terminal topic is generated too, so
+    /// it outranks the raw prompt (which Claude Code records before its
+    /// `ai-title`), and it still works with transcript saving off.
+    fn content_title_for(
+        &self,
+        tab: &Tab,
+        snapshot: Option<&codescope_core::TelemetrySnapshot>,
+        cx: &App,
+    ) -> Option<String> {
+        let from_transcript = snapshot.and_then(|s| s.title.as_ref());
+        if let Some(title) =
+            from_transcript.filter(|t| t.source >= codescope_core::TitleSource::Generated)
+        {
+            return Some(title.text.clone());
+        }
+        let from_terminal = tab.agent_id.and_then(|agent| {
+            let raw = tab.terminal.read(cx).title()?.to_owned();
+            let display_name = self
+                .agent_registry
+                .get_by_id(agent.as_str())
+                .map(|p| p.display_name.clone())
+                .unwrap_or_default();
+            codescope_core::terminal_title_candidate(&raw, &[&display_name, agent.as_str()])
+        });
+        from_terminal.or_else(|| from_transcript.map(|t| t.text.clone()))
+    }
+
+    /// The name a tab's session goes by: the user's rename, else its
+    /// live content title, else the title persisted from an earlier
+    /// run. `None` while none of those is known.
+    fn session_label_for(&self, tab: &Tab, content_title: Option<&str>) -> Option<String> {
+        let session = self
+            .projects
+            .projects
+            .iter()
+            .flat_map(|p| p.sessions.iter())
+            .find(|s| s.id == tab.session_id);
+        let non_blank = |s: &&str| !s.trim().is_empty();
+        session
+            .and_then(|s| s.display_name.as_deref().filter(non_blank))
+            .or(content_title)
+            .or_else(|| session.and_then(|s| s.title.as_deref().filter(non_blank)))
+            .map(str::to_owned)
+    }
+
+    /// Carry each tab's session label onto its tab strip title
+    /// (`Project · Label`) and persist newly reported content titles to
+    /// `projects.json`, so closed history rows and the next launch keep
+    /// them. Runs on the telemetry cadence; a tick where no label moved
+    /// touches neither the tabs nor the disk.
+    fn apply_session_titles(&mut self, cx: &mut Context<Self>) {
+        let mut retitled: Vec<(usize, usize, String)> = Vec::new();
+        let mut to_persist: Vec<(String, String)> = Vec::new();
+        for (g_idx, group) in self.groups.iter().enumerate() {
+            for (t_idx, tab) in group.tabs.iter().enumerate() {
+                let snapshot =
+                    tab.adopted_session_id.as_deref().and_then(|sid| self.telemetry_for(sid));
+                let content = self.content_title_for(tab, snapshot.as_ref(), cx);
+                if let Some(title) = content.as_deref() {
+                    let persisted = self
+                        .projects
+                        .projects
+                        .iter()
+                        .flat_map(|p| p.sessions.iter())
+                        .find(|s| s.id == tab.session_id)
+                        .map(|s| s.title.as_deref());
+                    // `None` = free-floating tab with no row to write to.
+                    if let Some(persisted) = persisted
+                        && persisted != Some(title)
+                    {
+                        to_persist.push((tab.session_id.clone(), title.to_owned()));
+                    }
+                }
+                let Some(label) = self.session_label_for(tab, content.as_deref()) else {
+                    continue;
+                };
+                if tab.applied_label.as_deref() != Some(label.as_str()) {
+                    retitled.push((g_idx, t_idx, label));
+                }
+            }
+        }
+
+        if !to_persist.is_empty() {
+            // Reload-then-mutate, like every other AppShell write: the
+            // sidebar writes `projects.json` too.
+            match ProjectsConfig::load(&self.paths) {
+                Ok(cfg) => self.projects = cfg,
+                Err(err) => {
+                    eprintln!("warning: failed to reload projects.json before saving titles: {err:#}")
+                }
+            }
+            let mut changed = false;
+            for (session_id, title) in &to_persist {
+                // A row the reload no longer has (closed or removed
+                // meanwhile) has nothing to keep the title on.
+                changed |= SessionManager::set_title(&mut self.projects, session_id, title)
+                    .unwrap_or(false);
+            }
+            if changed {
+                if let Err(err) = self.projects.save(&self.paths) {
+                    eprintln!("warning: failed to persist session titles: {err:#}");
+                }
+                self.mirror_projects_to_sidebar(cx);
+            }
+        }
+
+        if retitled.is_empty() {
+            return;
+        }
+        for (g_idx, t_idx, label) in retitled {
+            let tab = &mut self.groups[g_idx].tabs[t_idx];
+            if let Some(title) = codescope_core::titled_tab_title(tab.title.as_ref(), &label) {
+                tab.title = SharedString::from(title);
+            }
+            tab.applied_label = Some(label);
+        }
+        cx.notify();
     }
 
     /// Canonicalised worktree path of the currently focused tab (the
@@ -6062,8 +6508,13 @@ impl AppShell {
     /// last tab closes and there's no longer a focused tab.
     fn push_sidebar_active_context(&self, cx: &mut Context<Self>) {
         let path = self.focused_tab_worktree_path();
+        // The live session rows carry the focus highlight and come and
+        // go with tabs; refresh them here rather than wait for the
+        // telemetry poll, which idles at 30 s with only shells open.
+        let live_rows = self.sidebar_live_session_rows(cx);
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.set_active_context(path, cx);
+            sidebar.set_live_sessions(live_rows, cx);
         });
     }
 
@@ -9476,7 +9927,7 @@ mod tests {
     fn select_adoption_takes_newest_unclaimed() {
         let hits = vec![(SID_A.to_owned(), at(10)), (SID_B.to_owned(), at(20))];
         assert_eq!(
-            select_adoption(&hits, &ids(&[]), None, &ids(&[])),
+            select_adoption(&hits, &ids(&[]), None, &ids(&[]), None),
             Some(SID_B.to_owned())
         );
     }
@@ -9488,11 +9939,11 @@ mod tests {
         // than steal it.
         let hits = vec![(SID_A.to_owned(), at(10)), (SID_B.to_owned(), at(20))];
         assert_eq!(
-            select_adoption(&hits, &ids(&[]), None, &ids(&[SID_B])),
+            select_adoption(&hits, &ids(&[]), None, &ids(&[SID_B]), None),
             Some(SID_A.to_owned())
         );
         assert_eq!(
-            select_adoption(&hits, &ids(&[]), None, &ids(&[SID_A, SID_B])),
+            select_adoption(&hits, &ids(&[]), None, &ids(&[SID_A, SID_B]), None),
             None
         );
     }
@@ -9505,7 +9956,7 @@ mod tests {
         // telemetry tail never registers.
         let hits = vec![(SID_A.to_owned(), at(10))];
         assert_eq!(
-            select_adoption(&hits, &ids(&[]), Some(SID_A), &ids(&[SID_A])),
+            select_adoption(&hits, &ids(&[]), Some(SID_A), &ids(&[SID_A]), None),
             Some(SID_A.to_owned())
         );
     }
@@ -9522,13 +9973,13 @@ mod tests {
         let mut claimed = ids(&[SID_A]);
 
         // Round 1 — tabs with no adoption yet.
-        let picked = select_adoption(&hits, &ids(&[]), None, &claimed);
+        let picked = select_adoption(&hits, &ids(&[]), None, &claimed, None);
         assert_eq!(picked, Some(SID_B.to_owned()));
         claimed.insert(picked.unwrap());
 
         // Round 2 — A, which already fired SID_A, finds nothing left.
         assert_eq!(
-            select_adoption(&hits, &ids(&[SID_A]), Some(SID_A), &claimed),
+            select_adoption(&hits, &ids(&[SID_A]), Some(SID_A), &claimed, None),
             None
         );
     }
@@ -9537,7 +9988,47 @@ mod tests {
     fn select_adoption_skips_already_fired_ids() {
         let hits = vec![(SID_A.to_owned(), at(10))];
         assert_eq!(
-            select_adoption(&hits, &ids(&[SID_A]), Some(SID_A), &ids(&[SID_A])),
+            select_adoption(&hits, &ids(&[SID_A]), Some(SID_A), &ids(&[SID_A]), None),
+            None
+        );
+    }
+
+    #[test]
+    fn exact_session_wins_over_the_newest_transcript_and_claims() {
+        // Two fresh tabs in one folder; the *second* tab's agent was
+        // prompted first, so its transcript (SID_A) is the older one.
+        // The first tab's agent reports SID_B — it gets SID_B, even
+        // though a wrong guess on an earlier tick already claimed it.
+        let hits = vec![(SID_A.to_owned(), at(10)), (SID_B.to_owned(), at(20))];
+        assert_eq!(
+            select_adoption(&hits, &ids(&[SID_A]), Some(SID_A), &ids(&[SID_A, SID_B]), Some(SID_B)),
+            Some(SID_B.to_owned())
+        );
+    }
+
+    #[test]
+    fn exact_session_reclaims_an_id_the_tab_rotated_away_from() {
+        // The tab owned SID_B, then a guess moved it onto SID_A (its
+        // exact id was unreadable that tick). Its agent reports SID_B
+        // again — return to it even though SID_B was fired before.
+        let hits = vec![(SID_A.to_owned(), at(20)), (SID_B.to_owned(), at(10))];
+        assert_eq!(
+            select_adoption(&hits, &ids(&[SID_A, SID_B]), Some(SID_A), &ids(&[]), Some(SID_B)),
+            Some(SID_B.to_owned())
+        );
+    }
+
+    #[test]
+    fn exact_session_waits_for_its_transcript() {
+        // The agent reports its session before it writes the transcript
+        // (Claude Code writes on the first prompt). The tab must wait,
+        // not fall back to guessing a neighbour's file.
+        let hits = vec![(SID_A.to_owned(), at(10))];
+        assert_eq!(select_adoption(&hits, &ids(&[]), None, &ids(&[]), Some(SID_B)), None);
+        // Already adopted — nothing new to fire.
+        let hits = vec![(SID_B.to_owned(), at(10))];
+        assert_eq!(
+            select_adoption(&hits, &ids(&[SID_B]), Some(SID_B), &ids(&[SID_B]), Some(SID_B)),
             None
         );
     }
@@ -9805,6 +10296,7 @@ mod tests {
             last_turn_duration: None,
             state,
             quiet_timeout: false,
+            title: None,
         }
     }
 

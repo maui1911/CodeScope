@@ -70,9 +70,41 @@ pub fn no_window_command(program: impl AsRef<OsStr>) -> Command {
     cmd
 }
 
+/// Variables Claude Code sets on the processes it launches to mark
+/// them as part of *its* session. CodeScope inherits them when it is
+/// started from inside a Claude session (a dev build launched by an
+/// agent working on this repo), and every tab would pass them on: the
+/// `claude` started in that tab then takes itself for a child session,
+/// turns transcript saving off, and nothing gets adopted.
+///
+/// Only session markers — a user's own `CLAUDE_*` configuration
+/// (`CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR`,
+/// …) is left alone.
+pub const INHERITED_AGENT_SESSION_VARS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_PID",
+    "CLAUDE_PLUGIN_DATA",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_markers_are_stripped_but_user_config_is_not() {
+        assert!(INHERITED_AGENT_SESSION_VARS.contains(&"CLAUDE_CODE_CHILD_SESSION"));
+        assert!(INHERITED_AGENT_SESSION_VARS.contains(&"CLAUDECODE"));
+        for kept in ["CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR", "CLAUDE_CODE_USE_BEDROCK"] {
+            assert!(!INHERITED_AGENT_SESSION_VARS.contains(&kept), "{kept}");
+        }
+    }
 
     /// The helper must not change behaviour on non-Windows hosts —
     /// the returned `Command` should be byte-equivalent to a plain

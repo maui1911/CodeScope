@@ -68,6 +68,13 @@ impl Render for Root {
 }
 
 fn main() -> Result<()> {
+    // Drop another agent's session markers before anything can spawn a
+    // tab with them — see `INHERITED_AGENT_SESSION_VARS`.
+    for var in codescope_core::process::INHERITED_AGENT_SESSION_VARS {
+        // SAFETY: first statement of `main`, before any thread exists,
+        // so nothing can be reading the environment concurrently.
+        unsafe { std::env::remove_var(var) };
+    }
     let paths = AppPaths::detect();
     if let Err(err) = paths.ensure_dirs() {
         eprintln!(

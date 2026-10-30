@@ -266,6 +266,7 @@ mod tests {
             last_opened: last_opened.map(|s| s.to_string()),
             agent_session_id: None,
             closed_at: closed_at.map(|s| s.to_string()),
+            title: None,
         }
     }
 

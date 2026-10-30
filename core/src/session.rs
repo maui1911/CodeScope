@@ -547,6 +547,45 @@ impl SessionManager {
         Err(anyhow!("session '{session_id}' not found"))
     }
 
+    /// Store the content title the agent's telemetry reported for a
+    /// session. Returns `true` when the value changed, so the caller
+    /// only writes `projects.json` when there is something new. Errors
+    /// when the session is unknown.
+    pub fn set_title(cfg: &mut ProjectsConfig, session_id: &str, title: &str) -> Result<bool> {
+        for project in cfg.projects.iter_mut() {
+            if let Some(s) = project.sessions.iter_mut().find(|s| s.id == session_id) {
+                if s.title.as_deref() == Some(title) {
+                    return Ok(false);
+                }
+                s.title = Some(title.to_string());
+                return Ok(true);
+            }
+        }
+        Err(anyhow!("session '{session_id}' not found"))
+    }
+
+    /// Forget the agent session a row was linked to, together with the
+    /// content title that came from it — for a tab that adopted a
+    /// neighbour's transcript and has to let go. Without this the row
+    /// would resume the neighbour's conversation on the next launch and
+    /// keep showing its title. The user's rename stays. Returns `true`
+    /// when anything changed; an unknown row (closed meanwhile) is a
+    /// no-op.
+    pub fn release_agent_session(cfg: &mut ProjectsConfig, session_id: &str) -> bool {
+        let Some(s) = cfg
+            .projects
+            .iter_mut()
+            .flat_map(|p| p.sessions.iter_mut())
+            .find(|s| s.id == session_id)
+        else {
+            return false;
+        };
+        let changed = s.agent_session_id.is_some() || s.title.is_some();
+        s.agent_session_id = None;
+        s.title = None;
+        changed
+    }
+
     /// Update the persisted `agent_session_id` — typically called by
     /// the future agent-discovery layer once a CLI has reported its
     /// own session UUID. Mirrors C#
@@ -829,6 +868,7 @@ mod tests {
             last_opened: None,
             agent_session_id: None,
             closed_at: None,
+            title: None,
         }
     }
 
@@ -1367,6 +1407,56 @@ mod tests {
         SessionManager::rename(&mut cfg, "s1", Some("Re")).unwrap();
         SessionManager::rename(&mut cfg, "s1", None).unwrap();
         assert!(cfg.projects[0].sessions[0].display_name.is_none());
+    }
+
+    #[test]
+    fn set_title_reports_whether_it_changed() {
+        let mut cfg = ProjectsConfig::default();
+        let mut p = make_project("p1");
+        p.sessions.push(make_session("s1", None));
+        cfg.projects.push(p);
+
+        assert!(SessionManager::set_title(&mut cfg, "s1", "Resize fix").unwrap());
+        assert!(!SessionManager::set_title(&mut cfg, "s1", "Resize fix").unwrap());
+        assert_eq!(cfg.projects[0].sessions[0].title.as_deref(), Some("Resize fix"));
+        // The user's rename is a separate field and stays untouched.
+        assert!(cfg.projects[0].sessions[0].display_name.is_none());
+        assert!(SessionManager::set_title(&mut cfg, "nope", "x").is_err());
+    }
+
+    #[test]
+    fn release_agent_session_drops_the_id_and_its_title_only() {
+        let mut cfg = ProjectsConfig::default();
+        let mut p = make_project("p1");
+        let mut s = make_session("s1", None);
+        s.agent_session_id = Some("neighbour".into());
+        s.title = Some("Neighbour's topic".into());
+        s.display_name = Some("Mine".into());
+        p.sessions.push(s);
+        cfg.projects.push(p);
+
+        assert!(SessionManager::release_agent_session(&mut cfg, "s1"));
+        let s = &cfg.projects[0].sessions[0];
+        assert!(s.agent_session_id.is_none());
+        assert!(s.title.is_none());
+        assert_eq!(s.display_name.as_deref(), Some("Mine"));
+        // Nothing left to drop; unknown rows are a no-op.
+        assert!(!SessionManager::release_agent_session(&mut cfg, "s1"));
+        assert!(!SessionManager::release_agent_session(&mut cfg, "nope"));
+    }
+
+    #[test]
+    fn title_round_trips_and_older_files_load_without_it() {
+        let mut s = make_session("s1", None);
+        s.title = Some("Resize fix".into());
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""title":"Resize fix""#));
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.title.as_deref(), Some("Resize fix"));
+
+        let old: Session =
+            serde_json::from_str(r#"{"id":"s1","worktreePath":"C:\\repo"}"#).unwrap();
+        assert!(old.title.is_none());
     }
 
     #[test]

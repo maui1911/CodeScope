@@ -18,11 +18,13 @@ serde_json = "1"
 uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-# `K32GetProcessMemoryInfo` for the dev-only memory watchdog. Mirrors
-# the version pinned by the binary crate's `Cargo.toml` so we're not
-# pulling two copies of `windows` into the workspace.
+# `K32GetProcessMemoryInfo` for the dev-only memory watchdog, ToolHelp
+# for `process_tree`. Mirrors the version pinned by the binary crate's
+# `Cargo.toml` so we're not pulling two copies of `windows` into the
+# workspace.
 windows = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }

@@ -70,6 +70,10 @@ pub struct TelemetrySnapshot {
     /// finished turn. Cleared by the next snapshot the transcript itself
     /// produces. Always `false` for tails without that fallback.
     pub quiet_timeout: bool,
+    /// What the session is about, as far as the agent's own files say
+    /// (see [`crate::session_title`]). `None` until a title or a first
+    /// prompt has been seen, and for agents that record neither.
+    pub title: Option<crate::session_title::SessionTitle>,
 }
 
 /// Nominal context-window capacity for a model id.
