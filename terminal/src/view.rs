@@ -19,7 +19,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use parking_lot::Mutex;
 
@@ -149,7 +149,7 @@ pub struct TerminalView {
     link_click_consumed: bool,
     /// When the user last pressed a plain Enter here — see
     /// [`Self::last_submit`].
-    last_submit: Option<Instant>,
+    last_submit: Option<SystemTime>,
 }
 
 impl TerminalView {
@@ -282,8 +282,9 @@ impl TerminalView {
     /// terminal; `None` before the first. Input written through
     /// [`Self::write_input`] doesn't count. Agents that create their
     /// session record on the first prompt create it right after one,
-    /// which tells same-folder tabs apart when they adopt.
-    pub fn last_submit(&self) -> Option<Instant> {
+    /// which tells same-folder tabs apart when they adopt. Wall-clock
+    /// time, so it compares with file mtimes.
+    pub fn last_submit(&self) -> Option<SystemTime> {
         self.last_submit
     }
 
@@ -704,7 +705,7 @@ impl TerminalView {
             self.backend.write_input(bytes);
             self.show_cursor_now();
             if key == "enter" && plain && !mods.shift {
-                self.last_submit = Some(Instant::now());
+                self.last_submit = Some(SystemTime::now());
             }
         }
     }

@@ -2,8 +2,9 @@
 //!
 //! Copilot CLI marks every session a process has open with
 //! `~/.copilot/session-state/<sid>/inuse.<pid>.lock` (holding just the
-//! pid), created together with `workspace.yaml` when the session starts
-//! — before the first prompt (observed on Copilot CLI 1.0.61). Given the processes running in a
+//! pid), written right after `workspace.yaml` when the session starts —
+//! before the first prompt (observed on Copilot CLI 1.0.61 and 1.0.105;
+//! see [`LOCK_GRACE`] for the gap). Given the processes running in a
 //! tab (see [`crate::process_tree`]), that names the tab's session
 //! exactly, the way [`crate::agents::claude::live_session`] does for
 //! Claude Code, and it rules out sessions another live `copilot` holds:
@@ -14,7 +15,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// Pids named by the `inuse.<pid>.lock` files in `session_dir`. Empty
 /// when there are none or the directory can't be read.
@@ -63,16 +64,28 @@ pub struct Ownership {
     /// session the tab's own `copilot` has since left). Without an
     /// `exact`, the rest are left to the heuristic.
     pub foreign: Vec<String>,
+    /// Unheld candidates touched less than [`LOCK_GRACE`] ago, while the
+    /// tab knows no session of its own: their lock may not be written
+    /// yet. Neither adoptable nor ruled out — judge them again later.
+    pub undecided: Vec<String>,
 }
 
+/// How long a session directory may go without a lock before it is
+/// taken for one whose `copilot` writes none. Copilot CLI creates
+/// `workspace.yaml`, which makes the directory a candidate, about half
+/// a second before `inuse.<pid>.lock` (measured on 1.0.105).
+pub const LOCK_GRACE: Duration = Duration::from_secs(3);
+
 /// Judge each of `hits` — `(session id, mtime)` adoption candidates
-/// under `session_state_root` — by its lock files. One `read_dir` per
-/// candidate; callers only do this when a tab is about to adopt one.
+/// under `session_state_root` — by its lock files, at `now`. One
+/// `read_dir` per candidate; callers only do this when a tab is about
+/// to adopt one.
 pub fn ownership(
     session_state_root: &Path,
     hits: &[(String, SystemTime)],
     tab_pids: &[u32],
     live: &HashSet<u32>,
+    now: SystemTime,
 ) -> Ownership {
     let mut exact: Option<(SystemTime, &str)> = None;
     let mut others = Vec::new();
@@ -81,24 +94,29 @@ pub fn ownership(
         if holder == Holder::Tab && exact.is_none_or(|(t, _)| *mtime >= t) {
             exact = Some((*mtime, sid));
         }
-        others.push((sid, holder));
+        others.push((sid, *mtime, holder));
     }
-    let exact = exact.map(|(_, sid)| sid.to_owned());
-    let foreign = others
-        .into_iter()
-        .filter(|(sid, holder)| match &exact {
-            Some(own) => *sid != own,
-            None => *holder == Holder::Other,
-        })
-        .map(|(sid, _)| sid.clone())
-        .collect();
-    Ownership { exact, foreign }
+    let mut out = Ownership { exact: exact.map(|(_, sid)| sid.to_owned()), ..Default::default() };
+    for (sid, mtime, holder) in others {
+        match (&out.exact, holder) {
+            (Some(own), _) if own != sid => out.foreign.push(sid.clone()),
+            (Some(_), _) => {}
+            (None, Holder::Other) => out.foreign.push(sid.clone()),
+            // A directory dated ahead of `now` counts as fresh too.
+            (None, Holder::Nobody)
+                if now.duration_since(mtime).map_or(true, |age| age < LOCK_GRACE) =>
+            {
+                out.undecided.push(sid.clone())
+            }
+            (None, _) => {}
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     const SID_A: &str = "aaaaaaaa-0000-0000-0000-000000000001";
     const SID_B: &str = "bbbbbbbb-0000-0000-0000-000000000002";
@@ -119,6 +137,16 @@ mod tests {
 
     fn live(pids: &[u32]) -> HashSet<u32> {
         pids.iter().copied().collect()
+    }
+
+    /// [`ownership`] long after every candidate was last touched.
+    fn judge(
+        root: &Path,
+        hits: &[(String, SystemTime)],
+        tab_pids: &[u32],
+        live: &HashSet<u32>,
+    ) -> Ownership {
+        ownership(root, hits, tab_pids, live, at(1000))
     }
 
     #[test]
@@ -168,7 +196,7 @@ mod tests {
             (SID_A.to_owned(), at(10)),
             (SID_C.to_owned(), at(30)),
         ];
-        let got = ownership(dir.path(), &hits, &[11, 12], &live(&[11, 12, 40]));
+        let got = judge(dir.path(), &hits, &[11, 12], &live(&[11, 12, 40]));
         assert_eq!(got.exact.as_deref(), Some(SID_B));
         // The session it left and the neighbour's are both off-limits.
         assert_eq!(got.foreign, vec![SID_A.to_owned(), SID_C.to_owned()]);
@@ -180,8 +208,8 @@ mod tests {
         session(dir.path(), SID_A, &[]);
         session(dir.path(), SID_C, &[40]);
         let hits = vec![(SID_A.to_owned(), at(10)), (SID_C.to_owned(), at(30))];
-        let got = ownership(dir.path(), &hits, &[11, 12], &live(&[11, 12, 40]));
-        assert_eq!(got, Ownership { exact: None, foreign: vec![SID_C.to_owned()] });
+        let got = judge(dir.path(), &hits, &[11, 12], &live(&[11, 12, 40]));
+        assert_eq!(got, Ownership { foreign: vec![SID_C.to_owned()], ..Default::default() });
     }
 
     #[test]
@@ -192,9 +220,48 @@ mod tests {
         session(dir.path(), SID_A, &[]);
         session(dir.path(), SID_B, &[12]);
         let hits = vec![(SID_A.to_owned(), at(30)), (SID_B.to_owned(), at(10))];
-        let got = ownership(dir.path(), &hits, &[11, 12], &live(&[11, 12]));
-        let want = Ownership { exact: Some(SID_B.to_owned()), foreign: vec![SID_A.to_owned()] };
+        let got = judge(dir.path(), &hits, &[11, 12], &live(&[11, 12]));
+        let want = Ownership {
+            exact: Some(SID_B.to_owned()),
+            foreign: vec![SID_A.to_owned()],
+            ..Default::default()
+        };
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn ownership_waits_for_the_lock_of_a_brand_new_session() {
+        // Copilot writes `workspace.yaml` (which makes the directory a
+        // candidate) ~0.5 s before its lock. A neighbour judging it in
+        // that window must neither guess it nor rule it out for good.
+        let dir = tempfile::tempdir().unwrap();
+        session(dir.path(), SID_B, &[]);
+        let hits = vec![(SID_B.to_owned(), at(100))];
+        let early = Duration::from_millis(500);
+        let got = ownership(dir.path(), &hits, &[11], &live(&[11]), at(100) + early);
+        assert_eq!(got, Ownership { undecided: vec![SID_B.to_owned()], ..Default::default() });
+        // Past the grace period an unheld session is the heuristic's
+        // again: an older Copilot that writes no lock at all.
+        let late = at(100) + LOCK_GRACE;
+        assert_eq!(ownership(dir.path(), &hits, &[11], &live(&[11]), late), Ownership::default());
+        // Once the lock lands, the directory is the neighbour's.
+        std::fs::write(dir.path().join(SID_B).join("inuse.40.lock"), "40").unwrap();
+        let got = ownership(dir.path(), &hits, &[11], &live(&[11, 40]), at(100) + early);
+        assert_eq!(got, Ownership { foreign: vec![SID_B.to_owned()], ..Default::default() });
+    }
+
+    #[test]
+    fn ownership_with_an_own_session_rules_out_a_new_unheld_one() {
+        // The tab already knows its session, so a fresh unheld one is
+        // someone else's, not undecided.
+        let dir = tempfile::tempdir().unwrap();
+        session(dir.path(), SID_A, &[]);
+        session(dir.path(), SID_B, &[12]);
+        let hits = vec![(SID_A.to_owned(), at(100)), (SID_B.to_owned(), at(10))];
+        let got = ownership(dir.path(), &hits, &[12], &live(&[12]), at(100));
+        assert_eq!(got.exact.as_deref(), Some(SID_B));
+        assert_eq!(got.foreign, vec![SID_A.to_owned()]);
+        assert!(got.undecided.is_empty());
     }
 
     #[test]
@@ -205,6 +272,6 @@ mod tests {
         session(dir.path(), SID_A, &[]);
         session(dir.path(), SID_B, &[99]);
         let hits = vec![(SID_A.to_owned(), at(10)), (SID_B.to_owned(), at(20))];
-        assert_eq!(ownership(dir.path(), &hits, &[11], &live(&[11])), Ownership::default());
+        assert_eq!(judge(dir.path(), &hits, &[11], &live(&[11])), Ownership::default());
     }
 }

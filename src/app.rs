@@ -290,6 +290,12 @@ struct Tab {
     /// the same tail twice.  Mirrors the C# `WatchHandle._fired`
     /// HashSet.
     fired_session_ids: std::collections::HashSet<String>,
+    /// `adopted_session_id` was a guess — no agent record named it.
+    /// Such a claim doesn't stop a tab whose agent can name its session
+    /// from checking whether that one is really its own (see the
+    /// adoption tick). `false` for exact adoptions and for the id a
+    /// restored tab resumes.
+    adopted_by_guess: bool,
     /// Detected agent backend, derived from `auto_type` at spawn time
     /// via [`codescope_core::agent_id_from_auto_type`]. `None` for
     /// plain shell tabs (no auto-type) and tabs whose first token
@@ -366,7 +372,12 @@ struct ClaudeProc {
 ///   at startup (`codescope_core::agents::copilot::live_session`).
 ///   Sessions only *another* live process holds are dropped from the
 ///   tab's guesses, which also keeps out a `copilot` running outside
-///   this CodeScope instance.
+///   this CodeScope instance. The lock lands ~0.5 s after the
+///   directory becomes a candidate, so a fresh unheld one is nobody's
+///   guess until its lock is there (or `LOCK_GRACE` has passed).
+///
+/// A guess by one tab doesn't stop another tab's agent from naming the
+/// same session as its own: see `wants_exact_check`.
 /// * **Codex** — heuristic. Nothing on disk ties a thread to a pid: the
 ///   `thread-writer-locks/<id>.lock` files are empty, and since 0.160
 ///   the TUI hands its threads to a shared app-server daemon, so even
@@ -380,19 +391,21 @@ struct ClaudeProc {
 /// Copilot (`--session-id`), which the lock files already cover.
 ///
 /// For the heuristic agents the gap is within a round: several same-cwd
-/// tabs can see the same new transcript. The tab the user last pressed
-/// Enter in picks first ([`adoption_rank`]): Codex, Pi and gemini-cli
-/// 0.3x create their record on the first prompt, not at startup, so
-/// the launch time can't tell two tabs apart beyond the `since` filter
-/// the scans already apply. (Later gemini-cli releases create theirs
-/// at startup; there the order is unchanged, iteration order decides
-/// between tabs nobody has typed in.) Left over:
+/// tabs can see the same new transcript. The tab whose Enter came
+/// shortly before that transcript picks first ([`adoption_rank`]):
+/// Codex, Pi and gemini-cli 0.3x create their record on the first
+/// prompt, not at startup, so the launch time can't tell two tabs apart
+/// beyond the `since` filter the scans already apply. (Later gemini-cli
+/// releases create theirs at startup; there iteration order still
+/// decides between tabs nobody has typed in.) Left over:
 ///
 /// * A tab with no transcript yet still picks before tabs that own
 ///   one, so a `/clear` rotation in one of those goes to a fresh
 ///   neighbour that sees it.
-/// * Prompting two same-cwd tabs within the time it takes the first
-///   agent to write (Pi waits for the first reply) still crosses them.
+/// * Two same-cwd tabs prompted before either agent writes are taken
+///   to write in prompt order; agents that answer in a different order
+///   still cross. So does an agent slower than `SUBMIT_WINDOW` to write
+///   (Pi waits for the first reply) next to a tab prompted later.
 /// * The dev build and the installed build share the agents' data
 ///   directories but keep separate `projects.json` stores, so neither
 ///   sees the other's claims. A tab in one instance can still adopt a
@@ -427,17 +440,71 @@ fn select_adoption(
     newest.map(|(_, sid)| sid.to_owned())
 }
 
+/// Whether a tab whose agent can name its own session (Claude Code,
+/// Copilot CLI) should be asked to this tick — one process-table walk.
+///
+/// Yes when the tab is about to guess. Also when a candidate it hasn't
+/// asked about (`checked`) is held only by a neighbour's *guess*
+/// (`guessed`, a subset of `claimed`): that neighbour may have taken
+/// this tab's session in the moment before its agent could name it,
+/// and only an exact claim takes it back (`select_adoption`). Each such
+/// candidate is asked about once, so a correct guess next door costs
+/// one walk, not one per tick.
+fn wants_exact_check(
+    hits: &[(String, SystemTime)],
+    fired: &HashSet<String>,
+    adopted: Option<&str>,
+    claimed: &HashSet<String>,
+    guessed: &HashSet<String>,
+    checked: Option<&HashSet<String>>,
+) -> bool {
+    select_adoption(hits, fired, adopted, claimed, None).is_some()
+        || hits.iter().any(|(sid, _)| {
+            guessed.contains(sid)
+                && adopted != Some(sid.as_str())
+                && !fired.contains(sid)
+                && checked.is_none_or(|c| !c.contains(sid))
+        })
+}
+
+/// How long before a transcript's mtime an Enter may have been pressed
+/// to count as the prompt that created it — see [`adoption_rank`].
+/// Long enough for an agent to start writing, short enough that an old
+/// Enter (a trust prompt answered minutes ago) doesn't count.
+const SUBMIT_WINDOW: Duration = Duration::from_secs(10);
+
 /// Sort key for the order tabs pick in an adoption pass, lowest first:
 /// tabs whose agent named its own session, then tabs that own nothing
-/// yet, then the rest — see [`select_adoption`]. Within each class the
-/// tab the user last pressed Enter in goes first: an agent that writes
-/// its transcript on the first prompt writes it right after one.
+/// yet, then the rest — see [`select_adoption`].
+///
+/// Within each class, tabs whose last Enter (`last_submit`) fell within
+/// [`SUBMIT_WINDOW`] before the mtime of the transcript they would take
+/// (`guess_mtime`) go first — agents that write on the first prompt
+/// write right after one. Among those, tabs that own nothing yet go in
+/// prompt order (the agent prompted first writes first), and tabs that
+/// own a transcript latest Enter first (the `/clear` that rotated it).
+/// Then the rest, latest Enter first; iteration order breaks ties.
 fn adoption_rank(
     exact: bool,
     has_adoption: bool,
-    last_submit: Option<Instant>,
-) -> (bool, bool, std::cmp::Reverse<Option<Instant>>) {
-    (!exact, has_adoption, std::cmp::Reverse(last_submit))
+    last_submit: Option<SystemTime>,
+    guess_mtime: Option<SystemTime>,
+) -> (bool, bool, bool, i128) {
+    let nanos = |t: SystemTime| {
+        t.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as i128)
+    };
+    let led_to_it = match (last_submit, guess_mtime) {
+        (Some(enter), Some(mtime)) => {
+            mtime.duration_since(enter).is_ok_and(|gap| gap <= SUBMIT_WINDOW)
+        }
+        _ => false,
+    };
+    let order = match last_submit {
+        Some(enter) if led_to_it && !has_adoption => nanos(enter),
+        Some(enter) => -nanos(enter),
+        None => i128::MAX,
+    };
+    (!exact, has_adoption, !led_to_it, order)
 }
 
 /// One column in the work area: a tab strip + the currently-selected
@@ -1003,6 +1070,10 @@ pub struct AppShell {
     /// every tick; looked at again once the directory changes (a lock
     /// file added or removed changes it).
     copilot_foreign: HashMap<u64, HashMap<String, SystemTime>>,
+    /// Per Claude / Copilot tab: candidates its agent has already been
+    /// asked about. A candidate a neighbour only *guessed* is checked
+    /// once (does this tab's agent name it?), not on every tick.
+    exact_checked: HashMap<u64, HashSet<String>>,
     /// Placement seen on the previous bounds-observer tick. Feeds
     /// [`unmaximized_by_display_change`]; `None` until the first tick.
     last_window_placement: Option<WindowPlacement>,
@@ -1790,6 +1861,7 @@ impl AppShell {
             telemetry_tails: HashMap::new(),
             claude_procs: HashMap::new(),
             copilot_foreign: HashMap::new(),
+            exact_checked: HashMap::new(),
             last_window_placement: None,
             last_monitor_change: None,
             maximized_before_minimize: false,
@@ -2365,6 +2437,9 @@ impl AppShell {
                         /// CodeScope-allocated id from
                         /// `projects.json::Session.id`.
                         codescope_session_id: String,
+                        /// Adopted by the heuristic, not because the
+                        /// agent named it — `Tab::adopted_by_guess`.
+                        guessed: bool,
                     }
                     /// One tab's scan result, captured before any
                     /// selection happens so the two selection rounds
@@ -2392,7 +2467,7 @@ impl AppShell {
                         /// `TerminalView::last_submit` — orders tabs
                         /// within a selection round, see
                         /// `adoption_rank`.
-                        last_submit: Option<Instant>,
+                        last_submit: Option<SystemTime>,
                     }
                     let mut scans: Vec<Scan> = Vec::new();
                     let mut any_active = false;
@@ -2440,6 +2515,7 @@ impl AppShell {
                         }
                     });
                     this.copilot_foreign.retain(|tab_id, _| live_tabs.contains(tab_id));
+                    this.exact_checked.retain(|tab_id, _| live_tabs.contains(tab_id));
                     for (g_idx, group) in this.groups.iter().enumerate() {
                         for (t_idx, tab) in group.tabs.iter().enumerate() {
                             let Some(agent_id) = tab.agent_id else { continue };
@@ -2627,7 +2703,14 @@ impl AppShell {
                     // `select_adoption`): ask it first — one
                     // process-table snapshot for all of them. Only
                     // then, so a quiet workspace never pays for the
-                    // walk.
+                    // walk. See `wants_exact_check`.
+                    let guessed: HashSet<String> = this
+                        .groups
+                        .iter()
+                        .flat_map(|g| g.tabs.iter())
+                        .filter(|t| t.adopted_by_guess)
+                        .filter_map(|t| t.adopted_session_id.clone())
+                        .collect();
                     let unresolved: Vec<usize> = (0..scans.len())
                         .filter(|&i| {
                             let s = &scans[i];
@@ -2640,14 +2723,14 @@ impl AppShell {
                                     .get(s.group_idx)
                                     .and_then(|g| g.tabs.get(s.tab_idx))
                                     .is_some_and(|tab| {
-                                        select_adoption(
+                                        wants_exact_check(
                                             &s.hits,
                                             &tab.fired_session_ids,
                                             tab.adopted_session_id.as_deref(),
                                             &claimed,
-                                            None,
+                                            &guessed,
+                                            this.exact_checked.get(&tab.id),
                                         )
-                                        .is_some()
                                     })
                         })
                         .collect();
@@ -2676,11 +2759,19 @@ impl AppShell {
                                     &scans[i].hits,
                                     &pids,
                                     live,
+                                    SystemTime::now(),
                                 );
-                                // Out of this and every later guess
-                                // until the directory changes.
+                                // Foreign: out of this and every later
+                                // guess until the directory changes.
+                                // Undecided (lock not written yet): out
+                                // of this tick only, asked again next.
                                 let foreign = this.copilot_foreign.entry(tab.id).or_default();
+                                let checked = this.exact_checked.entry(tab.id).or_default();
                                 scans[i].hits.retain(|(sid, mtime)| {
+                                    if owned.undecided.contains(sid) {
+                                        return false;
+                                    }
+                                    checked.insert(sid.clone());
                                     let theirs = owned.foreign.contains(sid);
                                     if theirs {
                                         foreign.insert(sid.clone(), *mtime);
@@ -2690,6 +2781,10 @@ impl AppShell {
                                 scans[i].exact = owned.exact;
                                 continue;
                             }
+                            this.exact_checked
+                                .entry(tab.id)
+                                .or_default()
+                                .extend(scans[i].hits.iter().map(|(sid, _)| sid.clone()));
                             let Some(dir) = claude_sessions_dir.as_deref() else { continue };
                             let wd = tab
                                 .working_directory
@@ -2721,17 +2816,41 @@ impl AppShell {
                     // the neighbour it shares a working directory with
                     // — stealing the conversation *and*, now that
                     // claims are exclusive, locking the rightful tab
-                    // out for good. Within each class the tab the user
-                    // submitted to last goes first, then iteration
-                    // order (stable sort). Ahead of both: tabs whose
-                    // agent named its own session, and those sessions
-                    // are off-limits to every guess.
+                    // out for good. Within each class, whose Enter led
+                    // to the transcript it would take decides — see
+                    // `adoption_rank` — then iteration order (stable
+                    // sort). Ahead of both: tabs whose agent named its
+                    // own session, and those sessions are off-limits to
+                    // every guess.
                     claimed.extend(scans.iter().filter_map(|s| s.exact.clone()));
+                    let ranks: Vec<_> = scans
+                        .iter()
+                        .map(|s| {
+                            let guess_mtime = this
+                                .groups
+                                .get(s.group_idx)
+                                .and_then(|g| g.tabs.get(s.tab_idx))
+                                .and_then(|tab| {
+                                    select_adoption(
+                                        &s.hits,
+                                        &tab.fired_session_ids,
+                                        tab.adopted_session_id.as_deref(),
+                                        &claimed,
+                                        s.exact.as_deref(),
+                                    )
+                                })
+                                .and_then(|sid| s.hits.iter().find(|(h, _)| *h == sid))
+                                .map(|(_, mtime)| *mtime);
+                            adoption_rank(
+                                s.exact.is_some(),
+                                s.has_adoption,
+                                s.last_submit,
+                                guess_mtime,
+                            )
+                        })
+                        .collect();
                     let mut order: Vec<usize> = (0..scans.len()).collect();
-                    order.sort_by_key(|&i| {
-                        let s = &scans[i];
-                        adoption_rank(s.exact.is_some(), s.has_adoption, s.last_submit)
-                    });
+                    order.sort_by_key(|&i| ranks[i]);
                     let mut found = Vec::new();
                     for i in order {
                         let s = &scans[i];
@@ -2768,6 +2887,7 @@ impl AppShell {
                                 .map(|wd| wd.to_string_lossy().into_owned())
                                 .unwrap_or_default(),
                             codescope_session_id: tab.session_id.clone(),
+                            guessed: s.exact.is_none(),
                         });
                     }
                     // An exact adoption can take a transcript a
@@ -2788,6 +2908,7 @@ impl AppShell {
                                 && tab.adopted_session_id.as_ref().is_some_and(|s| taken.contains(s))
                             {
                                 tab.adopted_session_id = None;
+                                tab.adopted_by_guess = false;
                                 tab.fired_session_ids.retain(|s| !taken.contains(s));
                                 tab.retitle(|t| t.clear_label());
                                 released.push(tab.session_id.clone());
@@ -2822,6 +2943,7 @@ impl AppShell {
                             && let Some(tab) = group.tabs.get_mut(f.tab_idx) {
                                 tab.adopted_session_id =
                                     Some(f.new_agent_session_id.clone());
+                                tab.adopted_by_guess = f.guessed;
                                 tab.fired_session_ids.insert(f.new_agent_session_id);
                             }
                     }
@@ -4417,6 +4539,7 @@ impl AppShell {
             spawned_at: SystemTime::now(),
             adopted_session_id,
             fired_session_ids: std::collections::HashSet::new(),
+            adopted_by_guess: false,
             agent_id,
         });
         let new_idx = group.tabs.len() - 1;
@@ -10201,21 +10324,29 @@ mod tests {
     // ─── adoption_rank ─────────────────────────────────────────────
 
     /// One guessing pass over same-folder tabs, the way the adoption
-    /// tick runs it: `(adopted id, last submit)` per tab, all seeing
+    /// tick runs it: `(adopted id, last Enter)` per tab, all seeing
     /// `hits`. Returns what each tab adopts.
     fn guess_round(
-        tabs: &[(Option<&str>, Option<Instant>)],
+        tabs: &[(Option<&str>, Option<SystemTime>)],
         hits: &[(String, SystemTime)],
     ) -> Vec<Option<String>> {
         let mut claimed: HashSet<String> =
             tabs.iter().filter_map(|(adopted, _)| adopted.map(str::to_owned)).collect();
+        let fired = |adopted: Option<&str>| adopted.map(|a| ids(&[a])).unwrap_or_default();
+        let ranks: Vec<_> = tabs
+            .iter()
+            .map(|&(adopted, enter)| {
+                let guess = select_adoption(hits, &fired(adopted), adopted, &claimed, None);
+                let mtime = guess.and_then(|g| hits.iter().find(|(s, _)| *s == g)).map(|h| h.1);
+                adoption_rank(false, adopted.is_some(), enter, mtime)
+            })
+            .collect();
         let mut order: Vec<usize> = (0..tabs.len()).collect();
-        order.sort_by_key(|&i| adoption_rank(false, tabs[i].0.is_some(), tabs[i].1));
+        order.sort_by_key(|&i| ranks[i]);
         let mut out = vec![None; tabs.len()];
         for i in order {
             let (adopted, _) = tabs[i];
-            let fired = adopted.map(|a| ids(&[a])).unwrap_or_default();
-            if let Some(sid) = select_adoption(hits, &fired, adopted, &claimed, None) {
+            if let Some(sid) = select_adoption(hits, &fired(adopted), adopted, &claimed, None) {
                 claimed.insert(sid.clone());
                 out[i] = Some(sid);
             }
@@ -10223,43 +10354,97 @@ mod tests {
         out
     }
 
-    #[test]
-    fn the_tab_prompted_last_takes_a_new_transcript_first() {
-        // Two fresh tabs in one folder; the user prompts the right-hand
-        // one first and only its agent has written. Iteration order
-        // alone handed that transcript to the left-hand tab.
-        let t0 = Instant::now();
-        let hits = vec![(SID_B.to_owned(), at(20))];
-        let tabs = [(None, None), (None, Some(t0))];
-        assert_eq!(guess_round(&tabs, &hits), vec![None, Some(SID_B.to_owned())]);
+    fn picks(who: usize, of: usize) -> Vec<Option<String>> {
+        (0..of).map(|i| (i == who).then(|| SID_B.to_owned())).collect()
     }
 
     #[test]
-    fn a_rotation_goes_to_the_tab_that_submitted_it() {
-        // Both tabs own a transcript; `/clear` in the right-hand tab
-        // mints SID_B. The left-hand tab's last prompt was earlier.
-        let t0 = Instant::now();
-        let t1 = t0 + Duration::from_secs(5);
+    fn the_only_tab_prompted_takes_a_new_transcript() {
+        // Two fresh tabs in one folder; the user prompts the right-hand
+        // one and its agent writes. Iteration order alone handed that
+        // transcript to the left-hand tab.
+        let hits = vec![(SID_B.to_owned(), at(20))];
+        assert_eq!(guess_round(&[(None, None), (None, Some(at(19)))], &hits), picks(1, 2));
+    }
+
+    #[test]
+    fn both_tabs_prompted_before_the_first_record_go_in_prompt_order() {
+        // The first agent prompted is the first to write, whichever
+        // tab it runs in.
+        let hits = vec![(SID_B.to_owned(), at(12))];
+        let left_first = [(None, Some(at(10))), (None, Some(at(11)))];
+        assert_eq!(guess_round(&left_first, &hits), picks(0, 2));
+        let right_first = [(None, Some(at(11))), (None, Some(at(10)))];
+        assert_eq!(guess_round(&right_first, &hits), picks(1, 2));
+    }
+
+    #[test]
+    fn an_enter_after_the_record_does_not_count() {
+        // Left prompted, its record landed, then the right was prompted
+        // before the tick that adopts.
+        let hits = vec![(SID_B.to_owned(), at(11))];
+        let tabs = [(None, Some(at(10))), (None, Some(at(12)))];
+        assert_eq!(guess_round(&tabs, &hits), picks(0, 2));
+    }
+
+    #[test]
+    fn a_long_past_enter_does_not_count() {
+        // The left tab only answered a trust prompt minutes ago; the
+        // right one was just prompted.
+        let hits = vec![(SID_B.to_owned(), at(101))];
+        let tabs = [(None, Some(at(1))), (None, Some(at(100)))];
+        assert_eq!(guess_round(&tabs, &hits), picks(1, 2));
+    }
+
+    #[test]
+    fn a_rotation_goes_to_the_tab_that_submitted_last() {
+        // Both tabs own a transcript and were prompted recently; `/clear`
+        // in the right-hand tab, the later Enter, mints SID_B.
         let hits = vec![(SID_A.to_owned(), at(10)), (SID_B.to_owned(), at(20))];
         let sid_c = "cccccccc-0000-0000-0000-000000000000";
-        let tabs = [(Some(SID_A), Some(t0)), (Some(sid_c), Some(t1))];
-        assert_eq!(guess_round(&tabs, &hits), vec![None, Some(SID_B.to_owned())]);
+        let tabs = [(Some(SID_A), Some(at(15))), (Some(sid_c), Some(at(19)))];
+        assert_eq!(guess_round(&tabs, &hits), picks(1, 2));
     }
 
     #[test]
     fn adoption_rank_keeps_exact_then_unadopted_ahead_of_recency() {
-        let t0 = Instant::now();
-        let t1 = t0 + Duration::from_secs(1);
+        let rec = Some(at(20));
         let mut ranks = [
-            (5, adoption_rank(false, true, None)),
-            (4, adoption_rank(false, true, Some(t1))),
-            (3, adoption_rank(false, false, None)),
-            (2, adoption_rank(false, false, Some(t0))),
-            (1, adoption_rank(false, false, Some(t1))),
-            (0, adoption_rank(true, true, None)),
+            (6, adoption_rank(false, true, None, rec)),
+            (5, adoption_rank(false, true, Some(at(19)), rec)),
+            (4, adoption_rank(false, false, None, rec)),
+            (3, adoption_rank(false, false, Some(at(21)), rec)),
+            (2, adoption_rank(false, false, Some(at(19)), rec)),
+            (1, adoption_rank(false, false, Some(at(18)), rec)),
+            (0, adoption_rank(true, true, None, None)),
         ];
         ranks.sort_by_key(|(_, rank)| *rank);
-        assert_eq!(ranks.map(|(i, _)| i), [0, 1, 2, 3, 4, 5]);
+        assert_eq!(ranks.map(|(i, _)| i), [0, 1, 2, 3, 4, 5, 6]);
+    }
+
+    // ─── wants_exact_check ─────────────────────────────────────────
+
+    #[test]
+    fn exact_check_when_about_to_guess() {
+        let hits = vec![(SID_A.to_owned(), at(10))];
+        let none = ids(&[]);
+        assert!(wants_exact_check(&hits, &none, None, &none, &none, None));
+    }
+
+    #[test]
+    fn exact_check_once_for_a_session_a_neighbour_only_guessed() {
+        // A neighbour guessed SID_B before this tab's agent could name
+        // it (Copilot writes its lock ~0.5 s after the session dir).
+        // This tab has nothing to guess, but must ask once — and only
+        // once, or a correct guess next door costs a walk every tick.
+        let hits = vec![(SID_B.to_owned(), at(10))];
+        let none = ids(&[]);
+        let claimed = ids(&[SID_B]);
+        assert!(wants_exact_check(&hits, &none, None, &claimed, &claimed, None));
+        let asked = ids(&[SID_B]);
+        assert!(!wants_exact_check(&hits, &none, None, &claimed, &claimed, Some(&asked)));
+        // An exact (or restored) claim is never questioned.
+        assert!(!wants_exact_check(&hits, &none, None, &claimed, &none, None));
     }
 
     // ─── normalise_group_weights ───────────────────────────────────
