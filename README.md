@@ -95,7 +95,7 @@ Every asset has a matching `.sha256` file, and `sha256.sum` lists them all. `Cod
 ### Requirements
 
 - `git` on `PATH`
-- At least one agent CLI on `PATH` (`claude`, `codex`, `copilot`, `opencode` (`opencode-cli` on Windows), `pi`, `gemini`, etc.)
+- At least one agent CLI on `PATH` (`claude`, `codex`, `copilot`, `opencode`, `pi`, `gemini`, etc.)
 - Optional: the GitHub CLI (`gh`), signed in, for the PR and CI status on worktree rows
 - **Windows only:** PowerShell 7+ (`pwsh.exe`) on `PATH`. CodeScope spawns `pwsh.exe` for every terminal tab and for the `-Command "& { <agent> }"` wrapper that auto-types the agent CLI — legacy `powershell.exe` (Windows PowerShell 5.1) is not used. Override with the `CODESCOPE_SHELL` env var if you want a different shell.
 
