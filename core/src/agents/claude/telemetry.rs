@@ -159,6 +159,18 @@ struct Entry {
     /// of the conversation) or `last-prompt` (a prompt, the stand-in
     /// until the first `ai-title` lands).
     title: Option<(String, TitleSource)>,
+    /// The `<task-notification>` a queued message carries: the `content`
+    /// of a `queue-operation` line or the `prompt` of a `queued_command`
+    /// attachment. Current Claude Code delivers a finished background
+    /// agent's completion only there, never in a `user` entry (issue
+    /// #379). `None` for every other entry, and for queued messages
+    /// that are not a notification.
+    queued_notification: Option<String>,
+    /// Id of the agent a `SendMessage` tool result set running again
+    /// (`toolUseResult.resumedAgentId`). Its text names only a short
+    /// prefix of the id, and it is not the launch marker, so the id is
+    /// read from the structured field.
+    resumed_agent: Option<String>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -204,6 +216,32 @@ fn parse_line(line: &str) -> Option<Entry> {
         let text = obj.get(key).and_then(Value::as_str)?;
         Some((text.to_string(), source))
     });
+
+    // Only these two fields: the marker also turns up where it is no
+    // completion (tool docs in `prompt_snapshot` attachments, request
+    // history in `api-request-blob` lines).
+    let queued_text = match entry_type {
+        Some("queue-operation") => obj.get("content"),
+        Some("attachment") => obj
+            .get("attachment")
+            .filter(|a| a.get("type").and_then(Value::as_str) == Some("queued_command"))
+            .and_then(|a| a.get("prompt")),
+        _ => None,
+    };
+    let queued_notification = queued_text
+        .and_then(Value::as_str)
+        .filter(|text| text.contains(TASK_NOTIFICATION_MARKER))
+        .map(str::to_owned);
+
+    let resumed_agent = match kind {
+        EntryKind::User => obj
+            .get("toolUseResult")
+            .and_then(|r| r.get("resumedAgentId"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned),
+        _ => None,
+    };
 
     // Client-side slash command answers. See the field doc on
     // `Entry::local_command_answer`. A `user` entry carries the
@@ -324,6 +362,8 @@ fn parse_line(line: &str) -> Option<Entry> {
         compact_summary,
         bookkeeping,
         title,
+        queued_notification,
+        resumed_agent,
     })
 }
 
@@ -387,11 +427,13 @@ const TASK_NOTIFICATION_MARKER: &str = "<task-notification>";
 
 /// Update `pending` from one **user** transcript line.
 ///
-/// Both markers only ever reach the transcript inside user entries
-/// (the launch as a `tool_result`, the completion as an injected
-/// `<task-notification>` message), so the caller gates on
+/// The launch marker only ever reaches the transcript inside a user
+/// entry (as a `tool_result`), so the caller gates on
 /// [`EntryKind::User`] and we can scan the raw JSON text instead of
-/// walking a `content` shape that differs between the two.
+/// walking the `content` shape. A completion can arrive here too — a
+/// background Bash task's `<task-notification>` still does — but an
+/// agent's now comes queued instead (see
+/// [`Entry::queued_notification`] and [`retire_notified_agents`]).
 ///
 /// One line can carry several markers — two `Agent` calls in a single
 /// assistant message produce two `tool_result` blocks in one user
@@ -402,13 +444,25 @@ fn apply_agent_markers(line: &str, pending: &mut HashSet<String>) {
             pending.insert(id);
         }
     }
-    if line.contains(TASK_NOTIFICATION_MARKER) {
-        for (idx, _) in line.match_indices("<task-id>") {
-            if let Some(id) = tagged_value(&line[idx..], "<task-id>", |c| c != '<') {
-                pending.remove(&id);
-            }
+    retire_notified_agents(line, pending);
+}
+
+/// Drop every id a `<task-notification>` in `text` names from `pending`.
+/// Its status is always terminal, so seeing the same notification again
+/// (Claude Code writes one completion to several lines) is harmless.
+///
+/// Returns whether an id was actually retired.
+fn retire_notified_agents(text: &str, pending: &mut HashSet<String>) -> bool {
+    if !text.contains(TASK_NOTIFICATION_MARKER) {
+        return false;
+    }
+    let mut retired = false;
+    for (idx, _) in text.match_indices("<task-id>") {
+        if let Some(id) = tagged_value(&text[idx..], "<task-id>", |c| c != '<') {
+            retired |= pending.remove(&id);
         }
     }
+    retired
 }
 
 /// First `prefix`-introduced run of `accept` characters in `hay`, or
@@ -433,7 +487,9 @@ pub struct ReadOutcome {
     /// At least one line read was something other than Claude Code's own
     /// bookkeeping (`is_bookkeeping_type`) — the transcript moved in a
     /// way that may mean a turn is running. Lines that fail to parse
-    /// count, so an unrecognised write is never mistaken for silence.
+    /// count, so an unrecognised write is never mistaken for silence. So
+    /// does a queued notification that retired a pending background
+    /// agent: a turn on its hand-back follows (issue #379).
     pub activity: bool,
 }
 
@@ -564,6 +620,16 @@ pub fn process_new_lines(
         {
             title_changed = true;
         }
+        // A background agent finished (issue #379). The queue lines are
+        // bookkeeping, but one that retires an agent means a turn on its
+        // hand-back is about to run, so it restarts the quiet window
+        // rather than letting an agent that outlived it drop the session
+        // straight to `Idle`.
+        if let Some(text) = &entry.queued_notification
+            && retire_notified_agents(text, pending_agents)
+        {
+            activity = true;
+        }
 
         match entry.kind {
             // A compacted conversation's summary (see the field doc on
@@ -591,6 +657,9 @@ pub fn process_new_lines(
                     *last_user_ts = entry.timestamp_secs;
                 }
                 apply_agent_markers(&line, pending_agents);
+                if let Some(id) = &entry.resumed_agent {
+                    pending_agents.insert(id.clone());
+                }
                 changed = true;
             }
             EntryKind::Assistant => {
@@ -665,9 +734,10 @@ pub fn process_new_lines(
     }
 
     // The main agent ending its turn does not mean the session is
-    // done — background subagents outlive it, and their completion
-    // arrives later as a `<task-notification>` user entry (which
-    // flips the state back to `Busy` on its own).
+    // done — background subagents outlive it. Their completion arrives
+    // later as a queued `<task-notification>`, followed by a user entry
+    // with the agent's hand-back (which flips the state back to `Busy`
+    // on its own).
     if state == SessionState::Idle && !pending_agents.is_empty() {
         state = SessionState::Busy;
     }
@@ -1530,6 +1600,190 @@ mod tests {
         assert!(pending.contains("aaa111"));
     }
 
+    // --- queued agent completions (issue #379) ---
+    //
+    // Current Claude Code no longer writes a finished background agent's
+    // `<task-notification>` into a `user` entry. It queues it instead:
+    // `queue-operation` lines (`enqueue`, later `remove`) carry it in
+    // `content`, a `queued_command` attachment carries it in `prompt`,
+    // and the `user` entry that follows holds only the agent's
+    // `<agent-message>`. Same structure as the captured transcripts;
+    // ids, paths and text are neutral.
+
+    const QUEUED_AGENT_MESSAGE: &str = r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-08-09T08:05:00Z","sessionId":"s","content":"<agent-message from=\"a02e36f821d048123\">[Subagent hand-back] done</agent-message>"}"#;
+    const QUEUED_NOTIFICATION: &str = r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-08-09T08:05:00Z","sessionId":"s","content":"<task-notification>\n<task-id>a02e36f821d048123</task-id>\n<tool-use-id>toolu_1</tool-use-id>\n<output-file>/tmp/tasks/a02e36f821d048123.output</output-file>\n<status>completed</status>\n<summary>Agent \"review\" completed</summary>\n</task-notification>"}"#;
+    const DEQUEUED_NOTIFICATION: &str = r#"{"type":"queue-operation","operation":"remove","timestamp":"2026-08-09T08:05:01Z","sessionId":"s","commandUuid":"c1","deliveryId":"d1","reason":"delivered","content":"<task-notification>\n<task-id>a02e36f821d048123</task-id>\n<tool-use-id>toolu_1</tool-use-id>\n<status>completed</status>\n</task-notification>"}"#;
+    const QUEUED_COMMAND_NOTIFICATION: &str = r#"{"type":"attachment","sessionId":"s","timestamp":"2026-08-09T08:05:01Z","attachment":{"type":"queued_command","commandMode":"task-notification","prompt":"<task-notification>\n<task-id>a02e36f821d048123</task-id>\n<tool-use-id>toolu_1</tool-use-id>\n<status>completed</status>\n</task-notification>"},"rendered":[{"content":"<task-notification>\n<task-id>a02e36f821d048123</task-id>\n</task-notification>"}]}"#;
+    const USER_AGENT_MESSAGE: &str = r#"{"type":"user","sessionId":"s","timestamp":"2026-08-09T08:05:02Z","message":{"role":"user","content":"Another Claude session sent a message:\n<agent-message from=\"a02e36f821d048123\">[Subagent hand-back] done</agent-message>"},"origin":{"from":"a02e36f821d048123"}}"#;
+    /// `SendMessage` to a finished agent: it runs again in the background,
+    /// and its id is only in `toolUseResult` (the text has a short prefix).
+    const RESUME: &str = r#"{"type":"user","sessionId":"s","timestamp":"2026-08-09T08:10:00Z","message":{"role":"user","content":[{"tool_use_id":"toolu_2","type":"tool_result","content":[{"type":"text","text":"{\"success\":true,\"message\":\"Resuming agent a02e36f\",\"resumedAgentId\":\"a02e36f821d048123\"}"}]}]},"toolUseResult":{"success":true,"message":"Resuming agent a02e36f","resumedAgentId":"a02e36f821d048123"}}"#;
+    /// The resumed run's completion: no `<tool-use-id>` this time.
+    const QUEUED_RESUMED_NOTIFICATION: &str = r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-08-09T08:15:00Z","sessionId":"s","content":"<task-notification>\n<task-id>a02e36f821d048123</task-id>\n<output-file>/tmp/tasks/a02e36f821d048123.output</output-file>\n<status>completed</status>\n</task-notification>"}"#;
+    /// A background Bash task still reports in a `user` entry.
+    const BASH_NOTIFICATION: &str = r#"{"type":"user","sessionId":"s","timestamp":"2026-08-09T08:03:00Z","message":{"role":"user","content":"<task-notification>\n<task-id>b7x2k9q4</task-id>\n<tool-use-id>toolu_3</tool-use-id>\n<status>completed</status>\n<summary>Background command \"build\" completed (exit code 0)</summary>\n</task-notification>"}}"#;
+
+    /// Tail state with `PROMPT` already replayed, so whatever the test
+    /// appends next is read live.
+    fn live_tail(
+        path: &std::path::Path,
+    ) -> (FileTail, Option<TelemetrySnapshot>, Option<f64>, HashSet<String>) {
+        write_lines(path, &[PROMPT]);
+        let mut tail = FileTail::default();
+        let mut snap = None;
+        let mut last_user_ts = None;
+        let mut pending = HashSet::new();
+        process_new_lines(path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
+        (tail, snap, last_user_ts, pending)
+    }
+
+    #[test]
+    fn agent_completion_via_queue_operation_goes_idle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let (mut tail, mut snap, mut last_user_ts, mut pending) = live_tail(&path);
+
+        append_lines(&path, &[LAUNCH, END_TURN]);
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Busy);
+
+        append_lines(
+            &path,
+            &[
+                QUEUED_AGENT_MESSAGE,
+                QUEUED_NOTIFICATION,
+                DEQUEUED_NOTIFICATION,
+                USER_AGENT_MESSAGE,
+                END_TURN,
+            ],
+        );
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
+        assert!(pending.is_empty());
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Idle);
+    }
+
+    #[test]
+    fn agent_completion_via_queued_command_attachment_goes_idle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let (mut tail, mut snap, mut last_user_ts, mut pending) = live_tail(&path);
+
+        append_lines(&path, &[LAUNCH, END_TURN]);
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
+        assert!(!pending.is_empty());
+
+        append_lines(&path, &[QUEUED_COMMAND_NOTIFICATION, USER_AGENT_MESSAGE, END_TURN]);
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
+        assert!(pending.is_empty());
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Idle);
+    }
+
+    #[test]
+    fn repeated_notification_retires_only_its_own_agent() {
+        // The full shape delivers one completion up to four times
+        // (enqueue, remove, attachment, and the old `user` entry where a
+        // CLI still writes it). Seeing it again must not disturb the
+        // other agent still running.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let (mut tail, mut snap, mut last_user_ts, mut pending) = live_tail(&path);
+
+        let second = LAUNCH.replace("a02e36f821d048123", "bbb222ccc333");
+        append_lines(&path, &[LAUNCH, &second, END_TURN]);
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
+        assert_eq!(pending.len(), 2);
+
+        append_lines(
+            &path,
+            &[
+                QUEUED_NOTIFICATION,
+                DEQUEUED_NOTIFICATION,
+                QUEUED_COMMAND_NOTIFICATION,
+                NOTIFICATION,
+                QUEUED_NOTIFICATION,
+                USER_AGENT_MESSAGE,
+                END_TURN,
+            ],
+        );
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains("bbb222ccc333"));
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Busy);
+    }
+
+    #[test]
+    fn background_bash_notification_in_a_user_entry_still_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let (mut tail, mut snap, mut last_user_ts, mut pending) = live_tail(&path);
+
+        // A Bash task the tail never tracked reports back: harmless to
+        // the agent that is still running.
+        append_lines(&path, &[LAUNCH, BASH_NOTIFICATION, END_TURN]);
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
+        assert!(pending.contains("a02e36f821d048123"));
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Busy);
+
+        // And the `user` entry route still retires an id it names.
+        let bash_for_agent = BASH_NOTIFICATION.replace("b7x2k9q4", "a02e36f821d048123");
+        append_lines(&path, &[&bash_for_agent, END_TURN]);
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
+        assert!(pending.is_empty());
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Idle);
+    }
+
+    #[test]
+    fn agent_resumed_with_send_message_is_pending_until_it_reports() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        // The first run launched and finished in history.
+        write_lines(
+            &path,
+            &[PROMPT, LAUNCH, END_TURN, QUEUED_NOTIFICATION, USER_AGENT_MESSAGE, END_TURN],
+        );
+        let mut tail = FileTail::default();
+        let mut snap = None;
+        let mut last_user_ts = None;
+        let mut pending = HashSet::new();
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
+        assert!(pending.is_empty());
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Idle);
+
+        // Resumed live: it is working again in the background.
+        append_lines(&path, &[PROMPT, RESUME, END_TURN]);
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
+        assert!(pending.contains("a02e36f821d048123"));
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Busy);
+
+        append_lines(&path, &[QUEUED_RESUMED_NOTIFICATION, USER_AGENT_MESSAGE, END_TURN]);
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
+        assert!(pending.is_empty());
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Idle);
+    }
+
+    #[test]
+    fn notification_text_in_other_entries_does_not_retire_agents() {
+        // Claude Code also writes the marker where it is not a
+        // completion: tool docs in a `prompt_snapshot` attachment, and
+        // the request history in `api-request-blob` lines.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let (mut tail, mut snap, mut last_user_ts, mut pending) = live_tail(&path);
+
+        append_lines(
+            &path,
+            &[
+                LAUNCH,
+                END_TURN,
+                r#"{"type":"attachment","sessionId":"s","attachment":{"type":"prompt_snapshot","tools":[{"description":"<task-notification><task-id>a02e36f821d048123</task-id></task-notification>"}]}}"#,
+                r#"{"type":"api-request-blob","sessionId":"s","message":{"content":[{"type":"text","text":"<task-notification><task-id>a02e36f821d048123</task-id></task-notification>"}]}}"#,
+            ],
+        );
+        process_new_lines(&path, &mut tail, &mut snap, &mut last_user_ts, &mut pending);
+        assert!(pending.contains("a02e36f821d048123"));
+        assert_eq!(snap.as_ref().unwrap().state, SessionState::Busy);
+    }
+
     // --- client-side slash commands (issue #343) ---
     //
     // Captured from `~/.claude/projects/C--dev-codescope-public/*.jsonl`.
@@ -1833,6 +2087,34 @@ mod tests {
 
         assert!(!tail.poll_at(start + past_timeout()));
         assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Busy);
+    }
+
+    #[test]
+    fn queued_agent_completion_restarts_the_quiet_window() {
+        // An agent that outlived the window reports back through the
+        // queue (issue #379). Those lines are bookkeeping, but this one
+        // means a turn is about to run on the hand-back: the session
+        // must not drop to Idle on the very poll that retires the agent.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        write_lines(&path, &[PROMPT]);
+
+        let mut tail = ClaudeTranscriptTail::new(path.clone());
+        let start = Instant::now();
+        append_lines(&path, &[LAUNCH, END_TURN]);
+        tail.poll_at(start);
+
+        let reported = start + past_timeout() * 2;
+        append_lines(&path, &[QUEUED_NOTIFICATION]);
+        tail.poll_at(reported);
+        assert!(tail.pending_agents.is_empty());
+        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Busy);
+
+        // Should the turn never come, the fallback still applies.
+        assert!(tail.poll_at(reported + past_timeout()));
+        let snap = tail.snapshot.as_ref().unwrap();
+        assert_eq!(snap.state, SessionState::Idle);
+        assert!(snap.quiet_timeout);
     }
 
     #[test]
