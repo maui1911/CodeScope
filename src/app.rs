@@ -290,6 +290,11 @@ struct Tab {
     /// dispatch — mirrors the `agentId` string the C#
     /// `MainViewModel.RegisterAgentTelemetry` branches on.
     agent_id: Option<codescope_core::AgentId>,
+    /// The session label (rename, else content title) last written
+    /// into `title` by [`AppShell::apply_session_titles`], so a tick
+    /// that sees the same label again does no work. `None` until one
+    /// is known.
+    applied_label: Option<String>,
 }
 
 /// Pick the transcript a tab should adopt this tick: the newest
@@ -1275,6 +1280,14 @@ impl AppShell {
                 SidebarEvent::ReopenSession { session_id } => {
                     this.reopen_session(session_id.clone(), window, cx);
                 }
+                SidebarEvent::FocusTab { tab_id } => {
+                    let found = this.groups.iter().enumerate().find_map(|(g_idx, g)| {
+                        g.tabs.iter().position(|t| t.id == *tab_id).map(|t_idx| (g_idx, t_idx))
+                    });
+                    if let Some((g_idx, t_idx)) = found {
+                        this.activate_tab(g_idx, t_idx, window, cx);
+                    }
+                }
                 SidebarEvent::OpenDiff { worktree_path } => {
                     this.open_diff_viewer(Some(worktree_path.clone()), cx);
                 }
@@ -2079,6 +2092,9 @@ impl AppShell {
                     for tail in this.telemetry_tails.values_mut() {
                         tail.poll();
                     }
+                    // Titles first, so the sidebar rows pushed below
+                    // already carry this tick's labels.
+                    this.apply_session_titles(cx);
                     // After every poll, recompute the per-path
                     // active/busy snapshot the sidebar uses to colour
                     // its worktree dots and propagate "agent busy" up
@@ -2491,6 +2507,8 @@ impl AppShell {
             agent_session_id: Option<String>,
             project_name: String,
             branch: Option<String>,
+            /// Persisted content title — the tab comes back under it.
+            title: Option<String>,
             /// `Some` for a remote-shell session (#323) — carries the
             /// project id + command so the tab respawns without a cwd.
             remote: Option<RemoteShellLaunch>,
@@ -2531,6 +2549,7 @@ impl AppShell {
                         agent_session_id: s.agent_session_id.clone(),
                         project_name: project_name.clone(),
                         branch,
+                        title: s.title.clone(),
                         remote,
                     })
                 })
@@ -2679,11 +2698,19 @@ impl AppShell {
             // `Session.display_name` does NOT participate here; it
             // only flows into the sidebar row title (a separate
             // projection), matching C# `MainViewModel.HydrateFromLoaded`.
-            let title = SharedString::from(codescope_core::restored_title(
+            // A persisted content title replaces the branch segment.
+            let base = codescope_core::restored_title(
                 &entry.project_name,
                 entry.branch.as_deref(),
                 &entry.worktree_path,
-            ));
+            );
+            let title = SharedString::from(
+                entry
+                    .title
+                    .as_deref()
+                    .and_then(|t| codescope_core::titled_tab_title(&base, t))
+                    .unwrap_or(base),
+            );
 
             self.spawn_tab_in(
                 Some(path),
@@ -2862,17 +2889,19 @@ impl AppShell {
         // Snapshot per-session display_name lookup so we don't borrow
         // `self.projects` across the mutable iteration over groups.
         // Sessions with an explicit display_name set must not be
-        // overwritten — the user renamed them.
+        // overwritten — the user renamed them. Nor may sessions with a
+        // content title: their tab reads `Project · Title` and has no
+        // branch segment left to swap.
         let renamed_session_ids: HashSet<String> = self
             .projects
             .projects
             .iter()
             .flat_map(|p| p.sessions.iter())
             .filter(|s| {
-                s.display_name
-                    .as_deref()
-                    .map(|d| !d.trim().is_empty())
-                    .unwrap_or(false)
+                [s.display_name.as_deref(), s.title.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|d| !d.trim().is_empty())
             })
             .map(|s| s.id.clone())
             .collect();
@@ -2952,6 +2981,7 @@ impl AppShell {
                 last_opened: None,
                 agent_session_id: None,
                 closed_at: None,
+                title: None,
             };
             match SessionManager::open(&mut self.projects, project_id, session, &now_iso8601()) {
                 Ok(_) => {
@@ -3004,6 +3034,7 @@ impl AppShell {
             last_opened: None,
             agent_session_id: None,
             closed_at: None,
+            title: None,
         };
         match SessionManager::open(&mut self.projects, &project_id, session, &now_iso8601()) {
             Ok(_) => {
@@ -3359,12 +3390,21 @@ impl AppShell {
                 .and_then(|g| g.branch_name().map(str::to_string))
                 .or_else(|| restored.branch.clone());
             match project_name {
-                Some(p) => codescope_core::restored_title(
-                    &p,
-                    branch_label.as_deref(),
-                    &descriptor.working_directory,
-                )
-                .into(),
+                Some(p) => {
+                    let base = codescope_core::restored_title(
+                        &p,
+                        branch_label.as_deref(),
+                        &descriptor.working_directory,
+                    );
+                    // A session that had a content title comes back
+                    // under it, not under its branch.
+                    restored
+                        .title
+                        .as_deref()
+                        .and_then(|t| codescope_core::titled_tab_title(&base, t))
+                        .unwrap_or(base)
+                        .into()
+                }
                 None => descriptor.title.clone().into(),
             }
         };
@@ -4000,6 +4040,7 @@ impl AppShell {
             adopted_session_id,
             fired_session_ids: std::collections::HashSet::new(),
             agent_id,
+            applied_label: None,
         });
         let new_idx = group.tabs.len() - 1;
         self.activate_tab(group_idx, new_idx, window, cx);
@@ -6013,10 +6054,152 @@ impl AppShell {
             .flat_map(|g| g.tabs.iter())
             .filter_map(|t| t.remote_project_id.clone())
             .collect();
+        let live_rows = self.sidebar_live_session_rows();
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.set_session_paths(busy, active, dots, cx);
             sidebar.set_remote_live_project_ids(remote_live, cx);
+            sidebar.set_live_sessions(live_rows, cx);
         });
+    }
+
+    /// One sidebar row per open local tab, keyed by canonicalised
+    /// worktree path, in tab order — so two sessions in one worktree
+    /// show as two rows under it instead of one shared worktree row.
+    fn sidebar_live_session_rows(&self) -> HashMap<String, Vec<crate::sidebar::LiveSessionRow>> {
+        let focused_tab_id = self
+            .groups
+            .get(self.focused_group)
+            .and_then(|g| g.tabs.get(g.active_tab))
+            .map(|t| t.id);
+        let mut rows: HashMap<String, Vec<crate::sidebar::LiveSessionRow>> = HashMap::new();
+        for tab in self.groups.iter().flat_map(|g| g.tabs.iter()) {
+            if tab.remote_project_id.is_some() {
+                continue;
+            }
+            let Some(wd) = tab.working_directory.as_ref() else { continue };
+            let canon = codescope_core::path_canon::canonicalize_path(&wd.to_string_lossy());
+            if canon.is_empty() {
+                continue;
+            }
+            let snapshot = tab.adopted_session_id.as_deref().and_then(|sid| self.telemetry_for(sid));
+            let dot = tab.adopted_session_id.as_ref().map(|_| {
+                let busy = snapshot.as_ref().is_some_and(|s| {
+                    matches!(
+                        s.state,
+                        codescope_core::SessionState::Busy
+                            | codescope_core::SessionState::PendingToolUse
+                    )
+                });
+                if busy { codescope_core::SessionDot::Busy } else { codescope_core::SessionDot::Idle }
+            });
+            let agent_label = tab
+                .agent_id
+                .and_then(|id| self.agent_registry.get_by_id(id.as_str()))
+                .map(|p| p.display_name.clone());
+            let label = self.session_label_for(tab, snapshot.as_ref()).or(agent_label);
+            rows.entry(canon).or_default().push(crate::sidebar::LiveSessionRow {
+                tab_id: tab.id,
+                label: codescope_core::session_label(None, label.as_deref(), None).into(),
+                dot,
+                focused: Some(tab.id) == focused_tab_id,
+            });
+        }
+        rows
+    }
+
+    /// The name a tab's session goes by: the user's rename, else the
+    /// content title its telemetry reports, else the title persisted
+    /// from an earlier run. `None` while none of those is known.
+    fn session_label_for(
+        &self,
+        tab: &Tab,
+        snapshot: Option<&codescope_core::TelemetrySnapshot>,
+    ) -> Option<String> {
+        let session = self
+            .projects
+            .projects
+            .iter()
+            .flat_map(|p| p.sessions.iter())
+            .find(|s| s.id == tab.session_id);
+        let non_blank = |s: &&str| !s.trim().is_empty();
+        session
+            .and_then(|s| s.display_name.as_deref().filter(non_blank))
+            .or_else(|| snapshot.and_then(|s| s.title.as_ref()).map(|t| t.text.as_str()))
+            .or_else(|| session.and_then(|s| s.title.as_deref().filter(non_blank)))
+            .map(str::to_owned)
+    }
+
+    /// Carry each tab's session label onto its tab strip title
+    /// (`Project · Label`) and persist newly reported content titles to
+    /// `projects.json`, so closed history rows and the next launch keep
+    /// them. Runs on the telemetry cadence; a tick where no label moved
+    /// touches neither the tabs nor the disk.
+    fn apply_session_titles(&mut self, cx: &mut Context<Self>) {
+        let mut retitled: Vec<(usize, usize, String)> = Vec::new();
+        let mut to_persist: Vec<(String, String)> = Vec::new();
+        for (g_idx, group) in self.groups.iter().enumerate() {
+            for (t_idx, tab) in group.tabs.iter().enumerate() {
+                let snapshot =
+                    tab.adopted_session_id.as_deref().and_then(|sid| self.telemetry_for(sid));
+                if let Some(title) = snapshot.as_ref().and_then(|s| s.title.as_ref()) {
+                    let persisted = self
+                        .projects
+                        .projects
+                        .iter()
+                        .flat_map(|p| p.sessions.iter())
+                        .find(|s| s.id == tab.session_id)
+                        .map(|s| s.title.as_deref());
+                    // `None` = free-floating tab with no row to write to.
+                    if let Some(persisted) = persisted
+                        && persisted != Some(title.text.as_str())
+                    {
+                        to_persist.push((tab.session_id.clone(), title.text.clone()));
+                    }
+                }
+                let Some(label) = self.session_label_for(tab, snapshot.as_ref()) else {
+                    continue;
+                };
+                if tab.applied_label.as_deref() != Some(label.as_str()) {
+                    retitled.push((g_idx, t_idx, label));
+                }
+            }
+        }
+
+        if !to_persist.is_empty() {
+            // Reload-then-mutate, like every other AppShell write: the
+            // sidebar writes `projects.json` too.
+            match ProjectsConfig::load(&self.paths) {
+                Ok(cfg) => self.projects = cfg,
+                Err(err) => {
+                    eprintln!("warning: failed to reload projects.json before saving titles: {err:#}")
+                }
+            }
+            let mut changed = false;
+            for (session_id, title) in &to_persist {
+                // A row the reload no longer has (closed or removed
+                // meanwhile) has nothing to keep the title on.
+                changed |= SessionManager::set_title(&mut self.projects, session_id, title)
+                    .unwrap_or(false);
+            }
+            if changed {
+                if let Err(err) = self.projects.save(&self.paths) {
+                    eprintln!("warning: failed to persist session titles: {err:#}");
+                }
+                self.mirror_projects_to_sidebar(cx);
+            }
+        }
+
+        if retitled.is_empty() {
+            return;
+        }
+        for (g_idx, t_idx, label) in retitled {
+            let tab = &mut self.groups[g_idx].tabs[t_idx];
+            if let Some(title) = codescope_core::titled_tab_title(tab.title.as_ref(), &label) {
+                tab.title = SharedString::from(title);
+            }
+            tab.applied_label = Some(label);
+        }
+        cx.notify();
     }
 
     /// Canonicalised worktree path of the currently focused tab (the
@@ -9805,6 +9988,7 @@ mod tests {
             last_turn_duration: None,
             state,
             quiet_timeout: false,
+            title: None,
         }
     }
 

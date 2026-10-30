@@ -442,6 +442,10 @@ pub enum SidebarEvent {
     /// the persisted `worktree_path` + `agent_id`. Mirrors C#
     /// `MainViewModel.ReopenClosedSessionAsync`.
     ReopenSession { session_id: String },
+    /// Click on a live session row: bring that tab to the front.
+    /// `tab_id` is `Tab::id` from the [`LiveSessionRow`] AppShell
+    /// pushed; a tab that closed in the meantime is ignored.
+    FocusTab { tab_id: u64 },
     /// User picked "Rename project…" / "Rename session…" from a
     /// context menu. AppShell owns the rename dialog state and the
     /// rename persistence path; the sidebar fires the request and
@@ -616,6 +620,22 @@ fn history_agent_display_name(agent_id: &str) -> Option<&'static str> {
     })
 }
 
+/// One open tab, as the sidebar lists it under its worktree row.
+/// Built by AppShell (which owns the tabs and their telemetry) and
+/// pushed through [`Sidebar::set_live_sessions`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveSessionRow {
+    /// `Tab::id` — what a click hands back in [`SidebarEvent::FocusTab`].
+    pub tab_id: u64,
+    /// Rename, else content title, else agent name, else `"shell"`.
+    pub label: SharedString,
+    /// Agent activity; `None` for a tab with no adopted agent session
+    /// (a plain shell, or an agent that hasn't written yet).
+    pub dot: Option<SessionDot>,
+    /// The tab the user is looking at right now.
+    pub focused: bool,
+}
+
 /// Display data for a single closed-session row inside a worktree's
 /// history disclosure. Snapshotted at render time so the per-row
 /// listener closure can hold an owned `session_id` without keeping
@@ -729,6 +749,10 @@ pub struct Sidebar {
     /// and project rows (#374). Pushed with `busy_paths` /
     /// `active_paths` by [`Sidebar::set_session_paths`].
     session_dots: HashMap<String, Vec<SessionDot>>,
+    /// Open tabs per canonicalised worktree path, in tab order — one
+    /// row each under the worktree row. Pushed by
+    /// [`Sidebar::set_live_sessions`].
+    live_sessions: HashMap<String, Vec<LiveSessionRow>>,
     /// Drop slot under the cursor during a project / group drag
     /// (#374). Stale once the drag ends without a drop — render only
     /// trusts it while `cx.has_active_drag()`.
@@ -872,6 +896,7 @@ impl Sidebar {
             collapsed_projects,
             collapsed_project_groups,
             session_dots: HashMap::new(),
+            live_sessions: HashMap::new(),
             drop_hover: None,
             expanded_worktrees: HashSet::new(),
             busy_paths: HashSet::new(),
@@ -985,6 +1010,20 @@ impl Sidebar {
         self.busy_paths = busy;
         self.active_paths = active;
         self.session_dots = dots;
+        cx.notify();
+    }
+
+    /// Replace the open-tab rows listed under each worktree. No-op +
+    /// no notify when unchanged, same as [`Self::set_session_paths`].
+    pub fn set_live_sessions(
+        &mut self,
+        rows: HashMap<String, Vec<LiveSessionRow>>,
+        cx: &mut Context<Self>,
+    ) {
+        if rows == self.live_sessions {
+            return;
+        }
+        self.live_sessions = rows;
         cx.notify();
     }
 
@@ -3182,12 +3221,14 @@ impl Render for Sidebar {
                         .agent_id
                         .as_deref()
                         .and_then(history_agent_display_name);
-                    let label: SharedString = s
-                        .display_name
-                        .clone()
-                        .or_else(|| agent_label.map(|s| s.to_string()))
-                        .unwrap_or_else(|| "shell".to_string())
-                        .into();
+                    // The content title the session ran under sits
+                    // between the two, so history says what it was about.
+                    let label: SharedString = codescope_core::session_label(
+                        s.display_name.as_deref(),
+                        s.title.as_deref(),
+                        agent_label,
+                    )
+                    .into();
                     closed_by_wt
                         .entry(key)
                         .or_default()
@@ -4091,6 +4132,56 @@ impl Render for Sidebar {
                     wt_row
                 };
                 project_and_worktree_rows.push(wt_row.into_any_element());
+
+                // Live session rows — one per open tab in this worktree,
+                // always shown, so two sessions in one worktree read as
+                // two rows. Click brings the tab to the front.
+                if let Some(live) = self.live_sessions.get(&wt.canonical_path) {
+                    let frost_hover = theme::surface_elev(&theme);
+                    let ink_hover = theme::ink(&theme);
+                    for row in live {
+                        let tab_id = row.tab_id;
+                        let dot_color = match row.dot {
+                            Some(SessionDot::Busy) => theme::signal_warn(),
+                            Some(SessionDot::Idle) => theme::signal_ok(),
+                            None => theme::text_faint(),
+                        };
+                        let label_color = if row.focused {
+                            theme::ink(&theme)
+                        } else {
+                            theme::ink_muted(&theme)
+                        };
+                        let live_row = div()
+                            .id(("live-session", tab_id))
+                            .h(px(24.0))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .pl(px(46.0)) // same indent as the history rows
+                            .pr_3()
+                            .gap_2()
+                            .text_size(px(11.0))
+                            .cursor_pointer()
+                            .when(row.focused, |s| s.bg(theme::active_context_wash_dim(&theme)))
+                            .hover(move |s| s.bg(frost_hover).text_color(ink_hover))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |_, _, _, cx| {
+                                    cx.stop_propagation();
+                                    cx.emit(SidebarEvent::FocusTab { tab_id });
+                                }),
+                            )
+                            .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(dot_color))
+                            .child(
+                                div()
+                                    .flex_grow()
+                                    .truncate()
+                                    .text_color(label_color)
+                                    .child(row.label.clone()),
+                            );
+                        project_and_worktree_rows.push(live_row.into_any_element());
+                    }
+                }
 
                 // Closed-session history rows. Hidden unless the user
                 // has expanded this worktree's chevron. Each row is dim
