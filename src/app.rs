@@ -348,8 +348,11 @@ fn select_adoption(
     exact: Option<&str>,
 ) -> Option<String> {
     if let Some(own) = exact {
+        // Fired before but since rotated away from (a guess on a tick
+        // when the exact id wasn't readable) still counts: come back.
         let on_disk = hits.iter().any(|(sid, _)| sid == own);
-        return (on_disk && !fired.contains(own)).then(|| own.to_owned());
+        let current = fired.contains(own) && adopted == Some(own);
+        return (on_disk && !current).then(|| own.to_owned());
     }
     let mut newest: Option<(SystemTime, &str)> = None;
     for (sid, mtime) in hits {
@@ -1892,6 +1895,31 @@ impl AppShell {
         }
     }
 
+    /// Persist that the rows of `session_ids` no longer own the agent
+    /// session (and content title) they had adopted — see
+    /// `SessionManager::release_agent_session`. Reload-then-mutate,
+    /// like every other `projects.json` write here.
+    fn release_agent_sessions(&mut self, session_ids: &[String], cx: &mut Context<Self>) {
+        match ProjectsConfig::load(&self.paths) {
+            Ok(cfg) => self.projects = cfg,
+            Err(err) => {
+                eprintln!("warning: failed to reload projects.json before releasing sessions: {err:#}");
+                return;
+            }
+        }
+        let mut changed = false;
+        for id in session_ids {
+            changed |= SessionManager::release_agent_session(&mut self.projects, id);
+        }
+        if !changed {
+            return;
+        }
+        if let Err(err) = self.projects.save(&self.paths) {
+            eprintln!("warning: failed to persist released agent sessions: {err:#}");
+        }
+        self.mirror_projects_to_sidebar(cx);
+    }
+
     /// Register a transcript tail for `session_id` under
     /// `working_directory`, dispatching by `agent_id`. Safe to call
     /// multiple times with the same id — the old tail is replaced
@@ -2469,8 +2497,12 @@ impl AppShell {
                     // neighbour guessed wrong; that neighbour lets go
                     // (and re-adopts its own on a later tick) instead of
                     // both tabs showing one conversation.
+                    // Its row forgets the id and the title that came
+                    // with it too, or the next launch would resume the
+                    // neighbour's conversation in both tabs.
                     let taken: HashSet<String> =
                         found.iter().map(|f| f.new_agent_session_id.clone()).collect();
+                    let mut released: Vec<String> = Vec::new();
                     for (g_idx, group) in this.groups.iter_mut().enumerate() {
                         for (t_idx, tab) in group.tabs.iter_mut().enumerate() {
                             let adopts_now =
@@ -2479,8 +2511,17 @@ impl AppShell {
                                 && tab.adopted_session_id.as_ref().is_some_and(|s| taken.contains(s))
                             {
                                 tab.adopted_session_id = None;
+                                tab.fired_session_ids.retain(|s| !taken.contains(s));
+                                tab.applied_label = None;
+                                if let Some((base, _)) = tab.title.split_once(" · ") {
+                                    tab.title = SharedString::from(base.to_owned());
+                                }
+                                released.push(tab.session_id.clone());
                             }
                         }
+                    }
+                    if !released.is_empty() {
+                        this.release_agent_sessions(&released, cx);
                     }
                     for f in found {
                         if let Some(prev) = f.previous_agent_session_id.as_deref()
@@ -6187,27 +6228,34 @@ impl AppShell {
         rows
     }
 
-    /// What a tab's session is about, live: the title its transcript
-    /// reports, else — for an agent tab — the topic the agent put in
-    /// the terminal title. The latter still works with the agent's
-    /// transcript saving switched off, when there is no tail to read.
+    /// What a tab's session is about, live: a title its transcript
+    /// reports the agent or user gave it, else — for an agent tab — the
+    /// topic the agent put in the terminal title, else the transcript's
+    /// first-prompt stand-in. The terminal topic is generated too, so
+    /// it outranks the raw prompt (which Claude Code records before its
+    /// `ai-title`), and it still works with transcript saving off.
     fn content_title_for(
         &self,
         tab: &Tab,
         snapshot: Option<&codescope_core::TelemetrySnapshot>,
         cx: &App,
     ) -> Option<String> {
-        if let Some(title) = snapshot.and_then(|s| s.title.as_ref()) {
+        let from_transcript = snapshot.and_then(|s| s.title.as_ref());
+        if let Some(title) =
+            from_transcript.filter(|t| t.source >= codescope_core::TitleSource::Generated)
+        {
             return Some(title.text.clone());
         }
-        let agent = tab.agent_id?;
-        let raw = tab.terminal.read(cx).title()?.to_owned();
-        let display_name = self
-            .agent_registry
-            .get_by_id(agent.as_str())
-            .map(|p| p.display_name.clone())
-            .unwrap_or_default();
-        codescope_core::terminal_title_candidate(&raw, &[&display_name, agent.as_str()])
+        let from_terminal = tab.agent_id.and_then(|agent| {
+            let raw = tab.terminal.read(cx).title()?.to_owned();
+            let display_name = self
+                .agent_registry
+                .get_by_id(agent.as_str())
+                .map(|p| p.display_name.clone())
+                .unwrap_or_default();
+            codescope_core::terminal_title_candidate(&raw, &[&display_name, agent.as_str()])
+        });
+        from_terminal.or_else(|| from_transcript.map(|t| t.text.clone()))
     }
 
     /// The name a tab's session goes by: the user's rename, else its
@@ -6345,8 +6393,13 @@ impl AppShell {
     /// last tab closes and there's no longer a focused tab.
     fn push_sidebar_active_context(&self, cx: &mut Context<Self>) {
         let path = self.focused_tab_worktree_path();
+        // The live session rows carry the focus highlight and come and
+        // go with tabs; refresh them here rather than wait for the
+        // telemetry poll, which idles at 30 s with only shells open.
+        let live_rows = self.sidebar_live_session_rows(cx);
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.set_active_context(path, cx);
+            sidebar.set_live_sessions(live_rows, cx);
         });
     }
 
@@ -9834,6 +9887,18 @@ mod tests {
         let hits = vec![(SID_A.to_owned(), at(10)), (SID_B.to_owned(), at(20))];
         assert_eq!(
             select_adoption(&hits, &ids(&[SID_A]), Some(SID_A), &ids(&[SID_A, SID_B]), Some(SID_B)),
+            Some(SID_B.to_owned())
+        );
+    }
+
+    #[test]
+    fn exact_session_reclaims_an_id_the_tab_rotated_away_from() {
+        // The tab owned SID_B, then a guess moved it onto SID_A (its
+        // exact id was unreadable that tick). Its agent reports SID_B
+        // again — return to it even though SID_B was fired before.
+        let hits = vec![(SID_A.to_owned(), at(20)), (SID_B.to_owned(), at(10))];
+        assert_eq!(
+            select_adoption(&hits, &ids(&[SID_A, SID_B]), Some(SID_A), &ids(&[]), Some(SID_B)),
             Some(SID_B.to_owned())
         );
     }

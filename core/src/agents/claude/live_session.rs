@@ -23,7 +23,9 @@ pub fn default_sessions_dir() -> Option<PathBuf> {
 /// `claude` started yet, or a Claude Code too old to write the file).
 ///
 /// The cwd check guards against a stale file whose pid the OS has since
-/// handed to an unrelated process in the tab.
+/// handed to an unrelated process in the tab. Only `interactive`
+/// processes count (a missing `kind` is taken as one): a `claude -p`
+/// the tab's agent runs as a tool is in a session of its own.
 pub fn session_for_pids(
     sessions_dir: &Path,
     pids: &[u32],
@@ -35,7 +37,12 @@ pub fn session_for_pids(
         let same_pid = entry.get("pid").and_then(serde_json::Value::as_u64) == Some(pid.into());
         let cwd = entry.get("cwd").and_then(serde_json::Value::as_str)?;
         let session_id = entry.get("sessionId").and_then(serde_json::Value::as_str)?;
+        let interactive = entry
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|kind| kind == "interactive");
         (same_pid
+            && interactive
             && !session_id.is_empty()
             && crate::path_canon::paths_match(cwd, working_directory))
         .then(|| session_id.to_owned())
@@ -78,6 +85,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), 12, &entry(12, "sid-a", r"C:\other"));
         assert_eq!(session_for_pids(dir.path(), &[12], "C:/repo"), None);
+    }
+
+    #[test]
+    fn skips_a_non_interactive_claude_nested_in_the_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = serde_json::json!({ "pid": 12, "sessionId": "sid-p", "cwd": "C:/repo", "kind": "print" });
+        write(dir.path(), 12, &nested.to_string());
+        write(dir.path(), 14, &entry(14, "sid-a", "C:/repo"));
+        assert_eq!(session_for_pids(dir.path(), &[12, 14], "C:/repo").as_deref(), Some("sid-a"));
     }
 
     #[test]
