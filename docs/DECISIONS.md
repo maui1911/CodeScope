@@ -752,12 +752,30 @@ feature, in `codescope-core` (`agents::opencode::db`).
   `SQLITE_OPEN_READ_ONLY` (no create, no URI parsing) and a zero busy
   timeout. `SQLITE_BUSY` / `SQLITE_LOCKED` and a missing database both
   mean "nothing new this tick"; a busy read is retried on the next
-  tick. CodeScope never writes to the file.
-* **Stat before query:** both the adoption scan (every ~350 ms per
-  OpenCode tab) and the session tail (250 ms – 2 s) first stat
-  `opencode.db` and `opencode.db-wal` (mtime + length) and only query
-  when either moved. Discovery caches the session list per database
-  path, shared by all tabs; each tail keeps its own connection.
+  tick, on the same connection. CodeScope never writes database pages.
+  It does touch the side files the way any WAL reader does: it records
+  read marks in `opencode.db-shm`, and if `-wal` / `-shm` are absent
+  (OpenCode not running, its last connection closed) opening the
+  database creates them and may run WAL recovery into `-shm`.
+* **`data_version` before query:** both the adoption scan (every
+  ~350 ms per OpenCode tab) and the session tail (250 ms – 2 s) keep a
+  connection open and ask it for `PRAGMA data_version`, which changes
+  whenever another connection commits. It reads the WAL-index header,
+  not table pages: a few µs. Only a changed value runs the queries.
+  File stats were tried first and miss commits: after an automatic
+  checkpoint SQLite rewrites the WAL from offset 0, so its length stops
+  changing, and on Windows consecutive commits often share an mtime.
+  Discovery caches the session list per database path, shared by all
+  tabs; each tail keeps its own connection.
+* **One stat per tick, for identity only:** each probe also checks that
+  `opencode.db` exists and, on Unix, that it is the same inode, and
+  reopens if it was replaced. The stat is shared by every tab polled in
+  the same tick (50 ms reuse window). On Windows an open connection
+  stops OpenCode from deleting or renaming the file (sharing violation,
+  error 32). Tails close their connection with their tab, but the
+  discovery cache keeps its connection until CodeScope exits, so once
+  an OpenCode tab has been open, deleting `opencode.db` (an OpenCode
+  reset) fails until CodeScope is closed.
 * **Adoption recency:** there is no per-session file to stat, so
   discovery returns the session's `time_updated` and the adoption tick
   compares candidates by it.
@@ -769,7 +787,8 @@ feature, in `codescope-core` (`agents::opencode::db`).
   already requires).
 * The reader follows OpenCode's schema (`session`, `message`, `part`
   and the JSON inside `data`), not a published API. A schema change in
-  OpenCode reads as "no data" and logs once per database change, not a
-  crash, and needs a matching change in `agents::opencode`.
+  OpenCode reads as "no data" and is logged once (repeats of the same
+  error are not printed), not a crash, and needs a matching change in
+  `agents::opencode`.
 * OpenCode versions older than the database (the JSON-file layout) are
   no longer read; that reader was removed.
