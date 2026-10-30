@@ -166,6 +166,15 @@ pub enum RecordOutcome {
     ProjectGone,
 }
 
+impl RecordOutcome {
+    /// Whether the "open a session in the new worktree" toggle may
+    /// still be honoured. Not for [`Self::ProjectGone`]: no project
+    /// owns the folder any more, so the tab would belong to nothing.
+    pub fn may_open_session(self) -> bool {
+        !matches!(self, Self::ProjectGone)
+    }
+}
+
 /// Append a row for a worktree `git worktree add` just created at
 /// `path` on `branch` to project `project_id`. Meant to run on a
 /// config reloaded from disk right before saving it (the
@@ -367,5 +376,14 @@ mod tests {
             RecordOutcome::ProjectGone
         );
         assert_eq!(cfg.projects[0].worktrees.len(), 1);
+    }
+
+    #[test]
+    fn only_a_worktree_some_project_owns_may_open_a_session() {
+        assert!(RecordOutcome::Added.may_open_session());
+        assert!(RecordOutcome::AlreadyTracked.may_open_session());
+        // No project tracks the folder: a tab there would belong to
+        // nothing in the sidebar.
+        assert!(!RecordOutcome::ProjectGone.may_open_session());
     }
 }

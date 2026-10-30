@@ -634,7 +634,9 @@ impl Sidebar {
     /// Land a finished `git worktree add`. On success the row is
     /// committed to `projects.json`, the dialog closes if it is still
     /// showing this create, and a session opens when the toggle was
-    /// on. A failure goes back into the dialog when it is still
+    /// on — even if the dialog was closed meanwhile — unless the
+    /// project was removed while git ran, which gets an info toast
+    /// instead. A failure goes back into the dialog when it is still
     /// showing this create — leaving what the user typed in place —
     /// and to a toast when it was closed meanwhile.
     fn finish_worktree_create(
@@ -653,9 +655,28 @@ impl Sidebar {
         self.note_worktree_edit();
         let dialog_owns = self.dialog().is_some_and(|s| s.creating == Some(id));
         match result.and_then(|()| self.commit_created_worktree(&job)) {
-            Ok(()) => {
+            Ok(outcome) => {
                 if dialog_owns {
                     self.take_dialog();
+                }
+                if !outcome.may_open_session() {
+                    // The project was removed while git ran: the
+                    // worktree exists, but nothing in the sidebar owns
+                    // it, so say where it went instead of opening a
+                    // tab that belongs to no project.
+                    cx.emit(SidebarEvent::Toast {
+                        kind: ToastSeverity::Info,
+                        title: format!("Worktree '{}' created", job.branch).into(),
+                        detail: Some(
+                            format!(
+                                "Created at {}, but its project was removed meanwhile.",
+                                job.path
+                            )
+                            .into(),
+                        ),
+                    });
+                    cx.notify();
+                    return;
                 }
                 // Spawn a session pinned to the new worktree only when
                 // the toggle is on. Mirrors the C# dialog's
@@ -708,11 +729,17 @@ impl Sidebar {
     /// mutate, like every other `projects.json` writer: AppShell
     /// writes the file too (session rows, agent session ids), and git
     /// may have run for minutes, so the copy held here is too old to
-    /// save over it.
-    fn commit_created_worktree(&mut self, job: &PendingWorktree) -> anyhow::Result<()> {
+    /// save over it. Returns what [`record_created_worktree`] did, so
+    /// the caller knows whether a project still owns the worktree.
+    fn commit_created_worktree(
+        &mut self,
+        job: &PendingWorktree,
+    ) -> anyhow::Result<RecordOutcome> {
         let mut next =
             ProjectsConfig::load(self.paths_ref()).context("reload of projects.json failed")?;
-        match record_created_worktree(&mut next, &job.project_id, &job.path, &job.branch) {
+        let outcome =
+            record_created_worktree(&mut next, &job.project_id, &job.path, &job.branch);
+        match outcome {
             RecordOutcome::Added => next.save(self.paths_ref()).context("save failed")?,
             // Already tracked (e.g. adopted by discovery) or the
             // project went away while git ran: nothing to write, but
@@ -720,7 +747,7 @@ impl Sidebar {
             RecordOutcome::AlreadyTracked | RecordOutcome::ProjectGone => {}
         }
         self.replace_projects(next);
-        Ok(())
+        Ok(outcome)
     }
 
     /// Render the modal. Returns `None` when no dialog is open.
