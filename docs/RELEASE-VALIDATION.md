@@ -226,8 +226,23 @@ curl.exe -sL -H "Accept: application/octet-stream" -o $env:TEMP\rv.zip `
 > here: it works without the header and would re-create exactly the
 > blind spot this check exists to close.
 
+### 7. README still current (minor releases)
+
+The README drifted two minor versions once (#344): a stale keyboard
+table and features that shipped without a mention. On every minor
+release (`vX.Y.0`):
+
+- [ ] Every feature merged since the last minor release is findable in
+      `README.md`.
+- [ ] The keyboard table matches the chord table in `src/app.rs`
+      (`AppShell::on_key_down`) and
+      `codescope_terminal::view::is_app_level_shortcut`.
+- [ ] Asset names in the Install table match the published release.
+- [ ] `docs/screenshots/` still shows the current UI; reshoot stale ones
+      in one sitting (same theme, window size and DPI).
+
 ### Sign-off
 
-When all checks (1-6c) pass, the release is OK to announce. Push the
+When all checks (1-7) pass, the release is OK to announce. Push the
 release notes to the GitHub release body, mention any breaking
 changes, and link relevant PRs.
