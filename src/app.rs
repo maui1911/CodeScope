@@ -448,8 +448,8 @@ fn select_adoption(
 
 /// What a tab takes this round. A tab that owns nothing yet and has
 /// had an Enter takes the *oldest* free record created at or after that
-/// Enter (`born`: creation time, or the mtime where the agent's store
-/// has none): tabs pick in prompt order ([`adoption_rank`]), so two
+/// Enter (`born`: creation time; records without one are skipped
+/// here): tabs pick in prompt order ([`adoption_rank`]), so two
 /// records landing in one tick go to the tabs whose prompts made them.
 /// Everything else — exact ids, rotations of an owned transcript, tabs
 /// nobody has typed in, records older than the Enter — is
@@ -470,7 +470,11 @@ fn pick_adoption(
         let first = hits
             .iter()
             .filter(|(sid, _)| !fired.contains(sid) && !claimed.contains(sid))
-            .map(|(sid, mtime)| (born.get(sid).copied().unwrap_or(*mtime), sid))
+            // No creation time (OpenCode, Linux without birth time):
+            // leave it to newest-wins. The mtime is no stand-in here —
+            // the record still being written is the newer one, so
+            // "oldest" would hand each tab its neighbour's record.
+            .filter_map(|(sid, _)| born.get(sid).map(|created| (*created, sid)))
             .filter(|(created, _)| *created >= enter)
             .min_by_key(|(created, _)| *created);
         if let Some((_, sid)) = first {
@@ -10397,6 +10401,17 @@ mod tests {
         ]);
         let tabs = [(None, Some(at_ms(10_400))), (None, Some(at_ms(10_000)))];
         let got = guess_round(&tabs, &hits, &born);
+        assert_eq!(got, vec![Some(SID_B.to_owned()), Some(SID_A.to_owned())]);
+    }
+
+    #[test]
+    fn records_without_a_creation_time_are_not_ordered_by_mtime() {
+        // Same tick as above, but the store has no creation time
+        // (OpenCode, Linux without birth time). Taking the mtime as one
+        // made T2 "oldest-first" pick B and hand A to T1 — crossed.
+        let hits = vec![(SID_A.to_owned(), at_ms(11_000)), (SID_B.to_owned(), at_ms(10_900))];
+        let tabs = [(None, Some(at_ms(10_400))), (None, Some(at_ms(10_000)))];
+        let got = guess_round(&tabs, &hits, &HashMap::new());
         assert_eq!(got, vec![Some(SID_B.to_owned()), Some(SID_A.to_owned())]);
     }
 
