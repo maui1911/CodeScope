@@ -16,17 +16,25 @@
 //! * `thread/revert` keeps the thread id but continues in a new file,
 //!   `rollout-<ts>-<thread-id>_<rollout-id>.jsonl`, dated the day of
 //!   the revert.
-//! * The first line is a `session_meta` record carrying `id`, `cwd`
-//!   and `source`. The interactive TUI writes `source: "cli"`; `codex
-//!   exec`, the IDE extension / app-server (`"vscode"`, which is also
-//!   what the Codex plugin for Claude Code runs as), MCP and sub-agent
-//!   threads write something else. Only `cli` threads are adoptable, so
-//!   a Claude tab running a Codex review in the same folder is never
+//! * The first line is a `session_meta` record carrying `id`, `cwd`,
+//!   `originator`, `source` and `thread_source`. The interactive TUI
+//!   writes `originator: "codex-tui"`; up to 0.153 it also wrote
+//!   `source: "cli"`, but since 0.159 it runs on the app server and
+//!   writes `source: "vscode"`, the same as the IDE extension, Codex
+//!   Desktop and the Codex plugin for Claude Code (`originator:
+//!   "Claude Code"`). `codex exec` writes `codex_exec` / `exec`. Only
+//!   the TUI's own threads are adoptable (sub-agents excluded), so a
+//!   Claude tab running a Codex review in the same folder is never
 //!   mistaken for the Codex tab's session.
+//! * A rollout untouched for 7 days is compressed in the background to
+//!   `….jsonl.zst`, and turned back into plain `.jsonl` before Codex
+//!   appends to it again (`codex-rs/rollout/src/compression.rs`). A
+//!   live session therefore always writes plain `.jsonl`, the only form
+//!   read here.
 //!
 //! # Semantics
 //!
-//! A rollout is a candidate when its `session_meta` says `cli`, its
+//! A rollout is a candidate when its `session_meta` is the TUI's, its
 //! `cwd` canonicalises to the tab's working directory, and it was
 //! *created* at or after `since` (the tab's spawn time). Modification
 //! alone does not qualify: another tab's long-running session in the
@@ -167,7 +175,7 @@ pub fn locate_rollout(sessions_root: &Path, id: &str) -> Option<PathBuf> {
 /// Thread id from a rollout file name:
 /// `rollout-2026-10-30T11-36-54-<thread-id>[_<rollout-id>].jsonl`.
 /// `None` for anything else — compressed `.jsonl.zst` files included,
-/// which Codex only produces for cold rollouts.
+/// which Codex only produces for rollouts untouched for a week.
 pub fn thread_id_from_file_name(name: &str) -> Option<&str> {
     let core = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
     // `YYYY-MM-DDThh-mm-ss` is 19 bytes, then a `-` separator.
@@ -184,7 +192,8 @@ pub fn thread_id_from_file_name(name: &str) -> Option<&str> {
 struct SessionMeta {
     /// `cwd`, canonicalised with [`canonicalize_path`].
     canon_cwd: String,
-    /// `source == "cli"` and no non-user `thread_source`.
+    /// Started by the interactive TUI for the user; see
+    /// [`MetaPayload::interactive`].
     interactive: bool,
 }
 
@@ -204,6 +213,7 @@ struct MetaLine {
 #[derive(Deserialize)]
 struct MetaPayload {
     cwd: Option<String>,
+    originator: Option<serde_json::Value>,
     source: Option<serde_json::Value>,
     thread_source: Option<serde_json::Value>,
 }
@@ -253,16 +263,31 @@ fn read_session_meta(path: &Path) -> Option<Option<SessionMeta>> {
     else {
         return Some(None);
     };
+    let interactive = payload.interactive();
     let Some(cwd) = payload.cwd else { return Some(None) };
-    let cli = payload.source.as_ref().and_then(serde_json::Value::as_str) == Some("cli");
-    let user_thread = payload
-        .thread_source
-        .as_ref()
-        .is_none_or(|s| s.is_null() || s.as_str() == Some("user"));
-    Some(Some(SessionMeta {
-        canon_cwd: canonicalize_path(&cwd),
-        interactive: cli && user_thread,
-    }))
+    Some(Some(SessionMeta { canon_cwd: canonicalize_path(&cwd), interactive }))
+}
+
+impl MetaPayload {
+    /// A thread the interactive TUI started for the user. Since 0.159
+    /// the TUI runs on the app server and records `source: "vscode"`,
+    /// like the IDE extension, Codex Desktop and the Claude Code plugin,
+    /// so `originator: "codex-tui"` is what identifies it. Older TUIs
+    /// wrote `source: "cli"` under a `codex-tui`, `codex_cli_rs` or no
+    /// `originator`, and nothing else ever did. Sub-agent threads carry
+    /// the TUI's originator too; their `source` is a `{"subagent": …}`
+    /// object and, since `thread_source` exists, that is `"subagent"`.
+    fn interactive(&self) -> bool {
+        let source = self.source.as_ref();
+        let tui = self.originator.as_ref().and_then(serde_json::Value::as_str) == Some("codex-tui")
+            || source.and_then(serde_json::Value::as_str) == Some("cli");
+        let sub_agent = source.is_some_and(|s| s.get("subagent").is_some());
+        let user_thread = self
+            .thread_source
+            .as_ref()
+            .is_none_or(|s| s.is_null() || s.as_str() == Some("user"));
+        tui && !sub_agent && user_thread
+    }
 }
 
 fn meta_cache() -> &'static Mutex<HashMap<PathBuf, Option<SessionMeta>>> {
@@ -338,22 +363,132 @@ pub(crate) mod tests {
     const ID_B: &str = "01a18c5a-3b93-7e73-b7a8-32a4dd2b8b80";
     const CWD: &str = "C:/repo/alpha";
 
+    /// `session_meta` of an interactive TUI thread from before 0.159,
+    /// the last versions that wrote `source: "cli"`.
     pub(crate) fn meta_line(id: &str, cwd: &str, source: &str) -> String {
+        meta_line_with(id, cwd, &format!(r#""originator":"codex-tui","source":"{source}""#))
+    }
+
+    /// `session_meta` whose identifying fields (`originator`, `source`,
+    /// `thread_source`, …) are the raw JSON members in `fields`.
+    fn meta_line_with(id: &str, cwd: &str, fields: &str) -> String {
         format!(
-            r#"{{"timestamp":"2026-10-30T10:36:55.704Z","type":"session_meta","payload":{{"session_id":"{id}","id":"{id}","timestamp":"2026-10-30T10:36:54.583Z","cwd":"{}","originator":"codex-tui","cli_version":"0.160.1","source":"{source}","base_instructions":{{"text":"…"}}}}}}"#,
+            r#"{{"timestamp":"2026-10-30T10:36:55.704Z","type":"session_meta","payload":{{"session_id":"{id}","id":"{id}","timestamp":"2026-10-30T10:36:54.583Z","cwd":"{}",{fields},"base_instructions":{{"text":"…"}}}}}}"#,
             cwd.replace('\\', "\\\\")
         ) + "\n"
     }
+
+    /// Interactive TUI thread since 0.159: the TUI runs on the app
+    /// server, so `source` is `"vscode"` and only `originator` tells it
+    /// apart from the IDE extension and the Claude Code plugin.
+    const TUI_0_159: &str =
+        r#""originator":"codex-tui","cli_version":"0.159.0","source":"vscode","thread_source":"user""#;
+    /// The Codex plugin a Claude Code tab runs reviews through.
+    const CLAUDE_CODE_PLUGIN: &str =
+        r#""originator":"Claude Code","cli_version":"0.160.1","source":"vscode""#;
+    /// `codex exec`.
+    const CODEX_EXEC: &str =
+        r#""originator":"codex_exec","cli_version":"0.160.1","source":"exec","thread_source":"user""#;
 
     fn day_dir(root: &Path, t: SystemTime) -> PathBuf {
         day_dirs(root, &[t]).remove(1)
     }
 
     fn write_rollout(dir: &Path, id: &str, cwd: &str, source: &str) -> PathBuf {
+        write_rollout_with(dir, id, cwd, &format!(r#""originator":"codex-tui","source":"{source}""#))
+    }
+
+    fn write_rollout_with(dir: &Path, id: &str, cwd: &str, fields: &str) -> PathBuf {
         std::fs::create_dir_all(dir).unwrap();
         let path = dir.join(format!("rollout-2026-10-30T11-36-54-{id}.jsonl"));
-        std::fs::write(&path, meta_line(id, cwd, source)).unwrap();
+        std::fs::write(&path, meta_line_with(id, cwd, fields)).unwrap();
         path
+    }
+
+    /// One fixture per `session_meta` shape seen in real rollouts from
+    /// codex-cli 0.77 to 0.160, and whether it is an interactive thread.
+    const META_SHAPES: &[(&str, &str, bool)] = &[
+        (
+            "TUI 0.153.4",
+            r#""originator":"codex-tui","cli_version":"0.153.4","source":"cli","thread_source":"user""#,
+            true,
+        ),
+        ("TUI 0.159.0", TUI_0_159, true),
+        (
+            "TUI 0.121.0, before thread_source",
+            r#""originator":"codex-tui","cli_version":"0.121.0","source":"cli""#,
+            true,
+        ),
+        (
+            "TUI 0.80.0, generic originator",
+            r#""originator":"codex_cli_rs","cli_version":"0.80.0","source":"cli""#,
+            true,
+        ),
+        ("rollout without originator", r#""cli_version":"0.77.0","source":"cli""#, true),
+        ("Claude Code plugin", CLAUDE_CODE_PLUGIN, false),
+        ("codex exec", CODEX_EXEC, false),
+        (
+            "codex exec, no thread_source",
+            r#""originator":"codex_exec","cli_version":"0.137.0","source":"exec""#,
+            false,
+        ),
+        (
+            "Codex Desktop",
+            r#""originator":"Codex Desktop","cli_version":"0.144.2","source":"vscode","thread_source":"user""#,
+            false,
+        ),
+        (
+            "IDE extension 0.80.0",
+            r#""originator":"codex_cli_rs","cli_version":"0.80.0","source":"vscode""#,
+            false,
+        ),
+        (
+            "TUI sub-agent 0.121.0",
+            r#""originator":"codex-tui","cli_version":"0.121.0","source":{"subagent":{"thread_spawn":{"parent_thread_id":"01a18c5a-3b93-7e73-b7a8-32a4dd2b8b80","depth":1}}}"#,
+            false,
+        ),
+        (
+            "TUI sub-agent with thread_source",
+            r#""originator":"codex-tui","cli_version":"0.160.1","source":{"subagent":{"other":"guardian"}},"thread_source":"subagent""#,
+            false,
+        ),
+        (
+            "TUI thread_source subagent",
+            r#""originator":"codex-tui","cli_version":"0.160.1","source":"vscode","thread_source":"subagent""#,
+            false,
+        ),
+        (
+            "TUI 0.159.0, null thread_source",
+            r#""originator":"codex-tui","cli_version":"0.159.0","source":"vscode","thread_source":null"#,
+            true,
+        ),
+    ];
+
+    #[test]
+    fn session_meta_recognises_interactive_threads_by_originator_and_source() {
+        let tmp = TempDir::new().unwrap();
+        for (i, (label, fields, interactive)) in META_SHAPES.iter().enumerate() {
+            let path = tmp.path().join(format!("{i}.jsonl"));
+            std::fs::write(&path, meta_line_with(ID_A, CWD, fields)).unwrap();
+            let meta = read_session_meta(&path).flatten();
+            assert_eq!(meta.map(|m| m.interactive), Some(*interactive), "{label}");
+        }
+    }
+
+    #[test]
+    fn scan_adopts_tui_thread_recorded_as_vscode() {
+        // Codex 0.159+ records the interactive TUI as `source: "vscode"`
+        // (#398); a Claude tab's plugin review in the same folder and a
+        // `codex exec` run stay out.
+        let tmp = TempDir::new().unwrap();
+        let now = SystemTime::now();
+        let dir = day_dir(tmp.path(), now);
+        let path = write_rollout_with(&dir, ID_A, CWD, TUI_0_159);
+        write_rollout_with(&dir, ID_B, CWD, CLAUDE_CODE_PLUGIN);
+        let id_c = "01a18c5b-0000-7000-8000-000000000001";
+        write_rollout_with(&dir, id_c, CWD, CODEX_EXEC);
+        let found = scan_at(tmp.path(), CWD, now - Duration::from_secs(60), None, now);
+        assert_eq!(found, vec![AdoptionCandidate { session_id: ID_A.into(), path }]);
     }
 
     fn ids(found: &[AdoptionCandidate]) -> Vec<&str> {
@@ -428,8 +563,8 @@ pub(crate) mod tests {
         let tmp = TempDir::new().unwrap();
         let now = SystemTime::now();
         let dir = day_dir(tmp.path(), now);
-        write_rollout(&dir, ID_A, CWD, "exec");
-        write_rollout(&dir, ID_B, CWD, "vscode");
+        write_rollout_with(&dir, ID_A, CWD, CODEX_EXEC);
+        write_rollout_with(&dir, ID_B, CWD, CLAUDE_CODE_PLUGIN);
         assert!(scan_at(tmp.path(), CWD, now - Duration::from_secs(60), None, now).is_empty());
     }
 
