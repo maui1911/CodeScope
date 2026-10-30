@@ -59,8 +59,8 @@ use crate::telemetry::{
 /// the Claude tail's (issue #351).
 pub const BUSY_QUIET_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
-/// How often a tail whose rollout file isn't known yet retries
-/// locating it.
+/// How often a tail looks for its rollout file again: until it first
+/// appears, then for a `thread/revert` moving the thread to a new one.
 const LOCATE_RETRY: Duration = Duration::from_secs(2);
 
 /// How often the shared `session_index.jsonl` is checked for a new
@@ -343,11 +343,7 @@ impl CodexRolloutTail {
     /// [`Self::poll`] with the clock passed in, for the quiet-window
     /// tests.
     pub fn poll_at(&mut self, now: Instant) -> bool {
-        if self.path.is_none() && now >= self.next_locate {
-            self.path = super::discovery::locate_rollout(&self.sessions_root, &self.session_id);
-            self.next_locate = now + LOCATE_RETRY;
-        }
-        let mut dirty = false;
+        let mut dirty = self.relocate(now);
         if let Some(path) = self.path.as_deref() {
             let parser = &mut self.parser;
             let read = read_new_lines(path, &mut self.tail, |read| match read {
@@ -405,6 +401,28 @@ impl CodexRolloutTail {
         }
         self.snapshot = next;
         true
+    }
+
+    /// Every [`LOCATE_RETRY`], find the thread's rollout again: the
+    /// first time, and after a `thread/revert` moved the thread on to a
+    /// new file. A switch starts the new file from the top, keeping the
+    /// title (the index entries that set it are not re-read). Returns
+    /// whether the file changed.
+    fn relocate(&mut self, now: Instant) -> bool {
+        if now < self.next_locate {
+            return false;
+        }
+        self.next_locate = now + LOCATE_RETRY;
+        let found = super::discovery::locate_rollout(&self.sessions_root, &self.session_id);
+        if found.is_none() || found == self.path {
+            return false;
+        }
+        let moved = self.path.is_some();
+        self.path = found;
+        self.tail = FileTail::default();
+        self.parser = RolloutParser { title: self.parser.title.take(), ..Default::default() };
+        self.observed_mtime = None;
+        moved
     }
 
     /// Suggested poll interval: 250 ms while Busy / PendingToolUse,
@@ -734,6 +752,30 @@ mod tests {
         assert!(!tail.poll_at(start + Duration::from_millis(100)), "retry is throttled");
         assert!(tail.poll_at(start + LOCATE_RETRY * 2));
         assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Busy);
+    }
+
+    #[test]
+    fn tail_follows_a_reverted_thread_to_its_new_rollout() {
+        // `thread/revert` keeps the thread id and moves on to a new file.
+        let f = fixture();
+        append(&f.rollout, &(paginated_prompt("first prompt") + "\n" + &ev("task_started", "") + "\n"));
+        let start = Instant::now();
+        let mut tail = CodexRolloutTail::for_session(&f.home, ID_A);
+        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Busy);
+        let old = std::fs::File::options().write(true).open(&f.rollout).unwrap();
+        old.set_modified(SystemTime::now() - Duration::from_secs(600)).unwrap();
+        let reverted = f.rollout.with_file_name(format!(
+            "rollout-2026-10-30T12-00-00-{ID_A}_01a18c62-0000-7000-8000-000000000001.jsonl"
+        ));
+        let body = meta_line(ID_A, "C:/repo/alpha", "cli") + &ev("task_complete", "") + "\n";
+        std::fs::write(&reverted, body).unwrap();
+        crate::agents::dir_listing::forget(f.rollout.parent().unwrap());
+        assert!(!tail.poll_at(start + Duration::from_millis(100)), "re-locating is throttled");
+        assert!(tail.poll_at(start + LOCATE_RETRY * 2));
+        assert_eq!(tail.path.as_deref(), Some(reverted.as_path()));
+        let s = tail.snapshot.clone().unwrap();
+        assert_eq!(s.state, SessionState::Idle);
+        assert_eq!(s.title.unwrap().text, "first prompt", "the title survives the switch");
     }
 
     #[test]

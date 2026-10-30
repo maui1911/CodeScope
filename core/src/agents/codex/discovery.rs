@@ -13,7 +13,9 @@
 //!   first prompt — a freshly launched `codex` has no rollout yet.
 //! * `codex resume <id>` appends to the existing file, wherever (and
 //!   whenever) it was created.
-//! * A reverted thread's file appends `_<rollout-id>` to the thread id.
+//! * `thread/revert` keeps the thread id but continues in a new file,
+//!   `rollout-<ts>-<thread-id>_<rollout-id>.jsonl`, dated the day of
+//!   the revert.
 //! * The first line is a `session_meta` record carrying `id`, `cwd`
 //!   and `source`. The interactive TUI writes `source: "cli"`; `codex
 //!   exec`, the IDE extension / app-server (`"vscode"`, which is also
@@ -118,33 +120,42 @@ fn scan_at(
     out
 }
 
-/// Find the rollout file of thread `id`: the path a scan last saw it
-/// at, else the dated directories around the creation time encoded in
-/// a v7 thread id. `None` for a v4 id (threads from before 2025) whose
-/// file no scan has seen — the tree is never walked.
+/// Find the rollout file of thread `id` among the path a scan last saw
+/// it at, the dated directories around the creation time encoded in a
+/// v7 thread id, and those around now. `None` for a v4 id (threads from
+/// before 2025) whose file no scan has seen — the tree is never walked.
 ///
-/// A reverted thread has more than one file; the most recently
-/// modified wins, since that is the one Codex appends to.
+/// A reverted thread has more than one file — `thread/revert` starts a
+/// new one in the directory of the day it runs — and the most recently
+/// modified wins, since that is the one Codex appends to. Callers that
+/// follow a thread re-locate it periodically to notice the switch.
 pub fn locate_rollout(sessions_root: &Path, id: &str) -> Option<PathBuf> {
-    if let Some(path) = path_cache().lock().ok()?.get(id).cloned()
-        && path.starts_with(sessions_root)
-        && path.is_file()
-    {
-        return Some(path);
-    }
-    let created = uuid_v7_time(id)?;
+    let mtime_of = |path: &Path| {
+        std::fs::metadata(path)
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .map(|m| crate::telemetry::modified_or_none(&m).unwrap_or(UNIX_EPOCH))
+    };
     let mut best: Option<(SystemTime, PathBuf)> = None;
-    for dir in day_dirs(sessions_root, &[created]) {
+    let mut offer = |path: &Path, mtime: SystemTime| {
+        if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
+            best = Some((mtime, path.to_path_buf()));
+        }
+    };
+    let cached = path_cache().lock().ok().and_then(|map| map.get(id).cloned());
+    if let Some(path) = cached.filter(|p| p.starts_with(sessions_root))
+        && let Some(mtime) = mtime_of(&path)
+    {
+        offer(&path, mtime);
+    }
+    let mut instants = vec![SystemTime::now()];
+    instants.extend(uuid_v7_time(id));
+    for dir in day_dirs(sessions_root, &instants) {
         for file in list_files(&dir).iter() {
-            if thread_id_from_file_name(&file.name) != Some(id) {
-                continue;
-            }
-            let mtime = std::fs::metadata(&file.path)
-                .ok()
-                .and_then(|m| crate::telemetry::modified_or_none(&m))
-                .unwrap_or(UNIX_EPOCH);
-            if best.as_ref().is_none_or(|(t, _)| mtime >= *t) {
-                best = Some((mtime, file.path.clone()));
+            if thread_id_from_file_name(&file.name) == Some(id)
+                && let Some(mtime) = mtime_of(&file.path)
+            {
+                offer(&file.path, mtime);
             }
         }
     }
@@ -499,6 +510,26 @@ pub(crate) mod tests {
         let new = dir.join(format!("rollout-2026-10-30T11-28-06-{ID_B}_{ID_A}.jsonl"));
         std::fs::write(&new, "").unwrap();
         assert_eq!(locate_rollout(tmp.path(), ID_B), Some(new));
+    }
+
+    #[test]
+    fn locate_rollout_moves_to_a_revert_written_today() {
+        // `thread/revert` keeps the thread id but starts a new file in
+        // the directory of the day it happens, not the thread's own.
+        let tmp = TempDir::new().unwrap();
+        let now = SystemTime::now();
+        let created = now - Duration::from_secs(200 * 86_400);
+        let id = v7_id(created);
+        let old = write_rollout(&day_dir(tmp.path(), created), &id, CWD, "cli");
+        assert_eq!(locate_rollout(tmp.path(), &id), Some(old.clone()));
+        let file = std::fs::File::options().write(true).open(&old).unwrap();
+        file.set_modified(now - Duration::from_secs(600)).unwrap();
+        let today = day_dir(tmp.path(), now);
+        std::fs::create_dir_all(&today).unwrap();
+        let new = today.join(format!("rollout-2026-10-30T11-28-06-{id}_{ID_A}.jsonl"));
+        std::fs::write(&new, meta_line(&id, CWD, "cli")).unwrap();
+        crate::agents::dir_listing::forget(&today);
+        assert_eq!(locate_rollout(tmp.path(), &id), Some(new));
     }
 
     #[test]
