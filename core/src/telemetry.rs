@@ -1,5 +1,5 @@
 //! Vendor-neutral telemetry primitives shared across every agent
-//! telemetry module (Claude / Copilot / OpenCode / Pi).
+//! telemetry module (Claude / Codex / Copilot / Gemini / OpenCode / Pi).
 //!
 //! Each agent module owns its own format-specific parser
 //! (`claude_telemetry`, `copilot_telemetry`, etc.) but they all
@@ -129,6 +129,80 @@ pub struct FileTail {
     /// correctness but handy for debugging; callers can use
     /// `metadata.len()` instead.
     pub last_mtime: Option<SystemTime>,
+}
+
+/// What [`read_new_lines`] hands its callback.
+pub(crate) enum LineRead<'a> {
+    /// The file shrank — it was rewritten, and is re-read from the
+    /// start. Comes before any of the new lines.
+    Rewritten,
+    /// One complete, non-blank line, trimmed.
+    Line(&'a str),
+}
+
+/// Outcome of one [`read_new_lines`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReadOutcome {
+    /// Bytes were consumed (at least one complete line, blank or not).
+    pub consumed: bool,
+    /// The file's mtime from the call's own `stat` — `None` when the
+    /// file is missing — so callers need no second one.
+    pub mtime: Option<SystemTime>,
+}
+
+/// Feed every complete line appended to a JSONL file since
+/// `tail.last_pos` to `on_read`, advancing the cursor past them. Costs a
+/// single `stat` when nothing was appended.
+///
+/// A trailing line without its newline is left for the next call, so a
+/// line caught mid-write is never parsed torn and then skipped. Read
+/// errors stop at the last complete line; the rest is retried later.
+pub(crate) fn read_new_lines(
+    path: &std::path::Path,
+    tail: &mut FileTail,
+    mut on_read: impl FnMut(LineRead<'_>),
+) -> ReadOutcome {
+    use std::io::{BufRead as _, BufReader, Seek as _, SeekFrom};
+    let Ok(meta) = std::fs::metadata(path) else {
+        return ReadOutcome { consumed: false, mtime: None };
+    };
+    let mtime = modified_or_none(&meta);
+    let unchanged = ReadOutcome { consumed: false, mtime };
+    let len = meta.len();
+    if len == tail.last_pos {
+        return unchanged;
+    }
+    if len < tail.last_pos {
+        tail.last_pos = 0;
+        on_read(LineRead::Rewritten);
+    }
+    let Ok(mut file) = std::fs::File::open(path) else { return unchanged };
+    if file.seek(SeekFrom::Start(tail.last_pos)).is_err() {
+        return unchanged;
+    }
+    let mut reader = BufReader::new(file);
+    let mut buf = Vec::new();
+    let start = tail.last_pos;
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if buf.last() != Some(&b'\n') {
+                    break;
+                }
+                tail.last_pos += n as u64;
+                if let Ok(line) = std::str::from_utf8(&buf) {
+                    let line = line.trim();
+                    if !line.is_empty() {
+                        on_read(LineRead::Line(line));
+                    }
+                }
+            }
+        }
+    }
+    tail.last_mtime = mtime;
+    ReadOutcome { consumed: tail.last_pos != start, mtime }
 }
 
 // ---------------------------------------------------------------------------
