@@ -227,10 +227,14 @@ pub fn built_in_defaults() -> Vec<AgentProfile> {
             id: "codex".into(),
             display_name: "Codex".into(),
             command: "codex".into(),
+            // `codex resume` alone opens the session picker; with the
+            // thread id adopted from the rollout files
+            // (`agents::codex::discovery`) it resumes that thread:
+            // `codex resume <id>`.
             resume_args: vec!["resume".into()],
             new_session_args: vec![],
             session_id_flag: None,
-            resume_by_id_args: vec![],
+            resume_by_id_args: vec!["resume".into()],
             is_default: false,
             icon: Some("◇".into()),
             context_window_tokens: 0,
@@ -303,18 +307,15 @@ pub fn built_in_defaults() -> Vec<AgentProfile> {
             id: "gemini".into(),
             display_name: "Gemini CLI".into(),
             command: "gemini".into(),
-            // Fresh launches: bare `gemini` (#324). Resume args stay
-            // empty for now — the CLI's session-resume surface
-            // (`/chat resume` inside the REPL) has no stable
-            // command-line shape we can bake without risking a broken
-            // launch; a wrong flag here would fail every relaunch.
-            // Like Codex, discovery/telemetry is a follow-up — the
-            // registry entry gives the new-session menu, settings
-            // default-agent picker, and session records the id today.
+            // Fresh launches: bare `gemini` (#324). Resume-by-id:
+            // `gemini --resume <uuid>` looks the full `sessionId` up
+            // among the current project's chats; the id is adopted
+            // from those chat files (`agents::gemini::discovery`).
+            // Without an id the relaunch stays a bare `gemini`.
             resume_args: vec![],
             new_session_args: vec![],
             session_id_flag: None,
-            resume_by_id_args: vec![],
+            resume_by_id_args: vec!["--resume".into()],
             is_default: false,
             icon: Some("✦".into()),
             // Gemini CLI defaults to Gemini 2.5 Pro, whose standard
@@ -379,8 +380,8 @@ pub fn build_resume_auto_type(
             return Some(argv.join(" "));
         }
         // Fall through to resume_args — the profile has no per-id
-        // resume verb (Codex), so the best we can do is "continue
-        // most recent" or just re-launch.
+        // resume verb, so the best we can do is "continue most
+        // recent" or just re-launch.
 
     let mut argv: Vec<String> = Vec::with_capacity(1 + profile.resume_args.len());
     argv.push(profile.command.clone());
@@ -615,17 +616,22 @@ mod tests {
     }
 
     #[test]
-    fn gemini_new_session_and_resume_are_bare_command() {
-        // No resume verbs are baked yet (see the profile comment) —
-        // both shapes must come out as plain `gemini` so a relaunch
-        // never types a flag the CLI might reject.
+    fn gemini_new_session_and_id_less_resume_are_bare_command() {
+        // Without an adopted id there is nothing to resume: both shapes
+        // come out as plain `gemini`.
         let profile = registry_profile("gemini");
         assert_eq!(build_new_session_auto_type(&profile), Some("gemini".into()));
         assert_eq!(build_resume_auto_type(&profile, None), Some("gemini".into()));
+    }
+
+    #[test]
+    fn gemini_resume_with_id_passes_it_to_resume_flag() {
+        // `gemini --resume <uuid>` resolves the session by its full
+        // `sessionId` among the current project's chats.
+        let profile = registry_profile("gemini");
         assert_eq!(
-            build_resume_auto_type(&profile, Some("some-id")),
-            Some("gemini".into()),
-            "an adopted id must not invent a resume flag"
+            build_resume_auto_type(&profile, Some("d1c96a3f-b64d-4144-a3e6-09670879c25e")),
+            Some("gemini --resume d1c96a3f-b64d-4144-a3e6-09670879c25e".into()),
         );
     }
 
@@ -705,15 +711,19 @@ mod tests {
     }
 
     #[test]
-    fn build_resume_auto_type_codex_ignores_id_when_resume_by_id_args_empty() {
-        // Codex has `resume_args = ["resume"]` but no
-        // `resume_by_id_args` — passing an id must not change the
-        // shape, the helper falls through to `resume_args`.
+    fn build_resume_auto_type_codex_with_id_resumes_that_thread() {
+        // `codex resume [SESSION_ID]` takes the thread id as a
+        // positional argument (codex-cli 0.160 `codex resume --help`).
         let profile = registry_profile("codex");
         assert_eq!(
-            build_resume_auto_type(&profile, Some("ignored-id")),
-            Some("codex resume".into()),
+            build_resume_auto_type(&profile, Some("01a18c62-4b86-7fd3-afc0-abb45949f121")),
+            Some("codex resume 01a18c62-4b86-7fd3-afc0-abb45949f121".into()),
         );
+    }
+
+    #[test]
+    fn build_resume_auto_type_codex_without_id_falls_back_to_resume_args() {
+        let profile = registry_profile("codex");
         assert_eq!(
             build_resume_auto_type(&profile, None),
             Some("codex resume".into()),

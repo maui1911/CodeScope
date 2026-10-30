@@ -51,8 +51,10 @@ pub use agent_registry::{
 };
 pub use agents::claude::discovery::POLL_INTERVAL_MS as CLAUDE_DISCOVERY_POLL_MS;
 pub use agents::claude::telemetry::{ClaudeTranscriptTail, encode_cwd, model_display_name};
+pub use agents::codex::telemetry::CodexRolloutTail;
 pub use agents::copilot::discovery::POLL_INTERVAL_MS as COPILOT_DISCOVERY_POLL_MS;
 pub use agents::copilot::telemetry::CopilotTranscriptTail;
+pub use agents::gemini::telemetry::GeminiChatTail;
 pub use agents::opencode::discovery::POLL_INTERVAL_MS as OPENCODE_DISCOVERY_POLL_MS;
 pub use agents::opencode::telemetry::OpenCodeMessageTail;
 pub use agents::pi::discovery::POLL_INTERVAL_MS as PI_DISCOVERY_POLL_MS;
