@@ -19,7 +19,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use parking_lot::Mutex;
 
@@ -147,6 +147,9 @@ pub struct TerminalView {
     /// `claude-code` treats that lone release as its own click, so
     /// the URL opens a second time in the browser.
     link_click_consumed: bool,
+    /// When the user last pressed a plain Enter here — see
+    /// [`Self::last_submit`].
+    last_submit: Option<SystemTime>,
 }
 
 impl TerminalView {
@@ -271,7 +274,18 @@ impl TerminalView {
             hovered_link: None,
             link_click_consumed: false,
             title: None,
+            last_submit: None,
         }
+    }
+
+    /// When the user last pressed Enter (no modifiers) in this
+    /// terminal; `None` before the first. Input written through
+    /// [`Self::write_input`] doesn't count. Agents that create their
+    /// session record on the first prompt create it right after one,
+    /// which tells same-folder tabs apart when they adopt. Wall-clock
+    /// time, so it compares with file mtimes.
+    pub fn last_submit(&self) -> Option<SystemTime> {
+        self.last_submit
     }
 
     /// The title the program running in the terminal last set via
@@ -690,6 +704,9 @@ impl TerminalView {
             self.backend.reset_scroll();
             self.backend.write_input(bytes);
             self.show_cursor_now();
+            if key == "enter" && plain && !mods.shift {
+                self.last_submit = Some(SystemTime::now());
+            }
         }
     }
 
