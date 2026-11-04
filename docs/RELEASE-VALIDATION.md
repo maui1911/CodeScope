@@ -3,7 +3,15 @@
 Run this before announcing any `vX.Y.Z` tag. The auto-update path
 crashed three release cycles in a row — rc.10, rc.12 and rc.14 — and
 that is what retired Velopack in #244. The unit tests caught none of
-them, so this manual end-to-end pass is mandatory.
+them, so the real in-app update (§4) stays a manual step on every
+release.
+
+The localhost dry runs of the updater (archive extraction, truncated
+downloads, the GitHub API asset URL) were dropped once the updater had
+held up across several real releases. Their failure modes are pinned by
+unit tests in `src/update.rs` (the `verify_complete` tests and
+`download_asks_github_for_the_raw_asset_bytes`); the old steps live in
+this file's git history if the updater changes again.
 
 ## Per release
 
@@ -56,177 +64,7 @@ Tag `vX.Y.Z` and after the artifacts are published:
       the default browser. (No in-app apply on macOS yet — by
       design until notarization lands.)
 
-### 6. Dev-mode end-to-end + archive-extraction regression (MANDATORY)
-
-This is not optional. The in-app updater downloads an archive and
-extracts it before the atomic swap. The download succeeding does NOT
-mean the extraction will: archive extraction depends on `self_update`
-*compression* feature flags being enabled in `Cargo.toml`, and a
-download can complete only to fail at extract with "unsupported
-extraction method". This bit us once already — `compression-zip-deflate`
-was missing, so every `Compress-Archive` / cargo-dist zip (all DEFLATE-
-compressed) would have failed to extract in production. No unit test
-or PR review caught it; only clicking through the real flow did.
-
-So the load-bearing check here is: **the flow must reach "Installing"
-→ "Update installed", which proves extraction succeeded** — not just
-"the download started".
-
-For a self-contained dry run without publishing a real release:
-
-```pwsh
-# 1. Stage a fake "newer" archive at version 99.0.0.
-#    Use the SAME tool the release workflow uses (Compress-Archive),
-#    so the test exercises the real compression method, not a hand-
-#    rolled STORED zip that would mask a missing deflate feature.
-cargo build --release --bin codescope
-New-Item -ItemType Directory -Path dist/fake -Force | Out-Null
-Copy-Item target/release/codescope.exe dist/fake/CodeScope.exe
-Compress-Archive -Path dist/fake/* `
-  -DestinationPath "dist/CodeScope-v99.0.0-windows.zip" -Force
-
-# 2. Serve it on :8000. Any static server works for the extraction
-#    check; `truncating_server.py --truncate-first 0` (full, no cut)
-#    is in-repo. The byte-progress toast completes near-instantly over
-#    localhost — to eyeball it ticking you need a rate-limited server
-#    (the retired dist/slow_server.py lives in PR #249's history, or
-#    use any throttling proxy). Extraction success doesn't depend on it.
-python dist/truncating_server.py dist/CodeScope-v99.0.0-windows.zip --port 8000 --truncate-first 0
-
-# 3. Launch the DEBUG dev build with the override pointing at the zip.
-#    (A release build ignores CODESCOPE_DEV_UPDATE_URL — it's gated
-#    behind debug_assertions as a security measure.)
-$env:CODESCOPE_DEV = "1"
-$env:CODESCOPE_DEV_FAKE_UPDATE_TOAST = "1"
-$env:CODESCOPE_DEV_UPDATE_URL = "http://127.0.0.1:8000/CodeScope-v99.0.0-windows.zip"
-cargo run --bin codescope
-```
-
-- [ ] Toast appears (~15s after launch).
-- [ ] Click "Update". The toast switches to "Downloading update… N / M".
-      With a throttled server the byte count **visibly advances**; over
-      a plain localhost server it may jump near-instantly to the total —
-      either is fine, the extraction check below is what matters.
-- [ ] **Extraction succeeds:** the toast reaches "Installing update…"
-      then "Update installed". (A failure here with "unsupported
-      extraction method" means a `self_update` compression feature is
-      missing for that archive format — fix `Cargo.toml`, do not ship.)
-- [ ] Restart prompt appears; clicking "Restart" closes the window and
-      a new one opens by itself within a few seconds (#341). If it does
-      not, `update.log` has the `restart:` line and `boot.log` shows how
-      far the new instance got (`relaunch:waited … gone=true` first).
-- [ ] The relaunched instance is the self-replaced binary and the entire
-      flow ran through without crashing. Run `cargo build --bin
-      codescope` afterward to relink a proper debug binary (self_replace
-      left a release binary at `target/debug/`).
-
-> Repeat the extraction check on Linux with a real `.tar.gz` (the
-> `compression-flate2` feature) whenever the `self_update` feature set
-> or `dist-workspace.toml`'s `unix-archive` changes.
-
-### 6b. Truncated-download resilience (MANDATORY)
-
-Why this exists: §6 serves the archive from a *localhost* server,
-which never truncates — so it proves extraction works but structurally
-**cannot** catch a download that is cut short on a real network. That
-gap shipped a v0.5.0 update that failed for a user behind a
-TLS-inspecting proxy with the baffling `ZipError: ... Could not find
-EOCD` (the downloaded zip was truncated; the failure only surfaced at
-extract time). The installer now verifies `received == Content-Length`
-and retries (`download_archive` / `verify_complete` in `src/update.rs`,
-PR #275). This check guards that resilience.
-
-`dist/truncating_server.py` advertises the real `Content-Length` but
-cuts the body short on the first N requests, then serves it in full —
-a faithful stand-in for a middlebox clipping a large HTTPS download.
-
-Stage the fake v99 archive with §6's staging commands — `cargo build
---release --bin codescope`, copy the exe to `dist/fake/CodeScope.exe`,
-then `Compress-Archive` it to `dist/CodeScope-v99.0.0-windows.zip`.
-Then serve it with the truncating server instead of §6's full one:
-
-```pwsh
-# Self-heal: cut the first 2 attempts, serve the 3rd in full.
-# DOWNLOAD_ATTEMPTS is 3, so the install should recover on attempt 3.
-python dist/truncating_server.py dist/CodeScope-v99.0.0-windows.zip `
-  --port 8000 --truncate-first 2 --fraction 0.5
-
-# (separate window) launch the DEBUG dev build pointed at it:
-$env:CODESCOPE_DEV = "1"
-$env:CODESCOPE_DEV_FAKE_UPDATE_TOAST = "1"
-$env:CODESCOPE_DEV_UPDATE_URL = "http://127.0.0.1:8000/CodeScope-v99.0.0-windows.zip"
-cargo run --bin codescope
-```
-
-- [ ] Click "Update". The server log prints two `TRUNCATED` lines then
-      one `full` line, and the toast **self-heals** through to
-      "Installing update…" → "Update installed". (The progress bar may
-      visibly reset between attempts.)
-
-Then restart the server to truncate **every** attempt and confirm the
-honest failure (this is the case the EOCD bug used to mangle):
-
-```pwsh
-python dist/truncating_server.py dist/CodeScope-v99.0.0-windows.zip `
-  --port 8000 --truncate-first 999 --fraction 0.5
-```
-
-- [ ] Click "Update". The server log shows exactly **3** `TRUNCATED`
-      lines (the retry budget — *not* a single request that jumps
-      straight to an extract error), and the toast ends on
-      **"Download incomplete: received N of M bytes (connection
-      truncated …)"** — **not** "Could not find EOCD". The failure
-      toast is brief; watch for it, or read the count of attempts in
-      the server log as the proof the verify+retry path ran (old code
-      issued a single GET then failed at extract).
-
-> The unit tests in `src/update.rs` (`verify_complete`) pin the exact
-> truncated / over-read / unknown-length wording; this manual pass
-> proves the wiring end-to-end against a real socket.
-
-### 6c. Real GitHub asset URL (MANDATORY)
-
-Why this exists: §6 and §6b both drive the installer through
-`CODESCOPE_DEV_UPDATE_URL`, which points it at a plain localhost file
-server. That **structurally bypasses the URL the shipped app actually
-downloads from** — `ReleaseInfo::archive_url` is GitHub's *API* asset
-URL (`api.github.com/repos/…/releases/assets/{id}`, from
-`self_update`'s `asset["url"]`, not `browser_download_url`). That URL
-serves the archive only when the request carries
-`Accept: application/octet-stream`; without it, it answers **200 with
-~1.6 KB of asset metadata JSON**. The hand-rolled downloader added in
-#249 never sent the header, so every in-app update on a real release
-downloaded JSON and died at extract with "Could not find EOCD" — the
-symptom that was twice misdiagnosed (as middlebox truncation in #275,
-as a timeout in #301) precisely because these localhost-only checks
-could never reproduce it. Fixed in #305.
-
-`download_asks_github_for_the_raw_asset_bytes` in `src/update.rs`
-pins the header against a server that mimics GitHub's behaviour, but
-run this one-liner against the **real** freshly-published asset too —
-GitHub's API contract is theirs to change, not ours:
-
-```pwsh
-# Grab the API asset URL for this release's Windows zip …
-$asset = (gh release view $TAG --repo maui1911/CodeScope --json assets `
-  | ConvertFrom-Json).assets | Where-Object name -like '*-windows.zip'
-$url = "https://api.github.com/repos/maui1911/CodeScope/releases/assets/$($asset.id)"
-
-# … and fetch it the way the app does.
-curl.exe -sL -H "Accept: application/octet-stream" -o $env:TEMP\rv.zip `
-  -w "%{http_code} %{size_download} %{content_type}`n" $url
-```
-
-- [ ] The output is `200 <size> application/octet-stream` with `<size>`
-      equal to the asset's published size — **not**
-      `application/json`. The first two bytes of `$env:TEMP\rv.zip`
-      are `PK`.
-
-> Do not substitute the `github.com/…/releases/download/…` browser URL
-> here: it works without the header and would re-create exactly the
-> blind spot this check exists to close.
-
-### 7. README still current (minor releases)
+### 6. README still current (minor releases)
 
 The README drifted two minor versions once (#344): a stale keyboard
 table and features that shipped without a mention. On every minor
@@ -243,6 +81,6 @@ release (`vX.Y.0`):
 
 ### Sign-off
 
-When all checks (1-7) pass, the release is OK to announce. Push the
+When all checks (1-6) pass, the release is OK to announce. Push the
 release notes to the GitHub release body, mention any breaking
 changes, and link relevant PRs.
