@@ -64,6 +64,8 @@ use crate::sidebar::{
 };
 use crate::theme;
 
+mod claude_update;
+
 /// Pixel height of the bottom status bar. Shared between
 /// `render_status_bar` (the actual bar's `h(...)`) and
 /// `render_notifications_popover` (first-frame fallback bottom inset
@@ -713,6 +715,9 @@ pub(crate) enum ToastActionKind {
     RestartForUpdate,
     /// Open the GitHub releases page in the default browser.
     OpenReleasesPage,
+    /// Restart every idle Claude tab that still runs an older Claude
+    /// Code build than the installed one — see [`claude_update`].
+    RestartOutdatedClaudeTabs,
 }
 
 /// How long a toast stays visible before the auto-dismiss task
@@ -1088,6 +1093,9 @@ pub struct AppShell {
     /// The `claude` process found in each Claude tab, keyed by tab id —
     /// see [`ClaudeProc`].
     claude_procs: HashMap<u64, ClaudeProc>,
+    /// Claude tabs still on an older build than the installed one, and
+    /// their restarts — see [`claude_update`].
+    claude_updates: claude_update::ClaudeUpdates,
     /// Per Copilot tab: what its lock files said about each candidate,
     /// valid while the candidate's directory mtime holds (see
     /// `codescope_core::agents::copilot::live_session::Verdicts`).
@@ -1775,6 +1783,10 @@ impl AppShell {
         })
         .detach();
 
+        // Spot Claude tabs left on an older build by a Claude Code
+        // update and offer to restart them in place.
+        Self::start_claude_update_watch(cx);
+
         // Restore sidebar geometry from layout. Width is clamped on
         // load too — a corrupt or hand-edited layout.json could
         // otherwise pin the sidebar at 0 or eat the whole window.
@@ -1881,6 +1893,7 @@ impl AppShell {
             window_active_cached: true,
             telemetry_tails: HashMap::new(),
             claude_procs: HashMap::new(),
+            claude_updates: claude_update::ClaudeUpdates::default(),
             copilot_verdicts: HashMap::new(),
             last_window_placement: None,
             last_monitor_change: None,
@@ -5568,6 +5581,9 @@ impl AppShell {
         // workspace would just no-op into the same shape it's already
         // in. Mirrors WPF's `IsEnabled` gating on the equivalent row.
         let can_move_to_new_group = has_others || self.groups.len() > 1;
+        // `Some(idle)` when this tab's `claude` is behind the installed
+        // build; the row only appears then, and only acts while idle.
+        let claude_restart = self.claude_updates.restart_offer(tab_id);
 
         let elevated = theme::elevated(theme);
         let divider = theme::divider(theme);
@@ -5784,6 +5800,22 @@ impl AppShell {
                     this.move_tab_to_new_group(group_id, tab_id, window, cx);
                 }),
             ))
+            .children(claude_restart.map(|idle| {
+                item(
+                    "tab-menu-claude-restart",
+                    if idle {
+                        "Restart on new Claude version"
+                    } else {
+                        "Restart on new Claude version (busy)"
+                    },
+                    idle,
+                    false,
+                    Box::new(move |this, _window, cx| {
+                        this.close_tab_menu(cx);
+                        this.restart_claude_tab(tab_id, cx);
+                    }),
+                )
+            }))
             // ── Open in browser section ──
             //
             // Both rows are gated against `Sidebar` state at menu-build
@@ -7116,6 +7148,9 @@ impl AppShell {
                     );
                 }
             }
+            ToastActionKind::RestartOutdatedClaudeTabs => {
+                self.restart_outdated_claude_tabs(cx);
+            }
         }
         cx.notify();
     }
@@ -7988,6 +8023,7 @@ impl Render for AppShell {
                             tab_id: tab.id,
                             title: tab.title.clone(),
                             busy,
+                            claude_outdated: self.claude_updates.is_outdated(tab.id),
                         }
                     })
                     .collect(),
@@ -8645,6 +8681,9 @@ struct TabRenderData {
     /// the per-tab render closure doesn't have to re-borrow
     /// `self.telemetry_tails`.
     busy: bool,
+    /// The tab's `claude` runs an older build than the installed one;
+    /// draws the `↑` marker (see [`claude_update`]).
+    claude_outdated: bool,
 }
 
 /// Frame-local snapshot for one group. We snapshot `Entity<TerminalView>`
@@ -9436,6 +9475,11 @@ impl AppShell {
                         .bg(status_dot),
                 )
                 .child(div().flex_grow().truncate().child(title))
+                // Older Claude build than the installed one — the tab
+                // menu offers the restart.
+                .children(tmeta.claude_outdated.then(|| {
+                    div().flex_none().text_size(px(12.0)).text_color(accent).child("↑")
+                }))
                 .child(
                     div()
                         .id(("close", tab_id))
