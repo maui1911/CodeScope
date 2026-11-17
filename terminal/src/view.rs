@@ -150,6 +150,10 @@ pub struct TerminalView {
     /// When the user last pressed a plain Enter here — see
     /// [`Self::last_submit`].
     last_submit: Option<SystemTime>,
+    /// When the user last typed or pasted anything here — see
+    /// [`Self::typed_since_submit`]. A `Cell` because `paste` takes
+    /// `&self`.
+    last_typed: std::cell::Cell<Option<SystemTime>>,
 }
 
 impl TerminalView {
@@ -275,6 +279,7 @@ impl TerminalView {
             link_click_consumed: false,
             title: None,
             last_submit: None,
+            last_typed: std::cell::Cell::new(None),
         }
     }
 
@@ -286,6 +291,17 @@ impl TerminalView {
     /// time, so it compares with file mtimes.
     pub fn last_submit(&self) -> Option<SystemTime> {
         self.last_submit
+    }
+
+    /// The user typed or pasted something here after their last Enter
+    /// — so the program may hold an unsent draft. Conservative: any
+    /// key counts (an arrow or Esc too), so a `true` only means
+    /// "maybe". Bytes written through [`Self::write_input`] don't
+    /// count; they aren't the user's.
+    pub fn typed_since_submit(&self) -> bool {
+        self.last_typed
+            .get()
+            .is_some_and(|typed| self.last_submit.is_none_or(|submit| typed > submit))
     }
 
     /// The title the program running in the terminal last set via
@@ -704,8 +720,10 @@ impl TerminalView {
             self.backend.reset_scroll();
             self.backend.write_input(bytes);
             self.show_cursor_now();
+            let now = SystemTime::now();
+            self.last_typed.set(Some(now));
             if key == "enter" && plain && !mods.shift {
-                self.last_submit = Some(SystemTime::now());
+                self.last_submit = Some(now);
             }
         }
     }
@@ -789,6 +807,7 @@ impl TerminalView {
         } else {
             self.backend.write_input(normalised.into_bytes());
         }
+        self.last_typed.set(Some(SystemTime::now()));
         self.backend.reset_scroll();
     }
 

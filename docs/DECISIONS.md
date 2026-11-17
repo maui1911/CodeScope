@@ -792,3 +792,79 @@ feature, in `codescope-core` (`agents::opencode::db`).
   `agents::opencode`.
 * OpenCode versions older than the database (the JSON-file layout) are
   no longer read; that reader was removed.
+
+## ADR-0026 — Restart Claude tabs onto a new Claude Code build in place
+
+**Date:** 2026-11-17
+**Status:** Accepted
+
+A Claude Code update used to mean restarting CodeScope. The native
+installer already swaps `~/.local/bin/claude.exe` while tabs still run
+it: it renames the in-use image to `claude.exe.old.<ts>.<pid>`, which
+Windows allows for a running executable. So the update lands, but every
+`claude` that was already running keeps the old build ("Update
+installed · Restart to update"). Closing all of CodeScope was the
+blunt way to restart them all.
+
+**Decision:** CodeScope restarts the tabs, not itself
+(`src/app/claude_update.rs`, `agents::claude::{version, restart}`).
+
+* **Detecting:** every 5 minutes (first check 30 s after launch)
+  `claude --version` gives the installed build (20 s timeout). Each
+  Claude tab's process reports its own build and `idle`/`busy` status
+  in `~/.claude/sessions/<pid>.json`, which adoption already reads. A
+  tab is outdated when its build is older. Outdated tabs get a `↑` in
+  the tab strip and a "Restart on new Claude version" row in the tab
+  menu. While any tab is outdated it is re-read every 15 s.
+* **Restarting on its own:** an outdated tab is restarted without
+  asking once it is idle, the user hasn't typed into it since their
+  last Enter (a draft would be wiped), and it isn't the visible tab of
+  a group in a focused window (the screen would redraw under them). A
+  first version of this PR asked with a toast button; that was dropped
+  as noise — the restart is invisible when done this way. Each tab gets
+  one automatic attempt per installed build: a relaunch that comes
+  back still outdated (its shell resolves `claude` to another install
+  than CodeScope's PATH does) or a `claude` that won't exit is not
+  retried every tick. The tab menu can always retry.
+* **The sequence:** Ctrl+C (clears a draft, or just shows "press again
+  to exit"), then `/exit` + Enter on the empty prompt, which shuts
+  Claude Code down cleanly with no double-press timing involved. Then
+  `claude --resume <session id>` is typed at the `pwsh -NoExit` prompt
+  left behind. Before every keystroke the state is re-read: the
+  process must still be under the tab's shell (a failed or empty
+  process snapshot aborts, it never reads as "exited"), its pid file
+  must still say idle, and the user must not have started typing. A
+  session nobody sent a prompt in has an id but no transcript, so it
+  gets a plain `claude` instead. "No transcript" requires both a
+  missing file and no adoption of that id, so a missed path lookup
+  can't swap a conversation for a blank one. The session id must be
+  UUID-shaped before it is typed into a shell.
+* **Three Ctrl+C instead of `/exit`:** tried first. It needs the
+  presses inside Claude Code's double-press window, and a spare one
+  can cut an already-running shutdown short.
+* **Not installing updates ourselves:** Claude Code's own updater
+  already handles the locked binary. Doing the swap ourselves would
+  duplicate it and drift from it.
+* **Not launching from `versions/<v>`:** running each tab from the
+  versioned file would keep `bin/claude.exe` unlocked, but those files
+  have no `.exe` extension (pwsh can't run them as a command) and it
+  would change the launch path for every agent profile.
+
+**Consequences:**
+
+* A restart from the tab menu wipes a draft prompt, the same as
+  pressing Ctrl+C by hand. Automatic restarts skip tabs that may have
+  one. "Typed since the last Enter" is conservative: an arrow key
+  counts too, so such a tab waits until its next prompt is sent.
+* Whatever the idle `claude` owns dies with it: MCP servers come back
+  with `--resume`, background shells or dev servers its tools started
+  do not. A tab in a modal state that still reports `idle` (a dialog,
+  an external editor) gets Ctrl+C and `/exit` typed into that, and the
+  restart gives up after 10 s.
+* The relaunch uses the registry's `claude` profile, like reopening a
+  session, so extra flags the tab was started with are not repeated.
+* Relies on undocumented Claude Code details: the pid file's
+  `version`/`status` keys and `/exit`. If the keys change, tabs read as
+  "not outdated" or "not idle" and are left alone. If `/exit` stops
+  exiting, the restart gives up with one error toast per tab and
+  build. Nothing is killed by CodeScope either way.
