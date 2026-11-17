@@ -715,9 +715,6 @@ pub(crate) enum ToastActionKind {
     RestartForUpdate,
     /// Open the GitHub releases page in the default browser.
     OpenReleasesPage,
-    /// Restart every idle Claude tab that still runs an older Claude
-    /// Code build than the installed one — see [`claude_update`].
-    RestartOutdatedClaudeTabs,
 }
 
 /// How long a toast stays visible before the auto-dismiss task
@@ -5581,9 +5578,11 @@ impl AppShell {
         // workspace would just no-op into the same shape it's already
         // in. Mirrors WPF's `IsEnabled` gating on the equivalent row.
         let can_move_to_new_group = has_others || self.groups.len() > 1;
-        // `Some(idle)` when this tab's `claude` is behind the installed
-        // build; the row only appears then, and only acts while idle.
-        let claude_restart = self.claude_updates.restart_offer(tab_id);
+        // The row only appears while this tab's `claude` is behind the
+        // installed build. It stays clickable: the restart re-reads
+        // whether `claude` is busy and says so, which a menu built from
+        // the last scan could only guess.
+        let claude_restart = self.claude_updates.is_outdated(tab_id);
 
         let elevated = theme::elevated(theme);
         let divider = theme::divider(theme);
@@ -5800,15 +5799,11 @@ impl AppShell {
                     this.move_tab_to_new_group(group_id, tab_id, window, cx);
                 }),
             ))
-            .children(claude_restart.map(|idle| {
+            .children(claude_restart.then(|| {
                 item(
                     "tab-menu-claude-restart",
-                    if idle {
-                        "Restart on new Claude version"
-                    } else {
-                        "Restart on new Claude version (busy)"
-                    },
-                    idle,
+                    "Restart on new Claude version",
+                    true,
                     false,
                     Box::new(move |this, _window, cx| {
                         this.close_tab_menu(cx);
@@ -7147,9 +7142,6 @@ impl AppShell {
                         cx,
                     );
                 }
-            }
-            ToastActionKind::RestartOutdatedClaudeTabs => {
-                self.restart_outdated_claude_tabs(cx);
             }
         }
         cx.notify();
