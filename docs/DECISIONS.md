@@ -792,3 +792,55 @@ feature, in `codescope-core` (`agents::opencode::db`).
   `agents::opencode`.
 * OpenCode versions older than the database (the JSON-file layout) are
   no longer read; that reader was removed.
+
+## ADR-0026 — Restart Claude tabs onto a new Claude Code build in place
+
+**Date:** 2026-11-17
+**Status:** Accepted
+
+A Claude Code update used to mean restarting CodeScope. The native
+installer already swaps `~/.local/bin/claude.exe` while tabs still run
+it: it renames the in-use image to `claude.exe.old.<ts>.<pid>`, which
+Windows allows for a running executable. So the update lands, but every
+`claude` that was already running keeps the old build ("Update
+installed · Restart to update"). Closing all of CodeScope was the
+blunt way to restart them all.
+
+**Decision:** CodeScope restarts the tabs, not itself
+(`src/app/claude_update.rs`, `agents::claude::{version, restart}`).
+
+* **Detecting:** every 5 minutes (first check 30 s after launch)
+  `claude --version` gives the installed build. Each Claude tab's
+  process reports its own build and `idle`/`busy` status in
+  `~/.claude/sessions/<pid>.json`, which adoption already reads. A tab
+  is outdated when its build is older. Outdated tabs get a `↑` in the
+  tab strip, and one toast per installed build offers "Restart idle
+  tabs".
+* **Restarting:** only an idle `claude` is touched; busy tabs are
+  counted and left for the tab menu's "Restart on new Claude version".
+  CodeScope sends Ctrl+C up to three times, 450 ms apart (clear a draft,
+  arm "press again to exit", exit), then types
+  `claude --resume <session id>` at the `pwsh -NoExit` prompt left
+  behind. A session nobody sent a prompt in has an id but no
+  transcript, so it gets a plain `claude` instead.
+* **Not installing updates ourselves:** Claude Code's own updater
+  already handles the locked binary. Doing the swap ourselves would
+  duplicate it and drift from it.
+* **Not launching from `versions/<v>`:** running each tab from the
+  versioned file would keep `bin/claude.exe` unlocked, but those files
+  have no `.exe` extension (pwsh can't run them as a command) and it
+  would change the launch path for every agent profile.
+
+**Consequences:**
+
+* Any draft prompt in an idle tab is lost on restart, the same as
+  pressing Ctrl+C by hand.
+* With no draft, the second Ctrl+C already exits. A third one goes out
+  only if `claude` is still shutting down 450 ms later, and then cuts
+  that shutdown short. The conversation is already on disk because the
+  tab was idle.
+* Relies on undocumented Claude Code details: the pid file's `version`
+  and `status` keys and the double Ctrl+C exit. If either changes, tabs
+  read as "not outdated" or "not idle" and are left alone. If Ctrl+C
+  stops exiting, the restart gives up with an error toast. Nothing gets
+  killed either way.
