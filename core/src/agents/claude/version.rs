@@ -45,19 +45,55 @@ pub fn parse_version_output(output: &str) -> Option<ClaudeVersion> {
 
 /// The Claude Code build a freshly started `claude` would run right
 /// now, from `claude --version`. `None` when `claude` is not on PATH or
-/// its output is unrecognised. Spawns a process (a few hundred ms), so
-/// call it off the UI thread.
+/// its output is unrecognised, or it doesn't answer within
+/// [`VERSION_TIMEOUT`]. Spawns a process (a few hundred ms) and blocks
+/// on it, so call it off the UI thread.
+///
+/// `claude` resolves through CodeScope's own PATH, which can differ
+/// from a tab shell's (a profile that prepends an npm install, say).
+/// Callers must not keep acting on a mismatch: a restart that comes
+/// back on the "old" build is not retried.
 pub fn installed_version() -> Option<ClaudeVersion> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::Instant;
+
     let mut cmd = crate::process::no_window_command("claude");
     for var in crate::process::INHERITED_AGENT_SESSION_VARS {
         cmd.env_remove(var);
     }
-    let out = cmd.arg("--version").output().ok()?;
-    if !out.status.success() {
+    let mut child = cmd
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + VERSION_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
         return None;
     }
-    parse_version_output(&String::from_utf8_lossy(&out.stdout))
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    parse_version_output(&out)
 }
+
+/// How long `claude --version` may take before the check gives up —
+/// a hung CLI must not stall the update watch for good.
+pub const VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Whether a tab running `running` should restart to pick up
 /// `installed`. An unparseable running version is never outdated —
