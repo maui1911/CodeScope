@@ -39,6 +39,41 @@ pub fn session_for_pids(
     pids: &[u32],
     working_directory: &str,
 ) -> Option<(u32, String)> {
+    process_for_pids(sessions_dir, pids, working_directory).map(|live| (live.pid, live.session_id))
+}
+
+/// What a running interactive `claude` reports about itself in its
+/// `~/.claude/sessions/<pid>.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveProcess {
+    pub pid: u32,
+    /// The conversation it is in right now.
+    pub session_id: String,
+    /// The directory it runs in, as Claude Code spells it — the one its
+    /// transcript is filed under.
+    pub cwd: String,
+    /// The Claude Code build the process runs (`2.1.326`) — fixed for
+    /// the life of the process, so it lags the installed build after
+    /// an update. `None` on builds too old to write it.
+    pub version: Option<String>,
+    /// `idle` / `busy` / … as Claude Code reports it.
+    pub status: Option<String>,
+}
+
+impl LiveProcess {
+    /// Waiting for the user's next prompt. A missing status counts as
+    /// not idle, so nothing is ever interrupted on a guess.
+    pub fn is_idle(&self) -> bool {
+        self.status.as_deref() == Some("idle")
+    }
+}
+
+/// Like [`session_for_pids`], with the process's version and status.
+pub fn process_for_pids(
+    sessions_dir: &Path,
+    pids: &[u32],
+    working_directory: &str,
+) -> Option<LiveProcess> {
     pids.iter().find_map(|&pid| {
         let text = std::fs::read_to_string(session_file(sessions_dir, pid)).ok()?;
         let entry: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -53,7 +88,18 @@ pub fn session_for_pids(
             && interactive
             && !session_id.is_empty()
             && crate::path_canon::paths_match(cwd, working_directory))
-        .then(|| (pid, session_id.to_owned()))
+        .then(|| {
+            let text_field = |key: &str| {
+                entry.get(key).and_then(serde_json::Value::as_str).map(str::to_owned)
+            };
+            LiveProcess {
+                pid,
+                session_id: session_id.to_owned(),
+                cwd: cwd.to_owned(),
+                version: text_field("version"),
+                status: text_field("status"),
+            }
+        })
     })
 }
 
@@ -105,6 +151,38 @@ mod tests {
             session_for_pids(dir.path(), &[12, 14], "C:/repo"),
             Some((14, "sid-a".to_owned()))
         );
+    }
+
+    #[test]
+    fn process_for_pids_reports_version_and_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = serde_json::json!({
+            "pid": 12, "sessionId": "sid-a", "cwd": "C:/repo", "kind": "interactive",
+            "version": "2.1.325", "status": "idle",
+        });
+        write(dir.path(), 12, &body.to_string());
+        let live = process_for_pids(dir.path(), &[11, 12], "C:/repo").unwrap();
+        assert_eq!(live.pid, 12);
+        assert_eq!(live.session_id, "sid-a");
+        assert_eq!(live.cwd, "C:/repo");
+        assert_eq!(live.version.as_deref(), Some("2.1.325"));
+        assert!(live.is_idle());
+    }
+
+    #[test]
+    fn busy_or_missing_status_is_not_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let busy = serde_json::json!({
+            "pid": 12, "sessionId": "sid-a", "cwd": "C:/repo", "status": "busy",
+        });
+        write(dir.path(), 12, &busy.to_string());
+        // Older Claude Code: no `version` / `status` keys at all.
+        write(dir.path(), 14, &entry(14, "sid-b", "C:/repo"));
+        let busy = process_for_pids(dir.path(), &[12], "C:/repo").unwrap();
+        assert!(!busy.is_idle());
+        let old = process_for_pids(dir.path(), &[14], "C:/repo").unwrap();
+        assert!(!old.is_idle());
+        assert_eq!(old.version, None);
     }
 
     #[test]

@@ -3,4 +3,6 @@
 
 pub mod discovery;
 pub mod live_session;
+pub mod restart;
 pub mod telemetry;
+pub mod version;
