@@ -132,6 +132,22 @@ pub fn bytes_to_mib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
+/// Working-set / RSS of this process in bytes, for the status bar.
+/// `None` where the platform can't report it; callers hide the segment.
+pub fn process_memory_bytes() -> Option<u64> {
+    sample_working_set_bytes()
+}
+
+/// Compact label: `"512 MB"` below 1 GiB, `"1.4 GB"` above.
+pub fn format_memory(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    if bytes as f64 >= GIB {
+        format!("{:.1} GB", bytes as f64 / GIB)
+    } else {
+        format!("{:.0} MB", bytes_to_mib(bytes))
+    }
+}
+
 /// Sample the current process's working-set / RSS in bytes. Returns
 /// `None` if the platform isn't supported or the syscall fails — the
 /// watchdog treats that as "skip this tick" and tries again next time.
@@ -193,6 +209,13 @@ fn sample_working_set_bytes() -> Option<u64> {
 mod tests {
     use super::*;
     use std::time::UNIX_EPOCH;
+
+    #[test]
+    fn format_memory_switches_to_gb() {
+        assert_eq!(format_memory(0), "0 MB");
+        assert_eq!(format_memory(512 * 1024 * 1024), "512 MB");
+        assert_eq!(format_memory(1536 * 1024 * 1024), "1.5 GB");
+    }
 
     #[test]
     fn bytes_to_mib_round_numbers() {

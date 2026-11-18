@@ -43,6 +43,7 @@ pub mod telemetry;
 pub mod theme;
 pub mod time;
 pub mod update_check;
+pub mod usage;
 pub mod window_state;
 pub mod worktree_create;
 

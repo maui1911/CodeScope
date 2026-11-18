@@ -620,6 +620,26 @@ impl ProjectsConfig {
     }
 }
 
+impl ProjectsConfig {
+    /// Name of the project that owns `path`: the project's own folder or
+    /// any of its worktrees, matched path-normalised like
+    /// [`Self::find_project_index_by_path`]. `None` for an unknown path
+    /// (a stray shell tab) and for an empty one.
+    pub fn project_name_for_path(&self, path: &str) -> Option<&str> {
+        let needle = normalise_project_path(path);
+        if needle.is_empty() {
+            return None;
+        }
+        self.projects
+            .iter()
+            .find(|p| {
+                normalise_project_path(&p.path) == needle
+                    || p.worktrees.iter().any(|w| normalise_project_path(&w.path) == needle)
+            })
+            .map(|p| p.name.as_str())
+    }
+}
+
 /// Rows one [`ProjectsConfig::sync_worktrees`] call added and dropped.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WorktreeSync {
@@ -1899,6 +1919,28 @@ mod tests {
         }
         assert_eq!(cfg.find_project_index_by_path("C:\\repos\\other"), None);
         assert_eq!(cfg.find_project_index_by_path(""), None);
+    }
+
+    #[test]
+    fn project_name_for_path_matches_project_and_worktrees() {
+        let mut project = Project::new(r"C:\repos\repo".into());
+        project.name = "repo".into();
+        project.worktrees.push(Worktree {
+            id: "w1".into(),
+            path: r"C:\repos\repo-feature".into(),
+            branch: Some("feature".into()),
+            is_primary: false,
+        });
+        let cfg = ProjectsConfig {
+            version: CURRENT_VERSION,
+            agents: Vec::new(),
+            projects: vec![project],
+            project_groups: Vec::new(),
+        };
+        assert_eq!(cfg.project_name_for_path("C:/repos/repo/"), Some("repo"));
+        assert_eq!(cfg.project_name_for_path(r"C:\repos\repo-feature"), Some("repo"));
+        assert_eq!(cfg.project_name_for_path(r"C:\repos\other"), None);
+        assert_eq!(cfg.project_name_for_path(""), None);
     }
 
     /// Load a file containing agent overrides → mutate projects → save
