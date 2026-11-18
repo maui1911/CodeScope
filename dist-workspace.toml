@@ -6,7 +6,7 @@ members = ["cargo:."]
 # Scope notes for CodeScope:
 #
 # - cargo-dist builds the release binary on native runners per target
-#   (`macos-14`, `macos-15-intel`, `ubuntu-22.04`) and packages each
+#   (`macos-15`, `macos-15-intel`, `ubuntu-22.04`) and packages each
 #   as a `.tar.gz`. Windows packaging is handled by a custom workflow
 #   job that uses Inno Setup — see `.github/workflows/release.yml`'s
 #   `windows-package` job and `installer/CodeScope.iss`. cargo-dist
@@ -49,6 +49,13 @@ pr-run-mode = "skip"
 # notifier-only (browser fallback) for in-app updates so it doesn't
 # extract programmatically.
 unix-archive = ".tar.gz"
+
+# cargo-dist 0.31 defaults aarch64-apple-darwin to `macos-14`, which
+# GitHub retired ("The configuration 'macos-14-arm64-us-default' is
+# not supported" — the v0.8.1 release run). Pin the arm64 build to
+# `macos-15`.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
 
 [dist.dependencies.apt]
 libwayland-dev = "*"
