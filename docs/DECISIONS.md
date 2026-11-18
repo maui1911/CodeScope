@@ -868,3 +868,63 @@ blunt way to restart them all.
   "not outdated" or "not idle" and are left alone. If `/exit` stops
   exiting, the restart gives up with one error toast per tab and
   build. Nothing is killed by CodeScope either way.
+
+## ADR-0027 — Status bar shows Claude plan usage from the CLI's OAuth endpoint
+
+**Date:** 2026-11-18
+**Status:** Accepted
+
+The status bar gains three segments: the active tab's project name, the
+Claude plan windows (5-hour session, 7-day week, and the monthly extra
+usage when it is enabled), and CodeScope's own memory. They sit next to
+the context-window readout that was already there. The idea and the
+first implementation come from a fork, `mhensen/CodeScope` (branch
+`feat/status-bar-usage`). That branch also had a tokens-per-second
+readout, which was left out (it was wrong in live sessions, see below),
+and two sidebar rows that launch Claude with
+`--dangerously-skip-permissions`, which auto mode makes unnecessary.
+
+The plan windows are the only segment that talks to the network. Plan
+limits are counted server-side and include use from other machines and
+claude.ai, so the local transcripts cannot produce them.
+
+**Decision:** `codescope_core::usage` reads the OAuth access token
+that Claude Code keeps in `~/.claude/.credentials.json` (honouring
+`CLAUDE_CONFIG_DIR`) and calls `GET https://api.anthropic.com/api/oauth/usage`,
+the endpoint behind the CLI's own `/usage` view, every 2 minutes on the
+background executor.
+
+* **Read-only token use:** the token is never refreshed or written. An
+  expired one (`expiresAt` in the past) skips the call; Claude Code
+  refreshes it on its next run. The token goes only to
+  `api.anthropic.com`, which already receives it from the CLI.
+* **Tolerant of an undocumented API:** every field is optional. A
+  missing or reshaped window hides that window; a body that is not a
+  JSON object hides the whole cluster. Errors are logged once per
+  distinct message, not every poll.
+* **No stale numbers:** a failed poll keeps the last good reading, so
+  a blip does not make the segment flicker. A reading that has not been
+  refreshed for 10 minutes is dropped instead of being shown as
+  current.
+* **No tokens per second:** the fork timed each assistant entry from
+  the entry before it. Claude Code writes one reply as one entry per
+  content block, each repeating the reply's final `output_tokens`, and
+  can run a tool while the rest of the reply streams, so a tool result
+  lands between two blocks of one reply. On a real session that read a
+  median of 200 t/s with spikes past 3000. Timing per reply
+  (`message.id`) from the request fixes it (95 t/s median), but needs
+  extra state carried across polls in the Claude parser. The plan and
+  context windows matter more, so the rate was dropped for now.
+
+**Consequences:**
+
+* On macOS Claude Code keeps its credentials in the login Keychain,
+  not in the file, so the plan windows stay hidden there. Reading the
+  Keychain was left out.
+* API-key users and machines without a Claude login see no plan
+  windows; the rest of the status bar is unaffected.
+* An endpoint change reads as "no plan windows" plus one log line, not
+  a crash, and needs a matching change in `usage`.
+* `codescope-core` depends on `reqwest` (blocking, rustls). The
+  binary crate already used it with the same features, so no new crate
+  enters the lockfile.
