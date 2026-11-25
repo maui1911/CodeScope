@@ -233,28 +233,49 @@ pub fn suggest_mapping(columns: &[Column]) -> ColumnMapping {
 }
 
 /// The stored mapping, with every role whose column is not on the board filled in by
-/// [`suggest_mapping`]; a column added on the host later is picked up without a remap.
+/// [`suggest_mapping`]; a column added on the host later is picked up without a remap. A column
+/// gets one role: the first stored one in [`ColumnRole::ALL`] order, else its suggested one.
 pub fn effective_mapping(board: &Board, mapping: &ColumnMapping) -> ColumnMapping {
-    let mut effective = suggest_mapping(&board.columns);
-    for (role, name) in mapping {
-        if mapped_column(board, mapping, *role).is_some() {
-            effective.insert(*role, name.clone());
+    let mut effective = ColumnMapping::new();
+    let mut claimed: Vec<&str> = Vec::new();
+    let suggested = suggest_mapping(&board.columns);
+    for source in [mapping, &suggested] {
+        for role in source.keys() {
+            if effective.contains_key(role) {
+                continue;
+            }
+            if let Some(column) = mapped_column(board, source, *role)
+                && !claimed.contains(&column.id.as_str())
+            {
+                claimed.push(&column.id);
+                effective.insert(*role, column.name.clone());
+            }
         }
     }
     effective
 }
 
-/// The column a role maps to, matched the way [`normalize_column_name`] compares.
+/// The column a role maps to: the one with exactly that name, else the only one whose
+/// [`normalize_column_name`] matches.
 pub fn mapped_column<'a>(
     board: &'a Board,
     mapping: &ColumnMapping,
     role: ColumnRole,
 ) -> Option<&'a Column> {
-    let name = normalize_column_name(mapping.get(&role)?);
-    board
+    let stored = mapping.get(&role)?;
+    if let Some(exact) = board.columns.iter().find(|c| c.name == *stored) {
+        return Some(exact);
+    }
+    let name = normalize_column_name(stored);
+    if name.is_empty() {
+        return None;
+    }
+    let mut alike = board
         .columns
         .iter()
-        .find(|c| normalize_column_name(&c.name) == name)
+        .filter(|c| normalize_column_name(&c.name) == name);
+    let column = alike.next()?;
+    alike.next().is_none().then_some(column)
 }
 
 /// Roles without a column on this board, in [`ColumnRole::ALL`] order.
@@ -560,6 +581,50 @@ mod tests {
         let layout = panel_columns(&b, &mapping);
         assert_eq!(layout[2].sections[0].role, Some(ColumnRole::Ready));
         assert_eq!(layout[2].sections[0].items, vec![0]);
+    }
+
+    #[test]
+    fn a_mapped_name_matches_its_own_column_before_a_lookalike() {
+        let b = board(
+            vec![
+                column("a", "In progress"),
+                column("b", "In-progress"),
+                column("c", "🚀"),
+                column("d", "🔥"),
+            ],
+            vec![],
+        );
+        let mapped = |name: &str| {
+            let mapping = ColumnMapping::from([(ColumnRole::InProgress, name.to_string())]);
+            mapped_column(&b, &mapping, ColumnRole::InProgress).map(|c| c.id.clone())
+        };
+        assert_eq!(mapped("In-progress").as_deref(), Some("b"));
+        assert_eq!(mapped("🔥").as_deref(), Some("d"));
+        assert_eq!(mapped("IN PROGRESS"), None, "two columns look like it");
+        assert_eq!(mapped("✨"), None, "an emoji-only name is not a wildcard");
+    }
+
+    #[test]
+    fn a_column_gets_one_role() {
+        let b = board(vec![column("t", "Todo"), column("r", "Ready")], vec![]);
+        let stored = ColumnMapping::from([
+            (ColumnRole::Todo, "Ready".to_string()),
+            (ColumnRole::Ready, "Ready".to_string()),
+        ]);
+        let effective = effective_mapping(&b, &stored);
+        assert_eq!(
+            effective.get(&ColumnRole::Todo).map(String::as_str),
+            Some("Ready")
+        );
+        assert_eq!(effective.get(&ColumnRole::Ready), None);
+
+        let stored = ColumnMapping::from([(ColumnRole::Ready, "Todo".to_string())]);
+        let effective = effective_mapping(&b, &stored);
+        assert_eq!(
+            effective.get(&ColumnRole::Ready).map(String::as_str),
+            Some("Todo")
+        );
+        assert_eq!(effective.get(&ColumnRole::Todo), None, "Todo's column is taken");
     }
 
     #[test]
