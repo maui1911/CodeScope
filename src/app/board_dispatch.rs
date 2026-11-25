@@ -1033,6 +1033,7 @@ impl AppShell {
                 round,
                 trigger_at: trigger_at.clone(),
                 findings: None,
+                pull_request: None,
             },
             assign_to: item.assignees.is_empty().then_some(content_id),
             board,

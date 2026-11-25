@@ -11,6 +11,7 @@ use serde::de::DeserializeOwned;
 
 use super::answers::Comment;
 use super::dispatch::StatusChange;
+use super::pull_request::{Checks, PullRequest, PullRequestState};
 use super::{Board, BoardItem, BoardOwner, BoardRef, Column, ItemKind, ItemState};
 use crate::process::no_window_command;
 
@@ -366,6 +367,85 @@ fn write_access(permission: Result<String>) -> Result<bool> {
     }
 }
 
+const PULL_REQUESTS_QUERY: &str = r#"query($owner: String!, $name: String!, $branch: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(headRefName: $branch, states: [OPEN, MERGED], first: 5,
+      orderBy: { field: CREATED_AT, direction: DESC }) {
+      nodes {
+        id number url state isDraft isCrossRepository
+        commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+      }
+    }
+  }
+}"#;
+
+/// The open and merged pull requests from `branch` of `repository` (`owner/name`) itself, newest
+/// first; those from forks with a branch of the same name are left out.
+pub fn fetch_pull_requests(repository: &str, branch: &str) -> Result<Vec<PullRequest>> {
+    let (owner, name) = repository
+        .split_once('/')
+        .ok_or_else(|| anyhow!("{repository} is not an owner/name repository"))?;
+    let stdout = run_graphql(
+        &[
+            format!("query={PULL_REQUESTS_QUERY}"),
+            format!("owner={owner}"),
+            format!("name={name}"),
+            format!("branch={branch}"),
+        ],
+        &[],
+    )?;
+    parse_pull_requests(&stdout)
+}
+
+/// Parse [`fetch_pull_requests`]' response.
+pub fn parse_pull_requests(json: &str) -> Result<Vec<PullRequest>> {
+    let data: PullRequestsData = parse_data(json)?;
+    let repository = data
+        .repository
+        .ok_or_else(|| anyhow!("repository not found"))?;
+    Ok(repository
+        .pull_requests
+        .nodes
+        .into_iter()
+        .flatten()
+        .filter(|node| !node.is_cross_repository)
+        .filter_map(|node| {
+            let state = match node.state.as_str() {
+                "OPEN" => PullRequestState::Open,
+                "MERGED" => PullRequestState::Merged,
+                _ => return None,
+            };
+            let rollup = node
+                .commits
+                .nodes
+                .into_iter()
+                .flatten()
+                .next()
+                .and_then(|c| c.commit.status_check_rollup);
+            Some(PullRequest {
+                id: node.id,
+                number: node.number,
+                url: node.url,
+                state,
+                is_draft: node.is_draft,
+                checks: Checks::from_rollup(rollup.as_ref().map(|r| r.state.as_str())),
+            })
+        })
+        .collect())
+}
+
+/// Mark a draft pull request ready for review, by its node id.
+pub fn mark_ready_for_review(pull_request_id: &str) -> Result<()> {
+    let query = r#"mutation($id: ID!) {
+  markPullRequestReadyForReview(input: { pullRequestId: $id }) { clientMutationId }
+}"#;
+    let stdout = run_graphql(
+        &[format!("query={query}"), format!("id={pull_request_id}")],
+        &[],
+    )?;
+    parse_data::<serde_json::Value>(&stdout).map(|_| ())
+}
+
 fn run_graphql(raw_fields: &[String], typed_fields: &[String]) -> Result<String> {
     run_gh_api(&graphql_args(raw_fields, typed_fields))
 }
@@ -670,6 +750,55 @@ struct IssueCommentNode {
     body: String,
     created_at: String,
     author: Option<Login>,
+}
+
+#[derive(Deserialize)]
+struct PullRequestsData {
+    repository: Option<PullRequestsOwner>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestsOwner {
+    pull_requests: PullRequestList,
+}
+
+#[derive(Deserialize)]
+struct PullRequestList {
+    nodes: Vec<Option<PullRequestNode>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestNode {
+    id: String,
+    number: u32,
+    url: String,
+    state: String,
+    is_draft: bool,
+    is_cross_repository: bool,
+    commits: CommitList,
+}
+
+#[derive(Deserialize)]
+struct CommitList {
+    nodes: Vec<Option<CommitNode>>,
+}
+
+#[derive(Deserialize)]
+struct CommitNode {
+    commit: Commit,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Commit {
+    status_check_rollup: Option<Rollup>,
+}
+
+#[derive(Deserialize)]
+struct Rollup {
+    state: String,
 }
 
 #[derive(Deserialize)]
@@ -1062,6 +1191,45 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn reads_the_pull_requests_on_a_branch_but_not_those_from_forks() {
+        let json = r#"{"data":{"repository":{"pullRequests":{"nodes":[
+          {"id":"PR_3","number":417,"url":"https://github.com/maui1911/CodeScope/pull/417",
+           "state":"OPEN","isDraft":true,"isCrossRepository":false,
+           "commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"PENDING"}}}]}},
+          {"id":"PR_2","number":416,"url":"https://github.com/maui1911/CodeScope/pull/416",
+           "state":"OPEN","isDraft":false,"isCrossRepository":true,
+           "commits":{"nodes":[{"commit":{"statusCheckRollup":null}}]}},
+          {"id":"PR_1","number":415,"url":"https://github.com/maui1911/CodeScope/pull/415",
+           "state":"MERGED","isDraft":false,"isCrossRepository":false,
+           "commits":{"nodes":[]}}
+        ]}}}}"#;
+        let found = parse_pull_requests(json).unwrap();
+        assert_eq!(
+            found,
+            vec![
+                PullRequest {
+                    id: "PR_3".into(),
+                    number: 417,
+                    url: "https://github.com/maui1911/CodeScope/pull/417".into(),
+                    state: PullRequestState::Open,
+                    is_draft: true,
+                    checks: Checks::Running,
+                },
+                PullRequest {
+                    id: "PR_1".into(),
+                    number: 415,
+                    url: "https://github.com/maui1911/CodeScope/pull/415".into(),
+                    state: PullRequestState::Merged,
+                    is_draft: false,
+                    checks: Checks::None,
+                },
+            ]
+        );
+        let missing = parse_pull_requests(r#"{"data":{"repository":null}}"#).unwrap_err();
+        assert_eq!(missing.to_string(), "repository not found");
     }
 
     #[test]
