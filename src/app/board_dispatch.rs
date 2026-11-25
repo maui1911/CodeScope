@@ -376,6 +376,7 @@ impl AppShell {
         let mut running = self.running_dispatches(cx);
         let limit = self.settings.dispatch_limit;
         let mut holds = HashMap::new();
+        let mut seen = HashSet::new();
         let mut decided = HashSet::new();
         let mut starts = Vec::new();
         let state = &self.board.dispatch;
@@ -388,6 +389,7 @@ impl AppShell {
             };
             let mapping = effective_mapping(board, &settings.columns);
             for item in &board.items {
+                seen.insert(item.id.clone());
                 if state.starting.contains_key(&item.id) {
                     continue;
                 }
@@ -447,8 +449,10 @@ impl AppShell {
                 }
             }
         }
-        self.board.dispatch.holds = holds;
-        self.board.dispatch.failed.retain(|id, _| decided.contains(id));
+        let state = &mut self.board.dispatch;
+        state.holds.retain(|id, _| !seen.contains(id));
+        state.holds.extend(holds);
+        state.failed.retain(|id, _| decided.contains(id) || !seen.contains(id));
         for start in starts {
             self.start_dispatch(start, &viewer, window, cx);
         }
