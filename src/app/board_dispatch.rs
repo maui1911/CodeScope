@@ -5,6 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use codescope_core::AgentId;
+use codescope_core::agents::claude::live_session::{self, LiveProcess};
 use codescope_core::board::dispatch::{
     Facts, Hold, ProjectRemotes, Round, StatusChange, WorktreeDispatch, add_dispatch_worktree,
     branch_name, counts_towards_limit, decide, exclude_handover_files, find_skill, launch_with_task,
@@ -15,8 +17,11 @@ use codescope_core::board::github::{self, Viewer};
 use codescope_core::board::{
     Board, BoardItem, BoardRef, ColumnMapping, effective_mapping, mapped_column,
 };
+use codescope_core::path_canon::paths_match;
+use codescope_core::process_tree;
 use codescope_core::projects::{ProjectKind, ProjectsConfig};
 use codescope_core::worktree_create::record_dispatch;
+use codescope_terminal::TerminalView;
 use gpui::{AppContext as _, Context, SharedString, Window};
 
 use super::{AppShell, ToastKind};
@@ -100,6 +105,23 @@ struct Launch {
     title: codescope_core::TabTitle,
     agent_id: String,
     command: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabAtHandover {
+    Shell,
+    IdleAgent,
+    Busy,
+}
+
+fn tab_at_handover(pids: &[u32], claude: Option<&LiveProcess>, typed: bool) -> TabAtHandover {
+    if pids.is_empty() {
+        TabAtHandover::Shell
+    } else if claude.is_some_and(LiveProcess::is_idle) && !typed {
+        TabAtHandover::IdleAgent
+    } else {
+        TabAtHandover::Busy
+    }
 }
 
 fn access_key(repository: &str, login: &str) -> (String, String) {
@@ -592,8 +614,9 @@ impl AppShell {
         cx.notify();
     }
 
-    /// Give the session on `path` its task: typed into an open tab, else in a new one. Focus stays
-    /// where it was.
+    /// Give the session on `path` its task: typed into a tab whose Claude Code waits for a
+    /// prompt, else in a new tab, unless something else runs in a tab there. Focus stays where it
+    /// was.
     fn hand_over(
         &mut self,
         path: &Path,
@@ -602,28 +625,24 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let open = self
-            .groups
-            .iter()
-            .flat_map(|g| g.tabs.iter())
-            .find(|t| t.working_directory.as_deref() == Some(path))
-            .map(|t| t.terminal.clone());
-        if let Some(terminal) = open {
-            let task = task_message(number);
-            if terminal.read(cx).typed_since_submit() {
-                self.push_toast(
-                    ToastKind::Info,
-                    format!("#{number} waits for you to finish typing"),
-                    Some(format!("Send this in its tab: {task}").into()),
-                    cx,
-                );
-                return;
-            }
+        let task = task_message(number);
+        let tabs = self.tabs_at_handover(path, cx);
+        let idle = tabs.iter().find(|(_, at)| *at == TabAtHandover::IdleAgent);
+        if let Some((terminal, _)) = idle {
             terminal.update(cx, |term, _| {
                 let mut bytes = task.into_bytes();
                 bytes.push(b'\r');
                 term.write_input(bytes);
             });
+            return;
+        }
+        if tabs.iter().any(|(_, at)| *at == TabAtHandover::Busy) {
+            self.push_toast(
+                ToastKind::Info,
+                format!("#{number} waits for its tab"),
+                Some(format!("Something runs there now. When it's done, send: {task}").into()),
+                cx,
+            );
             return;
         }
         let before = self
@@ -647,6 +666,46 @@ impl AppShell {
         if let Some(focused) = focused {
             focused.focus(window);
         }
+    }
+
+    fn tabs_at_handover(
+        &self,
+        path: &Path,
+        cx: &Context<Self>,
+    ) -> Vec<(gpui::Entity<TerminalView>, TabAtHandover)> {
+        let wanted = path.to_string_lossy();
+        let on_path: Vec<_> = self
+            .groups
+            .iter()
+            .flat_map(|g| g.tabs.iter())
+            .filter(|t| t.remote_project_id.is_none())
+            .filter(|t| {
+                t.working_directory
+                    .as_deref()
+                    .is_some_and(|wd| paths_match(&wd.to_string_lossy(), &wanted))
+            })
+            .collect();
+        if on_path.is_empty() {
+            return Vec::new();
+        }
+        let table = process_tree::process_table();
+        let sessions = live_session::default_sessions_dir();
+        on_path
+            .into_iter()
+            .map(|tab| {
+                let terminal = tab.terminal.read(cx);
+                let pids = terminal
+                    .child_pid()
+                    .map(|shell| process_tree::descendants(shell, &table))
+                    .unwrap_or_default();
+                let claude = (tab.agent_id == Some(AgentId::Claude))
+                    .then_some(sessions.as_deref())
+                    .flatten()
+                    .and_then(|dir| live_session::process_for_pids(dir, &pids, &wanted));
+                let at = tab_at_handover(&pids, claude.as_ref(), terminal.typed_since_submit());
+                (tab.terminal.clone(), at)
+            })
+            .collect()
     }
 
     /// What each card on the board at `board_url` says about dispatch, by item id.
@@ -700,5 +759,31 @@ impl AppShell {
             );
         }
         notes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn claude(status: &str) -> LiveProcess {
+        LiveProcess {
+            pid: 7,
+            session_id: "s".into(),
+            cwd: "D:/wt".into(),
+            version: None,
+            status: Some(status.into()),
+        }
+    }
+
+    #[test]
+    fn only_an_idle_claude_gets_the_task_typed_and_a_bare_shell_is_no_session() {
+        let idle = claude("idle");
+        let busy = claude("busy");
+        assert_eq!(tab_at_handover(&[], None, false), TabAtHandover::Shell);
+        assert_eq!(tab_at_handover(&[7], Some(&idle), false), TabAtHandover::IdleAgent);
+        assert_eq!(tab_at_handover(&[7], Some(&idle), true), TabAtHandover::Busy);
+        assert_eq!(tab_at_handover(&[7], Some(&busy), false), TabAtHandover::Busy);
+        assert_eq!(tab_at_handover(&[9], None, false), TabAtHandover::Busy);
     }
 }
