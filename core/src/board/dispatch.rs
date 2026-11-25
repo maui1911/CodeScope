@@ -1,6 +1,7 @@
 //! Which board items to dispatch and what their agent gets: the rules of `docs/board-protocol.md`
 //! as pure functions, and the files a dispatch writes into its worktree.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -518,8 +519,8 @@ fn handover_rules(round: Round, number: u32, repository: &str) -> Vec<String> {
     }
 }
 
-/// `info/exclude` with the handover files added; `None` when it lists them already.
-pub fn exclude_with_handover_files(existing: &str) -> Option<String> {
+/// The text to append to `info/exclude` so it lists the handover files; `None` when it does.
+pub fn handover_exclude_lines(existing: &str) -> Option<String> {
     let missing: Vec<&str> = EXCLUDED_FILES
         .into_iter()
         .filter(|file| !existing.lines().any(|line| line.trim() == *file))
@@ -527,15 +528,15 @@ pub fn exclude_with_handover_files(existing: &str) -> Option<String> {
     if missing.is_empty() {
         return None;
     }
-    let mut next = existing.to_string();
-    if !next.is_empty() && !next.ends_with('\n') {
-        next.push('\n');
+    let mut lines = String::new();
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        lines.push('\n');
     }
     for file in missing {
-        next.push_str(file);
-        next.push('\n');
+        lines.push_str(file);
+        lines.push('\n');
     }
-    Some(next)
+    Some(lines)
 }
 
 /// Keep the handover files out of `git status` in every worktree of the repository.
@@ -553,13 +554,18 @@ pub fn exclude_handover_files(worktree: &Path) -> Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
     };
-    let Some(next) = exclude_with_handover_files(&existing) else {
+    let Some(lines) = handover_exclude_lines(&existing) else {
         return Ok(());
     };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    std::fs::write(&path, next).with_context(|| format!("write {}", path.display()))
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| file.write_all(lines.as_bytes()))
+        .with_context(|| format!("write {}", path.display()))
 }
 
 /// Write [`TASK_FILE`] into the worktree; refuses when the file or its folder is a link.
@@ -1173,15 +1179,33 @@ mod tests {
 
     #[test]
     fn excludes_the_handover_files_once() {
-        let first = exclude_with_handover_files("# git ls-files\n*.log").unwrap();
+        let existing = "# git ls-files\n*.log";
+        let added = handover_exclude_lines(existing).unwrap();
+        assert_eq!(added, "\n/.codescope/dispatch.md\n/.codescope/findings.md\n");
+        assert_eq!(handover_exclude_lines(&format!("{existing}{added}")), None);
         assert_eq!(
-            first,
-            "# git ls-files\n*.log\n/.codescope/dispatch.md\n/.codescope/findings.md\n"
+            handover_exclude_lines("/.codescope/dispatch.md\n").unwrap(),
+            "/.codescope/findings.md\n"
         );
-        assert_eq!(exclude_with_handover_files(&first), None);
         assert_eq!(
-            exclude_with_handover_files("").unwrap(),
+            handover_exclude_lines("").unwrap(),
             "/.codescope/dispatch.md\n/.codescope/findings.md\n"
+        );
+    }
+
+    #[test]
+    fn excluding_the_handover_files_keeps_the_lines_already_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git(repo, &["init", "--quiet"]);
+        let exclude = repo.join(".git").join("info").join("exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        std::fs::write(&exclude, "*.log").unwrap();
+        exclude_handover_files(repo).unwrap();
+        exclude_handover_files(repo).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&exclude).unwrap(),
+            "*.log\n/.codescope/dispatch.md\n/.codescope/findings.md\n"
         );
     }
 
