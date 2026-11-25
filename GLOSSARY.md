@@ -29,12 +29,16 @@ One entry on a board: an issue, a pull request, or on GitHub also a draft issue.
 _Avoid_: card, ticket, task, work item
 
 **Trigger column**:
-A column on a board that makes a dispatch start for an item a person moves into it.
+A column on a board that makes a dispatch, or its next round, start for an item a person moves into it.
 _Avoid_: watched column, automation column
 
 **Progress column**:
 A column on a board that only the tool working on an item moves it into, to show how far its dispatch is.
 _Avoid_: status column, state column
+
+**Tool**:
+Whatever starts agent sessions on a board for one person: CodeScope, a script, or the person working by hand.
+_Avoid_: client, integration, bot
 
 **Board protocol**:
 The rules that let several people and tools share one board: what each column is for, who works on an item, and how results are marked in comments.
@@ -47,11 +51,11 @@ The work on one board item for the person it is assigned to: one worktree on tha
 _Avoid_: assign, pick up, run, bot task
 
 **Phase**:
-One stage of a dispatch, either research or implementation, each ending in something posted on the host.
+One stage of a dispatch: research, which ends with the findings, or implementation, which ends when its pull request is merged or closed.
 _Avoid_: step, stage
 
 **Round**:
-One stretch of work in a dispatch that a single event starts and a single result ends: research, implementation, a review round or a repair.
+One stretch of work in a dispatch that a single event starts and a single result ends: the research round, the implementation round, a review round or a repair.
 _Avoid_: run, job, iteration
 
 **Research**:
@@ -59,15 +63,15 @@ The phase in which the agent works out the cause and an approach for an item, wi
 _Avoid_: triage, investigation, analysis
 
 **Findings**:
-The comment on the item's issue or pull request in which research records the cause, the approach and any decision points; the handover to implementation.
+The comment on the item's issue or pull request in which research records the cause, the approach and any decision points; the handover to the round that Ready starts.
 _Avoid_: report, research notes
 
 **Decision point**:
-A choice in the findings that the user makes before implementation, with lettered options and the agent's advice.
+A choice in the findings that the user makes before the item goes to Ready, with lettered options and the agent's advice.
 _Avoid_: question, open point
 
 **Implementation**:
-The phase in which the agent changes the code for an item and opens a pull request.
+The phase in which the agent changes the code for an item: its first round opens a pull request, and review rounds and repairs keep working on it.
 _Avoid_: build, fix
 
 **Review round**:

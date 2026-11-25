@@ -896,8 +896,8 @@ board, each with their own CodeScope or another tool that follows the
   (`origin` is often a fork, the issues live on `upstream`). When
   several projects match, the user picks once per board. A draft issue
   is not dispatched: it has no repository and no timeline that says
-  who moved it. It waits as *needs you* until the user converts it to
-  an issue and moves it again.
+  who moved it. It waits, with that reason on its card, until a person
+  converts it to an issue and moves it again.
 * **Columns.** Two trigger columns, *Research* and *Ready*, are queues
   the user fills. CodeScope moves an item out of the queue into a
   progress column when it starts: *Researching*, *Needs decision*,
@@ -910,13 +910,15 @@ board, each with their own CodeScope or another tool that follows the
   role that has no column yet; the user adds it on GitHub, because
   rewriting the options of the status field through the API can
   regenerate their ids.
-* **Writing rule.** CodeScope moves an item in two ways only: out of a
-  trigger column into the progress column of the round a person's
-  move started, and on from the progress column CodeScope moved it
-  into (*Researching* to *Needs decision*, *In progress* to
+* **Writing rule.** CodeScope moves an item on its own in two ways
+  only: out of a trigger column into the progress column of the round
+  a person's move started, and on from the progress column CodeScope
+  moved it into (*Researching* to *Needs decision*, *In progress* to
   *In review*), once per round. A person's move into a trigger column
   hands the item to CodeScope again; a move to any other column ends
-  CodeScope's moves for that round. An item GitHub has moved to *Done*
+  CodeScope's moves for that round. A move the user makes through
+  CodeScope, such as *Ready* in the needs-you dialog or *Ready for
+  review*, is the user's own move. An item GitHub has moved to *Done*
   is left alone. If a board has the older "Pull request linked to
   issue" workflow on, the board panel warns: it can move *In review*
   back to *In progress*, and CodeScope then leaves it there.
@@ -926,16 +928,15 @@ board, each with their own CodeScope or another tool that follows the
   item: on dispatch CodeScope assigns the issue to its user if nobody
   is, and it never dispatches an item assigned only to others. With
   several assignees, only the tool of the assignee who moved the item
-  starts; a move by anyone else waits as *needs you*. A person runs one
-  tool per board: two CodeScopes of the same person (on two computers,
-  or an installed and a dev build) would both take the same moves,
-  because GitHub shows both as that person. Another tool that only
-  acts on issues assigned to its own user can share the board without
-  further agreement. The [board protocol](board-protocol.md)
-  describes what a tool does to share a board: column roles, the
-  assignee, the comment marker (named after no tool), draft PR means
-  testing by hand, the linked branch. CodeScope reads the results of
-  any tool that writes that marker.
+  starts; a move by anyone else waits, with that reason on its card. A
+  person runs one tool per board: two CodeScopes of the same person (on
+  two computers, or an installed and a dev build) would both take the
+  same moves, because GitHub shows both as that person. Another tool
+  shares the board by following the same rules. The
+  [board protocol](board-protocol.md) describes what a tool does to
+  share a board: column roles, the assignee, the comment marker (named
+  after no tool), draft PR means testing by hand, the linked branch.
+  CodeScope reads the results of any tool that writes that marker.
 * **Who starts a dispatch.** An automatic dispatch on a person's
   CodeScope starts only when the issue's
   `ProjectV2ItemStatusChangedEvent` is not `wasAutomated` and either
@@ -944,9 +945,11 @@ board, each with their own CodeScope or another tool that follows the
   lead hands out work by assigning it and moving it to *Ready*). Only
   moves made after the board was added count: an item that already
   sits in a trigger column then waits until it is moved again.
-  Anything else waits in its column as *needs you*. A dispatch hands
-  issue text to an agent that can push and post as the user; a
-  workflow or an outsider must not be able to start one.
+  Anything else waits in its column with the reason on its card; it
+  *needs you* only when a choice of the user's is all that is missing,
+  such as which of several projects. A dispatch hands issue text to an
+  agent that can push and post as the user; a workflow or an outsider
+  must not be able to start one.
 * **One item, one worktree, two phases.** *Research* ends when the
   agent has written its findings to `.codescope/findings.md` in the
   worktree and the session is idle. CodeScope adds that file to
@@ -957,33 +960,44 @@ board, each with their own CodeScope or another tool that follows the
   marker and a closing *Next step* line, on the issue or, for a pull
   request item, on the PR. Open choices are *decision points* (B1, B2,
   …, each with lettered options and the agent's advice). Posted
-  findings move the item to *Needs decision*: the person answers the
+  findings move the item to *Needs decision*: the user answers the
   decision points, if there are any, and decides whether it goes to
-  *Ready*. *Implementation* ends when the agent's pull request is
-  open. Moving an item to *Ready* after research sends the
-  implementation skill into the same session, resumed if its tab was
-  closed. A new session starts in the same worktree from the findings
-  when the session is lost, or when the user chose a different CLI for
+  *Ready*. The *implementation* phase starts with the implementation
+  round, which ends when the agent's pull request is open, and goes on
+  through review rounds and repairs until the pull request is merged
+  or closed. Moving an item to *Ready* after research starts the next
+  round in the same session, resumed if its tab was closed. A new
+  session starts in the same worktree from the findings when the
+  session is lost, or when the user chose a different CLI for
   implementation.
-* **What a move starts.** A move into *Research* starts research, on
-  an issue or a pull request. A move into *Ready* starts the round
-  that fits the item:
-  * an issue without a pull request from this dispatch:
-    *implementation* (`implement`), which ends when the agent's pull
-    request is open;
-  * an issue whose pull request this dispatch opened, or an item that
-    is itself a pull request: a *review round* (`address-review`),
-    which ends when the agent has pushed and its session is idle.
+* **What a move starts.** A move into *Research* starts the research
+  round, on an issue or a pull request. A move into *Ready* starts the
+  round that fits the item:
+  * an issue without an open pull request: the *implementation round*
+    (`implement`), which ends when the agent's pull request is open;
+  * an issue whose open pull request this dispatch opened, or an item
+    that is itself a pull request: a *review round*
+    (`address-review`) on that pull request, which ends when the agent
+    has pushed and its session is idle;
+  * an issue with an open pull request from elsewhere: nothing starts,
+    and the item *needs you*, with that pull request on its card.
+
+  Both rounds move the item to *In progress* when they start, and on
+  to *In review* when they end with a ready pull request; with a draft
+  it stays in *In progress*. A round that stops without its result
+  (findings, a pull request, a push) leaves its session idle, and the
+  dispatch *needs you* until the user steers it in the tab.
 * **Answers.** The needs-you dialog shows decision points as choices
   with the advice selected. The answer is posted as a comment where
   the findings are ("B1 A, B2 B"), and the dialog can move the item to
   *Ready* afterwards. A comment there after the findings, by anyone
   with write access to the repository, is an answer too, so a designer
-  or a teammate can answer from GitHub. Answers reach the session with
-  the implementation task, which lists each one and who gave it. While
-  the item waits in *Needs decision* the session gets nothing, so it
-  does not start building before *Ready*. Comments by others are shown
-  and start nothing.
+  or a teammate can answer from GitHub. The findings and the answers
+  reach the session with the task of the round that *Ready* starts,
+  which lists each answer and who gave it. While the item waits in
+  *Needs decision* the session gets nothing, so it does not start
+  implementing before *Ready*. Comments by others are shown and start
+  nothing.
 * **Manual testing decides what comes after the PR.** When the agent
   could test everything automatically, it opens a ready pull request
   and the item moves to *In review*. When something needs testing by
@@ -1014,17 +1028,20 @@ board, each with their own CodeScope or another tool that follows the
   exists. A pull request item is worked on in a worktree on its own
   branch.
 * **Skills, not prompt files.** Each round (research, implementation,
-  review, repair) runs a skill, named per project and by default
+  review round, repair) runs a skill, named per project and by default
   `research`, `implement`, `address-review` and `repair`, in the open
   Agent Skills format (`SKILL.md`) that Claude Code, Codex, Gemini CLI,
   OpenCode and Copilot read. The agent finds it the way it finds any
   skill: in the worktree's repository skills, or in the user's
   personal skills for repositories that are not the user's to commit
   to. Without one, CodeScope's built-in prompt runs. A team shares how
-  it researches and builds through its skills, whichever tool starts
-  the session. CodeScope always appends its own handover rules (where
-  the findings go, the decision-point format, when to open a draft),
-  so a skill describes the work and cannot break the handover.
+  it researches and implements through its skills, whichever tool
+  starts the session. CodeScope always appends its own handover rules
+  (where the findings go, the decision-point format, when to open a
+  draft, `Closes #N` in the pull request, and no comments of the
+  agent's own on the issue or the pull request, because CodeScope
+  posts what a round produces), so a skill describes the work and
+  cannot break the handover.
   CodeScope sets no agent per phase: agent definitions in the
   repository (such as `.claude/agents/`) reach the session through the
   worktree, as skills do, so a skill can hand work to them. The CLI
@@ -1052,7 +1069,7 @@ board, each with their own CodeScope or another tool that follows the
   once (a setting); the rest wait in their trigger column. The existing OS
   toast (`idle_notifier`) and an entry in the in-app bell fire when
   findings are ready, when a dispatch *needs you*, and when a session
-  may be waiting on the user: idle without findings or PR, or in a
+  may be waiting on the user: idle without its round's result, or in a
   pending tool call for over three minutes without its transcript
   growing. `notify_rust` cannot route a click on a Windows toast, so
   the bell entry is what opens the tab. A permission prompt writes
@@ -1065,8 +1082,9 @@ board, each with their own CodeScope or another tool that follows the
   pull request must catch up with, CodeScope sends the repair skill
   into the session. A repair fixes only that and leaves review
   comments alone. At most two attempts in a row; a comment by someone
-  with write access starts the count again. The session stops and the dispatch *needs
-  you* when a conflict involves a functional choice, or when the
+  else with write access starts the count again. The session stops and
+  the dispatch *needs you* when a conflict involves a functional
+  choice, or when the
   failure does not come from its branch (the base is red too, a flaky
   test). Repairs run only while the pull request has no submitted
   review, because a push after a review invalidates approvals.
@@ -1074,46 +1092,46 @@ board, each with their own CodeScope or another tool that follows the
   tab, or to hand back by moving the item to *Ready*, which sends the
   review skill into the same session; it repairs whatever is red or
   conflicting as well. Until the first review is submitted, a
-  conversation comment on the agent's pull request by someone with
-  write access is sent into the session. After that, every comment
-  waits for *Ready*, because a push after a review invalidates
-  approvals.
+  conversation comment on the agent's pull request by someone else
+  with write access is sent into the session. After that, every
+  comment waits for *Ready*, because a push after a review invalidates
+  approvals. "Someone else" leaves out the user: the agent posts as
+  them, and they steer their own session in its tab.
 * **Cleanup.** Merged: worktree removed, session closed, history kept
   ([ADR-0015](#adr-0015--closed-session-retention-policy-100-per-worktree-90-day-ttl)).
   Closed without a PR: removed only when the worktree is clean and has
   no commits of its own, otherwise the row is marked. Moved by the
-  user to a column that is not a trigger column: nothing new starts
-  and nothing is removed; what the round already produced is still
-  posted. CodeScope never stops an agent that is working.
+  user to a column that is not a trigger column: no round starts,
+  nothing more is sent into the session and nothing is removed; what
+  the round already produced is still posted. CodeScope never stops an
+  agent that is working.
 * **GitHub first, other hosts behind one seam.** The first version
   supports GitHub through `gh` only. Board access (read a board, move
   an item, link an item to a branch) sits behind one seam that does
   not assume GitHub's *Done* workflow, linked branches, or a status
-  field with option ids. Gitea 28 and later has a REST API for project
-  boards at repository, organisation and user level
-  ([release notes](https://blog.gitea.com/release-of-28.0.0/)), with
-  plain columns and no linked branches, so the PR needs `Closes #N`.
+  field with option ids. Gitea 28 and later has a REST API for boards
+  at repository, organisation and user level
+  ([release notes](https://blog.gitea.com/release-of-28.0.0/)).
   Forgejo has no board API in a release yet. GitLab CE boards are
   label lists.
 
 **Consequences:**
 
 * CodeScope writes to GitHub for the first time: statuses, assignees,
-  linked branches, findings, answers to decision points, the comments
-  that report a pull request or a round that stopped, and marking a
-  draft ready with its reviewers. Pull requests and pushes come from
+  linked branches, findings, answers to decision points, the comment
+  that reports a pull request, and marking a draft ready with its
+  reviewers. Pull requests and pushes come from
   the agent, so implementation needs an agent that can run `gh`;
   research works with any agent that can write a file.
 * A repository's skills steer every dispatch on it, for everyone on
   the board, whichever tool starts the session.
-* Tools share a board safely as long as each respects the assignee.
-  Reading each other's findings needs the same marker, so working
-  together with another tool starts with agreeing on the board
-  protocol.
+* Tools share a board safely as long as each follows the board
+  protocol, so working together with another tool starts with
+  agreeing on it.
 * Linked branches are in public preview. If they change, the worktree
-  row still holds the link, and the PR needs `Closes #N`, which a
-  Gitea implementation needs anyway. Either way only a merge into the
-  default branch closes the issue.
+  row still holds the link, and the pull request says `Closes #N`
+  anyway, which a Gitea implementation needs too. Either way only a
+  merge into the default branch closes the issue.
 * Every added board costs one GraphQL call per 30 s for as long as the
   app runs.
 * The Bots inbox

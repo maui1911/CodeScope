@@ -49,10 +49,20 @@ uses these names.
    the progress column of the round a person's move starts, and on
    from the progress column the tool itself put it in, once per round.
    A person's move into a trigger column hands the item to the tool
-   again; a move anywhere else ends the tool's moves for that round.
+   again; a move anywhere else ends the tool's moves for that round. A
+   move a person makes through a tool is that person's own move.
 5. Leave an item alone once GitHub has moved it to Done.
 6. A draft issue waits for a person to convert it to an issue: it has
    no repository and no timeline that says who moved it.
+
+## Rounds
+
+A move into Research starts research. A move into Ready starts
+implementation on an issue without an open pull request, and a review
+round on the tool's own pull request or on a pull request item; an
+issue with an open pull request from elsewhere waits for a person.
+Implementation and review rounds move the item to In progress when
+they start, and to In review when they end with a ready pull request.
 
 ## Comments
 
@@ -67,11 +77,12 @@ A comment that carries a result ends with a marker on its own line:
 | `research` | `findings` | Cause and approach, no open choices; the item is in Needs decision and can go to Ready |
 | `research` | `decision-points` | Findings with open choices; the item is in Needs decision |
 | `implementation` | `pull-request` | The pull request is open, after implementation or again after a review round or a repair |
-| `implementation` | `needs-you` | The round stopped; a person decides |
 
 `phase` is `research` or `implementation`; a review round and a repair
 are rounds in implementation. The tool working on the item posts these
 comments, on its issue, or on the pull request when the item is one.
+An agent posts no comments of its own there: they would look like its
+person's.
 `by` names the tool, for example `codescope`; nothing depends on it.
 The line before the marker starts with `**Next step:**` and says what
 a person does next.
@@ -91,7 +102,7 @@ Findings use these headings, in this order:
 ```
 
 *Decision points* is left out when nothing is open. Each point is a
-third-level heading `### B1 <question>`, the context in a sentence or
+third-level heading `### B1 <choice>`, the context in a sentence or
 two, the options as a list starting with **A**, **B**, …, and a line
 `Advice: A, <reason>`.
 
@@ -100,7 +111,7 @@ free text. Free text alone is an answer too.
 
 ## Branches and pull requests
 
-- The branch is `<number>-<slug>`, linked to the issue
+- For an issue, the branch is `<number>-<slug>`, linked to the issue
   (`createLinkedBranch`), and the pull request says
   `Closes #<number>`. Only a merge into the default branch closes the
   issue: GitHub ignores both for a pull request into another branch,
@@ -112,12 +123,12 @@ free text. Free text alone is an answer too.
   review.
 - A tool pushes a repair (red check, merge conflict, base moved on)
   only while the pull request has no submitted review, at most twice
-  in a row; a comment by someone with write access starts the count
-  again.
+  in a row; a comment by someone other than the tool's person, with
+  write access, starts the count again.
 
 ## Skills
 
-How the team researches and builds lives in the repository as Agent
+How the team researches and implements lives in the repository as Agent
 Skills (`SKILL.md`), by default named `research`, `implement`,
 `address-review` and `repair`. Any tool can start a session with them;
 the format of the result is this protocol's, not the skill's. Agent
