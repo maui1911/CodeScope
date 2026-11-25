@@ -271,6 +271,8 @@ struct Tab {
     /// as "this tab's session". Mirrors the `since` arg of
     /// `ClaudeSessionDiscovery.Watch`.
     spawned_at: SystemTime,
+    /// The same moment on the monotonic clock, for how long ago it was.
+    spawned_instant: Instant,
     /// Adopted agent session id, set once the agent-specific discovery
     /// scan returns a fresh transcript / message dir / session dir for
     /// this tab. `None` until the agent has written its first
@@ -4568,6 +4570,7 @@ impl AppShell {
             terminal,
             working_directory: working_directory_for_tab,
             spawned_at: SystemTime::now(),
+            spawned_instant: Instant::now(),
             adopted_session_id,
             fired_session_ids: std::collections::HashSet::new(),
             adopted_by_guess: false,

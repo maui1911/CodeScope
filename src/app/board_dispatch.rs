@@ -884,7 +884,7 @@ impl AppShell {
                     live_session::process_for_pids(dir, running, &wanted)?.reports_idle()
                 });
                 let relaunched = self.claude_updates.relaunched_at(tab.id);
-                let launched_lately = tab.spawned_at.elapsed().is_ok_and(|age| age < LAUNCH_GRACE)
+                let launched_lately = tab.spawned_instant.elapsed() < LAUNCH_GRACE
                     || relaunched.is_some_and(|at| at.elapsed() < LAUNCH_GRACE);
                 tab_at_handover(&TabProbe {
                     restarting: self.claude_updates.is_restarting(tab.id),
