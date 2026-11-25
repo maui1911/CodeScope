@@ -54,12 +54,12 @@ pub enum Round {
 }
 
 impl Round {
-    /// The round a move into `role` starts, given the round the item's worktree ran last.
-    pub fn after_move(role: ColumnRole, last: Option<Round>) -> Option<Round> {
-        match (role, last) {
-            (ColumnRole::Research, _) => Some(Round::Research),
-            (ColumnRole::Ready, Some(Round::Implementation | Round::Review)) => Some(Round::Review),
-            (ColumnRole::Ready, _) => Some(Round::Implementation),
+    /// The round a move into `role` starts. Ready starts implementation until the round's pull
+    /// request is known, which a review round needs.
+    pub fn after_move(role: ColumnRole) -> Option<Round> {
+        match role {
+            ColumnRole::Research => Some(Round::Research),
+            ColumnRole::Ready => Some(Round::Implementation),
             _ => None,
         }
     }
@@ -198,7 +198,7 @@ pub fn decide(
     facts: &Facts,
 ) -> Option<Result<Round, Hold>> {
     let role = board.role_of(item, mapping)?;
-    let round = Round::after_move(role, facts.dispatch.map(|d| d.round))?;
+    let round = Round::after_move(role)?;
     Some(check(board, mapping, item, facts, round).map(|()| round))
 }
 
@@ -764,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_after_research_implements_and_after_implementation_reviews() {
+    fn ready_implements_until_a_pull_request_is_known() {
         let change = moved_by(VIEWER, "Ready");
         let researched = dispatch(Round::Research, "2026-11-25T09:30:00Z");
         let implemented = dispatch(Round::Implementation, "2026-11-25T09:30:00Z");
@@ -782,7 +782,7 @@ mod tests {
         );
         assert_eq!(
             run_decide(issue_in("y"), &after_implementation),
-            Some(Ok(Round::Review))
+            Some(Ok(Round::Implementation))
         );
     }
 
