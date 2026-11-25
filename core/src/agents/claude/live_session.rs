@@ -66,6 +66,11 @@ impl LiveProcess {
     pub fn is_idle(&self) -> bool {
         self.status.as_deref() == Some("idle")
     }
+
+    /// Whether it waits for a prompt, or `None` from a build that reports no status at all.
+    pub fn reports_idle(&self) -> Option<bool> {
+        self.status.as_deref().map(|status| status == "idle")
+    }
 }
 
 /// Like [`session_for_pids`], with the process's version and status.
@@ -183,6 +188,8 @@ mod tests {
         let old = process_for_pids(dir.path(), &[14], "C:/repo").unwrap();
         assert!(!old.is_idle());
         assert_eq!(old.version, None);
+        assert_eq!(busy.reports_idle(), Some(false));
+        assert_eq!(old.reports_idle(), None, "it says nothing either way");
     }
 
     #[test]

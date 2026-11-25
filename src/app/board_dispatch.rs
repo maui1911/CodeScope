@@ -868,7 +868,7 @@ impl AppShell {
                 let running = running_under(terminal.child_pid(), &table);
                 let claude_idle = running.as_deref().and_then(|running| {
                     let dir = sessions.as_deref()?;
-                    live_session::process_for_pids(dir, running, &wanted).map(|l| l.is_idle())
+                    live_session::process_for_pids(dir, running, &wanted)?.reports_idle()
                 });
                 tab_at_handover(&TabProbe {
                     restarting: self.claude_updates.is_restarting(tab.id),
