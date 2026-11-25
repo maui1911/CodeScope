@@ -107,4 +107,6 @@ free text. Free text alone is an answer too.
 How the team researches and builds lives in the repository as Agent
 Skills (`SKILL.md`), by default named `research`, `implement`,
 `address-review` and `repair`. Any tool can start a session with them;
-the format of the result is this protocol's, not the skill's.
+the format of the result is this protocol's, not the skill's. Agent
+definitions in the repository come along the same way, so a skill can
+hand work to them.

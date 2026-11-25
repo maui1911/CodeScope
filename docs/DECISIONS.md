@@ -987,11 +987,12 @@ board, each with their own CodeScope or another tool that follows the
   it researches and builds through its skills, whichever tool starts
   the session. CodeScope always appends its own handover rules (where
   the findings go, the decision-point format, when to open a draft),
-  so a skill describes the work and cannot break the handover. A phase
-  can also name an agent definition: Claude Code then runs the session
-  as that agent (`--agent`), with its own prompt, tools and model;
-  other CLIs ignore it. The CLI per phase stays local, because it
-  depends on what the user has installed.
+  so a skill describes the work and cannot break the handover.
+  CodeScope sets no agent per phase: agent definitions in the
+  repository (such as `.claude/agents/`) reach the session through the
+  worktree, as skills do, so a skill can hand work to them. The CLI
+  per phase stays local, because it depends on what the user has
+  installed.
 * **Setup command.** A new worktree runs `.codescope/setup` from the
   repository's default branch in the project folder, else the one in
   `projects.json`, else nothing.
