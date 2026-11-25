@@ -1,7 +1,8 @@
 //! Dispatch (ADR-0027): after each board read, start a round for every item the user moved
 //! into a trigger column, in a worktree of its own with an agent session on it. When a research
 //! round's session is idle with its findings written, post them on the issue, then read the
-//! answers to its decision points and hand them to the implementation round.
+//! answers to its decision points and hand them to the implementation round. Watch that round's
+//! pull request, report it on the issue and move the item to In review when it is ready.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -24,17 +25,23 @@ use codescope_core::board::findings::{
     problems_message, read_findings,
 };
 use codescope_core::board::github::{self, Viewer};
+use codescope_core::board::pull_request::{
+    Checks, PostedPullRequest, PullRequest, PullRequestState, moves_to_in_review,
+    pull_request_comment, round_pull_request,
+};
 use codescope_core::board::{
     Board, BoardItem, BoardRef, ColumnMapping, ColumnRole, effective_mapping, mapped_column,
 };
 use codescope_core::path_canon::paths_match;
 use codescope_core::process_tree;
+use codescope_core::{SessionState, TelemetrySnapshot};
 use codescope_core::projects::{ProjectKind, ProjectsConfig};
 use codescope_core::worktree_create::{PendingId, record_dispatch, record_posted_findings};
 use codescope_terminal::TerminalView;
 use gpui::{App, AppContext as _, Context, Entity, SharedString, Window};
 
 use super::{AppShell, ToastKind};
+use crate::notifications::NotificationKind;
 
 const REMOTES_MAX_AGE: Duration = Duration::from_secs(300);
 const VIEWER_MAX_AGE: Duration = Duration::from_secs(300);
@@ -45,6 +52,7 @@ const SUBMIT_AFTER_TYPING: Duration = Duration::from_millis(200);
 const LAUNCH_GRACE: Duration = Duration::from_secs(30);
 const MAX_REMINDERS: u32 = 3;
 const POST_RETRY: Duration = Duration::from_secs(120);
+const PULL_REQUEST_READ_EVERY: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 pub(crate) struct DispatchState {
@@ -73,6 +81,92 @@ pub(crate) struct DispatchState {
     discussions: HashMap<String, Discussion>,
     /// Items the Decide dialog moved to Ready, until their implementation round starts.
     readied: HashSet<String>,
+    /// Item id → the pull request and session of its implementation round.
+    watches: HashMap<String, PullRequestWatch>,
+}
+
+/// What the board poll knows about an implementation round's pull request and session.
+#[derive(Default)]
+struct PullRequestWatch {
+    reading: bool,
+    /// When the last read started, whether it worked or not.
+    read_at: Option<Instant>,
+    /// When the last read that worked started.
+    read_ok_at: Option<Instant>,
+    /// What the last read that worked found.
+    pull_request: Option<PullRequest>,
+    /// Whether the session worked since CodeScope started watching it.
+    busy_seen: bool,
+    /// How many prompts the session had at the last look.
+    turns: Option<u32>,
+    /// When the session last stopped; `None` while it works or has no tab.
+    idle_since: Option<Instant>,
+    /// The stop the bell rang for.
+    rang_for: Option<Instant>,
+    reporting: bool,
+    /// Reported on the issue but not saved to `projects.json`.
+    reported: Option<PostedPullRequest>,
+    report_error: Option<(Instant, String)>,
+    moving: bool,
+    move_error: Option<(Instant, String)>,
+    marking_ready: bool,
+}
+
+impl PullRequestWatch {
+    fn track(&mut self, session: Option<(SessionState, u32)>) {
+        let Some((state, turns)) = session else {
+            self.idle_since = None;
+            return;
+        };
+        let new_turn = self.turns.is_some_and(|seen| turns > seen);
+        self.turns = Some(turns);
+        match state {
+            SessionState::Busy | SessionState::PendingToolUse => {
+                self.busy_seen = true;
+                self.idle_since = None;
+            }
+            SessionState::Idle if new_turn => {
+                self.busy_seen = true;
+                self.idle_since = Some(Instant::now());
+            }
+            SessionState::Idle => {
+                self.idle_since.get_or_insert_with(Instant::now);
+            }
+            SessionState::Unknown => self.idle_since = None,
+        }
+    }
+
+    /// Every 30 s while the item is in In progress or In review or its pull request is open, and
+    /// right after the session stops.
+    fn read_due(&self, role: Option<ColumnRole>) -> bool {
+        let open = self
+            .pull_request
+            .as_ref()
+            .is_some_and(|pr| pr.state == PullRequestState::Open);
+        let watched = open || matches!(role, Some(ColumnRole::InProgress | ColumnRole::InReview));
+        if self.reading || !watched {
+            return false;
+        }
+        let Some(read_at) = self.read_at else {
+            return true;
+        };
+        read_at.elapsed() >= PULL_REQUEST_READ_EVERY
+            || self.idle_since.is_some_and(|idle| read_at < idle)
+    }
+
+    /// The session worked and stopped, and a read since then found no pull request.
+    fn waits_for_you(&self) -> bool {
+        self.busy_seen
+            && self.pull_request.is_none()
+            && self
+                .idle_since
+                .zip(self.read_ok_at)
+                .is_some_and(|(idle, read)| read > idle)
+    }
+}
+
+fn retry_due(error: &Option<(Instant, String)>) -> bool {
+    error.as_ref().is_none_or(|(at, _)| at.elapsed() >= POST_RETRY)
 }
 
 /// A round: the board item's id and when the move that started the round was made.
@@ -209,6 +303,7 @@ impl CardNote {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CardAction {
     Decide,
+    ReadyForReview,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1105,29 +1200,12 @@ impl AppShell {
                 return None;
             }
         };
-        let path = job.path.to_string_lossy().into_owned();
-        let saved = ProjectsConfig::load(&self.paths)
-            .map_err(|err| format!("{err:#}"))
-            .and_then(|mut next| {
-                let project_id = &launch.project_id;
-                if !record_dispatch(&mut next, project_id, &path, &job.branch, record.clone()) {
-                    return Err("the project no longer tracks the worktree".to_string());
-                }
-                next.save(&self.paths).map_err(|err| format!("{err:#}"))?;
-                Ok(next)
-            });
-        let next = match saved {
-            Ok(next) => next,
-            Err(message) => {
-                self.fail_dispatch(&record.item_id, record.number, &record.trigger_at, message, cx);
-                return None;
-            }
-        };
-        self.projects = next.clone();
-        self.sidebar.update(cx, |sidebar, cx| {
-            sidebar.replace_projects(next);
-            cx.notify();
-        });
+        let saved =
+            self.save_record(&launch.project_id, &job.path, &job.branch, record.clone(), cx);
+        if let Err(message) = saved {
+            self.fail_dispatch(&record.item_id, record.number, &record.trigger_at, message, cx);
+            return None;
+        }
         self.board.dispatch.starting.remove(&record.item_id);
         self.hand_over(&job.path, terminal, launch, record.number, window, cx);
         cx.notify();
@@ -1354,6 +1432,13 @@ impl AppShell {
         snapshot.map_or(Turn::Unknown, |snap| turn_of(snap.state, snap.quiet_timeout))
     }
 
+    fn telemetry_at(&self, path: &Path) -> Option<TelemetrySnapshot> {
+        let mut sessions = self.tabs_on(path).into_iter().filter_map(|tab| {
+            tab.adopted_session_id.as_deref().and_then(|sid| self.telemetry_for(sid))
+        });
+        sessions.next()
+    }
+
     fn tab_title_at(&self, path: &Path) -> Option<SharedString> {
         self.tabs_on(path).first().map(|tab| tab.title.clone())
     }
@@ -1534,13 +1619,377 @@ impl AppShell {
             ToastKind::Ok
         };
         self.push_toast(kind, title.clone(), Some(detail.clone().into()), cx);
-        self.push_notification(
-            crate::notifications::NotificationKind::SessionReady,
-            title,
-            detail,
-            self.tab_title_at(&path),
-            cx,
-        );
+        let tab_title = self.tab_title_at(&path);
+        self.push_notification(NotificationKind::SessionReady, title, detail, tab_title, cx);
+        cx.notify();
+    }
+
+    /// Keep `record` on its worktree row in `projects.json`, read fresh so changes made since
+    /// stay.
+    fn save_record(
+        &mut self,
+        project_id: &str,
+        path: &Path,
+        branch: &str,
+        record: WorktreeDispatch,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let path = path.to_string_lossy();
+        let mut next = ProjectsConfig::load(&self.paths).map_err(|err| format!("{err:#}"))?;
+        if !record_dispatch(&mut next, project_id, &path, branch, record) {
+            return Err("the project no longer tracks the worktree".to_string());
+        }
+        next.save(&self.paths).map_err(|err| format!("{err:#}"))?;
+        self.projects = next.clone();
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.replace_projects(next);
+            cx.notify();
+        });
+        Ok(())
+    }
+
+    fn dispatch_record(
+        &self,
+        item_id: &str,
+        cx: &App,
+    ) -> Option<(String, PathBuf, Option<String>, WorktreeDispatch)> {
+        self.dispatch_records(cx)
+            .into_iter()
+            .find(|(_, _, _, r)| r.item_id == item_id)
+    }
+
+    fn board_and_mapping(&self, board_url: &str) -> Option<(&Board, ColumnMapping)> {
+        let board = self.board.reads_by_url.get(board_url)?.last_good.as_ref()?;
+        let settings = self.settings.boards.iter().find(|b| b.url == board_url)?;
+        Some((board, effective_mapping(board, &settings.columns)))
+    }
+
+    /// The role of the column `item_id` is in, on the last good read of `board_url`.
+    fn item_role(&self, board_url: &str, item_id: &str) -> Option<ColumnRole> {
+        let (board, mapping) = self.board_and_mapping(board_url)?;
+        let item = board.items.iter().find(|item| item.id == item_id)?;
+        board.role_of(item, &mapping)
+    }
+
+    /// The board at `board_url` and the id of its column with `role`, to move an item into.
+    fn column_target(&self, board_url: &str, role: ColumnRole) -> Option<(Board, String)> {
+        let (board, mapping) = self.board_and_mapping(board_url)?;
+        let column = mapped_column(board, &mapping, role)?;
+        Some((board.clone(), column.id.clone()))
+    }
+
+    /// Watch the pull request of every implementation round: read it, report it on the issue
+    /// once, move the item to In review once it is ready, and ring the bell when the session
+    /// stopped without one.
+    pub(crate) fn watch_pull_requests(&mut self, cx: &mut Context<Self>) {
+        let records: Vec<_> = self
+            .dispatch_records(cx)
+            .into_iter()
+            .filter(|(_, _, _, r)| r.round == Round::Implementation)
+            .collect();
+        self.board
+            .dispatch
+            .watches
+            .retain(|id, _| records.iter().any(|(_, _, _, r)| r.item_id == *id));
+        for (_, path, branch, record) in records {
+            let Some(branch) = branch else {
+                continue;
+            };
+            let role = self.item_role(&record.board_url, &record.item_id);
+            let session = self
+                .telemetry_at(&path)
+                .map(|snapshot| (super::notified_state(&snapshot), snapshot.turn_count));
+            let watch = self
+                .board
+                .dispatch
+                .watches
+                .entry(record.item_id.clone())
+                .or_default();
+            watch.track(session);
+            let read = watch.read_due(role);
+            watch.reading |= read;
+            let posted = record.pull_request.as_ref().or(watch.reported.as_ref());
+            let found = watch
+                .pull_request
+                .clone()
+                .filter(|pr| pr.state == PullRequestState::Open);
+            let report = found
+                .clone()
+                .filter(|_| posted.is_none() && !watch.reporting && retry_due(&watch.report_error));
+            let move_it = posted.is_some_and(|p| !p.in_review)
+                && found.is_some_and(|pr| moves_to_in_review(&pr, role))
+                && !watch.moving
+                && retry_due(&watch.move_error);
+            watch.moving |= move_it;
+            let ring = watch.waits_for_you() && watch.rang_for != watch.idle_since;
+            if ring {
+                watch.rang_for = watch.idle_since;
+            }
+            if read {
+                self.read_pull_request(&record, branch, cx);
+            }
+            if let Some(pr) = report {
+                self.report_pull_request(&record, pr, cx);
+            }
+            if move_it {
+                self.move_to_in_review(&record, cx);
+            }
+            if ring {
+                let tab_title = self.tab_title_at(&path);
+                self.push_notification(
+                    NotificationKind::SessionWaiting,
+                    format!("#{} waits for you", record.number),
+                    "Implementation stopped without a pull request.",
+                    tab_title,
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn read_pull_request(
+        &mut self,
+        record: &WorktreeDispatch,
+        branch: String,
+        cx: &mut Context<Self>,
+    ) {
+        let item_id = record.item_id.clone();
+        let repository = record.repository.clone();
+        let started = Instant::now();
+        cx.spawn(async move |this, cx| {
+            let (branch, result) = cx
+                .background_spawn(async move {
+                    let found = github::fetch_pull_requests(&repository, &branch);
+                    (branch, found.map(round_pull_request))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(watch) = this.board.dispatch.watches.get_mut(&item_id) else {
+                    return;
+                };
+                watch.reading = false;
+                watch.read_at = Some(started);
+                match result {
+                    Ok(found) => {
+                        watch.pull_request = found;
+                        watch.read_ok_at = Some(started);
+                    }
+                    Err(err) => {
+                        eprintln!("warning: couldn't read the pull request on {branch}: {err:#}")
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn report_pull_request(
+        &mut self,
+        record: &WorktreeDispatch,
+        pr: PullRequest,
+        cx: &mut Context<Self>,
+    ) {
+        let item_id = record.item_id.clone();
+        let content_id = record.content_id.clone();
+        let body = pull_request_comment(&pr);
+        if let Some(watch) = self.board.dispatch.watches.get_mut(&item_id) {
+            watch.reporting = true;
+            watch.report_error = None;
+        }
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    github::add_comment(&content_id, &body).map_err(|err| format!("{err:#}"))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| this.finish_report(&item_id, pr, result, cx));
+        })
+        .detach();
+    }
+
+    fn finish_report(
+        &mut self,
+        item_id: &str,
+        pr: PullRequest,
+        result: Result<String, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(watch) = self.board.dispatch.watches.get_mut(item_id) else {
+            return;
+        };
+        watch.reporting = false;
+        let comment_url = match result {
+            Ok(url) => url,
+            Err(message) => {
+                watch.report_error = Some((Instant::now(), message.clone()));
+                let title = format!("Couldn't report PR #{} on the issue", pr.number);
+                self.push_toast(ToastKind::Err, title, Some(message.into()), cx);
+                return;
+            }
+        };
+        let posted = PostedPullRequest {
+            number: pr.number,
+            url: pr.url.clone(),
+            comment_url,
+            in_review: false,
+        };
+        self.keep_posted(item_id, posted, cx);
+        let Some((_, path, _, record)) = self.dispatch_record(item_id, cx) else {
+            return;
+        };
+        let (kind, toast, title, detail) = if pr.is_draft {
+            (
+                NotificationKind::SessionWaiting,
+                ToastKind::Info,
+                format!("Draft PR #{} for #{}", pr.number, record.number),
+                "Test it by hand, then mark it ready for review.".to_string(),
+            )
+        } else {
+            (
+                NotificationKind::SessionReady,
+                ToastKind::Ok,
+                format!("PR #{} for #{}", pr.number, record.number),
+                record.title.clone(),
+            )
+        };
+        self.push_toast(toast, title.clone(), Some(detail.clone().into()), cx);
+        let tab_title = self.tab_title_at(&path);
+        self.push_notification(kind, title, detail, tab_title, cx);
+        cx.notify();
+    }
+
+    /// Save the reported pull request on its record; it stays in memory when that fails.
+    fn keep_posted(&mut self, item_id: &str, posted: PostedPullRequest, cx: &mut Context<Self>) {
+        let saved = match self.dispatch_record(item_id, cx) {
+            Some((project_id, path, branch, mut record)) => {
+                record.pull_request = Some(posted.clone());
+                let branch = branch.unwrap_or_default();
+                self.save_record(&project_id, &path, &branch, record, cx)
+            }
+            None => Err("the worktree is gone".to_string()),
+        };
+        if let Err(err) = &saved {
+            eprintln!("warning: couldn't record the pull request: {err}");
+        }
+        if let Some(watch) = self.board.dispatch.watches.get_mut(item_id) {
+            watch.reported = saved.is_err().then_some(posted);
+        }
+    }
+
+    fn move_to_in_review(&mut self, record: &WorktreeDispatch, cx: &mut Context<Self>) {
+        let item_id = record.item_id.clone();
+        let Some((board, column)) = self.column_target(&record.board_url, ColumnRole::InReview)
+        else {
+            if let Some(watch) = self.board.dispatch.watches.get_mut(&item_id) {
+                watch.moving = false;
+            }
+            return;
+        };
+        let number = record.number;
+        cx.spawn(async move |this, cx| {
+            let moved_id = item_id.clone();
+            let result = cx
+                .background_spawn(async move {
+                    github::set_status(&board, &moved_id, &column).map_err(|err| format!("{err:#}"))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| this.finish_move(&item_id, number, result, cx));
+        })
+        .detach();
+    }
+
+    fn finish_move(
+        &mut self,
+        item_id: &str,
+        number: u32,
+        result: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(watch) = self.board.dispatch.watches.get_mut(item_id) else {
+            return;
+        };
+        watch.moving = false;
+        if let Err(message) = result {
+            watch.move_error = Some((Instant::now(), message.clone()));
+            let title = format!("Couldn't move #{number} to In review");
+            self.push_toast(ToastKind::Err, title, Some(message.into()), cx);
+            return;
+        }
+        watch.move_error = None;
+        let reported = watch.reported.clone();
+        let posted = self
+            .dispatch_record(item_id, cx)
+            .and_then(|(_, _, _, record)| record.pull_request)
+            .or(reported);
+        if let Some(posted) = posted {
+            self.keep_posted(item_id, PostedPullRequest { in_review: true, ..posted }, cx);
+        }
+        self.refresh_boards(cx);
+        cx.notify();
+    }
+
+    /// Mark the draft pull request of `item_id` ready for review; the next watch moves the item
+    /// to In review.
+    pub(crate) fn ready_for_review(&mut self, item_id: &str, cx: &mut Context<Self>) {
+        let Some(watch) = self.board.dispatch.watches.get_mut(item_id) else {
+            return;
+        };
+        let draft = watch
+            .pull_request
+            .clone()
+            .filter(|pr| pr.is_draft && pr.state == PullRequestState::Open);
+        let Some(pr) = draft.filter(|_| !watch.marking_ready) else {
+            return;
+        };
+        watch.marking_ready = true;
+        cx.notify();
+        let item_id = item_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let id = pr.id.clone();
+            let result = cx
+                .background_spawn(async move {
+                    github::mark_ready_for_review(&id).map_err(|err| format!("{err:#}"))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.finish_ready_for_review(&item_id, pr, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_ready_for_review(
+        &mut self,
+        item_id: &str,
+        pr: PullRequest,
+        result: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(watch) = self.board.dispatch.watches.get_mut(item_id) else {
+            return;
+        };
+        watch.marking_ready = false;
+        if let Err(message) = result {
+            let title = format!("Couldn't mark PR #{} ready for review", pr.number);
+            self.push_toast(ToastKind::Err, title, Some(message.into()), cx);
+            return;
+        }
+        let ready = PullRequest {
+            is_draft: false,
+            ..pr
+        };
+        watch.pull_request = Some(ready.clone());
+        let role = self
+            .dispatch_record(item_id, cx)
+            .and_then(|(_, _, _, r)| self.item_role(&r.board_url, item_id));
+        let detail = moves_to_in_review(&ready, role)
+            .then(|| SharedString::from("It moves to In review."));
+        let title = format!("PR #{} is ready for review", ready.number);
+        self.push_toast(ToastKind::Ok, title, detail, cx);
+        self.watch_pull_requests(cx);
+        cx.notify();
     }
 
     /// What each card on the board at `board_url` says about dispatch, by item id.
@@ -1572,7 +2021,15 @@ impl AppShell {
                     ),
                     (None, None) => CardNote::new(r.round.label(), NoteTone::Working),
                 };
-                (r.item_id, note)
+                let watched = state
+                    .watches
+                    .get(&r.item_id)
+                    .filter(|_| r.round == Round::Implementation)
+                    .and_then(|watch| {
+                        let posted = r.pull_request.as_ref().or(watch.reported.as_ref());
+                        pull_request_note(watch, posted)
+                    });
+                (r.item_id, watched.unwrap_or(note))
             })
             .collect();
         for key in state.posting.iter().filter(|key| rounds.contains(*key)) {
@@ -1688,15 +2145,10 @@ impl AppShell {
 
     /// The board and Ready column to move `item_id` to, while it is in Needs decision.
     fn ready_target(&self, board_url: &str, item_id: &str) -> Option<(Board, String)> {
-        let board = self.board.reads_by_url.get(board_url)?.last_good.as_ref()?;
-        let settings = self.settings.boards.iter().find(|b| b.url == board_url)?;
-        let mapping = effective_mapping(board, &settings.columns);
-        let item = board.items.iter().find(|item| item.id == item_id)?;
-        if board.role_of(item, &mapping) != Some(ColumnRole::NeedsDecision) {
+        if self.item_role(board_url, item_id) != Some(ColumnRole::NeedsDecision) {
             return None;
         }
-        let column = mapped_column(board, &mapping, ColumnRole::Ready)?;
-        Some((board.clone(), column.id.clone()))
+        self.column_target(board_url, ColumnRole::Ready)
     }
 
     fn finish_answer(
@@ -1795,6 +2247,58 @@ fn decision_note(discussion: Option<&Discussion>, viewer: Option<&str>, readied:
     } else {
         CardNote::new(format!("{answered} · move it to Ready"), NoteTone::NeedsYou)
     }
+}
+
+/// The card line of an implementation round when its pull request or session has something to
+/// say; `None` leaves the round's own line.
+fn pull_request_note(
+    watch: &PullRequestWatch,
+    posted: Option<&PostedPullRequest>,
+) -> Option<CardNote> {
+    if watch.reporting {
+        return Some(CardNote::new("Reporting the pull request…", NoteTone::Working));
+    }
+    if let Some((_, message)) = &watch.report_error {
+        let text = format!("Couldn't report the pull request: {message}");
+        return Some(CardNote::new(text, NoteTone::Failed));
+    }
+    if let Some((_, message)) = &watch.move_error {
+        let text = format!("Couldn't move it to In review: {message}");
+        return Some(CardNote::new(text, NoteTone::Failed));
+    }
+    let Some(pr) = &watch.pull_request else {
+        if watch.waits_for_you() {
+            return Some(CardNote::new("Waiting for you in the tab", NoteTone::NeedsYou));
+        }
+        let unread = watch.read_ok_at.is_none();
+        return posted
+            .filter(|_| unread)
+            .map(|p| CardNote::new(format!("PR #{}", p.number), NoteTone::Waiting));
+    };
+    let number = pr.number;
+    Some(match (pr.state, pr.is_draft) {
+        (PullRequestState::Merged, _) => {
+            CardNote::new(format!("PR #{number} merged"), NoteTone::Waiting)
+        }
+        (PullRequestState::Open, true) if watch.marking_ready => CardNote::new(
+            format!("Marking PR #{number} ready for review…"),
+            NoteTone::Working,
+        ),
+        (PullRequestState::Open, true) => CardNote {
+            text: format!("Draft PR #{number} · test by hand").into(),
+            tone: NoteTone::NeedsYou,
+            action: Some(CardAction::ReadyForReview),
+        },
+        (PullRequestState::Open, false) => {
+            let (checks, tone) = match pr.checks {
+                Checks::None => ("no checks", NoteTone::Waiting),
+                Checks::Running => ("checks running", NoteTone::Waiting),
+                Checks::Passing => ("checks passing", NoteTone::Waiting),
+                Checks::Failing => ("checks failing", NoteTone::Failed),
+            };
+            CardNote::new(format!("PR #{number} · {checks}"), tone)
+        }
+    })
 }
 
 #[cfg(test)]
@@ -2049,5 +2553,102 @@ mod tests {
         discussion.answers.push(answer("sanne", &[]));
         let theirs = decision_note(Some(&discussion), Some("maui1911"), false);
         assert_eq!(theirs.text.as_ref(), "Answered by @sanne: B1 B, B2 A · move it to Ready");
+    }
+
+    fn open_pull_request(number: u32, is_draft: bool, checks: Checks) -> PullRequest {
+        PullRequest {
+            id: format!("PR_{number}"),
+            number,
+            url: format!("https://github.com/maui1911/CodeScope/pull/{number}"),
+            state: PullRequestState::Open,
+            is_draft,
+            checks,
+        }
+    }
+
+    fn posted(number: u32) -> PostedPullRequest {
+        PostedPullRequest {
+            number,
+            url: "u".into(),
+            comment_url: "c".into(),
+            in_review: false,
+        }
+    }
+
+    #[test]
+    fn a_draft_needs_testing_by_hand_and_offers_ready_for_review() {
+        let watch = PullRequestWatch {
+            pull_request: Some(open_pull_request(415, true, Checks::Running)),
+            read_ok_at: Some(Instant::now()),
+            ..PullRequestWatch::default()
+        };
+        let note = pull_request_note(&watch, Some(&posted(415))).unwrap();
+        assert_eq!(note.text.as_ref(), "Draft PR #415 · test by hand");
+        assert!(note.tone == NoteTone::NeedsYou);
+        assert!(note.action == Some(CardAction::ReadyForReview));
+    }
+
+    #[test]
+    fn a_ready_pull_request_shows_its_checks_and_red_ones_as_failed() {
+        let mut watch = PullRequestWatch {
+            pull_request: Some(open_pull_request(415, false, Checks::Passing)),
+            read_ok_at: Some(Instant::now()),
+            ..PullRequestWatch::default()
+        };
+        let note = pull_request_note(&watch, Some(&posted(415))).unwrap();
+        assert_eq!(note.text.as_ref(), "PR #415 · checks passing");
+        assert!(note.tone == NoteTone::Waiting && note.action.is_none());
+        watch.pull_request = Some(open_pull_request(415, false, Checks::Failing));
+        let note = pull_request_note(&watch, Some(&posted(415))).unwrap();
+        assert_eq!(note.text.as_ref(), "PR #415 · checks failing");
+        assert!(note.tone == NoteTone::Failed);
+    }
+
+    #[test]
+    fn a_session_that_worked_and_stopped_without_a_pull_request_waits_for_you() {
+        let mut watch = PullRequestWatch::default();
+        watch.track(Some((SessionState::Idle, 3)));
+        watch.read_ok_at = Some(Instant::now());
+        assert!(!watch.waits_for_you(), "it never worked while watched");
+        watch.track(Some((SessionState::Busy, 4)));
+        watch.track(Some((SessionState::Idle, 4)));
+        let stopped = watch.idle_since.unwrap();
+        watch.read_ok_at = Some(stopped - Duration::from_millis(1));
+        assert!(!watch.waits_for_you(), "no read since it stopped");
+        watch.read_ok_at = Some(stopped + Duration::from_millis(1));
+        assert!(watch.waits_for_you());
+        let note = pull_request_note(&watch, None).unwrap();
+        assert_eq!(note.text.as_ref(), "Waiting for you in the tab");
+        assert!(note.tone == NoteTone::NeedsYou);
+        watch.track(None);
+        assert!(!watch.waits_for_you(), "the tab is closed");
+    }
+
+    #[test]
+    fn a_stop_reads_the_pull_request_again_at_once() {
+        let mut watch = PullRequestWatch::default();
+        assert!(watch.read_due(Some(ColumnRole::InProgress)));
+        assert!(!watch.read_due(Some(ColumnRole::Done)), "no open pull request to follow");
+        watch.read_at = Some(Instant::now());
+        assert!(!watch.read_due(Some(ColumnRole::InProgress)));
+        watch.track(Some((SessionState::Busy, 4)));
+        watch.track(Some((SessionState::Idle, 4)));
+        assert!(watch.read_due(Some(ColumnRole::InProgress)));
+        watch.reading = true;
+        assert!(!watch.read_due(Some(ColumnRole::InProgress)));
+    }
+
+    #[test]
+    fn a_turn_between_two_looks_counts_as_work_and_as_a_new_stop() {
+        let mut watch = PullRequestWatch::default();
+        watch.track(Some((SessionState::Idle, 63)));
+        let first = watch.idle_since;
+        watch.track(Some((SessionState::Idle, 63)));
+        assert!(!watch.busy_seen);
+        assert_eq!(watch.idle_since, first);
+        std::thread::sleep(Duration::from_millis(2));
+        watch.track(Some((SessionState::Idle, 64)));
+        assert!(watch.busy_seen);
+        assert!(watch.idle_since > first);
     }
 }
