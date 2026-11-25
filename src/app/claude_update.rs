@@ -37,6 +37,7 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// How often a restart looks whether the tab's `claude` has exited.
 /// Each look is a process snapshot (a `ps` spawn on Unix).
 const EXIT_POLL: Duration = Duration::from_millis(100);
+const RELAUNCH_REMEMBERED: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Default)]
 pub(super) struct ClaudeUpdates {
@@ -46,6 +47,8 @@ pub(super) struct ClaudeUpdates {
     outdated: HashMap<u64, LiveProcess>,
     /// Tabs with a restart in flight.
     restarting: HashSet<u64>,
+    /// When a restart last typed the relaunch command, by tab id.
+    relaunched: HashMap<u64, Instant>,
     /// The build each tab was last restarted towards. A tab is
     /// restarted on its own once per installed build: if it comes back
     /// still outdated (its shell resolves `claude` to another install
@@ -64,6 +67,11 @@ impl ClaudeUpdates {
     /// Whether a restart is driving the tab's `claude` now.
     pub(super) fn is_restarting(&self, tab_id: u64) -> bool {
         self.restarting.contains(&tab_id)
+    }
+
+    /// When a restart last typed `claude --resume` into the tab; the new `claude` starts after.
+    pub(super) fn relaunched_at(&self, tab_id: u64) -> Option<Instant> {
+        self.relaunched.get(&tab_id).copied()
     }
 }
 
@@ -342,6 +350,8 @@ impl AppShell {
                 match outcome {
                     Outcome::Relaunched => {
                         updates.outdated.remove(&tab_id);
+                        updates.relaunched.retain(|_, at| at.elapsed() < RELAUNCH_REMEMBERED);
+                        updates.relaunched.insert(tab_id, Instant::now());
                     }
                     Outcome::Aborted => {
                         updates.attempted.remove(&tab_id);

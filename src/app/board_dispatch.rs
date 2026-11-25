@@ -31,6 +31,7 @@ const ACCESS_RECHECK_AFTER: Duration = Duration::from_secs(300);
 const ACCESS_EXPIRES_AFTER: Duration = Duration::from_secs(600);
 /// Text and Enter in one write can reach an agent's prompt as a paste, whose Enter is a newline.
 const SUBMIT_AFTER_TYPING: Duration = Duration::from_millis(200);
+const LAUNCH_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 pub(crate) struct DispatchState {
@@ -133,6 +134,7 @@ fn running_under(shell: Option<u32>, table: &[(u32, u32)]) -> Option<Vec<u32>> {
 
 struct TabProbe<'a> {
     restarting: bool,
+    launched_lately: bool,
     running: Option<&'a [u32]>,
     claude_idle: Option<bool>,
     typed: bool,
@@ -142,12 +144,16 @@ fn tab_at_handover(tab: &TabProbe) -> TabAtHandover {
     if tab.restarting {
         return TabAtHandover::Busy;
     }
-    match (tab.running, tab.claude_idle) {
+    let state = match (tab.running, tab.claude_idle) {
         (Some([]), _) => TabAtHandover::Shell,
         (Some(_), Some(true)) if tab.typed => TabAtHandover::Draft,
         (Some(_), Some(true)) => TabAtHandover::IdleClaude,
         (Some(_), Some(false)) => TabAtHandover::Busy,
         _ => TabAtHandover::Other,
+    };
+    match state {
+        TabAtHandover::Shell | TabAtHandover::Other if tab.launched_lately => TabAtHandover::Busy,
+        state => state,
     }
 }
 
@@ -870,8 +876,12 @@ impl AppShell {
                     let dir = sessions.as_deref()?;
                     live_session::process_for_pids(dir, running, &wanted)?.reports_idle()
                 });
+                let relaunched = self.claude_updates.relaunched_at(tab.id);
+                let launched_lately = tab.spawned_at.elapsed().is_ok_and(|age| age < LAUNCH_GRACE)
+                    || relaunched.is_some_and(|at| at.elapsed() < LAUNCH_GRACE);
                 tab_at_handover(&TabProbe {
                     restarting: self.claude_updates.is_restarting(tab.id),
+                    launched_lately,
                     running: running.as_deref(),
                     claude_idle,
                     typed: terminal.typed_since_submit(),
@@ -946,6 +956,7 @@ mod tests {
     fn tab(running: Option<&[u32]>, claude_idle: Option<bool>, typed: bool) -> TabAtHandover {
         tab_at_handover(&TabProbe {
             restarting: false,
+            launched_lately: false,
             running,
             claude_idle,
             typed,
@@ -968,6 +979,7 @@ mod tests {
         for running in [None, Some(&[][..]), Some(&[7][..])] {
             let probe = TabProbe {
                 restarting: true,
+                launched_lately: false,
                 running,
                 claude_idle: running.map(|_| true),
                 typed: false,
@@ -983,6 +995,24 @@ mod tests {
         assert_eq!(usable_access(Some(&answer), at + ACCESS_RECHECK_AFTER), Some(true));
         assert_eq!(usable_access(Some(&answer), at + ACCESS_EXPIRES_AFTER), None);
         assert_eq!(usable_access(None, at), None);
+    }
+
+    #[test]
+    fn a_tab_that_launched_lately_is_busy_until_its_program_shows() {
+        use TabAtHandover::*;
+        let lately = |running: Option<&[u32]>, claude_idle: Option<bool>| {
+            tab_at_handover(&TabProbe {
+                restarting: false,
+                launched_lately: true,
+                running,
+                claude_idle,
+                typed: false,
+            })
+        };
+        assert_eq!(lately(Some(&[]), None), Busy, "its shell hasn't started the agent yet");
+        assert_eq!(lately(Some(&[7]), None), Busy, "the agent hasn't written its session yet");
+        assert_eq!(lately(None, None), Busy);
+        assert_eq!(lately(Some(&[7]), Some(true)), IdleClaude);
     }
 
     #[test]
