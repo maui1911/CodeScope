@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{Board, BoardItem, ColumnMapping, ColumnRole, ItemKind, ItemState, RoleKind};
 use super::{mapped_column, normalize_column_name};
-use crate::git::run_git;
+use crate::git::{parse_worktree_porcelain, run_git};
+use crate::projects::normalise_project_path;
 use crate::time::parse_iso8601_secs;
 
 /// Where the agent reads what to do, relative to the worktree.
@@ -551,46 +552,72 @@ pub fn exclude_handover_files(worktree: &Path) -> Result<()> {
     std::fs::write(&path, next).with_context(|| format!("write {}", path.display()))
 }
 
-/// Write [`TASK_FILE`] into the worktree.
+/// Write [`TASK_FILE`] into the worktree; refuses when the file or its folder is a link.
 pub fn write_task_file(worktree: &Path, content: &str) -> Result<()> {
     let path = worktree.join(TASK_FILE);
+    for part in [path.parent(), Some(path.as_path())].into_iter().flatten() {
+        if std::fs::symlink_metadata(part).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            bail!("{} is a link", part.display());
+        }
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     std::fs::write(&path, content).with_context(|| format!("write {}", path.display()))
 }
 
-/// Create a dispatch's worktree at `path`. An existing local `branch` is checked out as it is;
-/// otherwise the branch starts from `remote`'s default branch, fetched first, without tracking it.
-pub fn add_dispatch_worktree(
-    repo: &Path,
-    path: &Path,
-    branch: &str,
-    remote: &str,
-    default_branch: &str,
-) -> Result<()> {
+/// Create a dispatch's worktree at `path` on `branch`, from `remote`'s own default branch,
+/// fetched first and not tracked. A worktree of `repo` already at `path` on `branch` is kept;
+/// an existing local `branch` is used only when the remote's default branch contains it.
+pub fn add_dispatch_worktree(repo: &Path, path: &Path, branch: &str, remote: &str) -> Result<()> {
     if path.exists() {
+        if is_worktree_on(repo, path, branch) {
+            return Ok(());
+        }
         bail!("{} already exists", path.display());
     }
-    let path_arg = path.to_string_lossy();
-    if ref_exists(repo, &format!("refs/heads/{branch}")) {
-        return run_git(repo, &["worktree", "add", &path_arg, branch]).map(|_| ());
+    let default_branch = remote_default_branch(repo, remote)?;
+    run_git(repo, &["fetch", "--quiet", remote, &default_branch])?;
+    let base = format!("refs/remotes/{remote}/{default_branch}");
+    if !ref_exists(repo, &base) {
+        bail!("fetching {remote} left no {remote}/{default_branch} to start from");
     }
-    let _ = run_git(repo, &["fetch", "--quiet", remote, default_branch]);
-    let base = [
-        format!("refs/remotes/{remote}/{default_branch}"),
-        format!("refs/remotes/{remote}/HEAD"),
-        format!("refs/heads/{default_branch}"),
-        "HEAD".to_string(),
-    ]
-    .into_iter()
-    .find(|candidate| ref_exists(repo, candidate))
-    .context("the repository has no commit to start the branch from")?;
+    let local = format!("refs/heads/{branch}");
+    if ref_exists(repo, &local)
+        && run_git(repo, &["merge-base", "--is-ancestor", &local, &base]).is_err()
+    {
+        bail!(
+            "the local branch {branch} has commits {remote}/{default_branch} doesn't: \
+             remove or rename it, then move the item again"
+        );
+    }
+    let path_arg = path.to_string_lossy();
     run_git(
         repo,
-        &["worktree", "add", "--no-track", "-b", branch, &path_arg, &base],
+        &["worktree", "add", "--no-track", "-B", branch, &path_arg, &base],
     )
     .map(|_| ())
+}
+
+fn remote_default_branch(repo: &Path, remote: &str) -> Result<String> {
+    let output = run_git(repo, &["ls-remote", "--symref", remote, "HEAD"])?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            let name = line.strip_prefix("ref: refs/heads/")?.strip_suffix("\tHEAD")?;
+            Some(name.to_string())
+        })
+        .with_context(|| format!("{remote} names no default branch"))
+}
+
+fn is_worktree_on(repo: &Path, path: &Path, branch: &str) -> bool {
+    let Ok(output) = run_git(repo, &["worktree", "list", "--porcelain"]) else {
+        return false;
+    };
+    let wanted = normalise_project_path(&path.to_string_lossy());
+    parse_worktree_porcelain(&String::from_utf8_lossy(&output.stdout))
+        .into_iter()
+        .any(|w| normalise_project_path(&w.path) == wanted && w.branch.as_deref() == Some(branch))
 }
 
 fn ref_exists(repo: &Path, reference: &str) -> bool {
@@ -1169,7 +1196,7 @@ mod tests {
         git(&upstream, &["commit", "--allow-empty", "-m", "two", "-q"]);
 
         let path = dir.path().join("repo.worktrees").join("411-fuzzy-paths");
-        add_dispatch_worktree(&repo, &path, "411-fuzzy-paths", "origin", "main").unwrap();
+        add_dispatch_worktree(&repo, &path, "411-fuzzy-paths", "origin").unwrap();
         assert_eq!(head(&path, "HEAD"), head(&upstream, "HEAD"));
         assert!(run_git(&path, &["rev-parse", "--abbrev-ref", "@{upstream}"]).is_err());
 
@@ -1179,10 +1206,85 @@ mod tests {
         let status = run_git(&path, &["status", "--porcelain"]).unwrap();
         assert_eq!(String::from_utf8_lossy(&status.stdout), "");
 
-        let again = add_dispatch_worktree(&repo, &path, "411-fuzzy-paths", "origin", "main");
-        assert!(again.unwrap_err().to_string().contains("already exists"));
+        add_dispatch_worktree(&repo, &path, "411-fuzzy-paths", "origin").unwrap();
+        assert_eq!(head(&path, "HEAD"), head(&upstream, "HEAD"), "its own worktree is kept");
         git(&repo, &["worktree", "remove", "--force", &path.to_string_lossy()]);
-        add_dispatch_worktree(&repo, &path, "411-fuzzy-paths", "origin", "main").unwrap();
+        add_dispatch_worktree(&repo, &path, "411-fuzzy-paths", "origin").unwrap();
         assert_eq!(head(&path, "HEAD"), head(&upstream, "HEAD"));
+
+        let foreign = dir.path().join("repo.worktrees").join("412-other");
+        std::fs::create_dir_all(&foreign).unwrap();
+        let err = add_dispatch_worktree(&repo, &foreign, "412-other", "origin").unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+    }
+
+    #[test]
+    fn a_dispatch_worktree_starts_from_the_remotes_own_default_branch() {
+        if no_window_command("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream");
+        let repo = dir.path().join("repo");
+        for folder in [&upstream, &repo] {
+            std::fs::create_dir_all(folder).unwrap();
+            git(folder, &["-c", "init.defaultBranch=master", "init", "-q"]);
+            git(folder, &["config", "user.email", "test@example.invalid"]);
+            git(folder, &["config", "user.name", "Test"]);
+            git(folder, &["commit", "--allow-empty", "-m", "start", "-q"]);
+        }
+        git(&upstream, &["commit", "--allow-empty", "-m", "upstream", "-q"]);
+        git(&repo, &["remote", "add", "upstream", &upstream.to_string_lossy()]);
+
+        let path = dir.path().join("repo.worktrees").join("7-seven");
+        add_dispatch_worktree(&repo, &path, "7-seven", "upstream").unwrap();
+        assert_eq!(head(&path, "HEAD"), head(&upstream, "HEAD"));
+
+        let gone = add_dispatch_worktree(&repo, &dir.path().join("x").join("8-x"), "8-x", "nowhere");
+        assert!(gone.is_err(), "a remote that can't be read is an error, not a fallback");
+    }
+
+    #[test]
+    fn a_local_branch_with_commits_of_its_own_is_not_taken_over() {
+        if no_window_command("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        git(&upstream, &["-c", "init.defaultBranch=main", "init", "-q"]);
+        git(&upstream, &["config", "user.email", "test@example.invalid"]);
+        git(&upstream, &["config", "user.name", "Test"]);
+        git(&upstream, &["commit", "--allow-empty", "-m", "one", "-q"]);
+        git(dir.path(), &["clone", "-q", "upstream", "repo"]);
+        let repo = dir.path().join("repo");
+        git(&repo, &["config", "user.email", "test@example.invalid"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        git(&repo, &["branch", "9-behind"]);
+        git(&repo, &["checkout", "-q", "-b", "10-theirs"]);
+        git(&repo, &["commit", "--allow-empty", "-m", "someone else's", "-q"]);
+        git(&repo, &["checkout", "-q", "main"]);
+
+        let behind = dir.path().join("repo.worktrees").join("9-behind");
+        add_dispatch_worktree(&repo, &behind, "9-behind", "origin").unwrap();
+        assert_eq!(head(&behind, "HEAD"), head(&upstream, "HEAD"));
+
+        let theirs = dir.path().join("repo.worktrees").join("10-theirs");
+        let err = add_dispatch_worktree(&repo, &theirs, "10-theirs", "origin").unwrap_err();
+        assert!(err.to_string().contains("10-theirs"), "{err}");
+        assert!(!theirs.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_task_file_is_not_written_through_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::os::unix::fs::symlink(&target, worktree.join(".codescope")).unwrap();
+        assert!(write_task_file(&worktree, "# Research\n").is_err());
+        assert!(!target.join("dispatch.md").exists());
     }
 }

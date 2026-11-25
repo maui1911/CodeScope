@@ -88,7 +88,6 @@ struct Job {
     path: PathBuf,
     branch: String,
     remote: String,
-    default_branch: String,
     create: bool,
     record: WorktreeDispatch,
     assign_to: Option<String>,
@@ -190,7 +189,7 @@ fn check_access(
 
 fn prepare_worktree(job: &Job) -> anyhow::Result<()> {
     if job.create {
-        add_dispatch_worktree(&job.repo, &job.path, &job.branch, &job.remote, &job.default_branch)?;
+        add_dispatch_worktree(&job.repo, &job.path, &job.branch, &job.remote)?;
     }
     exclude_handover_files(&job.path)?;
     let home = codescope_core::paths::home_dir();
@@ -500,7 +499,6 @@ impl AppShell {
             path,
             branch,
             remote,
-            default_branch: project.default_branch.clone(),
             create,
             record: WorktreeDispatch {
                 board_url,
