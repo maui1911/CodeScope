@@ -587,37 +587,45 @@ impl AppShell {
 
         let viewer_id = viewer.id.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let (job, result) = cx
+            let (job, prepared) = cx
                 .background_spawn(async move {
-                    let result = prepare_worktree(&job)
-                        .map(|()| claim_on_board(&job, &viewer_id))
-                        .map_err(|err| format!("{err:#}"));
-                    (job, result)
+                    let prepared = prepare_worktree(&job).map_err(|err| format!("{err:#}"));
+                    (job, prepared)
                 })
                 .await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.finish_dispatch(job, launch, result, window, cx);
+            let Ok(Some(job)) = this.update_in(cx, |this, window, cx| {
+                this.record_dispatch_start(job, launch, prepared, window, cx)
+            }) else {
+                return;
+            };
+            let (job, board_errors) = cx
+                .background_spawn(async move {
+                    let errors = claim_on_board(&job, &viewer_id);
+                    (job, errors)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.report_dispatch_start(&job.record, board_errors, cx);
             });
         })
         .detach();
     }
 
-    fn finish_dispatch(
+    /// Keep the started round on the worktree's row and hand the session its task; the job comes
+    /// back to be claimed on the board only once that is saved.
+    fn record_dispatch_start(
         &mut self,
         job: Job,
         launch: Launch,
-        result: Result<Vec<String>, String>,
+        prepared: Result<(), String>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        let record = job.record;
-        let board_errors = match result {
-            Ok(errors) => errors,
-            Err(message) => {
-                self.fail_dispatch(&record.item_id, record.number, &record.trigger_at, message, cx);
-                return;
-            }
-        };
+    ) -> Option<Job> {
+        let record = &job.record;
+        if let Err(message) = prepared {
+            self.fail_dispatch(&record.item_id, record.number, &record.trigger_at, message, cx);
+            return None;
+        }
         let path = job.path.to_string_lossy().into_owned();
         let saved = ProjectsConfig::load(&self.paths)
             .map_err(|err| format!("{err:#}"))
@@ -633,7 +641,7 @@ impl AppShell {
             Ok(next) => next,
             Err(message) => {
                 self.fail_dispatch(&record.item_id, record.number, &record.trigger_at, message, cx);
-                return;
+                return None;
             }
         };
         self.projects = next.clone();
@@ -643,10 +651,19 @@ impl AppShell {
         });
         self.board.dispatch.starting.remove(&record.item_id);
         self.hand_over(&job.path, launch, record.number, window, cx);
+        cx.notify();
+        Some(job)
+    }
 
+    fn report_dispatch_start(
+        &mut self,
+        record: &WorktreeDispatch,
+        board_errors: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
         let started = format!("{} started on #{}", record.round.label(), record.number);
         if board_errors.is_empty() {
-            self.push_toast(ToastKind::Ok, started, Some(record.title.into()), cx);
+            self.push_toast(ToastKind::Ok, started, Some(record.title.clone().into()), cx);
         } else {
             let detail = format!("The board isn't up to date: {}", board_errors.join("; "));
             self.push_toast(ToastKind::Err, started, Some(detail.into()), cx);
