@@ -6496,6 +6496,10 @@ async fn spawn_open_remote_in_browser(
 /// `git config`. macOS uses `open`, Linux uses `xdg-open`; both
 /// pass arguments verbatim without shell parsing.
 pub(crate) fn open_url_in_browser(url: &str) {
+    if !is_web_url(url) {
+        eprintln!("warning: not opening {url}: only http and https URLs open in the browser");
+        return;
+    }
     #[cfg(target_os = "windows")]
     {
         crate::win32_titlebar::shell_open_url(url);
@@ -6512,6 +6516,11 @@ pub(crate) fn open_url_in_browser(url: &str) {
             eprintln!("warning: failed to open URL in browser: {err:#}");
         }
     }
+}
+
+fn is_web_url(url: &str) -> bool {
+    let scheme = url.split_once("://").map(|(scheme, _)| scheme.to_ascii_lowercase());
+    matches!(scheme.as_deref(), Some("http" | "https"))
 }
 
 /// `wt -d <path>` — Windows-only. Logs a friendly warning on other
@@ -7328,6 +7337,21 @@ fn id_hash(id: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_http_and_https_urls_open_in_the_browser() {
+        assert!(is_web_url("https://github.com/users/maui1911/projects/3"));
+        assert!(is_web_url("HTTP://example.com"));
+        for url in [
+            "",
+            "C:\\Windows\\System32\\calc.exe",
+            "file:///C:/Windows",
+            "javascript:alert(1)",
+            "github.com/users/maui1911/projects/3",
+        ] {
+            assert!(!is_web_url(url), "{url}");
+        }
+    }
 
     #[test]
     fn history_agent_label_resolves_built_in_ids() {

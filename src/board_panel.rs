@@ -40,6 +40,7 @@ pub(crate) struct BoardPanelState {
 pub(crate) struct BoardRead {
     pub last_good: Option<Board>,
     pub error: Option<String>,
+    /// When `last_good` was read.
     pub read_at: Option<Instant>,
 }
 
@@ -172,11 +173,11 @@ impl AppShell {
         state.reading = false;
         for (url, result) in results {
             let read = state.reads_by_url.entry(url).or_default();
-            read.read_at = Some(Instant::now());
             match result {
                 Ok(board) => {
                     read.last_good = Some(board);
                     read.error = None;
+                    read.read_at = Some(Instant::now());
                 }
                 Err(err) => read.error = Some(err),
             }
@@ -417,7 +418,7 @@ impl AppShell {
         let board_url = read
             .and_then(|r| r.last_good.as_ref())
             .map(|b| b.url.clone())
-            .or(selected_url.clone());
+            .or_else(|| selected.and_then(|s| BoardRef::parse_url(&s.url)).map(|b| b.url()));
 
         div()
             .min_h(px(56.0))
