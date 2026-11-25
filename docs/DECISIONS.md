@@ -575,7 +575,7 @@ question on every change.
 
 The Rust port is also platform-portable in a way WPF is not. Velopack
 feeds now ship for Windows, macOS arm64/x64, and Linux x64 from one
-pipeline ([ADR-0019](#adr-0019), [PRs #201 / #202](https://github.com/maui1911/CodeScope/pulls)).
+pipeline ([ADR-0019](#adr-0019--rust-port-uses-cargo-dist--velopack-rs-for-its-own-release-pipeline), [PRs #201 / #202](https://github.com/maui1911/CodeScope/pulls)).
 
 Earlier ADRs in this file describe the C# stack as canonical
 (ADR-0001 .NET 10, ADR-0002 WPF, ADR-0003 EasyWindowsTerminalControl,
@@ -610,7 +610,7 @@ record:
   fully removed in cutover-2; the workspace is flattened and the
   Velopack pack id is renamed to `codescope` in cutover-3.
 * Historical `v0.2.X` GitHub releases stay published; the
-  `update_check` floor filter (see [ADR-0020](#adr-0020) and PR #206)
+  `update_check` floor filter (see [ADR-0020](#adr-0020--rust-empty-state-clone-from-git-url-cta-is-interactive-forced-deviation) and PR #206)
   keeps them out of the live update flow.
 * Solo dogfooding: no preflight migration release is shipped. Users
   (= the developer) reinstall once between the `codescope-rs` and
