@@ -414,6 +414,7 @@ mod tests {
             url: "https://github.com/maui1911/CodeScope/issues/411".into(),
             round: Round::Research,
             trigger_at: "2026-11-25T10:00:00Z".into(),
+            findings: None,
         };
         let path = "/repo.worktrees/411-fuzzy-paths";
         assert!(record_dispatch(&mut cfg, &id, path, "411-fuzzy-paths", research.clone()));

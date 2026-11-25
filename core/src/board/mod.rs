@@ -3,6 +3,7 @@
 //! GitHub Projects board through `gh`.
 
 pub mod dispatch;
+pub mod findings;
 pub mod github;
 
 use std::collections::BTreeMap;

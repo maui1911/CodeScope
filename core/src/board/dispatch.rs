@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::findings::Outcome;
 use super::{Board, BoardItem, ColumnMapping, ColumnRole, ItemKind, ItemState, RoleKind};
 use super::{mapped_column, normalize_column_name};
 use crate::git::{parse_worktree_porcelain, run_git};
@@ -108,6 +109,30 @@ pub struct WorktreeDispatch {
     pub round: Round,
     /// When the move that started that round was made, as the host reports it.
     pub trigger_at: String,
+    /// The research round's findings, once CodeScope posted them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findings: Option<PostedFindings>,
+}
+
+impl WorktreeDispatch {
+    /// A research round whose findings are not posted yet.
+    pub fn awaits_findings(&self) -> bool {
+        self.round == Round::Research && self.findings.is_none()
+    }
+}
+
+/// Findings CodeScope posted on the issue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostedFindings {
+    pub outcome: Outcome,
+    pub comment_url: String,
+}
+
+/// Whether posting findings moves the item to Needs decision: only with decision points, and
+/// only while the item is still in Researching, where CodeScope put it.
+pub fn moves_to_needs_decision(outcome: Outcome, role: Option<ColumnRole>) -> bool {
+    outcome == Outcome::DecisionPoints && role == Some(ColumnRole::Researching)
 }
 
 /// Why an item in a trigger column does not start.
@@ -605,6 +630,17 @@ pub fn exclude_handover_files(worktree: &Path) -> Result<()> {
         .with_context(|| format!("write {}", path.display()))
 }
 
+/// Remove the findings of an earlier round, so they can't be taken for this round's.
+pub fn clear_findings(worktree: &Path) -> Result<()> {
+    let path = worktree.join(FINDINGS_FILE);
+    match std::fs::remove_file(&path) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+            Err(err).with_context(|| format!("remove {}", path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Write [`TASK_FILE`] into the worktree; refuses when the file or its folder is a link.
 pub fn write_task_file(worktree: &Path, content: &str) -> Result<()> {
     let path = worktree.join(TASK_FILE);
@@ -768,6 +804,7 @@ mod tests {
             url: "https://github.com/maui1911/CodeScope/issues/411".into(),
             round,
             trigger_at: trigger_at.into(),
+            findings: None,
         }
     }
 
@@ -1095,6 +1132,42 @@ mod tests {
     }
 
     #[test]
+    fn only_decision_points_in_researching_move_the_item() {
+        let researching = Some(ColumnRole::Researching);
+        assert!(moves_to_needs_decision(Outcome::DecisionPoints, researching));
+        assert!(!moves_to_needs_decision(Outcome::Findings, researching));
+        assert!(!moves_to_needs_decision(Outcome::DecisionPoints, Some(ColumnRole::Todo)));
+        assert!(!moves_to_needs_decision(Outcome::DecisionPoints, None));
+    }
+
+    #[test]
+    fn only_research_without_posted_findings_awaits_them() {
+        let mut record = dispatch(Round::Research, MOVED);
+        assert!(record.awaits_findings());
+        record.findings = Some(PostedFindings {
+            outcome: Outcome::Findings,
+            comment_url: "https://github.com/maui1911/CodeScope/issues/411#issuecomment-1".into(),
+        });
+        assert!(!record.awaits_findings());
+        assert!(!dispatch(Round::Implementation, MOVED).awaits_findings());
+    }
+
+    #[test]
+    fn the_record_round_trips_with_and_without_posted_findings() {
+        let mut record = dispatch(Round::Research, MOVED);
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(!json.contains("findings"), "{json}");
+        assert_eq!(serde_json::from_str::<WorktreeDispatch>(&json).unwrap(), record);
+        record.findings = Some(PostedFindings {
+            outcome: Outcome::DecisionPoints,
+            comment_url: "u".into(),
+        });
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains(r#""outcome":"decision-points""#), "{json}");
+        assert_eq!(serde_json::from_str::<WorktreeDispatch>(&json).unwrap(), record);
+    }
+
+    #[test]
     fn trigger_ids_are_the_open_issues_in_trigger_columns() {
         let mut board = board_with(issue_in("r"));
         board.items.push(BoardItem {
@@ -1351,6 +1424,9 @@ mod tests {
         std::fs::write(path.join(FINDINGS_FILE), "## Cause\n").unwrap();
         let status = run_git(&path, &["status", "--porcelain"]).unwrap();
         assert_eq!(String::from_utf8_lossy(&status.stdout), "");
+        clear_findings(&path).unwrap();
+        assert!(!path.join(FINDINGS_FILE).exists());
+        clear_findings(&path).unwrap();
 
         add_dispatch_worktree(&repo, &path, "411-fuzzy-paths", "origin").unwrap();
         assert_eq!(head(&path, "HEAD"), head(&upstream, "HEAD"), "its own worktree is kept");

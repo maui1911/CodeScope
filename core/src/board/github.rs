@@ -2,6 +2,7 @@
 //! the 5,000-point hourly limit; `gh project item-list` would cost about a hundred.
 
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::process::Stdio;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -196,6 +197,27 @@ pub fn assign(content_id: &str, user_id: &str) -> Result<()> {
     parse_data::<serde_json::Value>(&stdout).map(|_| ())
 }
 
+/// Comment on an issue or pull request by its node id; returns the comment's URL. The request
+/// goes through stdin, so a long body is not cut off by the command line's length limit.
+pub fn add_comment(subject_id: &str, body: &str) -> Result<String> {
+    let query = r#"mutation($subject: ID!, $body: String!) {
+  addComment(input: { subjectId: $subject, body: $body }) { commentEdge { node { url } } }
+}"#;
+    let request = serde_json::json!({
+        "query": query,
+        "variables": { "subject": subject_id, "body": body },
+    });
+    let args = ["graphql", "--input", "-"].map(String::from);
+    let stdout = run_gh_api_with_input(&args, Some(request.to_string()))?;
+    parse_comment_url(&stdout)
+}
+
+/// Parse [`add_comment`]'s response.
+pub fn parse_comment_url(json: &str) -> Result<String> {
+    let data: AddCommentData = parse_data(json)?;
+    Ok(data.add_comment.comment_edge.node.url)
+}
+
 /// Whether `login` can push to `repository` (`owner/name`): admin, maintain or write. False too
 /// when GitHub won't say, which it does unless the signed-in user can push.
 pub fn can_write(repository: &str, login: &str) -> Result<bool> {
@@ -232,17 +254,38 @@ fn run_graphql(raw_fields: &[String], typed_fields: &[String]) -> Result<String>
 }
 
 fn run_gh_api(args: &[String]) -> Result<String> {
+    run_gh_api_with_input(args, None)
+}
+
+fn run_gh_api_with_input(args: &[String], input: Option<String>) -> Result<String> {
     let mut command = gh_api();
     command.args(args);
-    let output = command
-        .stdin(Stdio::null())
+    let mut child = command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn()
         .map_err(|err| match err.kind() {
             std::io::ErrorKind::NotFound => anyhow!("GitHub CLI (gh) is not installed"),
             _ => anyhow!(err).context("run gh"),
         })?;
+    let writer = match (input, child.stdin.take()) {
+        (Some(input), Some(mut stdin)) => {
+            Some(std::thread::spawn(move || stdin.write_all(input.as_bytes())))
+        }
+        _ => None,
+    };
+    let output = child.wait_with_output().context("wait for gh")?;
+    if let Some(writer) = writer {
+        writer
+            .join()
+            .map_err(|_| anyhow!("writing to gh panicked"))?
+            .context("write to gh")?;
+    }
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let message = stderr
@@ -368,6 +411,28 @@ fn item_state(state: &str) -> ItemState {
 struct Response<T> {
     data: Option<T>,
     errors: Option<Vec<GraphqlError>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddCommentData {
+    add_comment: AddCommentPayload,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddCommentPayload {
+    comment_edge: CommentEdge,
+}
+
+#[derive(Deserialize)]
+struct CommentEdge {
+    node: CommentNode,
+}
+
+#[derive(Deserialize)]
+struct CommentNode {
+    url: String,
 }
 
 #[derive(Deserialize)]
@@ -689,6 +754,16 @@ mod tests {
                 status: "Ready".into(),
                 created_at: "2026-11-25T10:00:00Z".into(),
             }
+        );
+    }
+
+    #[test]
+    fn reads_the_url_of_a_new_comment() {
+        let json = r#"{"data":{"addComment":{"commentEdge":{"node":{
+          "url":"https://github.com/maui1911/CodeScope/issues/408#issuecomment-1"}}}}}"#;
+        assert_eq!(
+            parse_comment_url(json).unwrap(),
+            "https://github.com/maui1911/CodeScope/issues/408#issuecomment-1"
         );
     }
 
