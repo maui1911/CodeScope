@@ -1076,7 +1076,7 @@ impl AppShell {
                 .iter()
                 .find(|item| item.id == record.item_id)
                 .and_then(|item| board.role_of(item, &mapping));
-            if !moves_to_needs_decision(posting.outcome, role) {
+            if !moves_to_needs_decision(role) {
                 return None;
             }
             let column = mapped_column(board, &mapping, ColumnRole::NeedsDecision)?;

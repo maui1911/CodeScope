@@ -129,10 +129,10 @@ pub struct PostedFindings {
     pub comment_url: String,
 }
 
-/// Whether posting findings moves the item to Needs decision: only with decision points, and
-/// only while the item is still in Researching, where CodeScope put it.
-pub fn moves_to_needs_decision(outcome: Outcome, role: Option<ColumnRole>) -> bool {
-    outcome == Outcome::DecisionPoints && role == Some(ColumnRole::Researching)
+/// Whether posting findings moves the item to Needs decision, with or without decision points:
+/// only while it is still in Researching, where CodeScope put it.
+pub fn moves_to_needs_decision(role: Option<ColumnRole>) -> bool {
+    role == Some(ColumnRole::Researching)
 }
 
 /// Why an item in a trigger column does not start.
@@ -1132,12 +1132,11 @@ mod tests {
     }
 
     #[test]
-    fn only_decision_points_in_researching_move_the_item() {
-        let researching = Some(ColumnRole::Researching);
-        assert!(moves_to_needs_decision(Outcome::DecisionPoints, researching));
-        assert!(!moves_to_needs_decision(Outcome::Findings, researching));
-        assert!(!moves_to_needs_decision(Outcome::DecisionPoints, Some(ColumnRole::Todo)));
-        assert!(!moves_to_needs_decision(Outcome::DecisionPoints, None));
+    fn posted_findings_move_the_item_only_out_of_researching() {
+        assert!(moves_to_needs_decision(Some(ColumnRole::Researching)));
+        assert!(!moves_to_needs_decision(Some(ColumnRole::Todo)));
+        assert!(!moves_to_needs_decision(Some(ColumnRole::Ready)));
+        assert!(!moves_to_needs_decision(None));
     }
 
     #[test]
