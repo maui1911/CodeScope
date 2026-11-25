@@ -119,7 +119,7 @@ pub enum Hold {
     NoMove,
     MovedBeforeAdded,
     MovedByWorkflow,
-    /// Moved by someone else, on an item not assigned to the user or without write access.
+    /// Moved by someone else: on an item not assigned to the user alone, or without write access.
     MovedByOther(String),
     /// Whether the mover can write to the repository has not been asked yet.
     AccessUnknown(String),
@@ -238,7 +238,7 @@ fn check(
     }
     let mover = change.actor.as_deref().unwrap_or("ghost");
     if !mover.eq_ignore_ascii_case(facts.viewer) {
-        match (assigned_to_viewer, facts.mover_can_write) {
+        match (is_assigned_to_only(item, facts.viewer), facts.mover_can_write) {
             (true, Some(true)) => {}
             (true, None) => return Err(Hold::AccessUnknown(mover.to_string())),
             _ => return Err(Hold::MovedByOther(mover.to_string())),
@@ -264,6 +264,10 @@ fn is_assigned_to(item: &BoardItem, login: &str) -> bool {
     item.assignees.iter().any(|a| a.eq_ignore_ascii_case(login))
 }
 
+fn is_assigned_to_only(item: &BoardItem, login: &str) -> bool {
+    item.assignees.len() == 1 && is_assigned_to(item, login)
+}
+
 fn is_at_or_after(at: &str, since: &str) -> bool {
     match (parse_iso8601_secs(at), parse_iso8601_secs(since)) {
         (Some(at), Some(since)) => at >= since,
@@ -285,7 +289,7 @@ pub fn trigger_content_ids(board: &Board, mapping: &ColumnMapping) -> Vec<String
 }
 
 /// The login whose write access [`decide`] needs for this move, if any: someone other than the
-/// viewer who moved an item assigned to the viewer.
+/// viewer who moved an item assigned to the viewer alone.
 pub fn mover_to_check<'a>(
     item: &BoardItem,
     change: &'a StatusChange,
@@ -294,7 +298,7 @@ pub fn mover_to_check<'a>(
     let mover = change.actor.as_deref()?;
     (!change.was_automated
         && !mover.eq_ignore_ascii_case(viewer)
-        && is_assigned_to(item, viewer))
+        && is_assigned_to_only(item, viewer))
     .then_some(mover)
 }
 
@@ -861,6 +865,28 @@ mod tests {
             run_decide(issue_in("y"), &can_write),
             Some(Err(Hold::MovedByOther("lead".into())))
         );
+    }
+
+    #[test]
+    fn with_several_assignees_only_the_one_who_moved_it_starts() {
+        let shared = BoardItem {
+            assignees: vec![VIEWER.into(), "sanne".into()],
+            ..issue_in("y")
+        };
+        for mover in ["sanne", "lead"] {
+            let change = moved_by(mover, "Ready");
+            let can_write = Facts {
+                mover_can_write: Some(true),
+                ..facts(&change)
+            };
+            assert_eq!(
+                run_decide(shared.clone(), &can_write),
+                Some(Err(Hold::MovedByOther(mover.into())))
+            );
+            assert_eq!(mover_to_check(&shared, &change, VIEWER), None);
+        }
+        let own = moved_by(VIEWER, "Ready");
+        assert_eq!(run_decide(shared, &facts(&own)), Some(Ok(Round::Implementation)));
     }
 
     #[test]
