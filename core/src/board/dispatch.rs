@@ -122,7 +122,8 @@ pub enum Hold {
     MovedByWorkflow,
     /// Moved by someone else: on an item not assigned to the user alone, or without write access.
     MovedByOther(String),
-    /// Whether the mover can write to the repository has not been asked yet.
+    /// Whether the mover can write to the repository couldn't be read; the next board read asks
+    /// again.
     AccessUnknown(String),
     /// This move already started a round.
     Handled,
@@ -135,10 +136,7 @@ pub enum Hold {
 impl Hold {
     /// Whether the item is none of the user's business, so its card shows nothing.
     pub fn is_quiet(&self) -> bool {
-        matches!(
-            self,
-            Hold::AssignedToOther(_) | Hold::AccessUnknown(_) | Hold::Handled
-        )
+        matches!(self, Hold::AssignedToOther(_) | Hold::Handled)
     }
 
     /// One line for the item's card.
@@ -154,7 +152,9 @@ impl Hold {
             }
             Hold::MovedByWorkflow => "Moved by a workflow: move it yourself to start".into(),
             Hold::MovedByOther(login) => format!("Moved by @{login}: move it yourself to start"),
-            Hold::AccessUnknown(login) => format!("Checking whether @{login} can write"),
+            Hold::AccessUnknown(login) => {
+                format!("Couldn't check whether @{login} can write: retrying")
+            }
             Hold::Handled => "Started".into(),
             Hold::NoProject(repository) => format!("No project has {repository} as a remote"),
             Hold::SeveralProjects(repository) => {
@@ -898,6 +898,9 @@ mod tests {
             run_decide(assigned, &cannot_write),
             Some(Err(Hold::MovedByOther("lead".into())))
         );
+        let unchecked = Hold::AccessUnknown("lead".into());
+        assert!(!unchecked.is_quiet());
+        assert_eq!(unchecked.label(), "Couldn't check whether @lead can write: retrying");
         assert_eq!(
             run_decide(issue_in("y"), &can_write),
             Some(Err(Hold::MovedByOther("lead".into())))

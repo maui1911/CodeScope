@@ -196,16 +196,22 @@ pub fn assign(content_id: &str, user_id: &str) -> Result<()> {
     parse_data::<serde_json::Value>(&stdout).map(|_| ())
 }
 
-/// Whether `login` can push to `repository` (`owner/name`): admin, maintain or write.
+/// Whether `login` can push to `repository` (`owner/name`): admin, maintain or write. False too
+/// when GitHub won't say, which it does unless the signed-in user can push.
 pub fn can_write(repository: &str, login: &str) -> Result<bool> {
-    let stdout = run_gh_api(&[
+    write_access(run_gh_api(&[
         format!("repos/{repository}/collaborators/{login}/permission"),
         "--jq".to_string(),
         ".permission".to_string(),
-    ]);
-    match stdout {
+    ]))
+}
+
+fn write_access(permission: Result<String>) -> Result<bool> {
+    match permission {
         Ok(permission) => Ok(matches!(permission.trim(), "admin" | "maintain" | "write")),
-        Err(err) if err.to_string().contains("HTTP 404") => Ok(false),
+        Err(err) if ["HTTP 403", "HTTP 404"].iter().any(|s| err.to_string().contains(s)) => {
+            Ok(false)
+        }
         Err(err) => Err(err),
     }
 }
@@ -688,5 +694,21 @@ mod tests {
     fn a_missing_board_is_an_error() {
         let err = parse_page(r#"{"data":{"organization":{"projectV2":null}}}"#).unwrap_err();
         assert_eq!(err.to_string(), "board not found");
+    }
+
+    #[test]
+    fn write_access_is_only_what_github_confirms() {
+        for (permission, can_write) in
+            [("admin
+", true), ("maintain", true), ("write", true), ("read", false)]
+        {
+            assert_eq!(write_access(Ok(permission.into())).unwrap(), can_write, "{permission}");
+        }
+        let not_a_collaborator = anyhow::anyhow!("gh: Not Found (HTTP 404)");
+        assert!(!write_access(Err(not_a_collaborator)).unwrap());
+        let viewer_cant_push =
+            anyhow::anyhow!("gh: Must have push access to view collaborator permission. (HTTP 403)");
+        assert!(!write_access(Err(viewer_cant_push)).unwrap());
+        assert!(write_access(Err(anyhow::anyhow!("connection reset"))).is_err());
     }
 }
