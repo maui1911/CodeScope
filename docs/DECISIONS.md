@@ -925,8 +925,9 @@ board, each with their own CodeScope or another tool that follows the
 * **Several people, one board.** Each person's CodeScope works only
   for that person. Whatever others need to see lives on GitHub; only
   sessions and worktrees stay local. The assignee says who works on an
-  item: on dispatch CodeScope assigns the issue to its user if nobody
-  is, and it never dispatches an item assigned only to others. With
+  item: on dispatch CodeScope assigns the issue or pull request to its
+  user if nobody is, and it never dispatches an item assigned only to
+  others. With
   several assignees, only the tool of the assignee who moved the item
   starts; a move by anyone else waits, with that reason shown. A
   person runs one tool per board: two CodeScopes of the same person (on
@@ -938,8 +939,8 @@ board, each with their own CodeScope or another tool that follows the
   after no tool), draft PR means testing by hand, the linked branch.
   CodeScope reads the results of any tool that writes that marker.
 * **Who starts a dispatch.** An automatic dispatch on a person's
-  CodeScope starts only when the issue's
-  `ProjectV2ItemStatusChangedEvent` is not `wasAutomated` and either
+  CodeScope starts only when the `ProjectV2ItemStatusChangedEvent` on
+  the item's issue or pull request is not `wasAutomated` and either
   names that person as actor, or names someone with write access to
   the repository while the item is assigned to that person alone (a
   lead hands out work by assigning it and moving it to *Ready*). Only
@@ -965,41 +966,45 @@ board, each with their own CodeScope or another tool that follows the
   *Ready*. For an issue, the *implementation* phase starts with the
   implementation round, which ends when the agent's pull request is
   open; for a pull request item it starts with a review round. It goes
-  on through review rounds and repairs until the pull request is
-  merged or closed. Moving an item to *Ready* after research starts
-  the next round in the same session, resumed if its tab was closed.
-  A new session starts in the same worktree from the findings when the
-  session is lost, or when the user chose a different CLI for
-  implementation.
+  on through review rounds, and repairs on a pull request the dispatch
+  opened, until the pull request is merged or closed. Moving an item
+  to *Ready* after research starts the next round in the same session,
+  resumed if its tab was closed. A new session starts in the same
+  worktree from the findings when the session is lost, or when the
+  user chose a different CLI for implementation.
 * **What a move starts.** A move into *Research* starts the research
   round, on an issue or a pull request. A move into *Ready* starts the
   round that fits the item:
   * an issue without an open pull request: the *implementation round*
     (`implement`), which ends when the agent's pull request is open;
-  * an issue whose open pull request this dispatch opened, or an item
-    that is itself a pull request: a *review round*
-    (`address-review`) on that pull request, which ends when the agent
-    has pushed and its session is idle;
+  * an issue whose open pull request this dispatch opened, or a pull
+    request item that no dispatch of the user's opened: a *review
+    round* (`address-review`) on that pull request, which ends when
+    the agent has pushed, or replied in the review threads it handles,
+    and its session is idle;
+  * a pull request item that one of the user's dispatches opened:
+    nothing starts, because that dispatch already works on it; its
+    issue is the item to move;
   * an issue with an open pull request from elsewhere: nothing starts,
-    and the item waits with that pull request shown. To work on that
-    pull request, a person adds it to the board and moves it to
-    *Ready*.
+    and the item waits with that pull request shown until it is moved
+    again. To work on that pull request, a person adds it to the board
+    and moves it to *Ready*.
 
   Both rounds move the item to *In progress* when they start, and on
   to *In review* once their pull request is ready: when the round ends
   with a ready pull request, or when its draft is marked ready later,
   by anyone. That is the round's one move on. A round that stops
-  without its result (findings, a pull request, a push) leaves its
-  session idle, and the dispatch *needs you* until the user steers it
-  in the tab.
+  without its result (findings, a pull request, a push or replies)
+  leaves its session idle, and the dispatch *needs you* until the user
+  steers it in the tab.
 * **Answers.** The needs-you dialog shows decision points as choices
   with the advice selected. The answer is posted as a comment where
   the findings are ("B1 A, B2 B"), and the dialog can move the item to
-  *Ready* afterwards. A comment there after the findings, by anyone
-  with write access to the repository, is an answer too, so a designer
-  or a teammate can answer from GitHub. The findings and the answers
-  reach the session with the prompt of the round that *Ready* starts,
-  which lists each answer and who gave it. While the item waits in
+  *Ready* afterwards. A conversation comment there after the findings,
+  by anyone with write access to the repository, is an answer too, so
+  a designer or a teammate can answer from GitHub. The findings and
+  the answers reach the session with the prompt of the round that
+  *Ready* starts, which lists each answer and who gave it. While the item waits in
   *Needs decision* the session gets nothing, so it does not start
   implementing before *Ready*. Comments by others are shown and start
   nothing.
@@ -1032,8 +1037,9 @@ board, each with their own CodeScope or another tool that follows the
   without a query and after GitHub drops the branch link once the PR
   exists. A pull request item is worked on in a worktree on its own
   branch.
-* **Skills, not prompt files.** Each round (research, implementation,
-  review round, repair) runs a skill, named per project and by default
+* **Skills, not prompt files.** Each round (the research round, the
+  implementation round, a review round, a repair) runs a skill, named
+  per project and by default
   `research`, `implement`, `address-review` and `repair`, in the open
   Agent Skills format (`SKILL.md`) that Claude Code, Codex, Gemini CLI,
   OpenCode and Copilot read. The agent finds it the way it finds any
@@ -1104,8 +1110,8 @@ board, each with their own CodeScope or another tool that follows the
   approvals. "Someone else" leaves out the user: the agent posts as
   them, and they steer their own session in its tab. Repairs and
   forwarded comments are only for the pull request the dispatch
-  opened: a pull request item is worked on only in the rounds a
-  person's move starts.
+  opened: a pull request item that no dispatch of the user's opened is
+  worked on only in the rounds a person's move starts.
 * **Cleanup.** Merged: worktree removed, session closed, history kept
   ([ADR-0015](#adr-0015--closed-session-retention-policy-100-per-worktree-90-day-ttl)).
   Closed without a PR: removed only when the worktree is clean and has

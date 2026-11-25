@@ -44,7 +44,8 @@ uses these names.
    item is assigned to its person alone. With several assignees, only
    the tool of the assignee who made the move starts.
 3. Before it moves the item into a progress column, the tool assigns
-   the issue to its person if nobody is assigned.
+   the item's issue or pull request to its person if nobody is
+   assigned.
 4. A tool moves an item in two ways only: from a trigger column into
    the progress column of the round a person's move starts, and on
    from the progress column the tool itself put it in, once per round.
@@ -60,15 +61,20 @@ uses these names.
 A move into Research starts the research round. A move into Ready
 starts the implementation round on an issue without an open pull
 request, and a review round on the tool's own pull request or on a
-pull request item; an issue with an open pull request from elsewhere
-waits for a person. The implementation round and review rounds move
-the item to In progress when they start, and to In review once their
-pull request is ready: when the round ends with a ready pull request,
-or when its draft is marked ready later, by anyone.
+pull request item the tool did not open; an issue with an open pull
+request from elsewhere waits until a person moves it again. A pull
+request item the tool opened for an issue starts nothing: the work on
+the issue already covers it. A review round ends when the agent has
+pushed, or replied in the review threads it handles.
+
+The implementation round and review rounds move the item to In
+progress when they start, and to In review once their pull request is
+ready: when the round ends with a ready pull request, or when its
+draft is marked ready later, by anyone.
 
 Repairs, and forwarding a comment into the session, are only for the
-pull request the tool opened. A pull request item is worked on only in
-the rounds a person's move starts.
+pull request the tool opened. A pull request item the tool did not
+open is worked on only in the rounds a person's move starts.
 
 ## Comments
 
@@ -94,9 +100,10 @@ threads it handles.
 The line before the marker starts with `**Next step:**` and says what
 a person does next.
 
-A comment without a marker is a person's, unless a bot posted it.
-Comments count as answers only from people with write access to the
-repository.
+A conversation comment without a marker is a person's, unless a bot
+posted it; a reply in a review thread may be an agent's. Answers are
+conversation comments, and count only from people with write access
+to the repository.
 
 ### Findings
 
@@ -128,6 +135,10 @@ free text. Free text alone is an answer too.
 - A draft pull request has a section `## Test by hand` in its body: a
   person tests it first. Once it is marked ready, by anyone, the tool
   moves the item to In review.
+- A tool sends a conversation comment on its pull request into the
+  session only while the pull request has no submitted review, and
+  only when someone other than its person, with write access, wrote
+  it; after a review, comments wait for a move to Ready.
 - A tool pushes a repair (red check, merge conflict, base moved on)
   only while the pull request has no submitted review, at most twice
   in a row; a comment by someone other than the tool's person, with

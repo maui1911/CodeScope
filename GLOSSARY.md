@@ -71,7 +71,7 @@ A choice in the findings that the user makes before the item goes to Ready, with
 _Avoid_: question, open point
 
 **Implementation**:
-The phase in which the agent changes the code for an item: for an issue, its first round opens a pull request; review rounds and repairs then keep working on that pull request, or on the pull request the item is.
+The phase in which the agent changes the code for an item: for an issue, its first round opens a pull request, and review rounds and repairs keep working on it; for a pull request item, review rounds work on that pull request.
 _Avoid_: build, fix
 
 **Review round**:
