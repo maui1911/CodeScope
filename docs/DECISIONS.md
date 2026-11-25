@@ -879,7 +879,8 @@ a tab. To move towards a software factory, work should come from a
 board on the host, and CodeScope should carry it out as far as it can
 on its own, in tabs the user can open and steer at any time. The terms
 below (board, board item, trigger and progress column, dispatch,
-phase, findings, needs you) are defined in [GLOSSARY.md](../GLOSSARY.md).
+phase, findings, decision point, needs you, turn, repair) are defined
+in [GLOSSARY.md](../GLOSSARY.md).
 
 **Decision:** a GitHub Projects board is CodeScope's control panel.
 The user moves items into trigger columns; CodeScope dispatches them
@@ -901,7 +902,9 @@ and reports progress back on the board.
   workflows (item closed, pull request merged), which are on by
   default on a new board. Column names are mapped to these roles once
   per board. Research is optional: an item moved straight to *Ready*
-  skips it.
+  skips it. The board panel names every role that has no column yet;
+  the user adds it on GitHub, because rewriting the options of the
+  status field through the API can regenerate their ids.
 * **Writing rule.** CodeScope changes an item's status only while it
   still holds the status CodeScope set last. A manual move ends
   CodeScope's say over that item, and an item GitHub has already moved
@@ -915,13 +918,35 @@ and reports progress back on the board.
   and post as the user; a workflow or another person must not be able
   to start one.
 * **One item, one worktree, one session, two phases.** *Research*
-  ends when the agent has posted its findings (a comment with a
-  marker, on the issue or, for a pull request item, on the PR) and the
-  session is idle. *Implementation* ends when the agent's pull request
-  is open. The agent posts both itself, with `gh`. Moving an item to
-  *Ready* after research sends the implementation prompt into the same
-  session, resumed if its tab was closed; if the session is lost, a new
-  one starts from the findings.
+  ends when the agent has written its findings to
+  `.codescope/findings.md` in the worktree and the session is idle.
+  CodeScope checks that the findings have the expected sections, tells
+  the session what is missing if they don't, and posts them itself: a
+  comment with a marker and a closing *Next step* line, on the issue
+  or, for a pull request item, on the PR. Open choices are *decision
+  points* (B1, B2, …, each with lettered options and the agent's
+  advice); findings with decision points move the item to *Needs
+  decision*. *Implementation* ends when the agent's pull request is
+  open. Moving an item to *Ready* after research sends the
+  implementation prompt into the same session, resumed if its tab was
+  closed; if the session is lost, a new one starts from the findings.
+* **Answers.** The needs-you dialog shows decision points as choices
+  with the advice selected. The answer is posted on the issue as a
+  comment ("B1 A, B2 B") and sent into the session. A comment the user
+  writes on the item's issue or pull request after the findings or the
+  PR is sent into the session as well, so the user can also answer
+  from GitHub. Comments by anyone else are shown and start nothing.
+* **Manual testing decides what comes after the PR.** When the agent
+  could test everything automatically, it opens a ready pull request
+  and the item moves to *In review*. When something needs testing by
+  hand (UI, another OS), it opens a draft with a test instruction in
+  the body; the item stays in *In progress* and needs the user. *Ready
+  for review* in the item drawer marks the PR ready, requests the
+  reviewers from the project's settings and moves the item to
+  *In review*.
+* **Turn.** Every dispatched item shows whose turn it is (agent, CI,
+  you, reviewers, nobody) and since when, worked out from the same
+  reads. *You* is the same as *needs you*.
 * **Branch and link.** The branch is `<number>-<slug>`, the `gh issue
   develop` default, and can be edited in the manual dispatch dialog.
   Research uses it as a local branch. When implementation starts,
@@ -931,14 +956,28 @@ and reports progress back on the board.
   the item, so CodeScope knows the link without a query and after
   GitHub drops the branch link once the PR exists. A pull request item
   is worked on in a worktree on its own branch.
-* **Per-project configuration is local** (`projects.json`): a setup
-  command run after the worktree is created, the agent per phase and a
-  prompt template per phase, with built-in defaults. Not a file in the
-  repository, because shared repositories are not the user's to
-  commit to.
+* **Prompts and setup can live in the repository.** Each round starts
+  from a prompt (research, implementation, review, repair), and a new
+  worktree gets a setup command. For each, the first that exists wins:
+  `.codescope/prompts/<name>.md` or `.codescope/setup` in the
+  repository; a local override in `projects.json`, for repositories
+  that are not the user's to commit to; CodeScope's built-in default.
+  Repository files are read from the default branch in the project
+  folder, never from the item's branch, so a pull request cannot
+  decide what runs with the user's rights. Project settings show which
+  source is used. CodeScope always appends its own handover rules to
+  the prompt (where the findings go, the decision-point format, when
+  to open a draft), so a repository prompt describes the work and
+  cannot break the handover. Skills need nothing from CodeScope: an
+  agent such as Claude Code finds the repository's skills in the
+  worktree, so a prompt can be a single skill call. The agent per
+  phase stays local, because it depends on which CLIs the user has.
 * **Polling, not push.** Each board is read every 30 s while the app
   runs, panel open or not, with a hand-written `gh api graphql` query
-  (about 1 point). `gh project item-list` fetches every field value
+  (about 1 point per 100 items). The latest comments, mergeability and
+  check status are read only for dispatched items: asking them for
+  every item makes the query several times as expensive.
+  `gh project item-list` fetches every field value
   and costs about 101 points per 100 items, so polling it once a
   minute would exceed the 5,000-point hourly limit. There is no push
   for a desktop app: the `projects_v2_item` webhook is organisation
@@ -957,11 +996,19 @@ and reports progress back on the board.
   (`agents::claude::telemetry`, `agents::codex::telemetry`). The
   permission mode comes from the phase's agent profile; CodeScope does
   not override it.
-* **After review.** Red CI: CodeScope prompts the session to fix it,
-  at most twice per PR, then the dispatch *needs you*. Review comments
-  are the user's to handle in the tab, or to hand back by moving the
-  item to *Ready*, which prompts the same session to address the
-  review.
+* **Repair.** On a red check, a merge conflict, or a base branch the
+  pull request must catch up with, CodeScope sends the repair prompt
+  into the session. A repair fixes only that and leaves review
+  comments alone. At most two attempts in a row; a comment by the user
+  starts the count again. The session stops and the dispatch *needs
+  you* when a conflict involves a functional choice, or when the
+  failure does not come from its branch (the base is red too, a flaky
+  test). Repairs run only while the pull request has no submitted
+  review, because a push after a review invalidates approvals.
+* **After review.** Review comments are the user's to handle in the
+  tab, or to hand back by moving the item to *Ready*, which sends the
+  review prompt into the same session; it repairs whatever is red or
+  conflicting as well.
 * **Cleanup.** Merged: worktree removed, session closed, history kept
   ([ADR-0015](#adr-0015)). Closed without a PR: removed only when the
   worktree is clean and has no commits of its own, otherwise the row
@@ -980,9 +1027,12 @@ and reports progress back on the board.
 **Consequences:**
 
 * CodeScope writes to GitHub for the first time: statuses, linked
-  branches and draft conversions. Comments and pull requests come from
-  the agent, so a research phase needs an agent that can run `gh`, and
-  findings are recognised only if the agent keeps the marker.
+  branches, draft conversions, findings, answers to decision points,
+  and marking a draft ready with its reviewers. Pull requests and
+  pushes come from the agent, so implementation needs an agent that
+  can run `gh`; research works with any agent that can write a file.
+* A repository that adds `.codescope/` changes what every dispatch on
+  it does, for every user of CodeScope.
 * Linked branches are in public preview. If they change, the worktree
   row still holds the link, and the PR needs `Closes #N`, which a
   Gitea implementation needs anyway.

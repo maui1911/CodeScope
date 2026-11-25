@@ -54,10 +54,22 @@ _Avoid_: triage, investigation, analysis
 The comment on the item's issue or pull request in which research records the cause, the approach and open questions; the handover to implementation.
 _Avoid_: report, research notes
 
+**Decision point**:
+A choice in the findings that the user makes before implementation, with lettered options and the agent's advice.
+_Avoid_: question, open point
+
 **Implementation**:
 The phase in which the agent changes the code for an item and opens a pull request.
 _Avoid_: build, fix
 
+**Repair**:
+A round in implementation in which the agent makes its own pull request mergeable again after a red check, a merge conflict or a base branch that moved on, without handling review comments.
+_Avoid_: fix-up, auto-fix, retry
+
 **Needs you**:
-The state of a dispatch that cannot go on without the user: its session waits for input, or CodeScope needs a choice before it can start.
+The state of a dispatch that cannot go on without the user: its session waits for input, a decision point is open, a draft pull request waits to be tested by hand, or CodeScope needs a choice before it can start.
 _Avoid_: blocked, stuck, waiting
+
+**Turn**:
+Who a dispatch is waiting on: the agent, CI, the user, the reviewers, or nobody. The user's turn is needs you.
+_Avoid_: owner, assignee, status
