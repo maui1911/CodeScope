@@ -487,7 +487,7 @@ fn handover_rules(round: Round, number: u32, repository: &str) -> Vec<String> {
         Round::Implementation => vec![
             format!(
                 "Push the branch and open a pull request against {repository} with \
-                 `gh pr create`. Its body says `Closes #{number}`."
+                 `gh pr create --assignee @me`. Its body says `Closes #{number}`."
             ),
             "When everything was tested automatically, open it ready for review. When \
              something needs testing by hand, such as how a screen looks or another operating \
@@ -1096,6 +1096,7 @@ mod tests {
         let implementation = task_file(&dispatch(Round::Implementation, MOVED), None);
         assert!(implementation.contains("Implement the issue."), "{implementation}");
         assert!(implementation.contains("Closes #411"));
+        assert!(implementation.contains("--assignee @me"));
         assert!(implementation.contains("## Test by hand"));
 
         let review = task_file(&dispatch(Round::Review, MOVED), None);
