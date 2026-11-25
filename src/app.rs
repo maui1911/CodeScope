@@ -4110,6 +4110,7 @@ impl AppShell {
         let font_changed = self.settings.font != settings.font;
         self.settings = Arc::new(settings);
         self.theme = theme.clone();
+        self.agent_registry = agent_registry.clone();
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.apply_theme(theme, cx);
             sidebar.apply_agent_registry(agent_registry, cx);
