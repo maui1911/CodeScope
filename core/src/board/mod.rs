@@ -61,10 +61,20 @@ impl BoardRef {
             self.owner, self.number
         )
     }
+
+    /// Whether both name one board; logins are compared without case, as GitHub does.
+    pub fn same_board(&self, other: &BoardRef) -> bool {
+        self.owner_kind == other.owner_kind
+            && self.number == other.number
+            && self.owner.eq_ignore_ascii_case(&other.owner)
+    }
 }
 
+/// Letters, digits, `-` and `_` (managed accounts end in `_<shortcode>`), not starting with `-`.
 fn is_login(s: &str) -> bool {
-    !s.is_empty() && !s.starts_with('-') && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    !s.is_empty()
+        && !s.starts_with('-')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// One column of a board; `id` is opaque and only meaningful to its host.
@@ -479,6 +489,26 @@ mod tests {
             "https://gitlab.com/users/maui1911/projects/1",
         ] {
             assert_eq!(BoardRef::parse_url(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn parses_logins_with_an_underscore() {
+        let board = BoardRef::parse_url("https://github.com/users/jdoe_acme/projects/2").unwrap();
+        assert_eq!(board.owner, "jdoe_acme");
+    }
+
+    #[test]
+    fn the_same_board_under_another_casing_is_the_same_board() {
+        let known = BoardRef::parse_url("https://github.com/users/maui1911/projects/3").unwrap();
+        let same = BoardRef::parse_url("github.com/users/Maui1911/projects/3").unwrap();
+        assert!(known.same_board(&same));
+        for other in [
+            "https://github.com/users/maui1911/projects/4",
+            "https://github.com/orgs/maui1911/projects/3",
+            "https://github.com/users/maui1912/projects/3",
+        ] {
+            assert!(!known.same_board(&BoardRef::parse_url(other).unwrap()), "{other}");
         }
     }
 
