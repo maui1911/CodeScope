@@ -135,6 +135,9 @@ pub enum Hold {
     /// A session runs in the item's worktree and isn't waiting for a prompt, so the task can't
     /// be handed to it yet.
     SessionBusy,
+    /// Claude Code waits for a prompt in a tab on the item's worktree, but the user typed there
+    /// since their last Enter, so the task would join a draft.
+    UnsentInput,
     /// Something other than an idle Claude Code runs in a tab on the item's worktree, or what
     /// runs there can't be read; only the user can free that tab.
     OtherProgram,
@@ -172,6 +175,9 @@ impl Hold {
             }
             Hold::LimitReached(limit) => format!("Waits: {limit} dispatches are running"),
             Hold::SessionBusy => "Waits for the session in its worktree to be idle".into(),
+            Hold::UnsentInput => {
+                "Waits for Enter in its session's tab: something was typed there".into()
+            }
             Hold::OtherProgram => {
                 "Waits: quit what runs in its worktree's tab, or close the tab".into()
             }
@@ -1049,6 +1055,15 @@ mod tests {
         assert_eq!(
             Hold::SessionBusy.label(),
             "Waits for the session in its worktree to be idle"
+        );
+    }
+
+    #[test]
+    fn a_round_waiting_on_unsent_typing_says_what_frees_it() {
+        assert!(!Hold::UnsentInput.is_quiet());
+        assert_eq!(
+            Hold::UnsentInput.label(),
+            "Waits for Enter in its session's tab: something was typed there"
         );
     }
 

@@ -118,6 +118,7 @@ struct Launch {
 enum TabAtHandover {
     Shell,
     IdleClaude,
+    Draft,
     Busy,
     Other,
 }
@@ -147,8 +148,9 @@ fn tab_at_handover(tab: &TabProbe) -> TabAtHandover {
     }
     match (tab.running, tab.claude_idle) {
         (Some([]), _) => TabAtHandover::Shell,
-        (Some(_), Some(true)) if !tab.typed => TabAtHandover::IdleClaude,
-        (Some(_), Some(_)) => TabAtHandover::Busy,
+        (Some(_), Some(true)) if tab.typed => TabAtHandover::Draft,
+        (Some(_), Some(true)) => TabAtHandover::IdleClaude,
+        (Some(_), Some(false)) => TabAtHandover::Busy,
         _ => TabAtHandover::Other,
     }
 }
@@ -165,6 +167,8 @@ fn handover_to(tabs: &[TabAtHandover]) -> Handover {
         Handover::Type(index)
     } else if tabs.contains(&TabAtHandover::Busy) {
         Handover::Wait(Hold::SessionBusy)
+    } else if tabs.contains(&TabAtHandover::Draft) {
+        Handover::Wait(Hold::UnsentInput)
     } else if tabs.contains(&TabAtHandover::Other) {
         Handover::Wait(Hold::OtherProgram)
     } else {
@@ -930,7 +934,7 @@ mod tests {
         use TabAtHandover::*;
         assert_eq!(tab(Some(&[]), None, false), Shell);
         assert_eq!(tab(Some(&[7]), Some(true), false), IdleClaude);
-        assert_eq!(tab(Some(&[7]), Some(true), true), Busy);
+        assert_eq!(tab(Some(&[7]), Some(true), true), Draft);
         assert_eq!(tab(Some(&[7]), Some(false), false), Busy);
         assert_eq!(tab(Some(&[7]), None, false), Other, "another agent, or any other program");
         assert_eq!(tab(None, None, false), Other, "nothing known about its processes");
@@ -968,5 +972,7 @@ mod tests {
         assert_eq!(handover_to(&[Shell, Busy]), Handover::Wait(Hold::SessionBusy));
         assert_eq!(handover_to(&[Other, Shell]), Handover::Wait(Hold::OtherProgram));
         assert_eq!(handover_to(&[Other, Busy]), Handover::Wait(Hold::SessionBusy));
+        assert_eq!(handover_to(&[Other, Draft]), Handover::Wait(Hold::UnsentInput));
+        assert_eq!(handover_to(&[Draft, Busy]), Handover::Wait(Hold::SessionBusy));
     }
 }
