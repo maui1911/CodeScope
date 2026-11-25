@@ -209,10 +209,12 @@ pub fn can_write(repository: &str, login: &str) -> Result<bool> {
 fn write_access(permission: Result<String>) -> Result<bool> {
     match permission {
         Ok(permission) => Ok(matches!(permission.trim(), "admin" | "maintain" | "write")),
-        Err(err) if ["HTTP 403", "HTTP 404"].iter().any(|s| err.to_string().contains(s)) => {
-            Ok(false)
+        Err(err) => {
+            let message = err.to_string();
+            let refused = message.contains("HTTP 404")
+                || (message.contains("HTTP 403") && message.contains("Must have push access"));
+            if refused { Ok(false) } else { Err(err) }
         }
-        Err(err) => Err(err),
     }
 }
 
@@ -699,8 +701,7 @@ mod tests {
     #[test]
     fn write_access_is_only_what_github_confirms() {
         for (permission, can_write) in
-            [("admin
-", true), ("maintain", true), ("write", true), ("read", false)]
+            [("admin\n", true), ("maintain", true), ("write", true), ("read", false)]
         {
             assert_eq!(write_access(Ok(permission.into())).unwrap(), can_write, "{permission}");
         }
@@ -710,6 +711,12 @@ mod tests {
             "gh: Must have push access to view collaborator permission. (HTTP 403)"
         );
         assert!(!write_access(Err(viewer_cant_push)).unwrap());
-        assert!(write_access(Err(anyhow::anyhow!("connection reset"))).is_err());
+        for refused in [
+            "Resource protected by organization SAML enforcement. (HTTP 403)",
+            "API rate limit exceeded for user ID 1. (HTTP 403)",
+            "connection reset",
+        ] {
+            assert!(write_access(Err(anyhow::anyhow!(refused))).is_err(), "{refused}");
+        }
     }
 }
