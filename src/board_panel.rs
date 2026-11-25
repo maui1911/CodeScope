@@ -120,6 +120,7 @@ impl AppShell {
                     }
                     this.stamp_board_added_at(cx);
                     this.run_dispatch(window, cx);
+                    this.collect_findings(cx);
                     this.begin_board_read(false, cx)
                 }) else {
                     break;
@@ -901,6 +902,7 @@ fn render_card(
             let color = match note.tone {
                 NoteTone::Working => theme::accent(theme),
                 NoteTone::Waiting => theme::ink_muted(theme),
+                NoteTone::NeedsYou => theme::signal_review(),
                 NoteTone::Failed => theme::danger(),
             };
             div()

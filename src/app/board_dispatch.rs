@@ -1,20 +1,25 @@
 //! Dispatch (ADR-0027): after each board read, start a round for every item the user moved
-//! into a trigger column, in a worktree of its own with an agent session on it.
+//! into a trigger column, in a worktree of its own with an agent session on it. When a research
+//! round's session is idle with its findings written, post them on the issue.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use codescope_core::agents::claude::live_session;
 use codescope_core::board::dispatch::{
-    Facts, Hold, ProjectRemotes, Round, StatusChange, WorktreeDispatch, add_dispatch_worktree,
-    branch_name, counts_towards_limit, decide, exclude_handover_files, find_skill, launch_with_task,
-    mover_to_check, projects_for_repository, task_file, task_message, trigger_content_ids,
-    write_task_file,
+    FINDINGS_FILE, Facts, Hold, PostedFindings, ProjectRemotes, Round, StatusChange,
+    WorktreeDispatch, add_dispatch_worktree, branch_name, clear_findings, counts_towards_limit,
+    decide, exclude_handover_files, find_skill, launch_with_task, mover_to_check,
+    moves_to_needs_decision, projects_for_repository, task_file, task_message,
+    trigger_content_ids, write_task_file,
+};
+use codescope_core::board::findings::{
+    Findings, Outcome, Problem, check_findings, comment_body, problems_message,
 };
 use codescope_core::board::github::{self, Viewer};
 use codescope_core::board::{
-    Board, BoardItem, BoardRef, ColumnMapping, effective_mapping, mapped_column,
+    Board, BoardItem, BoardRef, ColumnMapping, ColumnRole, effective_mapping, mapped_column,
 };
 use codescope_core::path_canon::paths_match;
 use codescope_core::process_tree;
@@ -32,6 +37,8 @@ const ACCESS_EXPIRES_AFTER: Duration = Duration::from_secs(600);
 /// Text and Enter in one write can reach an agent's prompt as a paste, whose Enter is a newline.
 const SUBMIT_AFTER_TYPING: Duration = Duration::from_millis(200);
 const LAUNCH_GRACE: Duration = Duration::from_secs(30);
+const MAX_REMINDERS: u32 = 3;
+const POST_RETRY: Duration = Duration::from_secs(120);
 
 #[derive(Default)]
 pub(crate) struct DispatchState {
@@ -47,6 +54,36 @@ pub(crate) struct DispatchState {
     /// Item id → the move that failed to start, and why.
     failed: HashMap<String, (String, String)>,
     holds: HashMap<String, Hold>,
+    /// Items whose findings are being posted.
+    posting: HashSet<String>,
+    /// Item id → findings posted but not yet saved to `projects.json`.
+    posted: HashMap<String, PostedFindings>,
+    /// Item id → when posting failed, and why.
+    post_errors: HashMap<String, (Instant, String)>,
+    /// Item id → what is wrong with its findings and what the session was told.
+    reminders: HashMap<String, Reminder>,
+}
+
+struct Reminder {
+    problems: String,
+    /// Modified time and length of the file the last reminder was about.
+    file: Option<(Option<SystemTime>, u64)>,
+    sent: u32,
+}
+
+/// The session on a worktree, as the findings pass needs it.
+enum SessionAt {
+    NoTab,
+    Idle(Entity<TerminalView>),
+    Busy,
+}
+
+struct Posting {
+    project_id: String,
+    path: PathBuf,
+    branch: String,
+    record: WorktreeDispatch,
+    outcome: Outcome,
 }
 
 /// What a board read needs from the app, taken on the foreground.
@@ -84,6 +121,7 @@ pub(crate) struct CardNote {
 pub(crate) enum NoteTone {
     Working,
     Waiting,
+    NeedsYou,
     Failed,
 }
 
@@ -292,6 +330,9 @@ fn prepare_worktree(job: &Job) -> anyhow::Result<()> {
         add_dispatch_worktree(&job.repo, &job.path, &job.branch, &job.remote)?;
     }
     exclude_handover_files(&job.path)?;
+    if job.record.round == Round::Research {
+        clear_findings(&job.path)?;
+    }
     let home = codescope_core::paths::home_dir();
     let skill = find_skill(&job.path, home.as_deref(), job.record.round.skill()).map(|skill| {
         skill
@@ -448,6 +489,10 @@ impl AppShell {
         let on_board = self
             .dispatch_records(cx)
             .iter()
+            .filter(|(_, _, _, record)| {
+                let posted = self.board.dispatch.posted.contains_key(&record.item_id);
+                record.findings.is_none() && !posted
+            })
             .filter(|(_, _, _, record)| {
                 let Some(read) = self.board.reads_by_url.get(&record.board_url) else {
                     return false;
@@ -695,6 +740,7 @@ impl AppShell {
                 url,
                 round,
                 trigger_at: trigger_at.clone(),
+                findings: None,
             },
             assign_to: item.assignees.is_empty().then_some(content_id),
             board,
@@ -903,6 +949,251 @@ impl AppShell {
         }
     }
 
+    /// Post the findings of every research round whose session is idle, or tell the session what
+    /// to fix first.
+    pub(crate) fn collect_findings(&mut self, cx: &mut Context<Self>) {
+        for (project_id, path, branch, record) in self.dispatch_records(cx) {
+            let state = &self.board.dispatch;
+            let waiting_to_retry = state
+                .post_errors
+                .get(&record.item_id)
+                .is_some_and(|(at, _)| at.elapsed() < POST_RETRY);
+            if !record.awaits_findings()
+                || state.posting.contains(&record.item_id)
+                || state.posted.contains_key(&record.item_id)
+                || waiting_to_retry
+            {
+                continue;
+            }
+            let file = path.join(FINDINGS_FILE);
+            let Ok(metadata) = std::fs::metadata(&file) else {
+                continue;
+            };
+            let session = self.session_at(&path);
+            if matches!(session, SessionAt::Busy) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            match check_findings(&text) {
+                Ok(findings) => {
+                    let posting = Posting {
+                        project_id,
+                        path,
+                        branch: branch.unwrap_or_default(),
+                        outcome: findings.outcome(),
+                        record,
+                    };
+                    self.post_findings(posting, &text, &findings, cx);
+                }
+                Err(problems) => {
+                    let stamp = (metadata.modified().ok(), metadata.len());
+                    self.remind(&record.item_id, stamp, session, &problems, cx);
+                }
+            }
+        }
+    }
+
+    fn session_at(&self, path: &Path) -> SessionAt {
+        let Some(tab) = self
+            .groups
+            .iter()
+            .flat_map(|g| g.tabs.iter())
+            .find(|t| t.working_directory.as_deref() == Some(path))
+        else {
+            return SessionAt::NoTab;
+        };
+        let idle = tab
+            .adopted_session_id
+            .as_deref()
+            .and_then(|sid| self.telemetry_for(sid))
+            .is_some_and(|snap| super::notified_state(&snap) == codescope_core::SessionState::Idle);
+        if idle {
+            SessionAt::Idle(tab.terminal.clone())
+        } else {
+            SessionAt::Busy
+        }
+    }
+
+    fn remind(
+        &mut self,
+        item_id: &str,
+        file: (Option<SystemTime>, u64),
+        session: SessionAt,
+        problems: &[Problem],
+        cx: &mut Context<Self>,
+    ) {
+        let message = problems_message(problems);
+        let reminder = self
+            .board
+            .dispatch
+            .reminders
+            .entry(item_id.to_string())
+            .or_insert(Reminder {
+                problems: String::new(),
+                file: None,
+                sent: 0,
+            });
+        reminder.problems = problems
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        if reminder.file == Some(file) || reminder.sent >= MAX_REMINDERS {
+            return;
+        }
+        let SessionAt::Idle(terminal) = session else {
+            return;
+        };
+        if terminal.read(cx).typed_since_submit() {
+            return;
+        }
+        reminder.file = Some(file);
+        reminder.sent += 1;
+        terminal.update(cx, |term, _| {
+            let mut bytes = message.into_bytes();
+            bytes.push(b'\r');
+            term.write_input(bytes);
+        });
+        cx.notify();
+    }
+
+    fn post_findings(
+        &mut self,
+        posting: Posting,
+        text: &str,
+        findings: &Findings,
+        cx: &mut Context<Self>,
+    ) {
+        let record = &posting.record;
+        let target = self.board.reads_by_url.get(&record.board_url).and_then(|read| {
+            let board = read.last_good.as_ref()?;
+            let settings = self.settings.boards.iter().find(|b| b.url == record.board_url)?;
+            let mapping = effective_mapping(board, &settings.columns);
+            let role = board
+                .items
+                .iter()
+                .find(|item| item.id == record.item_id)
+                .and_then(|item| board.role_of(item, &mapping));
+            if !moves_to_needs_decision(posting.outcome, role) {
+                return None;
+            }
+            let column = mapped_column(board, &mapping, ColumnRole::NeedsDecision)?;
+            Some((board.clone(), column.id.clone()))
+        });
+        let body = comment_body(text, findings);
+        let content_id = record.content_id.clone();
+        let item_id = record.item_id.clone();
+        let state = &mut self.board.dispatch;
+        state.posting.insert(item_id.clone());
+        state.reminders.remove(&item_id);
+        state.post_errors.remove(&item_id);
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let url = github::add_comment(&content_id, &body)
+                        .map_err(|err| format!("{err:#}"))?;
+                    let moved = match target {
+                        Some((board, column)) => github::set_status(&board, &item_id, &column)
+                            .map_err(|err| format!("{err:#}"))
+                            .err(),
+                        None => None,
+                    };
+                    Ok::<_, String>((url, moved))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| this.finish_posting(posting, result, cx));
+        })
+        .detach();
+    }
+
+    fn finish_posting(
+        &mut self,
+        posting: Posting,
+        result: Result<(String, Option<String>), String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Posting {
+            project_id,
+            path,
+            branch,
+            mut record,
+            outcome,
+        } = posting;
+        let state = &mut self.board.dispatch;
+        state.posting.remove(&record.item_id);
+        let (comment_url, move_error) = match result {
+            Ok(posted) => posted,
+            Err(message) => {
+                state
+                    .post_errors
+                    .insert(record.item_id.clone(), (Instant::now(), message.clone()));
+                self.push_toast(
+                    ToastKind::Err,
+                    format!("Couldn't post the findings of #{}", record.number),
+                    Some(message.into()),
+                    cx,
+                );
+                return;
+            }
+        };
+        let posted = PostedFindings {
+            outcome,
+            comment_url,
+        };
+        state.posted.insert(record.item_id.clone(), posted.clone());
+        record.findings = Some(posted);
+
+        let path_text = path.to_string_lossy().into_owned();
+        let saved = ProjectsConfig::load(&self.paths)
+            .map_err(|err| format!("{err:#}"))
+            .and_then(|mut next| {
+                if !record_dispatch(&mut next, &project_id, &path_text, &branch, record.clone()) {
+                    return Err("the project no longer tracks the worktree".to_string());
+                }
+                next.save(&self.paths).map_err(|err| format!("{err:#}"))?;
+                Ok(next)
+            });
+        match saved {
+            Ok(next) => {
+                self.board.dispatch.posted.remove(&record.item_id);
+                self.projects = next.clone();
+                self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.replace_projects(next);
+                    cx.notify();
+                });
+            }
+            Err(err) => eprintln!("warning: couldn't record the posted findings: {err}"),
+        }
+
+        let title = format!("Findings on #{}", record.number);
+        let next_step = match outcome {
+            Outcome::DecisionPoints => "Answer the decision points on the issue.",
+            Outcome::Findings => "Move the item to Ready to implement it.",
+        };
+        let detail = match &move_error {
+            Some(err) => format!("{next_step} Couldn't move it to Needs decision: {err}"),
+            None => next_step.to_string(),
+        };
+        let kind = if move_error.is_some() {
+            ToastKind::Err
+        } else {
+            ToastKind::Ok
+        };
+        self.push_toast(kind, title.clone(), Some(detail.clone().into()), cx);
+        self.push_notification(
+            crate::notifications::NotificationKind::SessionReady,
+            title,
+            detail,
+            Some(record.title.clone().into()),
+            cx,
+        );
+        cx.notify();
+    }
+
     /// What each card on the board at `board_url` says about dispatch, by item id.
     pub(crate) fn card_notes(&self, board_url: &str, cx: &App) -> HashMap<String, CardNote> {
         let state = &self.board.dispatch;
@@ -911,19 +1202,59 @@ impl AppShell {
             .into_iter()
             .filter(|(_, _, _, r)| r.board_url == board_url)
             .map(|(_, _, branch, r)| {
-                let text = match branch {
-                    Some(branch) => format!("{} · {branch}", r.round.label()),
-                    None => r.round.label().to_string(),
-                };
-                (
-                    r.item_id,
-                    CardNote {
-                        text: text.into(),
+                let posted = r
+                    .findings
+                    .as_ref()
+                    .or_else(|| state.posted.get(&r.item_id))
+                    .filter(|_| r.round == Round::Research);
+                let note = match (posted.map(|p| p.outcome), branch) {
+                    (Some(Outcome::DecisionPoints), _) => CardNote {
+                        text: "Decision points posted · answer on the issue".into(),
+                        tone: NoteTone::NeedsYou,
+                    },
+                    (Some(Outcome::Findings), _) => CardNote {
+                        text: "Findings posted · move it to Ready".into(),
+                        tone: NoteTone::NeedsYou,
+                    },
+                    (None, Some(branch)) => CardNote {
+                        text: format!("{} · {branch}", r.round.label()).into(),
                         tone: NoteTone::Working,
                     },
-                )
+                    (None, None) => CardNote {
+                        text: r.round.label().into(),
+                        tone: NoteTone::Working,
+                    },
+                };
+                (r.item_id, note)
             })
             .collect();
+        for item_id in &state.posting {
+            notes.insert(
+                item_id.clone(),
+                CardNote {
+                    text: "Posting the findings…".into(),
+                    tone: NoteTone::Working,
+                },
+            );
+        }
+        for (item_id, reminder) in &state.reminders {
+            notes.insert(
+                item_id.clone(),
+                CardNote {
+                    text: format!("Findings incomplete: {}", reminder.problems).into(),
+                    tone: NoteTone::Failed,
+                },
+            );
+        }
+        for (item_id, (_, message)) in &state.post_errors {
+            notes.insert(
+                item_id.clone(),
+                CardNote {
+                    text: format!("Couldn't post the findings: {message}").into(),
+                    tone: NoteTone::Failed,
+                },
+            );
+        }
         for (item_id, hold) in &state.holds {
             if !hold.is_quiet() {
                 notes.insert(
