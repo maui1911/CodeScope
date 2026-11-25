@@ -945,12 +945,15 @@ and reports progress back on the board.
   only, in preview, and needs a public URL. Triggers made while
   CodeScope is closed are picked up at the next launch.
 * **Limits and attention.** At most three dispatches run at once (a
-  setting); the rest wait in their trigger column. An OS notification
-  fires when findings are ready, when a dispatch *needs you*, and when
-  a session may be waiting on the user: idle without findings or PR,
-  or in a pending tool call for over three minutes without its
-  transcript growing. A permission prompt writes nothing until it is
-  answered, so it cannot be told apart from a long tool call
+  setting); the rest wait in their trigger column. The existing OS
+  toast (`idle_notifier`) and an entry in the in-app bell fire when
+  findings are ready, when a dispatch *needs you*, and when a session
+  may be waiting on the user: idle without findings or PR, or in a
+  pending tool call for over three minutes without its transcript
+  growing. `notify_rust` cannot route a click on a Windows toast, so
+  the bell entry is what opens the tab. A permission prompt writes
+  nothing until it is answered, so it cannot be told apart from a long
+  tool call
   (`agents::claude::telemetry`, `agents::codex::telemetry`). The
   permission mode comes from the phase's agent profile; CodeScope does
   not override it.
