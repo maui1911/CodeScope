@@ -57,12 +57,18 @@ uses these names.
 
 ## Rounds
 
-A move into Research starts research. A move into Ready starts
-implementation on an issue without an open pull request, and a review
-round on the tool's own pull request or on a pull request item; an
-issue with an open pull request from elsewhere waits for a person.
-Implementation and review rounds move the item to In progress when
-they start, and to In review when they end with a ready pull request.
+A move into Research starts the research round. A move into Ready
+starts the implementation round on an issue without an open pull
+request, and a review round on the tool's own pull request or on a
+pull request item; an issue with an open pull request from elsewhere
+waits for a person. The implementation round and review rounds move
+the item to In progress when they start, and to In review once their
+pull request is ready: when the round ends with a ready pull request,
+or when its draft is marked ready later, by anyone.
+
+Repairs, and forwarding a comment into the session, are only for the
+pull request the tool opened. A pull request item is worked on only in
+the rounds a person's move starts.
 
 ## Comments
 
@@ -76,13 +82,14 @@ A comment that carries a result ends with a marker on its own line:
 | --- | --- | --- |
 | `research` | `findings` | Cause and approach, no open choices; the item is in Needs decision and can go to Ready |
 | `research` | `decision-points` | Findings with open choices; the item is in Needs decision |
-| `implementation` | `pull-request` | The pull request is open, after implementation or again after a review round or a repair |
+| `implementation` | `pull-request` | The pull request is open, after the implementation round or again after a review round or a repair |
 
 `phase` is `research` or `implementation`; a review round and a repair
-are rounds in implementation. The tool working on the item posts these
-comments, on its issue, or on the pull request when the item is one.
-An agent posts no comments of its own there: they would look like its
-person's.
+are rounds of the implementation phase. The tool working on the item
+posts these comments, on its issue, or on the pull request when the
+item is one. An agent posts no comments of its own there: they would
+look like its person's. In a review round it may reply in the review
+threads it handles.
 `by` names the tool, for example `codescope`; nothing depends on it.
 The line before the marker starts with `**Next step:**` and says what
 a person does next.
@@ -119,8 +126,8 @@ free text. Free text alone is an answer too.
 - A ready pull request was tested automatically: the item moves to In
   review.
 - A draft pull request has a section `## Test by hand` in its body: a
-  person tests it first, and marking it ready moves the item to In
-  review.
+  person tests it first. Once it is marked ready, by anyone, the tool
+  moves the item to In review.
 - A tool pushes a repair (red check, merge conflict, base moved on)
   only while the pull request has no submitted review, at most twice
   in a row; a comment by someone other than the tool's person, with

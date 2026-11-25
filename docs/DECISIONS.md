@@ -896,8 +896,8 @@ board, each with their own CodeScope or another tool that follows the
   (`origin` is often a fork, the issues live on `upstream`). When
   several projects match, the user picks once per board. A draft issue
   is not dispatched: it has no repository and no timeline that says
-  who moved it. It waits, with that reason on its card, until a person
-  converts it to an issue and moves it again.
+  who moved it. It waits, with that reason shown on it in the board
+  panel, until a person converts it to an issue and moves it again.
 * **Columns.** Two trigger columns, *Research* and *Ready*, are queues
   the user fills. CodeScope moves an item out of the queue into a
   progress column when it starts: *Researching*, *Needs decision*,
@@ -917,8 +917,8 @@ board, each with their own CodeScope or another tool that follows the
   *In review*), once per round. A person's move into a trigger column
   hands the item to CodeScope again; a move to any other column ends
   CodeScope's moves for that round. A move the user makes through
-  CodeScope, such as *Ready* in the needs-you dialog or *Ready for
-  review*, is the user's own move. An item GitHub has moved to *Done*
+  CodeScope, such as *Ready* in the needs-you dialog, is the user's own
+  move. An item GitHub has moved to *Done*
   is left alone. If a board has the older "Pull request linked to
   issue" workflow on, the board panel warns: it can move *In review*
   back to *In progress*, and CodeScope then leaves it there.
@@ -928,7 +928,7 @@ board, each with their own CodeScope or another tool that follows the
   item: on dispatch CodeScope assigns the issue to its user if nobody
   is, and it never dispatches an item assigned only to others. With
   several assignees, only the tool of the assignee who moved the item
-  starts; a move by anyone else waits, with that reason on its card. A
+  starts; a move by anyone else waits, with that reason shown. A
   person runs one tool per board: two CodeScopes of the same person (on
   two computers, or an installed and a dev build) would both take the
   same moves, because GitHub shows both as that person. Another tool
@@ -945,7 +945,7 @@ board, each with their own CodeScope or another tool that follows the
   lead hands out work by assigning it and moving it to *Ready*). Only
   moves made after the board was added count: an item that already
   sits in a trigger column then waits until it is moved again.
-  Anything else waits in its column with the reason on its card; it
+  Anything else waits in its column with the reason shown; it
   *needs you* only when a choice of the user's is all that is missing,
   such as which of several projects. A dispatch hands issue text to an
   agent that can push and post as the user; a workflow or an outsider
@@ -962,12 +962,13 @@ board, each with their own CodeScope or another tool that follows the
   …, each with lettered options and the agent's advice). Posted
   findings move the item to *Needs decision*: the user answers the
   decision points, if there are any, and decides whether it goes to
-  *Ready*. The *implementation* phase starts with the implementation
-  round, which ends when the agent's pull request is open, and goes on
-  through review rounds and repairs until the pull request is merged
-  or closed. Moving an item to *Ready* after research starts the next
-  round in the same session, resumed if its tab was closed. A new
-  session starts in the same worktree from the findings when the
+  *Ready*. For an issue, the *implementation* phase starts with the
+  implementation round, which ends when the agent's pull request is
+  open; for a pull request item it starts with a review round. It goes
+  on through review rounds and repairs until the pull request is
+  merged or closed. Moving an item to *Ready* after research starts
+  the next round in the same session, resumed if its tab was closed.
+  A new session starts in the same worktree from the findings when the
   session is lost, or when the user chose a different CLI for
   implementation.
 * **What a move starts.** A move into *Research* starts the research
@@ -980,20 +981,24 @@ board, each with their own CodeScope or another tool that follows the
     (`address-review`) on that pull request, which ends when the agent
     has pushed and its session is idle;
   * an issue with an open pull request from elsewhere: nothing starts,
-    and the item *needs you*, with that pull request on its card.
+    and the item waits with that pull request shown. To work on that
+    pull request, a person adds it to the board and moves it to
+    *Ready*.
 
   Both rounds move the item to *In progress* when they start, and on
-  to *In review* when they end with a ready pull request; with a draft
-  it stays in *In progress*. A round that stops without its result
-  (findings, a pull request, a push) leaves its session idle, and the
-  dispatch *needs you* until the user steers it in the tab.
+  to *In review* once their pull request is ready: when the round ends
+  with a ready pull request, or when its draft is marked ready later,
+  by anyone. That is the round's one move on. A round that stops
+  without its result (findings, a pull request, a push) leaves its
+  session idle, and the dispatch *needs you* until the user steers it
+  in the tab.
 * **Answers.** The needs-you dialog shows decision points as choices
   with the advice selected. The answer is posted as a comment where
   the findings are ("B1 A, B2 B"), and the dialog can move the item to
   *Ready* afterwards. A comment there after the findings, by anyone
   with write access to the repository, is an answer too, so a designer
   or a teammate can answer from GitHub. The findings and the answers
-  reach the session with the task of the round that *Ready* starts,
+  reach the session with the prompt of the round that *Ready* starts,
   which lists each answer and who gave it. While the item waits in
   *Needs decision* the session gets nothing, so it does not start
   implementing before *Ready*. Comments by others are shown and start
@@ -1003,9 +1008,9 @@ board, each with their own CodeScope or another tool that follows the
   and the item moves to *In review*. When something needs testing by
   hand (UI, another OS), it opens a draft with a test instruction in
   the body; the item stays in *In progress* and needs the user. *Ready
-  for review* in the item drawer marks the PR ready, requests the
-  reviewers from the project's settings and moves the item to
-  *In review*.
+  for review* in the item drawer marks the PR ready and requests the
+  reviewers from the project's settings; the item then moves to
+  *In review* as it does for any draft marked ready.
 * **Turn.** Every dispatched item shows whose turn it is and since
   when, worked out from what is on GitHub alone, so it is the same on
   every teammate's screen: an agent (and whose), CI, a person (*you*,
@@ -1040,7 +1045,8 @@ board, each with their own CodeScope or another tool that follows the
   (where the findings go, the decision-point format, when to open a
   draft, `Closes #N` in the pull request, and no comments of the
   agent's own on the issue or the pull request, because CodeScope
-  posts what a round produces), so a skill describes the work and
+  posts what a round produces; in a review round the agent may reply
+  in the review threads it handles), so a skill describes the work and
   cannot break the handover.
   CodeScope sets no agent per phase: agent definitions in the
   repository (such as `.claude/agents/`) reach the session through the
@@ -1069,9 +1075,9 @@ board, each with their own CodeScope or another tool that follows the
   once (a setting); the rest wait in their trigger column. The existing OS
   toast (`idle_notifier`) and an entry in the in-app bell fire when
   findings are ready, when a dispatch *needs you*, and when a session
-  may be waiting on the user: idle without its round's result, or in a
-  pending tool call for over three minutes without its transcript
-  growing. `notify_rust` cannot route a click on a Windows toast, so
+  may be waiting on the user: in a pending tool call for over three
+  minutes without its transcript growing. `notify_rust` cannot route a
+  click on a Windows toast, so
   the bell entry is what opens the tab. A permission prompt writes
   nothing until it is answered, so it cannot be told apart from a long
   tool call
@@ -1089,14 +1095,17 @@ board, each with their own CodeScope or another tool that follows the
   test). Repairs run only while the pull request has no submitted
   review, because a push after a review invalidates approvals.
 * **After review.** Review comments are the user's to handle in the
-  tab, or to hand back by moving the item to *Ready*, which sends the
-  review skill into the same session; it repairs whatever is red or
+  tab, or to hand back by moving the item to *Ready*, which starts a
+  review round in the same session; it repairs whatever is red or
   conflicting as well. Until the first review is submitted, a
   conversation comment on the agent's pull request by someone else
   with write access is sent into the session. After that, every
   comment waits for *Ready*, because a push after a review invalidates
   approvals. "Someone else" leaves out the user: the agent posts as
-  them, and they steer their own session in its tab.
+  them, and they steer their own session in its tab. Repairs and
+  forwarded comments are only for the pull request the dispatch
+  opened: a pull request item is worked on only in the rounds a
+  person's move starts.
 * **Cleanup.** Merged: worktree removed, session closed, history kept
   ([ADR-0015](#adr-0015--closed-session-retention-policy-100-per-worktree-90-day-ttl)).
   Closed without a PR: removed only when the worktree is clean and has
@@ -1130,7 +1139,7 @@ board, each with their own CodeScope or another tool that follows the
   agreeing on it.
 * Linked branches are in public preview. If they change, the worktree
   row still holds the link, and the pull request says `Closes #N`
-  anyway, which a Gitea implementation needs too. Either way only a
+  anyway, which other hosts understand as well. Either way only a
   merge into the default branch closes the issue.
 * Every added board costs one GraphQL call per 30 s for as long as the
   app runs.
