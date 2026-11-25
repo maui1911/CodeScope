@@ -706,8 +706,9 @@ mod tests {
         }
         let not_a_collaborator = anyhow::anyhow!("gh: Not Found (HTTP 404)");
         assert!(!write_access(Err(not_a_collaborator)).unwrap());
-        let viewer_cant_push =
-            anyhow::anyhow!("gh: Must have push access to view collaborator permission. (HTTP 403)");
+        let viewer_cant_push = anyhow::anyhow!(
+            "gh: Must have push access to view collaborator permission. (HTTP 403)"
+        );
         assert!(!write_access(Err(viewer_cant_push)).unwrap());
         assert!(write_access(Err(anyhow::anyhow!("connection reset"))).is_err());
     }

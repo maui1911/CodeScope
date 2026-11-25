@@ -1338,7 +1338,8 @@ mod tests {
         std::fs::write(
             &path,
             format!(
-                r#"{{"version":1,"projects":[{{"id":"p","name":"p","path":"/p","worktrees":[{}]}}]}}"#,
+                r#"{{"version":1,"projects":[{{"id":"p","name":"p","path":"/p",
+                "worktrees":[{}]}}]}}"#,
                 worktrees.join(",")
             ),
         )

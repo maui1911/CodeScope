@@ -1332,7 +1332,8 @@ mod tests {
         add_dispatch_worktree(&repo, &path, "7-seven", "upstream").unwrap();
         assert_eq!(head(&path, "HEAD"), head(&upstream, "HEAD"));
 
-        let gone = add_dispatch_worktree(&repo, &dir.path().join("x").join("8-x"), "8-x", "nowhere");
+        let elsewhere = dir.path().join("x").join("8-x");
+        let gone = add_dispatch_worktree(&repo, &elsewhere, "8-x", "nowhere");
         assert!(gone.is_err(), "a remote that can't be read is an error, not a fallback");
     }
 
