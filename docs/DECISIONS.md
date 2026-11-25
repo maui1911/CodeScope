@@ -948,10 +948,14 @@ board, each with their own CodeScope or another tool that follows the
   closed; if the session is lost, a new one starts from the findings.
 * **Answers.** The needs-you dialog shows decision points as choices
   with the advice selected. The answer is posted on the issue as a
-  comment ("B1 A, B2 B") and sent into the session. A comment on the
-  item's issue or pull request after the findings or the PR, by anyone
-  with write access to the repository, is sent into the session as
-  well, so a designer or a teammate can answer from GitHub. Comments by
+  comment ("B1 A, B2 B"), and the dialog can move the item to *Ready*
+  afterwards. A comment on the issue after the findings, by anyone with
+  write access to the repository, is an answer too, so a designer or a
+  teammate can answer from GitHub. Answers reach the session with the
+  implementation task, which lists each one and who gave it. While the
+  item waits in *Needs decision* the session gets nothing, so it does
+  not start building before *Ready*. A comment on the pull request by
+  someone with write access is sent into the session. Comments by
   others are shown and start nothing.
 * **Manual testing decides what comes after the PR.** When the agent
   could test everything automatically, it opens a ready pull request
