@@ -1,6 +1,7 @@
-//! Board panel: a read-only view of the boards in `settings.json` (ADR-0027). It takes the
-//! work-area slot the Overview, the Bots inbox and the diff viewer share; opening one closes
-//! the others. Boards are read every 30 s whether or not the panel is on stage.
+//! Board panel: the boards in `settings.json` and what dispatch does with their items
+//! (ADR-0027). It takes the work-area slot the Overview, the Bots inbox and the diff viewer
+//! share; opening one closes the others. Boards are read every 30 s whether or not the panel is
+//! on stage.
 
 use std::collections::HashMap;
 use std::sync::Arc;
