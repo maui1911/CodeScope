@@ -449,8 +449,9 @@ pub fn task_file(dispatch: &WorktreeDispatch, skill: Option<&str>) -> String {
 fn built_in_work(round: Round) -> String {
     match round {
         Round::Research => format!(
-            "Find out what the issue asks for and why it happens. Read the code involved and \
-             name the cause and an approach. Don't change any code; only write `{FINDINGS_FILE}`."
+            "Find out what the issue asks for and, for a bug, why it happens. Read the code \
+             involved and name the cause (for a feature: what is missing) and an approach. Don't \
+             change any code; only write `{FINDINGS_FILE}`."
         ),
         Round::Implementation => format!(
             "Implement the issue. When `{FINDINGS_FILE}` exists it holds the research, and the \
