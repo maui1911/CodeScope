@@ -14,7 +14,7 @@ use codescope_core::board::{
 use codescope_core::{Settings, Theme};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, AppContext as _, Context, Hsla, InteractiveElement, IntoElement, MouseButton,
+    AnyElement, App, AppContext as _, Context, Hsla, InteractiveElement, IntoElement, MouseButton,
     ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 
@@ -119,7 +119,7 @@ impl AppShell {
                         cx.notify();
                     }
                     this.run_dispatch(window, cx);
-                    this.begin_board_read(false)
+                    this.begin_board_read(false, cx)
                 }) else {
                     break;
                 };
@@ -157,7 +157,7 @@ impl AppShell {
     }
 
     pub(crate) fn refresh_boards(&mut self, cx: &mut Context<Self>) {
-        let Some(input) = self.begin_board_read(true) else {
+        let Some(input) = self.begin_board_read(true, cx) else {
             return;
         };
         cx.spawn(async move |this, cx| {
@@ -167,7 +167,7 @@ impl AppShell {
         .detach();
     }
 
-    fn begin_board_read(&mut self, now: bool) -> Option<ReadInput> {
+    fn begin_board_read(&mut self, now: bool, cx: &App) -> Option<ReadInput> {
         let state = &mut self.board;
         let due = now
             || state
@@ -178,7 +178,7 @@ impl AppShell {
         }
         state.reading = true;
         state.last_read = Some(Instant::now());
-        Some(self.board_read_input())
+        Some(self.board_read_input(cx))
     }
 
     fn finish_board_read(&mut self, mut output: ReadOutput, cx: &mut Context<Self>) {
@@ -587,7 +587,7 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let columns = panel_columns(board, &effective_mapping(board, &settings.columns));
-        let notes = self.card_notes(&settings.url);
+        let notes = self.card_notes(&settings.url, cx);
         div()
             .flex()
             .flex_row()

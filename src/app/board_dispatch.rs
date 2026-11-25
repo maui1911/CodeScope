@@ -22,7 +22,7 @@ use codescope_core::process_tree;
 use codescope_core::projects::{ProjectKind, ProjectsConfig};
 use codescope_core::worktree_create::record_dispatch;
 use codescope_terminal::TerminalView;
-use gpui::{AppContext as _, Context, SharedString, Window};
+use gpui::{App, AppContext as _, Context, SharedString, Window};
 
 use super::{AppShell, ToastKind};
 
@@ -242,12 +242,18 @@ fn claim_on_board(job: &Job, viewer_id: &str) -> Vec<String> {
 
 impl AppShell {
     /// The read the board poll is about to make.
-    pub(crate) fn board_read_input(&mut self) -> ReadInput {
+    pub(crate) fn board_read_input(&mut self, cx: &App) -> ReadInput {
         let state = &self.board.dispatch;
-        let remotes_due = state
-            .remotes_read_at
-            .is_none_or(|at| at.elapsed() >= REMOTES_MAX_AGE)
-            || state.remotes.len() != self.local_projects().len();
+        let local = self.local_projects(cx);
+        let read_projects: Vec<(&str, &str)> = state
+            .remotes
+            .iter()
+            .map(|r| (r.project_id.as_str(), r.path.as_str()))
+            .collect();
+        let same_projects = read_projects.len() == local.len()
+            && local.iter().all(|(id, path)| read_projects.contains(&(id.as_str(), path.as_str())));
+        let remotes_due = !same_projects
+            || state.remotes_read_at.is_none_or(|at| at.elapsed() >= REMOTES_MAX_AGE);
         ReadInput {
             boards: self
                 .settings
@@ -266,12 +272,17 @@ impl AppShell {
                 .filter(|(_, (_, at))| at.elapsed() < ACCESS_MAX_AGE)
                 .map(|(key, _)| key.clone())
                 .collect(),
-            projects: remotes_due.then(|| self.local_projects()),
+            projects: remotes_due.then_some(local),
         }
     }
 
-    fn local_projects(&self) -> Vec<(String, String)> {
-        self.projects
+    /// The projects as the sidebar has them, which follows its own edits as well as this shell's.
+    fn current_projects<'a>(&self, cx: &'a App) -> &'a ProjectsConfig {
+        self.sidebar.read(cx).projects()
+    }
+
+    fn local_projects(&self, cx: &App) -> Vec<(String, String)> {
+        self.current_projects(cx)
             .projects
             .iter()
             .filter(|p| p.kind == ProjectKind::Local && !p.path.is_empty())
@@ -314,8 +325,11 @@ impl AppShell {
         self.board.dispatch.viewer_error.as_deref()
     }
 
-    fn dispatch_records(&self) -> Vec<(String, PathBuf, Option<String>, WorktreeDispatch)> {
-        self.projects
+    fn dispatch_records(
+        &self,
+        cx: &App,
+    ) -> Vec<(String, PathBuf, Option<String>, WorktreeDispatch)> {
+        self.current_projects(cx)
             .projects
             .iter()
             .flat_map(|p| {
@@ -327,9 +341,9 @@ impl AppShell {
             .collect()
     }
 
-    fn running_dispatches(&self) -> usize {
+    fn running_dispatches(&self, cx: &App) -> usize {
         let on_board = self
-            .dispatch_records()
+            .dispatch_records(cx)
             .iter()
             .filter(|(_, _, _, record)| {
                 let Some(read) = self.board.reads_by_url.get(&record.board_url) else {
@@ -358,8 +372,8 @@ impl AppShell {
         let Some(viewer) = self.board.dispatch.viewer.clone() else {
             return;
         };
-        let records = self.dispatch_records();
-        let mut running = self.running_dispatches();
+        let records = self.dispatch_records(cx);
+        let mut running = self.running_dispatches(cx);
         let limit = self.settings.dispatch_limit;
         let mut holds = HashMap::new();
         let mut decided = HashSet::new();
@@ -489,7 +503,7 @@ impl AppShell {
         let Some((project_id, remote)) = matched else {
             return;
         };
-        let Some(project) = self.projects.project(&project_id).cloned() else {
+        let Some(project) = self.current_projects(cx).project(&project_id).cloned() else {
             return;
         };
         let mapping = self
@@ -524,7 +538,7 @@ impl AppShell {
         };
 
         let existing = self
-            .dispatch_records()
+            .dispatch_records(cx)
             .into_iter()
             .find(|(_, _, _, r)| r.board_url == board_url && r.item_id == item.id);
         let (create, path, branch) = match &existing {
@@ -735,10 +749,10 @@ impl AppShell {
     }
 
     /// What each card on the board at `board_url` says about dispatch, by item id.
-    pub(crate) fn card_notes(&self, board_url: &str) -> HashMap<String, CardNote> {
+    pub(crate) fn card_notes(&self, board_url: &str, cx: &App) -> HashMap<String, CardNote> {
         let state = &self.board.dispatch;
         let mut notes: HashMap<String, CardNote> = self
-            .dispatch_records()
+            .dispatch_records(cx)
             .into_iter()
             .filter(|(_, _, _, r)| r.board_url == board_url)
             .map(|(_, _, branch, r)| {
