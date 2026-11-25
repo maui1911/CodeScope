@@ -1175,6 +1175,7 @@ pub struct AppShell {
     pub(crate) show_board: bool,
     pub(crate) board: crate::board_panel::BoardPanelState,
     pub(crate) add_board_dialog: Option<crate::dialogs::add_board::AddBoardDialogState>,
+    pub(crate) decide_dialog: Option<crate::dialogs::decide::DecideDialogState>,
     /// Monotonic sequence for diff-viewer background requests, so a
     /// stale `git diff` result can never clobber a newer one.
     pub(crate) diff_request_seq: u64,
@@ -1915,6 +1916,7 @@ impl AppShell {
             show_board: false,
             board: crate::board_panel::BoardPanelState::default(),
             add_board_dialog: None,
+            decide_dialog: None,
             diff_viewer: None,
             diff_request_seq: 0,
             settings_dialog: None,
@@ -2285,6 +2287,7 @@ impl AppShell {
     fn any_text_input_visible(&self) -> bool {
         self.rename_dialog.is_some()
             || self.add_board_dialog.is_some()
+            || self.decide_dialog.is_some()
             || self.settings_dialog.is_some()
             || self.command_palette.is_some()
     }
@@ -8656,6 +8659,7 @@ impl Render for AppShell {
             .children(self.render_settings_dialog(window, &theme, cx))
             .children(self.render_rename_dialog(window, &theme, cx))
             .children(self.render_add_board_dialog(window, &theme, cx))
+            .children(self.render_decide_dialog(window, &theme, cx))
             .children(self.render_confirm_dialog(window, &theme, cx))
     }
 }

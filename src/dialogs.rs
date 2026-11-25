@@ -3,6 +3,7 @@
 
 pub mod add_board;
 pub mod confirm;
+pub mod decide;
 pub mod new_project;
 pub mod new_worktree;
 pub mod rename;

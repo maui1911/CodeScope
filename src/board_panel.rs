@@ -21,7 +21,7 @@ use gpui::{
 
 use crate::app::AppShell;
 use crate::app::board_dispatch::{
-    CardNote, DispatchState, NoteTone, ReadInput, ReadOutput, read_boards,
+    CardAction, CardNote, DispatchState, NoteTone, ReadInput, ReadOutput, read_boards,
 };
 use crate::dialogs::confirm::ConfirmSpec;
 use crate::theme;
@@ -610,7 +610,7 @@ impl AppShell {
                     PanelGroup::Done => self
                         .render_done_column(theme, column, board, cx)
                         .into_any_element(),
-                    _ => render_group_column(theme, column, board, &notes).into_any_element(),
+                    _ => render_group_column(theme, column, board, &notes, cx).into_any_element(),
                 }
             }))
             .into_any_element()
@@ -763,6 +763,7 @@ fn render_group_column(
     column: &PanelColumn,
     board: &Board,
     notes: &HashMap<String, CardNote>,
+    cx: &mut Context<AppShell>,
 ) -> impl IntoElement {
     let framed = matches!(
         column.group,
@@ -793,7 +794,7 @@ fn render_group_column(
         .when(column.sections.is_empty(), |s| s.child(not_on_board()))
         .children(column.sections.iter().map(|section| {
             let heading = !(lone_todo && section.role == Some(ColumnRole::Todo));
-            render_section(theme, section, board, heading, notes)
+            render_section(theme, section, board, heading, notes, cx).into_any_element()
         }))
 }
 
@@ -803,6 +804,7 @@ fn render_section(
     board: &Board,
     heading: bool,
     notes: &HashMap<String, CardNote>,
+    cx: &mut Context<AppShell>,
 ) -> impl IntoElement {
     let trigger = section.role.map(ColumnRole::kind) == Some(RoleKind::Trigger);
     let name: SharedString = section
@@ -845,7 +847,7 @@ fn render_section(
         })
         .children(section.items.iter().map(|&index| {
             let item = &board.items[index];
-            render_card(theme, item, index, &board.url, notes.get(&item.id))
+            render_card(theme, item, index, &board.url, notes.get(&item.id), cx).into_any_element()
         }))
 }
 
@@ -855,6 +857,7 @@ fn render_card(
     index: usize,
     board_url: &str,
     dispatch: Option<&CardNote>,
+    cx: &mut Context<AppShell>,
 ) -> impl IntoElement {
     let url = item.url.clone().unwrap_or_else(|| board_url.to_string());
     let note = match item.state {
@@ -905,10 +908,43 @@ fn render_card(
                 NoteTone::NeedsYou => theme::signal_review(),
                 NoteTone::Failed => theme::danger(),
             };
-            div()
+            let line = div()
                 .text_size(px(11.0))
                 .text_color(color)
-                .child(note.text.clone())
+                .child(note.text.clone());
+            match note.action {
+                Some(CardAction::Decide) => {
+                    let item_id = item.id.clone();
+                    let button = div()
+                        .id(("board-card-decide", index))
+                        .flex_shrink_0()
+                        .px(px(8.0))
+                        .py(px(2.0))
+                        .rounded(px(4.0))
+                        .bg(theme::signal_review())
+                        .text_size(px(11.0))
+                        .text_color(theme::canvas(theme))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.open_decide_dialog(&item_id, window, cx);
+                            }),
+                        )
+                        .child("Decide");
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .child(line)
+                        .child(button)
+                        .into_any_element()
+                }
+                None => line.into_any_element(),
+            }
         }))
 }
 
