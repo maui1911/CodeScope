@@ -352,9 +352,21 @@ pub struct Worktree {
     pub branch: Option<String>,
     #[serde(default, alias = "is_primary")]
     pub is_primary: bool,
-    /// The board item this worktree was dispatched for; `None` for one the user made.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The board item this worktree was dispatched for; `None` for one the user made, and for a
+    /// record this build can't read.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "dispatch_or_none"
+    )]
     pub dispatch: Option<WorktreeDispatch>,
+}
+
+fn dispatch_or_none<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<WorktreeDispatch>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
 }
 
 /// A persisted tab. Live pty / process state lives in the runtime
@@ -1301,6 +1313,44 @@ mod tests {
         let old = ProjectsConfig::load_from(&path).unwrap();
         assert!(old.project_groups.is_empty());
         assert_eq!(old.projects[0].group_id, None);
+    }
+
+    #[test]
+    fn a_dispatch_record_this_build_cant_read_leaves_the_rest_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.json");
+        let dispatch = |round: &str| {
+            format!(
+                r#"{{"boardUrl":"https://github.com/users/o/projects/1","itemId":"PVTI_1",
+                "contentId":"I_1","repository":"o/n","number":1,"title":"t",
+                "url":"https://github.com/o/n/issues/1","round":"{round}",
+                "triggerAt":"2026-11-25T10:00:00Z"}}"#
+            )
+        };
+        let worktree = |id: &str, dispatch: &str| {
+            format!(r#"{{"id":"{id}","path":"/p/{id}","branch":"{id}","dispatch":{dispatch}}}"#)
+        };
+        let worktrees = [
+            worktree("known", &dispatch("implementation")),
+            worktree("newer", &dispatch("repair")),
+            worktree("partial", r#"{"boardUrl":"https://github.com/users/o/projects/1"}"#),
+        ];
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"projects":[{{"id":"p","name":"p","path":"/p","worktrees":[{}]}}]}}"#,
+                worktrees.join(",")
+            ),
+        )
+        .unwrap();
+        let loaded = ProjectsConfig::load_from(&path).unwrap();
+        let dispatch_of = |id: &str| {
+            let rows = &loaded.projects[0].worktrees;
+            rows.iter().find(|w| w.id == id).unwrap().dispatch.clone()
+        };
+        assert!(dispatch_of("known").is_some());
+        assert_eq!(dispatch_of("newer"), None);
+        assert_eq!(dispatch_of("partial"), None);
     }
 
     /// The sidebar edits while AppShell has written since the sidebar
