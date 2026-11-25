@@ -926,10 +926,11 @@ board, each with their own CodeScope or another tool that follows the
   for that person. Whatever others need to see lives on GitHub; only
   sessions and worktrees stay local. The assignee says who works on an
   item: on dispatch CodeScope assigns the issue or pull request to its
-  user if nobody is, and it never dispatches an item assigned only to
-  others. With
-  several assignees, only the tool of the assignee who moved the item
-  starts; a move by anyone else waits, with that reason shown. A
+  user if nobody is, and the pull request the agent opens as well, so
+  another person's tool leaves it alone. It never dispatches an item
+  assigned only to others. With several assignees, only the tool of
+  the assignee who moved the item starts; a move by anyone else waits,
+  with that reason shown. A
   person runs one tool per board: two CodeScopes of the same person (on
   two computers, or an installed and a dev build) would both take the
   same moves, because GitHub shows both as that person. Another tool
@@ -972,19 +973,21 @@ board, each with their own CodeScope or another tool that follows the
   resumed if its tab was closed. A new session starts in the same
   worktree from the findings when the session is lost, or when the
   user chose a different CLI for implementation.
-* **What a move starts.** A move into *Research* starts the research
-  round, on an issue or a pull request. A move into *Ready* starts the
-  round that fits the item:
+* **What a move starts.** A pull request item that one of the user's
+  dispatches opened starts nothing in either trigger column: that
+  dispatch already works on it, and its issue is the item to move.
+  Otherwise a move into *Research* starts the research round, on an
+  issue or a pull request, and a move into *Ready* starts the round
+  that fits the item:
   * an issue without an open pull request: the *implementation round*
     (`implement`), which ends when the agent's pull request is open;
   * an issue whose open pull request this dispatch opened, or a pull
     request item that no dispatch of the user's opened: a *review
     round* (`address-review`) on that pull request, which ends when
-    the agent has pushed, or replied in the review threads it handles,
-    and its session is idle;
-  * a pull request item that one of the user's dispatches opened:
-    nothing starts, because that dispatch already works on it; its
-    issue is the item to move;
+    the agent has handled the review and its session is idle: it has
+    pushed, replied in the review threads it handles, or written an
+    answer to `.codescope/reply.md`, which CodeScope excludes from git
+    as it does the findings and posts when the round ends;
   * an issue with an open pull request from elsewhere: nothing starts,
     and the item waits with that pull request shown until it is moved
     again. To work on that pull request, a person adds it to the board
@@ -994,7 +997,7 @@ board, each with their own CodeScope or another tool that follows the
   to *In review* once their pull request is ready: when the round ends
   with a ready pull request, or when its draft is marked ready later,
   by anyone. That is the round's one move on. A round that stops
-  without its result (findings, a pull request, a push or replies)
+  without its result (findings, a pull request, a push, a reply)
   leaves its session idle, and the dispatch *needs you* until the user
   steers it in the tab.
 * **Answers.** The needs-you dialog shows decision points as choices
@@ -1004,9 +1007,9 @@ board, each with their own CodeScope or another tool that follows the
   by anyone with write access to the repository, is an answer too, so
   a designer or a teammate can answer from GitHub. The findings and
   the answers reach the session with the prompt of the round that
-  *Ready* starts, which lists each answer and who gave it. While the item waits in
-  *Needs decision* the session gets nothing, so it does not start
-  implementing before *Ready*. Comments by others are shown and start
+  *Ready* starts, which lists each answer and who gave it. While the
+  item waits in *Needs decision* the session gets nothing, so it does
+  not start implementing before *Ready*. Comments by others are shown and start
   nothing.
 * **Manual testing decides what comes after the PR.** When the agent
   could test everything automatically, it opens a ready pull request
@@ -1052,8 +1055,9 @@ board, each with their own CodeScope or another tool that follows the
   draft, `Closes #N` in the pull request, and no comments of the
   agent's own on the issue or the pull request, because CodeScope
   posts what a round produces; in a review round the agent may reply
-  in the review threads it handles), so a skill describes the work and
-  cannot break the handover.
+  in the review threads it handles, and writes any other answer to
+  `.codescope/reply.md`), so a skill describes the work and cannot
+  break the handover.
   CodeScope sets no agent per phase: agent definitions in the
   repository (such as `.claude/agents/`) reach the session through the
   worktree, as skills do, so a skill can hand work to them. The CLI
@@ -1092,7 +1096,7 @@ board, each with their own CodeScope or another tool that follows the
   not override it.
 * **Repair.** On a red check, a merge conflict, or a base branch the
   pull request must catch up with, CodeScope sends the repair skill
-  into the session. A repair fixes only that and leaves review
+  into the session. A repair handles only that and leaves review
   comments alone. At most two attempts in a row; a comment by someone
   else with write access starts the count again. The session stops and
   the dispatch *needs you* when a conflict involves a functional

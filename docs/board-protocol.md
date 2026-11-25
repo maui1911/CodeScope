@@ -45,7 +45,8 @@ uses these names.
    the tool of the assignee who made the move starts.
 3. Before it moves the item into a progress column, the tool assigns
    the item's issue or pull request to its person if nobody is
-   assigned.
+   assigned. The pull request it opens is assigned to its person too,
+   so other tools leave it alone.
 4. A tool moves an item in two ways only: from a trigger column into
    the progress column of the round a person's move starts, and on
    from the progress column the tool itself put it in, once per round.
@@ -58,14 +59,15 @@ uses these names.
 
 ## Rounds
 
-A move into Research starts the research round. A move into Ready
-starts the implementation round on an issue without an open pull
-request, and a review round on the tool's own pull request or on a
-pull request item the tool did not open; an issue with an open pull
-request from elsewhere waits until a person moves it again. A pull
-request item the tool opened for an issue starts nothing: the work on
-the issue already covers it. A review round ends when the agent has
-pushed, or replied in the review threads it handles.
+A pull request item the tool opened for an issue starts nothing, in
+either trigger column: the work on the issue already covers it.
+Otherwise a move into Research starts the research round, and a move
+into Ready starts the implementation round on an issue without an open
+pull request, and a review round on the tool's own pull request or on
+a pull request item the tool did not open; an issue with an open pull
+request from elsewhere waits until a person moves it again. A review
+round ends when the agent has pushed, replied in the review threads it
+handles, or given the tool an answer to post.
 
 The implementation round and review rounds move the item to In
 progress when they start, and to In review once their pull request is
@@ -95,7 +97,7 @@ are rounds of the implementation phase. The tool working on the item
 posts these comments, on its issue, or on the pull request when the
 item is one. An agent posts no comments of its own there: they would
 look like its person's. In a review round it may reply in the review
-threads it handles.
+threads it handles; any other answer goes into the tool's comment.
 `by` names the tool, for example `codescope`; nothing depends on it.
 The line before the marker starts with `**Next step:**` and says what
 a person does next.
