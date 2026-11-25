@@ -128,12 +128,7 @@ fn running_under(shell: Option<u32>, table: &[(u32, u32)]) -> Option<Vec<u32>> {
     if table.is_empty() {
         return None;
     }
-    let shell = shell?;
-    if table.iter().any(|&(pid, _)| pid == shell) {
-        Some(process_tree::descendants(shell, table))
-    } else {
-        Some(Vec::new())
-    }
+    Some(process_tree::descendants(shell?, table))
 }
 
 struct TabProbe<'a> {
@@ -991,11 +986,13 @@ mod tests {
     }
 
     #[test]
-    fn a_shell_that_exited_runs_nothing_and_an_unread_table_tells_nothing() {
+    fn a_shell_that_exited_runs_only_its_orphans_and_an_unread_table_tells_nothing() {
         let table = [(1, 0), (10, 1), (11, 10), (12, 11)];
         assert_eq!(running_under(Some(10), &table), Some(vec![11, 12]));
         assert_eq!(running_under(Some(12), &table), Some(vec![]));
         assert_eq!(running_under(Some(40), &table), Some(vec![]), "its shell exited");
+        let orphaned = [(1, 0), (41, 40), (42, 41)];
+        assert_eq!(running_under(Some(40), &orphaned), Some(vec![41, 42]), "Windows keeps ppid");
         assert_eq!(running_under(None, &table), None);
         assert_eq!(running_under(Some(10), &[]), None);
     }
