@@ -182,6 +182,12 @@ enum HandoverTarget {
     Wait(Hold),
 }
 
+struct Place {
+    create: bool,
+    path: PathBuf,
+    branch: String,
+}
+
 fn access_key(repository: &str, login: &str) -> (String, String) {
     (repository.to_ascii_lowercase(), login.to_ascii_lowercase())
 }
@@ -399,6 +405,31 @@ impl AppShell {
             .collect()
     }
 
+    fn place_of(&self, board_url: &str, item: &BoardItem, cx: &App) -> Option<Place> {
+        let number = item.number?;
+        let existing = self
+            .dispatch_records(cx)
+            .into_iter()
+            .find(|(_, _, _, r)| r.board_url == board_url && r.item_id == item.id);
+        if let Some((_, path, branch, _)) = existing {
+            let branch = branch.unwrap_or_else(|| branch_name(number, &item.title));
+            return Some(Place {
+                create: false,
+                path,
+                branch,
+            });
+        }
+        let remotes = &self.board.dispatch.remotes;
+        let (matched, _) = *projects_for_repository(remotes, item.repository.as_deref()?).first()?;
+        let project = self.current_projects(cx).project(&matched.project_id)?;
+        let branch = branch_name(number, &item.title);
+        Some(Place {
+            create: true,
+            path: PathBuf::from(project.worktree_root_path()).join(&branch),
+            branch,
+        })
+    }
+
     fn running_dispatches(&self, cx: &App) -> usize {
         let on_board = self
             .dispatch_records(cx)
@@ -493,6 +524,13 @@ impl AppShell {
                             .get(&item.id)
                             .is_some_and(|(at, _)| *at == change.created_at);
                         if failed_before {
+                            continue;
+                        }
+                        let target = self
+                            .place_of(&settings.url, item, cx)
+                            .map(|place| self.handover_target(&place.path, cx));
+                        if let Some(HandoverTarget::Wait(hold)) = target {
+                            holds.insert(item.id.clone(), hold);
                             continue;
                         }
                         running += 1;
@@ -599,26 +637,9 @@ impl AppShell {
             return;
         };
 
-        let existing = self
-            .dispatch_records(cx)
-            .into_iter()
-            .find(|(_, _, _, r)| r.board_url == board_url && r.item_id == item.id);
-        let (create, path, branch) = match &existing {
-            Some((_, path, branch, _)) => (
-                false,
-                path.clone(),
-                branch.clone().unwrap_or_else(|| branch_name(number, &item.title)),
-            ),
-            None => {
-                let branch = branch_name(number, &item.title);
-                (true, PathBuf::from(project.worktree_root_path()).join(&branch), branch)
-            }
-        };
-        if let HandoverTarget::Wait(hold) = self.handover_target(&path, cx) {
-            self.board.dispatch.holds.insert(item.id.clone(), hold);
-            cx.notify();
+        let Some(Place { create, path, branch }) = self.place_of(&board_url, &item, cx) else {
             return;
-        }
+        };
         let pending = if create {
             let path = path.to_string_lossy().into_owned();
             let begun = self.sidebar.update(cx, |sidebar, cx| {
