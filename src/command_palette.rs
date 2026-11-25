@@ -93,6 +93,8 @@ pub enum BuiltInCommand {
     /// `labs/agent-bots` control plane — same panel as the sidebar
     /// footer "Bots" button. Keymap hint: Ctrl+Shift+I.
     ToggleBotsInbox,
+    /// Toggle the board panel, same as the sidebar footer "Board" button. No chord yet.
+    ToggleBoard,
     /// Show / hide the sidebar. Keymap hint: Ctrl+Shift+B.
     ToggleSidebar,
     /// Open the "Add project" dialog. Keymap hint: none (the `+` button).
@@ -130,6 +132,7 @@ impl BuiltInCommand {
             BuiltInCommand::ToggleOverview => "Toggle overview",
             BuiltInCommand::ToggleDiffViewer => "Toggle diff viewer",
             BuiltInCommand::ToggleBotsInbox => "Toggle bots inbox",
+            BuiltInCommand::ToggleBoard => "Toggle board",
             BuiltInCommand::ToggleSidebar => "Toggle sidebar",
             BuiltInCommand::NewProject => "New project",
             BuiltInCommand::NewSession => "New session",
@@ -147,6 +150,7 @@ impl BuiltInCommand {
             BuiltInCommand::ToggleOverview => "Ctrl+Shift+O",
             BuiltInCommand::ToggleDiffViewer => "Ctrl+Shift+D",
             BuiltInCommand::ToggleBotsInbox => "Ctrl+Shift+I",
+            BuiltInCommand::ToggleBoard => "",
             BuiltInCommand::ToggleSidebar => "Ctrl+Shift+B",
             BuiltInCommand::NewProject => "+",
             BuiltInCommand::NewSession => "Ctrl+Shift+T",

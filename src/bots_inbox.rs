@@ -283,6 +283,7 @@ impl AppShell {
         if value {
             self.close_diff_viewer(cx);
             self.set_show_overview(false, cx);
+            self.set_show_board(false, cx);
         }
         self.show_bots = value;
         self.push_bots_footer(cx);
