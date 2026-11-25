@@ -135,12 +135,16 @@ fn running_under(shell: Option<u32>, table: &[(u32, u32)]) -> Option<Vec<u32>> {
 }
 
 struct TabProbe<'a> {
+    restarting: bool,
     running: Option<&'a [u32]>,
     claude_idle: Option<bool>,
     typed: bool,
 }
 
 fn tab_at_handover(tab: &TabProbe) -> TabAtHandover {
+    if tab.restarting {
+        return TabAtHandover::Busy;
+    }
     match (tab.running, tab.claude_idle) {
         (Some([]), _) => TabAtHandover::Shell,
         (Some(_), Some(true)) if !tab.typed => TabAtHandover::IdleClaude,
@@ -835,15 +839,12 @@ impl AppShell {
             .map(|tab| {
                 let terminal = tab.terminal.read(cx);
                 let running = running_under(terminal.child_pid(), &table);
-                let claude_idle = if self.claude_updates.is_restarting(tab.id) {
-                    Some(false)
-                } else {
-                    running.as_deref().and_then(|running| {
-                        let dir = sessions.as_deref()?;
-                        live_session::process_for_pids(dir, running, &wanted).map(|l| l.is_idle())
-                    })
-                };
+                let claude_idle = running.as_deref().and_then(|running| {
+                    let dir = sessions.as_deref()?;
+                    live_session::process_for_pids(dir, running, &wanted).map(|l| l.is_idle())
+                });
                 tab_at_handover(&TabProbe {
+                    restarting: self.claude_updates.is_restarting(tab.id),
                     running: running.as_deref(),
                     claude_idle,
                     typed: terminal.typed_since_submit(),
@@ -917,6 +918,7 @@ mod tests {
 
     fn tab(running: Option<&[u32]>, claude_idle: Option<bool>, typed: bool) -> TabAtHandover {
         tab_at_handover(&TabProbe {
+            restarting: false,
             running,
             claude_idle,
             typed,
@@ -932,6 +934,19 @@ mod tests {
         assert_eq!(tab(Some(&[7]), Some(false), false), Busy);
         assert_eq!(tab(Some(&[7]), None, false), Other, "another agent, or any other program");
         assert_eq!(tab(None, None, false), Other, "nothing known about its processes");
+    }
+
+    #[test]
+    fn a_tab_a_claude_update_restarts_is_busy_whatever_runs_in_it() {
+        for running in [None, Some(&[][..]), Some(&[7][..])] {
+            let probe = TabProbe {
+                restarting: true,
+                running,
+                claude_idle: running.map(|_| true),
+                typed: false,
+            };
+            assert_eq!(tab_at_handover(&probe), TabAtHandover::Busy);
+        }
     }
 
     #[test]
