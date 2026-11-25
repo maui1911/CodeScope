@@ -122,6 +122,18 @@ enum TabAtHandover {
     Other,
 }
 
+fn running_under(shell: Option<u32>, table: &[(u32, u32)]) -> Option<Vec<u32>> {
+    if table.is_empty() {
+        return None;
+    }
+    let shell = shell?;
+    if table.iter().any(|&(pid, _)| pid == shell) {
+        Some(process_tree::descendants(shell, table))
+    } else {
+        Some(Vec::new())
+    }
+}
+
 struct TabProbe<'a> {
     running: Option<&'a [u32]>,
     claude_idle: Option<bool>,
@@ -822,10 +834,7 @@ impl AppShell {
             .iter()
             .map(|tab| {
                 let terminal = tab.terminal.read(cx);
-                let running = terminal
-                    .child_pid()
-                    .filter(|shell| table.iter().any(|&(pid, _)| pid == *shell))
-                    .map(|shell| process_tree::descendants(shell, &table));
+                let running = running_under(terminal.child_pid(), &table);
                 let claude_idle = if self.claude_updates.is_restarting(tab.id) {
                     Some(false)
                 } else {
@@ -923,6 +932,16 @@ mod tests {
         assert_eq!(tab(Some(&[7]), Some(false), false), Busy);
         assert_eq!(tab(Some(&[7]), None, false), Other, "another agent, or any other program");
         assert_eq!(tab(None, None, false), Other, "nothing known about its processes");
+    }
+
+    #[test]
+    fn a_shell_that_exited_runs_nothing_and_an_unread_table_tells_nothing() {
+        let table = [(1, 0), (10, 1), (11, 10), (12, 11)];
+        assert_eq!(running_under(Some(10), &table), Some(vec![11, 12]));
+        assert_eq!(running_under(Some(12), &table), Some(vec![]));
+        assert_eq!(running_under(Some(40), &table), Some(vec![]), "its shell exited");
+        assert_eq!(running_under(None, &table), None);
+        assert_eq!(running_under(Some(10), &[]), None);
     }
 
     #[test]
