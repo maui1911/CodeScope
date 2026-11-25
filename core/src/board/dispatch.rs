@@ -646,10 +646,15 @@ fn is_worktree_on(repo: &Path, path: &Path, branch: &str) -> bool {
     let Ok(output) = run_git(repo, &["worktree", "list", "--porcelain"]) else {
         return false;
     };
-    let wanted = normalise_project_path(&path.to_string_lossy());
+    let wanted = place(path);
     parse_worktree_porcelain(&String::from_utf8_lossy(&output.stdout))
         .into_iter()
-        .any(|w| normalise_project_path(&w.path) == wanted && w.branch.as_deref() == Some(branch))
+        .any(|w| place(Path::new(&w.path)) == wanted && w.branch.as_deref() == Some(branch))
+}
+
+fn place(path: &Path) -> String {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    normalise_project_path(&resolved.to_string_lossy())
 }
 
 fn ref_exists(repo: &Path, reference: &str) -> bool {
@@ -1395,6 +1400,27 @@ mod tests {
         let path = dir.path().join("repo.worktrees").join("13-fresh");
         add_dispatch_worktree(&repo, &path, "13-fresh", "origin").unwrap();
         assert_eq!(head(&path, "HEAD"), head(&upstream, "HEAD"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_worktree_reached_through_a_link_is_recognised_as_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        git(&upstream, &["-c", "init.defaultBranch=main", "init", "-q"]);
+        git(&upstream, &["config", "user.email", "test@example.invalid"]);
+        git(&upstream, &["config", "user.name", "Test"]);
+        git(&upstream, &["commit", "--allow-empty", "-m", "one", "-q"]);
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        git(&real, &["clone", "-q", &upstream.to_string_lossy(), "repo"]);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let repo = link.join("repo");
+        let path = link.join("repo.worktrees").join("14-linked");
+        add_dispatch_worktree(&repo, &path, "14-linked", "origin").unwrap();
+        add_dispatch_worktree(&repo, &path, "14-linked", "origin").unwrap();
     }
 
     #[cfg(unix)]
