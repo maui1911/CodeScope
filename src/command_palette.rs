@@ -557,6 +557,7 @@ pub(crate) fn render_palette(
         .justify_center()
         .pt(px(120.0))
         .bg(gpui::hsla(0.0, 0.0, 0.0, 0.55))
+        .occlude()
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| this.close_command_palette(cx)),

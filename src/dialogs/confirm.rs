@@ -384,6 +384,7 @@ impl AppShell {
             .items_center()
             .justify_center()
             .bg(gpui::hsla(0.0, 0.0, 0.0, 0.55))
+            .occlude()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
