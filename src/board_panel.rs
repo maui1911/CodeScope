@@ -111,13 +111,13 @@ fn item_reference(item: &BoardItem) -> SharedString {
 
 impl AppShell {
     pub(crate) fn start_board_poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.stamp_board_added_at(cx);
         cx.spawn_in(window, async move |this, cx| {
             loop {
                 let Ok(due) = this.update_in(cx, |this, window, cx| {
                     if this.show_board {
                         cx.notify();
                     }
+                    this.stamp_board_added_at(cx);
                     this.run_dispatch(window, cx);
                     this.begin_board_read(false, cx)
                 }) else {
@@ -139,7 +139,8 @@ impl AppShell {
         .detach();
     }
 
-    /// Boards added before dispatch existed count as added now, so earlier moves start nothing.
+    /// Boards without `addedAt`, from before dispatch existed or added by hand to `settings.json`,
+    /// count as added now, so earlier moves start nothing.
     fn stamp_board_added_at(&mut self, cx: &mut Context<Self>) {
         if self.settings.boards.iter().all(|b| !b.added_at.is_empty()) {
             return;
@@ -152,7 +153,14 @@ impl AppShell {
         });
         match saved {
             Ok(settings) => self.apply_settings(settings, cx),
-            Err(err) => eprintln!("warning: couldn't save when boards were added: {err:#}"),
+            Err(err) => {
+                eprintln!("warning: couldn't save when boards were added: {err:#}");
+                let mut settings = (*self.settings).clone();
+                for board in settings.boards.iter_mut().filter(|b| b.added_at.is_empty()) {
+                    board.added_at = now.clone();
+                }
+                self.apply_settings(settings, cx);
+            }
         }
     }
 
