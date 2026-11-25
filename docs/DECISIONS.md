@@ -985,9 +985,10 @@ board, each with their own CodeScope or another tool that follows the
     request item that no dispatch of the user's opened: a *review
     round* (`address-review`) on that pull request, which ends when
     the agent has handled the review and its session is idle: it has
-    pushed, replied in the review threads it handles, or written an
-    answer to `.codescope/reply.md`, which CodeScope excludes from git
-    as it does the findings and posts when the round ends;
+    pushed, replied in the review threads it handles, or written a
+    reply to `.codescope/reply.md`, which CodeScope excludes from git
+    as it does the findings; when the round ends, CodeScope posts that
+    reply on the pull request, with the marker, and removes the file;
   * an issue with an open pull request from elsewhere: nothing starts,
     and the item waits with that pull request shown until it is moved
     again. To work on that pull request, a person adds it to the board
@@ -1009,8 +1010,8 @@ board, each with their own CodeScope or another tool that follows the
   the answers reach the session with the prompt of the round that
   *Ready* starts, which lists each answer and who gave it. While the
   item waits in *Needs decision* the session gets nothing, so it does
-  not start implementing before *Ready*. Comments by others are shown and start
-  nothing.
+  not start implementing before *Ready*. Comments by others are shown
+  and start nothing.
 * **Manual testing decides what comes after the PR.** When the agent
   could test everything automatically, it opens a ready pull request
   and the item moves to *In review*. When something needs testing by
@@ -1055,7 +1056,7 @@ board, each with their own CodeScope or another tool that follows the
   draft, `Closes #N` in the pull request, and no comments of the
   agent's own on the issue or the pull request, because CodeScope
   posts what a round produces; in a review round the agent may reply
-  in the review threads it handles, and writes any other answer to
+  in the review threads it handles, and writes any other reply to
   `.codescope/reply.md`), so a skill describes the work and cannot
   break the handover.
   CodeScope sets no agent per phase: agent definitions in the
@@ -1138,10 +1139,11 @@ board, each with their own CodeScope or another tool that follows the
 
 * CodeScope writes to GitHub for the first time: statuses, assignees,
   linked branches, findings, answers to decision points, the comment
-  that reports a pull request, and marking a draft ready with its
-  reviewers. Pull requests and pushes come from
-  the agent, so implementation needs an agent that can run `gh`;
-  research works with any agent that can write a file.
+  that reports a pull request, a review round's reply on the pull
+  request, and marking a draft ready with its reviewers. Pull
+  requests and pushes come from the agent, so implementation needs an
+  agent that can run `gh`; research works with any agent that can
+  write a file.
 * A repository's skills steer every dispatch on it, for everyone on
   the board, whichever tool starts the session.
 * Tools share a board safely as long as each follows the board

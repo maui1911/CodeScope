@@ -67,7 +67,7 @@ pull request, and a review round on the tool's own pull request or on
 a pull request item the tool did not open; an issue with an open pull
 request from elsewhere waits until a person moves it again. A review
 round ends when the agent has pushed, replied in the review threads it
-handles, or given the tool an answer to post.
+handles, or given the tool a reply to post.
 
 The implementation round and review rounds move the item to In
 progress when they start, and to In review once their pull request is
@@ -91,13 +91,15 @@ A comment that carries a result ends with a marker on its own line:
 | `research` | `findings` | Cause and approach, no open choices; the item is in Needs decision and can go to Ready |
 | `research` | `decision-points` | Findings with open choices; the item is in Needs decision |
 | `implementation` | `pull-request` | The pull request is open, after the implementation round or again after a review round or a repair |
+| `implementation` | `reply` | The agent's reply to a review, outside its review threads |
 
 `phase` is `research` or `implementation`; a review round and a repair
 are rounds of the implementation phase. The tool working on the item
 posts these comments, on its issue, or on the pull request when the
-item is one. An agent posts no comments of its own there: they would
-look like its person's. In a review round it may reply in the review
-threads it handles; any other answer goes into the tool's comment.
+item is one; a `reply` always goes on the pull request. An agent posts
+no comments of its own there: they would look like its person's. In a
+review round it may reply in the review threads it handles; the tool
+posts any other reply of the agent's as a `reply`.
 `by` names the tool, for example `codescope`; nothing depends on it.
 The line before the marker starts with `**Next step:**` and says what
 a person does next.
