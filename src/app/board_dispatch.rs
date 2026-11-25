@@ -132,9 +132,14 @@ fn running_under(shell: Option<u32>, table: &[(u32, u32)]) -> Option<Vec<u32>> {
     Some(process_tree::descendants(shell?, table))
 }
 
+fn shell_gone(shell: Option<u32>, table: &[(u32, u32)]) -> bool {
+    !table.is_empty() && shell.is_some_and(|shell| table.iter().all(|&(pid, _)| pid != shell))
+}
+
 struct TabProbe<'a> {
     restarting: bool,
     launched_lately: bool,
+    shell_gone: bool,
     running: Option<&'a [u32]>,
     claude_idle: Option<bool>,
     typed: bool,
@@ -146,6 +151,7 @@ fn tab_at_handover(tab: &TabProbe) -> TabAtHandover {
     }
     let state = match (tab.running, tab.claude_idle) {
         (Some([]), _) => TabAtHandover::Shell,
+        (Some(_), _) if tab.shell_gone => TabAtHandover::Other,
         (Some(_), Some(true)) if tab.typed => TabAtHandover::Draft,
         (Some(_), Some(true)) => TabAtHandover::IdleClaude,
         (Some(_), Some(false)) => TabAtHandover::Busy,
@@ -871,7 +877,8 @@ impl AppShell {
             .iter()
             .map(|tab| {
                 let terminal = tab.terminal.read(cx);
-                let running = running_under(terminal.child_pid(), &table);
+                let shell = terminal.child_pid();
+                let running = running_under(shell, &table);
                 let claude_idle = running.as_deref().and_then(|running| {
                     let dir = sessions.as_deref()?;
                     live_session::process_for_pids(dir, running, &wanted)?.reports_idle()
@@ -882,6 +889,7 @@ impl AppShell {
                 tab_at_handover(&TabProbe {
                     restarting: self.claude_updates.is_restarting(tab.id),
                     launched_lately,
+                    shell_gone: shell_gone(shell, &table),
                     running: running.as_deref(),
                     claude_idle,
                     typed: terminal.typed_since_submit(),
@@ -957,6 +965,7 @@ mod tests {
         tab_at_handover(&TabProbe {
             restarting: false,
             launched_lately: false,
+            shell_gone: false,
             running,
             claude_idle,
             typed,
@@ -980,6 +989,7 @@ mod tests {
             let probe = TabProbe {
                 restarting: true,
                 launched_lately: false,
+                shell_gone: false,
                 running,
                 claude_idle: running.map(|_| true),
                 typed: false,
@@ -1004,6 +1014,7 @@ mod tests {
             tab_at_handover(&TabProbe {
                 restarting: false,
                 launched_lately: true,
+                shell_gone: false,
                 running,
                 claude_idle,
                 typed: false,
@@ -1025,6 +1036,28 @@ mod tests {
         assert_eq!(running_under(Some(40), &orphaned), Some(vec![41, 42]), "Windows keeps ppid");
         assert_eq!(running_under(None, &table), None);
         assert_eq!(running_under(Some(10), &[]), None);
+        assert!(shell_gone(Some(40), &orphaned));
+        assert!(!shell_gone(Some(10), &table));
+        assert!(!shell_gone(None, &table));
+        assert!(!shell_gone(Some(10), &[]), "an unread table tells nothing");
+    }
+
+    #[test]
+    fn a_tab_whose_shell_is_gone_takes_no_typing() {
+        use TabAtHandover::*;
+        let gone = |running: Option<&[u32]>, claude_idle: Option<bool>| {
+            tab_at_handover(&TabProbe {
+                restarting: false,
+                launched_lately: false,
+                shell_gone: true,
+                running,
+                claude_idle,
+                typed: false,
+            })
+        };
+        assert_eq!(gone(Some(&[41]), Some(true)), Other, "its terminal no longer takes input");
+        assert_eq!(gone(Some(&[41]), Some(false)), Other);
+        assert_eq!(gone(Some(&[]), None), Shell);
     }
 
     #[test]
