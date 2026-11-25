@@ -27,13 +27,16 @@ use gpui::{AppContext as _, Context, SharedString, Window};
 use super::{AppShell, ToastKind};
 
 const REMOTES_MAX_AGE: Duration = Duration::from_secs(300);
+const VIEWER_MAX_AGE: Duration = Duration::from_secs(300);
+const ACCESS_MAX_AGE: Duration = Duration::from_secs(300);
 
 #[derive(Default)]
 pub(crate) struct DispatchState {
     viewer: Option<Viewer>,
+    viewer_read_at: Option<Instant>,
     viewer_error: Option<String>,
-    /// Write access by `(repository, login)`, both lower case.
-    access: HashMap<(String, String), bool>,
+    /// Write access by `(repository, login)`, both lower case, and when it was read.
+    access: HashMap<(String, String), (bool, Instant)>,
     remotes: Vec<ProjectRemotes>,
     remotes_read_at: Option<Instant>,
     /// Item id → the round being started.
@@ -133,6 +136,11 @@ fn access_key(repository: &str, login: &str) -> (String, String) {
 pub(crate) fn read_boards(input: ReadInput) -> ReadOutput {
     let mut output = ReadOutput::default();
     let mut viewer = input.viewer;
+    if viewer.is_none() {
+        let fetched = github::fetch_viewer().map_err(|err| format!("{err:#}"));
+        viewer = fetched.as_ref().ok().cloned();
+        output.viewer = Some(fetched);
+    }
     let mut any_trigger = false;
     for (url, stored) in input.boards {
         let board = match BoardRef::parse_url(&url) {
@@ -145,11 +153,6 @@ pub(crate) fn read_boards(input: ReadInput) -> ReadOutput {
                 return Some(HashMap::new());
             }
             any_trigger = true;
-            if viewer.is_none() {
-                let fetched = github::fetch_viewer().map_err(|err| format!("{err:#}"));
-                viewer = fetched.as_ref().ok().cloned();
-                output.viewer = Some(fetched);
-            }
             github::fetch_status_changes(&board.id, &ids)
                 .inspect_err(|err| eprintln!("warning: couldn't read moves on {url}: {err:#}"))
                 .ok()
@@ -252,8 +255,17 @@ impl AppShell {
                 .iter()
                 .map(|b| (b.url.clone(), b.columns.clone()))
                 .collect(),
-            viewer: state.viewer.clone(),
-            known_access: state.access.keys().cloned().collect(),
+            viewer: state
+                .viewer_read_at
+                .is_some_and(|at| at.elapsed() < VIEWER_MAX_AGE)
+                .then(|| state.viewer.clone())
+                .flatten(),
+            known_access: state
+                .access
+                .iter()
+                .filter(|(_, (_, at))| at.elapsed() < ACCESS_MAX_AGE)
+                .map(|(key, _)| key.clone())
+                .collect(),
             projects: remotes_due.then(|| self.local_projects()),
         }
     }
@@ -272,13 +284,26 @@ impl AppShell {
         let state = &mut self.board.dispatch;
         match output.viewer.take() {
             Some(Ok(viewer)) => {
+                let switched = state
+                    .viewer
+                    .as_ref()
+                    .is_some_and(|before| !before.login.eq_ignore_ascii_case(&viewer.login));
+                if switched {
+                    state.access.clear();
+                    state.holds.clear();
+                    state.failed.clear();
+                }
                 state.viewer = Some(viewer);
+                state.viewer_read_at = Some(Instant::now());
                 state.viewer_error = None;
             }
             Some(Err(err)) => state.viewer_error = Some(err),
             None => {}
         }
-        state.access.extend(output.access.drain(..));
+        let now = Instant::now();
+        state
+            .access
+            .extend(output.access.drain(..).map(|(key, can_write)| (key, (can_write, now))));
         if let Some(remotes) = output.remotes.take() {
             state.remotes = remotes;
             state.remotes_read_at = Some(Instant::now());
@@ -361,7 +386,8 @@ impl AppShell {
                     .and_then(|c| mover_to_check(item, c, &viewer.login))
                     .zip(item.repository.as_deref())
                     .and_then(|(login, repository)| {
-                        state.access.get(&access_key(repository, login)).copied()
+                        let known = state.access.get(&access_key(repository, login));
+                        known.map(|(can_write, _)| *can_write)
                     });
                 let facts = Facts {
                     viewer: &viewer.login,
