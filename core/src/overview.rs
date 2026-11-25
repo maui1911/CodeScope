@@ -250,6 +250,7 @@ mod tests {
                 path: format!("C:\\dev\\{name}"),
                 branch: None,
                 is_primary: true,
+                dispatch: None,
             }],
             group_id: None,
         }
@@ -368,6 +369,7 @@ mod tests {
             path: "C:\\dev\\alpha.worktrees\\profit-wt-1".into(),
             branch: None,
             is_primary: false,
+            dispatch: None,
         });
         p.sessions = vec![s];
         let cfg = ProjectsConfig { version: 1, agents: vec![], projects: vec![p], project_groups: Vec::new() };
@@ -387,6 +389,7 @@ mod tests {
             path: "/home/u/alpha.worktrees/feat-x-dir".into(),
             branch: Some("feat/x".into()),
             is_primary: false,
+            dispatch: None,
         });
         p.sessions = vec![s];
         let cfg = ProjectsConfig { version: 1, agents: vec![], projects: vec![p], project_groups: Vec::new() };

@@ -852,6 +852,7 @@ mod tests {
                 path: "C:\\repo".into(),
                 branch: None,
                 is_primary: true,
+                dispatch: None,
             }],
             group_id: None,
         }

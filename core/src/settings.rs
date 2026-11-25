@@ -72,6 +72,9 @@ pub struct Settings {
     /// Boards the board panel reads and dispatch takes work from (ADR-0027).
     pub boards: Vec<BoardSettings>,
 
+    /// How many of the user's dispatches run at once; more wait in their trigger column.
+    #[serde(rename = "dispatchLimit")]
+    pub dispatch_limit: usize,
     /// Keys this build doesn't know, kept so a save doesn't drop what a newer build wrote.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -87,6 +90,7 @@ impl Default for Settings {
             default_agent: DEFAULT_AGENT_ID.to_string(),
             agents: Vec::new(),
             boards: Vec::new(),
+            dispatch_limit: crate::board::dispatch::DEFAULT_DISPATCH_LIMIT,
             extra: serde_json::Map::new(),
         }
     }

@@ -19,6 +19,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::board::dispatch::WorktreeDispatch;
 use crate::git::WorktreeInfo;
 use crate::paths::AppPaths;
 
@@ -125,6 +126,7 @@ impl Project {
             path: path.clone(),
             branch: None,
             is_primary: true,
+            dispatch: None,
         };
         Self {
             id: uuid::Uuid::new_v4().to_string(),
@@ -259,6 +261,7 @@ impl Project {
                 path: info.path.clone(),
                 branch: info.branch.clone(),
                 is_primary: false,
+                dispatch: None,
             });
             added += 1;
         }
@@ -349,6 +352,9 @@ pub struct Worktree {
     pub branch: Option<String>,
     #[serde(default, alias = "is_primary")]
     pub is_primary: bool,
+    /// The board item this worktree was dispatched for; `None` for one the user made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<WorktreeDispatch>,
 }
 
 /// A persisted tab. Live pty / process state lives in the runtime
@@ -473,6 +479,7 @@ impl ProjectsConfig {
                         path: p.path.clone(),
                         branch: None,
                         is_primary: true,
+                        dispatch: None,
                     },
                 );
             }
@@ -790,7 +797,13 @@ mod tests {
     }
 
     fn row(id: &str, path: &str) -> Worktree {
-        Worktree { id: id.into(), path: path.into(), branch: None, is_primary: false }
+        Worktree {
+            id: id.into(),
+            path: path.into(),
+            branch: None,
+            is_primary: false,
+            dispatch: None,
+        }
     }
 
     fn gone() -> PathOnDisk {
@@ -1248,6 +1261,7 @@ mod tests {
                     path: "C:\\repos\\repo".into(),
                     branch: Some("main".into()),
                     is_primary: true,
+                    dispatch: None,
                 }],
                 group_id: None,
             }],
@@ -1302,6 +1316,7 @@ mod tests {
             path: "/repo/alpha-feat".into(),
             branch: Some("feat".into()),
             is_primary: false,
+            dispatch: None,
         });
         let pid = seed.id.clone();
         ProjectsConfig { projects: vec![seed], ..ProjectsConfig::default() }
@@ -1790,6 +1805,7 @@ mod tests {
                     path: "C:\\repo".into(),
                     branch: None,
                     is_primary: true,
+                    dispatch: None,
                 }],
                 group_id: None,
             }],
