@@ -20,7 +20,7 @@ use codescope_core::board::{
 use codescope_core::path_canon::paths_match;
 use codescope_core::process_tree;
 use codescope_core::projects::{ProjectKind, ProjectsConfig};
-use codescope_core::worktree_create::record_dispatch;
+use codescope_core::worktree_create::{PendingId, record_dispatch};
 use codescope_terminal::TerminalView;
 use gpui::{App, AppContext as _, Context, SharedString, Window};
 
@@ -97,6 +97,8 @@ struct Job {
     branch: String,
     remote: String,
     create: bool,
+    /// The create the sidebar shows as in flight, while `create` runs.
+    pending: Option<PendingId>,
     record: WorktreeDispatch,
     assign_to: Option<String>,
     board: Board,
@@ -556,6 +558,22 @@ impl AppShell {
                 (true, PathBuf::from(project.worktree_root_path()).join(&branch), branch)
             }
         };
+        let pending = if create {
+            let path = path.to_string_lossy().into_owned();
+            let begun = self.sidebar.update(cx, |sidebar, cx| {
+                cx.notify();
+                sidebar.pending_worktrees_mut().begin(&project_id, &path, &branch)
+            });
+            match begun {
+                Ok(id) => Some(id),
+                Err(err) => {
+                    self.fail_dispatch(&item.id, number, &trigger_at, err.to_string(), cx);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let mut title = codescope_core::TabTitle::project(project.name.clone());
         title.set_branch(&branch);
         let launch = Launch {
@@ -570,6 +588,7 @@ impl AppShell {
             branch,
             remote,
             create,
+            pending,
             record: WorktreeDispatch {
                 board_url,
                 item_id: item.id.clone(),
@@ -625,6 +644,13 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Job> {
+        if let Some(id) = job.pending {
+            self.sidebar.update(cx, |sidebar, cx| {
+                sidebar.pending_worktrees_mut().finish(id);
+                sidebar.note_worktree_edit();
+                cx.notify();
+            });
+        }
         let record = &job.record;
         if let Err(message) = prepared {
             self.fail_dispatch(&record.item_id, record.number, &record.trigger_at, message, cx);
