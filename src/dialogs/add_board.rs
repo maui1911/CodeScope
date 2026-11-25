@@ -2,9 +2,10 @@
 //! its columns to roles by name, and adds it to `settings.json` (ADR-0027).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use codescope_core::Theme;
 use codescope_core::board::{Board, BoardRef, BoardSettings, github, suggest_mapping};
+use codescope_core::{Settings, Theme};
 use gpui::{
     AppContext as _, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
     MouseButton, MouseDownEvent, ParentElement, SharedString, Styled, Window, anchored, deferred,
@@ -15,11 +16,20 @@ use crate::app::AppShell;
 use crate::text_field::{TextField, focused_caret_style, render_input_content};
 use crate::theme;
 
+static NEXT_READ: AtomicU64 = AtomicU64::new(1);
+
 pub struct AddBoardDialogState {
     pub focus_handle: FocusHandle,
     pub url: TextField,
     pub error: Option<String>,
-    pub reading: bool,
+    /// The read in flight; a result for another read belongs to a dialog that was closed.
+    pub reading: Option<u64>,
+}
+
+fn is_added(board: &BoardRef, existing: &[BoardSettings]) -> bool {
+    existing
+        .iter()
+        .any(|b| BoardRef::parse_url(&b.url).is_some_and(|known| known.same_board(board)))
 }
 
 fn validate(input: &str, existing: &[BoardSettings]) -> Result<BoardRef, String> {
@@ -27,11 +37,7 @@ fn validate(input: &str, existing: &[BoardSettings]) -> Result<BoardRef, String>
         "That isn't a board URL. It looks like https://github.com/users/<you>/projects/<number>."
             .to_string()
     })?;
-    let url = board.url();
-    let duplicate = existing
-        .iter()
-        .any(|b| BoardRef::parse_url(&b.url).is_some_and(|known| known.url() == url));
-    if duplicate {
+    if is_added(&board, existing) {
         return Err("This board is already added.".to_string());
     }
     Ok(board)
@@ -48,7 +54,7 @@ impl AppShell {
             focus_handle,
             url: TextField::new(),
             error: None,
-            reading: false,
+            reading: None,
         });
         cx.notify();
     }
@@ -64,7 +70,7 @@ impl AppShell {
         let Some(state) = self.add_board_dialog.as_mut() else {
             return;
         };
-        if state.reading {
+        if state.reading.is_some() {
             return;
         }
         let board = match validate(state.url.text(), &existing) {
@@ -75,31 +81,37 @@ impl AppShell {
                 return;
             }
         };
-        state.reading = true;
+        let read = NEXT_READ.fetch_add(1, Ordering::Relaxed);
+        state.reading = Some(read);
         state.error = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let url = board.url();
+            let wanted = board.clone();
             let result = cx
                 .background_spawn(async move {
-                    github::fetch_board(&board).map_err(|err| format!("{err:#}"))
+                    github::fetch_board(&wanted).map_err(|err| format!("{err:#}"))
                 })
                 .await;
-            let _ = this.update(cx, |this, cx| this.finish_add_board(url, result, cx));
+            let _ = this.update(cx, |this, cx| this.finish_add_board(read, board, result, cx));
         })
         .detach();
     }
 
     fn finish_add_board(
         &mut self,
-        url: String,
+        read: u64,
+        wanted: BoardRef,
         result: Result<Board, String>,
         cx: &mut Context<Self>,
     ) {
-        let Some(state) = self.add_board_dialog.as_mut() else {
+        let Some(state) = self
+            .add_board_dialog
+            .as_mut()
+            .filter(|state| state.reading == Some(read))
+        else {
             return;
         };
-        state.reading = false;
+        state.reading = None;
         let board = match result {
             Ok(board) => board,
             Err(err) => {
@@ -108,18 +120,26 @@ impl AppShell {
                 return;
             }
         };
-        let mut settings = (*self.settings).clone();
-        settings.boards.push(BoardSettings {
-            url: url.clone(),
-            columns: suggest_mapping(&board.columns),
-        });
-        if let Err(err) = settings.save(self.paths_ref()) {
-            if let Some(state) = self.add_board_dialog.as_mut() {
-                state.error = Some(format!("Couldn't save settings: {err:#}"));
+        let url = wanted.url();
+        let saved = Settings::update(self.paths_ref(), |settings| {
+            if !is_added(&wanted, &settings.boards) {
+                settings.boards.push(BoardSettings {
+                    url: url.clone(),
+                    columns: suggest_mapping(&board.columns),
+                    ..BoardSettings::default()
+                });
             }
-            cx.notify();
-            return;
-        }
+        });
+        let settings = match saved {
+            Ok(settings) => settings,
+            Err(err) => {
+                if let Some(state) = self.add_board_dialog.as_mut() {
+                    state.error = Some(format!("Couldn't save settings: {err:#}"));
+                }
+                cx.notify();
+                return;
+            }
+        };
         self.add_board_dialog = None;
         self.apply_settings(settings, cx);
         self.accept_board_read(url, board);
@@ -135,7 +155,7 @@ impl AppShell {
         let Some(state) = self.add_board_dialog.as_mut() else {
             return;
         };
-        if state.reading || !edit(&mut state.url) {
+        if state.reading.is_some() || !edit(&mut state.url) {
             return;
         }
         state.error = None;
@@ -159,7 +179,7 @@ impl AppShell {
         let frost = theme::frost_10(theme);
         let accent = theme::accent(theme);
         let canvas = theme::canvas(theme);
-        let can_submit = !state.reading && !state.url.text().trim().is_empty();
+        let can_submit = state.reading.is_none() && !state.url.text().trim().is_empty();
 
         let header = div()
             .flex()
@@ -223,11 +243,12 @@ impl AppShell {
             )
             .child(textbox);
 
-        let message: Option<(SharedString, gpui::Hsla)> = match (&state.error, state.reading) {
-            (_, true) => Some(("Reading the board…".into(), ink_dim)),
-            (Some(err), false) => Some((err.clone().into(), theme::danger())),
-            (None, false) => None,
-        };
+        let message: Option<(SharedString, gpui::Hsla)> =
+            match (&state.error, state.reading.is_some()) {
+                (_, true) => Some(("Reading the board…".into(), ink_dim)),
+                (Some(err), false) => Some((err.clone().into(), theme::danger())),
+                (None, false) => None,
+            };
 
         let cancel_btn = div()
             .id("add-board-cancel")
@@ -382,6 +403,16 @@ mod tests {
             ..BoardSettings::default()
         }];
         let err = validate("github.com/users/maui1911/projects/3/views/1", &existing).unwrap_err();
+        assert_eq!(err, "This board is already added.");
+    }
+
+    #[test]
+    fn validate_rejects_a_board_already_added_with_other_casing() {
+        let existing = [BoardSettings {
+            url: "https://github.com/users/maui1911/projects/3".into(),
+            ..BoardSettings::default()
+        }];
+        let err = validate("https://github.com/users/Maui1911/projects/3", &existing).unwrap_err();
         assert_eq!(err, "This board is already added.");
     }
 

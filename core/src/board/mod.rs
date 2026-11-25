@@ -6,7 +6,7 @@ pub mod github;
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Whose namespace a board lives in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,7 +301,25 @@ pub fn missing_roles(board: &Board, mapping: &ColumnMapping) -> Vec<ColumnRole> 
 #[serde(default, rename_all = "camelCase")]
 pub struct BoardSettings {
     pub url: String,
+    /// Read leniently: a role this build doesn't know, or a name that isn't text, is skipped.
+    #[serde(deserialize_with = "known_roles")]
     pub columns: ColumnMapping,
+    /// Keys this build doesn't know, kept so a save doesn't drop what a newer build wrote.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn known_roles<'de, D: Deserializer<'de>>(deserializer: D) -> Result<ColumnMapping, D::Error> {
+    let serde_json::Value::Object(entries) = serde_json::Value::deserialize(deserializer)? else {
+        return Ok(ColumnMapping::new());
+    };
+    Ok(entries
+        .into_iter()
+        .filter_map(|(key, name)| {
+            let role = serde_json::from_value(serde_json::Value::String(key)).ok()?;
+            Some((role, name.as_str()?.to_string()))
+        })
+        .collect())
 }
 
 /// The four columns of the board panel; research and implementation each gather three host columns.
@@ -688,6 +706,7 @@ mod tests {
         let settings = BoardSettings {
             url: "https://github.com/users/maui1911/projects/3".into(),
             columns: ColumnMapping::from([(ColumnRole::NeedsDecision, "Needs decision".into())]),
+            ..BoardSettings::default()
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(
@@ -698,5 +717,23 @@ mod tests {
             serde_json::from_str::<BoardSettings>(&json).unwrap(),
             settings
         );
+    }
+
+    #[test]
+    fn board_settings_skip_unknown_roles_and_keep_unknown_keys() {
+        let json = r#"{"url":"https://github.com/users/maui1911/projects/3",
+            "columns":{"ready":"Ready","inreview":"Review","todo":5},
+            "addedAt":"2026-11-25T10:00:00Z"}"#;
+        let settings: BoardSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            settings.columns,
+            ColumnMapping::from([(ColumnRole::Ready, "Ready".to_string())])
+        );
+        let saved = serde_json::to_string(&settings).unwrap();
+        assert!(saved.contains(r#""addedAt":"2026-11-25T10:00:00Z""#), "{saved}");
+
+        let settings: BoardSettings =
+            serde_json::from_str(r#"{"url":"u","columns":"Ready"}"#).unwrap();
+        assert!(settings.columns.is_empty());
     }
 }

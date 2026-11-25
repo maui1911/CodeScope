@@ -8856,11 +8856,13 @@ impl AppShell {
                 // Live-apply: rewrite settings.theme, persist, and
                 // re-resolve through `apply_settings` so the chrome
                 // and the sidebar repaint immediately.
-                let mut next = (*self.settings).clone();
-                next.theme = id.clone();
-                if let Err(err) = next.save(&self.paths) {
-                    eprintln!("warning: failed to persist theme change: {err:#}");
-                }
+                let next = Settings::update(&self.paths, |settings| settings.theme = id.clone())
+                    .unwrap_or_else(|err| {
+                        eprintln!("warning: failed to persist theme change: {err:#}");
+                        let mut next = (*self.settings).clone();
+                        next.theme = id.clone();
+                        next
+                    });
                 self.apply_settings(next, cx);
                 self.push_toast(
                     ToastKind::Ok,

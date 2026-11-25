@@ -6,11 +6,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use codescope_core::Theme;
 use codescope_core::board::{
     Board, BoardItem, BoardRef, BoardSettings, ColumnRole, ItemKind, ItemState, PanelColumn,
     PanelGroup, PanelSection, RoleKind, effective_mapping, github, missing_roles, panel_columns,
 };
+use codescope_core::{Settings, Theme};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, AppContext as _, Context, Hsla, InteractiveElement, IntoElement, MouseButton,
@@ -247,17 +247,21 @@ impl AppShell {
                 return;
             }
             let _ = this.update(cx, |this, cx| {
-                let mut settings = (*this.settings).clone();
-                settings.boards.retain(|b| b.url != url);
-                if let Err(err) = settings.save(this.paths_ref()) {
-                    this.push_toast(
-                        crate::app::ToastKind::Err,
-                        "Couldn't remove the board",
-                        Some(format!("{err:#}").into()),
-                        cx,
-                    );
-                    return;
-                }
+                let saved = Settings::update(this.paths_ref(), |settings| {
+                    settings.boards.retain(|b| b.url != url);
+                });
+                let settings = match saved {
+                    Ok(settings) => settings,
+                    Err(err) => {
+                        this.push_toast(
+                            crate::app::ToastKind::Err,
+                            "Couldn't remove the board",
+                            Some(format!("{err:#}").into()),
+                            cx,
+                        );
+                        return;
+                    }
+                };
                 this.board.reads_by_url.remove(&url);
                 if this.board.selected_url.as_deref() == Some(url.as_str()) {
                     this.board.selected_url = None;

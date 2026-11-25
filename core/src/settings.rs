@@ -5,11 +5,9 @@
 //! and because it's what the user already knows from VS Code.
 //!
 //! Conservative defaults: every field is optional in serde, so a
-//! half-written or empty `settings.json` still loads. Unknown keys
-//! at the *root* are silently dropped on save — we don't currently
-//! preserve them via `#[serde(flatten)]`, so a write-back cycle will
-//! lose forward-compat fields. Re-add when the on-disk schema starts
-//! seeing real version skew.
+//! half-written or empty `settings.json` still loads. Unknown keys at
+//! the root and on each board are kept through a save, so an older
+//! build doesn't drop what a newer one wrote.
 
 use std::path::Path;
 
@@ -73,6 +71,10 @@ pub struct Settings {
 
     /// Boards the board panel reads and dispatch takes work from (ADR-0027).
     pub boards: Vec<BoardSettings>,
+
+    /// Keys this build doesn't know, kept so a save doesn't drop what a newer build wrote.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Default for Settings {
@@ -85,6 +87,7 @@ impl Default for Settings {
             default_agent: DEFAULT_AGENT_ID.to_string(),
             agents: Vec::new(),
             boards: Vec::new(),
+            extra: serde_json::Map::new(),
         }
     }
 }
@@ -211,6 +214,21 @@ impl Settings {
         self.save_to(&paths.settings_file())
     }
 
+    /// Load the file, apply `change` and save it, so edits made on disk since the last load
+    /// survive; a file that doesn't load is left alone and the error returned.
+    pub fn update(paths: &AppPaths, change: impl FnOnce(&mut Settings)) -> Result<Settings> {
+        paths.ensure_dirs()?;
+        Self::update_at(&paths.settings_file(), change)
+    }
+
+    /// [`Settings::update`] on an explicit path.
+    pub fn update_at(path: &Path, change: impl FnOnce(&mut Settings)) -> Result<Settings> {
+        let mut settings = Self::load_from(path)?;
+        change(&mut settings);
+        settings.save_to(path)?;
+        Ok(settings)
+    }
+
     pub fn save_to(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -321,6 +339,51 @@ mod tests {
         std::fs::write(&path, r#"{"default_agent":"codex"}"#).unwrap();
         let settings = Settings::load_from(&path).unwrap();
         assert_eq!(settings.default_agent, "codex");
+    }
+
+    #[test]
+    fn unknown_keys_survive_a_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"theme":"tokyo-night","later":{"a":1}}"#).unwrap();
+        Settings::load_from(&path).unwrap().save_to(&path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains(r#""later""#), "{saved}");
+    }
+
+    #[test]
+    fn an_unknown_board_role_does_not_fail_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"theme":"tokyo-night","boards":[{"url":"u","columns":{"inreview":"Review"}}]}"#,
+        )
+        .unwrap();
+        let settings = Settings::load_from(&path).unwrap();
+        assert_eq!(settings.theme, "tokyo-night");
+        assert_eq!(settings.boards.len(), 1);
+    }
+
+    #[test]
+    fn update_keeps_what_changed_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"theme":"tokyo-night"}"#).unwrap();
+        let updated = Settings::update_at(&path, |s| s.scrollback = 5).unwrap();
+        assert_eq!(updated.theme, "tokyo-night");
+        let loaded = Settings::load_from(&path).unwrap();
+        assert_eq!(loaded.theme, "tokyo-night");
+        assert_eq!(loaded.scrollback, 5);
+    }
+
+    #[test]
+    fn update_leaves_a_file_it_cannot_read_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{ invalid").unwrap();
+        assert!(Settings::update_at(&path, |s| s.scrollback = 5).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ invalid");
     }
 
     #[test]
