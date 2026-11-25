@@ -868,3 +868,124 @@ blunt way to restart them all.
   "not outdated" or "not idle" and are left alone. If `/exit` stops
   exiting, the restart gives up with one error toast per tab and
   build. Nothing is killed by CodeScope either way.
+
+## ADR-0027 — A board on the host drives dispatch
+
+**Date:** 2026-11-25
+**Status:** Proposed
+
+A project is a local folder, and work on it starts when the user opens
+a tab. To move towards a software factory, work should come from a
+board on the host, and CodeScope should carry it out as far as it can
+on its own, in tabs the user can open and steer at any time. The terms
+below (board, board item, trigger and progress column, dispatch,
+phase, findings, needs you) are defined in [GLOSSARY.md](../GLOSSARY.md).
+
+**Decision:** a GitHub Projects board is CodeScope's control panel.
+The user moves items into trigger columns; CodeScope dispatches them
+and reports progress back on the board.
+
+* **Board, not repository, is the intake.** A board is its own
+  concept, added by pasting its URL, not a property of a project: one
+  board spans several repositories, and one repository can sit on
+  several boards. An item finds its project through its repository; a
+  project belongs to every repository any of its remotes points to
+  (`origin` is often a fork, the issues live on `upstream`). When
+  several projects match, the user picks once per board. A draft issue
+  goes to the board's default project, or the user picks one, and is
+  converted to an issue on dispatch.
+* **Columns.** Two trigger columns, *Research* and *Ready*, are queues
+  the user fills. CodeScope moves an item out of the queue into a
+  progress column when it starts: *Researching*, *Needs decision*,
+  *In progress*, *In review*. *Done* is left to GitHub's built-in
+  workflows (item closed, pull request merged), which are on by
+  default on a new board. Column names are mapped to these roles once
+  per board. Research is optional: an item moved straight to *Ready*
+  skips it.
+* **Writing rule.** CodeScope changes an item's status only while it
+  still holds the status CodeScope set last. A manual move ends
+  CodeScope's say over that item, and an item GitHub has already moved
+  to *Done* is left alone. If a board has the older "Pull request
+  linked to issue" workflow on, the mapping dialog warns: it can move
+  *In review* back to *In progress*, and the rule then leaves it there.
+* **Only the user triggers.** An automatic dispatch starts only when
+  the issue's `ProjectV2ItemStatusChangedEvent` names the user as
+  actor and is not `wasAutomated`. Anything else waits in its column
+  as *needs you*. A dispatch hands issue text to an agent that can push
+  and post as the user; a workflow or another person must not be able
+  to start one.
+* **One item, one worktree, one session, two phases.** *Research*
+  ends when the agent has posted its findings (a comment with a
+  marker, on the issue or, for a pull request item, on the PR) and the
+  session is idle. *Implementation* ends when the agent's pull request
+  is open. The agent posts both itself, with `gh`. Moving an item to
+  *Ready* after research sends the implementation prompt into the same
+  session, resumed if its tab was closed; if the session is lost, a new
+  one starts from the findings.
+* **Branch and link.** The branch is `<number>-<slug>`, the `gh issue
+  develop` default, and can be edited in the manual dispatch dialog.
+  Research uses it as a local branch. When implementation starts,
+  CodeScope creates it on GitHub as a linked branch on the same commit
+  (`createLinkedBranch`), so the PR links to the issue and merging it
+  closes the issue. The worktree row in `projects.json` also records
+  the item, so CodeScope knows the link without a query and after
+  GitHub drops the branch link once the PR exists. A pull request item
+  is worked on in a worktree on its own branch.
+* **Per-project configuration is local** (`projects.json`): a setup
+  command run after the worktree is created, the agent per phase and a
+  prompt template per phase, with built-in defaults. Not a file in the
+  repository, because shared repositories are not the user's to
+  commit to.
+* **Polling, not push.** Each board is read every 30 s while the app
+  runs, panel open or not, with a hand-written `gh api graphql` query
+  (about 1 point). `gh project item-list` fetches every field value
+  and costs about 101 points per 100 items, so polling it once a
+  minute would exceed the 5,000-point hourly limit. There is no push
+  for a desktop app: the `projects_v2_item` webhook is organisation
+  only, in preview, and needs a public URL. Triggers made while
+  CodeScope is closed are picked up at the next launch.
+* **Limits and attention.** At most three dispatches run at once (a
+  setting); the rest wait in their trigger column. An OS notification
+  fires when findings are ready, when a dispatch *needs you*, and when
+  a session may be waiting on the user: idle without findings or PR,
+  or in a pending tool call for over three minutes without its
+  transcript growing. A permission prompt writes nothing until it is
+  answered, so it cannot be told apart from a long tool call
+  (`agents::claude::telemetry`, `agents::codex::telemetry`). The
+  permission mode comes from the phase's agent profile; CodeScope does
+  not override it.
+* **After review.** Red CI: CodeScope prompts the session to fix it,
+  at most twice per PR, then the dispatch *needs you*. Review comments
+  are the user's to handle in the tab, or to hand back by moving the
+  item to *Ready*, which prompts the same session to address the
+  review.
+* **Cleanup.** Merged: worktree removed, session closed, history kept
+  ([ADR-0015](#adr-0015)). Closed without a PR: removed only when the
+  worktree is clean and has no commits of its own, otherwise the row
+  is marked. Moved out of a progress column by the user: no further
+  prompts, nothing removed. CodeScope never stops an agent that is
+  working.
+* **GitHub first, other hosts behind one seam.** The first version
+  supports GitHub through `gh` only. Board access (read a board, move
+  an item, link an item to a branch) sits behind one seam that does
+  not assume GitHub's *Done* workflow, linked branches, or a status
+  field with option ids. Gitea 28 and later has a REST project API
+  with plain columns, no built-in automation before 29, no linked
+  branches (so `Closes #N` in the PR), and the `gt` CLI. Forgejo has
+  no board API in a release yet. GitLab CE boards are label lists.
+
+**Consequences:**
+
+* CodeScope writes to GitHub for the first time: statuses, linked
+  branches and draft conversions. Comments and pull requests come from
+  the agent, so a research phase needs an agent that can run `gh`, and
+  findings are recognised only if the agent keeps the marker.
+* Linked branches are in public preview. If they change, the worktree
+  row still holds the link, and the PR needs `Closes #N`, which a
+  Gitea implementation needs anyway.
+* Every added board costs one GraphQL call per 30 s for as long as the
+  app runs.
+* The Bots inbox ([ADR-0023](#adr-0023)) stays as it is and is not
+  part of this; a bot that takes board items would be a decision of
+  its own. Multiple users sharing a board are out of scope.
+* Screens are designed before any of this is built.
