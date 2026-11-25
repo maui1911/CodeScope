@@ -306,12 +306,23 @@ pub fn mover_to_check<'a>(
     .then_some(mover)
 }
 
-/// Whether an agent works on the item now, which counts towards the dispatch limit.
-pub fn is_running(board: &Board, mapping: &ColumnMapping, item: &BoardItem) -> bool {
-    matches!(
-        board.role_of(item, mapping),
-        Some(ColumnRole::Researching | ColumnRole::InProgress)
-    )
+/// Whether the dispatched item counts towards the dispatch limit: in a progress column, or still
+/// in a trigger column after the move that started its round, until the board shows it moved on.
+/// `change` is the item's last move.
+pub fn counts_towards_limit(
+    board: &Board,
+    mapping: &ColumnMapping,
+    item: &BoardItem,
+    dispatch: &WorktreeDispatch,
+    change: Option<&StatusChange>,
+) -> bool {
+    match board.role_of(item, mapping) {
+        Some(ColumnRole::Researching | ColumnRole::InProgress) => true,
+        Some(role) if role.kind() == RoleKind::Trigger => {
+            change.is_some_and(|c| c.created_at == dispatch.trigger_at)
+        }
+        _ => false,
+    }
 }
 
 /// `<number>-<slug>`: the title in lower-case words joined by `-`, at most 40 characters.
@@ -1055,8 +1066,27 @@ mod tests {
         });
         let mapping = suggest_mapping(&board.columns);
         assert_eq!(trigger_content_ids(&board, &mapping), vec!["I_411", "I_4"]);
-        assert!(is_running(&board, &mapping, &board.items[1]));
-        assert!(!is_running(&board, &mapping, &board.items[0]));
+    }
+
+    #[test]
+    fn a_started_round_counts_until_the_board_shows_it_moved_on() {
+        let record = dispatch(Round::Implementation, MOVED);
+        let started = moved_by(VIEWER, "Ready");
+        let moved_again = StatusChange {
+            created_at: "2026-11-25T11:00:00Z".into(),
+            ..started.clone()
+        };
+        let counts = |column: &str, change: Option<&StatusChange>| {
+            let board = board_with(issue_in(column));
+            let mapping = suggest_mapping(&board.columns);
+            counts_towards_limit(&board, &mapping, &board.items[0], &record, change)
+        };
+        assert!(counts("p", None));
+        assert!(counts("rs", None));
+        assert!(counts("y", Some(&started)));
+        assert!(!counts("y", Some(&moved_again)));
+        assert!(!counts("y", None));
+        assert!(!counts("v", Some(&started)));
     }
 
     #[test]

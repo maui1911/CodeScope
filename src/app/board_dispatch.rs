@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use codescope_core::board::dispatch::{
     Facts, Hold, ProjectRemotes, Round, StatusChange, WorktreeDispatch, add_dispatch_worktree,
-    branch_name, decide, exclude_handover_files, find_skill, is_running, launch_with_task,
+    branch_name, counts_towards_limit, decide, exclude_handover_files, find_skill, launch_with_task,
     mover_to_check, projects_for_repository, task_file, task_message, trigger_content_ids,
     write_task_file,
 };
@@ -285,18 +285,22 @@ impl AppShell {
             .dispatch_records()
             .iter()
             .filter(|(_, _, _, record)| {
-                let read = self.board.reads_by_url.get(&record.board_url);
+                let Some(read) = self.board.reads_by_url.get(&record.board_url) else {
+                    return false;
+                };
                 let settings = self.settings.boards.iter().find(|b| b.url == record.board_url);
-                match (read.and_then(|r| r.last_good.as_ref()), settings) {
-                    (Some(board), Some(settings)) => board
-                        .items
-                        .iter()
-                        .find(|item| item.id == record.item_id)
-                        .is_some_and(|item| {
-                            is_running(board, &effective_mapping(board, &settings.columns), item)
-                        }),
-                    _ => false,
-                }
+                let (Some(board), Some(settings)) = (&read.last_good, settings) else {
+                    return false;
+                };
+                let change = read.changes.as_ref().and_then(|c| c.get(&record.content_id));
+                board
+                    .items
+                    .iter()
+                    .find(|item| item.id == record.item_id)
+                    .is_some_and(|item| {
+                        let mapping = effective_mapping(board, &settings.columns);
+                        counts_towards_limit(board, &mapping, item, record, change)
+                    })
             })
             .count();
         on_board + self.board.dispatch.starting.len()
