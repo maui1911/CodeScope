@@ -148,7 +148,10 @@ impl AppShell {
         let frost = theme::frost_10(theme);
 
         let count = decision.points.len();
-        let choices_word = if count == 1 { "one choice" } else { "choices" };
+        let choices_word = match count {
+            1 => "one choice".to_string(),
+            _ => format!("{count} choices"),
+        };
         let findings_url = decision.findings_url.clone();
         let header = div()
             .flex()
@@ -210,6 +213,7 @@ impl AppShell {
             .id("decide-note")
             .px_3()
             .h(px(34.0))
+            .overflow_hidden()
             .bg(canvas)
             .border_1()
             .border_color(accent)
@@ -286,6 +290,7 @@ impl AppShell {
             .border_1()
             .border_color(divider)
             .rounded(px(6.0))
+            .flex_shrink_0()
             .cursor_pointer()
             .hover(move |s| s.bg(frost).text_color(ink))
             .on_mouse_down(
@@ -305,6 +310,7 @@ impl AppShell {
             .text_color(if can_send { canvas } else { theme::ink_ghost(theme) })
             .bg(if can_send { accent } else { divider })
             .rounded(px(6.0))
+            .flex_shrink_0()
             .child("Send answer");
         if can_send {
             send = send.cursor_pointer().on_mouse_down(
@@ -325,6 +331,7 @@ impl AppShell {
             .child(
                 div()
                     .flex_1()
+                    .min_w(px(0.0))
                     .text_size(px(11.0))
                     .text_color(faint)
                     .child(format!(
@@ -423,6 +430,8 @@ fn render_point(
                 )
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .text_size(px(13.0))
                         .text_color(ink)
                         .child(plain_text(&point.question)),
@@ -454,6 +463,8 @@ fn render_point(
                 .child(radio(on, accent, divider))
                 .child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .flex()
                         .flex_col()
                         .gap(px(2.0))
@@ -461,14 +472,21 @@ fn render_point(
                             div()
                                 .flex()
                                 .flex_row()
-                                .items_center()
+                                .items_start()
                                 .gap_2()
                                 .text_size(px(12.5))
                                 .text_color(ink)
-                                .child(format!("{letter} · {label}"))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .child(format!("{letter} · {label}")),
+                                )
                                 .when(letter == point.advice, |s| {
                                     s.child(
                                         div()
+                                            .flex_shrink_0()
+                                            .mt(px(2.0))
                                             .text_size(px(10.0))
                                             .font(theme::font_mono())
                                             .text_color(theme::signal_ok())

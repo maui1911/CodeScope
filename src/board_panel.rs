@@ -909,6 +909,7 @@ fn render_card(
                 NoteTone::Failed => theme::danger(),
             };
             let line = div()
+                .min_w(px(0.0))
                 .text_size(px(11.0))
                 .text_color(color)
                 .child(note.text.clone());
@@ -939,7 +940,7 @@ fn render_card(
                         .items_center()
                         .justify_between()
                         .gap(px(8.0))
-                        .child(line)
+                        .child(line.flex_1())
                         .child(button)
                         .into_any_element()
                 }

@@ -447,6 +447,9 @@ pub(crate) fn read_boards(input: ReadInput) -> ReadOutput {
         });
     }
     if !input.discussions.is_empty() {
+        if viewer.is_none() {
+            output.viewer = Some(github::fetch_viewer().map_err(|err| format!("{err:#}")));
+        }
         output.discussions =
             read_discussions(&input.discussions, &input.known_access, &mut output.access);
     }
@@ -1796,6 +1799,7 @@ fn decision_note(discussion: Option<&Discussion>, viewer: Option<&str>, readied:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codescope_core::board::findings::DecisionOption;
 
     fn tab(running: Option<&[u32]>, claude_idle: Option<bool>, typed: bool) -> TabAtHandover {
         tab_at_handover(&TabProbe {
@@ -1850,6 +1854,31 @@ mod tests {
                 typed: false,
             };
             assert_eq!(tab_at_handover(&probe), TabAtHandover::Busy);
+        }
+    }
+
+    fn point(id: &str) -> DecisionPoint {
+        DecisionPoint {
+            id: id.into(),
+            question: "Q?".into(),
+            context: String::new(),
+            options: ['A', 'B']
+                .map(|letter| DecisionOption {
+                    letter,
+                    text: "x".into(),
+                })
+                .to_vec(),
+            advice: 'A',
+        }
+    }
+
+    fn answer(author: &str, choices: &[(&str, char)]) -> Answer {
+        Answer {
+            author: author.into(),
+            created_at: "t".into(),
+            url: "u".into(),
+            choices: choices.iter().map(|(id, l)| (id.to_string(), *l)).collect(),
+            body: String::new(),
         }
     }
 
@@ -1989,5 +2018,35 @@ mod tests {
         assert_eq!(handover_to(&[Stopped, Draft]), Handover::Wait(Hold::SessionStopped));
         assert_eq!(handover_to(&[Stopped, IdleClaude]), Handover::Type(1));
         assert_eq!(handover_to(&[Stopped, Busy]), Handover::Wait(Hold::SessionBusy));
+    }
+
+    #[test]
+    fn unanswered_points_offer_the_decide_button() {
+        let discussion = Discussion {
+            points: vec![point("B1"), point("B2")],
+            answers: Vec::new(),
+        };
+        let note = decision_note(Some(&discussion), Some("maui1911"), false);
+        assert_eq!(note.text.as_ref(), "2 decision points · decide here or on the issue");
+        assert!(note.action == Some(CardAction::Decide));
+        let unknown = decision_note(None, Some("maui1911"), false);
+        assert_eq!(unknown.text.as_ref(), "Decision points posted · answer on the issue");
+        assert!(unknown.action.is_none());
+    }
+
+    #[test]
+    fn an_answer_names_who_gave_it_and_what_was_chosen() {
+        let mut discussion = Discussion {
+            points: vec![point("B1"), point("B2")],
+            answers: vec![answer("Maui1911", &[("B1", 'B'), ("B2", 'A')])],
+        };
+        let mine = decision_note(Some(&discussion), Some("maui1911"), false);
+        assert_eq!(mine.text.as_ref(), "Answered by you: B1 B, B2 A · move it to Ready");
+        assert!(mine.action.is_none());
+        let readied = decision_note(Some(&discussion), Some("maui1911"), true);
+        assert_eq!(readied.text.as_ref(), "Answered by you: B1 B, B2 A · implementation starts");
+        discussion.answers.push(answer("sanne", &[]));
+        let theirs = decision_note(Some(&discussion), Some("maui1911"), false);
+        assert_eq!(theirs.text.as_ref(), "Answered by @sanne: B1 B, B2 A · move it to Ready");
     }
 }
