@@ -960,8 +960,8 @@ and reports progress back on the board.
   from a prompt (research, implementation, review, repair), and a new
   worktree gets a setup command. For each, the first that exists wins:
   `.codescope/prompts/<name>.md` or `.codescope/setup` in the
-  repository; a local override in `projects.json`, for repositories
-  that are not the user's to commit to; CodeScope's built-in default.
+  repository; a local one in `projects.json`, for repositories that
+  are not the user's to commit to; CodeScope's built-in default.
   Repository files are read from the default branch in the project
   folder, never from the item's branch, so a pull request cannot
   decide what runs with the user's rights. Project settings show which
