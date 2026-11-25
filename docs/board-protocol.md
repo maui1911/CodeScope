@@ -7,9 +7,10 @@ The terms are defined in [GLOSSARY.md](../GLOSSARY.md).
 
 A tool here is whatever starts agent sessions for one person:
 CodeScope, a scheduled script, or a person working by hand. Each tool
-works for one person only. Everything another tool or person needs to
-know is on GitHub; sessions, worktrees and which computer runs what
-are not.
+works for one person only, and a person runs one tool per board:
+GitHub shows two tools of the same person as that one person.
+Everything another tool or person needs to know is on GitHub;
+sessions, worktrees and which computer runs what are not.
 
 ## Columns
 
@@ -28,21 +29,30 @@ roles, matched by name, ignoring case, punctuation and emoji:
 | Done | host | GitHub's workflows: item closed, pull request merged |
 
 Research is optional: an item moved from Todo straight to Ready skips
-it.
+it. A tool may let its person map other column names to these roles,
+but other tools on the board then don't see them; a shared board
+uses these names.
 
 ## Who works on an item
 
-1. An item belongs to the person it is assigned to. A tool never
-   starts work on an item assigned to someone else.
+1. An item belongs to the people it is assigned to. A tool never
+   starts work on an item assigned only to others.
 2. A tool starts automatically only on a status change into a trigger
-   column (`ProjectV2ItemStatusChangedEvent`, not `wasAutomated`) that
-   was made either by its own person, or by someone with write access
-   to the repository while the item is assigned to its person.
+   column (`ProjectV2ItemStatusChangedEvent`, not `wasAutomated`) made
+   after its person added the board, and made either by its own
+   person, or by someone with write access to the repository while the
+   item is assigned to its person alone. With several assignees, only
+   the tool of the assignee who made the move starts.
 3. Before it moves the item into a progress column, the tool assigns
    the issue to its person if nobody is assigned.
-4. A tool changes an item's status only while the item still has the
-   status that tool set last. Whoever moves it by hand takes it over.
+4. A tool moves an item in two ways only: from a trigger column into
+   the progress column of the round a person's move starts, and on
+   from the progress column the tool itself put it in, once per round.
+   A person's move into a trigger column hands the item to the tool
+   again; a move anywhere else ends the tool's moves for that round.
 5. Leave an item alone once GitHub has moved it to Done.
+6. A draft issue waits for a person to convert it to an issue: it has
+   no repository and no timeline that says who moved it.
 
 ## Comments
 
@@ -54,13 +64,14 @@ A comment that carries a result ends with a marker on its own line:
 
 | `phase` | `outcome` | Meaning |
 | --- | --- | --- |
-| `research` | `findings` | Cause and approach, no open choices; the item can go to Ready |
+| `research` | `findings` | Cause and approach, no open choices; the item is in Needs decision and can go to Ready |
 | `research` | `decision-points` | Findings with open choices; the item is in Needs decision |
-| `implementation` | `pull-request` | The pull request is open |
-| `implementation` | `question` | The agent stopped and asks something |
-| `repair` | `pull-request` | The pull request is mergeable again |
-| `repair` | `question` | The repair stopped; a person decides |
+| `implementation` | `pull-request` | The pull request is open, after implementation or again after a review round or a repair |
+| `implementation` | `needs-you` | The round stopped; a person decides |
 
+`phase` is `research` or `implementation`; a review round and a repair
+are rounds in implementation. The tool working on the item posts these
+comments, on its issue, or on the pull request when the item is one.
 `by` names the tool, for example `codescope`; nothing depends on it.
 The line before the marker starts with `**Next step:**` and says what
 a person does next.
@@ -90,8 +101,10 @@ free text. Free text alone is an answer too.
 ## Branches and pull requests
 
 - The branch is `<number>-<slug>`, linked to the issue
-  (`createLinkedBranch`); a pull request to another branch than the
-  default one says `Closes #<number>`.
+  (`createLinkedBranch`), and the pull request says
+  `Closes #<number>`. Only a merge into the default branch closes the
+  issue: GitHub ignores both for a pull request into another branch,
+  and a person closes the issue when that work lands.
 - A ready pull request was tested automatically: the item moves to In
   review.
 - A draft pull request has a section `## Test by hand` in its body: a
