@@ -49,14 +49,17 @@ pub struct BoardPage {
     pub next_cursor: Option<String>,
 }
 
-/// Read the whole board, page by page.
+/// Read the board, page by page, up to [`MAX_PAGES_PER_READ`] pages.
 pub fn fetch_board(board: &BoardRef) -> Result<Board> {
     let query = board_query(board.owner_kind);
+    read_pages(|cursor| run_query(&query, board, cursor))
+}
+
+fn read_pages(mut fetch_page: impl FnMut(Option<&str>) -> Result<String>) -> Result<Board> {
     let mut cursor: Option<String> = None;
     let mut read: Option<Board> = None;
     for _ in 0..MAX_PAGES_PER_READ {
-        let stdout = run_query(&query, board, cursor.as_deref())?;
-        let page = parse_page(&stdout)?;
+        let page = parse_page(&fetch_page(cursor.as_deref())?)?;
         match read.as_mut() {
             Some(read) => read.items.extend(page.board.items),
             None => read = Some(page.board),
@@ -66,13 +69,22 @@ pub fn fetch_board(board: &BoardRef) -> Result<Board> {
             break;
         }
     }
-    read.ok_or_else(|| anyhow!("the board returned no pages"))
+    let mut read = read.ok_or_else(|| anyhow!("the board returned no pages"))?;
+    read.truncated = cursor.is_some();
+    Ok(read)
+}
+
+/// `gh api` against github.com, whatever `GH_HOST` says.
+pub fn gh_api() -> std::process::Command {
+    let mut command = no_window_command("gh");
+    command.args(["api", "--hostname", "github.com"]);
+    command
 }
 
 fn run_query(query: &str, board: &BoardRef, cursor: Option<&str>) -> Result<String> {
-    let mut command = no_window_command("gh");
+    let mut command = gh_api();
     command
-        .args(["api", "graphql"])
+        .arg("graphql")
         .arg("-f")
         .arg(format!("query={query}"))
         .arg("-f")
@@ -134,6 +146,7 @@ pub fn parse_page(json: &str) -> Result<BoardPage> {
         .items
         .nodes
         .into_iter()
+        .flatten()
         .filter_map(into_item)
         .collect();
     let next_cursor = project
@@ -149,6 +162,7 @@ pub fn parse_page(json: &str) -> Result<BoardPage> {
             closed: project.closed,
             columns,
             items,
+            truncated: false,
         },
         next_cursor,
     })
@@ -249,7 +263,7 @@ struct StatusOption {
 #[serde(rename_all = "camelCase")]
 struct Items {
     page_info: PageInfo,
-    nodes: Vec<ItemNode>,
+    nodes: Vec<Option<ItemNode>>,
 }
 
 #[derive(Deserialize)]
@@ -375,6 +389,42 @@ mod tests {
         assert_eq!(draft.number, None);
         assert_eq!(draft.title, "Theme picker");
         assert_eq!(draft.column_id, None);
+    }
+
+    #[test]
+    fn api_calls_go_to_github_com() {
+        let command = gh_api();
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, ["api", "--hostname", "github.com"]);
+    }
+
+    #[test]
+    fn a_null_item_is_skipped() {
+        let json = PAGE.replace(r#""nodes":["#, r#""nodes":[null,"#);
+        assert_eq!(parse_page(&json).unwrap().board.items.len(), 3);
+    }
+
+    #[test]
+    fn a_board_larger_than_one_read_says_so() {
+        let mut pages = 0;
+        let board = read_pages(|_| {
+            pages += 1;
+            Ok(PAGE.to_string())
+        })
+        .unwrap();
+        assert_eq!(pages, MAX_PAGES_PER_READ);
+        assert!(board.truncated);
+        assert_eq!(board.items.len(), 3 * MAX_PAGES_PER_READ);
+
+        let last = PAGE.replace(r#""hasNextPage":true"#, r#""hasNextPage":false"#);
+        let mut cursors = Vec::new();
+        let board = read_pages(|cursor| {
+            cursors.push(cursor.map(str::to_string));
+            Ok(if cursors.len() == 1 { PAGE.to_string() } else { last.clone() })
+        })
+        .unwrap();
+        assert!(!board.truncated);
+        assert_eq!(cursors, [None, Some("Y3Vy".to_string())]);
     }
 
     #[test]

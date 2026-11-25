@@ -115,6 +115,8 @@ pub struct Board {
     pub closed: bool,
     pub columns: Vec<Column>,
     pub items: Vec<BoardItem>,
+    /// Set when the board holds more items than one read takes; the rest are left out.
+    pub truncated: bool,
 }
 
 impl Board {
@@ -427,6 +429,7 @@ mod tests {
             closed: false,
             columns,
             items,
+            truncated: false,
         }
     }
 

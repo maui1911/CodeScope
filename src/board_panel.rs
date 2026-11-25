@@ -380,11 +380,16 @@ impl AppShell {
                 (_, Some(err)) => (format!("couldn't read: {err}").into(), theme::danger()),
                 (Some(board), None) => {
                     let open = board.items.len();
-                    let text = match (open, board.closed) {
-                        (1, false) => "1 item".to_string(),
-                        (n, false) => format!("{n} items"),
-                        (n, true) => format!("{n} items · closed on GitHub"),
+                    let mut text = match open {
+                        1 => "1 item".to_string(),
+                        n => format!("{n} items"),
                     };
+                    if board.truncated {
+                        text.push_str(" · the board has more");
+                    }
+                    if board.closed {
+                        text.push_str(" · closed on GitHub");
+                    }
                     (text.into(), theme::ink_dim(theme))
                 }
                 (None, None) => ("reading…".into(), theme::ink_dim(theme)),
