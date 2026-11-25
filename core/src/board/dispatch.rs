@@ -338,13 +338,21 @@ pub fn branch_name(number: u32, title: &str) -> String {
 /// `owner/name` of a GitHub remote URL, HTTPS or SSH; `None` for another host.
 pub fn repository_from_remote(url: &str) -> Option<String> {
     let url = url.trim();
-    let rest = ["https://", "http://", "ssh://", "git://"]
+    let after_scheme = ["https://", "http://", "ssh://", "git://"]
         .iter()
-        .find_map(|scheme| url.strip_prefix(scheme))
-        .unwrap_or(url);
-    let rest = match rest.split_once('@') {
-        Some((user, host)) if !user.contains(['/', ':']) => host,
-        _ => rest,
+        .find_map(|scheme| url.strip_prefix(scheme));
+    let rest = match after_scheme {
+        Some(rest) => {
+            let authority = rest.split('/').next().unwrap_or(rest);
+            match authority.rfind('@') {
+                Some(at) => &rest[at + 1..],
+                None => rest,
+            }
+        }
+        None => match url.split_once('@') {
+            Some((user, host)) if !user.contains(['/', ':']) => host,
+            _ => url,
+        },
     };
     let path = rest
         .strip_prefix("github.com")?
@@ -1046,6 +1054,7 @@ mod tests {
             "https://github.com/maui1911/CodeScope",
             "https://github.com/maui1911/CodeScope/",
             "https://token@github.com/maui1911/CodeScope.git",
+            "https://user:token@github.com/maui1911/CodeScope.git",
             "git@github.com:maui1911/CodeScope.git",
             "ssh://git@github.com/maui1911/CodeScope.git",
         ] {
@@ -1059,6 +1068,8 @@ mod tests {
             "https://gitlab.com/maui1911/CodeScope.git",
             "https://github.com/maui1911",
             "https://github.com.evil.example/maui1911/CodeScope",
+            "https://github.com@evil.example/maui1911/CodeScope",
+            "https://evil.example/x@github.com/maui1911/CodeScope",
             "D:/repos/CodeScope",
         ] {
             assert_eq!(repository_from_remote(url), None, "{url}");
