@@ -110,8 +110,8 @@ pub fn fetch_viewer() -> Result<Viewer> {
 const STATUS_CHANGES_QUERY: &str = r#"query($ids: [ID!]!) {
   nodes(ids: $ids) {
     __typename
-    ... on Issue { id timelineItems(last: 10, itemTypes: [PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]) { nodes { ...change } } }
-    ... on PullRequest { id timelineItems(last: 10, itemTypes: [PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]) { nodes { ...change } } }
+    ... on Issue { id timelineItems(last: 100, itemTypes: [PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]) { nodes { ...change } } }
+    ... on PullRequest { id timelineItems(last: 100, itemTypes: [PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]) { nodes { ...change } } }
   }
 }
 fragment change on ProjectV2ItemStatusChangedEvent {
