@@ -61,7 +61,8 @@ pub(crate) struct ReadInput {
 pub(crate) struct ReadOutput {
     pub boards: Vec<BoardFetch>,
     viewer: Option<Result<Viewer, String>>,
-    access: Vec<((String, String), bool)>,
+    /// Write access by `(repository, login)`; `None` where the check failed.
+    access: Vec<((String, String), Option<bool>)>,
     remotes: Option<Vec<ProjectRemotes>>,
 }
 
@@ -212,7 +213,7 @@ fn check_access(
     changes: &HashMap<String, StatusChange>,
     viewer: &Viewer,
     known: &HashSet<(String, String)>,
-    found: &mut Vec<((String, String), bool)>,
+    found: &mut Vec<((String, String), Option<bool>)>,
 ) {
     for item in &board.items {
         let (Some(id), Some(repository)) = (&item.content_id, &item.repository) else {
@@ -228,12 +229,12 @@ fn check_access(
         if known.contains(&key) || found.iter().any(|(k, _)| *k == key) {
             continue;
         }
-        match github::can_write(repository, login) {
-            Ok(can_write) => found.push((key, can_write)),
-            Err(err) => {
+        let answer = github::can_write(repository, login)
+            .inspect_err(|err| {
                 eprintln!("warning: couldn't check {login}'s access to {repository}: {err:#}")
-            }
-        }
+            })
+            .ok();
+        found.push((key, answer));
     }
 }
 
@@ -337,9 +338,12 @@ impl AppShell {
             None => {}
         }
         let now = Instant::now();
-        state
-            .access
-            .extend(output.access.drain(..).map(|(key, can_write)| (key, (can_write, now))));
+        for (key, answer) in output.access.drain(..) {
+            match answer {
+                Some(can_write) => state.access.insert(key, (can_write, now)),
+                None => state.access.remove(&key),
+            };
+        }
         if let Some(remotes) = output.remotes.take() {
             state.remotes = remotes;
             state.remotes_read_at = Some(Instant::now());
