@@ -879,12 +879,14 @@ a tab. To move towards a software factory, work should come from a
 board on the host, and CodeScope should carry it out as far as it can
 on its own, in tabs the user can open and steer at any time. The terms
 below (board, board item, trigger and progress column, dispatch,
-phase, findings, decision point, needs you, turn, repair) are defined
-in [GLOSSARY.md](../GLOSSARY.md).
+phase, findings, decision point, needs you, turn, repair, board
+protocol) are defined in [GLOSSARY.md](../GLOSSARY.md).
 
 **Decision:** a GitHub Projects board is CodeScope's control panel.
 The user moves items into trigger columns; CodeScope dispatches them
-and reports progress back on the board.
+and reports progress back on the board. Several people can share one
+board, each with their own CodeScope or another tool that follows the
+[board protocol](board-protocol.md).
 
 * **Board, not repository, is the intake.** A board is its own
   concept, added by pasting its URL, not a property of a project: one
@@ -911,12 +913,26 @@ and reports progress back on the board.
   to *Done* is left alone. If a board has the older "Pull request
   linked to issue" workflow on, the mapping dialog warns: it can move
   *In review* back to *In progress*, and the rule then leaves it there.
-* **Only the user triggers.** An automatic dispatch starts only when
-  the issue's `ProjectV2ItemStatusChangedEvent` names the user as
-  actor and is not `wasAutomated`. Anything else waits in its column
-  as *needs you*. A dispatch hands issue text to an agent that can push
-  and post as the user; a workflow or another person must not be able
-  to start one.
+* **Several people, one board.** Each person's CodeScope works only
+  for that person. Whatever others need to see lives on GitHub; only
+  sessions and worktrees stay local. The assignee says who works on an
+  item: on dispatch CodeScope assigns the issue to its user, and it
+  never picks up an item assigned to someone else. Another tool that
+  only acts on issues assigned to its own user can share the board
+  without further agreement. The [board protocol](board-protocol.md)
+  describes what a tool does to share a board: column roles, the
+  assignee, the comment marker (named after no tool), draft PR means
+  testing by hand, the linked branch. CodeScope reads the results of
+  any tool that writes that marker.
+* **Who starts a dispatch.** An automatic dispatch on a person's
+  CodeScope starts only when the issue's
+  `ProjectV2ItemStatusChangedEvent` is not `wasAutomated` and either
+  names that person as actor, or names someone with write access to
+  the repository while the item is assigned to that person (a lead
+  hands out work by assigning it and moving it to *Ready*). Anything
+  else waits in its column as *needs you*. A dispatch hands issue text
+  to an agent that can push and post as the user; a workflow or an
+  outsider must not be able to start one.
 * **One item, one worktree, one session, two phases.** *Research*
   ends when the agent has written its findings to
   `.codescope/findings.md` in the worktree and the session is idle.
@@ -928,14 +944,15 @@ and reports progress back on the board.
   advice); findings with decision points move the item to *Needs
   decision*. *Implementation* ends when the agent's pull request is
   open. Moving an item to *Ready* after research sends the
-  implementation prompt into the same session, resumed if its tab was
+  implementation skill into the same session, resumed if its tab was
   closed; if the session is lost, a new one starts from the findings.
 * **Answers.** The needs-you dialog shows decision points as choices
   with the advice selected. The answer is posted on the issue as a
-  comment ("B1 A, B2 B") and sent into the session. A comment the user
-  writes on the item's issue or pull request after the findings or the
-  PR is sent into the session as well, so the user can also answer
-  from GitHub. Comments by anyone else are shown and start nothing.
+  comment ("B1 A, B2 B") and sent into the session. A comment on the
+  item's issue or pull request after the findings or the PR, by anyone
+  with write access to the repository, is sent into the session as
+  well, so a designer or a teammate can answer from GitHub. Comments by
+  others are shown and start nothing.
 * **Manual testing decides what comes after the PR.** When the agent
   could test everything automatically, it opens a ready pull request
   and the item moves to *In review*. When something needs testing by
@@ -944,9 +961,12 @@ and reports progress back on the board.
   for review* in the item drawer marks the PR ready, requests the
   reviewers from the project's settings and moves the item to
   *In review*.
-* **Turn.** Every dispatched item shows whose turn it is (agent, CI,
-  you, reviewers, nobody) and since when, worked out from the same
-  reads. *You* is the same as *needs you*.
+* **Turn.** Every dispatched item shows whose turn it is and since
+  when, worked out from what is on GitHub, so it is the same on every
+  teammate's screen: an agent (and whose), CI, a person (*you*, or a
+  GitHub login), the reviewers, or nobody. *You* is the same as *needs
+  you*. The board panel filters on *Mine* or *All*; the toast and the
+  bell fire only for the user's own dispatches.
 * **Branch and link.** The branch is `<number>-<slug>`, the `gh issue
   develop` default, and can be edited in the manual dispatch dialog.
   Research uses it as a local branch. When implementation starts,
@@ -956,22 +976,29 @@ and reports progress back on the board.
   the item, so CodeScope knows the link without a query and after
   GitHub drops the branch link once the PR exists. A pull request item
   is worked on in a worktree on its own branch.
-* **Prompts and setup can live in the repository.** Each round starts
-  from a prompt (research, implementation, review, repair), and a new
-  worktree gets a setup command. For each, the first that exists wins:
-  `.codescope/prompts/<name>.md` or `.codescope/setup` in the
-  repository; a local one in `projects.json`, for repositories that
-  are not the user's to commit to; CodeScope's built-in default.
-  Repository files are read from the default branch in the project
-  folder, never from the item's branch, so a pull request cannot
-  decide what runs with the user's rights. Project settings show which
-  source is used. CodeScope always appends its own handover rules to
-  the prompt (where the findings go, the decision-point format, when
-  to open a draft), so a repository prompt describes the work and
-  cannot break the handover. Skills need nothing from CodeScope: an
-  agent such as Claude Code finds the repository's skills in the
-  worktree, so a prompt can be a single skill call. The agent per
-  phase stays local, because it depends on which CLIs the user has.
+* **Skills, not prompt files.** Each round (research, implementation,
+  review, repair) runs a skill, named per project and by default
+  `research`, `implement`, `address-review` and `repair`, in the open
+  Agent Skills format (`SKILL.md`) that Claude Code, Codex, Gemini CLI,
+  OpenCode and Copilot read. The agent finds it the way it finds any
+  skill: in the worktree's repository skills, or in the user's
+  personal skills for repositories that are not the user's to commit
+  to. Without one, CodeScope's built-in prompt runs. A team shares how
+  it researches and builds through its skills, whichever tool starts
+  the session. CodeScope always appends its own handover rules (where
+  the findings go, the decision-point format, when to open a draft),
+  so a skill describes the work and cannot break the handover. A phase
+  can also name an agent definition: Claude Code then runs the session
+  as that agent (`--agent`), with its own prompt, tools and model;
+  other CLIs ignore it. The CLI per phase stays local, because it
+  depends on what the user has installed.
+* **Setup command.** A new worktree runs `.codescope/setup` from the
+  repository's default branch in the project folder, else the one in
+  `projects.json`, else nothing.
+* **Skills come from the item's branch.** The agent loads skills and
+  `CLAUDE.md` from the worktree, so a branch can change them for its
+  own dispatch. A pull request item from a fork therefore needs the
+  user before it is dispatched.
 * **Polling, not push.** Each board is read every 30 s while the app
   runs, panel open or not, with a hand-written `gh api graphql` query
   (about 1 point per 100 items). The latest comments, mergeability and
@@ -983,8 +1010,8 @@ and reports progress back on the board.
   for a desktop app: the `projects_v2_item` webhook is organisation
   only, in preview, and needs a public URL. Triggers made while
   CodeScope is closed are picked up at the next launch.
-* **Limits and attention.** At most three dispatches run at once (a
-  setting); the rest wait in their trigger column. The existing OS
+* **Limits and attention.** At most three of a user's dispatches run at
+  once (a setting); the rest wait in their trigger column. The existing OS
   toast (`idle_notifier`) and an entry in the in-app bell fire when
   findings are ready, when a dispatch *needs you*, and when a session
   may be waiting on the user: idle without findings or PR, or in a
@@ -997,17 +1024,17 @@ and reports progress back on the board.
   permission mode comes from the phase's agent profile; CodeScope does
   not override it.
 * **Repair.** On a red check, a merge conflict, or a base branch the
-  pull request must catch up with, CodeScope sends the repair prompt
+  pull request must catch up with, CodeScope sends the repair skill
   into the session. A repair fixes only that and leaves review
-  comments alone. At most two attempts in a row; a comment by the user
-  starts the count again. The session stops and the dispatch *needs
+  comments alone. At most two attempts in a row; a comment by someone
+  with write access starts the count again. The session stops and the dispatch *needs
   you* when a conflict involves a functional choice, or when the
   failure does not come from its branch (the base is red too, a flaky
   test). Repairs run only while the pull request has no submitted
   review, because a push after a review invalidates approvals.
 * **After review.** Review comments are the user's to handle in the
   tab, or to hand back by moving the item to *Ready*, which sends the
-  review prompt into the same session; it repairs whatever is red or
+  review skill into the same session; it repairs whatever is red or
   conflicting as well.
 * **Cleanup.** Merged: worktree removed, session closed, history kept
   ([ADR-0015](#adr-0015)). Closed without a PR: removed only when the
@@ -1026,13 +1053,18 @@ and reports progress back on the board.
 
 **Consequences:**
 
-* CodeScope writes to GitHub for the first time: statuses, linked
-  branches, draft conversions, findings, answers to decision points,
-  and marking a draft ready with its reviewers. Pull requests and
-  pushes come from the agent, so implementation needs an agent that
-  can run `gh`; research works with any agent that can write a file.
-* A repository that adds `.codescope/` changes what every dispatch on
-  it does, for every user of CodeScope.
+* CodeScope writes to GitHub for the first time: statuses, assignees,
+  linked branches, draft conversions, findings, answers to decision
+  points, and marking a draft ready with its reviewers. Pull requests
+  and pushes come from the agent, so implementation needs an agent
+  that can run `gh`; research works with any agent that can write a
+  file.
+* A repository's skills steer every dispatch on it, for everyone on
+  the board, whichever tool starts the session.
+* Tools share a board safely as long as each respects the assignee.
+  Reading each other's findings needs the same marker, so working
+  together with another tool starts with agreeing on the board
+  protocol.
 * Linked branches are in public preview. If they change, the worktree
   row still holds the link, and the PR needs `Closes #N`, which a
   Gitea implementation needs anyway.
@@ -1040,5 +1072,5 @@ and reports progress back on the board.
   app runs.
 * The Bots inbox ([ADR-0023](#adr-0023)) stays as it is and is not
   part of this; a bot that takes board items would be a decision of
-  its own. Multiple users sharing a board are out of scope.
+  its own.
 * Screens are designed before any of this is built.

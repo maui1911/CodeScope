@@ -29,17 +29,21 @@ One entry on a board: an issue, a pull request, or on GitHub also a draft issue.
 _Avoid_: card, ticket, task, work item
 
 **Trigger column**:
-A column on a board that makes CodeScope start a phase for any item the user moves into it.
+A column on a board that makes a dispatch start for an item a person moves into it.
 _Avoid_: watched column, automation column
 
 **Progress column**:
-A column on a board that only CodeScope moves items into, to show how far their dispatch is.
+A column on a board that only the tool working on an item moves it into, to show how far its dispatch is.
 _Avoid_: status column, state column
+
+**Board protocol**:
+The rules that let several people and tools share one board: what each column is for, who works on an item, and how results are marked in comments.
+_Avoid_: API, contract, integration
 
 ### Dispatch
 
 **Dispatch**:
-CodeScope's work on one board item: one worktree and one agent session, going through phases, in a tab the user can open and steer at any time.
+The work on one board item for the person it is assigned to: one worktree and one agent session on that person's computer, going through phases, in a tab they can open and steer at any time.
 _Avoid_: assign, pick up, run, bot task
 
 **Phase**:
@@ -67,9 +71,9 @@ A round in implementation in which the agent makes its own pull request mergeabl
 _Avoid_: fix-up, auto-fix, retry
 
 **Needs you**:
-The state of a dispatch that cannot go on without the user: its session waits for input, a decision point is open, a draft pull request waits to be tested by hand, or CodeScope needs a choice before it can start.
+The state of a dispatch that cannot go on without the person it is assigned to: its session waits for input, a decision point is open, a draft pull request waits to be tested by hand, or a choice is needed before it can start.
 _Avoid_: blocked, stuck, waiting
 
 **Turn**:
-Who a dispatch is waiting on: the agent, CI, the user, the reviewers, or nobody. The user's turn is needs you.
+Who a dispatch is waiting on: an agent, CI, a person, the reviewers, or nobody. When it is the turn of the person the dispatch is assigned to, it needs them.
 _Avoid_: owner, assignee, status
