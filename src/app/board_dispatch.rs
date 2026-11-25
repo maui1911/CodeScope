@@ -29,6 +29,8 @@ use super::{AppShell, ToastKind};
 const REMOTES_MAX_AGE: Duration = Duration::from_secs(300);
 const VIEWER_MAX_AGE: Duration = Duration::from_secs(300);
 const ACCESS_MAX_AGE: Duration = Duration::from_secs(300);
+/// Text and Enter in one write can reach an agent's prompt as a paste, whose Enter is a newline.
+const SUBMIT_AFTER_TYPING: Duration = Duration::from_millis(200);
 
 #[derive(Default)]
 pub(crate) struct DispatchState {
@@ -716,11 +718,13 @@ impl AppShell {
         let tabs = self.tabs_at_handover(path, cx);
         let idle = tabs.iter().find(|(_, at)| *at == TabAtHandover::IdleAgent);
         if let Some((terminal, _)) = idle {
-            terminal.update(cx, |term, _| {
-                let mut bytes = task.into_bytes();
-                bytes.push(b'\r');
-                term.write_input(bytes);
-            });
+            let terminal = terminal.downgrade();
+            cx.spawn(async move |_, cx| {
+                let _ = terminal.update(cx, |term, _| term.write_input(task.into_bytes()));
+                cx.background_executor().timer(SUBMIT_AFTER_TYPING).await;
+                let _ = terminal.update(cx, |term, _| term.write_input(&b"\r"[..]));
+            })
+            .detach();
             return;
         }
         if tabs.iter().any(|(_, at)| *at == TabAtHandover::Busy) {
