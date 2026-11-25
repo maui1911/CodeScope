@@ -601,21 +601,13 @@ pub fn write_task_file(worktree: &Path, content: &str) -> Result<()> {
 }
 
 /// Create a dispatch's worktree at `path` on `branch`, from `remote`'s own default branch,
-/// fetched first and not tracked. A worktree of `repo` already at `path` on `branch` is kept;
-/// an existing local `branch` is used only when the remote's default branch contains it.
+/// fetched first and not tracked. A local `branch`, and a worktree of `repo` already at `path` on
+/// it, are used only when the remote's default branch contains the branch.
 pub fn add_dispatch_worktree(repo: &Path, path: &Path, branch: &str, remote: &str) -> Result<()> {
-    if path.exists() {
-        if is_worktree_on(repo, path, branch) {
-            return Ok(());
-        }
-        bail!("{} already exists", path.display());
-    }
     let default_branch = remote_default_branch(repo, remote)?;
-    run_git(repo, &["fetch", "--quiet", remote, &default_branch])?;
     let base = format!("refs/remotes/{remote}/{default_branch}");
-    if !ref_exists(repo, &base) {
-        bail!("fetching {remote} left no {remote}/{default_branch} to start from");
-    }
+    let refspec = format!("+refs/heads/{default_branch}:{base}");
+    run_git(repo, &["fetch", "--quiet", remote, &refspec])?;
     let local = format!("refs/heads/{branch}");
     if ref_exists(repo, &local)
         && run_git(repo, &["merge-base", "--is-ancestor", &local, &base]).is_err()
@@ -624,6 +616,12 @@ pub fn add_dispatch_worktree(repo: &Path, path: &Path, branch: &str, remote: &st
             "the local branch {branch} has commits {remote}/{default_branch} doesn't: \
              remove or rename it, then move the item again"
         );
+    }
+    if path.exists() {
+        if is_worktree_on(repo, path, branch) {
+            return Ok(());
+        }
+        bail!("{} already exists", path.display());
     }
     let path_arg = path.to_string_lossy();
     run_git(
@@ -1366,6 +1364,37 @@ mod tests {
         let err = add_dispatch_worktree(&repo, &theirs, "10-theirs", "origin").unwrap_err();
         assert!(err.to_string().contains("10-theirs"), "{err}");
         assert!(!theirs.exists());
+
+        let checked_out = dir.path().join("repo.worktrees").join("11-checked-out");
+        let checked_out_arg = checked_out.to_string_lossy().into_owned();
+        git(&repo, &["worktree", "add", "-q", "-b", "11-checked-out", &checked_out_arg]);
+        git(&checked_out, &["commit", "--allow-empty", "-m", "someone else's", "-q"]);
+        let err = add_dispatch_worktree(&repo, &checked_out, "11-checked-out", "origin")
+            .unwrap_err();
+        assert!(err.to_string().contains("11-checked-out"), "{err}");
+    }
+
+    #[test]
+    fn the_default_branch_is_fetched_whatever_the_remote_is_set_to_fetch() {
+        if no_window_command("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        git(&upstream, &["-c", "init.defaultBranch=main", "init", "-q"]);
+        git(&upstream, &["config", "user.email", "test@example.invalid"]);
+        git(&upstream, &["config", "user.name", "Test"]);
+        git(&upstream, &["commit", "--allow-empty", "-m", "one", "-q"]);
+        git(dir.path(), &["clone", "-q", "upstream", "repo"]);
+        let repo = dir.path().join("repo");
+        let narrowed = "+refs/heads/other:refs/remotes/origin/other";
+        git(&repo, &["config", "remote.origin.fetch", narrowed]);
+        git(&upstream, &["commit", "--allow-empty", "-m", "two", "-q"]);
+
+        let path = dir.path().join("repo.worktrees").join("13-fresh");
+        add_dispatch_worktree(&repo, &path, "13-fresh", "origin").unwrap();
+        assert_eq!(head(&path, "HEAD"), head(&upstream, "HEAD"));
     }
 
     #[cfg(unix)]
