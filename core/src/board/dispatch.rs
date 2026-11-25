@@ -237,7 +237,9 @@ fn check(
     if change.was_automated {
         return Err(Hold::MovedByWorkflow);
     }
-    let mover = change.actor.as_deref().unwrap_or("ghost");
+    let Some(mover) = change.actor.as_deref() else {
+        return Err(Hold::MovedByOther("ghost".into()));
+    };
     if !mover.eq_ignore_ascii_case(facts.viewer) {
         match (is_assigned_to_only(item, facts.viewer), facts.mover_can_write) {
             (true, Some(true)) => {}
@@ -932,6 +934,14 @@ mod tests {
         };
         assert_eq!(
             run_decide(issue_in("y"), &facts(&change)),
+            Some(Err(Hold::MovedByOther("ghost".into())))
+        );
+        let yours = BoardItem {
+            assignees: vec![VIEWER.into()],
+            ..issue_in("y")
+        };
+        assert_eq!(
+            run_decide(yours, &facts(&change)),
             Some(Err(Hold::MovedByOther("ghost".into())))
         );
     }
