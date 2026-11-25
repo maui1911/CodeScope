@@ -60,6 +60,11 @@ impl ClaudeUpdates {
     pub(super) fn is_outdated(&self, tab_id: u64) -> bool {
         self.outdated.contains_key(&tab_id) && !self.restarting.contains(&tab_id)
     }
+
+    /// Whether a restart is driving the tab's `claude` now.
+    pub(super) fn is_restarting(&self, tab_id: u64) -> bool {
+        self.restarting.contains(&tab_id)
+    }
 }
 
 /// How a restart ended.

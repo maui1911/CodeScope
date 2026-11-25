@@ -132,6 +132,9 @@ pub enum Hold {
     SeveralProjects(String),
     NoProgressColumn(ColumnRole),
     LimitReached(usize),
+    /// A session runs in the item's worktree and isn't waiting for a prompt, so the task can't
+    /// be handed to it yet.
+    SessionBusy,
 }
 
 impl Hold {
@@ -165,6 +168,7 @@ impl Hold {
                 format!("Add a column {} to the board to start", role.label())
             }
             Hold::LimitReached(limit) => format!("Waits: {limit} dispatches are running"),
+            Hold::SessionBusy => "Waits for the session in its worktree to be idle".into(),
         }
     }
 }
@@ -1031,6 +1035,15 @@ mod tests {
             ..facts(&change)
         };
         assert_eq!(run_decide(issue_in("y"), &full), Some(Err(Hold::LimitReached(3))));
+    }
+
+    #[test]
+    fn a_round_waiting_for_its_session_says_so() {
+        assert!(!Hold::SessionBusy.is_quiet());
+        assert_eq!(
+            Hold::SessionBusy.label(),
+            "Waits for the session in its worktree to be idle"
+        );
     }
 
     #[test]
