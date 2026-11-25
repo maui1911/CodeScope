@@ -926,15 +926,15 @@ board, each with their own CodeScope or another tool that follows the
   for that person. Whatever others need to see lives on GitHub; only
   sessions and worktrees stay local. The assignee says who works on an
   item: on dispatch CodeScope assigns the issue or pull request to its
-  user if nobody is, and the pull request the agent opens as well, so
-  another person's tool leaves it alone. It never dispatches an item
-  assigned only to others. With several assignees, only the tool of
-  the assignee who moved the item starts; a move by anyone else waits,
-  with that reason shown. A
-  person runs one tool per board: two CodeScopes of the same person (on
-  two computers, or an installed and a dev build) would both take the
-  same moves, because GitHub shows both as that person. Another tool
-  shares the board by following the same rules. The
+  user if nobody is, and the agent opens its pull request assigned to
+  the user, so another person's tool leaves it alone. It never
+  dispatches an item assigned only to others. With several assignees,
+  only the tool of the assignee who moved the item starts; a move by
+  anyone else waits, with that reason shown. A person runs one tool
+  per board: two CodeScopes of the same person (on two computers, or
+  an installed and a dev build) would both take the same moves,
+  because GitHub shows both as that person. Another tool shares the
+  board by following the same rules. The
   [board protocol](board-protocol.md) describes what a tool does to
   share a board: column roles, the assignee, the comment marker (named
   after no tool), draft PR means testing by hand, the linked branch.
@@ -1053,12 +1053,12 @@ board, each with their own CodeScope or another tool that follows the
   it researches and implements through its skills, whichever tool
   starts the session. CodeScope always appends its own handover rules
   (where the findings go, the decision-point format, when to open a
-  draft, `Closes #N` in the pull request, and no comments of the
-  agent's own on the issue or the pull request, because CodeScope
-  posts what a round produces; in a review round the agent may reply
-  in the review threads it handles, and writes any other reply to
-  `.codescope/reply.md`), so a skill describes the work and cannot
-  break the handover.
+  draft, `Closes #N` and the user as assignee in the pull request, and
+  no comments of the agent's own on the issue or the pull request,
+  because CodeScope posts what a round produces; in a review round
+  the agent may reply in the review threads it handles, and writes any
+  other reply to `.codescope/reply.md`), so a skill describes the work
+  and cannot break the handover.
   CodeScope sets no agent per phase: agent definitions in the
   repository (such as `.claude/agents/`) reach the session through the
   worktree, as skills do, so a skill can hand work to them. The CLI

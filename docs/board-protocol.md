@@ -45,8 +45,8 @@ uses these names.
    the tool of the assignee who made the move starts.
 3. Before it moves the item into a progress column, the tool assigns
    the item's issue or pull request to its person if nobody is
-   assigned. The pull request it opens is assigned to its person too,
-   so other tools leave it alone.
+   assigned. The pull request it opens is assigned to its person from
+   the start, so other tools leave it alone.
 4. A tool moves an item in two ways only: from a trigger column into
    the progress column of the round a person's move starts, and on
    from the progress column the tool itself put it in, once per round.
