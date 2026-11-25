@@ -64,6 +64,7 @@ use crate::sidebar::{
 };
 use crate::theme;
 
+pub(crate) mod board_dispatch;
 mod claude_update;
 
 /// Pixel height of the bottom status bar. Shared between
@@ -1925,7 +1926,7 @@ impl AppShell {
         };
         shell.start_telemetry_poll(cx);
         shell.start_bots_poll(cx);
-        shell.start_board_poll(cx);
+        shell.start_board_poll(window, cx);
         shell.start_agent_discovery_poll(cx);
         shell.schedule_taskbar_badge_init(cx);
         shell.start_text_blink(cx);
