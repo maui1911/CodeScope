@@ -135,6 +135,9 @@ pub enum Hold {
     /// A session runs in the item's worktree and isn't waiting for a prompt, so the task can't
     /// be handed to it yet.
     SessionBusy,
+    /// Something other than an idle Claude Code runs in a tab on the item's worktree, or what
+    /// runs there can't be read; only the user can free that tab.
+    OtherProgram,
 }
 
 impl Hold {
@@ -169,6 +172,9 @@ impl Hold {
             }
             Hold::LimitReached(limit) => format!("Waits: {limit} dispatches are running"),
             Hold::SessionBusy => "Waits for the session in its worktree to be idle".into(),
+            Hold::OtherProgram => {
+                "Waits: quit what runs in its worktree's tab, or close the tab".into()
+            }
         }
     }
 }
@@ -1043,6 +1049,15 @@ mod tests {
         assert_eq!(
             Hold::SessionBusy.label(),
             "Waits for the session in its worktree to be idle"
+        );
+    }
+
+    #[test]
+    fn a_round_waiting_on_another_program_says_how_to_start_it() {
+        assert!(!Hold::OtherProgram.is_quiet());
+        assert_eq!(
+            Hold::OtherProgram.label(),
+            "Waits: quit what runs in its worktree's tab, or close the tab"
         );
     }
 

@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use codescope_core::agents::claude::live_session;
-use codescope_core::{AgentId, SessionState};
 use codescope_core::board::dispatch::{
     Facts, Hold, ProjectRemotes, Round, StatusChange, WorktreeDispatch, add_dispatch_worktree,
     branch_name, counts_towards_limit, decide, exclude_handover_files, find_skill, launch_with_task,
@@ -118,30 +117,40 @@ struct Launch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TabAtHandover {
     Shell,
-    IdleAgent,
+    IdleClaude,
     Busy,
+    Other,
 }
 
-fn tab_at_handover(running: Option<&[u32]>, waits_for_prompt: bool, typed: bool) -> TabAtHandover {
-    match running {
-        Some([]) => TabAtHandover::Shell,
-        Some(_) if waits_for_prompt && !typed => TabAtHandover::IdleAgent,
-        _ => TabAtHandover::Busy,
+struct TabProbe<'a> {
+    running: Option<&'a [u32]>,
+    claude_idle: Option<bool>,
+    typed: bool,
+}
+
+fn tab_at_handover(tab: &TabProbe) -> TabAtHandover {
+    match (tab.running, tab.claude_idle) {
+        (Some([]), _) => TabAtHandover::Shell,
+        (Some(_), Some(true)) if !tab.typed => TabAtHandover::IdleClaude,
+        (Some(_), Some(_)) => TabAtHandover::Busy,
+        _ => TabAtHandover::Other,
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Handover {
     Type(usize),
     NewTab,
-    Wait,
+    Wait(Hold),
 }
 
 fn handover_to(tabs: &[TabAtHandover]) -> Handover {
-    if let Some(index) = tabs.iter().position(|t| *t == TabAtHandover::IdleAgent) {
+    if let Some(index) = tabs.iter().position(|t| *t == TabAtHandover::IdleClaude) {
         Handover::Type(index)
     } else if tabs.contains(&TabAtHandover::Busy) {
-        Handover::Wait
+        Handover::Wait(Hold::SessionBusy)
+    } else if tabs.contains(&TabAtHandover::Other) {
+        Handover::Wait(Hold::OtherProgram)
     } else {
         Handover::NewTab
     }
@@ -150,7 +159,7 @@ fn handover_to(tabs: &[TabAtHandover]) -> Handover {
 enum HandoverTarget {
     Type(Entity<TerminalView>),
     NewTab,
-    Wait,
+    Wait(Hold),
 }
 
 fn access_key(repository: &str, login: &str) -> (String, String) {
@@ -585,8 +594,8 @@ impl AppShell {
                 (true, PathBuf::from(project.worktree_root_path()).join(&branch), branch)
             }
         };
-        if matches!(self.handover_target(&path, cx), HandoverTarget::Wait) {
-            self.board.dispatch.holds.insert(item.id.clone(), Hold::SessionBusy);
+        if let HandoverTarget::Wait(hold) = self.handover_target(&path, cx) {
+            self.board.dispatch.holds.insert(item.id.clone(), hold);
             cx.notify();
             return;
         }
@@ -691,10 +700,10 @@ impl AppShell {
         let terminal = match self.handover_target(&job.path, cx) {
             HandoverTarget::Type(terminal) => Some(terminal),
             HandoverTarget::NewTab => None,
-            HandoverTarget::Wait => {
+            HandoverTarget::Wait(hold) => {
                 let state = &mut self.board.dispatch;
                 state.starting.remove(&record.item_id);
-                state.holds.insert(record.item_id.clone(), Hold::SessionBusy);
+                state.holds.insert(record.item_id.clone(), hold);
                 cx.notify();
                 return None;
             }
@@ -744,8 +753,8 @@ impl AppShell {
         cx.notify();
     }
 
-    /// Give the session on `path` its task: typed into `terminal`, whose agent waits for a prompt,
-    /// or else in a new tab. Focus stays where it was.
+    /// Give the session on `path` its task: typed into `terminal`, where Claude Code waits for a
+    /// prompt, or else in a new tab. Focus stays where it was.
     fn hand_over(
         &mut self,
         path: &Path,
@@ -789,8 +798,8 @@ impl AppShell {
         }
     }
 
-    /// Where a task for the worktree at `path` goes: into a tab whose agent waits for a prompt,
-    /// into a new tab when no session runs there, or nowhere yet while one is busy.
+    /// Where a task for the worktree at `path` goes: into a tab where Claude Code waits for a
+    /// prompt, into a new tab when nothing runs there, or nowhere yet, with the reason.
     fn handover_target(&self, path: &Path, cx: &App) -> HandoverTarget {
         let wanted = path.to_string_lossy();
         let on_path: Vec<_> = self
@@ -817,30 +826,25 @@ impl AppShell {
                     .child_pid()
                     .filter(|shell| table.iter().any(|&(pid, _)| pid == *shell))
                     .map(|shell| process_tree::descendants(shell, &table));
-                let claude_waits = |running: &[u32]| {
-                    let dir = sessions.as_deref()?;
-                    live_session::process_for_pids(dir, running, &wanted).map(|l| l.is_idle())
+                let claude_idle = if self.claude_updates.is_restarting(tab.id) {
+                    Some(false)
+                } else {
+                    running.as_deref().and_then(|running| {
+                        let dir = sessions.as_deref()?;
+                        live_session::process_for_pids(dir, running, &wanted).map(|l| l.is_idle())
+                    })
                 };
-                let agent_waits = || {
-                    let snap = self.telemetry_for(tab.adopted_session_id.as_deref()?)?;
-                    Some(super::notified_state(&snap) == SessionState::Idle)
-                };
-                let waits = !self.claude_updates.is_restarting(tab.id)
-                    && running.as_deref().is_some_and(|running| {
-                        let waits = if tab.agent_id == Some(AgentId::Claude) {
-                            claude_waits(running)
-                        } else {
-                            agent_waits()
-                        };
-                        waits == Some(true)
-                    });
-                tab_at_handover(running.as_deref(), waits, terminal.typed_since_submit())
+                tab_at_handover(&TabProbe {
+                    running: running.as_deref(),
+                    claude_idle,
+                    typed: terminal.typed_since_submit(),
+                })
             })
             .collect();
         match handover_to(&states) {
             Handover::Type(index) => HandoverTarget::Type(on_path[index].terminal.clone()),
             Handover::NewTab => HandoverTarget::NewTab,
-            Handover::Wait => HandoverTarget::Wait,
+            Handover::Wait(hold) => HandoverTarget::Wait(hold),
         }
     }
 
@@ -902,22 +906,33 @@ impl AppShell {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_bare_shell_is_no_session_and_only_an_idle_agent_gets_the_task_typed() {
-        use TabAtHandover::*;
-        assert_eq!(tab_at_handover(Some(&[]), false, false), Shell);
-        assert_eq!(tab_at_handover(Some(&[7]), true, false), IdleAgent);
-        assert_eq!(tab_at_handover(Some(&[7]), true, true), Busy);
-        assert_eq!(tab_at_handover(Some(&[7]), false, false), Busy);
-        assert_eq!(tab_at_handover(None, true, false), Busy, "nothing known about its processes");
+    fn tab(running: Option<&[u32]>, claude_idle: Option<bool>, typed: bool) -> TabAtHandover {
+        tab_at_handover(&TabProbe {
+            running,
+            claude_idle,
+            typed,
+        })
     }
 
     #[test]
-    fn the_task_waits_while_a_session_there_is_busy() {
+    fn a_bare_shell_is_no_session_and_only_an_idle_claude_code_gets_the_task_typed() {
+        use TabAtHandover::*;
+        assert_eq!(tab(Some(&[]), None, false), Shell);
+        assert_eq!(tab(Some(&[7]), Some(true), false), IdleClaude);
+        assert_eq!(tab(Some(&[7]), Some(true), true), Busy);
+        assert_eq!(tab(Some(&[7]), Some(false), false), Busy);
+        assert_eq!(tab(Some(&[7]), None, false), Other, "another agent, or any other program");
+        assert_eq!(tab(None, None, false), Other, "nothing known about its processes");
+    }
+
+    #[test]
+    fn the_task_waits_while_a_session_there_is_busy_or_unknown() {
         use TabAtHandover::*;
         assert_eq!(handover_to(&[]), Handover::NewTab);
         assert_eq!(handover_to(&[Shell, Shell]), Handover::NewTab);
-        assert_eq!(handover_to(&[Busy, IdleAgent]), Handover::Type(1));
-        assert_eq!(handover_to(&[Shell, Busy]), Handover::Wait);
+        assert_eq!(handover_to(&[Busy, IdleClaude]), Handover::Type(1));
+        assert_eq!(handover_to(&[Shell, Busy]), Handover::Wait(Hold::SessionBusy));
+        assert_eq!(handover_to(&[Other, Shell]), Handover::Wait(Hold::OtherProgram));
+        assert_eq!(handover_to(&[Other, Busy]), Handover::Wait(Hold::SessionBusy));
     }
 }
