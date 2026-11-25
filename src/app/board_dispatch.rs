@@ -27,7 +27,8 @@ use super::{AppShell, ToastKind};
 
 const REMOTES_MAX_AGE: Duration = Duration::from_secs(300);
 const VIEWER_MAX_AGE: Duration = Duration::from_secs(300);
-const ACCESS_MAX_AGE: Duration = Duration::from_secs(300);
+const ACCESS_RECHECK_AFTER: Duration = Duration::from_secs(300);
+const ACCESS_EXPIRES_AFTER: Duration = Duration::from_secs(600);
 /// Text and Enter in one write can reach an agent's prompt as a paste, whose Enter is a newline.
 const SUBMIT_AFTER_TYPING: Duration = Duration::from_millis(200);
 
@@ -188,6 +189,12 @@ struct Place {
     branch: String,
 }
 
+fn usable_access(answer: Option<&(bool, Instant)>, now: Instant) -> Option<bool> {
+    answer
+        .filter(|(_, at)| now.saturating_duration_since(*at) < ACCESS_EXPIRES_AFTER)
+        .map(|(can_write, _)| *can_write)
+}
+
 fn access_key(repository: &str, login: &str) -> (String, String) {
     (repository.to_ascii_lowercase(), login.to_ascii_lowercase())
 }
@@ -330,7 +337,7 @@ impl AppShell {
             known_access: state
                 .access
                 .iter()
-                .filter(|(_, (_, at))| at.elapsed() < ACCESS_MAX_AGE)
+                .filter(|(_, (_, at))| at.elapsed() < ACCESS_RECHECK_AFTER)
                 .map(|(key, _)| key.clone())
                 .collect(),
             projects: remotes_due.then_some(local),
@@ -492,7 +499,7 @@ impl AppShell {
                     .zip(item.repository.as_deref())
                     .and_then(|(login, repository)| {
                         let known = state.access.get(&access_key(repository, login));
-                        known.map(|(can_write, _)| *can_write)
+                        usable_access(known, Instant::now())
                     });
                 let facts = Facts {
                     viewer: &viewer.login,
@@ -972,6 +979,15 @@ mod tests {
             };
             assert_eq!(tab_at_handover(&probe), TabAtHandover::Busy);
         }
+    }
+
+    #[test]
+    fn a_write_access_answer_no_read_could_recheck_stops_counting() {
+        let at = Instant::now();
+        let answer = (true, at);
+        assert_eq!(usable_access(Some(&answer), at + ACCESS_RECHECK_AFTER), Some(true));
+        assert_eq!(usable_access(Some(&answer), at + ACCESS_EXPIRES_AFTER), None);
+        assert_eq!(usable_access(None, at), None);
     }
 
     #[test]
