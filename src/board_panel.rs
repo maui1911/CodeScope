@@ -144,13 +144,14 @@ impl AppShell {
         if self.settings.boards.iter().all(|b| !b.added_at.is_empty()) {
             return;
         }
-        let mut settings = (*self.settings).clone();
         let now = codescope_core::time::now_iso8601();
-        for board in settings.boards.iter_mut().filter(|b| b.added_at.is_empty()) {
-            board.added_at = now.clone();
-        }
-        match settings.save(self.paths_ref()) {
-            Ok(()) => self.apply_settings(settings, cx),
+        let saved = Settings::update(self.paths_ref(), |settings| {
+            for board in settings.boards.iter_mut().filter(|b| b.added_at.is_empty()) {
+                board.added_at = now.clone();
+            }
+        });
+        match saved {
+            Ok(settings) => self.apply_settings(settings, cx),
             Err(err) => eprintln!("warning: couldn't save when boards were added: {err:#}"),
         }
     }
