@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::agent_registry::AgentProfile;
+use crate::board::BoardSettings;
 use crate::paths::AppPaths;
 use crate::theme::builtin::DEFAULT_NAME;
 
@@ -69,6 +70,9 @@ pub struct Settings {
     /// without a code change. Empty (the default) keeps the shipped
     /// 5-agent defaults.
     pub agents: Vec<AgentProfile>,
+
+    /// Boards the board panel reads and dispatch takes work from (ADR-0027).
+    pub boards: Vec<BoardSettings>,
 }
 
 impl Default for Settings {
@@ -80,6 +84,7 @@ impl Default for Settings {
             cursor: CursorSettings::default(),
             default_agent: DEFAULT_AGENT_ID.to_string(),
             agents: Vec::new(),
+            boards: Vec::new(),
         }
     }
 }
