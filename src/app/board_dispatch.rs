@@ -8,10 +8,11 @@ use std::time::{Duration, Instant};
 
 use codescope_core::agents::claude::live_session;
 use codescope_core::board::dispatch::{
-    Facts, Hold, PostedFindings, ProjectRemotes, Round, StatusChange, WorktreeDispatch,
-    add_dispatch_worktree, branch_name, clear_findings, counts_towards_limit, decide,
-    exclude_handover_files, find_skill, launch_with_task, mover_to_check, moves_to_needs_decision,
-    projects_for_repository, task_file, task_message, trigger_content_ids, write_task_file,
+    FINDINGS_FILE, Facts, Hold, PostedFindings, ProjectRemotes, Round, StatusChange,
+    WorktreeDispatch, add_dispatch_worktree, branch_name, clear_findings, counts_towards_limit,
+    decide, exclude_handover_files, find_skill, launch_with_task, mover_to_check,
+    moves_to_needs_decision, projects_for_repository, task_file, task_message,
+    trigger_content_ids, write_task_file,
 };
 use codescope_core::board::findings::{
     FileStamp, Outcome, Problem, comment_body, problems_list, problems_message, read_findings,
@@ -59,6 +60,8 @@ pub(crate) struct DispatchState {
     post_errors: HashMap<RoundKey, (Instant, String)>,
     /// Round → what is wrong with its findings and what the session was told.
     reminders: HashMap<RoundKey, Reminder>,
+    /// Rounds whose findings wait for a program in a tab on their worktree that isn't an agent.
+    findings_held: HashSet<RoundKey>,
 }
 
 /// A round: the board item's id and when the move that started the round was made.
@@ -77,7 +80,14 @@ struct Reminder {
 
 enum SessionAt {
     Working,
-    Done(Option<Entity<TerminalView>>),
+    Held,
+    Done(Remind),
+}
+
+enum Remind {
+    Typing(Entity<TerminalView>),
+    Notice,
+    Nothing,
 }
 
 struct Posting {
@@ -229,20 +239,31 @@ enum HandoverTarget {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FindingsGate {
-    Settled(Option<usize>),
+    Settled(RemindBy),
     Wait,
+    Held,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemindBy {
+    Typing(usize),
+    Notice,
+    Nothing,
 }
 
 fn findings_gate(tabs: &[(TabAtHandover, bool)]) -> FindingsGate {
-    let settled = tabs.iter().all(|(state, turn_ended)| match state {
-        TabAtHandover::Shell | TabAtHandover::IdleClaude => true,
-        TabAtHandover::Other => *turn_ended,
-        TabAtHandover::Busy | TabAtHandover::Draft => false,
-    });
-    if !settled {
+    let is = |wanted: TabAtHandover| move |(state, _): &(TabAtHandover, bool)| *state == wanted;
+    if tabs.iter().any(is(TabAtHandover::Busy)) {
         return FindingsGate::Wait;
     }
-    FindingsGate::Settled(tabs.iter().position(|(state, _)| *state == TabAtHandover::IdleClaude))
+    if tabs.iter().any(|(state, ended)| *state == TabAtHandover::Other && !ended) {
+        return FindingsGate::Held;
+    }
+    FindingsGate::Settled(match tabs.iter().position(is(TabAtHandover::IdleClaude)) {
+        Some(index) => RemindBy::Typing(index),
+        None if tabs.iter().any(is(TabAtHandover::Draft)) => RemindBy::Nothing,
+        None => RemindBy::Notice,
+    })
 }
 
 struct Place {
@@ -994,6 +1015,7 @@ impl AppShell {
         let state = &mut self.board.dispatch;
         state.reminders.retain(|key, _| awaiting.contains(key));
         state.post_errors.retain(|key, _| awaiting.contains(key));
+        let held_before = std::mem::take(&mut state.findings_held);
 
         for (_, path, _, record) in records {
             let key = round_key(&record);
@@ -1018,8 +1040,14 @@ impl AppShell {
             let Some(file) = read_findings(&path) else {
                 continue;
             };
-            let SessionAt::Done(waiting_tab) = self.session_at(&path, cx) else {
-                continue;
+            let remind = match self.session_at(&path, cx) {
+                SessionAt::Working => continue,
+                SessionAt::Held => {
+                    self.board.dispatch.findings_held.insert(key);
+                    continue;
+                }
+                SessionAt::Done(_) if !researching => Remind::Nothing,
+                SessionAt::Done(remind) => remind,
             };
             match file.check() {
                 Ok((text, findings)) => {
@@ -1030,11 +1058,11 @@ impl AppShell {
                     };
                     self.post_findings(posting, body, board, mapping, cx);
                 }
-                Err(problems) => {
-                    let terminal = waiting_tab.filter(|_| researching);
-                    self.remind(key, file.stamp, terminal, &problems, cx);
-                }
+                Err(problems) => self.remind(&record, file.stamp, remind, &problems, cx),
             }
+        }
+        if self.board.dispatch.findings_held != held_before {
+            cx.notify();
         }
     }
 
@@ -1048,9 +1076,12 @@ impl AppShell {
             .collect();
         match findings_gate(&probed) {
             FindingsGate::Wait => SessionAt::Working,
-            FindingsGate::Settled(index) => {
-                SessionAt::Done(index.map(|index| tabs[index].terminal.clone()))
+            FindingsGate::Held => SessionAt::Held,
+            FindingsGate::Settled(RemindBy::Typing(index)) => {
+                SessionAt::Done(Remind::Typing(tabs[index].terminal.clone()))
             }
+            FindingsGate::Settled(RemindBy::Notice) => SessionAt::Done(Remind::Notice),
+            FindingsGate::Settled(RemindBy::Nothing) => SessionAt::Done(Remind::Nothing),
         }
     }
 
@@ -1063,28 +1094,45 @@ impl AppShell {
 
     fn remind(
         &mut self,
-        key: RoundKey,
+        record: &WorktreeDispatch,
         file: FileStamp,
-        terminal: Option<Entity<TerminalView>>,
+        remind: Remind,
         problems: &[Problem],
         cx: &mut Context<Self>,
     ) {
-        let reminder = self.board.dispatch.reminders.entry(key).or_insert(Reminder {
+        let reminders = &mut self.board.dispatch.reminders;
+        let reminder = reminders.entry(round_key(record)).or_insert(Reminder {
             problems: String::new(),
             file: None,
             sent: 0,
         });
         reminder.problems = problems_list(problems);
         cx.notify();
-        if reminder.file == Some(file) || reminder.sent >= MAX_REMINDERS {
+        let due = reminder.file != Some(file) && reminder.sent < MAX_REMINDERS;
+        if !due || matches!(remind, Remind::Nothing) {
             return;
         }
-        let Some(terminal) = terminal else {
-            return;
-        };
         reminder.file = Some(file);
         reminder.sent += 1;
-        Self::submit_line(&terminal, problems_message(problems), cx);
+        let listed = reminder.problems.clone();
+        match remind {
+            Remind::Typing(terminal) => {
+                Self::submit_line(&terminal, problems_message(problems), cx);
+            }
+            Remind::Notice => {
+                let title = format!("Findings on #{} can't be posted yet", record.number);
+                let detail = format!("{listed}. Fix {FINDINGS_FILE}, or have its session fix it.");
+                self.push_toast(ToastKind::Err, title.clone(), Some(detail.clone().into()), cx);
+                self.push_notification(
+                    crate::notifications::NotificationKind::SessionWaiting,
+                    title,
+                    detail,
+                    Some(record.title.clone().into()),
+                    cx,
+                );
+            }
+            Remind::Nothing => {}
+        }
     }
 
     fn post_findings(
@@ -1272,6 +1320,17 @@ impl AppShell {
                 },
             );
         }
+        for key in state.findings_held.iter().filter(|key| rounds.contains(*key)) {
+            notes.insert(
+                key.0.clone(),
+                CardNote {
+                    text: "Findings written · to post them, quit what runs in its worktree's \
+                           tab, or close the tab"
+                        .into(),
+                    tone: NoteTone::Waiting,
+                },
+            );
+        }
         for (item_id, hold) in &state.holds {
             if !hold.is_quiet() {
                 notes.insert(
@@ -1410,23 +1469,28 @@ mod tests {
 
     #[test]
     fn findings_wait_for_every_session_on_the_worktree_and_only_claude_code_is_reminded() {
+        use FindingsGate::{Held, Settled, Wait};
+        use RemindBy::{Nothing, Notice, Typing};
         use TabAtHandover::*;
-        assert_eq!(findings_gate(&[]), FindingsGate::Settled(None));
-        assert_eq!(
-            findings_gate(&[(Shell, false), (IdleClaude, false)]),
-            FindingsGate::Settled(Some(1))
-        );
+        assert_eq!(findings_gate(&[]), Settled(Notice), "with no session left, the user is told");
+        assert_eq!(findings_gate(&[(Shell, false), (IdleClaude, false)]), Settled(Typing(1)));
         assert_eq!(
             findings_gate(&[(IdleClaude, true), (Busy, false)]),
-            FindingsGate::Wait,
+            Wait,
             "another session there still works"
         );
-        assert_eq!(findings_gate(&[(Draft, true)]), FindingsGate::Wait, "the user is typing");
-        assert_eq!(findings_gate(&[(Other, false)]), FindingsGate::Wait);
+        assert_eq!(
+            findings_gate(&[(Draft, true)]),
+            Settled(Nothing),
+            "the findings can be posted, but nothing is typed into the user's draft"
+        );
+        assert_eq!(findings_gate(&[(Draft, false), (IdleClaude, false)]), Settled(Typing(1)));
+        assert_eq!(findings_gate(&[(Other, false), (Shell, false)]), Held);
+        assert_eq!(findings_gate(&[(Other, false), (Busy, false)]), Wait);
         assert_eq!(
             findings_gate(&[(Other, true)]),
-            FindingsGate::Settled(None),
-            "another agent whose turn ended is done, but nothing is typed into it"
+            Settled(Notice),
+            "another agent whose turn ended is done; the user is told, nothing is typed"
         );
     }
 
