@@ -286,15 +286,8 @@ pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
         problems.push(Problem::ApproachBeforeCause);
     }
 
-    let near_miss = top.iter().any(|s| {
-        !s.heading.eq_ignore_ascii_case(DECISION_POINTS) && names_decision_points(&s.heading)
-    });
-    let points_inside =
-        position(DECISION_POINTS).map(|index| point_headings(&top[index].lines)).unwrap_or(0);
-    if near_miss {
-        problems.push(Problem::DecisionPointsHeading);
-    } else if point_headings(&lines) > points_inside {
-        problems.push(Problem::StrayDecisionPoint);
+    if let Some(problem) = misplaced_point_heading(&lines) {
+        problems.push(problem);
     }
 
     let mut decision_points = Vec::new();
@@ -312,7 +305,8 @@ pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
         }
         let names_point =
             |line: &Line<'_>| line.text.split(|c: char| !c.is_alphanumeric()).any(is_point_id);
-        if points.is_empty() && body.iter().any(names_point) {
+        let unheaded = points.is_empty() && body.iter().any(names_point);
+        if unheaded && !problems.contains(&Problem::UnheadedDecisionPoints) {
             problems.push(Problem::UnheadedDecisionPoints);
         }
     }
@@ -598,7 +592,11 @@ fn is_heading(text: &str) -> bool {
 }
 
 fn heading_title(text: &str) -> Option<&str> {
-    (1..=6).find_map(|level| heading(text, level))
+    heading_with_level(text).map(|(_, title)| title)
+}
+
+fn heading_with_level(text: &str) -> Option<(usize, &str)> {
+    (1..=6).find_map(|level| heading(text, level).map(|title| (level, title)))
 }
 
 /// CommonMark: a run of `=` or of `-` under a paragraph makes that paragraph a heading.
@@ -733,12 +731,38 @@ fn heading(line: &str, level: usize) -> Option<&str> {
     Some(title)
 }
 
-fn point_headings(lines: &[Line<'_>]) -> usize {
-    sections(lines, 3).iter().filter(|s| is_point_id(point_title(s).0)).count()
+fn misplaced_point_heading(lines: &[Line<'_>]) -> Option<Problem> {
+    let mut in_points = false;
+    let mut found = None;
+    for line in lines.iter().filter(|line| !line.code) {
+        let Some((level, title)) = heading_with_level(line.text) else {
+            continue;
+        };
+        let section = level == 2 && format!("## {title}").eq_ignore_ascii_case(DECISION_POINTS);
+        if level == 2 {
+            in_points = section;
+        }
+        let point = level == 3 && in_points && is_point_id(split_point_title(title).0);
+        if section || point || !mentions_point(title) {
+            continue;
+        }
+        if names_decision_points(title) {
+            return Some(Problem::DecisionPointsHeading);
+        }
+        found = if in_points {
+            found.or(Some(Problem::UnheadedDecisionPoints))
+        } else {
+            Some(Problem::StrayDecisionPoint)
+        };
+    }
+    found
 }
 
 fn point_title<'a>(section: &'a Section) -> (&'a str, &'a str) {
-    let title = section.heading.trim_start_matches('#').trim();
+    split_point_title(section.heading.trim_start_matches('#').trim())
+}
+
+fn split_point_title(title: &str) -> (&str, &str) {
     let (id, question) = title.split_once(char::is_whitespace).unwrap_or((title, ""));
     (id.trim_end_matches([':', '.', ')']), question.trim())
 }
@@ -1649,6 +1673,26 @@ Advice: A, it keeps the slice small.
         for other in ["> ## Decisions and their points\n", "Decision\n\npoints\n---\n"] {
             assert!(check_findings(&format!("{base}{other}")).is_ok(), "{other:?}");
         }
+    }
+
+    #[test]
+    fn every_heading_that_names_a_decision_point_is_one_the_check_reads() {
+        let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n";
+        let options = "- **A** a\n- **B** b\nAdvice: A\n";
+        for (heading, problem) in [
+            ("# Decision points\n\n#### B1 Stack or wait?\n", Problem::DecisionPointsHeading),
+            ("### Decision points\n", Problem::DecisionPointsHeading),
+            ("## Decision&#32;points\n\n### &#66;1 Which?\n", Problem::DecisionPointsHeading),
+            ("## B1 Stack or wait?\n", Problem::StrayDecisionPoint),
+            ("### **B1** Which?\n", Problem::StrayDecisionPoint),
+            ("## Decision points\n\n### B1 Q?\n", Problem::UnheadedDecisionPoints),
+        ] {
+            let unheaded = problem == Problem::UnheadedDecisionPoints;
+            let extra = if unheaded { "#### B2 R?\n" } else { "" };
+            let text = format!("{base}{heading}{options}{extra}{options}");
+            assert_eq!(check_findings(&text).unwrap_err(), vec![problem], "{heading:?}");
+        }
+        assert!(check_findings(&format!("{base}### Notes on the decision\n")).is_ok());
     }
 
     #[test]
