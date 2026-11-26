@@ -95,6 +95,12 @@ struct Posting {
     outcome: Outcome,
 }
 
+struct Posted {
+    url: String,
+    adopted: bool,
+    move_error: Option<String>,
+}
+
 /// What a board read needs from the app, taken on the foreground.
 pub(crate) struct ReadInput {
     boards: Vec<(String, ColumnMapping)>,
@@ -1156,6 +1162,7 @@ impl AppShell {
                     let failed = |err: anyhow::Error| format!("{err:#}");
                     let before = github::before_posting(&item_id, &content_id, &since, &body)
                         .map_err(failed)?;
+                    let adopted = before.posted.is_some();
                     let url = match before.posted {
                         Some(url) => url,
                         None => github::add_comment(&content_id, &body).map_err(failed)?,
@@ -1164,7 +1171,7 @@ impl AppShell {
                         .column_id
                         .as_deref()
                         .and_then(|id| board.role_of_column(id, &mapping));
-                    let moved = if !moves_to_needs_decision(role) {
+                    let move_error = if !moves_to_needs_decision(role) {
                         None
                     } else {
                         match mapped_column(&board, &mapping, ColumnRole::NeedsDecision) {
@@ -1174,7 +1181,11 @@ impl AppShell {
                             None => Some("the board has no Needs decision column".to_string()),
                         }
                     };
-                    Ok::<_, String>((url, moved))
+                    Ok::<_, String>(Posted {
+                        url,
+                        adopted,
+                        move_error,
+                    })
                 })
                 .await;
             let _ = this.update(cx, |this, cx| this.finish_posting(posting, result, cx));
@@ -1185,53 +1196,62 @@ impl AppShell {
     fn finish_posting(
         &mut self,
         posting: Posting,
-        result: Result<(String, Option<String>), String>,
+        result: Result<Posted, String>,
         cx: &mut Context<Self>,
     ) {
         let Posting { record, outcome } = posting;
         let key = round_key(&record);
         self.board.dispatch.posting.remove(&key);
-        let (comment_url, move_error) = match result {
+        cx.notify();
+        let Posted {
+            url,
+            adopted,
+            move_error,
+        } = match result {
             Ok(posted) => posted,
             Err(message) => {
                 let note = format!("Couldn't post the findings: {message}");
-                self.board.dispatch.post_errors.insert(key, (Instant::now(), note));
-                self.push_toast(
-                    ToastKind::Err,
-                    format!("Couldn't post the findings of #{}", record.number),
-                    Some(message.into()),
-                    cx,
-                );
+                let errors = &mut self.board.dispatch.post_errors;
+                let first = errors.insert(key, (Instant::now(), note)).is_none();
+                if first {
+                    self.push_toast(
+                        ToastKind::Err,
+                        format!("Couldn't post the findings of #{}", record.number),
+                        Some(message.into()),
+                        cx,
+                    );
+                }
                 return;
             }
         };
 
         let posted = PostedFindings {
             outcome,
-            comment_url,
+            comment_url: url,
         };
         let saved = ProjectsConfig::load(&self.paths)
             .map_err(|err| format!("{err:#}"))
             .and_then(|mut next| {
-                if !record_posted_findings(&mut next, &record.item_id, &record.trigger_at, posted) {
-                    return Ok(None);
+                if record_posted_findings(&mut next, &record.item_id, &record.trigger_at, posted) {
+                    next.save(&self.paths).map_err(|err| format!("{err:#}"))?;
                 }
-                next.save(&self.paths).map_err(|err| format!("{err:#}"))?;
-                Ok(Some(next))
+                Ok(next)
             });
         match saved {
-            Ok(Some(next)) => {
+            Ok(next) => {
                 self.projects = next.clone();
                 self.sidebar.update(cx, |sidebar, cx| {
                     sidebar.replace_projects(next);
                     cx.notify();
                 });
             }
-            Ok(None) => {}
             Err(err) => {
                 let note = format!("Findings posted, not saved: {err}");
                 self.board.dispatch.post_errors.insert(key, (Instant::now(), note));
             }
+        }
+        if adopted && move_error.is_none() {
+            return;
         }
 
         let title = format!("Findings on #{}", record.number);
@@ -1256,7 +1276,6 @@ impl AppShell {
             Some(record.title.clone().into()),
             cx,
         );
-        cx.notify();
     }
 
     /// What each card on the board at `board_url` says about dispatch, by item id.
