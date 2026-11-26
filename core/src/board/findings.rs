@@ -327,7 +327,7 @@ impl Fence {
         if run < 3 || (mark == '`' && info.contains('`')) {
             return None;
         }
-        let column = columns(&line[..line.len() - rest.len()]);
+        let column = advance(0, &line[..line.len() - rest.len()]);
         let item_column = if in_item { column } else { 0 };
         Some(Fence { mark, run, column, item_column })
     }
@@ -341,41 +341,90 @@ impl Fence {
     }
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum LastLine {
+    #[default]
+    NoParagraph,
+    MaybeParagraph,
+    Paragraph,
+}
+
 #[derive(Default)]
 struct Fences {
     open: Option<Fence>,
-    after_text: bool,
+    item_column: Option<usize>,
+    last: LastLine,
     less_indented: bool,
 }
 
 impl Fences {
     fn is_code(&mut self, line: &str) -> bool {
         let start = line.trim_start_matches([' ', '\t']);
-        let item = indent_width(line) <= 3
+        if let Some(fence) = self.open {
+            self.less_indented |= !start.is_empty() && indent_width(line) < fence.column;
+            if fence.closed_by(line) {
+                self.open = None;
+            }
+            self.last = LastLine::NoParagraph;
+            return true;
+        }
+        if start.is_empty() {
+            self.last = LastLine::NoParagraph;
+            return false;
+        }
+        let indent = indent_width(line);
+        let beside = self.item_column.is_some_and(|column| indent < column);
+        let item = indent <= 3
             && item_content(start).is_some()
-            && (!self.after_text || may_interrupt_text(start));
-        let code = match self.open {
-            Some(fence) => {
-                self.less_indented |= !start.is_empty() && indent_width(line) < fence.column;
-                if fence.closed_by(line) {
-                    self.open = None;
-                }
-                true
-            }
-            None => {
-                self.open = Fence::opened_by(line).filter(|f| item || f.item_column == 0);
-                self.open.is_some()
-            }
+            && (beside || self.last == LastLine::NoParagraph || may_interrupt_text(start));
+        self.open = Fence::opened_by(line).filter(|fence| item || fence.item_column == 0);
+        let lazy = self.last == LastLine::Paragraph && self.open.is_none() && is_prose(start);
+        let (text, column) = if item { after_markers(line) } else { (start, 0) };
+        if item {
+            self.item_column = Some(column);
+        } else if beside && !lazy {
+            self.item_column = None;
+        }
+        self.last = if self.open.is_some() || text.is_empty() || is_heading(text) {
+            LastLine::NoParagraph
+        } else if is_prose(text) {
+            LastLine::Paragraph
+        } else {
+            LastLine::MaybeParagraph
         };
-        self.after_text = !code && !item && !start.is_empty();
-        code
+        self.open.is_some()
     }
 }
 
-/// CommonMark lets a list start in the middle of a paragraph only with a bullet or the number 1.
+/// CommonMark lets a list start inside a paragraph only with a bullet or 1, and not empty.
 fn may_interrupt_text(item: &str) -> bool {
     let digits = item.len() - item.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-    digits == 0 || &item[..digits] == "1"
+    let filled = item_content(item).is_some_and(|c| !c.trim_matches([' ', '\t']).is_empty());
+    (digits == 0 || &item[..digits] == "1") && filled
+}
+
+/// CommonMark starts an item's content one to four columns past its marker, else one past it.
+fn after_markers(line: &str) -> (&str, usize) {
+    let mut rest = line.trim_start_matches([' ', '\t']);
+    let mut column = indent_width(line);
+    while let Some(content) = item_content(rest) {
+        let marker_end = advance(column, &rest[..rest.len() - content.len()]);
+        let text = content.trim_start_matches([' ', '\t']);
+        let text_column = advance(marker_end, &content[..content.len() - text.len()]);
+        if text.is_empty() || text_column - marker_end > 4 {
+            return ("", marker_end + 1);
+        }
+        (rest, column) = (text, text_column);
+    }
+    (rest, column)
+}
+
+fn is_prose(text: &str) -> bool {
+    text.starts_with(char::is_alphanumeric) && !text.contains('|')
+}
+
+fn is_heading(text: &str) -> bool {
+    (1..=6).any(|level| heading(text, level).is_some())
 }
 
 fn fence_problems(text: &str) -> Vec<Problem> {
@@ -388,11 +437,11 @@ fn fence_problems(text: &str) -> Vec<Problem> {
 }
 
 fn indent_width(line: &str) -> usize {
-    columns(&line[..line.len() - line.trim_start_matches([' ', '\t']).len()])
+    advance(0, &line[..line.len() - line.trim_start_matches([' ', '\t']).len()])
 }
 
-fn columns(text: &str) -> usize {
-    text.chars().fold(0, |width, c| if c == '\t' { width + 4 - width % 4 } else { width + 1 })
+fn advance(column: usize, text: &str) -> usize {
+    text.chars().fold(column, |width, c| if c == '\t' { width + 4 - width % 4 } else { width + 1 })
 }
 
 fn sections(text: &str, level: usize) -> Vec<Section<'_>> {
@@ -1158,6 +1207,31 @@ Advice: A, it keeps the slice small.
             vec![Problem::OpenFence],
             "a list numbered from 2 can't interrupt a paragraph, so its last line opens a block"
         );
+        for empty in ["* ", "1. "] {
+            let text = format!("{base}Steps\n{empty}\n2. ```\n   ~~~\n   ```\n");
+            assert_eq!(
+                check_findings(&text).unwrap_err(),
+                vec![Problem::OpenFence],
+                "an empty item can't interrupt a paragraph either: {empty:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_later_step_may_open_its_fence_on_its_line_after_any_text_of_the_list() {
+        let base = "## Cause\n\nX.\n\n## Approach\n\n";
+        let step = "2. ```sh\n   make test\n   ```\n";
+        for before in [
+            "1. ```sh\n   make\n   ```\n   This takes a minute.\n",
+            "1. Stop the service\n   and wait for it to drain.\n",
+            "1. Stop the service\nand wait for it to drain.\n",
+            "1. Build:\n    - debug\n",
+        ] {
+            let text = format!("{base}{before}{step}");
+            assert!(check_findings(&text).is_ok(), "{before:?}");
+        }
+        let heading = format!("## Cause\n\nX.\n\n## Approach\n{step}");
+        assert!(check_findings(&heading).is_ok(), "a heading is no paragraph");
     }
 
     #[test]
