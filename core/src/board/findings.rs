@@ -431,7 +431,7 @@ impl Fences {
         let behind = behind_containers(start);
         let read = is_heading(line);
         let shown = heading_title(behind).is_some_and(mentions_point);
-        let underline = is_underline(start) || is_underline(behind);
+        let underline = is_underline_in_container(start);
         self.hidden_point |= !read && shown || underline && self.text_names_point;
         self.text_names_point =
             !read && !underline && (self.text_names_point || mentions_point(behind));
@@ -606,6 +606,19 @@ fn names_decision_points(text: &str) -> bool {
 
 fn words(text: &str) -> Vec<&str> {
     text.split(|c: char| !c.is_alphanumeric()).filter(|word| !word.is_empty()).collect()
+}
+
+fn is_underline_in_container(line: &str) -> bool {
+    let mut rest = line.trim_start_matches([' ', '\t']);
+    loop {
+        if is_underline(rest) {
+            return true;
+        }
+        let Some(inner) = container_content(rest) else {
+            return false;
+        };
+        rest = inner.trim_start_matches([' ', '\t']);
+    }
 }
 
 fn behind_containers(line: &str) -> &str {
@@ -1512,6 +1525,9 @@ Advice: A, it keeps the slice small.
             "Decision points\n---\n",
             "- a\n\n  B1 Which?\n  ---\n",
             "- Decision points\n  -\n",
+            "> Decision points\n> -\n",
+            ">> Decision points\n>> -\n",
+            "> B1 Which?\n> -\n",
             "Some text about decision points\n===\n",
         ] {
             let text = format!("{base}{hidden}");
