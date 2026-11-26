@@ -72,6 +72,8 @@ pub enum Problem {
     DecisionPointsHeading,
     /// A `### B<n>` heading outside `## Decision points`.
     StrayDecisionPoint,
+    /// `B<n>` named under `## Decision points` without a single `### B<n>` heading there.
+    UnheadedDecisionPoints,
     /// A point's heading is not the next `B<n>`, which it holds.
     Numbering(String),
     TooFewOptions(String),
@@ -107,13 +109,16 @@ impl fmt::Display for Problem {
             Problem::StrayDecisionPoint => {
                 write!(f, "a ### B heading sits outside {DECISION_POINTS}")
             }
+            Problem::UnheadedDecisionPoints => {
+                write!(f, "each decision point needs a heading ### B1, ### B2 and so on")
+            }
             Problem::Numbering(expected) => {
                 write!(f, "decision point {expected} should be headed ### {expected}")
             }
             Problem::TooFewOptions(id) => {
                 write!(f, "{id} needs at least two options starting with **A**, **B**")
             }
-            Problem::NoAdvice(id) => write!(f, "{id} has no Advice line"),
+            Problem::NoAdvice(id) => write!(f, "{id} has no line Advice: <letter>, <reason>"),
             Problem::AdviceNotAnOption(id) => {
                 write!(f, "{id} advises a letter it has no option for")
             }
@@ -248,11 +253,15 @@ pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
             problems.push(Problem::DecisionPointsNotLast);
         }
         let body = top[index].lines.join("\n");
-        for (number, point) in sections(&body, 3).iter().enumerate() {
+        let points = sections(&body, 3);
+        for (number, point) in points.iter().enumerate() {
             match decision_point(point, number + 1) {
                 Ok(point) => decision_points.push(point),
                 Err(problem) => problems.push(problem),
             }
+        }
+        if points.is_empty() && body.split(|c: char| !c.is_alphanumeric()).any(is_point_id) {
+            problems.push(Problem::UnheadedDecisionPoints);
         }
     }
 
@@ -309,8 +318,6 @@ fn ends_in_code(text: &str) -> bool {
     fences.open.is_some()
 }
 
-/// The sections that start with an ATX heading of `level`, outside fenced code blocks, each
-/// heading as `## Text`. Text before the first heading is left out.
 fn sections(text: &str, level: usize) -> Vec<Section<'_>> {
     let mut sections: Vec<Section> = Vec::new();
     let mut fences = Fences::default();
@@ -348,16 +355,20 @@ fn heading(line: &str, level: usize) -> Option<&str> {
 }
 
 fn point_headings(text: &str) -> usize {
-    sections(text, 3)
-        .iter()
-        .filter(|s| {
-            let id = s.heading.trim_start_matches('#').split_whitespace().next().unwrap_or("");
-            let mut chars = id.chars();
-            matches!(chars.next(), Some('B' | 'b'))
-                && !chars.as_str().is_empty()
-                && chars.all(|c| c.is_ascii_digit())
-        })
-        .count()
+    sections(text, 3).iter().filter(|s| is_point_id(point_title(s).0)).count()
+}
+
+fn point_title<'a>(section: &'a Section) -> (&'a str, &'a str) {
+    let title = section.heading.trim_start_matches('#').trim();
+    let (id, question) = title.split_once(char::is_whitespace).unwrap_or((title, ""));
+    (id.trim_end_matches([':', '.', ')']), question.trim())
+}
+
+fn is_point_id(word: &str) -> bool {
+    let mut chars = word.chars();
+    matches!(chars.next(), Some('B' | 'b'))
+        && !chars.as_str().is_empty()
+        && chars.all(|c| c.is_ascii_digit())
 }
 
 fn is_blank(lines: &[&str]) -> bool {
@@ -366,8 +377,7 @@ fn is_blank(lines: &[&str]) -> bool {
 
 fn decision_point(section: &Section, number: usize) -> Result<DecisionPoint, Problem> {
     let expected = format!("B{number}");
-    let title = section.heading.trim_start_matches('#').trim();
-    let (id, question) = title.split_once(char::is_whitespace).unwrap_or((title, ""));
+    let (id, question) = point_title(section);
     if !id.eq_ignore_ascii_case(&expected) {
         return Err(Problem::Numbering(expected));
     }
@@ -385,13 +395,12 @@ fn decision_point(section: &Section, number: usize) -> Result<DecisionPoint, Pro
     }
     Ok(DecisionPoint {
         id: expected,
-        question: question.trim().to_string(),
+        question: question.to_string(),
         options,
         advice,
     })
 }
 
-/// `- **A** …`, `* **B.** …` or `1. **C:** …` → the letter.
 fn option_letter(line: &str) -> Option<char> {
     let item = line.trim_start();
     let item = item
@@ -409,14 +418,17 @@ fn option_letter(line: &str) -> Option<char> {
     rest.starts_with("**").then_some(letter)
 }
 
-/// `Advice: A, …`, also in bold → the letter, which stands as a word of its own.
 fn advice_letter(line: &str) -> Option<char> {
     let plain = line.replace("**", "");
     let plain = plain.trim();
     plain.get(..7).filter(|p| p.eq_ignore_ascii_case("advice:"))?;
     let mut rest = plain[7..].trim_start().chars();
     let letter = rest.next().filter(char::is_ascii_uppercase)?;
-    rest.next().is_none_or(|next| !next.is_alphanumeric()).then_some(letter)
+    let after = rest.as_str();
+    let aside = after.strip_prefix(' ').is_some_and(|aside| {
+        aside.trim_start().starts_with(['(', '-', '\u{2013}', '\u{2014}'])
+    });
+    (after.is_empty() || after.starts_with([',', '.', ':', ';', ')']) || aside).then_some(letter)
 }
 
 /// Whether `line` is a dispatch marker, in any spelling GitHub hides as a comment.
@@ -785,17 +797,45 @@ Advice: A, it keeps the slice small.
     }
 
     #[test]
+    fn a_point_id_may_end_in_punctuation_and_every_point_needs_its_heading() {
+        let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n## Decision points\n\n";
+        for heading in ["### B1: Q?", "### B1. Q?", "### B1) Q?"] {
+            let text = format!("{base}{heading}\n- **A** a\n- **B** b\nAdvice: A\n");
+            let findings = check_findings(&text).unwrap();
+            assert_eq!(findings.decision_points[0].id, "B1", "{heading}");
+            assert_eq!(findings.decision_points[0].question, "Q?", "{heading}");
+        }
+        for unheaded in ["#### B1 Q?", "**B1** Q?", "B1. Q?"] {
+            let text = format!("{base}{unheaded}\n- **A** a\n- **B** b\nAdvice: A\n");
+            assert_eq!(
+                check_findings(&text).unwrap_err(),
+                vec![Problem::UnheadedDecisionPoints],
+                "{unheaded}"
+            );
+        }
+    }
+
+    #[test]
     fn advice_names_a_letter_on_its_own() {
         let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n## Decision points\n\n### B1 Q?\n\
                     - **A** a\n- **B** b\n";
-        for advice in ["Advice: Both are viable", "Advice: Allow them"] {
+        for advice in ["Advice: Both are viable", "Advice: Allow them", "Advice: A better one is B"]
+        {
             assert_eq!(
                 check_findings(&format!("{base}{advice}\n")).unwrap_err(),
                 vec![Problem::NoAdvice("B1".into())],
                 "{advice}"
             );
         }
-        for advice in ["Advice: B", "Advice: B, simpler", "Advice: B.", "**Advice:** B) simpler"] {
+        let named = [
+            "Advice: B",
+            "Advice: B, simpler",
+            "Advice: B.",
+            "**Advice:** B) simpler",
+            "Advice: B (simpler)",
+            "Advice: B \u{2014} simpler",
+        ];
+        for advice in named {
             let findings = check_findings(&format!("{base}{advice}\n")).unwrap();
             assert_eq!(findings.decision_points[0].advice, 'B', "{advice}");
         }
@@ -900,8 +940,8 @@ Advice: A, it keeps the slice small.
             problems_message(&[Problem::Missing(APPROACH), Problem::NoAdvice("B2".into())]);
         assert_eq!(
             message,
-            "CodeScope cannot post .codescope/findings.md yet: no ## Approach; B2 has no Advice \
-             line. Fix the file and stop."
+            "CodeScope cannot post .codescope/findings.md yet: no ## Approach; B2 has no line \
+             Advice: <letter>, <reason>. Fix the file and stop."
         );
     }
 
@@ -926,6 +966,7 @@ Advice: A, it keeps the slice small.
             Problem::DecisionPointsNotLast,
             Problem::DecisionPointsHeading,
             Problem::StrayDecisionPoint,
+            Problem::UnheadedDecisionPoints,
             Problem::Numbering("B2".into()),
             Problem::TooFewOptions("B1".into()),
             Problem::NoAdvice("B1".into()),
@@ -946,12 +987,14 @@ Advice: A, it keeps the slice small.
 
     #[test]
     fn the_message_names_a_few_problems_and_counts_the_rest() {
-        let problems: Vec<Problem> = (1..=7).map(|n| Problem::NoAdvice(format!("B{n}"))).collect();
+        let problems: Vec<Problem> =
+            (1..=7).map(|n| Problem::AdviceNotAnOption(format!("B{n}"))).collect();
         assert_eq!(
             problems_message(&problems),
-            "CodeScope cannot post .codescope/findings.md yet: B1 has no Advice line; B2 has no \
-             Advice line; B3 has no Advice line; B4 has no Advice line; and 3 more. Fix the file \
-             and stop."
+            "CodeScope cannot post .codescope/findings.md yet: B1 advises a letter it has no \
+             option for; B2 advises a letter it has no option for; B3 advises a letter it has no \
+             option for; B4 advises a letter it has no option for; and 3 more. Fix the file and \
+             stop."
         );
     }
 }
