@@ -3313,7 +3313,8 @@ mod tests {
         watch.follow("2026-11-25T09:00:00Z", false);
         assert!(watch.busy_seen);
         watch.track(Some((SessionState::Idle, 5)));
-        watch.read_ok_at = Some(Instant::now());
+        let stopped = watch.idle_since.unwrap();
+        watch.read_ok_at = Some(stopped + Duration::from_millis(1));
         assert!(watch.stopped_after_work());
     }
 
