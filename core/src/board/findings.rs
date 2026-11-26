@@ -110,8 +110,9 @@ pub enum Problem {
     ListFence,
     /// A fence four or more columns into a list, which GitHub may or may not take for one.
     DeepFence,
-    /// A heading in a list item, which GitHub renders but no section of the check holds.
-    ListHeading,
+    /// A heading naming a decision point that GitHub may show but the check does not read: in a
+    /// list, quote or footnote, four or more columns in, or underlined.
+    HiddenPoint,
     /// The file, or the folder it is in, is a link.
     Link,
     /// A folder, a pipe or a device where the file should be.
@@ -173,10 +174,11 @@ impl fmt::Display for Problem {
                 "a code block in a list has a fence four or more columns in: keep its fences \
                  at most three columns in"
             ),
-            Problem::ListHeading => write!(
+            Problem::HiddenPoint => write!(
                 f,
-                "a line in a list starts with #, which GitHub may show as a heading: keep \
-                 headings out of lists and code in fenced blocks"
+                "a heading that names a decision point sits in a list, quote or footnote, is \
+                 indented, or is text underlined with = or -: start ## Decision points and \
+                 each ### B heading at the beginning of a line, and put a blank line above a rule"
             ),
             Problem::Link => write!(f, "it or its folder is a link"),
             Problem::NotAFile => write!(f, "it is not a plain file"),
@@ -379,7 +381,8 @@ struct Fences {
     less_indented: bool,
     deep: bool,
     unsure_item: bool,
-    list_heading: bool,
+    hidden_point: bool,
+    text_names_point: bool,
 }
 
 impl Fences {
@@ -387,6 +390,7 @@ impl Fences {
         let start = line.trim_start_matches([' ', '\t']);
         let indent = indent_width(line);
         if let Some(fence) = self.open {
+            self.text_names_point = false;
             self.less_indented |= !start.is_empty() && indent < fence.column;
             match fence.closer_at(line) {
                 Some(at) if (fence.item_column..=fence.item_column + 3).contains(&at) => {
@@ -404,25 +408,34 @@ impl Fences {
         if start.is_empty() {
             self.last = LastLine::NoParagraph;
             self.blank_before = true;
+            self.text_names_point = false;
             return false;
         }
         let after_blank = std::mem::take(&mut self.blank_before);
+        self.note_point(line, start);
         let markers = after_markers(line);
         let fenced = markers.map_or_else(
             || line.contains("```") || line.contains("~~~"),
             |(text, _)| Fence::at(text, 0, 0, false).is_some(),
         );
-        let headed = markers.map_or_else(|| line.contains('#'), |(text, _)| is_heading(text));
         let marker_line = indent <= 3 && item_content(start).is_some() && !is_thematic_break(start);
-        let deep = indent > 3 && self.listed;
-        self.deep |= deep && fenced;
-        self.list_heading |= headed && (marker_line || deep);
+        self.deep |= indent > 3 && self.listed && fenced;
         self.open = if marker_line {
             self.item(start, indent, markers, fenced)
         } else {
             self.other(line, indent, after_blank)
         };
         self.open.is_some()
+    }
+
+    fn note_point(&mut self, line: &str, start: &str) {
+        let behind = behind_containers(start);
+        let read = is_heading(line);
+        let shown = heading_title(behind).is_some_and(mentions_point);
+        let underline = is_underline(start) || is_underline(behind);
+        self.hidden_point |= !read && shown || underline && self.text_names_point;
+        self.text_names_point =
+            !read && !underline && (self.text_names_point || mentions_point(behind));
     }
 
     fn item(
@@ -486,7 +499,7 @@ impl Fences {
         [
             (self.unsure_item, Problem::ListFence),
             (self.deep, Problem::DeepFence),
-            (self.list_heading, Problem::ListHeading),
+            (self.hidden_point, Problem::HiddenPoint),
             (self.less_indented, Problem::UnevenFence),
             (self.open.is_some(), Problem::OpenFence),
         ]
@@ -554,7 +567,31 @@ fn is_thematic_break(text: &str) -> bool {
 }
 
 fn is_heading(text: &str) -> bool {
-    (1..=6).any(|level| heading(text, level).is_some())
+    heading_title(text).is_some()
+}
+
+fn heading_title(text: &str) -> Option<&str> {
+    (1..=6).find_map(|level| heading(text, level))
+}
+
+/// CommonMark: a run of `=` or of `-` under a paragraph makes that paragraph a heading.
+fn is_underline(text: &str) -> bool {
+    let run = text.trim_end_matches([' ', '\t']);
+    !run.is_empty() && (run.bytes().all(|b| b == b'=') || run.bytes().all(|b| b == b'-'))
+}
+
+fn mentions_point(text: &str) -> bool {
+    let first = text.split_whitespace().next().unwrap_or("");
+    is_point_id(first.trim_end_matches([':', '.', ')']))
+        || text.to_lowercase().contains("decision point")
+}
+
+fn behind_containers(line: &str) -> &str {
+    let mut rest = line.trim_start_matches([' ', '\t']);
+    while let Some(inner) = container_content(rest) {
+        rest = inner.trim_start_matches([' ', '\t']);
+    }
+    rest
 }
 
 fn indent_width(line: &str) -> usize {
@@ -829,10 +866,7 @@ fn disarm_info_strings(line: &str) -> String {
 
 /// GFM opens a fence after any run of block quote, list item and footnote definition markers.
 fn info_string_at(line: &str) -> Option<usize> {
-    let mut rest = line.trim_start_matches([' ', '\t']);
-    while let Some(inner) = container_content(rest) {
-        rest = inner.trim_start_matches([' ', '\t']);
-    }
+    let rest = behind_containers(line);
     let mark = rest.chars().next().filter(|c| matches!(c, '`' | '~'))?;
     let info = rest.trim_start_matches(mark);
     let run = rest.len() - info.len();
@@ -1441,21 +1475,39 @@ Advice: A, it keeps the slice small.
     }
 
     #[test]
-    fn a_heading_github_renders_in_a_list_item_is_refused() {
+    fn a_decision_point_github_would_show_where_the_check_reads_none_is_refused() {
         let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n";
-        for heading in [
+        for hidden in [
             "1.  Do it.\n\n    ## Decision points\n\n    ### B1 Which?\n",
             "- ## Decision points\n",
             "- a\n\n    - ### B1 Which?\n",
-            "- a\n\n    1. b\n    \t# c\n",
+            "- a\n\n    1. b\n    \t# B2 c\n",
+            "1. The issue asks:\n   > ## Decision points\n   > ### B1 Stack or wait?\n",
+            "> ## Decision points\n",
+            "- > ## Decision points\n",
+            "Y [^1].\n\n[^1]: x\n    ### B1 Q?\n",
+            "Y [^1].\n\n[^1]: ## Decision points\n",
+            "Decision points\n---\n",
+            "- a\n\n  B1 Which?\n  ---\n",
+            "- Decision points\n  -\n",
+            "Some text about decision points\n===\n",
         ] {
-            let text = format!("{base}{heading}");
+            let text = format!("{base}{hidden}");
             let problems = check_findings(&text).unwrap_err();
-            assert_eq!(problems, vec![Problem::ListHeading], "{heading:?}");
+            assert_eq!(problems, vec![Problem::HiddenPoint], "{hidden:?}");
         }
-        assert!(check_findings(&format!("{base}Y.\n\n    # a comment in code\n")).is_ok());
-        assert!(check_findings(&format!("{base}1. Run:\n   ```sh\n   # build\n   ```\n")).is_ok());
-        assert!(check_findings(&format!("{base}- a\n\nB.\n\n    # code again\n")).is_ok());
+        for shown in [
+            "Y.\n\n    # a comment in code\n",
+            "1. Run:\n   ```sh\n   # build\n   ```\n",
+            "- a\n\nB.\n\n    # code again\n",
+            "1. Run:\n\n       # build\n       make\n",
+            "- ## Setup\n",
+            "> ## Steps to reproduce\n",
+            "Text\n---\n",
+            "Decision points are below.\n\n---\n",
+        ] {
+            assert!(check_findings(&format!("{base}{shown}")).is_ok(), "{shown:?}");
+        }
     }
 
     #[test]
@@ -1625,7 +1677,7 @@ Advice: A, it keeps the slice small.
             Problem::UnevenFence,
             Problem::ListFence,
             Problem::DeepFence,
-            Problem::ListHeading,
+            Problem::HiddenPoint,
             Problem::Link,
             Problem::NotAFile,
             Problem::Unreadable,
