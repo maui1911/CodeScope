@@ -22,11 +22,14 @@ const ZERO_WIDTH_SPACE: char = '\u{200b}';
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Outcome {
+    /// Cause and approach only: the item can go to Ready as it is.
     Findings,
+    /// At least one `### B<n>` point waits for an answer on the issue.
     DecisionPoints,
 }
 
 impl Outcome {
+    /// The `outcome=` value in the marker, the same as the serialized form.
     pub fn marker_value(self) -> &'static str {
         match self {
             Outcome::Findings => "findings",
@@ -40,18 +43,23 @@ impl Outcome {
 pub struct DecisionPoint {
     /// `B1`, `B2`, …
     pub id: String,
+    /// The heading's text after the id, trimmed; may be empty.
     pub question: String,
+    /// The option letters in the order listed, `A` first.
     pub options: Vec<char>,
+    /// One of `options`.
     pub advice: char,
 }
 
 /// Findings that passed [`check_findings`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Findings {
+    /// In order, numbered from `B1`; empty for plain findings.
     pub decision_points: Vec<DecisionPoint>,
 }
 
 impl Findings {
+    /// [`Outcome::DecisionPoints`] when there is at least one point.
     pub fn outcome(&self) -> Outcome {
         if self.decision_points.is_empty() {
             Outcome::Findings
@@ -64,9 +72,13 @@ impl Findings {
 /// Why findings can't be posted yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Problem {
+    /// The required `##` heading isn't there.
     Missing(&'static str),
+    /// The required `##` heading has only blank lines under it.
     Empty(&'static str),
+    /// `## Approach` comes before `## Cause`.
     ApproachBeforeCause,
+    /// Another `##` section follows `## Decision points`.
     DecisionPointsNotLast,
     /// A `## ` heading about decision points that is not exactly `## Decision points`.
     DecisionPointsHeading,
@@ -76,11 +88,17 @@ pub enum Problem {
     UnheadedDecisionPoints,
     /// A point's heading is not the next `B<n>`, which it holds.
     Numbering(String),
+    /// The point, by id, lists fewer than two `**A**` options.
     TooFewOptions(String),
+    /// The point, by id, has no `Advice:` line that names a letter.
     NoAdvice(String),
+    /// The point, by id, advises a letter none of its options has.
     AdviceNotAnOption(String),
+    /// A dispatch marker line, which only CodeScope writes.
     Marker,
+    /// The length in bytes, over the most a comment holds with the next step added.
     TooLong(usize),
+    /// A fenced code block runs to the end of the file.
     OpenFence,
     /// An HTML comment or `<details>` left open, which would hide the next step.
     OpenHtml,
@@ -160,9 +178,8 @@ impl FindingsFile {
     }
 }
 
-/// The findings in `worktree`, `None` when there are none. A link, anything but a plain file,
-/// more than a comment holds, or text that isn't UTF-8 reads as that problem; the text comes
-/// back with `\n` line ends and without a byte order mark.
+/// The findings in `worktree`, `None` without a file; a link, an odd file, too much or non-UTF-8
+/// text reads as that problem. Line ends come back as `\n`, without byte order marks.
 pub fn read_findings(worktree: &Path) -> Option<FindingsFile> {
     let path = worktree.join(FINDINGS_FILE);
     let metadata = match std::fs::symlink_metadata(&path) {
