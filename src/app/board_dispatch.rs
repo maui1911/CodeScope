@@ -934,7 +934,8 @@ impl AppShell {
                 let running = running_under(shell, &table);
                 let claude_idle = running.as_deref().and_then(|running| {
                     let dir = sessions.as_deref()?;
-                    live_session::process_for_pids(dir, running, &wanted)?.reports_idle()
+                    let claude = live_session::process_for_pids(dir, running, &wanted)?;
+                    Some(claude.reports_idle()? && !process_tree::is_stopped(claude.pid))
                 });
                 let relaunched = self.claude_updates.relaunched_at(tab.id);
                 let launched_lately = tab.spawned_instant.elapsed() < LAUNCH_GRACE
