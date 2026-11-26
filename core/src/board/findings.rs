@@ -103,8 +103,8 @@ pub enum Problem {
     TooLarge(u64),
     /// A fenced code block runs to the end of the file.
     OpenFence,
-    /// A closing fence indented less than its opening one, which GitHub reads as a new block
-    /// when the code sits in a list item.
+    /// A line in a code block indented less than its opening fence, which ends the block on
+    /// GitHub when the code sits in a list item.
     UnevenFence,
     /// The file, or the folder it is in, is a link.
     Link,
@@ -155,7 +155,7 @@ impl fmt::Display for Problem {
             }
             Problem::OpenFence => write!(f, "a code block is not closed"),
             Problem::UnevenFence => {
-                write!(f, "a code block closes less indented than it opens")
+                write!(f, "a code block has a line indented less than its opening fence")
             }
             Problem::Link => write!(f, "it or its folder is a link"),
             Problem::NotAFile => write!(f, "it is not a plain file"),
@@ -305,13 +305,18 @@ pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
 #[derive(Default)]
 struct Fences {
     open: Option<(char, usize, usize)>,
-    closed_less_indented: bool,
+    less_indented: bool,
 }
 
 impl Fences {
     fn is_code(&mut self, line: &str) -> bool {
         let trimmed = line.trim_start_matches(' ');
         let indent = line.len() - trimmed.len();
+        if let Some((_, _, opened_at)) = self.open
+            && !line.trim_matches([' ', '\t']).is_empty()
+        {
+            self.less_indented |= indent_width(line) < opened_at;
+        }
         let fenced = indent <= 3;
         let mark = trimmed.chars().next().filter(|c| fenced && matches!(c, '`' | '~'));
         let Some(mark) = mark else {
@@ -320,10 +325,9 @@ impl Fences {
         let run = trimmed.chars().take_while(|c| *c == mark).count();
         let rest = &trimmed[run..];
         match self.open {
-            Some((open, length, opened_at)) => {
-                if mark == open && run >= length && rest.trim().is_empty() {
+            Some((open, length, _)) => {
+                if mark == open && run >= length && rest.chars().all(|c| matches!(c, ' ' | '\t')) {
                     self.open = None;
-                    self.closed_less_indented |= indent < opened_at;
                 }
                 true
             }
@@ -344,8 +348,13 @@ fn fence_problem(text: &str) -> Option<Problem> {
     if fences.open.is_some() {
         Some(Problem::OpenFence)
     } else {
-        fences.closed_less_indented.then_some(Problem::UnevenFence)
+        fences.less_indented.then_some(Problem::UnevenFence)
     }
+}
+
+fn indent_width(line: &str) -> usize {
+    let indent = line.chars().take_while(|c| matches!(c, ' ' | '\t'));
+    indent.fold(0, |width, c| if c == '\t' { width + 4 - width % 4 } else { width + 1 })
 }
 
 fn sections(text: &str, level: usize) -> Vec<Section<'_>> {
@@ -977,17 +986,6 @@ Advice: A, it keeps the slice small.
     }
 
     #[test]
-    fn a_fence_that_closes_less_indented_than_it_opens_is_refused() {
-        let base = "## Cause\n\nX.\n\n## Approach\n\n";
-        let listed = format!("{base}1. Run it:\n   ```\n   cargo test\n```\n");
-        assert_eq!(check_findings(&listed).unwrap_err(), vec![Problem::UnevenFence]);
-        let aligned = format!("{base}1. Run it:\n   ```\n   cargo test\n   ```\n");
-        assert!(check_findings(&aligned).is_ok());
-        let deeper = format!("{base}```\ncargo test\n  ```\n");
-        assert!(check_findings(&deeper).is_ok());
-    }
-
-    #[test]
     fn a_long_line_is_quieted_in_one_pass() {
         let z = '\u{200b}';
         let started = std::time::Instant::now();
@@ -1001,6 +999,28 @@ Advice: A, it keeps the slice small.
         assert_eq!(quiet(&tags), format!("<{z}a\u{e9}\u{e9}\u{e9}\u{e9}").repeat(READ_LIMIT / 10));
         let elapsed = started.elapsed();
         assert!(elapsed < std::time::Duration::from_secs(5), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn a_fence_that_closes_less_indented_than_it_opens_is_refused() {
+        let base = "## Cause\n\nX.\n\n## Approach\n\n";
+        let listed = format!("{base}1. Run it:\n   ```\n   cargo test\n```\n");
+        assert_eq!(check_findings(&listed).unwrap_err(), vec![Problem::UnevenFence]);
+        let ended = format!("{base}1. Run it:\n   ```\n   cargo test\nmore\n   ```\n");
+        assert_eq!(check_findings(&ended).unwrap_err(), vec![Problem::UnevenFence]);
+        let aligned = format!("{base}1. Run it:\n   ```\n   cargo test\n\n\tdeeper\n   ```\n");
+        assert!(check_findings(&aligned).is_ok());
+        let deeper = format!("{base}```\ncargo test\n  ```\n");
+        assert!(check_findings(&deeper).is_ok());
+    }
+
+    #[test]
+    fn a_closing_fence_may_be_followed_only_by_spaces_and_tabs() {
+        let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n";
+        let spaced = format!("{base}```\ncode\n``` \t\n");
+        assert!(check_findings(&spaced).is_ok());
+        let no_break = format!("{base}```\ncode\n```\u{a0}\n\nZ.\n");
+        assert_eq!(check_findings(&no_break).unwrap_err(), vec![Problem::OpenFence]);
     }
 
     #[test]
