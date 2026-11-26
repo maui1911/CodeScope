@@ -293,7 +293,7 @@ pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
         }
     }
 
-    problems.extend(fence_problem(text));
+    problems.extend(fence_problems(text));
 
     if problems.is_empty() {
         Ok(Findings { decision_points })
@@ -302,59 +302,97 @@ pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Fence {
+    mark: char,
+    run: usize,
+    column: usize,
+    item_column: usize,
+}
+
+impl Fence {
+    fn opened_by(line: &str) -> Option<Fence> {
+        if indent_width(line) > 3 {
+            return None;
+        }
+        let mut rest = line.trim_start_matches([' ', '\t']);
+        let mut in_item = false;
+        while let Some(content) = item_content(rest) {
+            rest = content.trim_start_matches([' ', '\t']);
+            in_item = true;
+        }
+        let mark = rest.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+        let info = rest.trim_start_matches(mark);
+        let run = rest.len() - info.len();
+        if run < 3 || (mark == '`' && info.contains('`')) {
+            return None;
+        }
+        let column = columns(&line[..line.len() - rest.len()]);
+        let item_column = if in_item { column } else { 0 };
+        Some(Fence { mark, run, column, item_column })
+    }
+
+    fn closed_by(&self, line: &str) -> bool {
+        let rest = line.trim_start_matches([' ', '\t']);
+        let after = rest.trim_start_matches(self.mark);
+        rest.len() - after.len() >= self.run
+            && after.chars().all(|c| matches!(c, ' ' | '\t'))
+            && (self.item_column..=self.item_column + 3).contains(&indent_width(line))
+    }
+}
+
 #[derive(Default)]
 struct Fences {
-    open: Option<(char, usize, usize)>,
+    open: Option<Fence>,
+    after_text: bool,
     less_indented: bool,
 }
 
 impl Fences {
     fn is_code(&mut self, line: &str) -> bool {
-        let trimmed = line.trim_start_matches(' ');
-        let indent = line.len() - trimmed.len();
-        if let Some((_, _, opened_at)) = self.open
-            && !line.trim_matches([' ', '\t']).is_empty()
-        {
-            self.less_indented |= indent_width(line) < opened_at;
-        }
-        let fenced = indent <= 3;
-        let mark = trimmed.chars().next().filter(|c| fenced && matches!(c, '`' | '~'));
-        let Some(mark) = mark else {
-            return self.open.is_some();
-        };
-        let run = trimmed.chars().take_while(|c| *c == mark).count();
-        let rest = &trimmed[run..];
-        match self.open {
-            Some((open, length, _)) => {
-                if mark == open && run >= length && rest.chars().all(|c| matches!(c, ' ' | '\t')) {
+        let start = line.trim_start_matches([' ', '\t']);
+        let item = indent_width(line) <= 3
+            && item_content(start).is_some()
+            && (!self.after_text || may_interrupt_text(start));
+        let code = match self.open {
+            Some(fence) => {
+                self.less_indented |= !start.is_empty() && indent_width(line) < fence.column;
+                if fence.closed_by(line) {
                     self.open = None;
                 }
                 true
             }
-            None if run >= 3 && !(mark == '`' && rest.contains('`')) => {
-                self.open = Some((mark, run, indent));
-                true
+            None => {
+                self.open = Fence::opened_by(line).filter(|f| item || f.item_column == 0);
+                self.open.is_some()
             }
-            None => false,
-        }
+        };
+        self.after_text = !code && !item && !start.is_empty();
+        code
     }
 }
 
-fn fence_problem(text: &str) -> Option<Problem> {
+/// CommonMark lets a list start in the middle of a paragraph only with a bullet or the number 1.
+fn may_interrupt_text(item: &str) -> bool {
+    let digits = item.len() - item.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    digits == 0 || &item[..digits] == "1"
+}
+
+fn fence_problems(text: &str) -> Vec<Problem> {
     let mut fences = Fences::default();
     for line in text.lines() {
         fences.is_code(line);
     }
-    if fences.open.is_some() {
-        Some(Problem::OpenFence)
-    } else {
-        fences.less_indented.then_some(Problem::UnevenFence)
-    }
+    let uneven = fences.less_indented.then_some(Problem::UnevenFence);
+    uneven.into_iter().chain(fences.open.map(|_| Problem::OpenFence)).collect()
 }
 
 fn indent_width(line: &str) -> usize {
-    let indent = line.chars().take_while(|c| matches!(c, ' ' | '\t'));
-    indent.fold(0, |width, c| if c == '\t' { width + 4 - width % 4 } else { width + 1 })
+    columns(&line[..line.len() - line.trim_start_matches([' ', '\t']).len()])
+}
+
+fn columns(text: &str) -> usize {
+    text.chars().fold(0, |width, c| if c == '\t' { width + 4 - width % 4 } else { width + 1 })
 }
 
 fn sections(text: &str, level: usize) -> Vec<Section<'_>> {
@@ -1099,6 +1137,29 @@ Advice: A, it keeps the slice small.
         assert!(check_findings(long).is_ok());
         let open = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n```rust\nfn main() {}\n";
         assert_eq!(check_findings(open).unwrap_err(), vec![Problem::OpenFence]);
+    }
+
+    #[test]
+    fn a_fence_may_open_on_the_line_of_its_list_item() {
+        let base = "## Cause\n\nX.\n\n## Approach\n\n";
+        let items = format!("{base}- ```sh\n  a\n  ```\n- ```sh\n  b\n  ```\n");
+        assert!(check_findings(&items).is_ok());
+        let numbered = format!("{base}1. ```sh\n   a\n   ```\n10. ```\n    b\n       ```\n");
+        assert!(check_findings(&numbered).is_ok());
+        let hidden = format!("{base}- ```md\n  ## Decision points\n  ```\n");
+        assert!(check_findings(&hidden).is_ok(), "the heading is code in the item");
+        let outside = format!("{base}- ```sh\n  a\n```\n");
+        assert_eq!(
+            check_findings(&outside).unwrap_err(),
+            vec![Problem::UnevenFence, Problem::OpenFence],
+            "the closing fence ends the item and opens a block that runs to the end"
+        );
+        let no_item = format!("{base}Steps:\n2. ```sh\n   a\n   ```\n");
+        assert_eq!(
+            check_findings(&no_item).unwrap_err(),
+            vec![Problem::OpenFence],
+            "a list numbered from 2 can't interrupt a paragraph, so its last line opens a block"
+        );
     }
 
     #[test]
