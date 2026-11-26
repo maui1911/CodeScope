@@ -528,7 +528,7 @@ fn quiet_line(line: &str) -> String {
                 quiet.push('@');
                 quiet.push(ZERO_WIDTH_SPACE);
             }
-            '/' if next.is_some_and(|n| n.is_ascii_alphanumeric()) && starts_word(line, at) => {
+            '/' if starts_command(line, at) => {
                 quiet.push('/');
                 quiet.push(ZERO_WIDTH_SPACE);
             }
@@ -549,11 +549,21 @@ fn quiet_line(line: &str) -> String {
     quiet
 }
 
-fn starts_word(line: &str, at: usize) -> bool {
-    let before = &line[..at];
-    let link_destination = before.ends_with("](");
-    let continues = |c: char| c.is_ascii_alphanumeric() || "/.-_~%:+=&#?@".contains(c);
-    !link_destination && !before.chars().next_back().is_some_and(continues)
+fn starts_command(line: &str, slash: usize) -> bool {
+    let before = &line[..slash];
+    let after = &line[slash + 1..];
+    let opens_word = |c: char| c.is_whitespace() || "([{\"'`*".contains(c);
+    let starts_word =
+        !before.ends_with("](") && before.chars().next_back().is_none_or(opens_word);
+    let name = after
+        .find(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '_' | '-'))
+        .unwrap_or(after.len());
+    let rest = &after[name..];
+    let extension = rest
+        .strip_prefix('.')
+        .is_some_and(|ext| ext.starts_with(|c: char| c.is_ascii_alphanumeric()));
+    let path = rest.starts_with('/') || extension;
+    starts_word && after.starts_with(|c: char| c.is_ascii_alphanumeric()) && !path
 }
 
 /// The path, query and fragment of each web address; GFM links one up to whitespace or `<`.
@@ -865,7 +875,7 @@ Advice: A, it keeps the slice small.
         assert_eq!(
             quiet(html),
             format!(
-                "<{z}!-- note\n<{z}details open>\n<{z}/{z}details><{z}img src=x>\n\
+                "<{z}!-- note\n<{z}details open>\n<{z}/details><{z}img src=x>\n\
                  <{z}?x <{z}!{z}[CDATA[ <{z}IMG\tsrc=x>"
             )
         );
@@ -934,14 +944,21 @@ Advice: A, it keeps the slice small.
     }
 
     #[test]
-    fn a_slash_that_starts_a_word_starts_no_command_and_paths_stay_as_they_are() {
+    fn a_slash_command_is_broken_and_paths_stay_as_they_are() {
         let z = '\u{200b}';
         assert_eq!(
-            quiet("run /deploy, `/deploy`, (/deploy) or \"/deploy\""),
-            format!("run /{z}deploy, `/{z}deploy`, (/{z}deploy) or \"/{z}deploy\"")
+            quiet("run /deploy, `/deploy`, (/deploy), \"/deploy\" or **/deploy**, then /x-y."),
+            format!(
+                "run /{z}deploy, `/{z}deploy`, (/{z}deploy), \"/{z}deploy\" or **/{z}deploy**, \
+                 then /{z}x-y."
+            )
         );
-        let paths = "src/app.rs ./x ../y ~/z C:/w https://e.example/a [docs](/docs/a.md) a/b";
+        let paths = "src/app.rs ./x ../y ~/z C:/w https://e.example/a [docs](/docs/a.md) a/b \
+                     cat /etc/hosts, GET /api/items, gh api /repos/{owner}/{repo}/issues \
+                     src/**/mod.rs docs/caf\u{e9}/menu.md https://e.example/wiki/Foo_(bar)/baz \
+                     $(pwd)/x /mod.rs";
         assert_eq!(quiet(paths), paths);
+        assert_eq!(quiet("[d]: /docs/a.md"), "[d]: /docs/a.md");
         assert_eq!(quiet("// a comment and 1 / 2"), "// a comment and 1 / 2");
     }
 
