@@ -86,6 +86,8 @@ pub enum Problem {
     Unreadable,
     /// Its bytes are not UTF-8, as a UTF-16 redirection writes them.
     NotText,
+    /// An image, which GitHub fetches when the comment shows, so its address carries data out.
+    Image,
 }
 
 impl fmt::Display for Problem {
@@ -124,6 +126,7 @@ impl fmt::Display for Problem {
             Problem::NotAFile => write!(f, "it is not a plain file"),
             Problem::Unreadable => write!(f, "it cannot be read"),
             Problem::NotText => write!(f, "it is not UTF-8 text"),
+            Problem::Image => write!(f, "it has an image, and CodeScope posts no images"),
         }
     }
 }
@@ -251,6 +254,9 @@ pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
 
     if ends_in_code(text) {
         problems.push(Problem::OpenFence);
+    }
+    if has_image(text) {
+        problems.push(Problem::Image);
     }
 
     if problems.is_empty() {
@@ -418,7 +424,104 @@ pub fn comment_body(text: &str, findings: &Findings) -> String {
         "<!-- dispatch v=1 phase=research outcome={} by=codescope -->",
         findings.outcome().marker_value()
     );
-    format!("{}\n\n**Next step:** {next_step}\n{marker}\n", text.trim_end())
+    let mut fences = Fences::default();
+    let quiet: Vec<String> = text
+        .trim_end()
+        .lines()
+        .map(|line| {
+            if fences.is_code(line) {
+                line.to_string()
+            } else {
+                quiet_line(line)
+            }
+        })
+        .collect();
+    format!("{}\n\n**Next step:** {next_step}\n{marker}\n", quiet.join("\n"))
+}
+
+fn quiet_line(line: &str) -> String {
+    let mut quiet: String = code_spans(line)
+        .into_iter()
+        .map(|(code, part)| if code { part.to_string() } else { quiet_mentions(part) })
+        .collect();
+    let indent = quiet.len() - quiet.trim_start().len();
+    if quiet[indent..].starts_with('/') {
+        quiet.insert(indent, '\\');
+    }
+    quiet
+}
+
+/// GitHub notifies `@name` in text, but not in a link, which a token with `://` or `](` becomes.
+fn quiet_mentions(text: &str) -> String {
+    let mut quiet = String::with_capacity(text.len());
+    for token in text.split_inclusive(char::is_whitespace) {
+        if token.contains("://") || token.contains("](") || token.contains("www.") {
+            quiet.push_str(token);
+            continue;
+        }
+        let chars: Vec<char> = token.chars().collect();
+        for (index, &c) in chars.iter().enumerate() {
+            quiet.push(c);
+            let names = chars.get(index + 1).is_some_and(char::is_ascii_alphanumeric);
+            let starts_word = index == 0
+                || !(chars[index - 1].is_alphanumeric() || chars[index - 1] == '_');
+            if c == '@' && names && starts_word {
+                quiet.push('\u{200b}');
+            }
+        }
+    }
+    quiet
+}
+
+fn code_spans(line: &str) -> Vec<(bool, &str)> {
+    let mut parts = Vec::new();
+    let mut text_from = 0;
+    let mut at = 0;
+    while let Some(found) = line[at..].find('`') {
+        let open = at + found;
+        let run = backtick_run(&line[open..]);
+        match closing_run(&line[open + run..], run) {
+            Some(close) => {
+                let end = open + run + close + run;
+                parts.push((false, &line[text_from..open]));
+                parts.push((true, &line[open..end]));
+                text_from = end;
+                at = end;
+            }
+            None => at = open + run,
+        }
+    }
+    parts.push((false, &line[text_from..]));
+    parts
+}
+
+fn backtick_run(text: &str) -> usize {
+    text.bytes().take_while(|b| *b == b'`').count()
+}
+
+fn closing_run(text: &str, length: usize) -> Option<usize> {
+    let mut at = 0;
+    while let Some(found) = text[at..].find('`') {
+        let start = at + found;
+        let run = backtick_run(&text[start..]);
+        if run == length {
+            return Some(start);
+        }
+        at = start + run;
+    }
+    None
+}
+
+fn has_image(text: &str) -> bool {
+    let mut fences = Fences::default();
+    text.lines().filter(|line| !fences.is_code(line)).any(|line| {
+        code_spans(line).into_iter().any(|(code, part)| {
+            let lower = part.to_ascii_lowercase();
+            !code
+                && (part.contains("![")
+                    || ["<img", "<picture", "<source", "<video"].iter().any(|t| lower.contains(t)))
+        })
+    })
 }
 
 /// The first few problems joined on one line, and how many more there are.
@@ -697,6 +800,34 @@ Advice: A, it keeps the slice small.
     }
 
     #[test]
+    fn the_comment_mentions_nobody_and_starts_no_command() {
+        let text = "## Cause\n\nAsk @octocat (and @github/team) about it; mail a@b.example.\n\n\
+                    ## Approach\n\n  /deploy production\nSee `@types/node`, ``a ` @x`` and \
+                    https://example.com/@user.\n\n```\n@kept\n/kept\n```\n";
+        let findings = check_findings(text).unwrap();
+        let body = comment_body(text, &findings);
+        assert!(body.contains("Ask @\u{200b}octocat (and @\u{200b}github/team) about"), "{body}");
+        assert!(body.contains("mail a@b.example."), "{body}");
+        assert!(body.contains("\n  \\/deploy production\n"), "{body}");
+        assert!(body.contains("See `@types/node`, ``a ` @x`` and https://example.com/@user."));
+        assert!(body.contains("\n@kept\n/kept\n"), "{body}");
+    }
+
+    #[test]
+    fn refuses_an_image_outside_code() {
+        let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n";
+        for image in ["![x](https://example.com/?d=1)", "<img src=x>", "<IMG src=x>", "![x][r]"] {
+            assert_eq!(
+                check_findings(&format!("{base}{image}\n")).unwrap_err(),
+                vec![Problem::Image],
+                "{image}"
+            );
+        }
+        let in_code = format!("{base}`![x](y)` stays code.\n\n```\n<img src=x>\n```\n");
+        assert!(check_findings(&in_code).is_ok());
+    }
+
+    #[test]
     fn the_message_to_the_session_is_one_line() {
         let message =
             problems_message(&[Problem::Missing(APPROACH), Problem::NoAdvice("B2".into())]);
@@ -739,6 +870,7 @@ Advice: A, it keeps the slice small.
             Problem::NotAFile,
             Problem::Unreadable,
             Problem::NotText,
+            Problem::Image,
         ];
         let message = problems_message(&all);
         let plain = |c: char| (c.is_ascii_graphic() || c == ' ') && !matches!(c, '\'' | '"' | '`');
