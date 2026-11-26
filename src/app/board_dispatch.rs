@@ -275,6 +275,16 @@ enum Turn {
     Unknown,
 }
 
+fn turn_of(state: codescope_core::SessionState, quiet_timeout: bool) -> Turn {
+    use codescope_core::SessionState;
+    match state {
+        _ if quiet_timeout => Turn::Unknown,
+        SessionState::Idle => Turn::Ended,
+        SessionState::Busy | SessionState::PendingToolUse => Turn::Running,
+        SessionState::Unknown => Turn::Unknown,
+    }
+}
+
 fn findings_gate(tabs: &[(TabAtHandover, Turn)]) -> FindingsGate {
     let other = |turn: Turn| tabs.contains(&(TabAtHandover::Other, turn));
     if tabs.iter().any(|(state, _)| *state == TabAtHandover::Busy) || other(Turn::Running) {
@@ -1112,13 +1122,8 @@ impl AppShell {
     }
 
     fn turn(&self, tab: &super::Tab) -> Turn {
-        use codescope_core::SessionState;
         let snapshot = tab.adopted_session_id.as_deref().and_then(|sid| self.telemetry_for(sid));
-        match snapshot.map(|snap| super::notified_state(&snap)) {
-            Some(SessionState::Idle) => Turn::Ended,
-            Some(SessionState::Busy | SessionState::PendingToolUse) => Turn::Running,
-            Some(SessionState::Unknown) | None => Turn::Unknown,
-        }
+        snapshot.map_or(Turn::Unknown, |snap| turn_of(snap.state, snap.quiet_timeout))
     }
 
     fn tab_title_at(&self, path: &Path) -> Option<SharedString> {
@@ -1532,6 +1537,16 @@ mod tests {
         assert_eq!(gone(Some(&[41]), Some(true)), Other, "its terminal no longer takes input");
         assert_eq!(gone(Some(&[41]), Some(false)), Other);
         assert_eq!(gone(Some(&[]), None), Shell);
+    }
+
+    #[test]
+    fn a_turn_counts_as_running_only_while_its_transcript_says_so() {
+        use codescope_core::SessionState::*;
+        assert_eq!(turn_of(Idle, false), Turn::Ended);
+        assert_eq!(turn_of(Busy, false), Turn::Running);
+        assert_eq!(turn_of(PendingToolUse, false), Turn::Running);
+        assert_eq!(turn_of(Unknown, false), Turn::Unknown);
+        assert_eq!(turn_of(Idle, true), Turn::Unknown, "it went quiet while busy: nothing ended");
     }
 
     #[test]
