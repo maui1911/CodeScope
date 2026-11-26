@@ -222,8 +222,9 @@ struct Section<'a> {
 /// Check findings against the board protocol: `## Cause` before `## Approach`, both with text;
 /// other sections anywhere before `## Decision points`, which comes last when there is one.
 pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
+    let text = &normalised(text);
     let mut problems = Vec::new();
-    let posted = quiet(text.trim()).chars().count();
+    let posted = quiet(text).chars().count();
     if posted > MAX_LENGTH {
         problems.push(Problem::TooLong(posted));
     }
@@ -471,16 +472,27 @@ pub fn comment_body(text: &str, findings: &Findings) -> String {
         "<!-- dispatch v=1 phase=research outcome={} by=codescope -->",
         findings.outcome().marker_value()
     );
-    format!("{}\n\n**Next step:** {next_step}\n{marker}\n", quiet(text.trim()))
+    format!("{}\n\n**Next step:** {next_step}\n{marker}\n", quiet(&normalised(text)))
+}
+
+fn normalised(text: &str) -> String {
+    let plain: String = text
+        .replace("\r\n", "\n")
+        .replace(['\r', '\u{2028}', '\u{2029}'], "\n")
+        .chars()
+        .filter(|c| *c != '\u{feff}' && (!c.is_control() || matches!(c, '\n' | '\t')))
+        .collect();
+    let blank_lead: usize = plain
+        .split_inclusive('\n')
+        .take_while(|line| line.trim_matches([' ', '\t', '\n']).is_empty())
+        .map(str::len)
+        .sum();
+    plain[blank_lead..].trim_end().to_string()
 }
 
 /// GitHub and bots act on `@name`, a leading `/command`, HTML, images and diagrams, in code too.
 fn quiet(text: &str) -> String {
-    let plain: String = at_signs(text)
-        .chars()
-        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
-        .collect();
-    let lines: Vec<String> = plain.lines().map(quiet_line).collect();
+    let lines: Vec<String> = at_signs(text).lines().map(quiet_line).collect();
     lines.join("\n")
 }
 
@@ -850,6 +862,22 @@ Advice: A, it keeps the slice small.
             "HTTPS://cdn.example/npm/react%4018 www.example.com/%40x <https://e.example/%40y>"
         );
         assert_eq!(quiet("https://@octocat"), "https://%40octocat");
+    }
+
+    #[test]
+    fn what_is_checked_is_what_is_posted() {
+        let z = '\u{200b}';
+        let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n";
+        let bell_fence = format!("{base}\u{7}```\n");
+        assert_eq!(check_findings(&bell_fence).unwrap_err(), vec![Problem::OpenFence]);
+        let bell_point = format!("{base}#\u{7}## B1 Which?\n");
+        assert_eq!(check_findings(&bell_point).unwrap_err(), vec![Problem::StrayDecisionPoint]);
+        let indented = format!("\n    ```\n{base}");
+        let findings = check_findings(&indented).unwrap();
+        assert!(comment_body(&indented, &findings).starts_with("    ```\n## Cause"));
+        let split = format!("{base}Ask &#\u{1}64;x and &com\u{7f}mat;y.\n");
+        let findings = check_findings(&split).unwrap();
+        assert!(comment_body(&split, &findings).contains(&format!("Ask @{z}x and @{z}y.")));
     }
 
     #[test]
