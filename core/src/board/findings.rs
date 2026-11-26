@@ -68,6 +68,7 @@ pub enum Problem {
     AdviceNotAnOption(String),
     Marker,
     TooLong(usize),
+    OpenFence,
 }
 
 impl fmt::Display for Problem {
@@ -95,6 +96,7 @@ impl fmt::Display for Problem {
             Problem::TooLong(length) => {
                 write!(f, "it is {length} bytes, more than {MAX_LENGTH}")
             }
+            Problem::OpenFence => write!(f, "a code block is not closed"),
         }
     }
 }
@@ -146,6 +148,10 @@ pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
         }
     }
 
+    if ends_in_code(text) {
+        problems.push(Problem::OpenFence);
+    }
+
     if problems.is_empty() {
         Ok(Findings { decision_points })
     } else {
@@ -153,17 +159,50 @@ pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
     }
 }
 
+#[derive(Default)]
+struct Fences {
+    open: Option<(char, usize)>,
+}
+
+impl Fences {
+    fn is_code(&mut self, line: &str) -> bool {
+        let trimmed = line.trim_start();
+        let Some(mark) = trimmed.chars().next().filter(|c| matches!(c, '`' | '~')) else {
+            return self.open.is_some();
+        };
+        let run = trimmed.chars().take_while(|c| *c == mark).count();
+        let rest = &trimmed[run..];
+        match self.open {
+            Some((open, length)) => {
+                if mark == open && run >= length && rest.trim().is_empty() {
+                    self.open = None;
+                }
+                true
+            }
+            None if run >= 3 && !(mark == '`' && rest.contains('`')) => {
+                self.open = Some((mark, run));
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+fn ends_in_code(text: &str) -> bool {
+    let mut fences = Fences::default();
+    for line in text.lines() {
+        fences.is_code(line);
+    }
+    fences.open.is_some()
+}
+
 /// The sections that start with a heading of `prefix`'s level, outside fenced code blocks.
 /// Text before the first heading is left out.
 fn sections<'a>(text: &'a str, prefix: &str) -> Vec<Section<'a>> {
     let mut sections: Vec<Section> = Vec::new();
-    let mut fenced = false;
+    let mut fences = Fences::default();
     for line in text.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            fenced = !fenced;
-        }
-        if !fenced && let Some(rest) = line.strip_prefix(prefix) {
+        if !fences.is_code(line) && let Some(rest) = line.strip_prefix(prefix) {
             sections.push(Section {
                 heading: format!("{prefix}{}", rest.trim()),
                 lines: Vec::new(),
@@ -398,6 +437,18 @@ Advice: A, it keeps the slice small.
     }
 
     #[test]
+    fn a_fence_closes_only_on_its_own_kind_and_an_open_one_is_refused() {
+        let inline = "## Cause\n\n```x``` reads it.\n\n## Approach\n\nY.\n";
+        assert!(check_findings(inline).is_ok());
+        let nested = "## Cause\n\nX.\n\n~~~\n```\n## Decision points\n~~~\n\n## Approach\n\nY.\n";
+        assert!(check_findings(nested).is_ok());
+        let long = "## Cause\n\nX.\n\n````\n```\n## Decision points\n````\n\n## Approach\n\nY.\n";
+        assert!(check_findings(long).is_ok());
+        let open = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n```rust\nfn main() {}\n";
+        assert_eq!(check_findings(open).unwrap_err(), vec![Problem::OpenFence]);
+    }
+
+    #[test]
     fn advice_names_a_letter_on_its_own() {
         let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n## Decision points\n\n### B1 Q?\n\
                     - **A** a\n- **B** b\n";
@@ -483,6 +534,7 @@ Advice: A, it keeps the slice small.
             Problem::AdviceNotAnOption("B1".into()),
             Problem::Marker,
             Problem::TooLong(70_000),
+            Problem::OpenFence,
         ];
         let message = problems_message(&all);
         let plain = |c: char| (c.is_ascii_graphic() || c == ' ') && !matches!(c, '\'' | '"' | '`');
