@@ -445,7 +445,7 @@ impl Fences {
             self.last = LastLine::Unknown;
             return None;
         };
-        if !text.is_empty() {
+        if !text.is_empty() && !may_define_link(text) {
             self.items.push(column);
         }
         self.last = if text.is_empty() || is_heading(text) {
@@ -526,6 +526,11 @@ fn after_markers(line: &str) -> Option<(&str, usize)> {
         (rest, column) = (text, text_column);
     }
     None
+}
+
+/// cmark-gfm drops a paragraph of only link definitions, so its list item may end up empty.
+fn may_define_link(text: &str) -> bool {
+    text.starts_with('[') && (text.contains("]:") || !text.contains(']'))
 }
 
 fn is_prose(text: &str) -> bool {
@@ -1451,6 +1456,19 @@ Advice: A, it keeps the slice small.
         assert!(check_findings(&format!("{base}Y.\n\n    # a comment in code\n")).is_ok());
         assert!(check_findings(&format!("{base}1. Run:\n   ```sh\n   # build\n   ```\n")).is_ok());
         assert!(check_findings(&format!("{base}- a\n\nB.\n\n    # code again\n")).is_ok());
+    }
+
+    #[test]
+    fn an_item_that_may_hold_only_a_link_definition_is_not_taken_for_open() {
+        let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n";
+        let rest = "\n\n\n  foo\n2. ```sh\n   x\n   ```\n";
+        let definitions = ["- [protocol]: docs/board-protocol.md", "- [a long\n  label]: /u"];
+        for item in definitions.into_iter().chain(["- [^1]: x"]) {
+            let text = format!("{base}{item}{rest}");
+            assert_eq!(check_findings(&text).unwrap_err()[0], Problem::ListFence, "{item:?}");
+        }
+        let linked = format!("{base}- [docs](/docs/a.md) explain it{rest}");
+        assert!(check_findings(&linked).is_ok());
     }
 
     #[test]
