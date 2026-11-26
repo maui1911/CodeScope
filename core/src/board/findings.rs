@@ -496,7 +496,7 @@ fn after_markers(line: &str) -> (&str, usize) {
 }
 
 fn is_prose(text: &str) -> bool {
-    text.starts_with(char::is_alphanumeric) && !text.contains('|')
+    text.starts_with(char::is_alphanumeric) && !text.contains('|') && item_content(text).is_none()
 }
 
 /// CommonMark: three or more of one of `-`, `*` and `_`, with only spaces and tabs between.
@@ -808,7 +808,7 @@ fn item_content(line: &str) -> Option<&str> {
         1..=9 => line[digits..].strip_prefix(['.', ')']),
         _ => None,
     };
-    marker.filter(|content| content.starts_with([' ', '\t']))
+    marker.filter(|content| content.is_empty() || content.starts_with([' ', '\t']))
 }
 
 fn at_signs(text: &str) -> String {
@@ -1349,6 +1349,25 @@ Advice: A, it keeps the slice small.
         }
         let heading = format!("## Cause\n\nX.\n\n## Approach\n{step}");
         assert!(check_findings(&heading).is_ok(), "a heading is no paragraph");
+    }
+
+    #[test]
+    fn a_marker_with_nothing_after_it_opens_an_item_and_starts_no_prose() {
+        let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n";
+        let step = "2. ```\n   ```\n";
+        for before in [
+            "- 1.\nx\n",
+            "- a\n1.\nx\n",
+            "10. - a\n    1. b\n\n      x\n\n        y\nz\n",
+        ] {
+            let text = format!("{base}{before}{step}");
+            assert_eq!(check_findings(&text).unwrap_err()[0], Problem::ListFence, "{before:?}");
+        }
+        let points = "-\n     ```\n  ```\n  ## Decision points\n\n  ### B1 Pick?\n  ```\n";
+        for deep in [points, "1.\n      ```\n   ## Approach\n"] {
+            let text = format!("{base}{deep}");
+            assert!(check_findings(&text).unwrap_err().contains(&Problem::DeepFence), "{deep:?}");
+        }
     }
 
     #[test]
