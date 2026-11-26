@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::dispatch::{FINDINGS_FILE, linked_part};
 
-const MAX_LENGTH: usize = 60_000;
+pub(super) const MAX_LENGTH: usize = 60_000;
 const READ_LIMIT: usize = 4 * MAX_LENGTH;
 const MAX_LISTED: usize = 4;
 const CAUSE: &str = "## Cause";
@@ -244,15 +244,15 @@ impl fmt::Display for Problem {
 /// Modified time and length, which tell one version of a file from the next.
 pub type FileStamp = (Option<SystemTime>, u64);
 
-/// [`FINDINGS_FILE`] as one read found it.
+/// A file an agent leaves for CodeScope to post, as one read found it.
 #[derive(Debug)]
-pub struct FindingsFile {
+pub struct HandoverFile {
     /// Taken as it was read, so the session hears about each version once.
     pub stamp: FileStamp,
-    read: Result<String, Problem>,
+    pub(super) read: Result<String, Problem>,
 }
 
-impl FindingsFile {
+impl HandoverFile {
     /// The text to post with its findings, or what to fix first.
     pub fn check(&self) -> Result<(&str, Findings), Vec<Problem>> {
         let text = self.read.as_ref().map_err(|problem| vec![problem.clone()])?;
@@ -262,26 +262,30 @@ impl FindingsFile {
 
 /// The findings in `worktree`, `None` without a file; a link, an odd file, too much or non-UTF-8
 /// text reads as that problem. Line ends come back as `\n`, without byte order marks.
-pub fn read_findings(worktree: &Path) -> Option<FindingsFile> {
-    let path = worktree.join(FINDINGS_FILE);
+pub fn read_findings(worktree: &Path) -> Option<HandoverFile> {
+    read_handover(worktree, FINDINGS_FILE)
+}
+
+pub(super) fn read_handover(worktree: &Path, relative: &str) -> Option<HandoverFile> {
+    let path = worktree.join(relative);
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
         Err(_) => {
-            return Some(FindingsFile {
+            return Some(HandoverFile {
                 stamp: (None, 0),
                 read: Err(Problem::Unreadable),
             });
         }
     };
-    let read = if linked_part(worktree, FINDINGS_FILE).is_some() {
+    let read = if linked_part(worktree, relative).is_some() {
         Err(Problem::Link)
     } else if !metadata.is_file() {
         Err(Problem::NotAFile)
     } else {
         read_text(&path)
     };
-    Some(FindingsFile {
+    Some(HandoverFile {
         stamp: (metadata.modified().ok(), metadata.len()),
         read,
     })
@@ -567,6 +571,19 @@ impl Fences {
         .filter_map(|(found, problem)| found.then_some(problem))
         .collect()
     }
+}
+
+pub(super) fn fence_problems(text: &str) -> Vec<Problem> {
+    let (_, problems) = read_lines(text);
+    problems
+        .into_iter()
+        .filter(|problem| {
+            matches!(
+                problem,
+                Problem::OpenFence | Problem::UnevenFence | Problem::ListFence | Problem::DeepFence
+            )
+        })
+        .collect()
 }
 
 fn read_lines(text: &str) -> (Vec<Line<'_>>, Vec<Problem>) {
@@ -944,7 +961,7 @@ pub fn comment_body(text: &str, findings: &Findings) -> String {
     format!("{}\n\n**Next step:** {next_step}\n{marker}\n", quiet(&normalised(text)))
 }
 
-fn normalised(text: &str) -> String {
+pub(super) fn normalised(text: &str) -> String {
     let plain: String = text
         .replace("\r\n", "\n")
         .replace(['\r', '\u{2028}', '\u{2029}'], "\n")
@@ -960,7 +977,7 @@ fn normalised(text: &str) -> String {
 }
 
 /// GitHub and bots act on `@name`, a `/command`, HTML, images and diagrams, in code too.
-fn quiet(text: &str) -> String {
+pub(super) fn quiet(text: &str) -> String {
     let lines: Vec<String> = at_signs(text).lines().map(quiet_line).collect();
     lines.join("\n")
 }

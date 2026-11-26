@@ -19,6 +19,8 @@ use crate::time::parse_iso8601_secs;
 pub const TASK_FILE: &str = ".codescope/dispatch.md";
 /// Where research leaves its findings, relative to the worktree.
 pub const FINDINGS_FILE: &str = ".codescope/findings.md";
+/// Where a review round leaves a reply for the pull request, relative to the worktree.
+pub const REPLY_FILE: &str = ".codescope/reply.md";
 /// How many of a user's dispatches run at once when `settings.json` names no limit.
 pub const DEFAULT_DISPATCH_LIMIT: usize = 3;
 
@@ -31,7 +33,11 @@ const SKILL_FOLDERS: [&str; 6] = [
     ".opencode",
     ".github",
 ];
-const EXCLUDED_FILES: [&str; 2] = ["/.codescope/dispatch.md", "/.codescope/findings.md"];
+const EXCLUDED_FILES: [&str; 3] = [
+    "/.codescope/dispatch.md",
+    "/.codescope/findings.md",
+    "/.codescope/reply.md",
+];
 
 /// The last move of an item on one board, from its issue's timeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -686,8 +692,18 @@ pub fn exclude_handover_files(worktree: &Path) -> Result<()> {
 /// Remove the findings of an earlier round, so they can't be taken for this round's; refuses
 /// when their folder is a link, and of a linked file removes only the link.
 pub fn clear_findings(worktree: &Path) -> Result<()> {
-    let path = worktree.join(FINDINGS_FILE);
-    if let Some(folder) = linked_part(worktree, FINDINGS_FILE).filter(|part| *part != path) {
+    clear_handover_file(worktree, FINDINGS_FILE)
+}
+
+/// Remove [`REPLY_FILE`]: one an earlier round left, or one CodeScope posted. Refuses as
+/// [`clear_findings`] does.
+pub fn clear_reply(worktree: &Path) -> Result<()> {
+    clear_handover_file(worktree, REPLY_FILE)
+}
+
+fn clear_handover_file(worktree: &Path, relative: &str) -> Result<()> {
+    let path = worktree.join(relative);
+    if let Some(folder) = linked_part(worktree, relative).filter(|part| *part != path) {
         bail!("{} is a link", folder.display());
     }
     let removed = std::fs::remove_file(&path).or_else(|err| {
@@ -1499,15 +1515,18 @@ mod tests {
     fn excludes_the_handover_files_once() {
         let existing = "# git ls-files\n*.log";
         let added = handover_exclude_lines(existing).unwrap();
-        assert_eq!(added, "\n/.codescope/dispatch.md\n/.codescope/findings.md\n");
+        assert_eq!(
+            added,
+            "\n/.codescope/dispatch.md\n/.codescope/findings.md\n/.codescope/reply.md\n"
+        );
         assert_eq!(handover_exclude_lines(&format!("{existing}{added}")), None);
         assert_eq!(
-            handover_exclude_lines("/.codescope/dispatch.md\n").unwrap(),
-            "/.codescope/findings.md\n"
+            handover_exclude_lines("/.codescope/dispatch.md\n/.codescope/findings.md\n").unwrap(),
+            "/.codescope/reply.md\n"
         );
         assert_eq!(
             handover_exclude_lines("").unwrap(),
-            "/.codescope/dispatch.md\n/.codescope/findings.md\n"
+            "/.codescope/dispatch.md\n/.codescope/findings.md\n/.codescope/reply.md\n"
         );
     }
 
@@ -1523,7 +1542,7 @@ mod tests {
         exclude_handover_files(repo).unwrap();
         assert_eq!(
             std::fs::read_to_string(&exclude).unwrap(),
-            "*.log\n/.codescope/dispatch.md\n/.codescope/findings.md\n"
+            "*.log\n/.codescope/dispatch.md\n/.codescope/findings.md\n/.codescope/reply.md\n"
         );
     }
 
@@ -1741,6 +1760,39 @@ mod tests {
         assert_eq!(file.check().unwrap_err(), vec![Problem::Link]);
         assert!(clear_findings(&worktree).is_err());
         assert!(theirs.exists());
+    }
+
+    #[test]
+    fn a_reply_is_not_read_or_removed_through_a_linked_folder() {
+        use crate::board::findings::Problem;
+        use crate::board::reply::read_reply;
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let theirs = elsewhere.join("reply.md");
+        std::fs::write(&theirs, "a secret").unwrap();
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        link_folder(&elsewhere, &worktree.join(".codescope"));
+        let file = read_reply(&worktree).unwrap();
+        assert_eq!(file.reply().unwrap_err(), vec![Problem::Link]);
+        assert!(clear_reply(&worktree).is_err());
+        assert!(theirs.exists());
+    }
+
+    #[test]
+    fn clearing_the_reply_removes_only_the_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path();
+        clear_reply(worktree).unwrap();
+        for file in [REPLY_FILE, FINDINGS_FILE] {
+            let path = worktree.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "x").unwrap();
+        }
+        clear_reply(worktree).unwrap();
+        assert!(!worktree.join(REPLY_FILE).exists());
+        assert!(worktree.join(FINDINGS_FILE).exists());
     }
 
     #[cfg(unix)]
