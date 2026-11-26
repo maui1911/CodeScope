@@ -15,7 +15,6 @@ const MAX_LISTED: usize = 4;
 const CAUSE: &str = "## Cause";
 const APPROACH: &str = "## Approach";
 const DECISION_POINTS: &str = "## Decision points";
-const MEDIA_TAGS: [&str; 6] = ["<img", "<image", "<picture", "<source", "<video", "<audio"];
 const ZERO_WIDTH_SPACE: char = '\u{200b}';
 
 /// What a research round produced, as the marker names it.
@@ -96,12 +95,10 @@ pub enum Problem {
     AdviceNotAnOption(String),
     /// A dispatch marker line, which only CodeScope writes.
     Marker,
-    /// The length in bytes, over the most a comment holds with the next step added.
+    /// The length as posted, over the most a comment holds with the next step added.
     TooLong(usize),
     /// A fenced code block runs to the end of the file.
     OpenFence,
-    /// An HTML comment or `<details>` left open, which would hide the next step.
-    OpenHtml,
     /// The file, or the folder it is in, is a link.
     Link,
     /// A folder, a pipe or a device where the file should be.
@@ -110,8 +107,6 @@ pub enum Problem {
     Unreadable,
     /// Its bytes are not UTF-8, as a UTF-16 redirection writes them.
     NotText,
-    /// An image, which GitHub fetches when the comment shows, so its address carries data out.
-    Image,
 }
 
 impl fmt::Display for Problem {
@@ -146,15 +141,13 @@ impl fmt::Display for Problem {
                 write!(f, "it contains a dispatch marker, which only CodeScope writes")
             }
             Problem::TooLong(length) => {
-                write!(f, "it is {length} bytes, more than {MAX_LENGTH}")
+                write!(f, "it is too long to post: {length} characters, at most {MAX_LENGTH}")
             }
             Problem::OpenFence => write!(f, "a code block is not closed"),
-            Problem::OpenHtml => write!(f, "an HTML comment or a details block is not closed"),
             Problem::Link => write!(f, "it or its folder is a link"),
             Problem::NotAFile => write!(f, "it is not a plain file"),
             Problem::Unreadable => write!(f, "it cannot be read"),
             Problem::NotText => write!(f, "it is not UTF-8 text"),
-            Problem::Image => write!(f, "it has an image, and CodeScope posts no images"),
         }
     }
 }
@@ -230,8 +223,9 @@ struct Section<'a> {
 /// other sections anywhere before `## Decision points`, which comes last when there is one.
 pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
     let mut problems = Vec::new();
-    if text.len() > MAX_LENGTH {
-        problems.push(Problem::TooLong(text.len()));
+    let posted = quiet(text.trim()).chars().count();
+    if posted > MAX_LENGTH {
+        problems.push(Problem::TooLong(posted));
     }
     if text.split(['\n', '\r']).any(is_marker_line) {
         problems.push(Problem::Marker);
@@ -288,12 +282,6 @@ pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
     if ends_in_code(text) {
         problems.push(Problem::OpenFence);
     }
-    if ends_in_html(text) {
-        problems.push(Problem::OpenHtml);
-    }
-    if has_image(text) {
-        problems.push(Problem::Image);
-    }
 
     if problems.is_empty() {
         Ok(Findings { decision_points })
@@ -339,34 +327,6 @@ fn ends_in_code(text: &str) -> bool {
         fences.is_code(line);
     }
     fences.open.is_some()
-}
-
-/// CommonMark: a line that starts `<!--` hides every line up to one holding `-->`.
-fn ends_in_html(text: &str) -> bool {
-    let mut fences = Fences::default();
-    let mut comment = false;
-    let mut details = 0usize;
-    for line in text.lines() {
-        if comment {
-            comment = !line.contains("-->");
-            continue;
-        }
-        if fences.is_code(line) {
-            continue;
-        }
-        let trimmed = line.trim_start_matches(' ');
-        comment = line.len() - trimmed.len() <= 3
-            && trimmed.starts_with("<!--")
-            && !line.contains("-->");
-        let prose = line.split('`').step_by(2).collect::<String>().to_ascii_lowercase();
-        let opened = prose.match_indices("<details").filter(|(at, _)| {
-            prose[at + "<details".len()..]
-                .starts_with(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')
-        });
-        details += opened.count();
-        details = details.saturating_sub(prose.matches("</details").count());
-    }
-    comment || details > 0
 }
 
 fn sections(text: &str, level: usize) -> Vec<Section<'_>> {
@@ -511,30 +471,87 @@ pub fn comment_body(text: &str, findings: &Findings) -> String {
         "<!-- dispatch v=1 phase=research outcome={} by=codescope -->",
         findings.outcome().marker_value()
     );
-    format!("{}\n\n**Next step:** {next_step}\n{marker}\n", quiet(text.trim_end()))
+    format!("{}\n\n**Next step:** {next_step}\n{marker}\n", quiet(text.trim()))
 }
 
-/// GitHub and bots act on `@name` and a leading `/command`, code too; a zero-width space stops it.
+/// GitHub and bots act on `@name`, a leading `/command`, HTML, images and diagrams, in code too.
 fn quiet(text: &str) -> String {
-    let lines: Vec<String> = at_signs(text).lines().map(quiet_line).collect();
+    let plain: String = at_signs(text)
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect();
+    let lines: Vec<String> = plain.lines().map(quiet_line).collect();
     lines.join("\n")
 }
 
 fn quiet_line(line: &str) -> String {
-    let mut quiet = String::with_capacity(line.len() + 3);
+    let addresses = web_addresses(line);
     let indent = line.len() - line.trim_start().len();
+    let mut quiet = String::with_capacity(line.len() + 8);
     let mut chars = line.char_indices().peekable();
     while let Some((at, c)) = chars.next() {
-        let names = chars.peek().is_some_and(|(_, next)| next.is_ascii_alphanumeric());
-        if c == '/' && at == indent && names {
-            quiet.push(ZERO_WIDTH_SPACE);
-        }
-        quiet.push(c);
-        if c == '@' && names {
-            quiet.push(ZERO_WIDTH_SPACE);
+        let next = chars.peek().map(|(_, next)| *next);
+        match c {
+            '@' if addresses.iter().any(|address| address.contains(&at)) => {
+                quiet.push_str("%40");
+            }
+            '@' => {
+                quiet.push('@');
+                quiet.push(ZERO_WIDTH_SPACE);
+            }
+            '/' if at == indent && next.is_some_and(|n| n.is_ascii_alphanumeric()) => {
+                quiet.push(ZERO_WIDTH_SPACE);
+                quiet.push('/');
+            }
+            '<' if next.is_some_and(|n| n.is_ascii_alphabetic() || matches!(n, '/' | '!' | '?'))
+                && !starts_web_address(&line[at + 1..]) =>
+            {
+                quiet.push('<');
+                quiet.push(ZERO_WIDTH_SPACE);
+            }
+            '!' if next == Some('[') => {
+                quiet.push('!');
+                quiet.push(ZERO_WIDTH_SPACE);
+            }
+            _ => quiet.push(c),
         }
     }
+    disarm_diagrams(&mut quiet);
     quiet
+}
+
+/// GFM ends a web address it links at whitespace or `<`.
+fn web_addresses(line: &str) -> Vec<std::ops::Range<usize>> {
+    let lower = line.to_ascii_lowercase();
+    ["https://", "http://", "www."]
+        .iter()
+        .flat_map(|prefix| lower.match_indices(prefix).map(|(start, _)| start))
+        .map(|start| {
+            let length = line[start..].find(|c: char| c.is_whitespace() || c == '<');
+            start..length.map_or(line.len(), |length| start + length)
+        })
+        .collect()
+}
+
+fn starts_web_address(text: &str) -> bool {
+    let start = text.get(..8).unwrap_or(text).to_ascii_lowercase();
+    start.starts_with("http://") || start.starts_with("https://")
+}
+
+/// GitHub draws a fenced block whose info string is `mermaid`, and a diagram can load images.
+fn disarm_diagrams(line: &mut String) {
+    let lower = line.to_ascii_lowercase();
+    let diagrams: Vec<usize> = lower
+        .match_indices("mermaid")
+        .map(|(at, _)| at)
+        .filter(|&at| {
+            let before = lower[..at].trim_end_matches([' ', '\t']);
+            before.ends_with("```") || before.ends_with("~~~")
+        })
+        .collect();
+    for at in diagrams.into_iter().rev() {
+        line.insert(at, ZERO_WIDTH_SPACE);
+    }
 }
 
 fn at_signs(text: &str) -> String {
@@ -572,53 +589,6 @@ fn at_reference(text: &str) -> Option<usize> {
     let value = u32::from_str_radix(&digits[..length], radix).ok()?;
     let end = text.len() - digits.len() + length;
     (value == u32::from('@')).then(|| end + usize::from(text[end..].starts_with(';')))
-}
-
-fn has_image(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    let media = MEDIA_TAGS.iter().any(|tag| {
-        lower.match_indices(tag).any(|(at, _)| {
-            lower[at + tag.len()..].starts_with(|c: char| c.is_ascii_whitespace() || c == '/')
-        })
-    });
-    let defined = definitions(text);
-    media
-        || text.match_indices("![").any(|(at, _)| {
-            let rest = &text[at + 2..];
-            label_end(rest).is_some_and(|end| {
-                rest[end + 1..].starts_with(['(', '['])
-                    || defined.contains(&label_key(&rest[..end]))
-            })
-        })
-}
-
-fn label_end(text: &str) -> Option<usize> {
-    let mut depth = 0;
-    let mut escaped = false;
-    for (at, c) in text.char_indices() {
-        match c {
-            _ if escaped => escaped = false,
-            '\\' => escaped = true,
-            '[' => depth += 1,
-            ']' if depth == 0 => return Some(at),
-            ']' => depth -= 1,
-            _ => {}
-        }
-    }
-    None
-}
-
-fn definitions(text: &str) -> Vec<String> {
-    text.match_indices("]:")
-        .filter_map(|(end, _)| {
-            let start = text[..end].rfind('[')?;
-            Some(label_key(&text[start + 1..end]))
-        })
-        .collect()
-}
-
-fn label_key(label: &str) -> String {
-    label.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
 /// The first few problems joined on one line, and how many more there are.
@@ -836,28 +806,70 @@ Advice: A, it keeps the slice small.
     }
 
     #[test]
-    fn an_open_html_comment_or_details_block_is_refused() {
+    fn no_raw_html_reaches_the_comment() {
+        let z = '\u{200b}';
+        let html = "<!-- note\n<details open>\n</details><img src=x>\n<?x <![CDATA[ <IMG\tsrc=x>";
+        assert_eq!(
+            quiet(html),
+            format!(
+                "<{z}!-- note\n<{z}details open>\n<{z}/details><{z}img src=x>\n\
+                 <{z}?x <{z}!{z}[CDATA[ <{z}IMG\tsrc=x>"
+            )
+        );
+        assert_eq!(quiet("a < b, a<=b, Vec<T>"), format!("a < b, a<=b, Vec<{z}T>"));
+        assert_eq!(quiet("<https://example.com/a>"), "<https://example.com/a>");
         let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n";
-        let open = ["<!-- note", "<details>\n<summary>Log</summary>\n\nZ.", "<DETAILS open>\n\nZ."];
-        for open in open {
-            assert_eq!(
-                check_findings(&format!("{base}{open}\n")).unwrap_err(),
-                vec![Problem::OpenHtml],
-                "{open}"
-            );
+        for open in ["<!-- note", "<details>\n\nZ.", "<script>"] {
+            assert!(check_findings(&format!("{base}{open}\n")).is_ok(), "{open}");
         }
-        let closed = [
-            "<!-- note -->",
-            "<!--\nnote\n-->",
-            "<!-->",
-            "<details>\n\nZ.\n\n</details>",
-            "`<details>` folds a block.",
-            "Reject a `<!-- dispatch` line.",
-            "```html\n<!--\n<details>\n```",
-        ];
-        for text in closed {
-            assert!(check_findings(&format!("{base}{text}\n")).is_ok(), "{text}");
+    }
+
+    #[test]
+    fn no_image_or_diagram_reaches_the_comment() {
+        let z = '\u{200b}';
+        assert_eq!(quiet("![x](https://e.example/?d)"), format!("!{z}[x](https://e.example/?d)"));
+        assert_eq!(quiet("![a `]` b](u) and ![x][r]"), format!("!{z}[a `]` b](u) and !{z}[x][r]"));
+        assert_eq!(quiet("rows![0][1] and vec![1]"), format!("rows!{z}[0][1] and vec!{z}[1]"));
+        assert_eq!(quiet("```mermaid\n~~~ Mermaid"), format!("```{z}mermaid\n~~~ {z}Mermaid"));
+        assert_eq!(quiet("```rust\nlet a = b!(c);"), "```rust\nlet a = b!(c);");
+        let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n";
+        for image in ["![x](u)", "![x]\n\n[x]: u", "rows![0][1]", "<img src=x>"] {
+            assert!(check_findings(&format!("{base}{image}\n")).is_ok(), "{image}");
         }
+    }
+
+    #[test]
+    fn an_at_sign_in_a_web_address_is_escaped_so_the_link_still_works() {
+        let z = '\u{200b}';
+        assert_eq!(
+            quiet("[types](https://www.npmjs.com/package/@types/node) and see @octocat"),
+            format!("[types](https://www.npmjs.com/package/%40types/node) and see @{z}octocat")
+        );
+        assert_eq!(
+            quiet("HTTPS://cdn.example/npm/react@18 www.example.com/@x <https://e.example/@y>"),
+            "HTTPS://cdn.example/npm/react%4018 www.example.com/%40x <https://e.example/%40y>"
+        );
+        assert_eq!(quiet("https://@octocat"), "https://%40octocat");
+    }
+
+    #[test]
+    fn the_comment_drops_control_characters_and_outer_blank_lines() {
+        let text = "\n\n## Cause\n\nX\u{7}\u{1b}[31m.\tTab.\n\n## Approach\n\nY.\n\n";
+        let findings = check_findings(text).unwrap();
+        let body = comment_body(text, &findings);
+        assert!(body.starts_with("## Cause\n\nX[31m.\tTab.\n"), "{body:?}");
+        assert!(body.contains("Y.\n\n**Next step:**"), "{body:?}");
+    }
+
+    #[test]
+    fn what_is_posted_must_fit_in_a_comment() {
+        let base = "## Cause\n\nX.\n\n## Approach\n\n";
+        let at_signs = format!("{base}{}\n", "@".repeat(MAX_LENGTH / 2));
+        assert!(at_signs.len() < MAX_LENGTH);
+        assert!(matches!(
+            check_findings(&at_signs).unwrap_err()[..],
+            [Problem::TooLong(length)] if length > MAX_LENGTH
+        ));
     }
 
     #[test]
@@ -953,14 +965,15 @@ Advice: A, it keeps the slice small.
     #[test]
     fn the_comment_mentions_nobody_and_starts_no_command_in_text_or_code() {
         let text = "## Cause\n\nAsk @octocat, _@org/team_ and \u{8c22}@octocat; mail a@b.example \
-                    &#64;x &#x40;y &commat;z.\n\n## Approach\n\n  /deploy production\n\
-                    // a comment\n\n```\n@claude run\n/close\n```\n";
+                    &#64;x &#x40;y &commat;z @&#111;ctocat.\n\n## Approach\n\n\
+                    \u{20}\u{20}/deploy production\n// a comment\n\n```\n@claude run\n/close\n\
+                    ```\n";
         let findings = check_findings(text).unwrap();
         let body = comment_body(text, &findings);
         let z = '\u{200b}';
         let mentions = format!(
             "Ask @{z}octocat, _@{z}org/team_ and \u{8c22}@{z}octocat; mail a@{z}b.example \
-             @{z}x @{z}y @{z}z."
+             @{z}x @{z}y @{z}z @{z}&#111;ctocat."
         );
         assert!(body.contains(&mentions), "{body}");
         assert!(body.contains(&format!("\n  {z}/deploy production\n// a comment\n")), "{body}");
@@ -969,35 +982,6 @@ Advice: A, it keeps the slice small.
             quiet("&#0064a &#X040;b &#65;c &amp;#64;d &commat e"),
             format!("@{z}a @{z}b &#65;c &amp;#64;d &commat e")
         );
-    }
-
-    #[test]
-    fn refuses_an_image_wherever_it_is() {
-        let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n";
-        let images = [
-            "![x](https://example.com/?d=1)",
-            "![x][r]",
-            "`![x](y)` in code",
-            "![x]\n\n[x]: https://example.com/",
-            "![Big  Logo]\n\n> [big logo]: https://example.com/",
-            "![a [b] c](https://example.com/)",
-            "<img src=x>",
-            "<IMG\tsrc=x>",
-            "<img/src=x>",
-            "<image src=x>",
-            "<video src=x>",
-            "```\n<img src=x>\n```",
-        ];
-        for image in images {
-            assert_eq!(
-                check_findings(&format!("{base}{image}\n")).unwrap_err(),
-                vec![Problem::Image],
-                "{image}"
-            );
-        }
-        for prose in ["`vec![1, 2]` grows.", "It returns Vec<SourceFile>.", "The <video> tag."] {
-            assert!(check_findings(&format!("{base}{prose}\n")).is_ok(), "{prose}");
-        }
     }
 
     #[test]
@@ -1050,12 +1034,10 @@ Advice: A, it keeps the slice small.
             Problem::Marker,
             Problem::TooLong(70_000),
             Problem::OpenFence,
-            Problem::OpenHtml,
             Problem::Link,
             Problem::NotAFile,
             Problem::Unreadable,
             Problem::NotText,
-            Problem::Image,
         ];
         let message = problems_message(&all);
         let plain = |c: char| (c.is_ascii_graphic() || c == ' ') && !matches!(c, '\'' | '"' | '`');
