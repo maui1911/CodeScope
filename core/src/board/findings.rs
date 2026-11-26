@@ -328,6 +328,7 @@ pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
 
 /// GitHub stops nesting list items about a hundred deep, so the check follows far fewer.
 const MAX_MARKERS: usize = 10;
+const POINT_LETTERS: &str = "decisionpoint";
 
 #[derive(Clone, Copy)]
 struct Fence {
@@ -382,6 +383,7 @@ struct Fences {
     unsure_item: bool,
     hidden_point: bool,
     text_names_point: bool,
+    text_tail: String,
 }
 
 impl Fences {
@@ -389,7 +391,7 @@ impl Fences {
         let start = line.trim_start_matches([' ', '\t']);
         let indent = indent_width(line);
         if let Some(fence) = self.open {
-            self.text_names_point = false;
+            self.end_paragraph();
             self.less_indented |= !start.is_empty() && indent < fence.column;
             match fence.closer_at(line) {
                 Some(at) if (fence.item_column..=fence.item_column + 3).contains(&at) => {
@@ -407,7 +409,7 @@ impl Fences {
         if start.is_empty() {
             self.last = LastLine::NoParagraph;
             self.blank_before = true;
-            self.text_names_point = false;
+            self.end_paragraph();
             return false;
         }
         let after_blank = std::mem::take(&mut self.blank_before);
@@ -433,8 +435,20 @@ impl Fences {
         let shown = heading_title(behind).is_some_and(mentions_point);
         let underline = is_underline_in_container(start);
         self.hidden_point |= !read && shown || underline && self.text_names_point;
-        self.text_names_point =
-            !read && !underline && (self.text_names_point || mentions_point(behind));
+        if read || underline {
+            self.end_paragraph();
+            return;
+        }
+        let text = shown_text(behind);
+        let joined = format!("{}{}", self.text_tail, letters(&text));
+        self.text_names_point |= starts_with_point_id(&text) || joined.contains(POINT_LETTERS);
+        let tail = joined.char_indices().rev().nth(POINT_LETTERS.len() - 2);
+        self.text_tail = joined[tail.map_or(0, |(at, _)| at)..].to_string();
+    }
+
+    fn end_paragraph(&mut self) {
+        self.text_names_point = false;
+        self.text_tail.clear();
     }
 
     fn item(
@@ -594,18 +608,65 @@ fn is_underline(text: &str) -> bool {
 }
 
 fn mentions_point(text: &str) -> bool {
-    words(text).first().is_some_and(|word| is_point_id(word)) || names_decision_points(text)
+    let text = shown_text(text);
+    starts_with_point_id(&text) || letters(&text).contains(POINT_LETTERS)
 }
 
 fn names_decision_points(text: &str) -> bool {
-    words(text).windows(2).any(|pair| {
-        pair[0].eq_ignore_ascii_case("decision")
-            && (pair[1].eq_ignore_ascii_case("point") || pair[1].eq_ignore_ascii_case("points"))
-    })
+    letters(&shown_text(text)).contains(POINT_LETTERS)
 }
 
-fn words(text: &str) -> Vec<&str> {
-    text.split(|c: char| !c.is_alphanumeric()).filter(|word| !word.is_empty()).collect()
+fn starts_with_point_id(text: &str) -> bool {
+    let mut words = text.split(|c: char| !c.is_alphanumeric()).filter(|word| !word.is_empty());
+    words.next().is_some_and(is_point_id)
+}
+
+fn letters(text: &str) -> String {
+    text.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+}
+
+/// CommonMark shows no emphasis, code or escape marks or link targets, and decodes references.
+fn shown_text(text: &str) -> String {
+    let mut shown = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        if let Some((decoded, length)) = character_reference(rest) {
+            shown.push(decoded);
+            rest = &rest[length..];
+        } else if let Some(target) = rest.strip_prefix("](") {
+            shown.push(' ');
+            rest = target.find(')').map_or("", |end| &target[end + 1..]);
+        } else {
+            if !matches!(c, '*' | '_' | '~' | '`' | '\\') {
+                shown.push(c);
+            }
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    shown
+}
+
+/// HTML: `&#` and decimal digits, `&#x` and hex digits, or `&` and a name, then `;`.
+fn character_reference(text: &str) -> Option<(char, usize)> {
+    let body = text.strip_prefix('&')?;
+    let (end, _) = body.char_indices().take(33).find(|&(_, c)| c == ';')?;
+    let name = &body[..end];
+    let decoded = match name.strip_prefix('#') {
+        Some(number) => {
+            let (digits, radix) = match number.strip_prefix(['x', 'X']) {
+                Some(hex) => (hex, 16),
+                None => (number, 10),
+            };
+            if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+                return None;
+            }
+            let code = u32::from_str_radix(digits, radix).unwrap_or(u32::MAX);
+            char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER)
+        }
+        None if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric()) => ' ',
+        None => return None,
+    };
+    Some((decoded, end + 2))
 }
 
 fn is_underline_in_container(line: &str) -> bool {
@@ -1563,7 +1624,7 @@ Advice: A, it keeps the slice small.
     }
 
     #[test]
-    fn decision_points_are_named_whatever_the_spacing_or_emphasis_between_the_words() {
+    fn decision_points_are_named_as_github_shows_them() {
         let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n";
         for spelled in ["## Decision  points\n\nX.\n", "## Decision\tpoints\n\nX.\n"] {
             let problems = check_findings(&format!("{base}{spelled}")).unwrap_err();
@@ -1574,11 +1635,20 @@ Advice: A, it keeps the slice small.
             "**Decision**  points\n---\n",
             "- Decision-points\n  ===\n",
             "> ### **B1** Which?\n",
+            "> ## Deci*sion* points\n",
+            "> ## Decision&#32;points\n",
+            "> ## Decision&nbsp;points\n",
+            "> ## [Decision](#x) points\n",
+            "> ### &#66;1 Which?\n",
+            "Decision\npoints\n---\n",
+            "- a\n\n  Open decision\n  points for you\n  ===\n",
         ] {
             let problems = check_findings(&format!("{base}{hidden}")).unwrap_err();
             assert_eq!(problems, vec![Problem::HiddenPoint], "{hidden:?}");
         }
-        assert!(check_findings(&format!("{base}> ## Decisions and their points\n")).is_ok());
+        for other in ["> ## Decisions and their points\n", "Decision\n\npoints\n---\n"] {
+            assert!(check_findings(&format!("{base}{other}")).is_ok(), "{other:?}");
+        }
     }
 
     #[test]
