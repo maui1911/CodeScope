@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use super::dispatch::{FINDINGS_FILE, linked_part};
 
 const MAX_LENGTH: usize = 60_000;
+const READ_LIMIT: usize = 4 * MAX_LENGTH;
 const MAX_LISTED: usize = 4;
 const CAUSE: &str = "## Cause";
 const APPROACH: &str = "## Approach";
@@ -98,6 +99,8 @@ pub enum Problem {
     Marker,
     /// The length as posted, over the most a comment holds with the next step added.
     TooLong(usize),
+    /// The file's size in bytes, over what CodeScope reads.
+    TooLarge(u64),
     /// A fenced code block runs to the end of the file.
     OpenFence,
     /// The file, or the folder it is in, is a link.
@@ -143,6 +146,9 @@ impl fmt::Display for Problem {
             }
             Problem::TooLong(length) => {
                 write!(f, "it is too long to post: {length} characters, at most {MAX_LENGTH}")
+            }
+            Problem::TooLarge(size) => {
+                write!(f, "it is {size} bytes, more than the {READ_LIMIT} CodeScope reads")
             }
             Problem::OpenFence => write!(f, "a code block is not closed"),
             Problem::Link => write!(f, "it or its folder is a link"),
@@ -202,11 +208,11 @@ pub fn read_findings(worktree: &Path) -> Option<FindingsFile> {
 fn read_text(path: &Path) -> Result<String, Problem> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)
-        .and_then(|file| file.take(MAX_LENGTH as u64 + 1).read_to_end(&mut bytes))
+        .and_then(|file| file.take(READ_LIMIT as u64 + 1).read_to_end(&mut bytes))
         .map_err(|_| Problem::Unreadable)?;
-    if bytes.len() > MAX_LENGTH {
-        let length = std::fs::metadata(path).map_or(bytes.len(), |m| m.len() as usize);
-        return Err(Problem::TooLong(length));
+    if bytes.len() > READ_LIMIT {
+        let size = std::fs::metadata(path).map_or(bytes.len() as u64, |m| m.len());
+        return Err(Problem::TooLarge(size));
     }
     let text = String::from_utf8(bytes).map_err(|_| Problem::NotText)?;
     Ok(text
@@ -787,9 +793,18 @@ Advice: A, it keeps the slice small.
         let utf16 = read_findings(utf16.path()).unwrap();
         assert_eq!(utf16.check().unwrap_err(), vec![Problem::NotText]);
 
-        let long = worktree_with(&vec![b'y'; MAX_LENGTH + 1]);
-        let long = read_findings(long.path()).unwrap();
-        assert_eq!(long.check().unwrap_err(), vec![Problem::TooLong(MAX_LENGTH + 1)]);
+        let huge = worktree_with(&vec![b'y'; READ_LIMIT + 1]);
+        let huge = read_findings(huge.path()).unwrap();
+        assert_eq!(huge.check().unwrap_err(), vec![Problem::TooLarge(READ_LIMIT as u64 + 1)]);
+    }
+
+    #[test]
+    fn the_length_limit_counts_characters_as_posted_not_bytes_read() {
+        let base = "## Cause\n\nX.\n\n## Approach\n\n";
+        let arrows = format!("{base}{}\n", "\u{2192}".repeat(MAX_LENGTH / 2));
+        assert!(arrows.len() > MAX_LENGTH);
+        let dir = worktree_with(arrows.as_bytes());
+        assert!(read_findings(dir.path()).unwrap().check().is_ok());
     }
 
     #[test]
@@ -1105,6 +1120,7 @@ Advice: A, it keeps the slice small.
             Problem::AdviceNotAnOption("B1".into()),
             Problem::Marker,
             Problem::TooLong(70_000),
+            Problem::TooLarge(300_000),
             Problem::OpenFence,
             Problem::Link,
             Problem::NotAFile,
