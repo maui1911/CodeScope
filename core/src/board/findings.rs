@@ -106,6 +106,10 @@ pub enum Problem {
     /// A line in a code block indented less than its opening fence, which ends the block on
     /// GitHub when the code sits in a list item.
     UnevenFence,
+    /// A fence on a list item's line after text, where GitHub may read the item as more text.
+    ListFence,
+    /// A fence four or more columns into a list, which GitHub may or may not take for one.
+    DeepFence,
     /// The file, or the folder it is in, is a link.
     Link,
     /// A folder, a pipe or a device where the file should be.
@@ -157,6 +161,16 @@ impl fmt::Display for Problem {
             Problem::UnevenFence => {
                 write!(f, "a code block has a line indented less than its opening fence")
             }
+            Problem::ListFence => write!(
+                f,
+                "a code block opens on the line of a list item that may read as text: put a \
+                 blank line before that item"
+            ),
+            Problem::DeepFence => write!(
+                f,
+                "a code block in a list has a fence four or more columns in: keep its fences \
+                 at most three columns in"
+            ),
             Problem::Link => write!(f, "it or its folder is a link"),
             Problem::NotAFile => write!(f, "it is not a plain file"),
             Problem::Unreadable => write!(f, "it cannot be read"),
@@ -229,7 +243,7 @@ fn read_text(path: &Path) -> Result<String, Problem> {
 
 struct Section<'a> {
     heading: String,
-    lines: Vec<&'a str>,
+    lines: Vec<Line<'a>>,
 }
 
 /// Check findings against the board protocol: `## Cause` before `## Approach`, both with text;
@@ -244,7 +258,8 @@ pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
     if text.split(['\n', '\r']).any(is_marker_line) {
         problems.push(Problem::Marker);
     }
-    let top = sections(text, 2);
+    let (lines, fence_problems) = read_lines(text);
+    let top = sections(&lines, 2);
     let position = |heading: &str| top.iter().position(|s| s.heading.eq_ignore_ascii_case(heading));
 
     for heading in [CAUSE, APPROACH] {
@@ -266,12 +281,11 @@ pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
         !s.heading.eq_ignore_ascii_case(DECISION_POINTS)
             && s.heading.to_ascii_lowercase().contains("decision point")
     });
-    let points_inside = position(DECISION_POINTS)
-        .map(|index| point_headings(&top[index].lines.join("\n")))
-        .unwrap_or(0);
+    let points_inside =
+        position(DECISION_POINTS).map(|index| point_headings(&top[index].lines)).unwrap_or(0);
     if near_miss {
         problems.push(Problem::DecisionPointsHeading);
-    } else if point_headings(text) > points_inside {
+    } else if point_headings(&lines) > points_inside {
         problems.push(Problem::StrayDecisionPoint);
     }
 
@@ -280,20 +294,22 @@ pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
         if index + 1 != top.len() {
             problems.push(Problem::DecisionPointsNotLast);
         }
-        let body = top[index].lines.join("\n");
-        let points = sections(&body, 3);
+        let body = &top[index].lines;
+        let points = sections(body, 3);
         for (number, point) in points.iter().enumerate() {
             match decision_point(point, number + 1) {
                 Ok(point) => decision_points.push(point),
                 Err(problem) => problems.push(problem),
             }
         }
-        if points.is_empty() && body.split(|c: char| !c.is_alphanumeric()).any(is_point_id) {
+        let names_point =
+            |line: &Line<'_>| line.text.split(|c: char| !c.is_alphanumeric()).any(is_point_id);
+        if points.is_empty() && body.iter().any(names_point) {
             problems.push(Problem::UnheadedDecisionPoints);
         }
     }
 
-    problems.extend(fence_problems(text));
+    problems.extend(fence_problems);
 
     if problems.is_empty() {
         Ok(Findings { decision_points })
@@ -308,36 +324,24 @@ struct Fence {
     run: usize,
     column: usize,
     item_column: usize,
+    listed: bool,
 }
 
 impl Fence {
-    fn opened_by(line: &str) -> Option<Fence> {
-        if indent_width(line) > 3 {
-            return None;
-        }
-        let mut rest = line.trim_start_matches([' ', '\t']);
-        let mut in_item = false;
-        while let Some(content) = item_content(rest) {
-            rest = content.trim_start_matches([' ', '\t']);
-            in_item = true;
-        }
-        let mark = rest.chars().next().filter(|c| matches!(c, '`' | '~'))?;
-        let info = rest.trim_start_matches(mark);
-        let run = rest.len() - info.len();
-        if run < 3 || (mark == '`' && info.contains('`')) {
-            return None;
-        }
-        let column = advance(0, &line[..line.len() - rest.len()]);
-        let item_column = if in_item { column } else { 0 };
-        Some(Fence { mark, run, column, item_column })
+    fn at(text: &str, column: usize, item_column: usize, listed: bool) -> Option<Fence> {
+        let mark = text.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+        let info = text.trim_start_matches(mark);
+        let run = text.len() - info.len();
+        let fence = Fence { mark, run, column, item_column, listed };
+        (run >= 3 && !(mark == '`' && info.contains('`'))).then_some(fence)
     }
 
-    fn closed_by(&self, line: &str) -> bool {
+    fn closer_at(&self, line: &str) -> Option<usize> {
         let rest = line.trim_start_matches([' ', '\t']);
         let after = rest.trim_start_matches(self.mark);
-        rest.len() - after.len() >= self.run
-            && after.chars().all(|c| matches!(c, ' ' | '\t'))
-            && (self.item_column..=self.item_column + 3).contains(&indent_width(line))
+        let closes = rest.len() - after.len() >= self.run
+            && after.chars().all(|c| matches!(c, ' ' | '\t'));
+        closes.then(|| indent_width(line))
     }
 }
 
@@ -345,55 +349,127 @@ impl Fence {
 enum LastLine {
     #[default]
     NoParagraph,
-    MaybeParagraph,
     Paragraph,
+    Unknown,
+}
+
+#[derive(Clone, Copy)]
+struct Line<'a> {
+    text: &'a str,
+    code: bool,
 }
 
 #[derive(Default)]
 struct Fences {
     open: Option<Fence>,
-    item_column: Option<usize>,
+    items: Vec<usize>,
+    listed: bool,
+    blank_before: bool,
     last: LastLine,
     less_indented: bool,
+    deep: bool,
+    unsure_item: bool,
 }
 
 impl Fences {
     fn is_code(&mut self, line: &str) -> bool {
         let start = line.trim_start_matches([' ', '\t']);
+        let indent = indent_width(line);
         if let Some(fence) = self.open {
-            self.less_indented |= !start.is_empty() && indent_width(line) < fence.column;
-            if fence.closed_by(line) {
-                self.open = None;
+            self.less_indented |= !start.is_empty() && indent < fence.column;
+            match fence.closer_at(line) {
+                Some(at) if (fence.item_column..=fence.item_column + 3).contains(&at) => {
+                    self.open = None;
+                    self.last = LastLine::NoParagraph;
+                }
+                Some(at) => {
+                    let unsure = fence.item_column + 3 < at && at <= fence.column + 3;
+                    self.deep |= fence.listed && unsure;
+                }
+                None => {}
             }
-            self.last = LastLine::NoParagraph;
             return true;
         }
         if start.is_empty() {
             self.last = LastLine::NoParagraph;
+            self.blank_before = true;
             return false;
         }
-        let indent = indent_width(line);
-        let beside = self.item_column.is_some_and(|column| indent < column);
-        let item = indent <= 3
-            && item_content(start).is_some()
-            && (beside || self.last == LastLine::NoParagraph || may_interrupt_text(start));
-        self.open = Fence::opened_by(line).filter(|fence| item || fence.item_column == 0);
-        let lazy = self.last == LastLine::Paragraph && self.open.is_none() && is_prose(start);
-        let (text, column) = if item { after_markers(line) } else { (start, 0) };
-        if item {
-            self.item_column = Some(column);
-        } else if beside && !lazy {
-            self.item_column = None;
+        let after_blank = std::mem::take(&mut self.blank_before);
+        let (text, column) = after_markers(line);
+        self.deep |= indent > 3 && self.listed && Fence::at(text, column, 0, true).is_some();
+        self.open = if indent <= 3 && item_content(start).is_some() && !is_thematic_break(start) {
+            self.item(start, indent, text, column)
+        } else {
+            self.other(line, indent, after_blank)
+        };
+        self.open.is_some()
+    }
+
+    fn item(&mut self, start: &str, indent: usize, text: &str, column: usize) -> Option<Fence> {
+        let beside = self.items.last().is_some_and(|&open| indent < open);
+        let fence = Fence::at(text, column, column, true);
+        self.listed = true;
+        if !(self.last == LastLine::NoParagraph || beside || may_interrupt_text(start)) {
+            self.unsure_item |= fence.is_some();
+            self.last = LastLine::Unknown;
+            return None;
         }
-        self.last = if self.open.is_some() || text.is_empty() || is_heading(text) {
+        self.items.retain(|&open| open <= indent);
+        if !text.is_empty() {
+            self.items.push(column);
+        }
+        self.last = if text.is_empty() || is_heading(text) {
             LastLine::NoParagraph
         } else if is_prose(text) {
             LastLine::Paragraph
         } else {
-            LastLine::MaybeParagraph
+            LastLine::Unknown
         };
-        self.open.is_some()
+        fence
     }
+
+    fn other(&mut self, line: &str, indent: usize, after_blank: bool) -> Option<Fence> {
+        let start = line.trim_start_matches([' ', '\t']);
+        let fence = if indent <= 3 { Fence::at(start, indent, 0, self.listed) } else { None };
+        let heading = is_heading(line);
+        let continues = self.last == LastLine::Paragraph && is_prose(start);
+        if !continues {
+            self.items.retain(|&open| open <= indent);
+        }
+        if indent == 0 && (after_blank || fence.is_some() || heading) {
+            self.listed = false;
+        }
+        let container = self.items.last().copied().unwrap_or(0);
+        self.last = if continues {
+            LastLine::Paragraph
+        } else if heading {
+            LastLine::NoParagraph
+        } else if self.last == LastLine::NoParagraph && is_prose(start) && indent < container + 4 {
+            LastLine::Paragraph
+        } else {
+            LastLine::Unknown
+        };
+        fence
+    }
+
+    fn problems(&self) -> Vec<Problem> {
+        [
+            (self.unsure_item, Problem::ListFence),
+            (self.deep, Problem::DeepFence),
+            (self.less_indented, Problem::UnevenFence),
+            (self.open.is_some(), Problem::OpenFence),
+        ]
+        .into_iter()
+        .filter_map(|(found, problem)| found.then_some(problem))
+        .collect()
+    }
+}
+
+fn read_lines(text: &str) -> (Vec<Line<'_>>, Vec<Problem>) {
+    let mut fences = Fences::default();
+    let lines = text.lines().map(|text| Line { code: fences.is_code(text), text }).collect();
+    (lines, fences.problems())
 }
 
 /// CommonMark lets a list start inside a paragraph only with a bullet or 1, and not empty.
@@ -423,17 +499,14 @@ fn is_prose(text: &str) -> bool {
     text.starts_with(char::is_alphanumeric) && !text.contains('|')
 }
 
-fn is_heading(text: &str) -> bool {
-    (1..=6).any(|level| heading(text, level).is_some())
+/// CommonMark: three or more of one of `-`, `*` and `_`, with only spaces and tabs between.
+fn is_thematic_break(text: &str) -> bool {
+    let marks: String = text.chars().filter(|c| !matches!(c, ' ' | '\t')).collect();
+    marks.len() >= 3 && ["-", "*", "_"].iter().any(|mark| marks.trim_start_matches(mark).is_empty())
 }
 
-fn fence_problems(text: &str) -> Vec<Problem> {
-    let mut fences = Fences::default();
-    for line in text.lines() {
-        fences.is_code(line);
-    }
-    let uneven = fences.less_indented.then_some(Problem::UnevenFence);
-    uneven.into_iter().chain(fences.open.map(|_| Problem::OpenFence)).collect()
+fn is_heading(text: &str) -> bool {
+    (1..=6).any(|level| heading(text, level).is_some())
 }
 
 fn indent_width(line: &str) -> usize {
@@ -444,11 +517,10 @@ fn advance(column: usize, text: &str) -> usize {
     text.chars().fold(column, |width, c| if c == '\t' { width + 4 - width % 4 } else { width + 1 })
 }
 
-fn sections(text: &str, level: usize) -> Vec<Section<'_>> {
+fn sections<'a>(lines: &[Line<'a>], level: usize) -> Vec<Section<'a>> {
     let mut sections: Vec<Section> = Vec::new();
-    let mut fences = Fences::default();
-    for line in text.lines() {
-        if !fences.is_code(line) && let Some(title) = heading(line, level) {
+    for &line in lines {
+        if !line.code && let Some(title) = heading(line.text, level) {
             sections.push(Section {
                 heading: format!("{} {title}", "#".repeat(level)),
                 lines: Vec::new(),
@@ -480,8 +552,8 @@ fn heading(line: &str, level: usize) -> Option<&str> {
     Some(title)
 }
 
-fn point_headings(text: &str) -> usize {
-    sections(text, 3).iter().filter(|s| is_point_id(point_title(s).0)).count()
+fn point_headings(lines: &[Line<'_>]) -> usize {
+    sections(lines, 3).iter().filter(|s| is_point_id(point_title(s).0)).count()
 }
 
 fn point_title<'a>(section: &'a Section) -> (&'a str, &'a str) {
@@ -497,8 +569,8 @@ fn is_point_id(word: &str) -> bool {
         && chars.all(|c| c.is_ascii_digit())
 }
 
-fn is_blank(lines: &[&str]) -> bool {
-    lines.iter().all(|line| line.trim().is_empty())
+fn is_blank(lines: &[Line<'_>]) -> bool {
+    lines.iter().all(|line| line.text.trim().is_empty())
 }
 
 fn decision_point(section: &Section, number: usize) -> Result<DecisionPoint, Problem> {
@@ -507,14 +579,14 @@ fn decision_point(section: &Section, number: usize) -> Result<DecisionPoint, Pro
     if !id.eq_ignore_ascii_case(&expected) {
         return Err(Problem::Numbering(expected));
     }
-    let options: Vec<char> = section.lines.iter().filter_map(|l| option_letter(l)).collect();
+    let options: Vec<char> = section.lines.iter().filter_map(|l| option_letter(l.text)).collect();
     if options.len() < 2 {
         return Err(Problem::TooFewOptions(expected));
     }
     let advice = section
         .lines
         .iter()
-        .find_map(|l| advice_letter(l))
+        .find_map(|l| advice_letter(l.text))
         .ok_or_else(|| Problem::NoAdvice(expected.clone()))?;
     if !options.contains(&advice) {
         return Err(Problem::AdviceNotAnOption(expected));
@@ -1204,16 +1276,60 @@ Advice: A, it keeps the slice small.
         let no_item = format!("{base}Steps:\n2. ```sh\n   a\n   ```\n");
         assert_eq!(
             check_findings(&no_item).unwrap_err(),
-            vec![Problem::OpenFence],
+            vec![Problem::ListFence, Problem::OpenFence],
             "a list numbered from 2 can't interrupt a paragraph, so its last line opens a block"
         );
         for empty in ["* ", "1. "] {
             let text = format!("{base}Steps\n{empty}\n2. ```\n   ~~~\n   ```\n");
             assert_eq!(
                 check_findings(&text).unwrap_err(),
-                vec![Problem::OpenFence],
+                vec![Problem::ListFence, Problem::OpenFence],
                 "an empty item can't interrupt a paragraph either: {empty:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_fence_on_an_item_s_line_is_refused_where_github_may_read_the_item_as_text() {
+        let base = "## Cause\n\nX.\n\n## Approach\n\n";
+        let step = "2. ```sh\n   a\n   ```\n";
+        for before in [
+            "Then run:\n    # build first\n",
+            "1. Run the build:\n\n       make all\nThen test it\n",
+            "- Build:\n\n      make all\nThen test\n",
+            "- ---\n  Steps\n",
+            "* * *\n    code\nlazy\n",
+            "1. \n\n   foo\n",
+            "- a\n===\n",
+            "> note\n",
+            "| a |\n|---|\n",
+        ] {
+            let text = format!("{base}{before}{step}");
+            assert_eq!(check_findings(&text).unwrap_err()[0], Problem::ListFence, "{before:?}");
+        }
+        let hidden = "- a\n===\n2. ```\n   x\n   ```\n   ## Decision points\n   ```\n";
+        let hidden = format!("{base}{hidden}");
+        assert_eq!(check_findings(&hidden).unwrap_err(), vec![Problem::ListFence], "a lazy ===");
+        let blank = format!("{base}> note\n\n{step}");
+        assert!(check_findings(&blank).is_ok(), "after a blank line it is surely an item");
+    }
+
+    #[test]
+    fn a_fence_four_or_more_columns_into_a_list_is_refused() {
+        let base = "## Cause\n\nX.\n\n## Approach\n\n";
+        for deep in [
+            "-   a\n    ```\n    code\n    ```\n",
+            "1. Build:\n   - debug:\n     ```sh\n     x\n     ```\n",
+            "10. Run:\n    ```sh\n    x\n    ```\n",
+            "1. a\n   - ```sh\n     x\n     ```\n     - ```sh\n       y\n       ```\n",
+            "- a\n  ```\n     ```\n  ## B9\n  ```\n",
+        ] {
+            let text = format!("{base}{deep}");
+            assert_eq!(check_findings(&text).unwrap_err(), vec![Problem::DeepFence], "{deep:?}");
+        }
+        for code in ["Y.\n\n    ```\n", "- a\n\n## Notes\n\n    ```\n", "- a\n\nB.\n\n    ```\n"] {
+            let text = format!("{base}{code}");
+            assert!(check_findings(&text).is_ok(), "no list holds it, so it is code: {code:?}");
         }
     }
 
@@ -1226,6 +1342,7 @@ Advice: A, it keeps the slice small.
             "1. Stop the service\n   and wait for it to drain.\n",
             "1. Stop the service\nand wait for it to drain.\n",
             "1. Build:\n    - debug\n",
+            "1. Add the flag:\n   - in settings\n   - in the CLI\n\n   Restart afterwards.\n",
         ] {
             let text = format!("{base}{before}{step}");
             assert!(check_findings(&text).is_ok(), "{before:?}");
@@ -1386,6 +1503,8 @@ Advice: A, it keeps the slice small.
             Problem::TooLarge(300_000),
             Problem::OpenFence,
             Problem::UnevenFence,
+            Problem::ListFence,
+            Problem::DeepFence,
             Problem::Link,
             Problem::NotAFile,
             Problem::Unreadable,
