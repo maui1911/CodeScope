@@ -1188,6 +1188,7 @@ impl AppShell {
                 trigger_at: trigger_at.clone(),
                 findings: None,
                 pull_request,
+                review: None,
             },
             assign_to: item.assignees.is_empty().then_some(content_id),
             board,
@@ -1853,7 +1854,7 @@ impl AppShell {
     ) {
         let item_id = record.item_id.clone();
         let content_id = record.content_id.clone();
-        let body = pull_request_comment(&pr);
+        let body = pull_request_comment(&pr, record.round);
         if let Some(watch) = self.board.dispatch.watches.get_mut(&item_id) {
             watch.reporting = true;
             watch.report_error = None;
@@ -2678,6 +2679,7 @@ mod tests {
             state: PullRequestState::Open,
             is_draft,
             checks,
+            head_oid: format!("c{number}"),
         }
     }
 
@@ -2703,6 +2705,7 @@ mod tests {
             trigger_at: "2026-11-25T09:00:00Z".into(),
             findings: None,
             pull_request,
+            review: None,
         }
     }
 

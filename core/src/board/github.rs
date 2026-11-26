@@ -372,7 +372,7 @@ const PULL_REQUESTS_QUERY: &str = r#"query($owner: String!, $name: String!, $bra
     pullRequests(headRefName: $branch, states: [OPEN, MERGED], first: 5,
       orderBy: { field: CREATED_AT, direction: DESC }) {
       nodes {
-        id number url state isDraft isCrossRepository
+        id number url state isDraft isCrossRepository headRefOid
         commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
       }
     }
@@ -429,9 +429,51 @@ pub fn parse_pull_requests(json: &str) -> Result<Vec<PullRequest>> {
                 state,
                 is_draft: node.is_draft,
                 checks: Checks::from_rollup(rollup.as_ref().map(|r| r.state.as_str())),
+                head_oid: node.head_ref_oid,
             })
         })
         .collect())
+}
+
+const THREAD_REPLIES_QUERY: &str = r#"query($id: ID!) {
+  node(id: $id) {
+    ... on PullRequest {
+      reviewThreads(last: 50) {
+        nodes { comments(last: 10) { nodes { viewerDidAuthor createdAt } } }
+      }
+    }
+  }
+}"#;
+
+/// When the signed-in user last commented in a review thread of the pull request with node id
+/// `pull_request_id`, ISO 8601; looks at the last 10 comments of its last 50 threads.
+pub fn fetch_last_thread_reply(pull_request_id: &str) -> Result<Option<String>> {
+    let stdout = run_graphql(
+        &[
+            format!("query={THREAD_REPLIES_QUERY}"),
+            format!("id={pull_request_id}"),
+        ],
+        &[],
+    )?;
+    parse_last_thread_reply(&stdout)
+}
+
+/// Parse [`fetch_last_thread_reply`]'s response.
+pub fn parse_last_thread_reply(json: &str) -> Result<Option<String>> {
+    let data: ThreadRepliesData = parse_data(json)?;
+    let threads = data.node.ok_or_else(|| anyhow!("pull request not found"))?;
+    Ok(threads
+        .review_threads
+        .nodes
+        .into_iter()
+        .flatten()
+        .flat_map(|thread| thread.comments.nodes.into_iter().flatten())
+        .filter(|comment| comment.viewer_did_author)
+        .map(|comment| comment.created_at)
+        .max_by(|a, b| {
+            let secs = |at: &str| crate::time::parse_iso8601_secs(at).unwrap_or(f64::MIN);
+            secs(a).total_cmp(&secs(b))
+        }))
 }
 
 /// Mark a draft pull request ready for review, by its node id.
@@ -777,7 +819,41 @@ struct PullRequestNode {
     state: String,
     is_draft: bool,
     is_cross_repository: bool,
+    head_ref_oid: String,
     commits: CommitList,
+}
+
+#[derive(Deserialize)]
+struct ThreadRepliesData {
+    node: Option<ThreadsOwner>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadsOwner {
+    review_threads: ThreadList,
+}
+
+#[derive(Deserialize)]
+struct ThreadList {
+    nodes: Vec<Option<ThreadNode>>,
+}
+
+#[derive(Deserialize)]
+struct ThreadNode {
+    comments: ThreadCommentList,
+}
+
+#[derive(Deserialize)]
+struct ThreadCommentList {
+    nodes: Vec<Option<ThreadComment>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadComment {
+    viewer_did_author: bool,
+    created_at: String,
 }
 
 #[derive(Deserialize)]
@@ -1197,13 +1273,13 @@ mod tests {
     fn reads_the_pull_requests_on_a_branch_but_not_those_from_forks() {
         let json = r#"{"data":{"repository":{"pullRequests":{"nodes":[
           {"id":"PR_3","number":417,"url":"https://github.com/maui1911/CodeScope/pull/417",
-           "state":"OPEN","isDraft":true,"isCrossRepository":false,
+           "state":"OPEN","isDraft":true,"isCrossRepository":false,"headRefOid":"c417",
            "commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"PENDING"}}}]}},
           {"id":"PR_2","number":416,"url":"https://github.com/maui1911/CodeScope/pull/416",
-           "state":"OPEN","isDraft":false,"isCrossRepository":true,
+           "state":"OPEN","isDraft":false,"isCrossRepository":true,"headRefOid":"c416",
            "commits":{"nodes":[{"commit":{"statusCheckRollup":null}}]}},
           {"id":"PR_1","number":415,"url":"https://github.com/maui1911/CodeScope/pull/415",
-           "state":"MERGED","isDraft":false,"isCrossRepository":false,
+           "state":"MERGED","isDraft":false,"isCrossRepository":false,"headRefOid":"c415",
            "commits":{"nodes":[]}}
         ]}}}}"#;
         let found = parse_pull_requests(json).unwrap();
@@ -1217,6 +1293,7 @@ mod tests {
                     state: PullRequestState::Open,
                     is_draft: true,
                     checks: Checks::Running,
+                    head_oid: "c417".into(),
                 },
                 PullRequest {
                     id: "PR_1".into(),
@@ -1225,11 +1302,36 @@ mod tests {
                     state: PullRequestState::Merged,
                     is_draft: false,
                     checks: Checks::None,
+                    head_oid: "c415".into(),
                 },
             ]
         );
         let missing = parse_pull_requests(r#"{"data":{"repository":null}}"#).unwrap_err();
         assert_eq!(missing.to_string(), "repository not found");
+    }
+
+    #[test]
+    fn the_last_review_thread_reply_is_the_viewers_newest_comment_in_any_thread() {
+        let json = r#"{"data":{"node":{"reviewThreads":{"nodes":[
+          {"comments":{"nodes":[
+            {"viewerDidAuthor":false,"createdAt":"2026-11-26T10:00:00Z"},
+            {"viewerDidAuthor":true,"createdAt":"2026-11-26T11:00:00Z"}]}},
+          {"comments":{"nodes":[
+            {"viewerDidAuthor":true,"createdAt":"2026-11-26T12:00:00Z"},
+            {"viewerDidAuthor":false,"createdAt":"2026-11-26T13:00:00Z"},
+            null]}},
+          null
+        ]}}}}"#;
+        assert_eq!(
+            parse_last_thread_reply(json).unwrap(),
+            Some("2026-11-26T12:00:00Z".to_string())
+        );
+        let none = r#"{"data":{"node":{"reviewThreads":{"nodes":[
+          {"comments":{"nodes":[{"viewerDidAuthor":false,"createdAt":"2026-11-26T10:00:00Z"}]}}
+        ]}}}}"#;
+        assert_eq!(parse_last_thread_reply(none).unwrap(), None);
+        let gone = parse_last_thread_reply(r#"{"data":{"node":null}}"#).unwrap_err();
+        assert_eq!(gone.to_string(), "pull request not found");
     }
 
     #[test]
