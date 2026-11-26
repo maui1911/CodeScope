@@ -1,7 +1,7 @@
 # Board protocol
 
 What a tool does to share a GitHub Projects board with CodeScope and
-with the people on it. Version 1, proposed in
+with the people on it. Version 1, set in
 [ADR-0027](DECISIONS.md#adr-0027--a-board-on-the-host-drives-dispatch).
 The terms are defined in [GLOSSARY.md](../GLOSSARY.md).
 

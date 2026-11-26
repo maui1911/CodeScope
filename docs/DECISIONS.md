@@ -872,7 +872,7 @@ blunt way to restart them all.
 ## ADR-0027 — A board on the host drives dispatch
 
 **Date:** 2026-11-25
-**Status:** Proposed
+**Status:** Accepted
 
 A project is a local folder, and work on it starts when the user opens
 a tab. To move towards a software factory, work should come from a
