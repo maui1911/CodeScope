@@ -25,6 +25,7 @@ pub const REPLY_FILE: &str = ".codescope/reply.md";
 pub const DEFAULT_DISPATCH_LIMIT: usize = 3;
 
 const SLUG_LENGTH: usize = 40;
+const TIMELINE_LAG_SECS: f64 = 120.0;
 const SKILL_FOLDERS: [&str; 6] = [
     ".claude",
     ".agents",
@@ -173,8 +174,12 @@ pub enum Hold {
     Draft,
     PullRequest,
     AssignedToOther(String),
-    /// The timeline has no move into the item's current column.
+    /// The timeline has no move into the item's current column, two minutes or more after the
+    /// item was put there.
     NoMove,
+    /// The item was put in its column less than two minutes ago, and its timeline doesn't show
+    /// that move yet.
+    MoveNotShownYet,
     MovedBeforeAdded,
     MovedByWorkflow,
     /// Moved by someone else: on an item not assigned to the user alone, or without write access.
@@ -219,6 +224,7 @@ impl Hold {
             Hold::PullRequest => "Pull request items don't start yet".into(),
             Hold::AssignedToOther(login) => format!("Assigned to @{login}"),
             Hold::NoMove => "No move on its timeline: move it again to start".into(),
+            Hold::MoveNotShownYet => "Waits for its move to show on its timeline".into(),
             Hold::MovedBeforeAdded => {
                 "Moved before the board was added: move it again to start".into()
             }
@@ -262,6 +268,8 @@ pub struct Facts<'a> {
     pub mover_can_write: Option<bool>,
     /// When the board was added, ISO 8601; earlier moves start nothing.
     pub board_added_at: &'a str,
+    /// When this decision is made, ISO 8601.
+    pub now: &'a str,
     /// Projects with a remote for the item's repository.
     pub projects: usize,
     /// This user's dispatch of the item, if any.
@@ -336,7 +344,7 @@ fn check(
     let change = facts
         .change
         .filter(|c| normalize_column_name(&c.status) == normalize_column_name(&column.name))
-        .ok_or(Hold::NoMove)?;
+        .ok_or_else(|| missing_move(item, facts.now))?;
     if facts.dispatch.is_some_and(|d| d.trigger_at == change.created_at) {
         return Err(Hold::Handled);
     }
@@ -370,6 +378,20 @@ fn check(
         return Err(Hold::LimitReached(facts.limit));
     }
     Ok(())
+}
+
+fn missing_move(item: &BoardItem, now: &str) -> Hold {
+    let since_set = item
+        .column_set_at
+        .as_deref()
+        .and_then(parse_iso8601_secs)
+        .zip(parse_iso8601_secs(now))
+        .map(|(set, now)| now - set);
+    if since_set.is_some_and(|secs| secs < TIMELINE_LAG_SECS) {
+        Hold::MoveNotShownYet
+    } else {
+        Hold::NoMove
+    }
 }
 
 fn is_assigned_to(item: &BoardItem, login: &str) -> bool {
@@ -864,6 +886,7 @@ mod tests {
     const VIEWER: &str = "maui1911";
     const ADDED: &str = "2026-11-25T09:00:00Z";
     const MOVED: &str = "2026-11-25T10:00:00Z";
+    const NOW: &str = "2026-11-25T11:00:00Z";
 
     fn board_with(item: BoardItem) -> Board {
         let columns = [
@@ -906,6 +929,7 @@ mod tests {
             assignees: Vec::new(),
             state: ItemState::Open,
             column_id: Some(column.into()),
+            column_set_at: Some(MOVED.into()),
             updated_at: MOVED.into(),
         }
     }
@@ -925,6 +949,7 @@ mod tests {
             change: Some(change),
             mover_can_write: None,
             board_added_at: ADDED,
+            now: NOW,
             projects: 1,
             dispatch: None,
             pull_request: OwnPullRequest::NotOpened,
@@ -1090,6 +1115,30 @@ mod tests {
             run_decide(issue_in("y"), &facts(&renamed)),
             Some(Ok(Round::Implementation))
         );
+    }
+
+    #[test]
+    fn a_move_the_timeline_does_not_show_yet_waits_two_minutes_for_it() {
+        let before = moved_by(VIEWER, "Todo");
+        let at = |now| Facts {
+            now,
+            ..facts(&before)
+        };
+        let waits = Some(Err(Hold::MoveNotShownYet));
+        let ask_again = Some(Err(Hold::NoMove));
+        assert_eq!(run_decide(issue_in("y"), &at("2026-11-25T10:00:15Z")), waits);
+        assert_eq!(run_decide(issue_in("y"), &at("2026-11-25T10:01:59Z")), waits);
+        assert_eq!(run_decide(issue_in("y"), &at("2026-11-25T10:02:00Z")), ask_again);
+        let none_shown = Facts {
+            change: None,
+            ..at("2026-11-25T10:00:15Z")
+        };
+        assert_eq!(run_decide(issue_in("y"), &none_shown), waits);
+        let unknown = BoardItem {
+            column_set_at: None,
+            ..issue_in("y")
+        };
+        assert_eq!(run_decide(unknown, &at("2026-11-25T10:00:15Z")), ask_again);
     }
 
     #[test]
