@@ -7,6 +7,7 @@ pub mod dispatch;
 pub mod findings;
 pub mod github;
 pub mod pull_request;
+pub mod reply;
 
 use std::collections::BTreeMap;
 

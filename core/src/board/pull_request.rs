@@ -1,9 +1,11 @@
-//! The pull request an implementation round opens, as the board poll reads it, and the comment
-//! that reports it on the issue.
+//! The pull request an implementation round opens, as the board poll reads it, the comment that
+//! reports it on the issue, and whether a review round on it did something.
 
 use serde::{Deserialize, Serialize};
 
 use super::ColumnRole;
+use super::dispatch::Round;
+use crate::time::parse_iso8601_secs;
 
 const MARKER: &str =
     "<!-- dispatch v=1 phase=implementation outcome=pull-request by=codescope -->";
@@ -47,6 +49,8 @@ pub struct PullRequest {
     pub state: PullRequestState,
     pub is_draft: bool,
     pub checks: Checks,
+    /// The commit its branch points at.
+    pub head_oid: String,
 }
 
 /// The pull request a round produced, from those on its branch newest first: the newest open
@@ -72,21 +76,40 @@ pub struct PostedPullRequest {
     pub in_review: bool,
 }
 
-/// The comment that reports a pull request on its issue: what is open, a `**Next step:**` line
-/// and the marker.
-pub fn pull_request_comment(pr: &PullRequest) -> String {
+/// The comment that reports a pull request on its issue after `round`: what is open or was
+/// updated, a `**Next step:**` line and the marker.
+pub fn pull_request_comment(pr: &PullRequest, round: Round) -> String {
+    let (state, again) = match round {
+        Round::Review => ("is updated for the review", " again"),
+        Round::Research | Round::Implementation => ("is open", ""),
+    };
+    let number = pr.number;
     let (opened, next_step) = if pr.is_draft {
         (
-            format!(
-                "Draft pull request #{} is open: part of it needs testing by hand.",
-                pr.number
-            ),
-            "test it as its *Test by hand* section says, then mark it ready for review.",
+            format!("Draft pull request #{number} {state}: part of it needs testing by hand."),
+            "test it as its *Test by hand* section says, then mark it ready for review."
+                .to_string(),
         )
     } else {
-        (format!("Pull request #{} is open.", pr.number), "review it.")
+        (format!("Pull request #{number} {state}."), format!("review it{again}."))
     };
     format!("{opened}\n\n**Next step:** {next_step}\n{MARKER}\n")
+}
+
+/// Whether a review round that started at `since` did something on its pull request: pushed
+/// past `start_head`, or replied in a review thread after the move (`replied_at`, ISO 8601).
+pub fn review_round_worked(
+    start_head: Option<&str>,
+    head: &str,
+    replied_at: Option<&str>,
+    since: &str,
+) -> bool {
+    let pushed = start_head.is_some_and(|start| start != head);
+    let replied = replied_at
+        .and_then(parse_iso8601_secs)
+        .zip(parse_iso8601_secs(since))
+        .is_some_and(|(at, since)| at > since);
+    pushed || replied
 }
 
 /// Whether CodeScope moves the item to In review: for an open pull request that is ready, and
@@ -107,7 +130,39 @@ mod tests {
             state,
             is_draft,
             checks: Checks::None,
+            head_oid: "h1".into(),
         }
+    }
+
+    #[test]
+    fn a_review_round_worked_when_it_pushed_or_replied_in_a_thread_after_its_move() {
+        let since = "2026-11-26T10:00:00Z";
+        assert!(review_round_worked(Some("h0"), "h1", None, since), "pushed");
+        assert!(!review_round_worked(Some("h1"), "h1", None, since));
+        assert!(review_round_worked(Some("h1"), "h1", Some("2026-11-26T10:00:01Z"), since));
+        assert!(!review_round_worked(Some("h1"), "h1", Some("2026-11-26T09:59:59Z"), since));
+        assert!(!review_round_worked(None, "h1", None, since), "no head to tell a push by");
+        assert!(!review_round_worked(Some("h1"), "h1", Some("yesterday"), since));
+    }
+
+    #[test]
+    fn after_a_review_round_the_comment_says_the_pull_request_was_updated() {
+        let ready = pull_request(415, PullRequestState::Open, false);
+        assert_eq!(
+            pull_request_comment(&ready, Round::Review),
+            "Pull request #415 is updated for the review.\n\n\
+             **Next step:** review it again.\n\
+             <!-- dispatch v=1 phase=implementation outcome=pull-request by=codescope -->\n"
+        );
+        let draft = pull_request(415, PullRequestState::Open, true);
+        assert_eq!(
+            pull_request_comment(&draft, Round::Review),
+            "Draft pull request #415 is updated for the review: part of it needs testing by \
+             hand.\n\n\
+             **Next step:** test it as its *Test by hand* section says, then mark it ready for \
+             review.\n\
+             <!-- dispatch v=1 phase=implementation outcome=pull-request by=codescope -->\n"
+        );
     }
 
     #[test]
@@ -138,14 +193,14 @@ mod tests {
     fn the_comment_says_what_is_open_and_what_comes_next() {
         let ready = pull_request(415, PullRequestState::Open, false);
         assert_eq!(
-            pull_request_comment(&ready),
+            pull_request_comment(&ready, Round::Implementation),
             "Pull request #415 is open.\n\n\
              **Next step:** review it.\n\
              <!-- dispatch v=1 phase=implementation outcome=pull-request by=codescope -->\n"
         );
         let draft = pull_request(415, PullRequestState::Open, true);
         assert_eq!(
-            pull_request_comment(&draft),
+            pull_request_comment(&draft, Round::Implementation),
             "Draft pull request #415 is open: part of it needs testing by hand.\n\n\
              **Next step:** test it as its *Test by hand* section says, then mark it ready for \
              review.\n\
