@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 
 use super::answers::Comment;
 use super::dispatch::StatusChange;
-use super::pull_request::{Checks, PullRequest, PullRequestState};
+use super::pull_request::{Checks, LinkedPullRequest, PullRequest, PullRequestState};
 use super::{Board, BoardItem, BoardOwner, BoardRef, Column, ItemKind, ItemState};
 use crate::process::no_window_command;
 
@@ -110,58 +110,90 @@ pub fn fetch_viewer() -> Result<Viewer> {
     })
 }
 
-const STATUS_CHANGES_QUERY: &str = r#"query($ids: [ID!]!) {
+const TRIGGER_ITEMS_QUERY: &str = r#"query($ids: [ID!]!) {
   nodes(ids: $ids) {
     __typename
-    ... on Issue { id timelineItems(last: 100, itemTypes: [PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]) { nodes { ...change } } }
+    ... on Issue {
+      id timelineItems(last: 100, itemTypes: [PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]) { nodes { ...change } }
+      closedByPullRequestsReferences(first: 10, includeClosedPrs: true) { nodes { ...linked } }
+    }
     ... on PullRequest { id timelineItems(last: 100, itemTypes: [PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]) { nodes { ...change } } }
   }
 }
 fragment change on ProjectV2ItemStatusChangedEvent {
   createdAt status wasAutomated actor { login } project { id }
+}
+fragment linked on PullRequest {
+  number state createdAt closedAt isCrossRepository headRefName
 }"#;
 
-/// The last status change on board `board_id` of each issue or pull request in `content_ids`,
-/// keyed by content id. Items with no change on that board are left out.
-pub fn fetch_status_changes(
-    board_id: &str,
-    content_ids: &[String],
-) -> Result<HashMap<String, StatusChange>> {
-    let mut changes = HashMap::new();
-    for chunk in content_ids.chunks(100) {
-        let mut args = vec![format!("query={STATUS_CHANGES_QUERY}")];
-        args.extend(chunk.iter().map(|id| format!("ids[]={id}")));
-        let stdout = run_graphql(&args, &[])?;
-        changes.extend(parse_status_changes(&stdout, board_id)?);
-    }
-    Ok(changes)
+/// What the board poll reads about the issues and pull requests in trigger columns, by content
+/// id.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TriggerReads {
+    /// The last status change on the board; items without one are left out.
+    pub changes: HashMap<String, StatusChange>,
+    /// Each issue's linked pull requests, open or not, up to ten.
+    pub linked: HashMap<String, Vec<LinkedPullRequest>>,
 }
 
-/// Parse [`fetch_status_changes`]' response, keeping the changes made on `board_id`.
-pub fn parse_status_changes(json: &str, board_id: &str) -> Result<HashMap<String, StatusChange>> {
+/// The last status change on board `board_id`, and the linked pull requests, of each issue or
+/// pull request in `content_ids`.
+pub fn fetch_trigger_reads(board_id: &str, content_ids: &[String]) -> Result<TriggerReads> {
+    let mut reads = TriggerReads::default();
+    for chunk in content_ids.chunks(100) {
+        let mut args = vec![format!("query={TRIGGER_ITEMS_QUERY}")];
+        args.extend(chunk.iter().map(|id| format!("ids[]={id}")));
+        let stdout = run_graphql(&args, &[])?;
+        let page = parse_trigger_reads(&stdout, board_id)?;
+        reads.changes.extend(page.changes);
+        reads.linked.extend(page.linked);
+    }
+    Ok(reads)
+}
+
+/// Parse [`fetch_trigger_reads`]' response, keeping the changes made on `board_id`.
+pub fn parse_trigger_reads(json: &str, board_id: &str) -> Result<TriggerReads> {
     let data: NodesData = parse_data(json)?;
-    Ok(data
-        .nodes
-        .into_iter()
-        .flatten()
-        .filter_map(|node| {
-            let change = node
-                .timeline_items?
+    let mut reads = TriggerReads::default();
+    for node in data.nodes.into_iter().flatten() {
+        let Some(id) = node.id else {
+            continue;
+        };
+        let change = node.timeline_items.and_then(|items| {
+            items
                 .nodes
                 .into_iter()
                 .flatten()
-                .rfind(|e| e.project.as_ref().is_some_and(|p| p.id == board_id))?;
-            Some((
-                node.id?,
-                StatusChange {
-                    actor: change.actor.map(|a| a.login),
-                    was_automated: change.was_automated,
-                    status: change.status,
-                    created_at: change.created_at,
-                },
-            ))
-        })
-        .collect())
+                .rfind(|e| e.project.as_ref().is_some_and(|p| p.id == board_id))
+        });
+        if let Some(change) = change {
+            let change = StatusChange {
+                actor: change.actor.map(|a| a.login),
+                was_automated: change.was_automated,
+                status: change.status,
+                created_at: change.created_at,
+            };
+            reads.changes.insert(id.clone(), change);
+        }
+        if let Some(linked) = node.closed_by_pull_requests_references {
+            let linked = linked
+                .nodes
+                .into_iter()
+                .flatten()
+                .map(|pr| LinkedPullRequest {
+                    number: pr.number,
+                    open: pr.state == "OPEN",
+                    head_ref_name: pr.head_ref_name,
+                    is_cross_repository: pr.is_cross_repository,
+                    created_at: pr.created_at,
+                    closed_at: pr.closed_at,
+                })
+                .collect();
+            reads.linked.insert(id, linked);
+        }
+    }
+    Ok(reads)
 }
 
 const COMMENTS_QUERY: &str = r#"query($ids: [ID!]!) {
@@ -752,6 +784,23 @@ struct NodesData {
 struct TimelineOwner {
     id: Option<String>,
     timeline_items: Option<TimelineItems>,
+    closed_by_pull_requests_references: Option<LinkedList>,
+}
+
+#[derive(Deserialize)]
+struct LinkedList {
+    nodes: Vec<Option<LinkedNode>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinkedNode {
+    number: u32,
+    state: String,
+    created_at: String,
+    closed_at: Option<String>,
+    is_cross_repository: bool,
+    head_ref_name: String,
 }
 
 #[derive(Deserialize)]
@@ -1161,7 +1210,7 @@ mod tests {
              "actor":null,"project":{"id":"PVT_OTHER"}}]}},
           null
         ]}}"#;
-        let changes = parse_status_changes(json, "PVT_1").unwrap();
+        let changes = parse_trigger_reads(json, "PVT_1").unwrap().changes;
         assert_eq!(changes.len(), 1);
         assert_eq!(
             changes["I_411"],
@@ -1171,6 +1220,42 @@ mod tests {
                 status: "Ready".into(),
                 created_at: "2026-11-25T10:00:00Z".into(),
             }
+        );
+    }
+
+    #[test]
+    fn reads_each_issues_linked_pull_requests() {
+        let json = r#"{"data":{"nodes":[
+          {"__typename":"Issue","id":"I_432","timelineItems":{"nodes":[]},
+           "closedByPullRequestsReferences":{"nodes":[
+            {"number":12,"state":"OPEN","createdAt":"2026-11-24T10:00:00Z","closedAt":null,
+             "isCrossRepository":true,"headRefName":"fix-paths"},
+            {"number":9,"state":"MERGED","createdAt":"2026-11-20T10:00:00Z",
+             "closedAt":"2026-11-21T10:00:00Z","isCrossRepository":false,"headRefName":"9-old"}]}},
+          {"__typename":"PullRequest","id":"PR_12","timelineItems":{"nodes":[]}}
+        ]}}"#;
+        let linked = parse_trigger_reads(json, "PVT_1").unwrap().linked;
+        assert_eq!(linked.len(), 1, "a pull request item has no linked pull requests");
+        assert_eq!(
+            linked["I_432"],
+            vec![
+                LinkedPullRequest {
+                    number: 12,
+                    open: true,
+                    head_ref_name: "fix-paths".into(),
+                    is_cross_repository: true,
+                    created_at: "2026-11-24T10:00:00Z".into(),
+                    closed_at: None,
+                },
+                LinkedPullRequest {
+                    number: 9,
+                    open: false,
+                    head_ref_name: "9-old".into(),
+                    is_cross_repository: false,
+                    created_at: "2026-11-20T10:00:00Z".into(),
+                    closed_at: Some("2026-11-21T10:00:00Z".into()),
+                },
+            ]
         );
     }
 

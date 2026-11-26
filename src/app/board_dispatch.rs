@@ -26,7 +26,7 @@ use codescope_core::board::findings::{
     DecisionPoint, FileStamp, Outcome, Problem, comment_body, posted_findings, problems_list,
     problems_message, read_findings,
 };
-use codescope_core::board::github::{self, Viewer};
+use codescope_core::board::github::{self, TriggerReads, Viewer};
 use codescope_core::board::pull_request::{
     Checks, PostedPullRequest, PullRequest, PullRequestState, moves_to_in_review,
     pull_request_comment, review_round_worked, round_pull_request,
@@ -510,8 +510,9 @@ pub(crate) struct ReadOutput {
 pub(crate) struct BoardFetch {
     pub url: String,
     pub board: Result<Board, String>,
-    /// Last moves of the items in trigger columns by content id; `None` when they couldn't be read.
-    pub changes: Option<HashMap<String, StatusChange>>,
+    /// Last moves and linked pull requests of the items in trigger columns; `None` when they
+    /// couldn't be read.
+    pub triggers: Option<TriggerReads>,
 }
 
 /// A card's line about dispatch.
@@ -754,23 +755,23 @@ pub(crate) fn read_boards(input: ReadInput) -> ReadOutput {
             Some(board) => github::fetch_board(&board).map_err(|err| format!("{err:#}")),
             None => Err("this is not a GitHub Projects board URL".to_string()),
         };
-        let changes = board.as_ref().ok().and_then(|board| {
+        let triggers = board.as_ref().ok().and_then(|board| {
             let ids = trigger_content_ids(board, &effective_mapping(board, &stored));
             if ids.is_empty() {
-                return Some(HashMap::new());
+                return Some(TriggerReads::default());
             }
             any_trigger = true;
-            github::fetch_status_changes(&board.id, &ids)
+            github::fetch_trigger_reads(&board.id, &ids)
                 .inspect_err(|err| eprintln!("warning: couldn't read moves on {url}: {err:#}"))
                 .ok()
         });
-        if let (Ok(board), Some(found), Some(viewer)) = (&board, &changes, &viewer) {
-            check_access(board, found, viewer, &input.known_access, &mut output.access);
+        if let (Ok(board), Some(found), Some(viewer)) = (&board, &triggers, &viewer) {
+            check_access(board, &found.changes, viewer, &input.known_access, &mut output.access);
         }
         output.boards.push(BoardFetch {
             url,
             board,
-            changes,
+            triggers,
         });
     }
     if !input.discussions.is_empty() {
@@ -1128,7 +1129,10 @@ impl AppShell {
                 let (Some(board), Some(settings)) = (&read.last_good, settings) else {
                     return false;
                 };
-                let change = read.changes.as_ref().and_then(|c| c.get(&record.content_id));
+                let change = read
+                    .triggers
+                    .as_ref()
+                    .and_then(|t| t.changes.get(&record.content_id));
                 board
                     .items
                     .iter()
@@ -1160,7 +1164,7 @@ impl AppShell {
             let Some(read) = self.board.reads_by_url.get(&settings.url) else {
                 continue;
             };
-            let (Some(board), Some(changes)) = (&read.last_good, &read.changes) else {
+            let (Some(board), Some(triggers)) = (&read.last_good, &read.triggers) else {
                 continue;
             };
             let mapping = effective_mapping(board, &settings.columns);
@@ -1169,11 +1173,16 @@ impl AppShell {
                 if state.starting.contains_key(&item.id) {
                     continue;
                 }
-                let record = records
+                let worktree = records
                     .iter()
-                    .find(|(_, _, _, r)| r.board_url == settings.url && r.item_id == item.id)
-                    .map(|(_, _, _, r)| r);
-                let change = item.content_id.as_ref().and_then(|id| changes.get(id));
+                    .find(|(_, _, _, r)| r.board_url == settings.url && r.item_id == item.id);
+                let record = worktree.map(|(_, _, _, r)| r);
+                let change = item.content_id.as_ref().and_then(|id| triggers.changes.get(id));
+                let linked = item
+                    .content_id
+                    .as_ref()
+                    .and_then(|id| triggers.linked.get(id))
+                    .map_or(&[][..], Vec::as_slice);
                 let mover_can_write = change
                     .and_then(|c| mover_to_check(item, c, &viewer.login))
                     .zip(item.repository.as_deref())
@@ -1194,6 +1203,8 @@ impl AppShell {
                         .unwrap_or(0),
                     dispatch: record,
                     pull_request: own_pull_request(record, state.watches.get(&item.id)),
+                    linked,
+                    branch: worktree.and_then(|(_, _, branch, _)| branch.as_deref()),
                     running,
                     limit,
                 };
@@ -3302,7 +3313,8 @@ mod tests {
         watch.follow("2026-11-25T09:00:00Z", false);
         assert!(watch.busy_seen);
         watch.track(Some((SessionState::Idle, 5)));
-        watch.read_ok_at = Some(Instant::now());
+        let stopped = watch.idle_since.unwrap();
+        watch.read_ok_at = Some(stopped + Duration::from_millis(1));
         assert!(watch.stopped_after_work());
     }
 

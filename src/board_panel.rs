@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use codescope_core::board::dispatch::StatusChange;
+use codescope_core::board::github::TriggerReads;
 use codescope_core::board::{
     Board, BoardItem, BoardRef, BoardSettings, ColumnRole, ItemKind, ItemState, PanelColumn,
     PanelGroup, PanelSection, RoleKind, effective_mapping, missing_roles, panel_columns,
@@ -48,8 +48,8 @@ pub(crate) struct BoardRead {
     pub error: Option<String>,
     /// When `last_good` was read.
     pub read_at: Option<Instant>,
-    /// Last moves of the items in trigger columns, by content id; `None` until read.
-    pub changes: Option<HashMap<String, StatusChange>>,
+    /// Last moves and linked pull requests of the items in trigger columns; `None` until read.
+    pub triggers: Option<TriggerReads>,
 }
 
 fn read_age(read_at: Option<Instant>) -> SharedString {
@@ -203,7 +203,7 @@ impl AppShell {
                     read.last_good = Some(board);
                     read.error = None;
                     read.read_at = Some(Instant::now());
-                    read.changes = fetch.changes;
+                    read.triggers = fetch.triggers;
                 }
                 Err(err) => read.error = Some(err),
             }
@@ -229,7 +229,7 @@ impl AppShell {
                 last_good: Some(board),
                 error: None,
                 read_at: Some(Instant::now()),
-                changes: None,
+                triggers: None,
             },
         );
         self.board.selected_url = Some(url);

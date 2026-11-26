@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use super::findings::Outcome;
-use super::pull_request::PostedPullRequest;
+use super::pull_request::{LinkedPullRequest, PostedPullRequest};
 use super::{Board, BoardItem, ColumnMapping, ColumnRole, ItemKind, ItemState, RoleKind};
 use super::{mapped_column, normalize_column_name};
 use crate::git::{parse_worktree_porcelain, run_git};
@@ -193,6 +193,12 @@ pub enum Hold {
     SeveralProjects(String),
     NoProgressColumn(ColumnRole),
     LimitReached(usize),
+    /// Pull requests from elsewhere are open for the issue, so Ready starts nothing; a person
+    /// adds one to the board to work on it.
+    PullRequestElsewhere(Vec<u32>),
+    /// A pull request from elsewhere was open when the item was moved to Ready, so that move
+    /// starts nothing, even after the pull request closed.
+    MovedWhilePullRequestOpen(u32),
     /// The dispatch opened a pull request that no read since CodeScope started has seen, so
     /// whether Ready reviews it or implements again is not known yet.
     PullRequestUnread,
@@ -242,6 +248,18 @@ impl Hold {
                 format!("Add a column {} to the board to start", role.label())
             }
             Hold::LimitReached(limit) => format!("Waits: {limit} dispatches are running"),
+            Hold::PullRequestElsewhere(numbers) => match numbers.as_slice() {
+                [number] => format!(
+                    "Pull request #{number} is open for it: add that to the board to work on it"
+                ),
+                _ => format!(
+                    "Pull requests {} are open for it: add one to the board to work on it",
+                    listed(numbers)
+                ),
+            },
+            Hold::MovedWhilePullRequestOpen(number) => format!(
+                "Pull request #{number} was open when it was moved: move it again to start"
+            ),
             Hold::PullRequestUnread => "Waits for its pull request to be read".into(),
             Hold::SessionBusy => "Waits for the session in its worktree to be idle".into(),
             Hold::UnsentInput => {
@@ -254,6 +272,14 @@ impl Hold {
                 "Waits: quit what runs in its worktree's tab, or close the tab".into()
             }
         }
+    }
+}
+
+fn listed(numbers: &[u32]) -> String {
+    let tags: Vec<String> = numbers.iter().map(|n| format!("#{n}")).collect();
+    match tags.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => tags.concat(),
     }
 }
 
@@ -276,6 +302,10 @@ pub struct Facts<'a> {
     pub dispatch: Option<&'a WorktreeDispatch>,
     /// The pull request that dispatch opened, as the board poll last read it.
     pub pull_request: OwnPullRequest,
+    /// The issue's linked pull requests: those that close it when merged.
+    pub linked: &'a [LinkedPullRequest],
+    /// The branch of the worktree this user's dispatch of the item works in.
+    pub branch: Option<&'a str>,
     /// This user's dispatches that are running now.
     pub running: usize,
     pub limit: usize,
@@ -364,6 +394,12 @@ fn check(
             _ => return Err(Hold::MovedByOther(mover.to_string())),
         }
     }
+    if round == Round::Implementation
+        && matches!(facts.pull_request, OwnPullRequest::NotOpened | OwnPullRequest::Closed)
+        && let Some(hold) = pull_request_elsewhere(facts, &change.created_at)
+    {
+        return Err(hold);
+    }
 
     let repository = item.repository.clone().unwrap_or_default();
     match facts.projects {
@@ -392,6 +428,41 @@ fn missing_move(item: &BoardItem, now: &str) -> Hold {
     } else {
         Hold::NoMove
     }
+}
+
+fn pull_request_elsewhere(facts: &Facts, moved_at: &str) -> Option<Hold> {
+    let theirs: Vec<&LinkedPullRequest> =
+        facts.linked.iter().filter(|pr| !is_own(pr, facts)).collect();
+    let open: Vec<u32> = theirs.iter().filter(|pr| pr.open).map(|pr| pr.number).collect();
+    if !open.is_empty() {
+        return Some(Hold::PullRequestElsewhere(open));
+    }
+    theirs
+        .iter()
+        .find(|pr| was_open_at(pr, moved_at))
+        .map(|pr| Hold::MovedWhilePullRequestOpen(pr.number))
+}
+
+fn is_own(pr: &LinkedPullRequest, facts: &Facts) -> bool {
+    let reported = facts
+        .dispatch
+        .and_then(|d| d.pull_request.as_ref())
+        .is_some_and(|posted| posted.number == pr.number);
+    let on_branch = !pr.is_cross_repository && facts.branch == Some(pr.head_ref_name.as_str());
+    reported || on_branch
+}
+
+fn was_open_at(pr: &LinkedPullRequest, at: &str) -> bool {
+    let Some(at) = parse_iso8601_secs(at) else {
+        return false;
+    };
+    let opened_before = parse_iso8601_secs(&pr.created_at).is_some_and(|opened| opened <= at);
+    let closed_after = pr
+        .closed_at
+        .as_deref()
+        .and_then(parse_iso8601_secs)
+        .is_some_and(|closed| closed > at);
+    opened_before && closed_after
 }
 
 fn is_assigned_to(item: &BoardItem, login: &str) -> bool {
@@ -953,8 +1024,21 @@ mod tests {
             projects: 1,
             dispatch: None,
             pull_request: OwnPullRequest::NotOpened,
+            linked: &[],
+            branch: None,
             running: 0,
             limit: DEFAULT_DISPATCH_LIMIT,
+        }
+    }
+
+    fn linked(number: u32, branch: &str, created: &str, closed: Option<&str>) -> LinkedPullRequest {
+        LinkedPullRequest {
+            number,
+            open: closed.is_none(),
+            head_ref_name: branch.into(),
+            is_cross_repository: false,
+            created_at: created.into(),
+            closed_at: closed.map(str::to_string),
         }
     }
 
@@ -1059,6 +1143,146 @@ mod tests {
             ..facts(&change)
         };
         assert_eq!(run_decide(issue_in("y"), &handled), Some(Err(Hold::Handled)));
+    }
+
+    #[test]
+    fn ready_waits_while_a_pull_request_from_elsewhere_is_open() {
+        let change = moved_by(VIEWER, "Ready");
+        let theirs = [linked(12, "fix-paths", "2026-11-24T10:00:00Z", None)];
+        let with = |linked| Facts {
+            linked,
+            ..facts(&change)
+        };
+        let waits = Some(Err(Hold::PullRequestElsewhere(vec![12])));
+        assert_eq!(run_decide(issue_in("y"), &with(&theirs)), waits);
+        let full = Facts {
+            running: DEFAULT_DISPATCH_LIMIT,
+            ..with(&theirs)
+        };
+        assert_eq!(run_decide(issue_in("y"), &full), waits, "before the limit");
+        let two = [theirs[0].clone(), linked(14, "paths-2", "2026-11-24T11:00:00Z", None)];
+        assert_eq!(
+            run_decide(issue_in("y"), &with(&two)),
+            Some(Err(Hold::PullRequestElsewhere(vec![12, 14])))
+        );
+        assert_eq!(run_decide(issue_in("y"), &with(&[])), Some(Ok(Round::Implementation)));
+
+        let research = moved_by(VIEWER, "Research");
+        let researching = Facts {
+            linked: &theirs,
+            ..facts(&research)
+        };
+        assert_eq!(run_decide(issue_in("r"), &researching), Some(Ok(Round::Research)));
+    }
+
+    #[test]
+    fn the_dispatchs_own_pull_request_is_not_from_elsewhere() {
+        let change = moved_by(VIEWER, "Ready");
+        let mut implemented = dispatch(Round::Implementation, "2026-11-25T09:30:00Z");
+        implemented.pull_request = Some(PostedPullRequest {
+            number: 15,
+            url: "https://github.com/maui1911/CodeScope/pull/15".into(),
+            comment_url: "https://github.com/maui1911/CodeScope/issues/411#issuecomment-2".into(),
+            in_review: true,
+        });
+        let own = |pull_request, linked| Facts {
+            dispatch: Some(&implemented),
+            branch: Some("411-fuzzy-paths"),
+            pull_request,
+            linked,
+            ..facts(&change)
+        };
+        let closed = Some("2026-11-25T10:30:00Z");
+        let reported = [linked(15, "renamed", "2026-11-25T09:40:00Z", closed)];
+        assert_eq!(
+            run_decide(issue_in("y"), &own(OwnPullRequest::Closed, &reported)),
+            Some(Ok(Round::Implementation))
+        );
+        let on_branch = [linked(16, "411-fuzzy-paths", "2026-11-25T09:40:00Z", None)];
+        assert_eq!(
+            run_decide(issue_in("y"), &own(OwnPullRequest::Closed, &on_branch)),
+            Some(Ok(Round::Implementation))
+        );
+        let fork = [LinkedPullRequest {
+            is_cross_repository: true,
+            ..on_branch[0].clone()
+        }];
+        assert_eq!(
+            run_decide(issue_in("y"), &own(OwnPullRequest::Closed, &fork)),
+            Some(Err(Hold::PullRequestElsewhere(vec![16])))
+        );
+        let no_dispatch = Facts {
+            linked: &on_branch,
+            ..facts(&change)
+        };
+        assert_eq!(
+            run_decide(issue_in("y"), &no_dispatch),
+            Some(Err(Hold::PullRequestElsewhere(vec![16])))
+        );
+
+        let both = [
+            linked(15, "411-fuzzy-paths", "2026-11-25T09:40:00Z", None),
+            linked(12, "fix-paths", "2026-11-24T10:00:00Z", None),
+        ];
+        assert_eq!(
+            run_decide(issue_in("y"), &own(OwnPullRequest::Open, &both)),
+            Some(Ok(Round::Review))
+        );
+        assert_eq!(
+            run_decide(issue_in("y"), &own(OwnPullRequest::Unread, &both)),
+            Some(Err(Hold::PullRequestUnread))
+        );
+    }
+
+    #[test]
+    fn a_move_made_while_a_pull_request_from_elsewhere_was_open_is_spent() {
+        let change = moved_by(VIEWER, "Ready");
+        let with = |linked| Facts {
+            linked,
+            ..facts(&change)
+        };
+        let opened = "2026-11-25T09:00:00Z";
+        let closed_since = [linked(12, "x", opened, Some("2026-11-25T10:30:00Z"))];
+        assert_eq!(
+            run_decide(issue_in("y"), &with(&closed_since)),
+            Some(Err(Hold::MovedWhilePullRequestOpen(12)))
+        );
+        let closed_before = [linked(12, "x", opened, Some("2026-11-25T09:30:00Z"))];
+        assert_eq!(
+            run_decide(issue_in("y"), &with(&closed_before)),
+            Some(Ok(Round::Implementation))
+        );
+        let after = "2026-11-25T10:10:00Z";
+        let opened_after = [linked(12, "x", after, Some("2026-11-25T10:30:00Z"))];
+        assert_eq!(
+            run_decide(issue_in("y"), &with(&opened_after)),
+            Some(Ok(Round::Implementation))
+        );
+        let and_open = [closed_since[0].clone(), linked(14, "y", "2026-11-25T10:20:00Z", None)];
+        assert_eq!(
+            run_decide(issue_in("y"), &with(&and_open)),
+            Some(Err(Hold::PullRequestElsewhere(vec![14])))
+        );
+    }
+
+    #[test]
+    fn the_card_names_the_pull_requests_from_elsewhere() {
+        assert_eq!(
+            Hold::PullRequestElsewhere(vec![12]).label(),
+            "Pull request #12 is open for it: add that to the board to work on it"
+        );
+        assert_eq!(
+            Hold::PullRequestElsewhere(vec![12, 14]).label(),
+            "Pull requests #12 and #14 are open for it: add one to the board to work on it"
+        );
+        assert_eq!(
+            Hold::PullRequestElsewhere(vec![12, 14, 15]).label(),
+            "Pull requests #12, #14 and #15 are open for it: add one to the board to work on it"
+        );
+        assert_eq!(
+            Hold::MovedWhilePullRequestOpen(12).label(),
+            "Pull request #12 was open when it was moved: move it again to start"
+        );
     }
 
     #[test]
