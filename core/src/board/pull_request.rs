@@ -63,6 +63,21 @@ pub fn round_pull_request(newest_first: Vec<PullRequest>) -> Option<PullRequest>
     newest_first.into_iter().nth(pick)
 }
 
+/// A pull request that closes an issue when merged: one in the issue's *Development* list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedPullRequest {
+    pub number: u32,
+    pub open: bool,
+    /// The branch it merges from, in its head repository.
+    pub head_ref_name: String,
+    /// Set when that branch lives in another repository, such as a fork.
+    pub is_cross_repository: bool,
+    /// ISO 8601.
+    pub created_at: String,
+    /// When it was last closed or merged, ISO 8601; `None` when it never was.
+    pub closed_at: Option<String>,
+}
+
 /// A pull request CodeScope reported on the issue, kept on the worktree's `projects.json` row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
