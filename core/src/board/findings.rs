@@ -123,7 +123,7 @@ pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
     if text.len() > MAX_LENGTH {
         problems.push(Problem::TooLong(text.len()));
     }
-    if text.lines().any(|line| line.trim_start().starts_with("<!-- dispatch")) {
+    if text.split(['\n', '\r']).any(is_marker_line) {
         problems.push(Problem::Marker);
     }
     let top = sections(text, "## ");
@@ -311,6 +311,15 @@ fn advice_letter(line: &str) -> Option<char> {
     rest.next().is_none_or(|next| !next.is_alphanumeric()).then_some(letter)
 }
 
+/// Whether `line` is a dispatch marker, in any spelling GitHub hides as a comment.
+pub fn is_marker_line(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix("<!--")
+        .map(str::trim_start)
+        .and_then(|rest| rest.get(..8))
+        .is_some_and(|word| word.eq_ignore_ascii_case("dispatch"))
+}
+
 /// The comment that posts findings: the text, a `**Next step:**` line and the marker.
 pub fn comment_body(text: &str, findings: &Findings) -> String {
     let next_step = match findings.outcome() {
@@ -470,6 +479,24 @@ Advice: A, it keeps the slice small.
             check_findings(&wrong_advice).unwrap_err(),
             vec![Problem::AdviceNotAnOption("B1".into())]
         );
+    }
+
+    #[test]
+    fn refuses_the_marker_however_it_is_spelled() {
+        let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n";
+        for marker in ["<!--dispatch v=1 -->", "  <!-- DISPATCH v=1 -->", "<!--\tdispatch -->"] {
+            assert_eq!(
+                check_findings(&format!("{base}{marker}\n")).unwrap_err(),
+                vec![Problem::Marker],
+                "{marker}"
+            );
+        }
+        let lone_cr = format!("{base}Z.\r<!-- dispatch v=1 -->\n");
+        assert_eq!(check_findings(&lone_cr).unwrap_err(), vec![Problem::Marker]);
+        assert!(is_marker_line(
+            "<!-- dispatch v=1 phase=research outcome=findings by=codescope -->"
+        ));
+        assert!(!is_marker_line("Reject a `<!-- dispatch` line."));
     }
 
     #[test]
