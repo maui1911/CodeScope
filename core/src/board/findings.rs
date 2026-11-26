@@ -16,6 +16,7 @@ const CAUSE: &str = "## Cause";
 const APPROACH: &str = "## Approach";
 const DECISION_POINTS: &str = "## Decision points";
 const ZERO_WIDTH_SPACE: char = '\u{200b}';
+const DIAGRAMS: [&str; 4] = ["mermaid", "geojson", "topojson", "stl"];
 
 /// What a research round produced, as the marker names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -528,7 +529,7 @@ fn quiet_line(line: &str) -> String {
             _ => quiet.push(c),
         }
     }
-    disarm_diagrams(&mut quiet);
+    disarm_info_strings(&mut quiet);
     quiet
 }
 
@@ -550,18 +551,23 @@ fn starts_web_address(text: &str) -> bool {
     start.starts_with("http://") || start.starts_with("https://")
 }
 
-/// GitHub draws a fenced block whose info string is `mermaid`, and a diagram can load images.
-fn disarm_diagrams(line: &mut String) {
+/// GitHub draws a fenced block whose info string, references decoded, names a diagram or map.
+fn disarm_info_strings(line: &mut String) {
     let lower = line.to_ascii_lowercase();
-    let diagrams: Vec<usize> = lower
-        .match_indices("mermaid")
-        .map(|(at, _)| at)
-        .filter(|&at| {
+    let Some(fence) = ["```", "~~~"].iter().filter_map(|run| lower.find(run)).min() else {
+        return;
+    };
+    let mut spaces: Vec<usize> =
+        lower[fence..].match_indices('&').map(|(at, _)| fence + at + 1).collect();
+    for diagram in DIAGRAMS {
+        spaces.extend(lower.match_indices(diagram).map(|(at, _)| at).filter(|&at| {
             let before = lower[..at].trim_end_matches([' ', '\t']);
             before.ends_with("```") || before.ends_with("~~~")
-        })
-        .collect();
-    for at in diagrams.into_iter().rev() {
+        }));
+    }
+    spaces.sort_unstable();
+    spaces.dedup();
+    for at in spaces.into_iter().rev() {
         line.insert(at, ZERO_WIDTH_SPACE);
     }
 }
@@ -843,6 +849,15 @@ Advice: A, it keeps the slice small.
         assert_eq!(quiet("![a `]` b](u) and ![x][r]"), format!("!{z}[a `]` b](u) and !{z}[x][r]"));
         assert_eq!(quiet("rows![0][1] and vec![1]"), format!("rows!{z}[0][1] and vec!{z}[1]"));
         assert_eq!(quiet("```mermaid\n~~~ Mermaid"), format!("```{z}mermaid\n~~~ {z}Mermaid"));
+        assert_eq!(
+            quiet("```geojson\n~~~TopoJSON\n``` stl"),
+            format!("```{z}geojson\n~~~{z}TopoJSON\n``` {z}stl")
+        );
+        assert_eq!(
+            quiet("```&#109;ermaid\n~~~ m&#x65;rmaid\n```&#32;mermaid"),
+            format!("```&{z}#109;ermaid\n~~~ m&{z}#x65;rmaid\n```&{z}#32;mermaid")
+        );
+        assert_eq!(quiet("R&D: a &amp; b"), "R&D: a &amp; b");
         assert_eq!(quiet("```rust\nlet a = b!(c);"), "```rust\nlet a = b!(c);");
         let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n";
         for image in ["![x](u)", "![x]\n\n[x]: u", "rows![0][1]", "<img src=x>"] {
