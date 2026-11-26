@@ -542,9 +542,12 @@ fn handover_rules(round: Round, number: u32, repository: &str) -> Vec<String> {
                 "Write the findings to `{FINDINGS_FILE}` under the headings `## Cause`, \
                  `## Approach` and, only when something is open, `## Decision points`."
             ),
-            "Write each open choice as a heading `### B1 <question>` (B2, B3, … for the next), \
-             a sentence or two of context, the options as a list starting with **A**, **B**, \
-             … and a line `Advice: A, <reason>`."
+            "Write each open choice under `## Decision points`, the last section, as a heading \
+             `### B1 <question>` (B2, B3, … for the next), a sentence or two of context, the \
+             options as a list starting with **A**, **B**, … and a line `Advice: A, <reason>`."
+                .to_string(),
+            "Leave out images and `<!-- dispatch` lines, and close every code block, HTML \
+             comment and `<details>`: CodeScope posts the file on the issue."
                 .to_string(),
             format!("Don't post the findings on the issue. {board}"),
             "Stop when the file is written.".to_string(),
@@ -1332,6 +1335,8 @@ mod tests {
         );
         assert!(research.contains(FINDINGS_FILE));
         assert!(research.contains("### B1 <question>"));
+        assert!(research.contains("under `## Decision points`, the last section"));
+        assert!(research.contains("Leave out images and `<!-- dispatch` lines"));
 
         let implementation = task_file(&dispatch(Round::Implementation, MOVED), None);
         assert!(implementation.contains("Implement the issue."), "{implementation}");
