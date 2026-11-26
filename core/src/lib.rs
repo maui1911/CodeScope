@@ -18,6 +18,7 @@ pub mod agent_registry;
 pub mod agents;
 pub mod atomic_write;
 pub mod attachments;
+pub mod board;
 pub mod bots;
 pub mod command_palette;
 pub mod crash_log;

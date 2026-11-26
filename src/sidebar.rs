@@ -435,6 +435,8 @@ pub enum SidebarEvent {
     /// User clicked the footer "Bots" button. The host toggles the
     /// bots inbox panel.
     OpenBots,
+    /// User clicked the footer "Board" button; the host toggles the board panel.
+    OpenBoard,
     /// User picked "View changes" in a worktree's context menu. The
     /// host opens the full-pane diff viewer for that worktree —
     /// same panel `Ctrl+Shift+D` opens for the focused tab.
@@ -808,6 +810,7 @@ pub struct Sidebar {
     /// Mirrors the C# `Sidebar.OverviewButton`'s `IsOverviewVisible`
     /// DataTrigger.
     overview_visible: bool,
+    board_visible: bool,
     /// Footer "Bots" button state, pushed by `AppShell`'s bots poll:
     /// whether the selected project has a bot control plane (the
     /// button is hidden otherwise), whether the inbox is on stage, and
@@ -912,6 +915,7 @@ impl Sidebar {
             active_paths: HashSet::new(),
             active_context_path: None,
             overview_visible: false,
+            board_visible: false,
             bots_footer: BotsFooter::default(),
             agent_registry,
             filter: String::new(),
@@ -978,6 +982,13 @@ impl Sidebar {
         }
         self.overview_visible = value;
         cx.notify();
+    }
+
+    pub fn set_board_visible(&mut self, value: bool, cx: &mut Context<Self>) {
+        if self.board_visible != value {
+            self.board_visible = value;
+            cx.notify();
+        }
     }
 
     /// Push the footer "Bots" button state. No-op when unchanged, so
@@ -4545,6 +4556,28 @@ impl Render for Sidebar {
                         .child("New Project"),
                 );
 
+            let board_active = self.board_visible;
+            let board_btn = div()
+                .id("sidebar-footer-board")
+                .mt(px(4.0))
+                .h(px(36.0))
+                .px_3()
+                .flex()
+                .flex_row()
+                .items_center()
+                .rounded(px(6.0))
+                .bg(elev)
+                .text_size(px(12.0))
+                .when(board_active, |s| s.border_l_2().border_color(accent).text_color(accent))
+                .when(!board_active, |s| s.text_color(ink_dim))
+                .cursor_pointer()
+                .hover(move |s| s.bg(frost_hover).text_color(ink_hover))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenBoard)),
+                )
+                .child(div().flex_grow().child("Board"));
+
             // Bots — same shape as Overview, shown only when the
             // selected project has a bot control plane. The count pill
             // is the number of tasks blocked or waiting for review.
@@ -4610,6 +4643,7 @@ impl Render for Sidebar {
                 .border_color(divider)
                 .p_2()
                 .child(overview_btn)
+                .child(board_btn)
                 .children(bots_btn)
                 .child(new_project_btn)
         };
@@ -6461,7 +6495,11 @@ async fn spawn_open_remote_in_browser(
 /// which is a command-injection risk for a URL we got out of
 /// `git config`. macOS uses `open`, Linux uses `xdg-open`; both
 /// pass arguments verbatim without shell parsing.
-fn open_url_in_browser(url: &str) {
+pub(crate) fn open_url_in_browser(url: &str) {
+    if !is_web_url(url) {
+        eprintln!("warning: not opening {url}: only http and https URLs open in the browser");
+        return;
+    }
     #[cfg(target_os = "windows")]
     {
         crate::win32_titlebar::shell_open_url(url);
@@ -6478,6 +6516,11 @@ fn open_url_in_browser(url: &str) {
             eprintln!("warning: failed to open URL in browser: {err:#}");
         }
     }
+}
+
+fn is_web_url(url: &str) -> bool {
+    let scheme = url.split_once("://").map(|(scheme, _)| scheme.to_ascii_lowercase());
+    matches!(scheme.as_deref(), Some("http" | "https"))
 }
 
 /// `wt -d <path>` — Windows-only. Logs a friendly warning on other
@@ -7294,6 +7337,21 @@ fn id_hash(id: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_http_and_https_urls_open_in_the_browser() {
+        assert!(is_web_url("https://github.com/users/maui1911/projects/3"));
+        assert!(is_web_url("HTTP://example.com"));
+        for url in [
+            "",
+            "C:\\Windows\\System32\\calc.exe",
+            "file:///C:/Windows",
+            "javascript:alert(1)",
+            "github.com/users/maui1911/projects/3",
+        ] {
+            assert!(!is_web_url(url), "{url}");
+        }
+    }
 
     #[test]
     fn history_agent_label_resolves_built_in_ids() {

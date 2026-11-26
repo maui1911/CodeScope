@@ -75,6 +75,7 @@ CodeScope checks GitHub Releases in the background (15 s after launch, then ever
 - **Notifications** — when an agent finishes its turn while CodeScope isn't the active window, an OS notification fires; the status-bar bell keeps the history with an unread dot. The taskbar / dock badge counts busy agents.
 - **Clickable terminal output** — `Ctrl+click` opens URLs and file paths.
 - **Bots inbox** (experimental, `Ctrl+Shift+I`) — a read-only view of the task board for projects that carry a `labs/agent-bots/.state` control plane ([ADR-0023](docs/DECISIONS.md#adr-0023--bots-inbox-is-a-read-only-view-of-the-lab-control-plane)). Hidden for every other project.
+- **Board** (experimental, *Board* in the sidebar footer or *Toggle board* in the palette) — a read-only view of a GitHub Projects board. Paste its URL, and CodeScope reads it every 30 s through the GitHub CLI (`gh`), lays its columns out by role and names the roles that have no column yet ([ADR-0027](docs/DECISIONS.md#adr-0027--a-board-on-the-host-drives-dispatch)).
 - **Multi-pane layout persisted** — groups, tabs, widths, focus — all restored on restart.
 
 ## Install

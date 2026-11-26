@@ -1010,7 +1010,7 @@ pub struct AppShell {
     /// Loaded user settings. Cloned into each new tab spawn so a
     /// future "reload settings" can swap this without disturbing
     /// already-running tabs.
-    settings: Arc<Settings>,
+    pub(crate) settings: Arc<Settings>,
     /// Active theme — chrome reads from this on every render. Kept
     /// in an `Arc` so swapping themes is a single pointer write.
     theme: Arc<Theme>,
@@ -1169,6 +1169,9 @@ pub struct AppShell {
     /// control plane. Kept fresh by the poll loop whether or not the
     /// panel is visible, so the sidebar badge stays current.
     pub(crate) bots: crate::bots_inbox::BotsInboxState,
+    pub(crate) show_board: bool,
+    pub(crate) board: crate::board_panel::BoardPanelState,
+    pub(crate) add_board_dialog: Option<crate::dialogs::add_board::AddBoardDialogState>,
     /// Monotonic sequence for diff-viewer background requests, so a
     /// stale `git diff` result can never clobber a newer one.
     pub(crate) diff_request_seq: u64,
@@ -1474,6 +1477,10 @@ impl AppShell {
                 SidebarEvent::OpenBots => {
                     let next = !this.show_bots;
                     this.set_show_bots(next, cx);
+                }
+                SidebarEvent::OpenBoard => {
+                    let next = !this.show_board;
+                    this.set_show_board(next, cx);
                 }
                 SidebarEvent::ReopenSession { session_id } => {
                     this.reopen_session(session_id.clone(), window, cx);
@@ -1902,6 +1909,9 @@ impl AppShell {
             show_overview: false,
             show_bots: false,
             bots: crate::bots_inbox::BotsInboxState::default(),
+            show_board: false,
+            board: crate::board_panel::BoardPanelState::default(),
+            add_board_dialog: None,
             diff_viewer: None,
             diff_request_seq: 0,
             settings_dialog: None,
@@ -1915,6 +1925,7 @@ impl AppShell {
         };
         shell.start_telemetry_poll(cx);
         shell.start_bots_poll(cx);
+        shell.start_board_poll(cx);
         shell.start_agent_discovery_poll(cx);
         shell.schedule_taskbar_badge_init(cx);
         shell.start_text_blink(cx);
@@ -2270,6 +2281,7 @@ impl AppShell {
     /// re-paint nothing.
     fn any_text_input_visible(&self) -> bool {
         self.rename_dialog.is_some()
+            || self.add_board_dialog.is_some()
             || self.settings_dialog.is_some()
             || self.command_palette.is_some()
     }
@@ -4013,6 +4025,7 @@ impl AppShell {
         if value {
             self.close_diff_viewer(cx);
             self.set_show_bots(false, cx);
+            self.set_show_board(false, cx);
         }
         self.show_overview = value;
         // Push the new state into the sidebar so its footer
@@ -8422,7 +8435,10 @@ impl Render for AppShell {
         // target (the group grid below) is hidden. Render an empty
         // placeholder so the caption row keeps the same layout
         // footprint but doesn't surface stale tab affordances.
-        let tab_strip_inline = if self.show_overview || self.show_bots || self.diff_viewer.is_some()
+        let tab_strip_inline = if self.show_overview
+            || self.show_bots
+            || self.show_board
+            || self.diff_viewer.is_some()
         {
             div()
                 .flex()
@@ -8501,6 +8517,8 @@ impl Render for AppShell {
             self.render_overview(&theme, cx).into_any_element()
         } else if self.show_bots {
             self.render_bots_inbox(&theme, cx).into_any_element()
+        } else if self.show_board {
+            self.render_board_panel(&theme, cx)
         } else if projects_empty {
             // First-run hero takes over the work area whenever no
             // projects are registered. Mirrors the C# `Sidebar.IsEmpty`
@@ -8632,6 +8650,7 @@ impl Render for AppShell {
             .children(self.render_command_palette(window, &theme, cx))
             .children(self.render_settings_dialog(window, &theme, cx))
             .children(self.render_rename_dialog(window, &theme, cx))
+            .children(self.render_add_board_dialog(window, &theme, cx))
             .children(self.render_confirm_dialog(window, &theme, cx))
     }
 }
@@ -8837,11 +8856,13 @@ impl AppShell {
                 // Live-apply: rewrite settings.theme, persist, and
                 // re-resolve through `apply_settings` so the chrome
                 // and the sidebar repaint immediately.
-                let mut next = (*self.settings).clone();
-                next.theme = id.clone();
-                if let Err(err) = next.save(&self.paths) {
-                    eprintln!("warning: failed to persist theme change: {err:#}");
-                }
+                let next = Settings::update(&self.paths, |settings| settings.theme = id.clone())
+                    .unwrap_or_else(|err| {
+                        eprintln!("warning: failed to persist theme change: {err:#}");
+                        let mut next = (*self.settings).clone();
+                        next.theme = id.clone();
+                        next
+                    });
                 self.apply_settings(next, cx);
                 self.push_toast(
                     ToastKind::Ok,
@@ -8868,6 +8889,10 @@ impl AppShell {
                 BuiltInCommand::ToggleBotsInbox => {
                     let next = !self.show_bots;
                     self.set_show_bots(next, cx);
+                }
+                BuiltInCommand::ToggleBoard => {
+                    let next = !self.show_board;
+                    self.set_show_board(next, cx);
                 }
                 BuiltInCommand::ToggleSidebar => {
                     self.toggle_sidebar(cx);
@@ -8941,6 +8966,7 @@ impl AppShell {
             BuiltInCommand::ToggleOverview,
             BuiltInCommand::ToggleDiffViewer,
             BuiltInCommand::ToggleBotsInbox,
+            BuiltInCommand::ToggleBoard,
             BuiltInCommand::NewProject,
             BuiltInCommand::OpenSettings,
             BuiltInCommand::ReloadTheme,
