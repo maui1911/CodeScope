@@ -259,22 +259,25 @@ enum FindingsGate {
 enum RemindBy {
     Typing(usize),
     Notice,
-    Nothing,
 }
 
-fn findings_gate(tabs: &[(TabAtHandover, bool)]) -> FindingsGate {
-    let is = |wanted: TabAtHandover| move |(state, _): &(TabAtHandover, bool)| *state == wanted;
-    if tabs.iter().any(is(TabAtHandover::Busy)) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Turn {
+    Ended,
+    Running,
+    Unknown,
+}
+
+fn findings_gate(tabs: &[(TabAtHandover, Turn)]) -> FindingsGate {
+    let other = |turn: Turn| tabs.contains(&(TabAtHandover::Other, turn));
+    if tabs.iter().any(|(state, _)| *state == TabAtHandover::Busy) || other(Turn::Running) {
         return FindingsGate::Wait;
     }
-    if tabs.iter().any(|(state, ended)| *state == TabAtHandover::Other && !ended) {
+    if other(Turn::Unknown) {
         return FindingsGate::Held;
     }
-    FindingsGate::Settled(match tabs.iter().position(is(TabAtHandover::IdleClaude)) {
-        Some(index) => RemindBy::Typing(index),
-        None if tabs.iter().any(is(TabAtHandover::Draft)) => RemindBy::Nothing,
-        None => RemindBy::Notice,
-    })
+    let idle_claude = tabs.iter().position(|(state, _)| *state == TabAtHandover::IdleClaude);
+    FindingsGate::Settled(idle_claude.map_or(RemindBy::Notice, RemindBy::Typing))
 }
 
 struct Place {
@@ -1079,10 +1082,10 @@ impl AppShell {
     fn session_at(&self, path: &Path, cx: &App) -> SessionAt {
         let tabs = self.tabs_on(path);
         let states = self.tab_states(&tabs, path, cx);
-        let probed: Vec<(TabAtHandover, bool)> = tabs
+        let probed: Vec<(TabAtHandover, Turn)> = tabs
             .iter()
             .zip(states)
-            .map(|(tab, state)| (state, self.turn_ended(tab)))
+            .map(|(tab, state)| (state, self.turn(tab)))
             .collect();
         match findings_gate(&probed) {
             FindingsGate::Wait => SessionAt::Working,
@@ -1091,15 +1094,17 @@ impl AppShell {
                 SessionAt::Done(Remind::Typing(tabs[index].terminal.clone()))
             }
             FindingsGate::Settled(RemindBy::Notice) => SessionAt::Done(Remind::Notice),
-            FindingsGate::Settled(RemindBy::Nothing) => SessionAt::Done(Remind::Nothing),
         }
     }
 
-    fn turn_ended(&self, tab: &super::Tab) -> bool {
-        tab.adopted_session_id
-            .as_deref()
-            .and_then(|sid| self.telemetry_for(sid))
-            .is_some_and(|snap| super::notified_state(&snap) == codescope_core::SessionState::Idle)
+    fn turn(&self, tab: &super::Tab) -> Turn {
+        use codescope_core::SessionState;
+        let snapshot = tab.adopted_session_id.as_deref().and_then(|sid| self.telemetry_for(sid));
+        match snapshot.map(|snap| super::notified_state(&snap)) {
+            Some(SessionState::Idle) => Turn::Ended,
+            Some(SessionState::Busy | SessionState::PendingToolUse) => Turn::Running,
+            Some(SessionState::Unknown) | None => Turn::Unknown,
+        }
     }
 
     fn remind(
@@ -1507,25 +1512,37 @@ mod tests {
     #[test]
     fn findings_wait_for_every_session_on_the_worktree_and_only_claude_code_is_reminded() {
         use FindingsGate::{Held, Settled, Wait};
-        use RemindBy::{Nothing, Notice, Typing};
+        use RemindBy::{Notice, Typing};
         use TabAtHandover::*;
+        use Turn::{Ended, Running, Unknown};
         assert_eq!(findings_gate(&[]), Settled(Notice), "with no session left, the user is told");
-        assert_eq!(findings_gate(&[(Shell, false), (IdleClaude, false)]), Settled(Typing(1)));
+        assert_eq!(findings_gate(&[(Shell, Unknown), (IdleClaude, Ended)]), Settled(Typing(1)));
         assert_eq!(
-            findings_gate(&[(IdleClaude, true), (Busy, false)]),
+            findings_gate(&[(IdleClaude, Ended), (Busy, Running)]),
             Wait,
             "another session there still works"
         );
+        for settled in [Draft, Stopped] {
+            assert_eq!(
+                findings_gate(&[(settled, Ended)]),
+                Settled(Notice),
+                "the findings can be posted; problems go to the user, not into the tab"
+            );
+        }
+        assert_eq!(findings_gate(&[(Draft, Ended), (IdleClaude, Ended)]), Settled(Typing(1)));
         assert_eq!(
-            findings_gate(&[(Draft, true)]),
-            Settled(Nothing),
-            "the findings can be posted, but nothing is typed into the user's draft"
+            findings_gate(&[(Other, Running), (Shell, Unknown)]),
+            Wait,
+            "another agent still in its turn"
         );
-        assert_eq!(findings_gate(&[(Draft, false), (IdleClaude, false)]), Settled(Typing(1)));
-        assert_eq!(findings_gate(&[(Other, false), (Shell, false)]), Held);
-        assert_eq!(findings_gate(&[(Other, false), (Busy, false)]), Wait);
         assert_eq!(
-            findings_gate(&[(Other, true)]),
+            findings_gate(&[(Other, Unknown), (Shell, Unknown)]),
+            Held,
+            "a program that is no agent only the user can stop"
+        );
+        assert_eq!(findings_gate(&[(Other, Unknown), (Busy, Running)]), Wait);
+        assert_eq!(
+            findings_gate(&[(Other, Ended)]),
             Settled(Notice),
             "another agent whose turn ended is done; the user is told, nothing is typed"
         );
