@@ -163,6 +163,9 @@ pub enum Hold {
     /// Claude Code waits for a prompt in a tab on the item's worktree, but the user typed there
     /// since their last Enter, so the task would join a draft.
     UnsentInput,
+    /// Claude Code in a tab on the item's worktree is stopped, so what is typed there reaches
+    /// its shell instead.
+    SessionStopped,
     /// Something other than an idle Claude Code runs in a tab on the item's worktree, or what
     /// runs there can't be read; only the user can free that tab.
     OtherProgram,
@@ -202,6 +205,9 @@ impl Hold {
             Hold::SessionBusy => "Waits for the session in its worktree to be idle".into(),
             Hold::UnsentInput => {
                 "Waits for Enter in its session's tab: something was typed there".into()
+            }
+            Hold::SessionStopped => {
+                "Waits: its session was stopped with Ctrl+Z; type fg in its tab to resume it".into()
             }
             Hold::OtherProgram => {
                 "Waits: quit what runs in its worktree's tab, or close the tab".into()
@@ -1123,6 +1129,15 @@ mod tests {
         assert_eq!(
             Hold::UnsentInput.label(),
             "Waits for Enter in its session's tab: something was typed there"
+        );
+    }
+
+    #[test]
+    fn a_round_waiting_on_a_stopped_session_says_how_to_resume_it() {
+        assert!(!Hold::SessionStopped.is_quiet());
+        assert_eq!(
+            Hold::SessionStopped.label(),
+            "Waits: its session was stopped with Ctrl+Z; type fg in its tab to resume it"
         );
     }
 

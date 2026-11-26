@@ -175,6 +175,7 @@ enum TabAtHandover {
     IdleClaude,
     Draft,
     Busy,
+    Stopped,
     Other,
 }
 
@@ -195,6 +196,7 @@ struct TabProbe<'a> {
     shell_gone: bool,
     running: Option<&'a [u32]>,
     claude_idle: Option<bool>,
+    stopped: bool,
     typed: bool,
 }
 
@@ -205,6 +207,7 @@ fn tab_at_handover(tab: &TabProbe) -> TabAtHandover {
     let state = match (tab.running, tab.claude_idle) {
         (Some([]), _) => TabAtHandover::Shell,
         (Some(_), _) if tab.shell_gone => TabAtHandover::Other,
+        (Some(_), Some(true)) if tab.stopped => TabAtHandover::Stopped,
         (Some(_), Some(true)) if tab.typed => TabAtHandover::Draft,
         (Some(_), Some(true)) => TabAtHandover::IdleClaude,
         (Some(_), Some(false)) => TabAtHandover::Busy,
@@ -228,6 +231,8 @@ fn handover_to(tabs: &[TabAtHandover]) -> Handover {
         Handover::Type(index)
     } else if tabs.contains(&TabAtHandover::Busy) {
         Handover::Wait(Hold::SessionBusy)
+    } else if tabs.contains(&TabAtHandover::Stopped) {
+        Handover::Wait(Hold::SessionStopped)
     } else if tabs.contains(&TabAtHandover::Draft) {
         Handover::Wait(Hold::UnsentInput)
     } else if tabs.contains(&TabAtHandover::Other) {
@@ -959,10 +964,8 @@ impl AppShell {
                 let terminal = tab.terminal.read(cx);
                 let shell = terminal.child_pid();
                 let running = running_under(shell, &table);
-                let claude_idle = running.as_deref().and_then(|running| {
-                    let dir = sessions.as_deref()?;
-                    let claude = live_session::process_for_pids(dir, running, &wanted)?;
-                    Some(claude.reports_idle()? && !process_tree::is_stopped(claude.pid))
+                let claude = running.as_deref().and_then(|running| {
+                    live_session::process_for_pids(sessions.as_deref()?, running, &wanted)
                 });
                 let relaunched = self.claude_updates.relaunched_at(tab.id);
                 let launched_lately = tab.spawned_instant.elapsed() < LAUNCH_GRACE
@@ -972,7 +975,8 @@ impl AppShell {
                     launched_lately,
                     shell_gone: shell_gone(shell, &table),
                     running: running.as_deref(),
-                    claude_idle,
+                    claude_idle: claude.as_ref().and_then(|claude| claude.reports_idle()),
+                    stopped: claude.is_some_and(|claude| process_tree::is_stopped(claude.pid)),
                     typed: terminal.typed_since_submit(),
                 })
             })
@@ -1394,6 +1398,7 @@ mod tests {
             shell_gone: false,
             running,
             claude_idle,
+            stopped: false,
             typed,
         })
     }
@@ -1407,6 +1412,16 @@ mod tests {
         assert_eq!(tab(Some(&[7]), Some(false), false), Busy);
         assert_eq!(tab(Some(&[7]), None, false), Other, "another agent, or any other program");
         assert_eq!(tab(None, None, false), Other, "nothing known about its processes");
+        let stopped = TabProbe {
+            restarting: false,
+            launched_lately: false,
+            shell_gone: false,
+            running: Some(&[7]),
+            claude_idle: Some(true),
+            stopped: true,
+            typed: true,
+        };
+        assert_eq!(tab_at_handover(&stopped), Stopped, "Ctrl+Z hands its keys to the shell");
     }
 
     #[test]
@@ -1418,6 +1433,7 @@ mod tests {
                 shell_gone: false,
                 running,
                 claude_idle: running.map(|_| true),
+                stopped: false,
                 typed: false,
             };
             assert_eq!(tab_at_handover(&probe), TabAtHandover::Busy);
@@ -1443,6 +1459,7 @@ mod tests {
                 shell_gone: false,
                 running,
                 claude_idle,
+                stopped: false,
                 typed: false,
             })
         };
@@ -1478,6 +1495,7 @@ mod tests {
                 shell_gone: true,
                 running,
                 claude_idle,
+                stopped: false,
                 typed: false,
             })
         };
@@ -1524,5 +1542,9 @@ mod tests {
         assert_eq!(handover_to(&[Other, Busy]), Handover::Wait(Hold::SessionBusy));
         assert_eq!(handover_to(&[Other, Draft]), Handover::Wait(Hold::UnsentInput));
         assert_eq!(handover_to(&[Draft, Busy]), Handover::Wait(Hold::SessionBusy));
+        assert_eq!(handover_to(&[Stopped, Shell]), Handover::Wait(Hold::SessionStopped));
+        assert_eq!(handover_to(&[Stopped, Draft]), Handover::Wait(Hold::SessionStopped));
+        assert_eq!(handover_to(&[Stopped, IdleClaude]), Handover::Type(1));
+        assert_eq!(handover_to(&[Stopped, Busy]), Handover::Wait(Hold::SessionBusy));
     }
 }
