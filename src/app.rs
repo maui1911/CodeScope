@@ -1359,60 +1359,8 @@ impl AppShell {
                     //      unconditionally for explicit "New
                     //      session" / "New <agent> session" menu
                     //      rows).
-                    if !*force_new {
-                        // Tier 1: focus an already-open tab.
-                        let mut focus_target: Option<(usize, usize)> = None;
-                        for (g_idx, group) in this.groups.iter().enumerate() {
-                            for (t_idx, tab) in group.tabs.iter().enumerate() {
-                                if tab.working_directory.as_deref() == Some(working_directory.as_path()) {
-                                    focus_target = Some((g_idx, t_idx));
-                                    break;
-                                }
-                            }
-                            if focus_target.is_some() {
-                                break;
-                            }
-                        }
-                        if let Some((g_idx, t_idx)) = focus_target {
-                            this.activate_tab(g_idx, t_idx, window, cx);
-                            return;
-                        }
-
-                        // Tier 2: reopen the most-recent closed
-                        // session for this worktree. Path matching
-                        // goes through `paths_match` so a `\\`-vs-`/`
-                        // mismatch between the spawn event and the
-                        // persisted `worktree_path` doesn't drop the
-                        // history hit (same reason
-                        // `locate_project_for_path` uses it). Sort
-                        // by `closed_at` desc — newest first —
-                        // mirroring the sidebar's history disclosure
-                        // ordering so a double-click and the visible
-                        // top-of-history row stay in lockstep. ISO-
-                        // 8601 sorts lexicographically the same way
-                        // it sorts chronologically, so a plain str
-                        // cmp is enough.
-                        let wd_str = working_directory.to_string_lossy();
-                        let most_recent_closed = this
-                            .projects
-                            .projects
-                            .iter()
-                            .flat_map(|p| p.sessions.iter())
-                            .filter(|s| s.closed_at.is_some())
-                            .filter(|s| {
-                                codescope_core::path_canon::paths_match(
-                                    &s.worktree_path,
-                                    &wd_str,
-                                )
-                            })
-                            .max_by(|a, b| {
-                                a.closed_at.as_deref().cmp(&b.closed_at.as_deref())
-                            })
-                            .map(|s| s.id.clone());
-                        if let Some(session_id) = most_recent_closed {
-                            this.reopen_session(session_id, window, cx);
-                            return;
-                        }
+                    if !*force_new && this.focus_or_reopen(working_directory, window, cx) {
+                        return;
                     }
 
                     // Tier 3: spawn a fresh session. Reached when
@@ -3778,6 +3726,42 @@ impl AppShell {
         self.mirror_projects_to_sidebar(cx);
     }
 
+    fn focus_or_reopen(
+        &mut self,
+        working_directory: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let wanted = working_directory.to_string_lossy();
+        let open = self.groups.iter().enumerate().find_map(|(g_idx, group)| {
+            group
+                .tabs
+                .iter()
+                .position(|tab| {
+                    tab.working_directory.as_deref().is_some_and(|wd| {
+                        codescope_core::path_canon::paths_match(&wd.to_string_lossy(), &wanted)
+                    })
+                })
+                .map(|t_idx| (g_idx, t_idx))
+        });
+        if let Some((g_idx, t_idx)) = open {
+            self.activate_tab(g_idx, t_idx, window, cx);
+            return true;
+        }
+        let closed = SessionManager::last_closed_on(&self.projects, &wanted).map(|s| s.id.clone());
+        let Some(session_id) = closed else {
+            return false;
+        };
+        self.reopen_session(session_id, window, cx);
+        true
+    }
+
+    fn show_workspace(&mut self, cx: &mut Context<Self>) {
+        self.set_show_board(false, cx);
+        self.set_show_bots(false, cx);
+        self.set_show_overview(false, cx);
+    }
+
     pub(crate) fn reopen_session(
         &mut self,
         session_id: String,
@@ -5405,9 +5389,7 @@ impl AppShell {
                                                 .map(|t_idx| (g_idx, t_idx))
                                         });
                                     if let Some((g_idx, t_idx)) = target {
-                                        this.set_show_board(false, cx);
-                                        this.set_show_bots(false, cx);
-                                        this.set_show_overview(false, cx);
+                                        this.show_workspace(cx);
                                         this.activate_tab(g_idx, t_idx, window, cx);
                                     }
                                 }

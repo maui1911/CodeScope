@@ -867,6 +867,20 @@ fn render_card(
         ItemState::Open => None,
     };
     let accent = theme::accent(theme);
+    let dispatched = dispatch.is_some();
+    let issue_url = url.clone();
+    let reference = div()
+        .id(("board-card-reference", index))
+        .when(!dispatched, |s| s.child(item_reference(item)))
+        .when(dispatched, |s| {
+            s.child(format!("{} ↗", item_reference(item)))
+                .hover(move |s| s.text_color(accent))
+                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    cx.stop_propagation();
+                    crate::sidebar::open_url_in_browser(&issue_url);
+                })
+        });
+    let (item_id, board_url) = (item.id.clone(), board_url.to_string());
     div()
         .id(("board-card", index))
         .flex()
@@ -880,9 +894,16 @@ fn render_card(
         .rounded(px(8.0))
         .cursor_pointer()
         .hover(move |s| s.border_color(accent))
-        .on_mouse_down(MouseButton::Left, move |_, _, _| {
-            crate::sidebar::open_url_in_browser(&url)
-        })
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, window, cx| {
+                if dispatched {
+                    this.open_dispatch_tab(&board_url, &item_id, window, cx);
+                } else {
+                    crate::sidebar::open_url_in_browser(&url);
+                }
+            }),
+        )
         .child(
             div()
                 .flex()
@@ -893,7 +914,7 @@ fn render_card(
                 .text_color(theme::text_faint())
                 .font(theme::font_mono())
                 .child(state_dot(state_color(item, theme)))
-                .child(item_reference(item))
+                .child(reference)
                 .children(note.map(|n| div().child(format!("· {n}")))),
         )
         .child(

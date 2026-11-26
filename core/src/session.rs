@@ -689,6 +689,14 @@ impl SessionManager {
         out
     }
 
+    /// The session closed most recently on `worktree_path`, in the order of [`Self::closed`];
+    /// paths compare as [`crate::path_canon::paths_match`] does.
+    pub fn last_closed_on<'a>(cfg: &'a ProjectsConfig, worktree_path: &str) -> Option<&'a Session> {
+        Self::closed(cfg)
+            .into_iter()
+            .find(|s| crate::path_canon::paths_match(&s.worktree_path, worktree_path))
+    }
+
     // ---- retention -------------------------------------------------
 
     /// Drop closed sessions whose agent transcript is provably gone,
@@ -1635,6 +1643,27 @@ mod tests {
         // Newest-first: b (Apr 2) before a (Apr 1).
         assert_eq!(closed[0].id, "b");
         assert_eq!(closed[1].id, "a");
+    }
+
+    #[test]
+    fn last_closed_on_picks_the_newest_closed_session_of_that_worktree() {
+        let mut cfg = ProjectsConfig::default();
+        let mut p = make_project("p1");
+        let on = |id: &str, path: &str, closed_at: Option<&str>| {
+            let mut s = make_session(id, None);
+            s.worktree_path = path.into();
+            s.closed_at = closed_at.map(String::from);
+            s
+        };
+        p.sessions.push(on("older", "C:\\wt\\410", Some("2026-04-01T10:00:00Z")));
+        p.sessions.push(on("newer", "C:/wt/410", Some("2026-04-02T10:00:00Z")));
+        p.sessions.push(on("live", "C:\\wt\\410", None));
+        p.sessions.push(on("elsewhere", "C:\\wt\\411", Some("2026-04-03T10:00:00Z")));
+        cfg.projects.push(p);
+
+        let last = SessionManager::last_closed_on(&cfg, "C:\\wt\\410").map(|s| s.id.as_str());
+        assert_eq!(last, Some("newer"));
+        assert!(SessionManager::last_closed_on(&cfg, "C:\\wt\\412").is_none());
     }
 
     // ---- retention --------------------------------------------
