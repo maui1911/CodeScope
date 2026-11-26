@@ -515,13 +515,13 @@ fn quiet(text: &str) -> String {
 }
 
 fn quiet_line(line: &str) -> String {
-    let addresses = web_addresses(line);
+    let linked = at_signs_in_web_paths(line);
     let mut quiet = String::with_capacity(line.len() + 8);
     let mut chars = line.char_indices().peekable();
     while let Some((at, c)) = chars.next() {
         let next = chars.peek().map(|(_, next)| *next);
         match c {
-            '@' if addresses.iter().any(|address| address.contains(&at)) => {
+            '@' if linked.binary_search(&at).is_ok() => {
                 quiet.push_str("%40");
             }
             '@' => {
@@ -545,8 +545,7 @@ fn quiet_line(line: &str) -> String {
             _ => quiet.push(c),
         }
     }
-    disarm_info_strings(&mut quiet);
-    quiet
+    disarm_info_strings(&quiet)
 }
 
 fn starts_command(line: &str, slash: usize) -> bool {
@@ -566,42 +565,59 @@ fn starts_command(line: &str, slash: usize) -> bool {
     starts_word && after.starts_with(|c: char| c.is_ascii_alphanumeric()) && !path
 }
 
-/// The path, query and fragment of each web address; GFM links one up to whitespace or `<`.
-fn web_addresses(line: &str) -> Vec<std::ops::Range<usize>> {
-    let lower = line.to_ascii_lowercase();
-    ["https://", "http://", "www."]
-        .iter()
-        .flat_map(|prefix| lower.match_indices(prefix).map(|(at, prefix)| at + prefix.len()))
-        .map(|host| {
-            let end = line[host..]
-                .find(|c: char| c.is_whitespace() || "<\"'`)".contains(c))
-                .map_or(line.len(), |length| host + length);
-            let path = line[host..end].find(['/', '?', '#']).map_or(end, |length| host + length);
-            path..end
-        })
-        .collect()
+/// GFM links a web address up to whitespace or `<`, so an `@` in its path, query or fragment
+/// is part of the link.
+fn at_signs_in_web_paths(line: &str) -> Vec<usize> {
+    let mut linked = Vec::new();
+    let mut host = false;
+    let mut path = false;
+    for (at, c) in line.char_indices() {
+        if c.is_whitespace() || "<\"'`)".contains(c) {
+            host = false;
+            path = false;
+            continue;
+        }
+        host |= ["https://", "http://", "www."].iter().any(|prefix| {
+            at.checked_sub(prefix.len()).is_some_and(|start| ascii_at(line, start, prefix))
+        });
+        path |= host && matches!(c, '/' | '?' | '#');
+        if path && c == '@' {
+            linked.push(at);
+        }
+    }
+    linked
+}
+
+fn ascii_at(text: &str, at: usize, ascii: &str) -> bool {
+    text.as_bytes()
+        .get(at..at + ascii.len())
+        .is_some_and(|bytes| bytes.eq_ignore_ascii_case(ascii.as_bytes()))
 }
 
 fn starts_web_address(text: &str) -> bool {
-    let start = text.get(..8).unwrap_or(text).to_ascii_lowercase();
-    start.starts_with("http://") || start.starts_with("https://")
+    ["http://", "https://"].iter().any(|scheme| ascii_at(text, 0, scheme))
 }
 
 /// GitHub draws a fenced block whose info string, references decoded, names a diagram or map.
-fn disarm_info_strings(line: &mut String) {
+fn disarm_info_strings(line: &str) -> String {
     let Some(info) = info_string_at(line) else {
-        return;
+        return line.to_string();
     };
-    let lower = line[info..].to_ascii_lowercase();
-    let mut spaces: Vec<usize> = lower.match_indices('&').map(|(at, _)| info + at + 1).collect();
-    let word = lower.len() - lower.trim_start_matches([' ', '\t']).len();
-    if DIAGRAMS.iter().any(|diagram| lower[word..].starts_with(diagram)) {
-        spaces.push(info + word);
+    let rest = &line[info..];
+    let word = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+    let diagram = DIAGRAMS.iter().any(|diagram| ascii_at(rest, word, diagram));
+    let mut disarmed = String::with_capacity(line.len() + 8);
+    disarmed.push_str(&line[..info]);
+    for (at, c) in rest.char_indices() {
+        if diagram && at == word {
+            disarmed.push(ZERO_WIDTH_SPACE);
+        }
+        disarmed.push(c);
+        if c == '&' {
+            disarmed.push(ZERO_WIDTH_SPACE);
+        }
     }
-    spaces.sort_unstable();
-    for at in spaces.into_iter().rev() {
-        line.insert(at, ZERO_WIDTH_SPACE);
-    }
+    disarmed
 }
 
 /// CommonMark opens a fence after any run of block quote and list markers.
@@ -969,6 +985,22 @@ Advice: A, it keeps the slice small.
         assert!(check_findings(&aligned).is_ok());
         let deeper = format!("{base}```\ncargo test\n  ```\n");
         assert!(check_findings(&deeper).is_ok());
+    }
+
+    #[test]
+    fn a_long_line_is_quieted_in_one_pass() {
+        let z = '\u{200b}';
+        let started = std::time::Instant::now();
+        let fence = format!("```{}", "&".repeat(READ_LIMIT));
+        assert_eq!(quiet(&fence), format!("```{}", format!("&{z}").repeat(READ_LIMIT)));
+        let hosts = "www.".repeat(READ_LIMIT / 4);
+        assert_eq!(quiet(&hosts), hosts);
+        let paths = "www.x/@".repeat(READ_LIMIT / 7);
+        assert_eq!(quiet(&paths), "www.x/%40".repeat(READ_LIMIT / 7));
+        let tags = "<a\u{e9}\u{e9}\u{e9}\u{e9}".repeat(READ_LIMIT / 10);
+        assert_eq!(quiet(&tags), format!("<{z}a\u{e9}\u{e9}\u{e9}\u{e9}").repeat(READ_LIMIT / 10));
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(5), "took {elapsed:?}");
     }
 
     #[test]
