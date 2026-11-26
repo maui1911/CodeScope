@@ -280,12 +280,7 @@ fn run_gh_api_with_input(args: &[String], input: Option<String>) -> Result<Strin
         _ => None,
     };
     let output = child.wait_with_output().context("wait for gh")?;
-    if let Some(writer) = writer {
-        writer
-            .join()
-            .map_err(|_| anyhow!("writing to gh panicked"))?
-            .context("write to gh")?;
-    }
+    let written = writer.map(std::thread::JoinHandle::join);
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let message = stderr
@@ -294,6 +289,9 @@ fn run_gh_api_with_input(args: &[String], input: Option<String>) -> Result<Strin
             .unwrap_or("gh failed")
             .trim();
         bail!("{}", message.strip_prefix("gh: ").unwrap_or(message));
+    }
+    if let Some(written) = written {
+        written.map_err(|_| anyhow!("writing to gh panicked"))?.context("write to gh")?;
     }
     String::from_utf8(output.stdout).context("gh printed something other than UTF-8")
 }
