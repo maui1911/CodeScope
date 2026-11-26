@@ -103,6 +103,9 @@ pub enum Problem {
     TooLarge(u64),
     /// A fenced code block runs to the end of the file.
     OpenFence,
+    /// A closing fence indented less than its opening one, which GitHub reads as a new block
+    /// when the code sits in a list item.
+    UnevenFence,
     /// The file, or the folder it is in, is a link.
     Link,
     /// A folder, a pipe or a device where the file should be.
@@ -151,6 +154,9 @@ impl fmt::Display for Problem {
                 write!(f, "it is {size} bytes, more than the {READ_LIMIT} CodeScope reads")
             }
             Problem::OpenFence => write!(f, "a code block is not closed"),
+            Problem::UnevenFence => {
+                write!(f, "a code block closes less indented than it opens")
+            }
             Problem::Link => write!(f, "it or its folder is a link"),
             Problem::NotAFile => write!(f, "it is not a plain file"),
             Problem::Unreadable => write!(f, "it cannot be read"),
@@ -287,9 +293,7 @@ pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
         }
     }
 
-    if ends_in_code(text) {
-        problems.push(Problem::OpenFence);
-    }
+    problems.extend(fence_problem(text));
 
     if problems.is_empty() {
         Ok(Findings { decision_points })
@@ -300,13 +304,15 @@ pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
 
 #[derive(Default)]
 struct Fences {
-    open: Option<(char, usize)>,
+    open: Option<(char, usize, usize)>,
+    closed_less_indented: bool,
 }
 
 impl Fences {
     fn is_code(&mut self, line: &str) -> bool {
         let trimmed = line.trim_start_matches(' ');
-        let fenced = line.len() - trimmed.len() <= 3;
+        let indent = line.len() - trimmed.len();
+        let fenced = indent <= 3;
         let mark = trimmed.chars().next().filter(|c| fenced && matches!(c, '`' | '~'));
         let Some(mark) = mark else {
             return self.open.is_some();
@@ -314,14 +320,15 @@ impl Fences {
         let run = trimmed.chars().take_while(|c| *c == mark).count();
         let rest = &trimmed[run..];
         match self.open {
-            Some((open, length)) => {
+            Some((open, length, opened_at)) => {
                 if mark == open && run >= length && rest.trim().is_empty() {
                     self.open = None;
+                    self.closed_less_indented |= indent < opened_at;
                 }
                 true
             }
             None if run >= 3 && !(mark == '`' && rest.contains('`')) => {
-                self.open = Some((mark, run));
+                self.open = Some((mark, run, indent));
                 true
             }
             None => false,
@@ -329,12 +336,16 @@ impl Fences {
     }
 }
 
-fn ends_in_code(text: &str) -> bool {
+fn fence_problem(text: &str) -> Option<Problem> {
     let mut fences = Fences::default();
     for line in text.lines() {
         fences.is_code(line);
     }
-    fences.open.is_some()
+    if fences.open.is_some() {
+        Some(Problem::OpenFence)
+    } else {
+        fences.closed_less_indented.then_some(Problem::UnevenFence)
+    }
 }
 
 fn sections(text: &str, level: usize) -> Vec<Section<'_>> {
@@ -912,6 +923,17 @@ Advice: A, it keeps the slice small.
     }
 
     #[test]
+    fn a_fence_that_closes_less_indented_than_it_opens_is_refused() {
+        let base = "## Cause\n\nX.\n\n## Approach\n\n";
+        let listed = format!("{base}1. Run it:\n   ```\n   cargo test\n```\n");
+        assert_eq!(check_findings(&listed).unwrap_err(), vec![Problem::UnevenFence]);
+        let aligned = format!("{base}1. Run it:\n   ```\n   cargo test\n   ```\n");
+        assert!(check_findings(&aligned).is_ok());
+        let deeper = format!("{base}```\ncargo test\n  ```\n");
+        assert!(check_findings(&deeper).is_ok());
+    }
+
+    #[test]
     fn a_slash_that_starts_a_word_starts_no_command_and_paths_stay_as_they_are() {
         let z = '\u{200b}';
         assert_eq!(
@@ -1122,6 +1144,7 @@ Advice: A, it keeps the slice small.
             Problem::TooLong(70_000),
             Problem::TooLarge(300_000),
             Problem::OpenFence,
+            Problem::UnevenFence,
             Problem::Link,
             Problem::NotAFile,
             Problem::Unreadable,
