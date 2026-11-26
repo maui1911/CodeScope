@@ -1380,8 +1380,8 @@ impl AppShell {
                      close the tab"
                 }
                 HeldBy::QuietAgent => {
-                    "Findings written · its agent may not be done: to post them, quit it, or \
-                     close its tab"
+                    "Findings written · its agent may not be done: to post them, quit what runs \
+                     in its tab, or close the tab"
                 }
                 HeldBy::StoppedSession => {
                     "Findings written · to post them, type fg in its session's tab to resume \
