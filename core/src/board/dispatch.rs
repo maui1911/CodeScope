@@ -631,13 +631,21 @@ pub fn exclude_handover_files(worktree: &Path) -> Result<()> {
 }
 
 /// Remove the findings of an earlier round, so they can't be taken for this round's; refuses
-/// when the file or its folder is a link.
+/// when their folder is a link, and of a linked file removes only the link.
 pub fn clear_findings(worktree: &Path) -> Result<()> {
-    if let Some(part) = linked_part(worktree, FINDINGS_FILE) {
-        bail!("{} is a link", part.display());
-    }
     let path = worktree.join(FINDINGS_FILE);
-    match std::fs::remove_file(&path) {
+    if let Some(folder) = linked_part(worktree, FINDINGS_FILE).filter(|part| *part != path) {
+        bail!("{} is a link", folder.display());
+    }
+    let removed = std::fs::remove_file(&path).or_else(|err| {
+        let link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
+        if link {
+            std::fs::remove_dir(&path)
+        } else {
+            Err(err)
+        }
+    });
+    match removed {
         Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
             Err(err).with_context(|| format!("remove {}", path.display()))
         }
@@ -1618,5 +1626,22 @@ mod tests {
         std::os::unix::fs::symlink(&theirs, worktree.join(FINDINGS_FILE)).unwrap();
         let file = read_findings(&worktree).unwrap();
         assert_eq!(file.check().unwrap_err(), vec![Problem::Link]);
+        clear_findings(&worktree).unwrap();
+        assert!(std::fs::symlink_metadata(worktree.join(FINDINGS_FILE)).is_err());
+        assert!(theirs.exists());
+    }
+
+    #[test]
+    fn findings_that_link_to_a_folder_lose_only_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("keep.md"), "keep").unwrap();
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(worktree.join(".codescope")).unwrap();
+        link_folder(&elsewhere, &worktree.join(".codescope").join("findings.md"));
+        clear_findings(&worktree).unwrap();
+        assert!(std::fs::symlink_metadata(worktree.join(FINDINGS_FILE)).is_err());
+        assert!(elsewhere.join("keep.md").exists());
     }
 }
