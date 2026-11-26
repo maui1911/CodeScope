@@ -501,7 +501,7 @@ fn after_markers(line: &str) -> Option<(&str, usize)> {
     let mut rest = line.trim_start_matches([' ', '\t']);
     let mut column = indent_width(line);
     for _ in 0..=MAX_MARKERS {
-        let Some(content) = item_content(rest) else {
+        let Some(content) = item_content(rest).filter(|_| !is_thematic_break(rest)) else {
             return Some((rest, column));
         };
         let marker_end = advance(column, &rest[..rest.len() - content.len()]);
@@ -521,8 +521,18 @@ fn is_prose(text: &str) -> bool {
 
 /// CommonMark: three or more of one of `-`, `*` and `_`, with only spaces and tabs between.
 fn is_thematic_break(text: &str) -> bool {
-    let marks: String = text.chars().filter(|c| !matches!(c, ' ' | '\t')).collect();
-    marks.len() >= 3 && ["-", "*", "_"].iter().any(|mark| marks.trim_start_matches(mark).is_empty())
+    let mut marks = text.chars().filter(|c| !matches!(c, ' ' | '\t'));
+    let Some(mark) = marks.next().filter(|c| matches!(c, '-' | '*' | '_')) else {
+        return false;
+    };
+    let mut count = 1;
+    for c in marks {
+        if c != mark {
+            return false;
+        }
+        count += 1;
+    }
+    count >= 3
 }
 
 fn is_heading(text: &str) -> bool {
@@ -1398,6 +1408,18 @@ Advice: A, it keeps the slice small.
         let fenced = format!("{base}{}```\n", "- ".repeat(20));
         assert_eq!(check_findings(&fenced).unwrap_err(), vec![Problem::DeepFence]);
         assert!(check_findings(&format!("{base}- 1. - a\n\n      b\n")).is_ok());
+    }
+
+    #[test]
+    fn a_rule_in_a_list_item_is_its_content_not_more_items() {
+        let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n";
+        let step = "2. ```\n   ```\n";
+        for rule in ["- * * *", "+ - - -"] {
+            let text = format!("{base}{rule}\n\n      x\ny\n{step}");
+            assert_eq!(check_findings(&text).unwrap_err()[0], Problem::ListFence, "{rule:?}");
+        }
+        let kept = format!("{base}- * * *\n  x\n2. ```sh\n   a\n   ```\n");
+        assert!(check_findings(&kept).is_ok(), "the next step is beside the item");
     }
 
     #[test]
