@@ -1,5 +1,6 @@
 //! Dispatch (ADR-0027): after each board read, start a round for every item the user moved
-//! into a trigger column, in a worktree of its own with an agent session on it.
+//! into a trigger column, in a worktree of its own with an agent session on it. When a research
+//! round's session is idle with its findings written, post them on the issue.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -7,19 +8,23 @@ use std::time::{Duration, Instant};
 
 use codescope_core::agents::claude::live_session;
 use codescope_core::board::dispatch::{
-    Facts, Hold, ProjectRemotes, Round, StatusChange, WorktreeDispatch, add_dispatch_worktree,
-    branch_name, counts_towards_limit, decide, exclude_handover_files, find_skill, launch_with_task,
-    mover_to_check, projects_for_repository, task_file, task_message, trigger_content_ids,
-    write_task_file,
+    FINDINGS_FILE, Facts, Hold, PostedFindings, ProjectRemotes, Round, StatusChange,
+    WorktreeDispatch, add_dispatch_worktree, branch_name, clear_findings, counts_towards_limit,
+    decide, exclude_handover_files, find_skill, launch_with_task, mover_to_check,
+    moves_to_needs_decision, projects_for_repository, task_file, task_message,
+    trigger_content_ids, write_task_file,
+};
+use codescope_core::board::findings::{
+    FileStamp, Outcome, Problem, comment_body, problems_list, problems_message, read_findings,
 };
 use codescope_core::board::github::{self, Viewer};
 use codescope_core::board::{
-    Board, BoardItem, BoardRef, ColumnMapping, effective_mapping, mapped_column,
+    Board, BoardItem, BoardRef, ColumnMapping, ColumnRole, effective_mapping, mapped_column,
 };
 use codescope_core::path_canon::paths_match;
 use codescope_core::process_tree;
 use codescope_core::projects::{ProjectKind, ProjectsConfig};
-use codescope_core::worktree_create::{PendingId, record_dispatch};
+use codescope_core::worktree_create::{PendingId, record_dispatch, record_posted_findings};
 use codescope_terminal::TerminalView;
 use gpui::{App, AppContext as _, Context, Entity, SharedString, Window};
 
@@ -32,6 +37,8 @@ const ACCESS_EXPIRES_AFTER: Duration = Duration::from_secs(600);
 /// Text and Enter in one write can reach an agent's prompt as a paste, whose Enter is a newline.
 const SUBMIT_AFTER_TYPING: Duration = Duration::from_millis(200);
 const LAUNCH_GRACE: Duration = Duration::from_secs(30);
+const MAX_REMINDERS: u32 = 3;
+const POST_RETRY: Duration = Duration::from_secs(120);
 
 #[derive(Default)]
 pub(crate) struct DispatchState {
@@ -47,6 +54,52 @@ pub(crate) struct DispatchState {
     /// Item id → the move that failed to start, and why.
     failed: HashMap<String, (String, String)>,
     holds: HashMap<String, Hold>,
+    /// Rounds whose findings are being posted.
+    posting: HashSet<RoundKey>,
+    /// Round → when posting or saving its findings failed, and the card's line about it.
+    post_errors: HashMap<RoundKey, (Instant, String)>,
+    /// Round → what is wrong with its findings and what the session was told.
+    reminders: HashMap<RoundKey, Reminder>,
+    /// Rounds whose findings wait for the user to free a tab on their worktree, and what holds it.
+    findings_held: HashMap<RoundKey, HeldBy>,
+    findings_announced: HashSet<RoundKey>,
+}
+
+/// A round: the board item's id and when the move that started the round was made.
+type RoundKey = (String, String);
+
+fn round_key(record: &WorktreeDispatch) -> RoundKey {
+    (record.item_id.clone(), record.trigger_at.clone())
+}
+
+struct Reminder {
+    problems: String,
+    /// The version of the file the last reminder was about.
+    file: Option<FileStamp>,
+    sent: u32,
+}
+
+enum SessionAt {
+    Working,
+    Held(HeldBy),
+    Done(Remind),
+}
+
+enum Remind {
+    Typing(Entity<TerminalView>),
+    Notice,
+    Nothing,
+}
+
+struct Posting {
+    record: WorktreeDispatch,
+    path: PathBuf,
+    outcome: Outcome,
+}
+
+struct Posted {
+    url: String,
+    move_error: Option<String>,
 }
 
 /// What a board read needs from the app, taken on the foreground.
@@ -84,6 +137,7 @@ pub(crate) struct CardNote {
 pub(crate) enum NoteTone {
     Working,
     Waiting,
+    NeedsYou,
     Failed,
 }
 
@@ -122,6 +176,7 @@ enum TabAtHandover {
     IdleClaude,
     Draft,
     Busy,
+    Stopped,
     Other,
 }
 
@@ -142,6 +197,7 @@ struct TabProbe<'a> {
     shell_gone: bool,
     running: Option<&'a [u32]>,
     claude_idle: Option<bool>,
+    stopped: bool,
     typed: bool,
 }
 
@@ -152,6 +208,7 @@ fn tab_at_handover(tab: &TabProbe) -> TabAtHandover {
     let state = match (tab.running, tab.claude_idle) {
         (Some([]), _) => TabAtHandover::Shell,
         (Some(_), _) if tab.shell_gone => TabAtHandover::Other,
+        (Some(_), _) if tab.stopped => TabAtHandover::Stopped,
         (Some(_), Some(true)) if tab.typed => TabAtHandover::Draft,
         (Some(_), Some(true)) => TabAtHandover::IdleClaude,
         (Some(_), Some(false)) => TabAtHandover::Busy,
@@ -175,6 +232,8 @@ fn handover_to(tabs: &[TabAtHandover]) -> Handover {
         Handover::Type(index)
     } else if tabs.contains(&TabAtHandover::Busy) {
         Handover::Wait(Hold::SessionBusy)
+    } else if tabs.contains(&TabAtHandover::Stopped) {
+        Handover::Wait(Hold::SessionStopped)
     } else if tabs.contains(&TabAtHandover::Draft) {
         Handover::Wait(Hold::UnsentInput)
     } else if tabs.contains(&TabAtHandover::Other) {
@@ -188,6 +247,62 @@ enum HandoverTarget {
     Type(Entity<TerminalView>),
     NewTab,
     Wait(Hold),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FindingsGate {
+    Settled(RemindBy),
+    Wait,
+    Held(HeldBy),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeldBy {
+    Program,
+    QuietAgent,
+    StoppedSession,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemindBy {
+    Typing(usize),
+    Notice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Turn {
+    Ended,
+    Running,
+    Quiet,
+    Unknown,
+}
+
+fn turn_of(state: codescope_core::SessionState, quiet_timeout: bool) -> Turn {
+    use codescope_core::SessionState;
+    match state {
+        _ if quiet_timeout => Turn::Quiet,
+        SessionState::Idle => Turn::Ended,
+        SessionState::Busy | SessionState::PendingToolUse => Turn::Running,
+        SessionState::Unknown => Turn::Unknown,
+    }
+}
+
+fn findings_gate(tabs: &[(TabAtHandover, Turn)]) -> FindingsGate {
+    let other = |turn: Turn| tabs.contains(&(TabAtHandover::Other, turn));
+    if tabs.iter().any(|(state, _)| *state == TabAtHandover::Busy) || other(Turn::Running) {
+        return FindingsGate::Wait;
+    }
+    if other(Turn::Unknown) {
+        return FindingsGate::Held(HeldBy::Program);
+    }
+    if other(Turn::Quiet) {
+        return FindingsGate::Held(HeldBy::QuietAgent);
+    }
+    if tabs.iter().any(|(state, _)| *state == TabAtHandover::Stopped) {
+        return FindingsGate::Held(HeldBy::StoppedSession);
+    }
+    let idle_claude = tabs.iter().position(|(state, _)| *state == TabAtHandover::IdleClaude);
+    FindingsGate::Settled(idle_claude.map_or(RemindBy::Notice, RemindBy::Typing))
 }
 
 struct Place {
@@ -292,6 +407,9 @@ fn prepare_worktree(job: &Job) -> anyhow::Result<()> {
         add_dispatch_worktree(&job.repo, &job.path, &job.branch, &job.remote)?;
     }
     exclude_handover_files(&job.path)?;
+    if job.record.round == Round::Research {
+        clear_findings(&job.path)?;
+    }
     let home = codescope_core::paths::home_dir();
     let skill = find_skill(&job.path, home.as_deref(), job.record.round.skill()).map(|skill| {
         skill
@@ -448,6 +566,7 @@ impl AppShell {
         let on_board = self
             .dispatch_records(cx)
             .iter()
+            .filter(|(_, _, _, record)| record.findings.is_none())
             .filter(|(_, _, _, record)| {
                 let Some(read) = self.board.reads_by_url.get(&record.board_url) else {
                     return false;
@@ -695,6 +814,7 @@ impl AppShell {
                 url,
                 round,
                 trigger_at: trigger_at.clone(),
+                findings: None,
             },
             assign_to: item.assignees.is_empty().then_some(content_id),
             board,
@@ -820,14 +940,7 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) {
         if let Some(terminal) = terminal {
-            let task = task_message(number);
-            let terminal = terminal.downgrade();
-            cx.spawn(async move |_, cx| {
-                let _ = terminal.update(cx, |term, _| term.write_input(task.into_bytes()));
-                cx.background_executor().timer(SUBMIT_AFTER_TYPING).await;
-                let _ = terminal.update(cx, |term, _| term.write_input(&b"\r"[..]));
-            })
-            .detach();
+            Self::submit_line(&terminal, task_message(number), cx);
             return;
         }
         let before = self
@@ -853,12 +966,9 @@ impl AppShell {
         }
     }
 
-    /// Where a task for the worktree at `path` goes: into a tab where Claude Code waits for a
-    /// prompt, into a new tab when nothing runs there, or nowhere yet, with the reason.
-    fn handover_target(&self, path: &Path, cx: &App) -> HandoverTarget {
+    fn tabs_on(&self, path: &Path) -> Vec<&super::Tab> {
         let wanted = path.to_string_lossy();
-        let on_path: Vec<_> = self
-            .groups
+        self.groups
             .iter()
             .flat_map(|g| g.tabs.iter())
             .filter(|t| t.remote_project_id.is_none())
@@ -867,21 +977,23 @@ impl AppShell {
                     .as_deref()
                     .is_some_and(|wd| paths_match(&wd.to_string_lossy(), &wanted))
             })
-            .collect();
-        if on_path.is_empty() {
-            return HandoverTarget::NewTab;
+            .collect()
+    }
+
+    fn tab_states(&self, tabs: &[&super::Tab], path: &Path, cx: &App) -> Vec<TabAtHandover> {
+        if tabs.is_empty() {
+            return Vec::new();
         }
+        let wanted = path.to_string_lossy();
         let table = process_tree::process_table();
         let sessions = live_session::default_sessions_dir();
-        let states: Vec<TabAtHandover> = on_path
-            .iter()
+        tabs.iter()
             .map(|tab| {
                 let terminal = tab.terminal.read(cx);
                 let shell = terminal.child_pid();
                 let running = running_under(shell, &table);
-                let claude_idle = running.as_deref().and_then(|running| {
-                    let dir = sessions.as_deref()?;
-                    live_session::process_for_pids(dir, running, &wanted)?.reports_idle()
+                let claude = running.as_deref().and_then(|running| {
+                    live_session::process_for_pids(sessions.as_deref()?, running, &wanted)
                 });
                 let relaunched = self.claude_updates.relaunched_at(tab.id);
                 let launched_lately = tab.spawned_instant.elapsed() < LAUNCH_GRACE
@@ -891,39 +1003,399 @@ impl AppShell {
                     launched_lately,
                     shell_gone: shell_gone(shell, &table),
                     running: running.as_deref(),
-                    claude_idle,
+                    claude_idle: claude.as_ref().and_then(|claude| claude.reports_idle()),
+                    stopped: claude.is_some_and(|claude| process_tree::is_stopped(claude.pid)),
                     typed: terminal.typed_since_submit(),
                 })
             })
-            .collect();
-        match handover_to(&states) {
+            .collect()
+    }
+
+    /// Where a task for the worktree at `path` goes: into a tab where Claude Code waits for a
+    /// prompt, into a new tab when nothing runs there, or nowhere yet, with the reason.
+    fn handover_target(&self, path: &Path, cx: &App) -> HandoverTarget {
+        let on_path = self.tabs_on(path);
+        if on_path.is_empty() {
+            return HandoverTarget::NewTab;
+        }
+        match handover_to(&self.tab_states(&on_path, path, cx)) {
             Handover::Type(index) => HandoverTarget::Type(on_path[index].terminal.clone()),
             Handover::NewTab => HandoverTarget::NewTab,
             Handover::Wait(hold) => HandoverTarget::Wait(hold),
         }
     }
 
+    fn submit_line(terminal: &Entity<TerminalView>, line: String, cx: &mut Context<Self>) {
+        let terminal = terminal.downgrade();
+        cx.spawn(async move |_, cx| {
+            let _ = terminal.update(cx, |term, _| term.write_input(line.into_bytes()));
+            cx.background_executor().timer(SUBMIT_AFTER_TYPING).await;
+            let _ = terminal.update(cx, |term, _| term.write_input(&b"\r"[..]));
+        })
+        .detach();
+    }
+
+    fn read_board(&self, board_url: &str) -> Option<(&Board, ColumnMapping)> {
+        let board = self.board.reads_by_url.get(board_url)?.last_good.as_ref()?;
+        let settings = self.settings.boards.iter().find(|b| b.url == board_url)?;
+        Some((board, effective_mapping(board, &settings.columns)))
+    }
+
+    /// Post the findings of every research round whose sessions are done, or tell the session
+    /// what to fix first while the item is still in Researching.
+    pub(crate) fn collect_findings(&mut self, cx: &mut Context<Self>) {
+        let records = self.dispatch_records(cx);
+        let awaiting: HashSet<RoundKey> = records
+            .iter()
+            .filter(|(_, _, _, record)| record.awaits_findings())
+            .map(|(_, _, _, record)| round_key(record))
+            .collect();
+        let state = &mut self.board.dispatch;
+        state.reminders.retain(|key, _| awaiting.contains(key));
+        state.post_errors.retain(|key, _| awaiting.contains(key));
+        state.findings_announced.retain(|key| awaiting.contains(key));
+        let held_before = std::mem::take(&mut state.findings_held);
+
+        for (_, path, _, record) in records {
+            let key = round_key(&record);
+            let state = &self.board.dispatch;
+            let waiting_to_retry = state
+                .post_errors
+                .get(&key)
+                .is_some_and(|(at, _)| at.elapsed() < POST_RETRY);
+            if !awaiting.contains(&key) || state.posting.contains(&key) || waiting_to_retry {
+                continue;
+            }
+            let Some((board, mapping)) = self.read_board(&record.board_url) else {
+                continue;
+            };
+            let researching = board
+                .items
+                .iter()
+                .find(|item| item.id == record.item_id)
+                .and_then(|item| board.role_of(item, &mapping))
+                == Some(ColumnRole::Researching);
+            let board = board.clone();
+            let Some(file) = read_findings(&path) else {
+                continue;
+            };
+            let remind = match self.session_at(&path, cx) {
+                SessionAt::Working => continue,
+                SessionAt::Held(by) => {
+                    self.board.dispatch.findings_held.insert(key, by);
+                    continue;
+                }
+                SessionAt::Done(_) if !researching => Remind::Nothing,
+                SessionAt::Done(remind) => remind,
+            };
+            match file.check() {
+                Ok((text, findings)) => {
+                    let body = comment_body(text, &findings);
+                    let posting = Posting {
+                        record,
+                        path,
+                        outcome: findings.outcome(),
+                    };
+                    self.post_findings(posting, body, board, mapping, cx);
+                }
+                Err(problems) => {
+                    self.remind(&record, &path, file.stamp, remind, &problems, cx);
+                }
+            }
+        }
+        if self.board.dispatch.findings_held != held_before {
+            cx.notify();
+        }
+    }
+
+    fn session_at(&self, path: &Path, cx: &App) -> SessionAt {
+        let tabs = self.tabs_on(path);
+        let states = self.tab_states(&tabs, path, cx);
+        let probed: Vec<(TabAtHandover, Turn)> = tabs
+            .iter()
+            .zip(states)
+            .map(|(tab, state)| (state, self.turn(tab)))
+            .collect();
+        match findings_gate(&probed) {
+            FindingsGate::Wait => SessionAt::Working,
+            FindingsGate::Held(by) => SessionAt::Held(by),
+            FindingsGate::Settled(RemindBy::Typing(index)) => {
+                SessionAt::Done(Remind::Typing(tabs[index].terminal.clone()))
+            }
+            FindingsGate::Settled(RemindBy::Notice) => SessionAt::Done(Remind::Notice),
+        }
+    }
+
+    fn turn(&self, tab: &super::Tab) -> Turn {
+        let snapshot = tab.adopted_session_id.as_deref().and_then(|sid| self.telemetry_for(sid));
+        snapshot.map_or(Turn::Unknown, |snap| turn_of(snap.state, snap.quiet_timeout))
+    }
+
+    fn tab_title_at(&self, path: &Path) -> Option<SharedString> {
+        self.tabs_on(path).first().map(|tab| tab.title.clone())
+    }
+
+    fn remind(
+        &mut self,
+        record: &WorktreeDispatch,
+        path: &Path,
+        file: FileStamp,
+        remind: Remind,
+        problems: &[Problem],
+        cx: &mut Context<Self>,
+    ) {
+        let reminders = &mut self.board.dispatch.reminders;
+        let reminder = reminders.entry(round_key(record)).or_insert(Reminder {
+            problems: String::new(),
+            file: None,
+            sent: 0,
+        });
+        reminder.problems = problems_list(problems);
+        cx.notify();
+        let due = reminder.file != Some(file) && reminder.sent < MAX_REMINDERS;
+        if !due || matches!(remind, Remind::Nothing) {
+            return;
+        }
+        reminder.file = Some(file);
+        reminder.sent += 1;
+        let listed = reminder.problems.clone();
+        match remind {
+            Remind::Typing(terminal) => {
+                Self::submit_line(&terminal, problems_message(problems), cx);
+            }
+            Remind::Notice => {
+                let title = format!("Findings on #{} can't be posted yet", record.number);
+                let detail = format!("{listed}. Fix {FINDINGS_FILE}, or have its session fix it.");
+                self.push_toast(ToastKind::Err, title.clone(), Some(detail.clone().into()), cx);
+                self.push_notification(
+                    crate::notifications::NotificationKind::SessionWaiting,
+                    title,
+                    detail,
+                    self.tab_title_at(path),
+                    cx,
+                );
+            }
+            Remind::Nothing => {}
+        }
+    }
+
+    fn post_findings(
+        &mut self,
+        posting: Posting,
+        body: String,
+        board: Board,
+        mapping: ColumnMapping,
+        cx: &mut Context<Self>,
+    ) {
+        let record = &posting.record;
+        let item_id = record.item_id.clone();
+        let content_id = record.content_id.clone();
+        let since = record.trigger_at.clone();
+        self.board.dispatch.posting.insert(round_key(record));
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let failed = |err: anyhow::Error| format!("{err:#}");
+                    let before = github::before_posting(&item_id, &content_id, &since, &body)
+                        .map_err(failed)?;
+                    let url = match before.posted {
+                        Some(url) => url,
+                        None => github::add_comment(&content_id, &body).map_err(failed)?,
+                    };
+                    let role = before
+                        .column_id
+                        .as_deref()
+                        .and_then(|id| board.role_of_column(id, &mapping));
+                    let move_error = if !moves_to_needs_decision(role) {
+                        None
+                    } else {
+                        match mapped_column(&board, &mapping, ColumnRole::NeedsDecision) {
+                            Some(column) => github::set_status(&board, &item_id, &column.id)
+                                .map_err(failed)
+                                .err(),
+                            None => Some("the board has no Needs decision column".to_string()),
+                        }
+                    };
+                    Ok::<_, String>(Posted { url, move_error })
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| this.finish_posting(posting, result, cx));
+        })
+        .detach();
+    }
+
+    fn finish_posting(
+        &mut self,
+        posting: Posting,
+        result: Result<Posted, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Posting {
+            record,
+            path,
+            outcome,
+        } = posting;
+        let key = round_key(&record);
+        self.board.dispatch.posting.remove(&key);
+        cx.notify();
+        let Posted { url, move_error } = match result {
+            Ok(posted) => posted,
+            Err(message) => {
+                let note = format!("Couldn't post the findings: {message}");
+                let errors = &mut self.board.dispatch.post_errors;
+                let first = errors.insert(key, (Instant::now(), note)).is_none();
+                if first {
+                    self.push_toast(
+                        ToastKind::Err,
+                        format!("Couldn't post the findings of #{}", record.number),
+                        Some(message.into()),
+                        cx,
+                    );
+                }
+                return;
+            }
+        };
+
+        let first_news = self.board.dispatch.findings_announced.insert(key.clone());
+        let posted = PostedFindings {
+            outcome,
+            comment_url: url,
+        };
+        let saved = ProjectsConfig::load(&self.paths)
+            .map_err(|err| format!("{err:#}"))
+            .and_then(|mut next| {
+                if record_posted_findings(&mut next, &record.item_id, &record.trigger_at, posted) {
+                    next.save(&self.paths).map_err(|err| format!("{err:#}"))?;
+                }
+                Ok(next)
+            });
+        match saved {
+            Ok(next) => {
+                self.projects = next.clone();
+                self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.replace_projects(next);
+                    cx.notify();
+                });
+            }
+            Err(err) => {
+                let note = format!("Findings posted, not saved: {err}");
+                self.board.dispatch.post_errors.insert(key, (Instant::now(), note));
+            }
+        }
+        if !first_news && move_error.is_none() {
+            return;
+        }
+
+        let title = format!("Findings on #{}", record.number);
+        let next_step = match outcome {
+            Outcome::DecisionPoints => "Answer the decision points on the issue.",
+            Outcome::Findings => "Move the item to Ready to implement it.",
+        };
+        let detail = match &move_error {
+            Some(err) => format!("{next_step} Couldn't move it to Needs decision: {err}"),
+            None => next_step.to_string(),
+        };
+        let kind = if move_error.is_some() {
+            ToastKind::Err
+        } else {
+            ToastKind::Ok
+        };
+        self.push_toast(kind, title.clone(), Some(detail.clone().into()), cx);
+        self.push_notification(
+            crate::notifications::NotificationKind::SessionReady,
+            title,
+            detail,
+            self.tab_title_at(&path),
+            cx,
+        );
+    }
+
     /// What each card on the board at `board_url` says about dispatch, by item id.
     pub(crate) fn card_notes(&self, board_url: &str, cx: &App) -> HashMap<String, CardNote> {
         let state = &self.board.dispatch;
-        let mut notes: HashMap<String, CardNote> = self
+        let records: Vec<_> = self
             .dispatch_records(cx)
             .into_iter()
             .filter(|(_, _, _, r)| r.board_url == board_url)
+            .collect();
+        let rounds: HashSet<RoundKey> = records.iter().map(|(_, _, _, r)| round_key(r)).collect();
+        let mut notes: HashMap<String, CardNote> = records
+            .into_iter()
             .map(|(_, _, branch, r)| {
-                let text = match branch {
-                    Some(branch) => format!("{} · {branch}", r.round.label()),
-                    None => r.round.label().to_string(),
-                };
-                (
-                    r.item_id,
-                    CardNote {
-                        text: text.into(),
+                let posted = r.findings.as_ref().filter(|_| r.round == Round::Research);
+                let note = match (posted.map(|p| p.outcome), branch) {
+                    (Some(Outcome::DecisionPoints), _) => CardNote {
+                        text: "Decision points posted · answer on the issue".into(),
+                        tone: NoteTone::NeedsYou,
+                    },
+                    (Some(Outcome::Findings), _) => CardNote {
+                        text: "Findings posted · move it to Ready".into(),
+                        tone: NoteTone::NeedsYou,
+                    },
+                    (None, Some(branch)) => CardNote {
+                        text: format!("{} · {branch}", r.round.label()).into(),
                         tone: NoteTone::Working,
                     },
-                )
+                    (None, None) => CardNote {
+                        text: r.round.label().into(),
+                        tone: NoteTone::Working,
+                    },
+                };
+                (r.item_id, note)
             })
             .collect();
+        for key in state.posting.iter().filter(|key| rounds.contains(*key)) {
+            notes.insert(
+                key.0.clone(),
+                CardNote {
+                    text: "Posting the findings…".into(),
+                    tone: NoteTone::Working,
+                },
+            );
+        }
+        for (key, reminder) in state.reminders.iter().filter(|(key, _)| rounds.contains(*key)) {
+            notes.insert(
+                key.0.clone(),
+                CardNote {
+                    text: format!("Findings incomplete: {}", reminder.problems).into(),
+                    tone: NoteTone::Failed,
+                },
+            );
+        }
+        for (key, (_, note)) in state.post_errors.iter().filter(|(key, _)| rounds.contains(*key)) {
+            notes.insert(
+                key.0.clone(),
+                CardNote {
+                    text: note.clone().into(),
+                    tone: NoteTone::Failed,
+                },
+            );
+        }
+        for (key, by) in state.findings_held.iter().filter(|(key, _)| rounds.contains(*key)) {
+            let text = match by {
+                HeldBy::Program => {
+                    "Findings written · to post them, quit what runs in its worktree's tab, or \
+                     close the tab"
+                }
+                HeldBy::QuietAgent => {
+                    "Findings written · its agent may not be done: to post them, quit what runs \
+                     in its tab, or close the tab"
+                }
+                HeldBy::StoppedSession => {
+                    "Findings written · to post them, type fg in its session's tab to resume \
+                     it, or close the tab"
+                }
+            };
+            notes.insert(
+                key.0.clone(),
+                CardNote {
+                    text: text.into(),
+                    tone: NoteTone::Waiting,
+                },
+            );
+        }
         for (item_id, hold) in &state.holds {
             if !hold.is_quiet() {
                 notes.insert(
@@ -968,6 +1440,7 @@ mod tests {
             shell_gone: false,
             running,
             claude_idle,
+            stopped: false,
             typed,
         })
     }
@@ -981,6 +1454,23 @@ mod tests {
         assert_eq!(tab(Some(&[7]), Some(false), false), Busy);
         assert_eq!(tab(Some(&[7]), None, false), Other, "another agent, or any other program");
         assert_eq!(tab(None, None, false), Other, "nothing known about its processes");
+        let stopped = TabProbe {
+            restarting: false,
+            launched_lately: false,
+            shell_gone: false,
+            running: Some(&[7]),
+            claude_idle: Some(true),
+            stopped: true,
+            typed: true,
+        };
+        assert_eq!(tab_at_handover(&stopped), Stopped, "Ctrl+Z hands its keys to the shell");
+        for claude_idle in [Some(false), None] {
+            let other_status = TabProbe {
+                claude_idle,
+                ..stopped
+            };
+            assert_eq!(tab_at_handover(&other_status), Stopped, "mid-turn or without a status");
+        }
     }
 
     #[test]
@@ -992,6 +1482,7 @@ mod tests {
                 shell_gone: false,
                 running,
                 claude_idle: running.map(|_| true),
+                stopped: false,
                 typed: false,
             };
             assert_eq!(tab_at_handover(&probe), TabAtHandover::Busy);
@@ -1017,6 +1508,7 @@ mod tests {
                 shell_gone: false,
                 running,
                 claude_idle,
+                stopped: false,
                 typed: false,
             })
         };
@@ -1052,12 +1544,70 @@ mod tests {
                 shell_gone: true,
                 running,
                 claude_idle,
+                stopped: false,
                 typed: false,
             })
         };
         assert_eq!(gone(Some(&[41]), Some(true)), Other, "its terminal no longer takes input");
         assert_eq!(gone(Some(&[41]), Some(false)), Other);
         assert_eq!(gone(Some(&[]), None), Shell);
+    }
+
+    #[test]
+    fn a_turn_counts_as_running_only_while_its_transcript_says_so() {
+        use codescope_core::SessionState::*;
+        assert_eq!(turn_of(Idle, false), Turn::Ended);
+        assert_eq!(turn_of(Busy, false), Turn::Running);
+        assert_eq!(turn_of(PendingToolUse, false), Turn::Running);
+        assert_eq!(turn_of(Unknown, false), Turn::Unknown);
+        assert_eq!(turn_of(Idle, true), Turn::Quiet, "a guess at its end, or a killed agent");
+    }
+
+    #[test]
+    fn findings_wait_for_every_session_on_the_worktree_and_only_claude_code_is_reminded() {
+        use FindingsGate::{Held, Settled, Wait};
+        use RemindBy::{Notice, Typing};
+        use TabAtHandover::*;
+        use Turn::{Ended, Quiet, Running, Unknown};
+        assert_eq!(findings_gate(&[]), Settled(Notice), "with no session left, the user is told");
+        assert_eq!(findings_gate(&[(Shell, Unknown), (IdleClaude, Ended)]), Settled(Typing(1)));
+        assert_eq!(
+            findings_gate(&[(IdleClaude, Ended), (Busy, Running)]),
+            Wait,
+            "another session there still works"
+        );
+        assert_eq!(
+            findings_gate(&[(Draft, Ended)]),
+            Settled(Notice),
+            "the findings can be posted; problems go to the user, not into the tab"
+        );
+        assert_eq!(
+            findings_gate(&[(Stopped, Ended), (IdleClaude, Ended)]),
+            Held(HeldBy::StoppedSession),
+            "a stopped session may be mid-turn, and only the user can resume it"
+        );
+        assert_eq!(findings_gate(&[(Draft, Ended), (IdleClaude, Ended)]), Settled(Typing(1)));
+        assert_eq!(
+            findings_gate(&[(Other, Running), (Shell, Unknown)]),
+            Wait,
+            "another agent still in its turn"
+        );
+        assert_eq!(
+            findings_gate(&[(Other, Unknown), (Shell, Unknown)]),
+            Held(HeldBy::Program),
+            "a program that is no agent only the user can stop"
+        );
+        assert_eq!(
+            findings_gate(&[(Other, Quiet), (Shell, Unknown)]),
+            Held(HeldBy::QuietAgent),
+            "an agent whose transcript went quiet may or may not be done"
+        );
+        assert_eq!(findings_gate(&[(Other, Unknown), (Busy, Running)]), Wait);
+        assert_eq!(
+            findings_gate(&[(Other, Ended)]),
+            Settled(Notice),
+            "another agent whose turn ended is done; the user is told, nothing is typed"
+        );
     }
 
     #[test]
@@ -1071,5 +1621,9 @@ mod tests {
         assert_eq!(handover_to(&[Other, Busy]), Handover::Wait(Hold::SessionBusy));
         assert_eq!(handover_to(&[Other, Draft]), Handover::Wait(Hold::UnsentInput));
         assert_eq!(handover_to(&[Draft, Busy]), Handover::Wait(Hold::SessionBusy));
+        assert_eq!(handover_to(&[Stopped, Shell]), Handover::Wait(Hold::SessionStopped));
+        assert_eq!(handover_to(&[Stopped, Draft]), Handover::Wait(Hold::SessionStopped));
+        assert_eq!(handover_to(&[Stopped, IdleClaude]), Handover::Type(1));
+        assert_eq!(handover_to(&[Stopped, Busy]), Handover::Wait(Hold::SessionBusy));
     }
 }

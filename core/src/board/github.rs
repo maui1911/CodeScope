@@ -2,6 +2,7 @@
 //! the 5,000-point hourly limit; `gh project item-list` would cost about a hundred.
 
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::process::Stdio;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -196,6 +197,105 @@ pub fn assign(content_id: &str, user_id: &str) -> Result<()> {
     parse_data::<serde_json::Value>(&stdout).map(|_| ())
 }
 
+/// Comment on an issue or pull request by its node id; returns the comment's URL. The request
+/// goes through stdin, so a long body is not cut off by the command line's length limit.
+pub fn add_comment(subject_id: &str, body: &str) -> Result<String> {
+    let query = r#"mutation($subject: ID!, $body: String!) {
+  addComment(input: { subjectId: $subject, body: $body }) { commentEdge { node { url } } }
+}"#;
+    let request = serde_json::json!({
+        "query": query,
+        "variables": { "subject": subject_id, "body": body },
+    });
+    let args = ["graphql", "--input", "-"].map(String::from);
+    let stdout = run_gh_api_with_input(&args, Some(request.to_string()))?;
+    parse_comment_url(&stdout)
+}
+
+/// Parse [`add_comment`]'s response.
+pub fn parse_comment_url(json: &str) -> Result<String> {
+    let data: AddCommentData = parse_data(json)?;
+    Ok(data.add_comment.comment_edge.node.url)
+}
+
+const BEFORE_POSTING_QUERY: &str = r#"query($item: ID!, $subject: ID!) {
+  item: node(id: $item) {
+    ... on ProjectV2Item {
+      fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { optionId } }
+    }
+  }
+  subject: node(id: $subject) {
+    ... on Issue { comments(last: 50) { ...Posted } }
+    ... on PullRequest { comments(last: 50) { ...Posted } }
+  }
+}
+fragment Posted on IssueCommentConnection { nodes { url createdAt viewerDidAuthor body } }"#;
+
+/// What posting a research round's findings checks on GitHub first.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BeforePosting {
+    /// The column the item is in now; `None` without a status or off the board.
+    pub column_id: Option<String>,
+    /// The URL of this very comment, when the signed-in user already posted it this round.
+    pub posted: Option<String>,
+}
+
+/// Read the board item `item_id`'s column, and look among the last 50 comments on the issue or
+/// pull request `subject_id` for `body` posted by the signed-in user after `since`.
+pub fn before_posting(
+    item_id: &str,
+    subject_id: &str,
+    since: &str,
+    body: &str,
+) -> Result<BeforePosting> {
+    let args = graphql_args(
+        &[
+            format!("query={BEFORE_POSTING_QUERY}"),
+            format!("item={item_id}"),
+            format!("subject={subject_id}"),
+        ],
+        &[],
+    );
+    let (stdout, failure) = gh_output(&args, None)?;
+    parse_before_posting(&String::from_utf8_lossy(&stdout), since, body).map_err(|err| {
+        match failure {
+            Some(message) => anyhow!(message),
+            None => err,
+        }
+    })
+}
+
+/// Parse [`before_posting`]'s response, in which an item off the board is `NOT_FOUND`; `since`
+/// is ISO 8601, as GitHub writes `createdAt`.
+pub fn parse_before_posting(json: &str, since: &str, body: &str) -> Result<BeforePosting> {
+    let response: Response<BeforePostingData> =
+        serde_json::from_str(json).context("parse the gh response")?;
+    let unexpected: Vec<String> = response
+        .errors
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|error| !error.is_not_found("item"))
+        .map(|error| error.message)
+        .collect();
+    if !unexpected.is_empty() {
+        bail!("{}", unexpected.join("; "));
+    }
+    let data = response.data.ok_or_else(|| anyhow!("the response has no data"))?;
+    let same = |posted: &str| posted.replace("\r\n", "\n").trim_end() == body.trim_end();
+    let posted = data
+        .subject
+        .and_then(|subject| subject.comments)
+        .into_iter()
+        .flat_map(|comments| comments.nodes.into_iter().flatten())
+        .filter(|c| c.viewer_did_author && c.created_at.as_str() > since)
+        .rfind(|c| same(&c.body))
+        .map(|c| c.url);
+    Ok(BeforePosting {
+        column_id: data.item.and_then(|item| item.field_value_by_name?.option_id),
+        posted,
+    })
+}
+
 /// Whether `login` can push to `repository` (`owner/name`): admin, maintain or write. False too
 /// when GitHub won't say, which it does unless the signed-in user can push.
 pub fn can_write(repository: &str, login: &str) -> Result<bool> {
@@ -219,6 +319,10 @@ fn write_access(permission: Result<String>) -> Result<bool> {
 }
 
 fn run_graphql(raw_fields: &[String], typed_fields: &[String]) -> Result<String> {
+    run_gh_api(&graphql_args(raw_fields, typed_fields))
+}
+
+fn graphql_args(raw_fields: &[String], typed_fields: &[String]) -> Vec<String> {
     let mut args = vec!["graphql".to_string()];
     for field in raw_fields {
         args.push("-f".to_string());
@@ -228,21 +332,46 @@ fn run_graphql(raw_fields: &[String], typed_fields: &[String]) -> Result<String>
         args.push("-F".to_string());
         args.push(field.clone());
     }
-    run_gh_api(&args)
+    args
 }
 
 fn run_gh_api(args: &[String]) -> Result<String> {
+    run_gh_api_with_input(args, None)
+}
+
+fn run_gh_api_with_input(args: &[String], input: Option<String>) -> Result<String> {
+    let (stdout, failure) = gh_output(args, input)?;
+    if let Some(message) = failure {
+        bail!("{message}");
+    }
+    String::from_utf8(stdout).context("gh printed something other than UTF-8")
+}
+
+/// What `gh api` printed and its error: `gh` fails on a GraphQL error but prints the response.
+fn gh_output(args: &[String], input: Option<String>) -> Result<(Vec<u8>, Option<String>)> {
     let mut command = gh_api();
     command.args(args);
-    let output = command
-        .stdin(Stdio::null())
+    let mut child = command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn()
         .map_err(|err| match err.kind() {
             std::io::ErrorKind::NotFound => anyhow!("GitHub CLI (gh) is not installed"),
             _ => anyhow!(err).context("run gh"),
         })?;
+    let writer = match (input, child.stdin.take()) {
+        (Some(input), Some(mut stdin)) => {
+            Some(std::thread::spawn(move || stdin.write_all(input.as_bytes())))
+        }
+        _ => None,
+    };
+    let output = child.wait_with_output().context("wait for gh")?;
+    let written = writer.map(std::thread::JoinHandle::join);
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let message = stderr
@@ -250,9 +379,13 @@ fn run_gh_api(args: &[String]) -> Result<String> {
             .find(|l| !l.trim().is_empty())
             .unwrap_or("gh failed")
             .trim();
-        bail!("{}", message.strip_prefix("gh: ").unwrap_or(message));
+        let message = message.strip_prefix("gh: ").unwrap_or(message).to_string();
+        return Ok((output.stdout, Some(message)));
     }
-    String::from_utf8(output.stdout).context("gh printed something other than UTF-8")
+    if let Some(written) = written {
+        written.map_err(|_| anyhow!("writing to gh panicked"))?.context("write to gh")?;
+    }
+    Ok((output.stdout, None))
 }
 
 fn parse_data<T: DeserializeOwned>(json: &str) -> Result<T> {
@@ -371,6 +504,59 @@ struct Response<T> {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddCommentData {
+    add_comment: AddCommentPayload,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddCommentPayload {
+    comment_edge: CommentEdge,
+}
+
+#[derive(Deserialize)]
+struct CommentEdge {
+    node: CommentNode,
+}
+
+#[derive(Deserialize)]
+struct CommentNode {
+    url: String,
+}
+
+#[derive(Deserialize)]
+struct BeforePostingData {
+    item: Option<ItemStatus>,
+    subject: Option<Subject>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ItemStatus {
+    field_value_by_name: Option<StatusValue>,
+}
+
+#[derive(Deserialize)]
+struct Subject {
+    comments: Option<Comments>,
+}
+
+#[derive(Deserialize)]
+struct Comments {
+    nodes: Vec<Option<IssueComment>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueComment {
+    url: String,
+    created_at: String,
+    viewer_did_author: bool,
+    body: String,
+}
+
+#[derive(Deserialize)]
 struct ViewerData {
     viewer: ViewerNode,
 }
@@ -421,6 +607,16 @@ struct ProjectId {
 #[derive(Deserialize)]
 struct GraphqlError {
     message: String,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    path: Vec<serde_json::Value>,
+}
+
+impl GraphqlError {
+    fn is_not_found(&self, field: &str) -> bool {
+        self.kind.as_deref() == Some("NOT_FOUND") && self.path == [serde_json::json!(field)]
+    }
 }
 
 #[derive(Deserialize)]
@@ -690,6 +886,76 @@ mod tests {
                 created_at: "2026-11-25T10:00:00Z".into(),
             }
         );
+    }
+
+    #[test]
+    fn reads_the_url_of_a_new_comment() {
+        let json = r#"{"data":{"addComment":{"commentEdge":{"node":{
+          "url":"https://github.com/maui1911/CodeScope/issues/408#issuecomment-1"}}}}}"#;
+        assert_eq!(
+            parse_comment_url(json).unwrap(),
+            "https://github.com/maui1911/CodeScope/issues/408#issuecomment-1"
+        );
+    }
+
+    #[test]
+    fn reads_the_column_and_the_same_findings_the_user_posted_since_the_round_began() {
+        let marker = "<!-- dispatch v=1 phase=research outcome=findings by=codescope -->";
+        let body = format!("D.\n\n**Next step:** move it.\n{marker}\n");
+        let comment = |url: &str, at: &str, mine: bool, body: &str| {
+            serde_json::json!({
+                "url": url, "createdAt": at, "viewerDidAuthor": mine, "body": body,
+            })
+        };
+        let comments = serde_json::json!({ "nodes": [
+            comment("u-earlier", "2026-11-25T09:00:00Z", true, &body),
+            comment("u-theirs", "2026-11-25T10:05:00Z", false, &body),
+            comment("u-round", "2026-11-25T10:06:00Z", true, &format!("C.\n{marker}\n")),
+            comment("u-mine", "2026-11-25T10:07:00Z", true, &body.replace('\n', "\r\n")),
+            comment("u-chat", "2026-11-25T10:08:00Z", true, "Looks good."),
+        ] });
+        let json = serde_json::json!({ "data": {
+            "item": { "fieldValueByName": { "optionId": "opt-researching" } },
+            "subject": { "comments": comments },
+        } })
+        .to_string();
+        let since = "2026-11-25T10:00:00Z";
+        let before = parse_before_posting(&json, since, &body).unwrap();
+        assert_eq!(before.column_id.as_deref(), Some("opt-researching"));
+        assert_eq!(before.posted.as_deref(), Some("u-mine"));
+
+        let later = parse_before_posting(&json, "2026-11-25T10:07:00Z", &body).unwrap();
+        assert_eq!(later.posted, None, "a comment from before the round is not this round's");
+        let other = parse_before_posting(&json, since, "E.\n").unwrap();
+        assert_eq!(other.posted, None, "other findings are not these");
+        let bare = parse_before_posting(r#"{"data":{"item":null,"subject":{}}}"#, since, &body);
+        let bare = bare.unwrap();
+        assert_eq!((bare.column_id, bare.posted), (None, None));
+    }
+
+    #[test]
+    fn an_item_taken_off_the_board_is_in_no_column_but_other_errors_fail() {
+        let not_found = |path: &str| {
+            serde_json::json!({
+                "type": "NOT_FOUND", "path": [path], "message": "Could not resolve to a node",
+            })
+        };
+        let response = |error: serde_json::Value| {
+            serde_json::json!({
+                "data": { "item": null, "subject": { "comments": { "nodes": [] } } },
+                "errors": [error],
+            })
+            .to_string()
+        };
+        let since = "2026-11-25T10:00:00Z";
+        let removed = parse_before_posting(&response(not_found("item")), since, "D.").unwrap();
+        assert_eq!(removed, BeforePosting::default());
+        assert!(parse_before_posting(&response(not_found("subject")), since, "D.").is_err());
+        let forbidden = serde_json::json!({
+            "type": "FORBIDDEN", "path": ["item"], "message": "Resource not accessible",
+        });
+        let err = parse_before_posting(&response(forbidden), since, "D.").unwrap_err();
+        assert_eq!(err.to_string(), "Resource not accessible");
     }
 
     #[test]

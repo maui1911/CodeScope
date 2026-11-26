@@ -95,9 +95,45 @@ fn parse_ps(text: &str) -> ProcessTable {
         .collect()
 }
 
+/// Whether `pid` is stopped by job control (Ctrl+Z), so what its terminal types reaches the shell.
+#[cfg(not(windows))]
+pub fn is_stopped(pid: u32) -> bool {
+    crate::process::no_window_command("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .is_some_and(|o| stopped_state(&String::from_utf8_lossy(&o.stdout)))
+}
+
+/// Always false: Windows consoles have no job control that stops a process.
+#[cfg(windows)]
+pub fn is_stopped(_pid: u32) -> bool {
+    false
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+fn stopped_state(stat: &str) -> bool {
+    stat.trim_start().starts_with('T')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_process_state_starting_with_t_is_stopped() {
+        assert!(stopped_state("T+\n"));
+        assert!(stopped_state("  Ts\n"));
+        assert!(!stopped_state("S+\n"));
+        assert!(!stopped_state("R\n"));
+        assert!(!stopped_state(""));
+    }
+
+    #[test]
+    fn this_process_is_not_stopped() {
+        assert!(!is_stopped(std::process::id()));
+    }
 
     #[test]
     fn descendants_walks_children_before_grandchildren() {

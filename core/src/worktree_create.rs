@@ -18,7 +18,7 @@
 //! leaves no trace in `projects.json`, and the worktree discovery poll
 //! adopts whatever git finished on disk at the next launch.
 
-use crate::board::dispatch::WorktreeDispatch;
+use crate::board::dispatch::{PostedFindings, Round, WorktreeDispatch};
 use crate::git::WorktreeInfo;
 use crate::projects::{ProjectsConfig, Worktree, normalise_project_path};
 
@@ -232,6 +232,29 @@ pub fn record_dispatch(
     }
 }
 
+/// Note `findings` on the row whose dispatch is still the research round of board item `item_id`
+/// that the move at `trigger_at` started; `false` when no row holds that round any more.
+pub fn record_posted_findings(
+    cfg: &mut ProjectsConfig,
+    item_id: &str,
+    trigger_at: &str,
+    findings: PostedFindings,
+) -> bool {
+    let round = cfg
+        .projects
+        .iter_mut()
+        .flat_map(|p| p.worktrees.iter_mut())
+        .filter_map(|wt| wt.dispatch.as_mut())
+        .find(|d| d.item_id == item_id && d.trigger_at == trigger_at && d.round == Round::Research);
+    match round {
+        Some(dispatch) => {
+            dispatch.findings = Some(findings);
+            true
+        }
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,6 +437,7 @@ mod tests {
             url: "https://github.com/maui1911/CodeScope/issues/411".into(),
             round: Round::Research,
             trigger_at: "2026-11-25T10:00:00Z".into(),
+            findings: None,
         };
         let path = "/repo.worktrees/411-fuzzy-paths";
         assert!(record_dispatch(&mut cfg, &id, path, "411-fuzzy-paths", research.clone()));
@@ -433,6 +457,47 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].dispatch, Some(implementation.clone()));
         assert!(!record_dispatch(&mut cfg, "gone", path, "411-fuzzy-paths", implementation));
+    }
+
+    #[test]
+    fn posted_findings_land_only_on_the_round_they_came_from() {
+        use crate::board::dispatch::PostedFindings;
+        use crate::board::findings::Outcome;
+        let (mut cfg, id) = config_with_project("/repo");
+        let research = WorktreeDispatch {
+            board_url: "https://github.com/users/maui1911/projects/3".into(),
+            item_id: "PVTI_1".into(),
+            content_id: "I_411".into(),
+            repository: "maui1911/CodeScope".into(),
+            number: 411,
+            title: "Fuzzy paths".into(),
+            url: "https://github.com/maui1911/CodeScope/issues/411".into(),
+            round: Round::Research,
+            trigger_at: "2026-11-25T10:00:00Z".into(),
+            findings: None,
+        };
+        let path = "/repo.worktrees/411-fuzzy-paths";
+        assert!(record_dispatch(&mut cfg, &id, path, "411-fuzzy-paths", research.clone()));
+        let posted = PostedFindings {
+            outcome: Outcome::Findings,
+            comment_url: "https://github.com/maui1911/CodeScope/issues/411#issuecomment-1".into(),
+        };
+        let other_round = "2026-11-25T09:00:00Z";
+        assert!(!record_posted_findings(&mut cfg, "PVTI_1", other_round, posted.clone()));
+        assert!(record_posted_findings(&mut cfg, "PVTI_1", &research.trigger_at, posted.clone()));
+        let row = |cfg: &ProjectsConfig| cfg.projects[0].worktrees[1].dispatch.clone();
+        assert_eq!(row(&cfg).unwrap().findings, Some(posted.clone()));
+
+        let implementation = WorktreeDispatch {
+            round: Round::Implementation,
+            trigger_at: "2026-11-25T11:00:00Z".into(),
+            findings: None,
+            ..research.clone()
+        };
+        assert!(record_dispatch(&mut cfg, &id, path, "411-fuzzy-paths", implementation.clone()));
+        assert!(!record_posted_findings(&mut cfg, "PVTI_1", &research.trigger_at, posted));
+        assert_eq!(row(&cfg), Some(implementation));
+        assert_eq!(cfg.projects[0].worktrees.len(), 2, "no row is added");
     }
 
     #[test]

@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use codescope_core::agents::claude::live_session::{self, LiveProcess};
 use codescope_core::agents::claude::restart::{self, ClaudeState, StopStep};
 use codescope_core::agents::claude::version::{self, ClaudeVersion};
+use codescope_core::process_tree::is_stopped;
 use gpui::{Context, SharedString};
 
 use super::{AppShell, ToastKind};
@@ -101,7 +102,7 @@ fn claude_state(shell: u32, pid: u32, sessions_dir: &std::path::Path, cwd: &str)
         return ClaudeState::Gone;
     }
     match live_session::process_for_pids(sessions_dir, &[pid], cwd) {
-        Some(live) if !live.is_idle() => ClaudeState::Busy,
+        Some(live) if !live.is_idle() || is_stopped(live.pid) => ClaudeState::Busy,
         // Idle, or the pid file is already gone mid-shutdown.
         _ => ClaudeState::Idle,
     }
@@ -165,7 +166,7 @@ impl AppShell {
                 !updates.restarting.contains(tab_id)
                     && updates.attempted.get(tab_id) != updates.installed.as_ref()
                     && restart::may_auto_restart(
-                        live.is_idle(),
+                        live.is_idle() && !is_stopped(live.pid),
                         self.tab_may_have_draft(*tab_id, cx),
                         in_view.contains(tab_id),
                     )
@@ -262,6 +263,15 @@ impl AppShell {
                 ToastKind::Info,
                 "Claude is busy in this tab",
                 Some("Restart it once the current turn is done.".into()),
+                cx,
+            );
+            return;
+        }
+        if is_stopped(live.pid) {
+            self.push_toast(
+                ToastKind::Info,
+                "Claude is stopped in this tab",
+                Some("Type fg in the tab to resume it, then restart it.".into()),
                 cx,
             );
             return;

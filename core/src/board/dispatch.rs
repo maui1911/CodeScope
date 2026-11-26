@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::findings::Outcome;
 use super::{Board, BoardItem, ColumnMapping, ColumnRole, ItemKind, ItemState, RoleKind};
 use super::{mapped_column, normalize_column_name};
 use crate::git::{parse_worktree_porcelain, run_git};
@@ -108,6 +109,30 @@ pub struct WorktreeDispatch {
     pub round: Round,
     /// When the move that started that round was made, as the host reports it.
     pub trigger_at: String,
+    /// The research round's findings, once CodeScope posted them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findings: Option<PostedFindings>,
+}
+
+impl WorktreeDispatch {
+    /// A research round whose findings are not posted yet.
+    pub fn awaits_findings(&self) -> bool {
+        self.round == Round::Research && self.findings.is_none()
+    }
+}
+
+/// Findings CodeScope posted on the issue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostedFindings {
+    pub outcome: Outcome,
+    pub comment_url: String,
+}
+
+/// Whether posting findings moves the item to Needs decision, with or without decision points:
+/// only while it is still in Researching, where CodeScope put it.
+pub fn moves_to_needs_decision(role: Option<ColumnRole>) -> bool {
+    role == Some(ColumnRole::Researching)
 }
 
 /// Why an item in a trigger column does not start.
@@ -138,6 +163,9 @@ pub enum Hold {
     /// Claude Code waits for a prompt in a tab on the item's worktree, but the user typed there
     /// since their last Enter, so the task would join a draft.
     UnsentInput,
+    /// Claude Code in a tab on the item's worktree is stopped, so what is typed there reaches
+    /// its shell instead.
+    SessionStopped,
     /// Something other than an idle Claude Code runs in a tab on the item's worktree, or what
     /// runs there can't be read; only the user can free that tab.
     OtherProgram,
@@ -177,6 +205,9 @@ impl Hold {
             Hold::SessionBusy => "Waits for the session in its worktree to be idle".into(),
             Hold::UnsentInput => {
                 "Waits for Enter in its session's tab: something was typed there".into()
+            }
+            Hold::SessionStopped => {
+                "Waits: its session was stopped with Ctrl+Z; type fg in its tab to resume it".into()
             }
             Hold::OtherProgram => {
                 "Waits: quit what runs in its worktree's tab, or close the tab".into()
@@ -517,9 +548,13 @@ fn handover_rules(round: Round, number: u32, repository: &str) -> Vec<String> {
                 "Write the findings to `{FINDINGS_FILE}` under the headings `## Cause`, \
                  `## Approach` and, only when something is open, `## Decision points`."
             ),
-            "Write each open choice as a heading `### B1 <question>` (B2, B3, … for the next), \
-             a sentence or two of context, the options as a list starting with **A**, **B**, \
-             … and a line `Advice: A, <reason>`."
+            "Write each open choice under `## Decision points`, the last section, as a heading \
+             `### B1 <question>` (B2, B3, … for the next), a sentence or two of context, the \
+             options as a list starting with **A**, **B**, … and a line `Advice: A, <reason>`."
+                .to_string(),
+            "Leave out images, HTML, diagrams and `<!-- dispatch` lines: CodeScope posts the \
+             file on the issue and shows such markup as text. Open each code block on a line of \
+             its own, at most three columns in, and close it."
                 .to_string(),
             format!("Don't post the findings on the issue. {board}"),
             "Stop when the file is written.".to_string(),
@@ -605,18 +640,48 @@ pub fn exclude_handover_files(worktree: &Path) -> Result<()> {
         .with_context(|| format!("write {}", path.display()))
 }
 
+/// Remove the findings of an earlier round, so they can't be taken for this round's; refuses
+/// when their folder is a link, and of a linked file removes only the link.
+pub fn clear_findings(worktree: &Path) -> Result<()> {
+    let path = worktree.join(FINDINGS_FILE);
+    if let Some(folder) = linked_part(worktree, FINDINGS_FILE).filter(|part| *part != path) {
+        bail!("{} is a link", folder.display());
+    }
+    let removed = std::fs::remove_file(&path).or_else(|err| {
+        let link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
+        if link {
+            std::fs::remove_dir(&path)
+        } else {
+            Err(err)
+        }
+    });
+    match removed {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+            Err(err).with_context(|| format!("remove {}", path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Write [`TASK_FILE`] into the worktree; refuses when the file or its folder is a link.
 pub fn write_task_file(worktree: &Path, content: &str) -> Result<()> {
-    let path = worktree.join(TASK_FILE);
-    for part in [path.parent(), Some(path.as_path())].into_iter().flatten() {
-        if std::fs::symlink_metadata(part).is_ok_and(|meta| meta.file_type().is_symlink()) {
-            bail!("{} is a link", part.display());
-        }
+    if let Some(part) = linked_part(worktree, TASK_FILE) {
+        bail!("{} is a link", part.display());
     }
+    let path = worktree.join(TASK_FILE);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     std::fs::write(&path, content).with_context(|| format!("write {}", path.display()))
+}
+
+pub(crate) fn linked_part(worktree: &Path, relative: &str) -> Option<PathBuf> {
+    let path = worktree.join(relative);
+    [path.parent(), Some(path.as_path())]
+        .into_iter()
+        .flatten()
+        .find(|part| std::fs::symlink_metadata(part).is_ok_and(|m| m.file_type().is_symlink()))
+        .map(Path::to_path_buf)
 }
 
 /// Create a dispatch's worktree at `path` on `branch`, from `remote`'s own default branch,
@@ -768,6 +833,7 @@ mod tests {
             url: "https://github.com/maui1911/CodeScope/issues/411".into(),
             round,
             trigger_at: trigger_at.into(),
+            findings: None,
         }
     }
 
@@ -1068,6 +1134,15 @@ mod tests {
     }
 
     #[test]
+    fn a_round_waiting_on_a_stopped_session_says_how_to_resume_it() {
+        assert!(!Hold::SessionStopped.is_quiet());
+        assert_eq!(
+            Hold::SessionStopped.label(),
+            "Waits: its session was stopped with Ctrl+Z; type fg in its tab to resume it"
+        );
+    }
+
+    #[test]
     fn a_round_waiting_on_another_program_says_how_to_start_it() {
         assert!(!Hold::OtherProgram.is_quiet());
         assert_eq!(
@@ -1092,6 +1167,41 @@ mod tests {
         assert_eq!(mover_to_check(&assigned, &by_you, VIEWER), None);
         assert_eq!(mover_to_check(&assigned, &by_workflow, VIEWER), None);
         assert_eq!(mover_to_check(&issue_in("y"), &by_lead, VIEWER), None);
+    }
+
+    #[test]
+    fn posted_findings_move_the_item_only_out_of_researching() {
+        assert!(moves_to_needs_decision(Some(ColumnRole::Researching)));
+        assert!(!moves_to_needs_decision(Some(ColumnRole::Todo)));
+        assert!(!moves_to_needs_decision(Some(ColumnRole::Ready)));
+        assert!(!moves_to_needs_decision(None));
+    }
+
+    #[test]
+    fn only_research_without_posted_findings_awaits_them() {
+        let mut record = dispatch(Round::Research, MOVED);
+        assert!(record.awaits_findings());
+        record.findings = Some(PostedFindings {
+            outcome: Outcome::Findings,
+            comment_url: "https://github.com/maui1911/CodeScope/issues/411#issuecomment-1".into(),
+        });
+        assert!(!record.awaits_findings());
+        assert!(!dispatch(Round::Implementation, MOVED).awaits_findings());
+    }
+
+    #[test]
+    fn the_record_round_trips_with_and_without_posted_findings() {
+        let mut record = dispatch(Round::Research, MOVED);
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(!json.contains("findings"), "{json}");
+        assert_eq!(serde_json::from_str::<WorktreeDispatch>(&json).unwrap(), record);
+        record.findings = Some(PostedFindings {
+            outcome: Outcome::DecisionPoints,
+            comment_url: "u".into(),
+        });
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains(r#""outcome":"decision-points""#), "{json}");
+        assert_eq!(serde_json::from_str::<WorktreeDispatch>(&json).unwrap(), record);
     }
 
     #[test]
@@ -1241,6 +1351,9 @@ mod tests {
         );
         assert!(research.contains(FINDINGS_FILE));
         assert!(research.contains("### B1 <question>"));
+        assert!(research.contains("under `## Decision points`, the last section"));
+        assert!(research.contains("Leave out images, HTML, diagrams and `<!-- dispatch` lines"));
+        assert!(research.contains("code block on a line of its own, at most three columns in"));
 
         let implementation = task_file(&dispatch(Round::Implementation, MOVED), None);
         assert!(implementation.contains("Implement the issue."), "{implementation}");
@@ -1351,6 +1464,9 @@ mod tests {
         std::fs::write(path.join(FINDINGS_FILE), "## Cause\n").unwrap();
         let status = run_git(&path, &["status", "--porcelain"]).unwrap();
         assert_eq!(String::from_utf8_lossy(&status.stdout), "");
+        clear_findings(&path).unwrap();
+        assert!(!path.join(FINDINGS_FILE).exists());
+        clear_findings(&path).unwrap();
 
         add_dispatch_worktree(&repo, &path, "411-fuzzy-paths", "origin").unwrap();
         assert_eq!(head(&path, "HEAD"), head(&upstream, "HEAD"), "its own worktree is kept");
@@ -1474,7 +1590,23 @@ mod tests {
         add_dispatch_worktree(&repo, &path, "14-linked", "origin").unwrap();
     }
 
-    #[cfg(unix)]
+    fn link_folder(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "{made:?}");
+        }
+    }
+
     #[test]
     fn the_task_file_is_not_written_through_a_link() {
         let dir = tempfile::tempdir().unwrap();
@@ -1482,8 +1614,56 @@ mod tests {
         std::fs::create_dir_all(&target).unwrap();
         let worktree = dir.path().join("worktree");
         std::fs::create_dir_all(&worktree).unwrap();
-        std::os::unix::fs::symlink(&target, worktree.join(".codescope")).unwrap();
+        link_folder(&target, &worktree.join(".codescope"));
         assert!(write_task_file(&worktree, "# Research\n").is_err());
         assert!(!target.join("dispatch.md").exists());
+    }
+
+    #[test]
+    fn findings_are_not_read_or_removed_through_a_linked_folder() {
+        use crate::board::findings::{Problem, read_findings};
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let theirs = elsewhere.join("findings.md");
+        std::fs::write(&theirs, "## Cause\n\nX.\n\n## Approach\n\nY.\n").unwrap();
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        link_folder(&elsewhere, &worktree.join(".codescope"));
+        let file = read_findings(&worktree).unwrap();
+        assert_eq!(file.check().unwrap_err(), vec![Problem::Link]);
+        assert!(clear_findings(&worktree).is_err());
+        assert!(theirs.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn findings_that_are_a_link_are_not_read() {
+        use crate::board::findings::{Problem, read_findings};
+        let dir = tempfile::tempdir().unwrap();
+        let theirs = dir.path().join("theirs.md");
+        std::fs::write(&theirs, "## Cause\n\nX.\n\n## Approach\n\nY.\n").unwrap();
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(worktree.join(".codescope")).unwrap();
+        std::os::unix::fs::symlink(&theirs, worktree.join(FINDINGS_FILE)).unwrap();
+        let file = read_findings(&worktree).unwrap();
+        assert_eq!(file.check().unwrap_err(), vec![Problem::Link]);
+        clear_findings(&worktree).unwrap();
+        assert!(std::fs::symlink_metadata(worktree.join(FINDINGS_FILE)).is_err());
+        assert!(theirs.exists());
+    }
+
+    #[test]
+    fn findings_that_link_to_a_folder_lose_only_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("keep.md"), "keep").unwrap();
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(worktree.join(".codescope")).unwrap();
+        link_folder(&elsewhere, &worktree.join(".codescope").join("findings.md"));
+        clear_findings(&worktree).unwrap();
+        assert!(std::fs::symlink_metadata(worktree.join(FINDINGS_FILE)).is_err());
+        assert!(elsewhere.join("keep.md").exists());
     }
 }
