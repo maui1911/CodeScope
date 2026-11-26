@@ -562,7 +562,6 @@ fn quiet(text: &str) -> String {
 }
 
 fn quiet_line(line: &str) -> String {
-    let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
     let linked = at_signs_in_web_paths(line);
     let mut quiet = String::with_capacity(line.len() + 8);
     let mut chars = line.char_indices().peekable();
@@ -576,7 +575,7 @@ fn quiet_line(line: &str) -> String {
                 quiet.push('@');
                 quiet.push(ZERO_WIDTH_SPACE);
             }
-            '/' if starts_command(line, at, indent) => {
+            '/' if starts_command(line, at) => {
                 quiet.push('/');
                 quiet.push(ZERO_WIDTH_SPACE);
             }
@@ -596,21 +595,12 @@ fn quiet_line(line: &str) -> String {
     disarm_info_strings(&quiet)
 }
 
-fn starts_command(line: &str, slash: usize, indent: usize) -> bool {
+fn starts_command(line: &str, slash: usize) -> bool {
     let before = &line[..slash];
-    let after = &line[slash + 1..];
     let word = before.trim_end_matches(|c: char| "([{\"'`*".contains(c));
     let starts_word =
         !before.ends_with("](") && word.chars().next_back().is_none_or(char::is_whitespace);
-    let name = after
-        .find(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '_' | '-'))
-        .unwrap_or(after.len());
-    let rest = &after[name..];
-    let extension = rest
-        .strip_prefix('.')
-        .is_some_and(|ext| ext.starts_with(|c: char| c.is_ascii_alphanumeric()));
-    let path = slash > indent && (rest.starts_with('/') || extension);
-    starts_word && after.starts_with(|c: char| c.is_ascii_alphanumeric()) && !path
+    starts_word && line[slash + 1..].starts_with(|c: char| c.is_ascii_alphanumeric())
 }
 
 /// GFM links a web address up to whitespace or `<`, so an `@` in its path, query or fragment
@@ -1074,7 +1064,7 @@ Advice: A, it keeps the slice small.
     }
 
     #[test]
-    fn a_slash_command_is_broken_and_paths_stay_as_they_are() {
+    fn a_slash_that_starts_a_word_is_broken_and_one_inside_a_word_is_not() {
         let z = '\u{200b}';
         assert_eq!(
             quiet("run /deploy, `/deploy`, (/deploy), \"/deploy\" or **/deploy**, then /x-y."),
@@ -1083,17 +1073,19 @@ Advice: A, it keeps the slice small.
                  then /{z}x-y."
             )
         );
-        let paths = "src/app.rs ./x ../y ~/z C:/w https://e.example/a [docs](/docs/a.md) a/b \
-                     cat /etc/hosts, GET /api/items, gh api /repos/{owner}/{repo}/issues \
-                     src/**/mod.rs docs/caf\u{e9}/menu.md https://e.example/wiki/Foo_(bar)/baz \
-                     $(pwd)/x /mod.rs packages/*/src src/**/tests \"$ROOT\"/build '$HOME'/bin";
-        assert_eq!(quiet(paths), paths);
         assert_eq!(
-            quiet("/deploy/\n  /close/x\n/approve.1\n/etc/hosts"),
-            format!("/{z}deploy/\n  /{z}close/x\n/{z}approve.1\n/{z}etc/hosts"),
-            "bots read a command at the start of a line whatever follows its name"
+            quiet("see /claude.md, cat /etc/hosts\n/deploy/\n  /close/x\n\u{a0}/deploy.prod"),
+            format!(
+                "see /{z}claude.md, cat /{z}etc/hosts\n/{z}deploy/\n  /{z}close/x\n\
+                 \u{a0}/{z}deploy.prod"
+            ),
+            "a bot may take a command after any whitespace, whatever follows its name"
         );
-        assert_eq!(quiet("[d]: /docs/a.md"), "[d]: /docs/a.md");
+        let paths = "src/app.rs ./x ../y ~/z C:/w https://e.example/a [docs](/docs/a.md) a/b \
+                     src/**/mod.rs docs/caf\u{e9}/menu.md https://e.example/wiki/Foo_(bar)/baz \
+                     $(pwd)/x packages/*/src src/**/tests \"$ROOT\"/build '$HOME'/bin";
+        assert_eq!(quiet(paths), paths);
+        assert_eq!(quiet("[d]: /docs/a.md"), format!("[d]: /{z}docs/a.md"));
         assert_eq!(quiet("// a comment and 1 / 2"), "// a comment and 1 / 2");
     }
 
