@@ -110,6 +110,8 @@ pub enum Problem {
     ListFence,
     /// A fence four or more columns into a list, which GitHub may or may not take for one.
     DeepFence,
+    /// A heading in a list item, which GitHub renders but no section of the check holds.
+    ListHeading,
     /// The file, or the folder it is in, is a link.
     Link,
     /// A folder, a pipe or a device where the file should be.
@@ -170,6 +172,11 @@ impl fmt::Display for Problem {
                 f,
                 "a code block in a list has a fence four or more columns in: keep its fences \
                  at most three columns in"
+            ),
+            Problem::ListHeading => write!(
+                f,
+                "a line in a list starts with #, which GitHub may show as a heading: keep \
+                 headings out of lists and code in fenced blocks"
             ),
             Problem::Link => write!(f, "it or its folder is a link"),
             Problem::NotAFile => write!(f, "it is not a plain file"),
@@ -372,6 +379,7 @@ struct Fences {
     less_indented: bool,
     deep: bool,
     unsure_item: bool,
+    list_heading: bool,
 }
 
 impl Fences {
@@ -404,8 +412,12 @@ impl Fences {
             || line.contains("```") || line.contains("~~~"),
             |(text, _)| Fence::at(text, 0, 0, false).is_some(),
         );
-        self.deep |= indent > 3 && self.listed && fenced;
-        self.open = if indent <= 3 && item_content(start).is_some() && !is_thematic_break(start) {
+        let headed = markers.map_or_else(|| line.contains('#'), |(text, _)| is_heading(text));
+        let marker_line = indent <= 3 && item_content(start).is_some() && !is_thematic_break(start);
+        let deep = indent > 3 && self.listed;
+        self.deep |= deep && fenced;
+        self.list_heading |= headed && (marker_line || deep);
+        self.open = if marker_line {
             self.item(start, indent, markers, fenced)
         } else {
             self.other(line, indent, after_blank)
@@ -474,6 +486,7 @@ impl Fences {
         [
             (self.unsure_item, Problem::ListFence),
             (self.deep, Problem::DeepFence),
+            (self.list_heading, Problem::ListHeading),
             (self.less_indented, Problem::UnevenFence),
             (self.open.is_some(), Problem::OpenFence),
         ]
@@ -1423,6 +1436,24 @@ Advice: A, it keeps the slice small.
     }
 
     #[test]
+    fn a_heading_github_renders_in_a_list_item_is_refused() {
+        let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n";
+        for heading in [
+            "1.  Do it.\n\n    ## Decision points\n\n    ### B1 Which?\n",
+            "- ## Decision points\n",
+            "- a\n\n    - ### B1 Which?\n",
+            "- a\n\n    1. b\n    \t# c\n",
+        ] {
+            let text = format!("{base}{heading}");
+            let problems = check_findings(&text).unwrap_err();
+            assert_eq!(problems, vec![Problem::ListHeading], "{heading:?}");
+        }
+        assert!(check_findings(&format!("{base}Y.\n\n    # a comment in code\n")).is_ok());
+        assert!(check_findings(&format!("{base}1. Run:\n   ```sh\n   # build\n   ```\n")).is_ok());
+        assert!(check_findings(&format!("{base}- a\n\nB.\n\n    # code again\n")).is_ok());
+    }
+
+    #[test]
     fn a_point_id_may_end_in_punctuation_and_every_point_needs_its_heading() {
         let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n## Decision points\n\n";
         for heading in ["### B1: Q?", "### B1. Q?", "### B1) Q?"] {
@@ -1576,6 +1607,7 @@ Advice: A, it keeps the slice small.
             Problem::UnevenFence,
             Problem::ListFence,
             Problem::DeepFence,
+            Problem::ListHeading,
             Problem::Link,
             Problem::NotAFile,
             Problem::Unreadable,
