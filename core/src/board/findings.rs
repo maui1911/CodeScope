@@ -287,8 +287,7 @@ pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
     }
 
     let near_miss = top.iter().any(|s| {
-        !s.heading.eq_ignore_ascii_case(DECISION_POINTS)
-            && s.heading.to_ascii_lowercase().contains("decision point")
+        !s.heading.eq_ignore_ascii_case(DECISION_POINTS) && names_decision_points(&s.heading)
     });
     let points_inside =
         position(DECISION_POINTS).map(|index| point_headings(&top[index].lines)).unwrap_or(0);
@@ -581,9 +580,18 @@ fn is_underline(text: &str) -> bool {
 }
 
 fn mentions_point(text: &str) -> bool {
-    let first = text.split_whitespace().next().unwrap_or("");
-    is_point_id(first.trim_end_matches([':', '.', ')']))
-        || text.to_lowercase().contains("decision point")
+    words(text).first().is_some_and(|word| is_point_id(word)) || names_decision_points(text)
+}
+
+fn names_decision_points(text: &str) -> bool {
+    words(text).windows(2).any(|pair| {
+        pair[0].eq_ignore_ascii_case("decision")
+            && (pair[1].eq_ignore_ascii_case("point") || pair[1].eq_ignore_ascii_case("points"))
+    })
+}
+
+fn words(text: &str) -> Vec<&str> {
+    text.split(|c: char| !c.is_alphanumeric()).filter(|word| !word.is_empty()).collect()
 }
 
 fn behind_containers(line: &str) -> &str {
@@ -1521,6 +1529,25 @@ Advice: A, it keeps the slice small.
         }
         let linked = format!("{base}- [docs](/docs/a.md) explain it{rest}");
         assert!(check_findings(&linked).is_ok());
+    }
+
+    #[test]
+    fn decision_points_are_named_whatever_the_spacing_or_emphasis_between_the_words() {
+        let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n";
+        for spelled in ["## Decision  points\n\nX.\n", "## Decision\tpoints\n\nX.\n"] {
+            let problems = check_findings(&format!("{base}{spelled}")).unwrap_err();
+            assert_eq!(problems, vec![Problem::DecisionPointsHeading], "{spelled:?}");
+        }
+        for hidden in [
+            "> ## *Decision* points\n",
+            "**Decision**  points\n---\n",
+            "- Decision-points\n  ===\n",
+            "> ### **B1** Which?\n",
+        ] {
+            let problems = check_findings(&format!("{base}{hidden}")).unwrap_err();
+            assert_eq!(problems, vec![Problem::HiddenPoint], "{hidden:?}");
+        }
+        assert!(check_findings(&format!("{base}> ## Decisions and their points\n")).is_ok());
     }
 
     #[test]
