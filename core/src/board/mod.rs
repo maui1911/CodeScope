@@ -146,7 +146,11 @@ impl Board {
 
     /// The role of the column an item is in, if that column has one.
     pub fn role_of(&self, item: &BoardItem, mapping: &ColumnMapping) -> Option<ColumnRole> {
-        let column_id = item.column_id.as_deref()?;
+        self.role_of_column(item.column_id.as_deref()?, mapping)
+    }
+
+    /// The role of the column with id `column_id`, if it has one.
+    pub fn role_of_column(&self, column_id: &str, mapping: &ColumnMapping) -> Option<ColumnRole> {
         ColumnRole::ALL.into_iter().find(|role| {
             mapped_column(self, mapping, *role).is_some_and(|c| c.id == column_id)
         })
