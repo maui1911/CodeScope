@@ -56,8 +56,8 @@ pub enum Round {
 }
 
 impl Round {
-    /// The round a move into `role` starts. Ready starts implementation until the round's pull
-    /// request is known, which a review round needs.
+    /// The round a move into `role` starts, before [`decide`] knows whether the dispatch's pull
+    /// request is open: Ready starts implementation.
     pub fn after_move(role: ColumnRole) -> Option<Round> {
         match role {
             ColumnRole::Research => Some(Round::Research),
@@ -161,6 +161,9 @@ pub enum Hold {
     SeveralProjects(String),
     NoProgressColumn(ColumnRole),
     LimitReached(usize),
+    /// The dispatch opened a pull request that no read since CodeScope started has seen, so
+    /// whether Ready reviews it or implements again is not known yet.
+    PullRequestUnread,
     /// A session runs in the item's worktree and isn't waiting for a prompt, so the task can't
     /// be handed to it yet.
     SessionBusy,
@@ -206,6 +209,7 @@ impl Hold {
                 format!("Add a column {} to the board to start", role.label())
             }
             Hold::LimitReached(limit) => format!("Waits: {limit} dispatches are running"),
+            Hold::PullRequestUnread => "Waits for its pull request to be read".into(),
             Hold::SessionBusy => "Waits for the session in its worktree to be idle".into(),
             Hold::UnsentInput => {
                 "Waits for Enter in its session's tab: something was typed there".into()
@@ -235,9 +239,23 @@ pub struct Facts<'a> {
     pub projects: usize,
     /// This user's dispatch of the item, if any.
     pub dispatch: Option<&'a WorktreeDispatch>,
+    /// The pull request that dispatch opened, as the board poll last read it.
+    pub pull_request: OwnPullRequest,
     /// This user's dispatches that are running now.
     pub running: usize,
     pub limit: usize,
+}
+
+/// The pull request the user's dispatch of an item opened, as far as the board poll knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnPullRequest {
+    /// The dispatch reported none.
+    NotOpened,
+    /// Reported, but not read since CodeScope started.
+    Unread,
+    Open,
+    /// Merged or closed.
+    Closed,
 }
 
 /// The round a move into a trigger column starts, or why it doesn't. `None` when the item is
@@ -249,8 +267,19 @@ pub fn decide(
     facts: &Facts,
 ) -> Option<Result<Round, Hold>> {
     let role = board.role_of(item, mapping)?;
-    let round = Round::after_move(role)?;
-    Some(check(board, mapping, item, facts, round).map(|()| round))
+    let moved_to = Round::after_move(role)?;
+    Some(
+        check(board, mapping, item, facts, moved_to)
+            .and_then(|()| round_on(moved_to, facts.pull_request)),
+    )
+}
+
+fn round_on(moved_to: Round, pull_request: OwnPullRequest) -> Result<Round, Hold> {
+    match (moved_to, pull_request) {
+        (Round::Implementation, OwnPullRequest::Open) => Ok(Round::Review),
+        (Round::Implementation, OwnPullRequest::Unread) => Err(Hold::PullRequestUnread),
+        (round, _) => Ok(round),
+    }
 }
 
 fn check(
@@ -831,6 +860,7 @@ mod tests {
             board_added_at: ADDED,
             projects: 1,
             dispatch: None,
+            pull_request: OwnPullRequest::NotOpened,
             running: 0,
             limit: DEFAULT_DISPATCH_LIMIT,
         }
@@ -878,7 +908,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_implements_until_a_pull_request_is_known() {
+    fn ready_reviews_the_open_pull_request_the_dispatch_opened_and_implements_otherwise() {
         let change = moved_by(VIEWER, "Ready");
         let researched = dispatch(Round::Research, "2026-11-25T09:30:00Z");
         let implemented = dispatch(Round::Implementation, "2026-11-25T09:30:00Z");
@@ -886,8 +916,9 @@ mod tests {
             dispatch: Some(&researched),
             ..facts(&change)
         };
-        let after_implementation = Facts {
+        let after = |pull_request| Facts {
             dispatch: Some(&implemented),
+            pull_request,
             ..facts(&change)
         };
         assert_eq!(
@@ -895,9 +926,46 @@ mod tests {
             Some(Ok(Round::Implementation))
         );
         assert_eq!(
-            run_decide(issue_in("y"), &after_implementation),
-            Some(Ok(Round::Implementation))
+            run_decide(issue_in("y"), &after(OwnPullRequest::Open)),
+            Some(Ok(Round::Review))
         );
+        assert_eq!(
+            run_decide(issue_in("y"), &after(OwnPullRequest::Unread)),
+            Some(Err(Hold::PullRequestUnread))
+        );
+        for gone in [OwnPullRequest::Closed, OwnPullRequest::NotOpened] {
+            assert_eq!(
+                run_decide(issue_in("y"), &after(gone)),
+                Some(Ok(Round::Implementation)),
+                "{gone:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn research_stays_research_whatever_the_pull_request_does() {
+        let change = moved_by(VIEWER, "Research");
+        let implemented = dispatch(Round::Implementation, "2026-11-25T09:30:00Z");
+        for pull_request in [OwnPullRequest::Open, OwnPullRequest::Unread] {
+            let after = Facts {
+                dispatch: Some(&implemented),
+                pull_request,
+                ..facts(&change)
+            };
+            assert_eq!(run_decide(issue_in("r"), &after), Some(Ok(Round::Research)));
+        }
+    }
+
+    #[test]
+    fn an_unread_pull_request_waits_behind_every_other_reason() {
+        let change = moved_by(VIEWER, "Ready");
+        let started = dispatch(Round::Implementation, MOVED);
+        let handled = Facts {
+            dispatch: Some(&started),
+            pull_request: OwnPullRequest::Unread,
+            ..facts(&change)
+        };
+        assert_eq!(run_decide(issue_in("y"), &handled), Some(Err(Hold::Handled)));
     }
 
     #[test]

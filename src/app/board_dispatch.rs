@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 
 use codescope_core::agents::claude::live_session;
 use codescope_core::board::dispatch::{
-    FINDINGS_FILE, Facts, Hold, PostedFindings, ProjectRemotes, Round, StatusChange,
-    WorktreeDispatch, add_dispatch_worktree, branch_name, clear_findings, counts_towards_limit,
-    decide, exclude_handover_files, find_skill, launch_with_task, mover_to_check,
-    moves_to_needs_decision, projects_for_repository, task_file, task_message,
+    FINDINGS_FILE, Facts, Hold, OwnPullRequest, PostedFindings, ProjectRemotes, Round,
+    StatusChange, WorktreeDispatch, add_dispatch_worktree, branch_name, clear_findings,
+    counts_towards_limit, decide, exclude_handover_files, find_skill, launch_with_task,
+    mover_to_check, moves_to_needs_decision, projects_for_repository, task_file, task_message,
     trigger_content_ids, write_task_file,
 };
 use codescope_core::board::answers::{
@@ -81,13 +81,16 @@ pub(crate) struct DispatchState {
     discussions: HashMap<String, Discussion>,
     /// Items the Decide dialog moved to Ready, until their implementation round starts.
     readied: HashSet<String>,
-    /// Item id → the pull request and session of its implementation round.
+    /// Item id → the pull request and session of its implementation or review round.
     watches: HashMap<String, PullRequestWatch>,
 }
 
-/// What the board poll knows about an implementation round's pull request and session.
+/// What the board poll knows about the pull request of an implementation or review round, and
+/// about the round's session.
 #[derive(Default)]
 struct PullRequestWatch {
+    /// The round the session fields below follow, by when its move was made.
+    round: Option<String>,
     reading: bool,
     /// When the last read started, whether it worked or not.
     read_at: Option<Instant>,
@@ -113,6 +116,25 @@ struct PullRequestWatch {
 }
 
 impl PullRequestWatch {
+    /// Follow the round started at `trigger_at`, forgetting what the session did in the one
+    /// before; what was read of the pull request, and calls still under way, stay.
+    fn follow(&mut self, trigger_at: &str) {
+        if self.round.as_deref() == Some(trigger_at) {
+            return;
+        }
+        *self = PullRequestWatch {
+            round: Some(trigger_at.to_string()),
+            reading: self.reading,
+            read_at: self.read_at,
+            read_ok_at: self.read_ok_at,
+            pull_request: self.pull_request.take(),
+            reporting: self.reporting,
+            moving: self.moving,
+            marking_ready: self.marking_ready,
+            ..PullRequestWatch::default()
+        };
+    }
+
     fn track(&mut self, session: Option<(SessionState, u32)>) {
         let Some((state, turns)) = session else {
             self.idle_since = None;
@@ -137,13 +159,17 @@ impl PullRequestWatch {
     }
 
     /// Every 30 s while the item is in In progress or In review or its pull request is open, and
-    /// right after the session stops.
-    fn read_due(&self, role: Option<ColumnRole>) -> bool {
+    /// right after the session stops; and for a `posted` pull request until a read works,
+    /// wherever the item is, so a move to Ready can tell a review round from an implementation.
+    fn read_due(&self, role: Option<ColumnRole>, posted: bool) -> bool {
         let open = self
             .pull_request
             .as_ref()
             .is_some_and(|pr| pr.state == PullRequestState::Open);
-        let watched = open || matches!(role, Some(ColumnRole::InProgress | ColumnRole::InReview));
+        let unread = posted && self.read_ok_at.is_none();
+        let watched = open
+            || unread
+            || matches!(role, Some(ColumnRole::InProgress | ColumnRole::InReview));
         if self.reading || !watched {
             return false;
         }
@@ -154,6 +180,20 @@ impl PullRequestWatch {
             || self.idle_since.is_some_and(|idle| read_at < idle)
     }
 
+    /// What the last read that worked says of the `posted` pull request.
+    fn own_pull_request(&self, posted: bool) -> OwnPullRequest {
+        if !posted {
+            return OwnPullRequest::NotOpened;
+        }
+        if self.read_ok_at.is_none() {
+            return OwnPullRequest::Unread;
+        }
+        match &self.pull_request {
+            Some(pr) if pr.state == PullRequestState::Open => OwnPullRequest::Open,
+            _ => OwnPullRequest::Closed,
+        }
+    }
+
     /// The session worked and stopped, and a read since then found no pull request.
     fn waits_for_you(&self) -> bool {
         self.busy_seen
@@ -162,6 +202,19 @@ impl PullRequestWatch {
                 .idle_since
                 .zip(self.read_ok_at)
                 .is_some_and(|(idle, read)| read > idle)
+    }
+}
+
+fn own_pull_request(
+    record: Option<&WorktreeDispatch>,
+    watch: Option<&PullRequestWatch>,
+) -> OwnPullRequest {
+    let posted = record.is_some_and(|r| r.pull_request.is_some())
+        || watch.is_some_and(|w| w.reported.is_some());
+    match watch {
+        Some(watch) => watch.own_pull_request(posted),
+        None if posted => OwnPullRequest::Unread,
+        None => OwnPullRequest::NotOpened,
     }
 }
 
@@ -938,6 +991,7 @@ impl AppShell {
                         .map(|r| projects_for_repository(&state.remotes, r).len())
                         .unwrap_or(0),
                     dispatch: record,
+                    pull_request: own_pull_request(record, state.watches.get(&item.id)),
                     running,
                     limit,
                 };
@@ -1097,6 +1151,16 @@ impl AppShell {
                 since: previous.trigger_at.clone(),
             })
         });
+        let reported = self.board.dispatch.watches.get(&item.id).and_then(|w| w.reported.clone());
+        let pull_request = previous
+            .as_ref()
+            .and_then(|previous| previous.pull_request.clone())
+            .or(reported)
+            .filter(|_| round == Round::Review)
+            .map(|posted| PostedPullRequest {
+                in_review: false,
+                ..posted
+            });
         let mut title = codescope_core::TabTitle::project(project.name.clone());
         title.set_branch(&branch);
         let launch = Launch {
@@ -1123,7 +1187,7 @@ impl AppShell {
                 round,
                 trigger_at: trigger_at.clone(),
                 findings: None,
-                pull_request: None,
+                pull_request,
             },
             assign_to: item.assignees.is_empty().then_some(content_id),
             board,
@@ -1673,14 +1737,14 @@ impl AppShell {
         Some((board.clone(), column.id.clone()))
     }
 
-    /// Watch the pull request of every implementation round: read it, report it on the issue
-    /// once, move the item to In review once it is ready, and ring the bell when the session
-    /// stopped without one.
+    /// Watch the pull request of every implementation and review round: read it; for an
+    /// implementation round, report it on the issue once, move the item to In review once it is
+    /// ready, and ring the bell when the session stopped without one.
     pub(crate) fn watch_pull_requests(&mut self, cx: &mut Context<Self>) {
         let records: Vec<_> = self
             .dispatch_records(cx)
             .into_iter()
-            .filter(|(_, _, _, r)| r.round == Round::Implementation)
+            .filter(|(_, _, _, r)| matches!(r.round, Round::Implementation | Round::Review))
             .collect();
         self.board
             .dispatch
@@ -1700,10 +1764,11 @@ impl AppShell {
                 .watches
                 .entry(record.item_id.clone())
                 .or_default();
+            watch.follow(&record.trigger_at);
             watch.track(session);
-            let read = watch.read_due(role);
-            watch.reading |= read;
             let posted = record.pull_request.as_ref().or(watch.reported.as_ref());
+            let read = watch.read_due(role, posted.is_some());
+            watch.reading |= read;
             let found = watch
                 .pull_request
                 .clone()
@@ -1711,7 +1776,8 @@ impl AppShell {
             let report = found
                 .clone()
                 .filter(|_| posted.is_none() && !watch.reporting && retry_due(&watch.report_error));
-            let move_it = posted.is_some_and(|p| !p.in_review)
+            let move_it = record.round == Round::Implementation
+                && posted.is_some_and(|p| !p.in_review)
                 && found.is_some_and(|pr| moves_to_in_review(&pr, role))
                 && !watch.moving
                 && retry_due(&watch.move_error);
@@ -2624,6 +2690,22 @@ mod tests {
         }
     }
 
+    fn record_with(pull_request: Option<PostedPullRequest>) -> WorktreeDispatch {
+        WorktreeDispatch {
+            board_url: "https://github.com/users/maui1911/projects/1".into(),
+            item_id: "PVTI_1".into(),
+            content_id: "I_1".into(),
+            repository: "maui1911/CodeScope".into(),
+            number: 426,
+            title: "Review round".into(),
+            url: "https://github.com/maui1911/CodeScope/issues/426".into(),
+            round: Round::Implementation,
+            trigger_at: "2026-11-25T09:00:00Z".into(),
+            findings: None,
+            pull_request,
+        }
+    }
+
     #[test]
     fn a_draft_needs_testing_by_hand_and_offers_ready_for_review() {
         let watch = PullRequestWatch {
@@ -2676,15 +2758,69 @@ mod tests {
     #[test]
     fn a_stop_reads_the_pull_request_again_at_once() {
         let mut watch = PullRequestWatch::default();
-        assert!(watch.read_due(Some(ColumnRole::InProgress)));
-        assert!(!watch.read_due(Some(ColumnRole::Done)), "no open pull request to follow");
+        assert!(watch.read_due(Some(ColumnRole::InProgress), false));
+        assert!(!watch.read_due(Some(ColumnRole::Done), false), "no open pull request to follow");
         watch.read_at = Some(Instant::now());
-        assert!(!watch.read_due(Some(ColumnRole::InProgress)));
+        assert!(!watch.read_due(Some(ColumnRole::InProgress), false));
         watch.track(Some((SessionState::Busy, 4)));
         watch.track(Some((SessionState::Idle, 4)));
-        assert!(watch.read_due(Some(ColumnRole::InProgress)));
+        assert!(watch.read_due(Some(ColumnRole::InProgress), false));
         watch.reading = true;
-        assert!(!watch.read_due(Some(ColumnRole::InProgress)));
+        assert!(!watch.read_due(Some(ColumnRole::InProgress), false));
+    }
+
+    #[test]
+    fn a_reported_pull_request_is_read_once_wherever_the_item_is() {
+        let mut watch = PullRequestWatch::default();
+        assert!(!watch.read_due(Some(ColumnRole::Ready), false));
+        assert!(watch.read_due(Some(ColumnRole::Ready), true));
+        watch.read_at = Some(Instant::now() - PULL_REQUEST_READ_EVERY);
+        assert!(watch.read_due(Some(ColumnRole::Ready), true), "the last read failed");
+        watch.read_ok_at = watch.read_at;
+        assert!(!watch.read_due(Some(ColumnRole::Ready), true), "read, and found it closed");
+        watch.pull_request = Some(open_pull_request(9, false, Checks::Passing));
+        assert!(watch.read_due(Some(ColumnRole::Ready), true), "open, so followed every 30 s");
+    }
+
+    #[test]
+    fn ready_reviews_only_a_pull_request_a_read_found_open() {
+        let mut watch = PullRequestWatch::default();
+        assert_eq!(watch.own_pull_request(false), OwnPullRequest::NotOpened);
+        assert_eq!(watch.own_pull_request(true), OwnPullRequest::Unread);
+        let reported = record_with(Some(posted(9)));
+        assert_eq!(own_pull_request(Some(&reported), None), OwnPullRequest::Unread);
+        assert_eq!(own_pull_request(Some(&record_with(None)), None), OwnPullRequest::NotOpened);
+        assert_eq!(own_pull_request(None, None), OwnPullRequest::NotOpened);
+        watch.read_ok_at = Some(Instant::now());
+        assert_eq!(watch.own_pull_request(true), OwnPullRequest::Closed);
+        watch.pull_request = Some(PullRequest {
+            state: PullRequestState::Merged,
+            ..open_pull_request(9, false, Checks::Passing)
+        });
+        assert_eq!(watch.own_pull_request(true), OwnPullRequest::Closed);
+        watch.pull_request = Some(open_pull_request(9, true, Checks::Running));
+        assert_eq!(watch.own_pull_request(true), OwnPullRequest::Open);
+        watch.reported = Some(posted(9));
+        let record = record_with(None);
+        assert_eq!(own_pull_request(Some(&record), Some(&watch)), OwnPullRequest::Open);
+    }
+
+    #[test]
+    fn a_new_round_forgets_the_session_but_keeps_the_pull_request() {
+        let mut watch = PullRequestWatch::default();
+        watch.follow("2026-11-25T09:00:00Z");
+        watch.track(Some((SessionState::Busy, 4)));
+        watch.track(Some((SessionState::Idle, 5)));
+        watch.read_ok_at = Some(Instant::now());
+        watch.pull_request = Some(open_pull_request(9, false, Checks::Passing));
+        watch.follow("2026-11-25T09:00:00Z");
+        assert!(watch.busy_seen, "the same round");
+        watch.follow("2026-11-26T10:00:00Z");
+        assert!(!watch.busy_seen);
+        assert_eq!(watch.idle_since, None);
+        assert_eq!(watch.turns, None);
+        assert!(watch.read_ok_at.is_some());
+        assert_eq!(watch.pull_request.as_ref().map(|pr| pr.number), Some(9));
     }
 
     #[test]
