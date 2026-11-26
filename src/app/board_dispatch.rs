@@ -62,6 +62,7 @@ pub(crate) struct DispatchState {
     reminders: HashMap<RoundKey, Reminder>,
     /// Rounds whose findings wait for a program in a tab on their worktree that isn't an agent.
     findings_held: HashSet<RoundKey>,
+    findings_announced: HashSet<RoundKey>,
 }
 
 /// A round: the board item's id and when the move that started the round was made.
@@ -98,7 +99,6 @@ struct Posting {
 
 struct Posted {
     url: String,
-    adopted: bool,
     move_error: Option<String>,
 }
 
@@ -1029,6 +1029,7 @@ impl AppShell {
         let state = &mut self.board.dispatch;
         state.reminders.retain(|key, _| awaiting.contains(key));
         state.post_errors.retain(|key, _| awaiting.contains(key));
+        state.findings_announced.retain(|key| awaiting.contains(key));
         let held_before = std::mem::take(&mut state.findings_held);
 
         for (_, path, _, record) in records {
@@ -1180,7 +1181,6 @@ impl AppShell {
                     let failed = |err: anyhow::Error| format!("{err:#}");
                     let before = github::before_posting(&item_id, &content_id, &since, &body)
                         .map_err(failed)?;
-                    let adopted = before.posted.is_some();
                     let url = match before.posted {
                         Some(url) => url,
                         None => github::add_comment(&content_id, &body).map_err(failed)?,
@@ -1199,11 +1199,7 @@ impl AppShell {
                             None => Some("the board has no Needs decision column".to_string()),
                         }
                     };
-                    Ok::<_, String>(Posted {
-                        url,
-                        adopted,
-                        move_error,
-                    })
+                    Ok::<_, String>(Posted { url, move_error })
                 })
                 .await;
             let _ = this.update(cx, |this, cx| this.finish_posting(posting, result, cx));
@@ -1225,11 +1221,7 @@ impl AppShell {
         let key = round_key(&record);
         self.board.dispatch.posting.remove(&key);
         cx.notify();
-        let Posted {
-            url,
-            adopted,
-            move_error,
-        } = match result {
+        let Posted { url, move_error } = match result {
             Ok(posted) => posted,
             Err(message) => {
                 let note = format!("Couldn't post the findings: {message}");
@@ -1247,6 +1239,7 @@ impl AppShell {
             }
         };
 
+        let first_news = self.board.dispatch.findings_announced.insert(key.clone());
         let posted = PostedFindings {
             outcome,
             comment_url: url,
@@ -1272,7 +1265,7 @@ impl AppShell {
                 self.board.dispatch.post_errors.insert(key, (Instant::now(), note));
             }
         }
-        if adopted && move_error.is_none() {
+        if !first_news && move_error.is_none() {
             return;
         }
 
