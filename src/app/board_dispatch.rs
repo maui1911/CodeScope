@@ -2,7 +2,9 @@
 //! into a trigger column, in a worktree of its own with an agent session on it. When a research
 //! round's session is idle with its findings written, post them on the issue, then read the
 //! answers to its decision points and hand them to the implementation round. Watch that round's
-//! pull request, report it on the issue and move the item to In review when it is ready.
+//! pull request, report it on the issue and move the item to In review when it is ready. A
+//! review round on it posts the agent's reply on the pull request and reports it again once its
+//! session is done.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -10,11 +12,11 @@ use std::time::{Duration, Instant};
 
 use codescope_core::agents::claude::live_session;
 use codescope_core::board::dispatch::{
-    FINDINGS_FILE, Facts, Hold, OwnPullRequest, PostedFindings, ProjectRemotes, Round,
-    StatusChange, WorktreeDispatch, add_dispatch_worktree, branch_name, clear_findings,
-    counts_towards_limit, decide, exclude_handover_files, find_skill, launch_with_task,
-    mover_to_check, moves_to_needs_decision, projects_for_repository, task_file, task_message,
-    trigger_content_ids, write_task_file,
+    FINDINGS_FILE, Facts, Hold, OwnPullRequest, PostedFindings, ProjectRemotes, REPLY_FILE,
+    ReviewRound, Round, StatusChange, WorktreeDispatch, add_dispatch_worktree, branch_name,
+    clear_findings, clear_reply, counts_towards_limit, decide, exclude_handover_files,
+    find_skill, launch_with_task, mover_to_check, moves_to_needs_decision,
+    projects_for_repository, task_file, task_message, trigger_content_ids, write_task_file,
 };
 use codescope_core::board::answers::{
     Answer, Comment, after_findings, answer_body, answers_section, choices_text, chosen,
@@ -27,8 +29,9 @@ use codescope_core::board::findings::{
 use codescope_core::board::github::{self, Viewer};
 use codescope_core::board::pull_request::{
     Checks, PostedPullRequest, PullRequest, PullRequestState, moves_to_in_review,
-    pull_request_comment, round_pull_request,
+    pull_request_comment, review_round_worked, round_pull_request,
 };
+use codescope_core::board::reply::{read_reply, reply_problems_message};
 use codescope_core::board::{
     Board, BoardItem, BoardRef, ColumnMapping, ColumnRole, effective_mapping, mapped_column,
 };
@@ -113,6 +116,13 @@ struct PullRequestWatch {
     moving: bool,
     move_error: Option<(Instant, String)>,
     marking_ready: bool,
+    ending_review: bool,
+    review_end_error: Option<(Instant, String)>,
+    stop_without_result: Option<Instant>,
+    review_reply_url: Option<String>,
+    review_report_url: Option<String>,
+    reply_reminder: Option<Reminder>,
+    review_held: Option<HeldBy>,
 }
 
 impl PullRequestWatch {
@@ -131,6 +141,7 @@ impl PullRequestWatch {
             reporting: self.reporting,
             moving: self.moving,
             marking_ready: self.marking_ready,
+            ending_review: self.ending_review,
             ..PullRequestWatch::default()
         };
     }
@@ -196,12 +207,134 @@ impl PullRequestWatch {
 
     /// The session worked and stopped, and a read since then found no pull request.
     fn waits_for_you(&self) -> bool {
+        self.pull_request.is_none() && self.stopped_after_work()
+    }
+
+    fn stopped_after_work(&self) -> bool {
         self.busy_seen
-            && self.pull_request.is_none()
             && self
                 .idle_since
                 .zip(self.read_ok_at)
                 .is_some_and(|(idle, read)| read > idle)
+    }
+
+    fn stopped_without_result(&self) -> bool {
+        self.stop_without_result.is_some() && self.stop_without_result == self.idle_since
+    }
+}
+
+fn review_round(record: &WorktreeDispatch, watch: &PullRequestWatch) -> ReviewRound {
+    let mut review = record.review.clone().unwrap_or_default();
+    review.reply_url = review.reply_url.or_else(|| watch.review_reply_url.clone());
+    review.report_url = review.report_url.or_else(|| watch.review_report_url.clone());
+    review
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewSession {
+    Working,
+    Held(HeldBy),
+    Claude {
+        stopped_after_work: bool,
+        stop_checked: bool,
+    },
+    Settled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReviewStep {
+    Wait,
+    Held(HeldBy),
+    FixReply(Vec<Problem>),
+    End {
+        reply: Option<String>,
+        check_threads: bool,
+    },
+}
+
+fn review_step(
+    pr: &PullRequest,
+    review: &ReviewRound,
+    reply: Option<Result<Option<String>, Vec<Problem>>>,
+    session: ReviewSession,
+) -> ReviewStep {
+    let reply = reply.filter(|_| review.reply_url.is_none());
+    let pushed = review.start_head.as_deref().is_some_and(|start| start != pr.head_oid);
+    let wrote = matches!(reply, Some(Err(_) | Ok(Some(_))));
+    let result = pushed || wrote || review.reply_url.is_some();
+    let check_threads = match session {
+        ReviewSession::Working | ReviewSession::Claude {
+            stopped_after_work: false,
+            ..
+        } => return ReviewStep::Wait,
+        ReviewSession::Held(by) if result => return ReviewStep::Held(by),
+        ReviewSession::Held(_) => return ReviewStep::Wait,
+        ReviewSession::Claude { stop_checked, .. } => !stop_checked,
+        ReviewSession::Settled => false,
+    };
+    match reply {
+        Some(Err(problems)) => ReviewStep::FixReply(problems),
+        Some(Ok(Some(body))) => ReviewStep::End {
+            reply: Some(body),
+            check_threads: false,
+        },
+        _ if result || check_threads => ReviewStep::End {
+            reply: None,
+            check_threads: !result,
+        },
+        _ => ReviewStep::Wait,
+    }
+}
+
+struct ReviewEnd {
+    item_id: String,
+    content_id: String,
+    since: String,
+    pr: PullRequest,
+    start_head: Option<String>,
+    reply: Option<String>,
+    check_threads: bool,
+}
+
+struct ReviewEnded {
+    reply_url: Option<String>,
+    report_url: Result<Option<String>, String>,
+}
+
+fn post_review_end(end: &ReviewEnd) -> ReviewEnded {
+    let mut reply_url = None;
+    let report_url = report_review_end(end, &mut reply_url);
+    ReviewEnded {
+        reply_url,
+        report_url,
+    }
+}
+
+fn report_review_end(
+    end: &ReviewEnd,
+    reply_url: &mut Option<String>,
+) -> Result<Option<String>, String> {
+    if end.check_threads {
+        let replied_at =
+            github::fetch_last_thread_reply(&end.pr.id).map_err(|err| format!("{err:#}"))?;
+        let start = end.start_head.as_deref();
+        if !review_round_worked(start, &end.pr.head_oid, replied_at.as_deref(), &end.since) {
+            return Ok(None);
+        }
+    }
+    if let Some(body) = &end.reply {
+        *reply_url = Some(post_once(&end.item_id, &end.pr.id, &end.since, body)?);
+    }
+    let report = pull_request_comment(&end.pr, Round::Review);
+    post_once(&end.item_id, &end.content_id, &end.since, &report).map(Some)
+}
+
+fn post_once(item_id: &str, subject_id: &str, since: &str, body: &str) -> Result<String, String> {
+    let failed = |err: anyhow::Error| format!("{err:#}");
+    let before = github::before_posting(item_id, subject_id, since, body).map_err(failed)?;
+    match before.posted {
+        Some(url) => Ok(url),
+        None => github::add_comment(subject_id, body).map_err(failed),
     }
 }
 
@@ -276,11 +409,29 @@ pub(crate) struct AnswerPost {
     pub move_to_ready: bool,
 }
 
+#[derive(Default)]
 struct Reminder {
     problems: String,
     /// The version of the file the last reminder was about.
     file: Option<FileStamp>,
     sent: u32,
+}
+
+impl Reminder {
+    fn note(&mut self, problems: &[Problem], file: FileStamp, can_send: bool) -> bool {
+        self.problems = problems_list(problems);
+        let due = can_send && self.file != Some(file) && self.sent < MAX_REMINDERS;
+        if due {
+            self.file = Some(file);
+            self.sent += 1;
+        }
+        due
+    }
+}
+
+struct Notice {
+    title: String,
+    detail: String,
 }
 
 enum SessionAt {
@@ -745,8 +896,10 @@ fn prepare_worktree(job: &Job) -> anyhow::Result<()> {
         add_dispatch_worktree(&job.repo, &job.path, &job.branch, &job.remote)?;
     }
     exclude_handover_files(&job.path)?;
-    if job.record.round == Round::Research {
-        clear_findings(&job.path)?;
+    match job.record.round {
+        Round::Research => clear_findings(&job.path)?,
+        Round::Review => clear_reply(&job.path)?,
+        Round::Implementation => {}
     }
     let home = codescope_core::paths::home_dir();
     let skill = find_skill(&job.path, home.as_deref(), job.record.round.skill()).map(|skill| {
@@ -1151,7 +1304,12 @@ impl AppShell {
                 since: previous.trigger_at.clone(),
             })
         });
-        let reported = self.board.dispatch.watches.get(&item.id).and_then(|w| w.reported.clone());
+        let watch = self.board.dispatch.watches.get(&item.id);
+        let reported = watch.and_then(|w| w.reported.clone());
+        let review = (round == Round::Review).then(|| ReviewRound {
+            start_head: watch.and_then(|w| w.pull_request.as_ref()).map(|pr| pr.head_oid.clone()),
+            ..ReviewRound::default()
+        });
         let pull_request = previous
             .as_ref()
             .and_then(|previous| previous.pull_request.clone())
@@ -1188,7 +1346,7 @@ impl AppShell {
                 trigger_at: trigger_at.clone(),
                 findings: None,
                 pull_request,
-                review: None,
+                review,
             },
             assign_to: item.assignees.is_empty().then_some(content_id),
             board,
@@ -1513,35 +1671,62 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) {
         let reminders = &mut self.board.dispatch.reminders;
-        let reminder = reminders.entry(round_key(record)).or_insert(Reminder {
-            problems: String::new(),
-            file: None,
-            sent: 0,
-        });
-        reminder.problems = problems_list(problems);
+        let reminder = reminders.entry(round_key(record)).or_default();
+        let due = reminder.note(problems, file, !matches!(remind, Remind::Nothing));
         cx.notify();
-        let due = reminder.file != Some(file) && reminder.sent < MAX_REMINDERS;
-        if !due || matches!(remind, Remind::Nothing) {
+        if !due {
             return;
         }
-        reminder.file = Some(file);
-        reminder.sent += 1;
-        let listed = reminder.problems.clone();
+        let listed = &reminder.problems;
+        let notice = Notice {
+            title: format!("Findings on #{} can't be posted yet", record.number),
+            detail: format!("{listed}. Fix {FINDINGS_FILE}, or have its session fix it."),
+        };
+        self.send_reminder(remind, problems_message(problems), notice, path, cx);
+    }
+
+    fn remind_reply(
+        &mut self,
+        record: &WorktreeDispatch,
+        path: &Path,
+        file: FileStamp,
+        remind: Remind,
+        problems: &[Problem],
+        cx: &mut Context<Self>,
+    ) {
+        let Some(watch) = self.board.dispatch.watches.get_mut(&record.item_id) else {
+            return;
+        };
+        let reminder = watch.reply_reminder.get_or_insert_with(Reminder::default);
+        let due = reminder.note(problems, file, !matches!(remind, Remind::Nothing));
+        cx.notify();
+        if !due {
+            return;
+        }
+        let listed = &reminder.problems;
+        let notice = Notice {
+            title: format!("The reply on #{} can't be posted yet", record.number),
+            detail: format!("{listed}. Fix {REPLY_FILE}, or have its session fix it."),
+        };
+        self.send_reminder(remind, reply_problems_message(problems), notice, path, cx);
+    }
+
+    fn send_reminder(
+        &mut self,
+        remind: Remind,
+        message: String,
+        notice: Notice,
+        path: &Path,
+        cx: &mut Context<Self>,
+    ) {
         match remind {
-            Remind::Typing(terminal) => {
-                Self::submit_line(&terminal, problems_message(problems), cx);
-            }
+            Remind::Typing(terminal) => Self::submit_line(&terminal, message, cx),
             Remind::Notice => {
-                let title = format!("Findings on #{} can't be posted yet", record.number);
-                let detail = format!("{listed}. Fix {FINDINGS_FILE}, or have its session fix it.");
+                let Notice { title, detail } = notice;
                 self.push_toast(ToastKind::Err, title.clone(), Some(detail.clone().into()), cx);
-                self.push_notification(
-                    crate::notifications::NotificationKind::SessionWaiting,
-                    title,
-                    detail,
-                    self.tab_title_at(path),
-                    cx,
-                );
+                let tab_title = self.tab_title_at(path);
+                let kind = NotificationKind::SessionWaiting;
+                self.push_notification(kind, title, detail, tab_title, cx);
             }
             Remind::Nothing => {}
         }
@@ -1738,9 +1923,10 @@ impl AppShell {
         Some((board.clone(), column.id.clone()))
     }
 
-    /// Watch the pull request of every implementation and review round: read it; for an
-    /// implementation round, report it on the issue once, move the item to In review once it is
-    /// ready, and ring the bell when the session stopped without one.
+    /// Watch the pull request of every implementation and review round: read it; report it on
+    /// the issue once per round, an implementation's as soon as it is open and a review's once
+    /// its session is done; then move the item to In review once it is ready. Ring the bell when
+    /// a session stopped without a result.
     pub(crate) fn watch_pull_requests(&mut self, cx: &mut Context<Self>) {
         let records: Vec<_> = self
             .dispatch_records(cx)
@@ -1759,6 +1945,7 @@ impl AppShell {
             let session = self
                 .telemetry_at(&path)
                 .map(|snapshot| (super::notified_state(&snapshot), snapshot.turn_count));
+            let claude = session.is_some();
             let watch = self
                 .board
                 .dispatch
@@ -1777,13 +1964,20 @@ impl AppShell {
             let report = found
                 .clone()
                 .filter(|_| posted.is_none() && !watch.reporting && retry_due(&watch.report_error));
-            let move_it = record.round == Round::Implementation
+            let reported = match record.round {
+                Round::Implementation => true,
+                Round::Review => review_round(&record, watch).report_url.is_some(),
+                Round::Research => false,
+            };
+            let move_it = reported
                 && posted.is_some_and(|p| !p.in_review)
                 && found.is_some_and(|pr| moves_to_in_review(&pr, role))
                 && !watch.moving
                 && retry_due(&watch.move_error);
             watch.moving |= move_it;
-            let ring = watch.waits_for_you() && watch.rang_for != watch.idle_since;
+            let ring = record.round == Round::Implementation
+                && watch.waits_for_you()
+                && watch.rang_for != watch.idle_since;
             if ring {
                 watch.rang_for = watch.idle_since;
             }
@@ -1806,6 +2000,180 @@ impl AppShell {
                     cx,
                 );
             }
+            if record.round == Round::Review {
+                self.check_review_round(&record, &path, claude, cx);
+            }
+        }
+    }
+
+    fn check_review_round(
+        &mut self,
+        record: &WorktreeDispatch,
+        path: &Path,
+        claude: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(watch) = self.board.dispatch.watches.get(&record.item_id) else {
+            return;
+        };
+        let review = review_round(record, watch);
+        let due = review.report_url.is_none()
+            && !watch.ending_review
+            && retry_due(&watch.review_end_error);
+        let open = watch.pull_request.clone().filter(|pr| pr.state == PullRequestState::Open);
+        let Some(pr) = open.filter(|_| due) else {
+            return;
+        };
+        let stopped_after_work = watch.stopped_after_work();
+        let stop_checked = watch.stopped_without_result();
+        let file = read_reply(path).filter(|_| review.reply_url.is_none());
+        let reply = file.as_ref().map(|file| file.reply());
+        let (session, remind) = match self.session_at(path, cx) {
+            SessionAt::Working => (ReviewSession::Working, Remind::Nothing),
+            SessionAt::Held(by) => (ReviewSession::Held(by), Remind::Nothing),
+            SessionAt::Done(remind) if claude || matches!(remind, Remind::Typing(_)) => {
+                let session = ReviewSession::Claude {
+                    stopped_after_work,
+                    stop_checked,
+                };
+                (session, remind)
+            }
+            SessionAt::Done(remind) => (ReviewSession::Settled, remind),
+        };
+        let broken = matches!(reply, Some(Err(_)));
+        let step = review_step(&pr, &review, reply, session);
+        let Some(watch) = self.board.dispatch.watches.get_mut(&record.item_id) else {
+            return;
+        };
+        let held = match step {
+            ReviewStep::Held(by) => Some(by),
+            _ => None,
+        };
+        if watch.review_held != held || (!broken && watch.reply_reminder.is_some()) {
+            watch.review_held = held;
+            if !broken {
+                watch.reply_reminder = None;
+            }
+            cx.notify();
+        }
+        match step {
+            ReviewStep::FixReply(problems) => {
+                if let Some(file) = file {
+                    self.remind_reply(record, path, file.stamp, remind, &problems, cx);
+                }
+            }
+            ReviewStep::End {
+                reply,
+                check_threads,
+            } => self.end_review_round(record, pr, reply, check_threads, cx),
+            ReviewStep::Wait | ReviewStep::Held(_) => {}
+        }
+    }
+
+    fn end_review_round(
+        &mut self,
+        record: &WorktreeDispatch,
+        pr: PullRequest,
+        reply: Option<String>,
+        check_threads: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(watch) = self.board.dispatch.watches.get_mut(&record.item_id) else {
+            return;
+        };
+        watch.ending_review = true;
+        let stop = watch.idle_since;
+        cx.notify();
+        let key = round_key(record);
+        let end = ReviewEnd {
+            item_id: record.item_id.clone(),
+            content_id: record.content_id.clone(),
+            since: record.trigger_at.clone(),
+            pr: pr.clone(),
+            start_head: record.review.as_ref().and_then(|r| r.start_head.clone()),
+            reply,
+            check_threads,
+        };
+        cx.spawn(async move |this, cx| {
+            let ended = cx.background_spawn(async move { post_review_end(&end) }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.finish_review_round(key, stop, pr, ended, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_review_round(
+        &mut self,
+        key: RoundKey,
+        stop: Option<Instant>,
+        pr: PullRequest,
+        ended: ReviewEnded,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self.dispatch_record(&key.0, cx).filter(|(_, _, _, r)| round_key(r) == key);
+        let Some(watch) = self.board.dispatch.watches.get_mut(&key.0) else {
+            return;
+        };
+        watch.ending_review = false;
+        cx.notify();
+        let Some((project_id, path, branch, mut record)) = current else {
+            return;
+        };
+        let ReviewEnded {
+            reply_url,
+            report_url,
+        } = ended;
+        if reply_url.is_some() {
+            watch.review_reply_url.clone_from(&reply_url);
+            if let Err(err) = clear_reply(&path) {
+                eprintln!("warning: couldn't remove {REPLY_FILE}: {err:#}");
+            }
+        }
+        let report_url = match report_url {
+            Ok(Some(url)) => {
+                watch.review_end_error = None;
+                watch.review_report_url = Some(url.clone());
+                Some(url)
+            }
+            Ok(None) => {
+                watch.stop_without_result = stop;
+                let ring = watch.idle_since == stop && watch.rang_for != stop;
+                if ring {
+                    watch.rang_for = stop;
+                    let tab_title = self.tab_title_at(&path);
+                    self.push_notification(
+                        NotificationKind::SessionWaiting,
+                        format!("#{} waits for you", record.number),
+                        "Review stopped without a push or a reply.",
+                        tab_title,
+                        cx,
+                    );
+                }
+                None
+            }
+            Err(message) => {
+                let first = watch.review_end_error.is_none();
+                watch.review_end_error = Some((Instant::now(), message.clone()));
+                if first {
+                    let title = format!("Couldn't report the review of #{}", record.number);
+                    self.push_toast(ToastKind::Err, title, Some(message.into()), cx);
+                }
+                None
+            }
+        };
+        if reply_url.is_none() && report_url.is_none() {
+            return;
+        }
+        let review = record.review.get_or_insert_with(ReviewRound::default);
+        review.reply_url = reply_url.or(review.reply_url.take());
+        review.report_url.clone_from(&report_url);
+        let branch = branch.unwrap_or_default();
+        if let Err(err) = self.save_record(&project_id, &path, &branch, record.clone(), cx) {
+            eprintln!("warning: couldn't record the review round: {err}");
+        }
+        if report_url.is_some() {
+            self.announce_pull_request(&pr, &record, &path, "updated for", cx);
         }
     }
 
@@ -1901,23 +2269,34 @@ impl AppShell {
         let Some((_, path, _, record)) = self.dispatch_record(item_id, cx) else {
             return;
         };
+        self.announce_pull_request(&pr, &record, &path, "for", cx);
+    }
+
+    fn announce_pull_request(
+        &mut self,
+        pr: &PullRequest,
+        record: &WorktreeDispatch,
+        path: &Path,
+        relation: &str,
+        cx: &mut Context<Self>,
+    ) {
         let (kind, toast, title, detail) = if pr.is_draft {
             (
                 NotificationKind::SessionWaiting,
                 ToastKind::Info,
-                format!("Draft PR #{} for #{}", pr.number, record.number),
+                format!("Draft PR #{} {relation} #{}", pr.number, record.number),
                 "Test it by hand, then mark it ready for review.".to_string(),
             )
         } else {
             (
                 NotificationKind::SessionReady,
                 ToastKind::Ok,
-                format!("PR #{} for #{}", pr.number, record.number),
+                format!("PR #{} {relation} #{}", pr.number, record.number),
                 record.title.clone(),
             )
         };
         self.push_toast(toast, title.clone(), Some(detail.clone().into()), cx);
-        let tab_title = self.tab_title_at(&path);
+        let tab_title = self.tab_title_at(path);
         self.push_notification(kind, title, detail, tab_title, cx);
         cx.notify();
     }
@@ -2137,14 +2516,14 @@ impl AppShell {
                     ),
                     (None, None) => CardNote::new(r.round.label(), NoteTone::Working),
                 };
-                let watched = state
-                    .watches
-                    .get(&r.item_id)
-                    .filter(|_| r.round == Round::Implementation)
-                    .and_then(|watch| {
-                        let posted = r.pull_request.as_ref().or(watch.reported.as_ref());
-                        pull_request_note(watch, posted)
-                    });
+                let watched = state.watches.get(&r.item_id).and_then(|watch| {
+                    let posted = r.pull_request.as_ref().or(watch.reported.as_ref());
+                    match r.round {
+                        Round::Research => None,
+                        Round::Implementation => pull_request_note(watch, posted),
+                        Round::Review => review_note(watch, &review_round(&r, watch), posted),
+                    }
+                });
                 (r.item_id, watched.unwrap_or(note))
             })
             .collect();
@@ -2159,21 +2538,7 @@ impl AppShell {
             notes.insert(key.0.clone(), CardNote::new(note.clone(), NoteTone::Failed));
         }
         for (key, by) in state.findings_held.iter().filter(|(key, _)| rounds.contains(*key)) {
-            let text = match by {
-                HeldBy::Program => {
-                    "Findings written · to post them, quit what runs in its worktree's tab, or \
-                     close the tab"
-                }
-                HeldBy::QuietAgent => {
-                    "Findings written · its agent may not be done: to post them, quit what runs \
-                     in its tab, or close the tab"
-                }
-                HeldBy::StoppedSession => {
-                    "Findings written · to post them, type fg in its session's tab to resume \
-                     it, or close the tab"
-                }
-            };
-            notes.insert(key.0.clone(), CardNote::new(text, NoteTone::Waiting));
+            notes.insert(key.0.clone(), held_note("Findings written", "post them", *by));
         }
         for (item_id, hold) in &state.holds {
             if !hold.is_quiet() {
@@ -2365,8 +2730,55 @@ fn decision_note(discussion: Option<&Discussion>, viewer: Option<&str>, readied:
     }
 }
 
-/// The card line of an implementation round when its pull request or session has something to
-/// say; `None` leaves the round's own line.
+fn held_note(done: &str, to: &str, by: HeldBy) -> CardNote {
+    let text = match by {
+        HeldBy::Program => {
+            format!("{done} · to {to}, quit what runs in its worktree's tab, or close the tab")
+        }
+        HeldBy::QuietAgent => format!(
+            "{done} · its agent may not be done: to {to}, quit what runs in its tab, or close \
+             the tab"
+        ),
+        HeldBy::StoppedSession => format!(
+            "{done} · to {to}, type fg in its session's tab to resume it, or close the tab"
+        ),
+    };
+    CardNote::new(text, NoteTone::Waiting)
+}
+
+fn review_note(
+    watch: &PullRequestWatch,
+    review: &ReviewRound,
+    posted: Option<&PostedPullRequest>,
+) -> Option<CardNote> {
+    if watch.ending_review {
+        return Some(CardNote::new("Reporting the review…", NoteTone::Working));
+    }
+    if let Some(reminder) = &watch.reply_reminder {
+        let text = format!("Reply incomplete: {}", reminder.problems);
+        return Some(CardNote::new(text, NoteTone::Failed));
+    }
+    if let Some((_, message)) = &watch.review_end_error {
+        let text = format!("Couldn't report the review: {message}");
+        return Some(CardNote::new(text, NoteTone::Failed));
+    }
+    let open = watch.pull_request.as_ref().is_some_and(|pr| pr.state == PullRequestState::Open);
+    if review.report_url.is_some() || !open {
+        return pull_request_note(watch, posted);
+    }
+    if let Some(by) = watch.review_held {
+        return Some(held_note("Review answered", "report it", by));
+    }
+    watch.stopped_without_result().then(|| {
+        CardNote::new(
+            "Review stopped without a push or a reply · waiting for you in the tab",
+            NoteTone::NeedsYou,
+        )
+    })
+}
+
+/// The card line of a round's pull request when it or the session has something to say; `None`
+/// leaves the round's own line.
 fn pull_request_note(
     watch: &PullRequestWatch,
     posted: Option<&PostedPullRequest>,
@@ -2838,5 +3250,173 @@ mod tests {
         watch.track(Some((SessionState::Idle, 64)));
         assert!(watch.busy_seen);
         assert!(watch.idle_since > first);
+    }
+
+    fn review_from(start_head: &str) -> ReviewRound {
+        ReviewRound {
+            start_head: Some(start_head.into()),
+            ..ReviewRound::default()
+        }
+    }
+
+    const STOPPED: ReviewSession = ReviewSession::Claude {
+        stopped_after_work: true,
+        stop_checked: false,
+    };
+
+    fn end(reply: Option<&str>, check_threads: bool) -> ReviewStep {
+        ReviewStep::End {
+            reply: reply.map(Into::into),
+            check_threads,
+        }
+    }
+
+    #[test]
+    fn a_review_round_ends_once_its_stopped_session_pushed_or_wrote_a_reply() {
+        let pr = open_pull_request(415, false, Checks::Passing);
+        assert_eq!(review_step(&pr, &review_from("c1"), None, STOPPED), end(None, false));
+        let reply = Some(Ok(Some("Kept it.".to_string())));
+        let step = review_step(&pr, &review_from("c415"), reply, STOPPED);
+        assert_eq!(step, end(Some("Kept it."), false));
+    }
+
+    #[test]
+    fn without_a_push_or_a_reply_each_stop_is_checked_once_for_thread_replies() {
+        let pr = open_pull_request(415, false, Checks::Passing);
+        let unpushed = review_from("c415");
+        assert_eq!(review_step(&pr, &unpushed, None, STOPPED), end(None, true));
+        let blank = Some(Ok(None));
+        assert_eq!(review_step(&pr, &unpushed, blank, STOPPED), end(None, true), "blank");
+        let no_head = ReviewRound::default();
+        assert_eq!(review_step(&pr, &no_head, None, STOPPED), end(None, true), "no push to see");
+        let checked = ReviewSession::Claude {
+            stopped_after_work: true,
+            stop_checked: true,
+        };
+        assert_eq!(review_step(&pr, &unpushed, None, checked), ReviewStep::Wait);
+    }
+
+    #[test]
+    fn a_review_round_waits_for_its_session_to_work_and_stop() {
+        let pr = open_pull_request(415, false, Checks::Passing);
+        let pushed = review_from("c1");
+        let not_yet_at_work = ReviewSession::Claude {
+            stopped_after_work: false,
+            stop_checked: false,
+        };
+        for session in [ReviewSession::Working, not_yet_at_work] {
+            assert_eq!(review_step(&pr, &pushed, None, session), ReviewStep::Wait);
+        }
+        let held = ReviewSession::Held(HeldBy::Program);
+        assert_eq!(review_step(&pr, &pushed, None, held), ReviewStep::Held(HeldBy::Program));
+        let unpushed = review_from("c415");
+        assert_eq!(review_step(&pr, &unpushed, None, held), ReviewStep::Wait, "nothing to report");
+    }
+
+    #[test]
+    fn another_agents_review_round_ends_on_a_push_or_reply_once_its_tab_settles() {
+        let pr = open_pull_request(415, false, Checks::Passing);
+        let settled = ReviewSession::Settled;
+        assert_eq!(review_step(&pr, &review_from("c1"), None, settled), end(None, false));
+        assert_eq!(review_step(&pr, &review_from("c415"), None, settled), ReviewStep::Wait);
+    }
+
+    #[test]
+    fn a_reply_to_fix_holds_the_end_and_a_posted_one_is_not_read_again() {
+        let pr = open_pull_request(415, false, Checks::Passing);
+        let broken = || Some(Err(vec![Problem::OpenFence]));
+        let step = review_step(&pr, &review_from("c1"), broken(), STOPPED);
+        assert_eq!(step, ReviewStep::FixReply(vec![Problem::OpenFence]));
+        let replied = ReviewRound {
+            reply_url: Some("r".into()),
+            ..review_from("c415")
+        };
+        assert_eq!(review_step(&pr, &replied, broken(), STOPPED), end(None, false));
+    }
+
+    #[test]
+    fn a_review_rounds_card_says_what_holds_it_until_the_pull_request_is_reported() {
+        let mut watch = PullRequestWatch {
+            pull_request: Some(open_pull_request(415, false, Checks::Passing)),
+            read_ok_at: Some(Instant::now()),
+            ..PullRequestWatch::default()
+        };
+        let review = review_from("c415");
+        assert!(review_note(&watch, &review, None).is_none(), "the round's own line");
+        watch.review_held = Some(HeldBy::Program);
+        let note = review_note(&watch, &review, None).unwrap();
+        assert_eq!(
+            note.text.as_ref(),
+            "Review answered · to report it, quit what runs in its worktree's tab, or close the tab"
+        );
+        watch.review_held = None;
+        let stop = Instant::now();
+        watch.idle_since = Some(stop);
+        watch.stop_without_result = Some(stop);
+        let note = review_note(&watch, &review, None).unwrap();
+        assert_eq!(
+            note.text.as_ref(),
+            "Review stopped without a push or a reply · waiting for you in the tab"
+        );
+        assert!(note.tone == NoteTone::NeedsYou);
+        watch.reply_reminder = Some(Reminder {
+            problems: "a code block is not closed".into(),
+            ..Reminder::default()
+        });
+        let note = review_note(&watch, &review, None).unwrap();
+        assert_eq!(note.text.as_ref(), "Reply incomplete: a code block is not closed");
+        assert!(note.tone == NoteTone::Failed);
+        watch.ending_review = true;
+        let note = review_note(&watch, &review, None).unwrap();
+        assert_eq!(note.text.as_ref(), "Reporting the review…");
+        watch.ending_review = false;
+        watch.reply_reminder = None;
+        let reported = ReviewRound {
+            report_url: Some("c".into()),
+            ..review
+        };
+        let note = review_note(&watch, &reported, Some(&posted(415))).unwrap();
+        assert_eq!(note.text.as_ref(), "PR #415 · checks passing");
+    }
+
+    #[test]
+    fn a_new_stop_clears_the_finding_that_the_last_one_left_nothing() {
+        let mut watch = PullRequestWatch::default();
+        watch.track(Some((SessionState::Busy, 4)));
+        watch.track(Some((SessionState::Idle, 4)));
+        watch.stop_without_result = watch.idle_since;
+        assert!(watch.stopped_without_result());
+        watch.track(Some((SessionState::Busy, 5)));
+        assert!(!watch.stopped_without_result());
+    }
+
+    #[test]
+    fn the_review_round_on_record_takes_what_only_memory_kept() {
+        let mut record = record_with(Some(posted(415)));
+        record.review = Some(review_from("c1"));
+        let watch = PullRequestWatch {
+            review_reply_url: Some("reply".into()),
+            review_report_url: Some("report".into()),
+            ..PullRequestWatch::default()
+        };
+        let review = review_round(&record, &watch);
+        assert_eq!(review.start_head.as_deref(), Some("c1"));
+        assert_eq!(review.reply_url.as_deref(), Some("reply"));
+        assert_eq!(review.report_url.as_deref(), Some("report"));
+        record.review = None;
+        assert_eq!(review_round(&record, &PullRequestWatch::default()), ReviewRound::default());
+    }
+
+    #[test]
+    fn a_reminder_goes_out_once_per_version_of_the_file_and_three_times_at_most() {
+        let mut reminder = Reminder::default();
+        let stamp = |n: u64| (None, n);
+        assert!(!reminder.note(&[Problem::OpenFence], stamp(1), false), "no way to tell it");
+        assert_eq!(reminder.problems, "a code block is not closed");
+        assert!(reminder.note(&[Problem::OpenFence], stamp(1), true));
+        assert!(!reminder.note(&[Problem::OpenFence], stamp(1), true), "told about this one");
+        assert!(reminder.note(&[Problem::OpenFence], stamp(2), true));
+        assert!(reminder.note(&[Problem::OpenFence], stamp(3), true));
+        assert!(!reminder.note(&[Problem::OpenFence], stamp(4), true), "three is enough");
     }
 }
