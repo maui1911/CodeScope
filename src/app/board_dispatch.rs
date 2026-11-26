@@ -1105,7 +1105,7 @@ impl AppShell {
             let result = cx
                 .background_spawn(async move {
                     let failed = |err: anyhow::Error| format!("{err:#}");
-                    let before = github::before_posting(&item_id, &content_id, &since)
+                    let before = github::before_posting(&item_id, &content_id, &since, &body)
                         .map_err(failed)?;
                     let url = match before.posted {
                         Some(url) => url,

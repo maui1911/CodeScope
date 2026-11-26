@@ -218,59 +218,70 @@ pub fn parse_comment_url(json: &str) -> Result<String> {
     Ok(data.add_comment.comment_edge.node.url)
 }
 
-const BEFORE_POSTING_QUERY: &str = r#"query($item: ID!, $subject: ID!) {
-  item: node(id: $item) {
-    ... on ProjectV2Item {
-      fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { optionId } }
-    }
-  }
+const BEFORE_POSTING_QUERY: &str = r#"query($subject: ID!) {
   subject: node(id: $subject) {
-    ... on Issue { comments(last: 50) { nodes { url createdAt viewerDidAuthor body } } }
+    ... on Issue { projectItems(first: 20) { ...Items } comments(last: 50) { ...Posted } }
+    ... on PullRequest { projectItems(first: 20) { ...Items } comments(last: 50) { ...Posted } }
   }
-}"#;
+}
+fragment Items on ProjectV2ItemConnection {
+  nodes {
+    id
+    fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { optionId } }
+  }
+}
+fragment Posted on IssueCommentConnection { nodes { url createdAt viewerDidAuthor body } }"#;
 
 /// What posting a research round's findings checks on GitHub first.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BeforePosting {
-    /// The column the item is in now; `None` without a status.
+    /// The column the item is in now; `None` without a status or off the board.
     pub column_id: Option<String>,
-    /// The URL of findings the signed-in user already posted for this round.
+    /// The URL of this very comment, when the signed-in user already posted it this round.
     pub posted: Option<String>,
 }
 
-/// Read the board item `item_id`'s column and look among the last 50 comments on the issue
-/// `subject_id` for research findings the signed-in user posted after `since` (ISO 8601).
-pub fn before_posting(item_id: &str, subject_id: &str, since: &str) -> Result<BeforePosting> {
+/// Read the board item `item_id`'s column from the issue or pull request `subject_id`, and
+/// look among its last 50 comments for `body` posted by the signed-in user after `since`.
+pub fn before_posting(
+    item_id: &str,
+    subject_id: &str,
+    since: &str,
+    body: &str,
+) -> Result<BeforePosting> {
     let stdout = run_graphql(
-        &[
-            format!("query={BEFORE_POSTING_QUERY}"),
-            format!("item={item_id}"),
-            format!("subject={subject_id}"),
-        ],
+        &[format!("query={BEFORE_POSTING_QUERY}"), format!("subject={subject_id}")],
         &[],
     )?;
-    parse_before_posting(&stdout, since)
+    parse_before_posting(&stdout, item_id, since, body)
 }
 
-/// Parse [`before_posting`]'s response.
-pub fn parse_before_posting(json: &str, since: &str) -> Result<BeforePosting> {
+/// Parse [`before_posting`]'s response; `since` is ISO 8601, as GitHub writes `createdAt`.
+pub fn parse_before_posting(
+    json: &str,
+    item_id: &str,
+    since: &str,
+    body: &str,
+) -> Result<BeforePosting> {
     let data: BeforePostingData = parse_data(json)?;
-    let posted = data
-        .subject
-        .and_then(|subject| subject.comments)
+    let Some(subject) = data.subject else {
+        return Ok(BeforePosting::default());
+    };
+    let same = |posted: &str| posted.replace("\r\n", "\n").trim_end() == body.trim_end();
+    let posted = subject
+        .comments
         .into_iter()
         .flat_map(|comments| comments.nodes.into_iter().flatten())
         .filter(|c| c.viewer_did_author && c.created_at.as_str() > since)
-        .rfind(|c| {
-            c.body.lines().rev().find(|line| !line.trim().is_empty()).is_some_and(|line| {
-                super::findings::is_marker_line(line) && line.contains("phase=research")
-            })
-        })
+        .rfind(|c| same(&c.body))
         .map(|c| c.url);
-    Ok(BeforePosting {
-        column_id: data.item.and_then(|item| item.field_value_by_name?.option_id),
-        posted,
-    })
+    let column_id = subject
+        .project_items
+        .into_iter()
+        .flat_map(|items| items.nodes.into_iter().flatten())
+        .find(|item| item.id == item_id)
+        .and_then(|item| item.field_value_by_name?.option_id);
+    Ok(BeforePosting { column_id, posted })
 }
 
 /// Whether `login` can push to `repository` (`owner/name`): admin, maintain or write. False too
@@ -490,19 +501,26 @@ struct CommentNode {
 
 #[derive(Deserialize)]
 struct BeforePostingData {
-    item: Option<ItemStatus>,
     subject: Option<Subject>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ItemStatus {
-    field_value_by_name: Option<StatusValue>,
+struct Subject {
+    project_items: Option<SubjectItems>,
+    comments: Option<Comments>,
 }
 
 #[derive(Deserialize)]
-struct Subject {
-    comments: Option<Comments>,
+struct SubjectItems {
+    nodes: Vec<Option<SubjectItem>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubjectItem {
+    id: String,
+    field_value_by_name: Option<StatusValue>,
 }
 
 #[derive(Deserialize)]
@@ -852,32 +870,44 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_column_and_the_findings_the_user_posted_since_the_round_began() {
+    fn reads_the_column_and_the_same_findings_the_user_posted_since_the_round_began() {
         let marker = "<!-- dispatch v=1 phase=research outcome=findings by=codescope -->";
+        let body = format!("D.\n\n**Next step:** move it.\n{marker}\n");
         let comment = |url: &str, at: &str, mine: bool, body: &str| {
             serde_json::json!({
                 "url": url, "createdAt": at, "viewerDidAuthor": mine, "body": body,
             })
         };
-        let json = serde_json::json!({ "data": {
-            "item": { "fieldValueByName": { "optionId": "opt-researching" } },
-            "subject": { "comments": { "nodes": [
-                comment("u-earlier", "2026-11-25T09:00:00Z", true, &format!("A.\n{marker}\n")),
-                comment("u-theirs", "2026-11-25T10:05:00Z", false, &format!("B.\n{marker}")),
-                comment("u-quoted", "2026-11-25T10:06:00Z", true, &format!("{marker}\nC.")),
-                comment("u-mine", "2026-11-25T10:07:00Z", true, &format!("D.\n{marker}\n")),
+        let item = |id: &str, option: &str| {
+            serde_json::json!({ "id": id, "fieldValueByName": { "optionId": option } })
+        };
+        let json = serde_json::json!({ "data": { "subject": {
+            "projectItems": { "nodes": [
+                item("PVTI_other", "opt-done"),
+                item("PVTI_1", "opt-researching"),
+            ] },
+            "comments": { "nodes": [
+                comment("u-earlier", "2026-11-25T09:00:00Z", true, &body),
+                comment("u-theirs", "2026-11-25T10:05:00Z", false, &body),
+                comment("u-other-round", "2026-11-25T10:06:00Z", true, &format!("C.\n{marker}\n")),
+                comment("u-mine", "2026-11-25T10:07:00Z", true, &body.replace('\n', "\r\n")),
                 comment("u-chat", "2026-11-25T10:08:00Z", true, "Looks good."),
-            ] } },
-        } })
+            ] },
+        } } })
         .to_string();
-        let before = parse_before_posting(&json, "2026-11-25T10:00:00Z").unwrap();
+        let since = "2026-11-25T10:00:00Z";
+        let before = parse_before_posting(&json, "PVTI_1", since, &body).unwrap();
         assert_eq!(before.column_id.as_deref(), Some("opt-researching"));
         assert_eq!(before.posted.as_deref(), Some("u-mine"));
 
-        let later = parse_before_posting(&json, "2026-11-25T10:07:00Z").unwrap();
+        let later = parse_before_posting(&json, "PVTI_1", "2026-11-25T10:07:00Z", &body).unwrap();
         assert_eq!(later.posted, None, "a comment from before the round is not this round's");
-        let bare = r#"{"data":{"item":{"fieldValueByName":null},"subject":{}}}"#;
-        let bare = parse_before_posting(bare, "2026-11-25T10:00:00Z").unwrap();
+        let other = parse_before_posting(&json, "PVTI_1", since, "E.\n").unwrap();
+        assert_eq!(other.posted, None, "other findings are not these");
+        let removed = parse_before_posting(&json, "PVTI_gone", since, &body).unwrap();
+        assert_eq!(removed.column_id, None, "an item taken off the board is in no column");
+        let bare = parse_before_posting(r#"{"data":{"subject":{}}}"#, "PVTI_1", since, &body);
+        let bare = bare.unwrap();
         assert_eq!((bare.column_id, bare.posted), (None, None));
     }
 
