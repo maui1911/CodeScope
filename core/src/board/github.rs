@@ -9,6 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
+use super::answers::Comment;
 use super::dispatch::StatusChange;
 use super::{Board, BoardItem, BoardOwner, BoardRef, Column, ItemKind, ItemState};
 use crate::process::no_window_command;
@@ -158,6 +159,53 @@ pub fn parse_status_changes(json: &str, board_id: &str) -> Result<HashMap<String
                     created_at: change.created_at,
                 },
             ))
+        })
+        .collect())
+}
+
+const COMMENTS_QUERY: &str = r#"query($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    __typename
+    ... on Issue { id comments(last: 50) { nodes { ...comment } } }
+    ... on PullRequest { id comments(last: 50) { nodes { ...comment } } }
+  }
+}
+fragment comment on IssueComment { url body createdAt author { login } }"#;
+
+/// The last 50 comments of each issue or pull request in `content_ids`, oldest first, keyed by
+/// content id.
+pub fn fetch_comments(content_ids: &[String]) -> Result<HashMap<String, Vec<Comment>>> {
+    let mut comments = HashMap::new();
+    for chunk in content_ids.chunks(100) {
+        let mut args = vec![format!("query={COMMENTS_QUERY}")];
+        args.extend(chunk.iter().map(|id| format!("ids[]={id}")));
+        let stdout = run_graphql(&args, &[])?;
+        comments.extend(parse_comments(&stdout)?);
+    }
+    Ok(comments)
+}
+
+/// Parse [`fetch_comments`]' response.
+pub fn parse_comments(json: &str) -> Result<HashMap<String, Vec<Comment>>> {
+    let data: CommentsData = parse_data(json)?;
+    Ok(data
+        .nodes
+        .into_iter()
+        .flatten()
+        .filter_map(|node| {
+            let comments = node
+                .comments?
+                .nodes
+                .into_iter()
+                .flatten()
+                .map(|c| Comment {
+                    url: c.url,
+                    author: c.author.map(|a| a.login),
+                    body: c.body,
+                    created_at: c.created_at,
+                })
+                .collect();
+            Some((node.id?, comments))
         })
         .collect())
 }
@@ -600,6 +648,31 @@ struct Login {
 }
 
 #[derive(Deserialize)]
+struct CommentsData {
+    nodes: Vec<Option<CommentsOwner>>,
+}
+
+#[derive(Deserialize)]
+struct CommentsOwner {
+    id: Option<String>,
+    comments: Option<CommentList>,
+}
+
+#[derive(Deserialize)]
+struct CommentList {
+    nodes: Vec<Option<IssueCommentNode>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IssueCommentNode {
+    url: String,
+    body: String,
+    created_at: String,
+    author: Option<Login>,
+}
+
+#[derive(Deserialize)]
 struct ProjectId {
     id: String,
 }
@@ -956,6 +1029,39 @@ mod tests {
         });
         let err = parse_before_posting(&response(forbidden), since, "D.").unwrap_err();
         assert_eq!(err.to_string(), "Resource not accessible");
+    }
+
+    #[test]
+    fn reads_comments_by_content_id_and_keeps_deleted_authors() {
+        let json = r#"{"data":{"nodes":[
+          {"__typename":"Issue","id":"I_1","comments":{"nodes":[
+            {"url":"https://c/1","body":"B1 A","createdAt":"2026-11-25T18:00:00Z",
+             "author":{"login":"sanne"}},
+            {"url":"https://c/2","body":"Hm.","createdAt":"2026-11-25T18:01:00Z","author":null}
+          ]}},
+          {"__typename":"Issue","id":"I_2","comments":{"nodes":[]}},
+          null
+        ]}}"#;
+        let comments = parse_comments(json).unwrap();
+        assert_eq!(comments.len(), 2);
+        assert!(comments["I_2"].is_empty());
+        assert_eq!(
+            comments["I_1"],
+            vec![
+                Comment {
+                    url: "https://c/1".into(),
+                    author: Some("sanne".into()),
+                    body: "B1 A".into(),
+                    created_at: "2026-11-25T18:00:00Z".into(),
+                },
+                Comment {
+                    url: "https://c/2".into(),
+                    author: None,
+                    body: "Hm.".into(),
+                    created_at: "2026-11-25T18:01:00Z".into(),
+                },
+            ]
+        );
     }
 
     #[test]
