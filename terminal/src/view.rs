@@ -147,13 +147,14 @@ pub struct TerminalView {
     /// `claude-code` treats that lone release as its own click, so
     /// the URL opens a second time in the browser.
     link_click_consumed: bool,
-    /// When the user last pressed a plain Enter here — see
-    /// [`Self::last_submit`].
-    last_submit: Option<SystemTime>,
+    /// When the user last pressed a plain Enter here, on the wall clock
+    /// for [`Self::last_submit`] and the monotonic one for
+    /// [`Self::typed_since_submit`].
+    last_submit: Option<(SystemTime, Instant)>,
     /// When the user last typed or pasted anything here — see
     /// [`Self::typed_since_submit`]. A `Cell` because `paste` takes
     /// `&self`.
-    last_typed: std::cell::Cell<Option<SystemTime>>,
+    last_typed: std::cell::Cell<Option<Instant>>,
 }
 
 impl TerminalView {
@@ -290,7 +291,7 @@ impl TerminalView {
     /// which tells same-folder tabs apart when they adopt. Wall-clock
     /// time, so it compares with file mtimes.
     pub fn last_submit(&self) -> Option<SystemTime> {
-        self.last_submit
+        self.last_submit.map(|(wall, _)| wall)
     }
 
     /// The user typed or pasted something here after their last Enter
@@ -301,7 +302,7 @@ impl TerminalView {
     pub fn typed_since_submit(&self) -> bool {
         self.last_typed
             .get()
-            .is_some_and(|typed| self.last_submit.is_none_or(|submit| typed > submit))
+            .is_some_and(|typed| self.last_submit.is_none_or(|(_, submit)| typed > submit))
     }
 
     /// The title the program running in the terminal last set via
@@ -720,10 +721,10 @@ impl TerminalView {
             self.backend.reset_scroll();
             self.backend.write_input(bytes);
             self.show_cursor_now();
-            let now = SystemTime::now();
+            let now = Instant::now();
             self.last_typed.set(Some(now));
             if key == "enter" && plain && !mods.shift {
-                self.last_submit = Some(now);
+                self.last_submit = Some((SystemTime::now(), now));
             }
         }
     }
@@ -807,7 +808,7 @@ impl TerminalView {
         } else {
             self.backend.write_input(normalised.into_bytes());
         }
-        self.last_typed.set(Some(SystemTime::now()));
+        self.last_typed.set(Some(Instant::now()));
         self.backend.reset_scroll();
     }
 

@@ -2,6 +2,7 @@
 //! `GLOSSARY.md`). This module is host-neutral; [`github`] reads a
 //! GitHub Projects board through `gh`.
 
+pub mod dispatch;
 pub mod github;
 
 use std::collections::BTreeMap;
@@ -110,6 +111,10 @@ pub struct BoardItem {
     pub url: Option<String>,
     /// `owner/name` of the repository the issue or pull request lives in.
     pub repository: Option<String>,
+    /// The host's id for the issue or pull request itself; `None` for a draft.
+    pub content_id: Option<String>,
+    /// Logins the issue or pull request is assigned to.
+    pub assignees: Vec<String>,
     pub state: ItemState,
     /// Id of the [`Column`] the item is in; `None` when it has no status.
     pub column_id: Option<String>,
@@ -120,6 +125,10 @@ pub struct BoardItem {
 /// A board as read in one go. Archived items are left out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Board {
+    /// The host's id for the board, which writes to it need.
+    pub id: String,
+    /// The host's id for the status field whose options are the columns.
+    pub status_field_id: String,
     pub title: String,
     pub url: String,
     pub closed: bool,
@@ -132,6 +141,14 @@ pub struct Board {
 impl Board {
     pub fn column(&self, id: &str) -> Option<&Column> {
         self.columns.iter().find(|c| c.id == id)
+    }
+
+    /// The role of the column an item is in, if that column has one.
+    pub fn role_of(&self, item: &BoardItem, mapping: &ColumnMapping) -> Option<ColumnRole> {
+        let column_id = item.column_id.as_deref()?;
+        ColumnRole::ALL.into_iter().find(|role| {
+            mapped_column(self, mapping, *role).is_some_and(|c| c.id == column_id)
+        })
     }
 }
 
@@ -304,6 +321,8 @@ pub struct BoardSettings {
     /// Read leniently: a role this build doesn't know, or a name that isn't text, is skipped.
     #[serde(deserialize_with = "known_roles")]
     pub columns: ColumnMapping,
+    /// When the board was added, ISO 8601; moves made before then start nothing.
+    pub added_at: String,
     /// Keys this build doesn't know, kept so a save doesn't drop what a newer build wrote.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -465,6 +484,8 @@ mod tests {
             title: id.to_string(),
             url: None,
             repository: Some("maui1911/CodeScope".to_string()),
+            content_id: Some(format!("I_{id}")),
+            assignees: Vec::new(),
             state: ItemState::Open,
             column_id: column_id.map(str::to_string),
             updated_at: String::new(),
@@ -473,6 +494,8 @@ mod tests {
 
     fn board(columns: Vec<Column>, items: Vec<BoardItem>) -> Board {
         Board {
+            id: "PVT_1".into(),
+            status_field_id: "PVTSSF_1".into(),
             title: "CodeScope".into(),
             url: String::new(),
             closed: false,
@@ -676,6 +699,18 @@ mod tests {
     }
 
     #[test]
+    fn role_of_finds_the_role_of_the_items_column() {
+        let b = board(
+            vec![column("t", "Todo"), column("p", "Paused"), column("r", "Ready")],
+            vec![item("ready", Some("r")), item("paused", Some("p")), item("none", None)],
+        );
+        let mapping = suggest_mapping(&b.columns);
+        assert_eq!(b.role_of(&b.items[0], &mapping), Some(ColumnRole::Ready));
+        assert_eq!(b.role_of(&b.items[1], &mapping), None);
+        assert_eq!(b.role_of(&b.items[2], &mapping), None);
+    }
+
+    #[test]
     fn effective_mapping_keeps_stored_choices_and_fills_the_rest() {
         let b = board(
             vec![
@@ -706,6 +741,7 @@ mod tests {
         let settings = BoardSettings {
             url: "https://github.com/users/maui1911/projects/3".into(),
             columns: ColumnMapping::from([(ColumnRole::NeedsDecision, "Needs decision".into())]),
+            added_at: "2026-11-25T10:00:00Z".into(),
             ..BoardSettings::default()
         };
         let json = serde_json::to_string(&settings).unwrap();

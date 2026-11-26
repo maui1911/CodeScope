@@ -18,6 +18,7 @@
 //! leaves no trace in `projects.json`, and the worktree discovery poll
 //! adopts whatever git finished on disk at the next launch.
 
+use crate::board::dispatch::WorktreeDispatch;
 use crate::git::WorktreeInfo;
 use crate::projects::{ProjectsConfig, Worktree, normalise_project_path};
 
@@ -197,8 +198,38 @@ pub fn record_created_worktree(
         path: path.to_string(),
         branch: Some(branch.to_string()),
         is_primary: false,
+        dispatch: None,
     });
     RecordOutcome::Added
+}
+
+/// Keep `dispatch` on project `project_id`'s worktree row at `path`, first adding the row for a
+/// worktree git just created on `branch`. `false` when the project has no row there.
+pub fn record_dispatch(
+    cfg: &mut ProjectsConfig,
+    project_id: &str,
+    path: &str,
+    branch: &str,
+    dispatch: WorktreeDispatch,
+) -> bool {
+    record_created_worktree(cfg, project_id, path, branch);
+    let key = normalise_project_path(path);
+    let row = cfg
+        .projects
+        .iter_mut()
+        .find(|p| p.id == project_id)
+        .and_then(|p| {
+            p.worktrees
+                .iter_mut()
+                .find(|wt| normalise_project_path(&wt.path) == key)
+        });
+    match row {
+        Some(row) => {
+            row.dispatch = Some(dispatch);
+            true
+        }
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -354,6 +385,7 @@ mod tests {
             path: "/repo.worktrees/feat/".into(),
             branch: Some("feat".into()),
             is_primary: false,
+            dispatch: None,
         });
         assert_eq!(
             record_created_worktree(&mut cfg, &id, "/repo.worktrees/feat", "feat"),
@@ -366,6 +398,41 @@ mod tests {
             record_created_worktree(&mut cfg, &id, "/repo.worktrees/solo", "solo"),
             RecordOutcome::AlreadyTracked
         );
+    }
+
+    #[test]
+    fn record_dispatch_adds_the_row_once_and_then_updates_it() {
+        use crate::board::dispatch::Round;
+        let (mut cfg, id) = config_with_project("/repo");
+        let research = WorktreeDispatch {
+            board_url: "https://github.com/users/maui1911/projects/3".into(),
+            item_id: "PVTI_1".into(),
+            content_id: "I_411".into(),
+            repository: "maui1911/CodeScope".into(),
+            number: 411,
+            title: "Fuzzy paths".into(),
+            url: "https://github.com/maui1911/CodeScope/issues/411".into(),
+            round: Round::Research,
+            trigger_at: "2026-11-25T10:00:00Z".into(),
+        };
+        let path = "/repo.worktrees/411-fuzzy-paths";
+        assert!(record_dispatch(&mut cfg, &id, path, "411-fuzzy-paths", research.clone()));
+        let implementation = WorktreeDispatch {
+            round: Round::Implementation,
+            trigger_at: "2026-11-25T11:00:00Z".into(),
+            ..research
+        };
+        assert!(record_dispatch(
+            &mut cfg,
+            &id,
+            path,
+            "411-fuzzy-paths",
+            implementation.clone()
+        ));
+        let rows = &cfg.projects[0].worktrees;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].dispatch, Some(implementation.clone()));
+        assert!(!record_dispatch(&mut cfg, "gone", path, "411-fuzzy-paths", implementation));
     }
 
     #[test]

@@ -132,10 +132,14 @@ fn state_root() -> PathBuf {
 }
 
 fn home_or_temp() -> PathBuf {
+    home_dir().unwrap_or_else(std::env::temp_dir)
+}
+
+/// The user's home folder: `HOME`, else `USERPROFILE`.
+pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
 }
 
 /// Test helper: build an `AppPaths` rooted at an arbitrary directory.

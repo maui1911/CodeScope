@@ -126,6 +126,7 @@ impl AppShell {
                 settings.boards.push(BoardSettings {
                     url: url.clone(),
                     columns: suggest_mapping(&board.columns),
+                    added_at: codescope_core::time::now_iso8601(),
                     ..BoardSettings::default()
                 });
             }

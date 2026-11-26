@@ -1,23 +1,28 @@
-//! Board panel: a read-only view of the boards in `settings.json` (ADR-0027). It takes the
-//! work-area slot the Overview, the Bots inbox and the diff viewer share; opening one closes
-//! the others. Boards are read every 30 s whether or not the panel is on stage.
+//! Board panel: the boards in `settings.json` and what dispatch does with their items
+//! (ADR-0027). It takes the work-area slot the Overview, the Bots inbox and the diff viewer
+//! share; opening one closes the others. Boards are read every 30 s whether or not the panel is
+//! on stage.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use codescope_core::board::dispatch::StatusChange;
 use codescope_core::board::{
     Board, BoardItem, BoardRef, BoardSettings, ColumnRole, ItemKind, ItemState, PanelColumn,
-    PanelGroup, PanelSection, RoleKind, effective_mapping, github, missing_roles, panel_columns,
+    PanelGroup, PanelSection, RoleKind, effective_mapping, missing_roles, panel_columns,
 };
 use codescope_core::{Settings, Theme};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, AppContext as _, Context, Hsla, InteractiveElement, IntoElement, MouseButton,
+    AnyElement, App, AppContext as _, Context, Hsla, InteractiveElement, IntoElement, MouseButton,
     ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 
 use crate::app::AppShell;
+use crate::app::board_dispatch::{
+    CardNote, DispatchState, NoteTone, ReadInput, ReadOutput, read_boards,
+};
 use crate::dialogs::confirm::ConfirmSpec;
 use crate::theme;
 
@@ -34,6 +39,7 @@ pub(crate) struct BoardPanelState {
     pub show_all_done: bool,
     pub reading: bool,
     pub last_read: Option<Instant>,
+    pub dispatch: DispatchState,
 }
 
 #[derive(Default)]
@@ -42,20 +48,8 @@ pub(crate) struct BoardRead {
     pub error: Option<String>,
     /// When `last_good` was read.
     pub read_at: Option<Instant>,
-}
-
-type BoardResult = (String, Result<Board, String>);
-
-fn read_boards(urls: Vec<String>) -> Vec<BoardResult> {
-    urls.into_iter()
-        .map(|url| {
-            let result = match BoardRef::parse_url(&url) {
-                Some(board) => github::fetch_board(&board).map_err(|err| format!("{err:#}")),
-                None => Err("this is not a GitHub Projects board URL".to_string()),
-            };
-            (url, result)
-        })
-        .collect()
+    /// Last moves of the items in trigger columns, by content id; `None` until read.
+    pub changes: Option<HashMap<String, StatusChange>>,
 }
 
 fn read_age(read_at: Option<Instant>) -> SharedString {
@@ -117,23 +111,26 @@ fn item_reference(item: &BoardItem) -> SharedString {
 }
 
 impl AppShell {
-    pub(crate) fn start_board_poll(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
+    pub(crate) fn start_board_poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
             loop {
-                let Ok(due) = this.update(cx, |this, cx| {
+                let Ok(due) = this.update_in(cx, |this, window, cx| {
                     if this.show_board {
                         cx.notify();
                     }
-                    this.begin_board_read(false)
+                    this.stamp_board_added_at(cx);
+                    this.run_dispatch(window, cx);
+                    this.begin_board_read(false, cx)
                 }) else {
                     break;
                 };
-                if let Some(urls) = due {
-                    let results = cx.background_spawn(async move { read_boards(urls) }).await;
-                    if this
-                        .update(cx, |this, cx| this.finish_board_read(results, cx))
-                        .is_err()
-                    {
+                if let Some(input) = due {
+                    let output = cx.background_spawn(async move { read_boards(input) }).await;
+                    let finished = this.update_in(cx, |this, window, cx| {
+                        this.finish_board_read(output, cx);
+                        this.run_dispatch(window, cx);
+                    });
+                    if finished.is_err() {
                         break;
                     }
                 }
@@ -143,18 +140,43 @@ impl AppShell {
         .detach();
     }
 
+    /// Boards without `addedAt`, from before dispatch existed or added by hand to `settings.json`,
+    /// count as added now, so earlier moves start nothing.
+    fn stamp_board_added_at(&mut self, cx: &mut Context<Self>) {
+        if self.settings.boards.iter().all(|b| !b.added_at.is_empty()) {
+            return;
+        }
+        let now = codescope_core::time::now_iso8601();
+        let saved = Settings::update(self.paths_ref(), |settings| {
+            for board in settings.boards.iter_mut().filter(|b| b.added_at.is_empty()) {
+                board.added_at = now.clone();
+            }
+        });
+        match saved {
+            Ok(settings) => self.apply_settings(settings, cx),
+            Err(err) => {
+                eprintln!("warning: couldn't save when boards were added: {err:#}");
+                let mut settings = (*self.settings).clone();
+                for board in settings.boards.iter_mut().filter(|b| b.added_at.is_empty()) {
+                    board.added_at = now.clone();
+                }
+                self.apply_settings(settings, cx);
+            }
+        }
+    }
+
     pub(crate) fn refresh_boards(&mut self, cx: &mut Context<Self>) {
-        let Some(urls) = self.begin_board_read(true) else {
+        let Some(input) = self.begin_board_read(true, cx) else {
             return;
         };
         cx.spawn(async move |this, cx| {
-            let results = cx.background_spawn(async move { read_boards(urls) }).await;
-            let _ = this.update(cx, |this, cx| this.finish_board_read(results, cx));
+            let output = cx.background_spawn(async move { read_boards(input) }).await;
+            let _ = this.update(cx, |this, cx| this.finish_board_read(output, cx));
         })
         .detach();
     }
 
-    fn begin_board_read(&mut self, now: bool) -> Option<Vec<String>> {
+    fn begin_board_read(&mut self, now: bool, cx: &App) -> Option<ReadInput> {
         let state = &mut self.board;
         let due = now
             || state
@@ -165,19 +187,21 @@ impl AppShell {
         }
         state.reading = true;
         state.last_read = Some(Instant::now());
-        Some(self.settings.boards.iter().map(|b| b.url.clone()).collect())
+        Some(self.board_read_input(cx))
     }
 
-    fn finish_board_read(&mut self, results: Vec<BoardResult>, cx: &mut Context<Self>) {
+    fn finish_board_read(&mut self, mut output: ReadOutput, cx: &mut Context<Self>) {
+        self.accept_dispatch_read(&mut output);
         let state = &mut self.board;
         state.reading = false;
-        for (url, result) in results {
-            let read = state.reads_by_url.entry(url).or_default();
-            match result {
+        for fetch in output.boards {
+            let read = state.reads_by_url.entry(fetch.url).or_default();
+            match fetch.board {
                 Ok(board) => {
                     read.last_good = Some(board);
                     read.error = None;
                     read.read_at = Some(Instant::now());
+                    read.changes = fetch.changes;
                 }
                 Err(err) => read.error = Some(err),
             }
@@ -203,6 +227,7 @@ impl AppShell {
                 last_good: Some(board),
                 error: None,
                 read_at: Some(Instant::now()),
+                changes: None,
             },
         );
         self.board.selected_url = Some(url);
@@ -316,6 +341,7 @@ impl AppShell {
             .when(!missing.is_empty(), |s| {
                 s.child(render_missing_roles(theme, &missing))
             })
+            .children(self.dispatch_error().map(|err| render_dispatch_error(theme, err)))
             .child(body)
             .into_any_element()
     }
@@ -506,7 +532,8 @@ impl AppShell {
                     .text_center()
                     .child(
                         "Add a GitHub Projects board to see its items here. CodeScope reads it \
-                         every 30 seconds and does not change anything on it yet.",
+                         every 30 seconds and starts work on the items you move into Research \
+                         or Ready.",
                     ),
             )
             .child(
@@ -569,6 +596,7 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let columns = panel_columns(board, &effective_mapping(board, &settings.columns));
+        let notes = self.card_notes(&settings.url, cx);
         div()
             .flex()
             .flex_row()
@@ -581,7 +609,7 @@ impl AppShell {
                     PanelGroup::Done => self
                         .render_done_column(theme, column, board, cx)
                         .into_any_element(),
-                    _ => render_group_column(theme, column, board).into_any_element(),
+                    _ => render_group_column(theme, column, board, &notes).into_any_element(),
                 }
             }))
             .into_any_element()
@@ -733,6 +761,7 @@ fn render_group_column(
     theme: &Arc<Theme>,
     column: &PanelColumn,
     board: &Board,
+    notes: &HashMap<String, CardNote>,
 ) -> impl IntoElement {
     let framed = matches!(
         column.group,
@@ -763,7 +792,7 @@ fn render_group_column(
         .when(column.sections.is_empty(), |s| s.child(not_on_board()))
         .children(column.sections.iter().map(|section| {
             let heading = !(lone_todo && section.role == Some(ColumnRole::Todo));
-            render_section(theme, section, board, heading)
+            render_section(theme, section, board, heading, notes)
         }))
 }
 
@@ -772,6 +801,7 @@ fn render_section(
     section: &PanelSection,
     board: &Board,
     heading: bool,
+    notes: &HashMap<String, CardNote>,
 ) -> impl IntoElement {
     let trigger = section.role.map(ColumnRole::kind) == Some(RoleKind::Trigger);
     let name: SharedString = section
@@ -812,12 +842,10 @@ fn render_section(
                     .child(div().text_color(theme::text_faint()).child(who)),
             )
         })
-        .children(
-            section
-                .items
-                .iter()
-                .map(|&index| render_card(theme, &board.items[index], index, &board.url)),
-        )
+        .children(section.items.iter().map(|&index| {
+            let item = &board.items[index];
+            render_card(theme, item, index, &board.url, notes.get(&item.id))
+        }))
 }
 
 fn render_card(
@@ -825,6 +853,7 @@ fn render_card(
     item: &BoardItem,
     index: usize,
     board_url: &str,
+    dispatch: Option<&CardNote>,
 ) -> impl IntoElement {
     let url = item.url.clone().unwrap_or_else(|| board_url.to_string());
     let note = match item.state {
@@ -868,10 +897,34 @@ fn render_card(
                 .text_color(theme::ink(theme))
                 .child(item.title.clone()),
         )
+        .children(dispatch.map(|note| {
+            let color = match note.tone {
+                NoteTone::Working => theme::accent(theme),
+                NoteTone::Waiting => theme::ink_muted(theme),
+                NoteTone::Failed => theme::danger(),
+            };
+            div()
+                .text_size(px(11.0))
+                .text_color(color)
+                .child(note.text.clone())
+        }))
 }
 
 fn state_dot(color: Hsla) -> impl IntoElement {
     div().flex_shrink_0().size(px(6.0)).rounded_full().bg(color)
+}
+
+fn render_dispatch_error(theme: &Arc<Theme>, error: &str) -> impl IntoElement {
+    div()
+        .px(px(24.0))
+        .py(px(8.0))
+        .border_b_1()
+        .border_color(theme::divider(theme))
+        .text_size(px(12.0))
+        .text_color(theme::danger())
+        .child(format!(
+            "Nothing starts: CodeScope couldn't ask gh who is signed in ({error})."
+        ))
 }
 
 fn render_missing_roles(theme: &Arc<Theme>, missing: &[ColumnRole]) -> impl IntoElement {

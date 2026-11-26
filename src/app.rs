@@ -64,6 +64,7 @@ use crate::sidebar::{
 };
 use crate::theme;
 
+pub(crate) mod board_dispatch;
 mod claude_update;
 
 /// Pixel height of the bottom status bar. Shared between
@@ -270,6 +271,8 @@ struct Tab {
     /// as "this tab's session". Mirrors the `since` arg of
     /// `ClaudeSessionDiscovery.Watch`.
     spawned_at: SystemTime,
+    /// The same moment on the monotonic clock, for how long ago it was.
+    spawned_instant: Instant,
     /// Adopted agent session id, set once the agent-specific discovery
     /// scan returns a fresh transcript / message dir / session dir for
     /// this tab. `None` until the agent has written its first
@@ -1925,7 +1928,7 @@ impl AppShell {
         };
         shell.start_telemetry_poll(cx);
         shell.start_bots_poll(cx);
-        shell.start_board_poll(cx);
+        shell.start_board_poll(window, cx);
         shell.start_agent_discovery_poll(cx);
         shell.schedule_taskbar_badge_init(cx);
         shell.start_text_blink(cx);
@@ -4109,6 +4112,7 @@ impl AppShell {
         let font_changed = self.settings.font != settings.font;
         self.settings = Arc::new(settings);
         self.theme = theme.clone();
+        self.agent_registry = agent_registry.clone();
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.apply_theme(theme, cx);
             sidebar.apply_agent_registry(agent_registry, cx);
@@ -4566,6 +4570,7 @@ impl AppShell {
             terminal,
             working_directory: working_directory_for_tab,
             spawned_at: SystemTime::now(),
+            spawned_instant: Instant::now(),
             adopted_session_id,
             fired_session_ids: std::collections::HashSet::new(),
             adopted_by_guess: false,

@@ -282,6 +282,38 @@ pub fn remote_origin_url(repo: &Path) -> Result<Option<String>> {
     }
 }
 
+/// Every remote of the repository as `(name, URL)` pairs, in config order.
+pub fn remote_urls(repo: &Path) -> Result<Vec<(String, String)>> {
+    let output = no_window_command("git")
+        .args(["config", "--get-regexp", r"^remote\..*\.url$"])
+        .current_dir(repo)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| "spawn git config")?;
+    match output.status.code() {
+        Some(0) => Ok(parse_remote_urls(&String::from_utf8_lossy(&output.stdout))),
+        Some(1) => Ok(Vec::new()),
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(anyhow!("git config --get-regexp remote urls failed: {stderr}"))
+        }
+    }
+}
+
+/// Parse `git config --get-regexp` lines such as `remote.origin.url https://…`.
+pub fn parse_remote_urls(stdout: &str) -> Vec<(String, String)> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let (key, url) = line.split_once(' ')?;
+            let name = key.strip_prefix("remote.")?.strip_suffix(".url")?;
+            Some((name.to_string(), url.trim().to_string()))
+        })
+        .collect()
+}
+
 /// Convert a git remote URL (HTTPS or SSH) into a browser URL.
 /// Returns `None` for shapes we don't recognise so the caller can
 /// fall back to "open the URL as-is" or hide the action.
@@ -895,6 +927,21 @@ some-future-field foo bar\n";
         run(&parent.join("nested"), &["init", "-q"]);
         assert!(!is_work_tree(&parent).unwrap());
         assert!(is_work_tree(&parent.join("nested")).unwrap());
+    }
+
+    #[test]
+    fn parses_remote_urls_including_names_with_dots() {
+        let parsed = parse_remote_urls(concat!(
+            "remote.origin.url https://github.com/me/CodeScope.git\n",
+            "remote.my.fork.url git@github.com:fork/CodeScope.git\n",
+        ));
+        assert_eq!(
+            parsed,
+            vec![
+                ("origin".to_string(), "https://github.com/me/CodeScope.git".to_string()),
+                ("my.fork".to_string(), "git@github.com:fork/CodeScope.git".to_string()),
+            ]
+        );
     }
 
     fn init_repo() -> Option<(TempDir, std::path::PathBuf, std::path::PathBuf)> {
