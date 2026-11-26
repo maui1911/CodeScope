@@ -46,10 +46,63 @@ pub struct DecisionPoint {
     pub id: String,
     /// The heading's text after the id, trimmed; may be empty.
     pub question: String,
-    /// The option letters in the order listed, `A` first.
-    pub options: Vec<char>,
-    /// One of `options`.
+    /// The text between the heading and the first option, joined into one paragraph.
+    pub context: String,
+    /// The lettered options in the order listed, `A` first.
+    pub options: Vec<DecisionOption>,
+    /// The letter of one of `options`.
     pub advice: char,
+}
+
+impl DecisionPoint {
+    /// Whether one of its options has this letter.
+    pub fn has_option(&self, letter: char) -> bool {
+        self.options.iter().any(|o| o.letter == letter)
+    }
+}
+
+/// One lettered option of a decision point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionOption {
+    /// `A`, `B`, …
+    pub letter: char,
+    /// The Markdown after the letter, and its indented lines below it.
+    pub text: String,
+}
+
+impl DecisionOption {
+    /// The first sentence of the first line, and the rest on one line, as plain text without
+    /// emphasis or code marks.
+    pub fn label_and_detail(&self) -> (String, String) {
+        let (first, below) = self.text.split_once('\n').unwrap_or((&self.text, ""));
+        let (label, rest) = split_first_sentence(first);
+        let detail: Vec<String> = std::iter::once(rest)
+            .chain(below.lines())
+            .map(plain_text)
+            .filter(|part| !part.is_empty())
+            .collect();
+        (plain_text(label), detail.join(" "))
+    }
+}
+
+fn split_first_sentence(line: &str) -> (&str, &str) {
+    let mut in_code = false;
+    let mut chars = line.char_indices().peekable();
+    while let Some((index, c)) = chars.next() {
+        match c {
+            '`' => in_code = !in_code,
+            '.' if !in_code && chars.peek().is_some_and(|(_, next)| *next == ' ') => {
+                return line.split_at(index + 1);
+            }
+            _ => {}
+        }
+    }
+    (line, "")
+}
+
+/// Markdown without `**` and backticks, trimmed.
+pub fn plain_text(markdown: &str) -> String {
+    markdown.replace("**", "").replace('`', "").trim().to_string()
 }
 
 /// Findings that passed [`check_findings`].
@@ -784,7 +837,29 @@ fn decision_point(section: &Section, number: usize) -> Result<DecisionPoint, Pro
     if !id.eq_ignore_ascii_case(&expected) {
         return Err(Problem::Numbering(expected));
     }
-    let options: Vec<char> = section.lines.iter().filter_map(|l| option_letter(l.text)).collect();
+    let mut context: Vec<&str> = Vec::new();
+    let mut options: Vec<DecisionOption> = Vec::new();
+    let mut in_option = false;
+    for line in section.lines.iter().map(|line| line.text) {
+        if let Some((letter, text)) = option_start(line) {
+            options.push(DecisionOption {
+                letter,
+                text: text.to_string(),
+            });
+            in_option = true;
+        } else if line.trim().is_empty() || advice_letter(line).is_some() {
+            in_option = false;
+        } else if in_option && line.starts_with(char::is_whitespace) {
+            if let Some(option) = options.last_mut() {
+                option.text = format!("{}\n{}", option.text, line.trim());
+            }
+        } else {
+            in_option = false;
+            if options.is_empty() {
+                context.push(line.trim());
+            }
+        }
+    }
     if options.len() < 2 {
         return Err(Problem::TooFewOptions(expected));
     }
@@ -793,18 +868,19 @@ fn decision_point(section: &Section, number: usize) -> Result<DecisionPoint, Pro
         .iter()
         .find_map(|l| advice_letter(l.text))
         .ok_or_else(|| Problem::NoAdvice(expected.clone()))?;
-    if !options.contains(&advice) {
+    if !options.iter().any(|o| o.letter == advice) {
         return Err(Problem::AdviceNotAnOption(expected));
     }
     Ok(DecisionPoint {
         id: expected,
         question: question.to_string(),
+        context: context.join(" "),
         options,
         advice,
     })
 }
 
-fn option_letter(line: &str) -> Option<char> {
+fn option_start(line: &str) -> Option<(char, &str)> {
     let item = line.trim_start();
     let item = item
         .strip_prefix("- ")
@@ -818,7 +894,9 @@ fn option_letter(line: &str) -> Option<char> {
     let letter = chars.next().filter(char::is_ascii_uppercase)?;
     let rest = chars.as_str();
     let rest = rest.strip_prefix(['.', ':', ')']).unwrap_or(rest);
-    rest.starts_with("**").then_some(letter)
+    let text = rest.strip_prefix("**")?;
+    let text = text.trim_start_matches(|c: char| c.is_whitespace() || matches!(c, ':' | '.'));
+    Some((letter, text.trim_end()))
 }
 
 fn advice_letter(line: &str) -> Option<char> {
@@ -1060,6 +1138,19 @@ pub fn problems_list(problems: &[Problem]) -> String {
     list.join("; ")
 }
 
+/// The findings in a comment [`comment_body`] made, read back without its next step, its marker
+/// and the zero-width spaces `quiet` put in.
+pub fn posted_findings(body: &str) -> Option<Findings> {
+    let lines: Vec<&str> = body.lines().collect();
+    let marker =
+        lines.iter().rposition(|line| is_marker_line(line) && line.contains("phase=research"))?;
+    let end = lines[..marker]
+        .iter()
+        .rposition(|line| line.starts_with("**Next step:**"))
+        .unwrap_or(marker);
+    check_findings(&lines[..end].join("\n").replace(ZERO_WIDTH_SPACE, "")).ok()
+}
+
 /// One line for the session that wrote the findings, saying what to fix: fixed words and the
 /// headings CodeScope numbers itself, nothing taken from the file.
 pub fn problems_message(problems: &[Problem]) -> String {
@@ -1110,6 +1201,13 @@ Advice: A, it keeps the slice small.
 **Advice:** B, strict is simpler.
 ";
 
+    fn option(letter: char, text: &str) -> DecisionOption {
+        DecisionOption {
+            letter,
+            text: text.into(),
+        }
+    }
+
     #[test]
     fn accepts_findings_with_extra_sections_and_reads_the_decision_points() {
         let findings = check_findings(WITH_POINTS).unwrap();
@@ -1120,17 +1218,74 @@ Advice: A, it keeps the slice small.
                 DecisionPoint {
                     id: "B1".into(),
                     question: "Which branch?".into(),
-                    options: vec!['A', 'B', 'C'],
+                    context: "Context.".into(),
+                    options: vec![
+                        option('A', "Stack it."),
+                        option('B', "Wait."),
+                        option('C', "Fold it in."),
+                    ],
                     advice: 'A',
                 },
                 DecisionPoint {
                     id: "B2".into(),
                     question: "Extra sections?".into(),
-                    options: vec!['A', 'B'],
+                    context: String::new(),
+                    options: vec![option('A', "Allow them."), option('B', "Reject them.")],
                     advice: 'B',
                 },
             ]
         );
+    }
+
+    #[test]
+    fn an_option_takes_its_indented_lines_and_splits_into_label_and_detail() {
+        let text = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n## Decision points\n\n\
+                    ### B1 Which session?\n\nThe user can open a shell.\n\
+                    It has no id.\n\n\
+                    - **A** Prefer agent sessions, in this order:\n\
+                    \x20 1. an open tab with an `agent_id`;\n\
+                    \x20 2. else a fresh one.\n\
+                    - **B**: Use `cfg.first()`. It is what the sidebar does.\n\n\
+                    Advice: A. It needs no schema change.\n";
+        let point = &check_findings(text).unwrap().decision_points[0];
+        assert_eq!(point.context, "The user can open a shell. It has no id.");
+        assert_eq!(
+            point.options,
+            vec![
+                option(
+                    'A',
+                    "Prefer agent sessions, in this order:\n1. an open tab with an `agent_id`;\n\
+                     2. else a fresh one."
+                ),
+                option('B', "Use `cfg.first()`. It is what the sidebar does."),
+            ]
+        );
+        assert_eq!(
+            point.options[0].label_and_detail(),
+            (
+                "Prefer agent sessions, in this order:".to_string(),
+                "1. an open tab with an agent_id; 2. else a fresh one.".to_string()
+            )
+        );
+        assert_eq!(
+            point.options[1].label_and_detail(),
+            ("Use cfg.first().".to_string(), "It is what the sidebar does.".to_string())
+        );
+    }
+
+    #[test]
+    fn reads_the_findings_back_from_the_comment_that_posted_them() {
+        let findings = check_findings(WITH_POINTS).unwrap();
+        let body = comment_body(WITH_POINTS, &findings);
+        assert_eq!(posted_findings(&body), Some(findings));
+        assert_eq!(posted_findings(WITH_POINTS), None);
+        assert_eq!(posted_findings("B1 A, B2 B"), None);
+
+        let quieted = WITH_POINTS.replace("Stack it.", "Ask @maui1911 to run /deploy <now>.");
+        let findings = check_findings(&quieted).unwrap();
+        let body = comment_body(&quieted, &findings);
+        assert!(body.contains(ZERO_WIDTH_SPACE));
+        assert_eq!(posted_findings(&body), Some(findings));
     }
 
     #[test]

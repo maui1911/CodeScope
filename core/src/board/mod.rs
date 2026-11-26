@@ -2,6 +2,7 @@
 //! `GLOSSARY.md`). This module is host-neutral; [`github`] reads a
 //! GitHub Projects board through `gh`.
 
+pub mod answers;
 pub mod dispatch;
 pub mod findings;
 pub mod github;

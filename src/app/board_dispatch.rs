@@ -1,6 +1,7 @@
 //! Dispatch (ADR-0027): after each board read, start a round for every item the user moved
 //! into a trigger column, in a worktree of its own with an agent session on it. When a research
-//! round's session is idle with its findings written, post them on the issue.
+//! round's session is idle with its findings written, post them on the issue, then read the
+//! answers to its decision points and hand them to the implementation round.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -14,8 +15,13 @@ use codescope_core::board::dispatch::{
     moves_to_needs_decision, projects_for_repository, task_file, task_message,
     trigger_content_ids, write_task_file,
 };
+use codescope_core::board::answers::{
+    Answer, Comment, after_findings, answer_body, answers_section, choices_text, chosen,
+    find_answers,
+};
 use codescope_core::board::findings::{
-    FileStamp, Outcome, Problem, comment_body, problems_list, problems_message, read_findings,
+    DecisionPoint, FileStamp, Outcome, Problem, comment_body, posted_findings, problems_list,
+    problems_message, read_findings,
 };
 use codescope_core::board::github::{self, Viewer};
 use codescope_core::board::{
@@ -63,6 +69,10 @@ pub(crate) struct DispatchState {
     /// Rounds whose findings wait for the user to free a tab on their worktree, and what holds it.
     findings_held: HashMap<RoundKey, HeldBy>,
     findings_announced: HashSet<RoundKey>,
+    /// Content id → the decision points posted on it and the answers so far.
+    discussions: HashMap<String, Discussion>,
+    /// Items the Decide dialog moved to Ready, until their implementation round starts.
+    readied: HashSet<String>,
 }
 
 /// A round: the board item's id and when the move that started the round was made.
@@ -70,6 +80,53 @@ type RoundKey = (String, String);
 
 fn round_key(record: &WorktreeDispatch) -> RoundKey {
     (record.item_id.clone(), record.trigger_at.clone())
+}
+
+/// Decision points posted on an item, and the answers on its issue so far.
+#[derive(Clone, Default)]
+pub(crate) struct Discussion {
+    points: Vec<DecisionPoint>,
+    answers: Vec<Answer>,
+}
+
+/// An item whose decision points wait for answers, as a board read looks them up.
+pub(crate) struct DiscussionRead {
+    content_id: String,
+    repository: String,
+    findings_url: String,
+    /// When the research round started; older comments never answer it.
+    since: String,
+}
+
+/// Where an implementation round finds the answers to the research before it.
+struct AnswersFrom {
+    findings_url: String,
+    since: String,
+}
+
+/// What the Decide dialog asks about an item.
+pub(crate) struct Decision {
+    pub item_id: String,
+    pub board_url: String,
+    pub content_id: String,
+    pub number: u32,
+    pub repository: String,
+    pub title: String,
+    pub findings_url: String,
+    pub points: Vec<DecisionPoint>,
+    /// Per point, the option the latest answer chose, else the advice.
+    pub choices: Vec<char>,
+}
+
+/// An answer the Decide dialog sends.
+pub(crate) struct AnswerPost {
+    pub item_id: String,
+    pub board_url: String,
+    pub content_id: String,
+    pub number: u32,
+    pub choices: Vec<(String, char)>,
+    pub note: String,
+    pub move_to_ready: bool,
 }
 
 struct Reminder {
@@ -95,6 +152,7 @@ struct Posting {
     record: WorktreeDispatch,
     path: PathBuf,
     outcome: Outcome,
+    points: Vec<DecisionPoint>,
 }
 
 struct Posted {
@@ -106,9 +164,10 @@ struct Posted {
 pub(crate) struct ReadInput {
     boards: Vec<(String, ColumnMapping)>,
     viewer: Option<Viewer>,
-    known_access: HashSet<(String, String)>,
+    known_access: HashMap<(String, String), bool>,
     /// Local projects as `(id, path)`, when their remotes are due for a read.
     projects: Option<Vec<(String, String)>>,
+    discussions: Vec<DiscussionRead>,
 }
 
 #[derive(Default)]
@@ -118,6 +177,8 @@ pub(crate) struct ReadOutput {
     /// Write access by `(repository, login)`; `None` where the check failed.
     access: Vec<((String, String), Option<bool>)>,
     remotes: Option<Vec<ProjectRemotes>>,
+    /// Discussions by content id; `None` when they weren't read.
+    discussions: Option<HashMap<String, Discussion>>,
 }
 
 pub(crate) struct BoardFetch {
@@ -131,6 +192,23 @@ pub(crate) struct BoardFetch {
 pub(crate) struct CardNote {
     pub text: SharedString,
     pub tone: NoteTone,
+    pub action: Option<CardAction>,
+}
+
+impl CardNote {
+    fn new(text: impl Into<SharedString>, tone: NoteTone) -> Self {
+        Self {
+            text: text.into(),
+            tone,
+            action: None,
+        }
+    }
+}
+
+/// A button on a card.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CardAction {
+    Decide,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -161,6 +239,8 @@ struct Job {
     assign_to: Option<String>,
     board: Board,
     progress_column_id: String,
+    answers_from: Option<AnswersFrom>,
+    known_access: HashMap<(String, String), bool>,
 }
 
 struct Launch {
@@ -311,6 +391,16 @@ struct Place {
     branch: String,
 }
 
+fn fresh_access(
+    access: &HashMap<(String, String), (bool, Instant)>,
+) -> HashMap<(String, String), bool> {
+    access
+        .iter()
+        .filter(|(_, (_, at))| at.elapsed() < ACCESS_RECHECK_AFTER)
+        .map(|(key, (can_write, _))| (key.clone(), *can_write))
+        .collect()
+}
+
 fn usable_access(answer: Option<&(bool, Instant)>, now: Instant) -> Option<bool> {
     answer
         .filter(|(_, at)| now.saturating_duration_since(*at) < ACCESS_EXPIRES_AFTER)
@@ -356,6 +446,13 @@ pub(crate) fn read_boards(input: ReadInput) -> ReadOutput {
             changes,
         });
     }
+    if !input.discussions.is_empty() {
+        if viewer.is_none() {
+            output.viewer = Some(github::fetch_viewer().map_err(|err| format!("{err:#}")));
+        }
+        output.discussions =
+            read_discussions(&input.discussions, &input.known_access, &mut output.access);
+    }
     if any_trigger && let Some(projects) = input.projects {
         output.remotes = Some(
             projects
@@ -376,7 +473,7 @@ fn check_access(
     board: &Board,
     changes: &HashMap<String, StatusChange>,
     viewer: &Viewer,
-    known: &HashSet<(String, String)>,
+    known: &HashMap<(String, String), bool>,
     found: &mut Vec<((String, String), Option<bool>)>,
 ) {
     for item in &board.items {
@@ -389,17 +486,110 @@ fn check_access(
         else {
             continue;
         };
-        let key = access_key(repository, login);
-        if known.contains(&key) || found.iter().any(|(k, _)| *k == key) {
-            continue;
-        }
-        let answer = github::can_write(repository, login)
-            .inspect_err(|err| {
-                eprintln!("warning: couldn't check {login}'s access to {repository}: {err:#}")
-            })
-            .ok();
-        found.push((key, answer));
+        check_write_access(repository, login, known, found);
     }
+}
+
+fn check_write_access(
+    repository: &str,
+    login: &str,
+    known: &HashMap<(String, String), bool>,
+    found: &mut Vec<((String, String), Option<bool>)>,
+) {
+    let key = access_key(repository, login);
+    if known.contains_key(&key) || found.iter().any(|(k, _)| *k == key) {
+        return;
+    }
+    let answer = github::can_write(repository, login)
+        .inspect_err(|err| {
+            eprintln!("warning: couldn't check {login}'s access to {repository}: {err:#}")
+        })
+        .ok();
+    found.push((key, answer));
+}
+
+fn read_discussions(
+    reads: &[DiscussionRead],
+    known: &HashMap<(String, String), bool>,
+    found: &mut Vec<((String, String), Option<bool>)>,
+) -> Option<HashMap<String, Discussion>> {
+    let ids: Vec<String> = reads.iter().map(|r| r.content_id.clone()).collect();
+    let comments = github::fetch_comments(&ids)
+        .inspect_err(|err| eprintln!("warning: couldn't read the answers: {err:#}"))
+        .ok()?;
+    let mut discussions = HashMap::new();
+    for read in reads {
+        let Some(list) = comments.get(&read.content_id) else {
+            continue;
+        };
+        let found_here = discussion(
+            list,
+            &read.repository,
+            &read.findings_url,
+            &read.since,
+            known,
+            found,
+        );
+        discussions.insert(read.content_id.clone(), found_here);
+    }
+    Some(discussions)
+}
+
+/// The decision points of the findings comment among `comments`, and the answers after it.
+/// Write access that `known` doesn't cover is checked and added to `found`.
+fn discussion(
+    comments: &[Comment],
+    repository: &str,
+    findings_url: &str,
+    since: &str,
+    known: &HashMap<(String, String), bool>,
+    found: &mut Vec<((String, String), Option<bool>)>,
+) -> Discussion {
+    let points = comments
+        .iter()
+        .find(|c| c.url == findings_url)
+        .and_then(|c| posted_findings(&c.body))
+        .map(|findings| findings.decision_points)
+        .unwrap_or_default();
+    for comment in after_findings(comments, findings_url, since) {
+        if let Some(login) = comment.author.as_deref() {
+            check_write_access(repository, login, known, found);
+        }
+    }
+    let found: &[((String, String), Option<bool>)] = found;
+    let can_write = |login: &str| {
+        let key = access_key(repository, login);
+        known
+            .get(&key)
+            .copied()
+            .or_else(|| found.iter().find(|(k, _)| *k == key).and_then(|(_, can)| *can))
+            .unwrap_or(false)
+    };
+    let answers = find_answers(comments, findings_url, since, &points, can_write);
+    Discussion { points, answers }
+}
+
+/// The `## Answers` section of an implementation round's task file, read fresh from the issue.
+fn answers_for_task(job: &Job, from: &AnswersFrom) -> String {
+    let record = &job.record;
+    let comments = github::fetch_comments(std::slice::from_ref(&record.content_id))
+        .inspect_err(|err| {
+            eprintln!("warning: couldn't read #{}'s answers: {err:#}", record.number)
+        })
+        .ok()
+        .and_then(|mut found| found.remove(&record.content_id));
+    let mut checked = Vec::new();
+    let discussion = comments.map(|comments| {
+        discussion(
+            &comments,
+            &record.repository,
+            &from.findings_url,
+            &from.since,
+            &job.known_access,
+            &mut checked,
+        )
+    });
+    answers_section(discussion.as_ref().map(|d| d.answers.as_slice()), &from.findings_url)
 }
 
 fn prepare_worktree(job: &Job) -> anyhow::Result<()> {
@@ -417,7 +607,8 @@ fn prepare_worktree(job: &Job) -> anyhow::Result<()> {
             .map(|relative| relative.to_string_lossy().replace('\\', "/"))
             .unwrap_or_else(|_| skill.to_string_lossy().into_owned())
     });
-    write_task_file(&job.path, &task_file(&job.record, skill.as_deref()))
+    let answers = job.answers_from.as_ref().map(|from| answers_for_task(job, from));
+    write_task_file(&job.path, &task_file(&job.record, skill.as_deref(), answers.as_deref()))
 }
 
 fn claim_on_board(job: &Job, viewer_id: &str) -> Vec<String> {
@@ -447,6 +638,21 @@ impl AppShell {
             && local.iter().all(|(id, path)| read_projects.contains(&(id.as_str(), path.as_str())));
         let remotes_due = !same_projects
             || state.remotes_read_at.is_none_or(|at| at.elapsed() >= REMOTES_MAX_AGE);
+        let discussions = self
+            .dispatch_records(cx)
+            .into_iter()
+            .filter_map(|(_, _, _, record)| {
+                let posted = record.findings.clone()?;
+                let waiting = record.round == Round::Research
+                    && posted.outcome == Outcome::DecisionPoints;
+                waiting.then_some(DiscussionRead {
+                    content_id: record.content_id,
+                    repository: record.repository,
+                    findings_url: posted.comment_url,
+                    since: record.trigger_at,
+                })
+            })
+            .collect();
         ReadInput {
             boards: self
                 .settings
@@ -459,13 +665,9 @@ impl AppShell {
                 .is_some_and(|at| at.elapsed() < VIEWER_MAX_AGE)
                 .then(|| state.viewer.clone())
                 .flatten(),
-            known_access: state
-                .access
-                .iter()
-                .filter(|(_, (_, at))| at.elapsed() < ACCESS_RECHECK_AFTER)
-                .map(|(key, _)| key.clone())
-                .collect(),
+            known_access: fresh_access(&state.access),
             projects: remotes_due.then_some(local),
+            discussions,
         }
     }
 
@@ -510,6 +712,9 @@ impl AppShell {
                 Some(can_write) => state.access.insert(key, (can_write, now)),
                 None => state.access.remove(&key),
             };
+        }
+        if let Some(discussions) = output.discussions.take() {
+            state.discussions.extend(discussions);
         }
         if let Some(remotes) = output.remotes.take() {
             state.remotes = remotes;
@@ -789,6 +994,19 @@ impl AppShell {
         } else {
             None
         };
+        let previous = self
+            .dispatch_records(cx)
+            .into_iter()
+            .map(|(_, _, _, record)| record)
+            .find(|r| r.board_url == board_url && r.item_id == item.id);
+        let answers_from = previous.as_ref().and_then(|previous| {
+            let posted = previous.findings.clone()?;
+            let after_research = previous.round == Round::Research && round != Round::Research;
+            after_research.then(|| AnswersFrom {
+                findings_url: posted.comment_url,
+                since: previous.trigger_at.clone(),
+            })
+        });
         let mut title = codescope_core::TabTitle::project(project.name.clone());
         title.set_branch(&branch);
         let launch = Launch {
@@ -819,7 +1037,10 @@ impl AppShell {
             assign_to: item.assignees.is_empty().then_some(content_id),
             board,
             progress_column_id,
+            answers_from,
+            known_access: fresh_access(&self.board.dispatch.access),
         };
+        self.board.dispatch.readied.remove(&item.id);
         self.board.dispatch.starting.insert(item.id.clone(), round);
         self.board.dispatch.failed.remove(&item.id);
         cx.notify();
@@ -1092,6 +1313,7 @@ impl AppShell {
                 Ok((text, findings)) => {
                     let body = comment_body(text, &findings);
                     let posting = Posting {
+                        points: findings.decision_points.clone(),
                         record,
                         path,
                         outcome: findings.outcome(),
@@ -1236,6 +1458,7 @@ impl AppShell {
             record,
             path,
             outcome,
+            points,
         } = posting;
         let key = round_key(&record);
         self.board.dispatch.posting.remove(&key);
@@ -1263,6 +1486,13 @@ impl AppShell {
             outcome,
             comment_url: url,
         };
+        if outcome == Outcome::DecisionPoints {
+            let discussion = Discussion {
+                points,
+                answers: Vec::new(),
+            };
+            self.board.dispatch.discussions.insert(record.content_id.clone(), discussion);
+        }
         let saved = ProjectsConfig::load(&self.paths)
             .map_err(|err| format!("{err:#}"))
             .and_then(|mut next| {
@@ -1315,6 +1545,7 @@ impl AppShell {
     /// What each card on the board at `board_url` says about dispatch, by item id.
     pub(crate) fn card_notes(&self, board_url: &str, cx: &App) -> HashMap<String, CardNote> {
         let state = &self.board.dispatch;
+        let viewer = state.viewer.as_ref().map(|v| v.login.as_str());
         let records: Vec<_> = self
             .dispatch_records(cx)
             .into_iter()
@@ -1326,52 +1557,32 @@ impl AppShell {
             .map(|(_, _, branch, r)| {
                 let posted = r.findings.as_ref().filter(|_| r.round == Round::Research);
                 let note = match (posted.map(|p| p.outcome), branch) {
-                    (Some(Outcome::DecisionPoints), _) => CardNote {
-                        text: "Decision points posted · answer on the issue".into(),
-                        tone: NoteTone::NeedsYou,
-                    },
-                    (Some(Outcome::Findings), _) => CardNote {
-                        text: "Findings posted · move it to Ready".into(),
-                        tone: NoteTone::NeedsYou,
-                    },
-                    (None, Some(branch)) => CardNote {
-                        text: format!("{} · {branch}", r.round.label()).into(),
-                        tone: NoteTone::Working,
-                    },
-                    (None, None) => CardNote {
-                        text: r.round.label().into(),
-                        tone: NoteTone::Working,
-                    },
+                    (Some(Outcome::DecisionPoints), _) => decision_note(
+                        state.discussions.get(&r.content_id),
+                        viewer,
+                        state.readied.contains(&r.item_id),
+                    ),
+                    (Some(Outcome::Findings), _) => {
+                        CardNote::new("Findings posted · move it to Ready", NoteTone::NeedsYou)
+                    }
+                    (None, Some(branch)) => CardNote::new(
+                        format!("{} · {branch}", r.round.label()),
+                        NoteTone::Working,
+                    ),
+                    (None, None) => CardNote::new(r.round.label(), NoteTone::Working),
                 };
                 (r.item_id, note)
             })
             .collect();
         for key in state.posting.iter().filter(|key| rounds.contains(*key)) {
-            notes.insert(
-                key.0.clone(),
-                CardNote {
-                    text: "Posting the findings…".into(),
-                    tone: NoteTone::Working,
-                },
-            );
+            notes.insert(key.0.clone(), CardNote::new("Posting the findings…", NoteTone::Working));
         }
         for (key, reminder) in state.reminders.iter().filter(|(key, _)| rounds.contains(*key)) {
-            notes.insert(
-                key.0.clone(),
-                CardNote {
-                    text: format!("Findings incomplete: {}", reminder.problems).into(),
-                    tone: NoteTone::Failed,
-                },
-            );
+            let text = format!("Findings incomplete: {}", reminder.problems);
+            notes.insert(key.0.clone(), CardNote::new(text, NoteTone::Failed));
         }
         for (key, (_, note)) in state.post_errors.iter().filter(|(key, _)| rounds.contains(*key)) {
-            notes.insert(
-                key.0.clone(),
-                CardNote {
-                    text: note.clone().into(),
-                    tone: NoteTone::Failed,
-                },
-            );
+            notes.insert(key.0.clone(), CardNote::new(note.clone(), NoteTone::Failed));
         }
         for (key, by) in state.findings_held.iter().filter(|(key, _)| rounds.contains(*key)) {
             let text = match by {
@@ -1388,50 +1599,207 @@ impl AppShell {
                      it, or close the tab"
                 }
             };
-            notes.insert(
-                key.0.clone(),
-                CardNote {
-                    text: text.into(),
-                    tone: NoteTone::Waiting,
-                },
-            );
+            notes.insert(key.0.clone(), CardNote::new(text, NoteTone::Waiting));
         }
         for (item_id, hold) in &state.holds {
             if !hold.is_quiet() {
-                notes.insert(
-                    item_id.clone(),
-                    CardNote {
-                        text: hold.label().into(),
-                        tone: NoteTone::Waiting,
-                    },
-                );
+                notes.insert(item_id.clone(), CardNote::new(hold.label(), NoteTone::Waiting));
             }
         }
         for (item_id, (_, message)) in &state.failed {
-            notes.insert(
-                item_id.clone(),
-                CardNote {
-                    text: format!("Couldn't start: {message}").into(),
-                    tone: NoteTone::Failed,
-                },
-            );
+            let text = format!("Couldn't start: {message}");
+            notes.insert(item_id.clone(), CardNote::new(text, NoteTone::Failed));
         }
         for (item_id, round) in &state.starting {
-            notes.insert(
-                item_id.clone(),
-                CardNote {
-                    text: format!("Starting {}…", round.label().to_lowercase()).into(),
-                    tone: NoteTone::Working,
-                },
-            );
+            let text = format!("Starting {}…", round.label().to_lowercase());
+            notes.insert(item_id.clone(), CardNote::new(text, NoteTone::Working));
         }
         notes
+    }
+
+    /// What the Decide dialog asks about `item_id`, while its decision points are known.
+    pub(crate) fn decision(&self, item_id: &str, cx: &App) -> Option<Decision> {
+        let (_, _, _, record) = self
+            .dispatch_records(cx)
+            .into_iter()
+            .find(|(_, _, _, r)| r.item_id == item_id && r.round == Round::Research)?;
+        let posted = record.findings.clone()?;
+        let discussion = self.board.dispatch.discussions.get(&record.content_id)?;
+        if posted.outcome != Outcome::DecisionPoints || discussion.points.is_empty() {
+            return None;
+        }
+        let answered = chosen(&discussion.answers);
+        let choices = discussion
+            .points
+            .iter()
+            .map(|point| {
+                answered
+                    .iter()
+                    .find(|(id, _)| *id == point.id)
+                    .map_or(point.advice, |(_, letter)| *letter)
+            })
+            .collect();
+        Some(Decision {
+            item_id: record.item_id,
+            board_url: record.board_url,
+            content_id: record.content_id,
+            number: record.number,
+            repository: record.repository,
+            title: record.title,
+            findings_url: posted.comment_url,
+            points: discussion.points.clone(),
+            choices,
+        })
+    }
+
+    /// Post the answer on the issue, then move the item to Ready when asked and it is still in
+    /// Needs decision, where CodeScope put it.
+    pub(crate) fn send_answer(&mut self, post: AnswerPost, cx: &mut Context<Self>) {
+        let ready = if post.move_to_ready {
+            self.ready_target(&post.board_url, &post.item_id)
+        } else {
+            None
+        };
+        let stayed = post.move_to_ready && ready.is_none();
+        let body = answer_body(&post.choices, &post.note);
+        let content_id = post.content_id.clone();
+        let item_id = post.item_id.clone();
+        let posted_body = body.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let url = github::add_comment(&content_id, &posted_body)
+                        .map_err(|err| format!("{err:#}"))?;
+                    let moved = ready.and_then(|(board, column)| {
+                        github::set_status(&board, &item_id, &column)
+                            .map_err(|err| format!("{err:#}"))
+                            .err()
+                    });
+                    Ok::<_, String>((url, moved))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.finish_answer(post, body, stayed, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// The board and Ready column to move `item_id` to, while it is in Needs decision.
+    fn ready_target(&self, board_url: &str, item_id: &str) -> Option<(Board, String)> {
+        let board = self.board.reads_by_url.get(board_url)?.last_good.as_ref()?;
+        let settings = self.settings.boards.iter().find(|b| b.url == board_url)?;
+        let mapping = effective_mapping(board, &settings.columns);
+        let item = board.items.iter().find(|item| item.id == item_id)?;
+        if board.role_of(item, &mapping) != Some(ColumnRole::NeedsDecision) {
+            return None;
+        }
+        let column = mapped_column(board, &mapping, ColumnRole::Ready)?;
+        Some((board.clone(), column.id.clone()))
+    }
+
+    fn finish_answer(
+        &mut self,
+        post: AnswerPost,
+        body: String,
+        stayed: bool,
+        result: Result<(String, Option<String>), String>,
+        cx: &mut Context<Self>,
+    ) {
+        let (url, move_error) = match result {
+            Ok(done) => done,
+            Err(message) => {
+                if let Some(dialog) = self.decide_dialog.as_mut() {
+                    dialog.sending = false;
+                    dialog.error = Some(format!("Couldn't post the answer: {message}"));
+                }
+                cx.notify();
+                return;
+            }
+        };
+        self.decide_dialog = None;
+        let state = &mut self.board.dispatch;
+        if let (Some(viewer), Some(discussion)) =
+            (&state.viewer, state.discussions.get_mut(&post.content_id))
+        {
+            discussion.answers.push(Answer {
+                author: viewer.login.clone(),
+                created_at: codescope_core::time::now_iso8601(),
+                url,
+                choices: post.choices.clone(),
+                body,
+            });
+        }
+        let moved = post.move_to_ready && !stayed && move_error.is_none();
+        if moved {
+            state.readied.insert(post.item_id.clone());
+        }
+        let title = format!("Answer posted on #{}", post.number);
+        let (kind, detail) = match (&move_error, stayed, post.move_to_ready) {
+            (Some(err), _, _) => (ToastKind::Err, format!("Couldn't move it to Ready: {err}")),
+            (None, true, _) => (
+                ToastKind::Info,
+                "It isn't in Needs decision anymore, so it stays where it is.".to_string(),
+            ),
+            (None, false, true) => (
+                ToastKind::Ok,
+                "It moved to Ready; implementation starts at the next board read.".to_string(),
+            ),
+            (None, false, false) => (
+                ToastKind::Ok,
+                "Move it to Ready to start implementation.".to_string(),
+            ),
+        };
+        self.push_toast(kind, title, Some(detail.into()), cx);
+        if moved {
+            self.refresh_boards(cx);
+        }
+        cx.notify();
+    }
+}
+
+/// The card line of research that posted decision points: what to decide, or who answered.
+fn decision_note(discussion: Option<&Discussion>, viewer: Option<&str>, readied: bool) -> CardNote {
+    let Some(discussion) = discussion else {
+        return CardNote::new("Decision points posted · answer on the issue", NoteTone::NeedsYou);
+    };
+    let Some(last) = discussion.answers.last() else {
+        let count = discussion.points.len();
+        if count == 0 {
+            return CardNote::new(
+                "Decision points posted · answer on the issue",
+                NoteTone::NeedsYou,
+            );
+        }
+        let noun = if count == 1 { "decision point" } else { "decision points" };
+        return CardNote {
+            text: format!("{count} {noun} · decide here or on the issue").into(),
+            tone: NoteTone::NeedsYou,
+            action: Some(CardAction::Decide),
+        };
+    };
+    let who = if viewer.is_some_and(|v| v.eq_ignore_ascii_case(&last.author)) {
+        "you".to_string()
+    } else {
+        format!("@{}", last.author)
+    };
+    let picked = chosen(&discussion.answers);
+    let answered = if picked.is_empty() {
+        format!("Answered by {who}")
+    } else {
+        format!("Answered by {who}: {}", choices_text(&picked))
+    };
+    if readied {
+        CardNote::new(format!("{answered} · implementation starts"), NoteTone::Working)
+    } else {
+        CardNote::new(format!("{answered} · move it to Ready"), NoteTone::NeedsYou)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codescope_core::board::findings::DecisionOption;
 
     fn tab(running: Option<&[u32]>, claude_idle: Option<bool>, typed: bool) -> TabAtHandover {
         tab_at_handover(&TabProbe {
@@ -1486,6 +1854,31 @@ mod tests {
                 typed: false,
             };
             assert_eq!(tab_at_handover(&probe), TabAtHandover::Busy);
+        }
+    }
+
+    fn point(id: &str) -> DecisionPoint {
+        DecisionPoint {
+            id: id.into(),
+            question: "Q?".into(),
+            context: String::new(),
+            options: ['A', 'B']
+                .map(|letter| DecisionOption {
+                    letter,
+                    text: "x".into(),
+                })
+                .to_vec(),
+            advice: 'A',
+        }
+    }
+
+    fn answer(author: &str, choices: &[(&str, char)]) -> Answer {
+        Answer {
+            author: author.into(),
+            created_at: "t".into(),
+            url: "u".into(),
+            choices: choices.iter().map(|(id, l)| (id.to_string(), *l)).collect(),
+            body: String::new(),
         }
     }
 
@@ -1625,5 +2018,35 @@ mod tests {
         assert_eq!(handover_to(&[Stopped, Draft]), Handover::Wait(Hold::SessionStopped));
         assert_eq!(handover_to(&[Stopped, IdleClaude]), Handover::Type(1));
         assert_eq!(handover_to(&[Stopped, Busy]), Handover::Wait(Hold::SessionBusy));
+    }
+
+    #[test]
+    fn unanswered_points_offer_the_decide_button() {
+        let discussion = Discussion {
+            points: vec![point("B1"), point("B2")],
+            answers: Vec::new(),
+        };
+        let note = decision_note(Some(&discussion), Some("maui1911"), false);
+        assert_eq!(note.text.as_ref(), "2 decision points · decide here or on the issue");
+        assert!(note.action == Some(CardAction::Decide));
+        let unknown = decision_note(None, Some("maui1911"), false);
+        assert_eq!(unknown.text.as_ref(), "Decision points posted · answer on the issue");
+        assert!(unknown.action.is_none());
+    }
+
+    #[test]
+    fn an_answer_names_who_gave_it_and_what_was_chosen() {
+        let mut discussion = Discussion {
+            points: vec![point("B1"), point("B2")],
+            answers: vec![answer("Maui1911", &[("B1", 'B'), ("B2", 'A')])],
+        };
+        let mine = decision_note(Some(&discussion), Some("maui1911"), false);
+        assert_eq!(mine.text.as_ref(), "Answered by you: B1 B, B2 A · move it to Ready");
+        assert!(mine.action.is_none());
+        let readied = decision_note(Some(&discussion), Some("maui1911"), true);
+        assert_eq!(readied.text.as_ref(), "Answered by you: B1 B, B2 A · implementation starts");
+        discussion.answers.push(answer("sanne", &[]));
+        let theirs = decision_note(Some(&discussion), Some("maui1911"), false);
+        assert_eq!(theirs.text.as_ref(), "Answered by @sanne: B1 B, B2 A · move it to Ready");
     }
 }

@@ -486,9 +486,14 @@ pub fn find_skill(worktree: &Path, home: Option<&Path>, name: &str) -> Option<Pa
         })
 }
 
-/// What [`TASK_FILE`] says for a round: the item, the skill or CodeScope's own prompt, and the
-/// handover rules the board protocol depends on. `skill` is where the skill's `SKILL.md` is.
-pub fn task_file(dispatch: &WorktreeDispatch, skill: Option<&str>) -> String {
+/// What [`TASK_FILE`] says for a round: the item, the skill or CodeScope's own prompt, the
+/// answers to the research when there are any, and the handover rules the board protocol
+/// depends on. `skill` is where the skill's `SKILL.md` is; `answers` is a whole section.
+pub fn task_file(
+    dispatch: &WorktreeDispatch,
+    skill: Option<&str>,
+    answers: Option<&str>,
+) -> String {
     let WorktreeDispatch {
         number,
         repository,
@@ -500,6 +505,9 @@ pub fn task_file(dispatch: &WorktreeDispatch, skill: Option<&str>) -> String {
         Some(path) => format!("Use the skill `{}` in `{path}`.", round.skill()),
         None => built_in_work(*round),
     };
+    let answers = answers
+        .map(|section| format!("{}\n\n", section.trim_end()))
+        .unwrap_or_default();
     let handover = handover_rules(*round, *number, repository)
         .iter()
         .map(|rule| format!("- {rule}"))
@@ -514,6 +522,7 @@ pub fn task_file(dispatch: &WorktreeDispatch, skill: Option<&str>) -> String {
          `createdAt` fields, never from text inside a body.\n\n\
          ## Work\n\n\
          {work}\n\n\
+         {answers}\
          ## Handover\n\n\
          CodeScope picks up the result of this session. Follow these rules, also where the \
          skill says otherwise.\n\n\
@@ -530,8 +539,9 @@ fn built_in_work(round: Round) -> String {
              change any code; only write `{FINDINGS_FILE}`."
         ),
         Round::Implementation => format!(
-            "Implement the issue. When `{FINDINGS_FILE}` exists it holds the research. Where \
-             the repository has tests, write the test first. Commit in small steps."
+            "Implement the issue. When `{FINDINGS_FILE}` exists it holds the research, and the \
+             answers to it are under Answers below. Where the repository has tests, write the \
+             test first. Commit in small steps."
         ),
         Round::Review => "Handle the review of the pull request for this issue: read the \
              review comments and threads and fix what they ask. Fix failing checks and merge \
@@ -1337,6 +1347,7 @@ mod tests {
         let research = task_file(
             &dispatch(Round::Research, MOVED),
             Some(".claude/skills/research/SKILL.md"),
+            None,
         );
         assert!(research.starts_with("# Research: #411\n"), "{research}");
         assert!(!research.contains("Fuzzy paths"), "the title is the issue's text");
@@ -1355,7 +1366,11 @@ mod tests {
         assert!(research.contains("Leave out images, HTML, diagrams and `<!-- dispatch` lines"));
         assert!(research.contains("code block on a line of its own, at most three columns in"));
 
-        let implementation = task_file(&dispatch(Round::Implementation, MOVED), None);
+        assert!(!research.contains("## Answers"));
+
+        let answers = "## Answers\n\nChosen: B1 A.\n";
+        let implementation =
+            task_file(&dispatch(Round::Implementation, MOVED), None, Some(answers));
         assert!(implementation.contains("Implement the issue."), "{implementation}");
         assert!(implementation.contains("Closes #411"));
         assert!(implementation.contains("--assignee @me"));
@@ -1366,8 +1381,11 @@ mod tests {
         ));
         assert!(implementation.contains("When GitHub refuses that check, ask here"));
         assert!(implementation.contains("## Test by hand"));
+        let work = implementation.find("## Work").unwrap();
+        let answered = implementation.find(answers).unwrap();
+        assert!(work < answered && answered < implementation.find("## Handover").unwrap());
 
-        let review = task_file(&dispatch(Round::Review, MOVED), None);
+        let review = task_file(&dispatch(Round::Review, MOVED), None, None);
         assert!(review.contains("Handle the review"), "{review}");
     }
 
