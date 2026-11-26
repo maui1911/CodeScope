@@ -226,16 +226,14 @@ fn option_letter(line: &str) -> Option<char> {
     rest.starts_with("**").then_some(letter)
 }
 
-/// `Advice: A, …`, also in bold → the letter.
+/// `Advice: A, …`, also in bold → the letter, which stands as a word of its own.
 fn advice_letter(line: &str) -> Option<char> {
     let plain = line.replace("**", "");
     let plain = plain.trim();
     plain.get(..7).filter(|p| p.eq_ignore_ascii_case("advice:"))?;
-    plain[7..]
-        .trim_start()
-        .chars()
-        .next()
-        .filter(char::is_ascii_uppercase)
+    let mut rest = plain[7..].trim_start().chars();
+    let letter = rest.next().filter(char::is_ascii_uppercase)?;
+    rest.next().is_none_or(|next| !next.is_alphanumeric()).then_some(letter)
 }
 
 /// The comment that posts findings: the text, a `**Next step:**` line and the marker.
@@ -397,6 +395,23 @@ Advice: A, it keeps the slice small.
             check_findings(&wrong_advice).unwrap_err(),
             vec![Problem::AdviceNotAnOption("B1".into())]
         );
+    }
+
+    #[test]
+    fn advice_names_a_letter_on_its_own() {
+        let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n## Decision points\n\n### B1 Q?\n\
+                    - **A** a\n- **B** b\n";
+        for advice in ["Advice: Both are viable", "Advice: Allow them"] {
+            assert_eq!(
+                check_findings(&format!("{base}{advice}\n")).unwrap_err(),
+                vec![Problem::NoAdvice("B1".into())],
+                "{advice}"
+            );
+        }
+        for advice in ["Advice: B", "Advice: B, simpler", "Advice: B.", "**Advice:** B) simpler"] {
+            let findings = check_findings(&format!("{base}{advice}\n")).unwrap();
+            assert_eq!(findings.decision_points[0].advice, 'B', "{advice}");
+        }
     }
 
     #[test]
