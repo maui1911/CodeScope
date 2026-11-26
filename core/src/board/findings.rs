@@ -542,7 +542,21 @@ fn after_markers(line: &str) -> Option<(&str, usize)> {
 
 /// cmark-gfm drops a paragraph of only link definitions, so its list item may end up empty.
 fn may_define_link(text: &str) -> bool {
-    text.starts_with('[') && (text.contains("]:") || !text.contains(']'))
+    let Some(label) = text.strip_prefix('[') else {
+        return false;
+    };
+    let mut chars = label.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '[' => return false,
+            ']' => return chars.as_str().starts_with(':'),
+            _ => {}
+        }
+    }
+    true
 }
 
 fn is_prose(text: &str) -> bool {
@@ -1523,7 +1537,8 @@ Advice: A, it keeps the slice small.
         let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n";
         let rest = "\n\n\n  foo\n2. ```sh\n   x\n   ```\n";
         let definitions = ["- [protocol]: docs/board-protocol.md", "- [a long\n  label]: /u"];
-        for item in definitions.into_iter().chain(["- [^1]: x"]) {
+        let escaped = ["- [a\\]\n  b]: /u", "- [a\\] c\n  b]: /u", "- [^1]: x"];
+        for item in definitions.into_iter().chain(escaped) {
             let text = format!("{base}{item}{rest}");
             assert_eq!(check_findings(&text).unwrap_err()[0], Problem::ListFence, "{item:?}");
         }
