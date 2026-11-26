@@ -60,8 +60,8 @@ pub(crate) struct DispatchState {
     post_errors: HashMap<RoundKey, (Instant, String)>,
     /// Round → what is wrong with its findings and what the session was told.
     reminders: HashMap<RoundKey, Reminder>,
-    /// Rounds whose findings wait for a program in a tab on their worktree that isn't an agent.
-    findings_held: HashSet<RoundKey>,
+    /// Rounds whose findings wait for the user to free a tab on their worktree, and what holds it.
+    findings_held: HashMap<RoundKey, HeldBy>,
     findings_announced: HashSet<RoundKey>,
 }
 
@@ -81,7 +81,7 @@ struct Reminder {
 
 enum SessionAt {
     Working,
-    Held,
+    Held(HeldBy),
     Done(Remind),
 }
 
@@ -208,7 +208,7 @@ fn tab_at_handover(tab: &TabProbe) -> TabAtHandover {
     let state = match (tab.running, tab.claude_idle) {
         (Some([]), _) => TabAtHandover::Shell,
         (Some(_), _) if tab.shell_gone => TabAtHandover::Other,
-        (Some(_), Some(true)) if tab.stopped => TabAtHandover::Stopped,
+        (Some(_), _) if tab.stopped => TabAtHandover::Stopped,
         (Some(_), Some(true)) if tab.typed => TabAtHandover::Draft,
         (Some(_), Some(true)) => TabAtHandover::IdleClaude,
         (Some(_), Some(false)) => TabAtHandover::Busy,
@@ -253,7 +253,13 @@ enum HandoverTarget {
 enum FindingsGate {
     Settled(RemindBy),
     Wait,
-    Held,
+    Held(HeldBy),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeldBy {
+    Program,
+    StoppedSession,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,7 +281,10 @@ fn findings_gate(tabs: &[(TabAtHandover, Turn)]) -> FindingsGate {
         return FindingsGate::Wait;
     }
     if other(Turn::Unknown) {
-        return FindingsGate::Held;
+        return FindingsGate::Held(HeldBy::Program);
+    }
+    if tabs.iter().any(|(state, _)| *state == TabAtHandover::Stopped) {
+        return FindingsGate::Held(HeldBy::StoppedSession);
     }
     let idle_claude = tabs.iter().position(|(state, _)| *state == TabAtHandover::IdleClaude);
     FindingsGate::Settled(idle_claude.map_or(RemindBy::Notice, RemindBy::Typing))
@@ -1057,8 +1066,8 @@ impl AppShell {
             };
             let remind = match self.session_at(&path, cx) {
                 SessionAt::Working => continue,
-                SessionAt::Held => {
-                    self.board.dispatch.findings_held.insert(key);
+                SessionAt::Held(by) => {
+                    self.board.dispatch.findings_held.insert(key, by);
                     continue;
                 }
                 SessionAt::Done(_) if !researching => Remind::Nothing,
@@ -1094,7 +1103,7 @@ impl AppShell {
             .collect();
         match findings_gate(&probed) {
             FindingsGate::Wait => SessionAt::Working,
-            FindingsGate::Held => SessionAt::Held,
+            FindingsGate::Held(by) => SessionAt::Held(by),
             FindingsGate::Settled(RemindBy::Typing(index)) => {
                 SessionAt::Done(Remind::Typing(tabs[index].terminal.clone()))
             }
@@ -1354,12 +1363,15 @@ impl AppShell {
                 },
             );
         }
-        for key in state.findings_held.iter().filter(|key| rounds.contains(*key)) {
+        for (key, by) in state.findings_held.iter().filter(|(key, _)| rounds.contains(*key)) {
+            let free_it = match by {
+                HeldBy::Program => "quit what runs in its worktree's tab",
+                HeldBy::StoppedSession => "type fg in its session's tab to resume it",
+            };
             notes.insert(
                 key.0.clone(),
                 CardNote {
-                    text: "Findings written · to post them, quit what runs in its worktree's \
-                           tab, or close the tab"
+                    text: format!("Findings written · to post them, {free_it}, or close the tab")
                         .into(),
                     tone: NoteTone::Waiting,
                 },
@@ -1433,6 +1445,13 @@ mod tests {
             typed: true,
         };
         assert_eq!(tab_at_handover(&stopped), Stopped, "Ctrl+Z hands its keys to the shell");
+        for claude_idle in [Some(false), None] {
+            let other_status = TabProbe {
+                claude_idle,
+                ..stopped
+            };
+            assert_eq!(tab_at_handover(&other_status), Stopped, "mid-turn or without a status");
+        }
     }
 
     #[test]
@@ -1528,13 +1547,16 @@ mod tests {
             Wait,
             "another session there still works"
         );
-        for settled in [Draft, Stopped] {
-            assert_eq!(
-                findings_gate(&[(settled, Ended)]),
-                Settled(Notice),
-                "the findings can be posted; problems go to the user, not into the tab"
-            );
-        }
+        assert_eq!(
+            findings_gate(&[(Draft, Ended)]),
+            Settled(Notice),
+            "the findings can be posted; problems go to the user, not into the tab"
+        );
+        assert_eq!(
+            findings_gate(&[(Stopped, Ended), (IdleClaude, Ended)]),
+            Held(HeldBy::StoppedSession),
+            "a stopped session may be mid-turn, and only the user can resume it"
+        );
         assert_eq!(findings_gate(&[(Draft, Ended), (IdleClaude, Ended)]), Settled(Typing(1)));
         assert_eq!(
             findings_gate(&[(Other, Running), (Shell, Unknown)]),
@@ -1543,7 +1565,7 @@ mod tests {
         );
         assert_eq!(
             findings_gate(&[(Other, Unknown), (Shell, Unknown)]),
-            Held,
+            Held(HeldBy::Program),
             "a program that is no agent only the user can stop"
         );
         assert_eq!(findings_gate(&[(Other, Unknown), (Busy, Running)]), Wait);
