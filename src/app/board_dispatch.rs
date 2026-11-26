@@ -84,15 +84,16 @@ pub(crate) struct DispatchState {
     discussions: HashMap<String, Discussion>,
     /// Items the Decide dialog moved to Ready, until their implementation round starts.
     readied: HashSet<String>,
-    /// Item id → the pull request and session of its implementation or review round.
+    /// Item id → the pull request and session of its implementation or review round, or of a
+    /// research round on an item with a pull request.
     watches: HashMap<String, PullRequestWatch>,
+    seen_from_start: HashSet<RoundKey>,
 }
 
 /// What the board poll knows about the pull request of an implementation or review round, and
 /// about the round's session.
 #[derive(Default)]
 struct PullRequestWatch {
-    /// The round the session fields below follow, by when its move was made.
     round: Option<String>,
     reading: bool,
     /// When the last read started, whether it worked or not.
@@ -101,7 +102,8 @@ struct PullRequestWatch {
     read_ok_at: Option<Instant>,
     /// What the last read that worked found.
     pull_request: Option<PullRequest>,
-    /// Whether the session worked since CodeScope started watching it.
+    /// Whether the session worked in this round; taken as so for a round started before
+    /// CodeScope did.
     busy_seen: bool,
     /// How many prompts the session had at the last look.
     turns: Option<u32>,
@@ -123,17 +125,17 @@ struct PullRequestWatch {
     review_report_url: Option<String>,
     reply_reminder: Option<Reminder>,
     review_held: Option<HeldBy>,
+    settled_since: Option<Instant>,
 }
 
 impl PullRequestWatch {
-    /// Follow the round started at `trigger_at`, forgetting what the session did in the one
-    /// before; what was read of the pull request, and calls still under way, stay.
-    fn follow(&mut self, trigger_at: &str) {
+    fn follow(&mut self, trigger_at: &str, seen_from_start: bool) {
         if self.round.as_deref() == Some(trigger_at) {
             return;
         }
         *self = PullRequestWatch {
             round: Some(trigger_at.to_string()),
+            busy_seen: !seen_from_start,
             reading: self.reading,
             read_at: self.read_at,
             read_ok_at: self.read_ok_at,
@@ -191,7 +193,6 @@ impl PullRequestWatch {
             || self.idle_since.is_some_and(|idle| read_at < idle)
     }
 
-    /// What the last read that worked says of the `posted` pull request.
     fn own_pull_request(&self, posted: bool) -> OwnPullRequest {
         if !posted {
             return OwnPullRequest::NotOpened;
@@ -218,9 +219,33 @@ impl PullRequestWatch {
                 .is_some_and(|(idle, read)| read > idle)
     }
 
-    fn stopped_without_result(&self) -> bool {
-        self.stop_without_result.is_some() && self.stop_without_result == self.idle_since
+    fn review_stop(&self) -> Option<Instant> {
+        self.idle_since.or(self.settled_since)
     }
+
+    fn stopped_without_result(&self) -> bool {
+        self.stop_without_result.is_some() && self.stop_without_result == self.review_stop()
+    }
+}
+
+fn carried_pull_request(
+    round: Round,
+    posted: Option<PostedPullRequest>,
+    open: Option<&PullRequest>,
+) -> Option<PostedPullRequest> {
+    let posted = posted.filter(|_| round != Round::Implementation)?;
+    let posted = match open {
+        Some(pr) if pr.number != posted.number => PostedPullRequest {
+            number: pr.number,
+            url: pr.url.clone(),
+            ..posted
+        },
+        _ => posted,
+    };
+    Some(PostedPullRequest {
+        in_review: false,
+        ..posted
+    })
 }
 
 fn review_round(record: &WorktreeDispatch, watch: &PullRequestWatch) -> ReviewRound {
@@ -238,7 +263,9 @@ enum ReviewSession {
         stopped_after_work: bool,
         stop_checked: bool,
     },
-    Settled,
+    Settled {
+        stop_checked: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,8 +296,9 @@ fn review_step(
         } => return ReviewStep::Wait,
         ReviewSession::Held(by) if result => return ReviewStep::Held(by),
         ReviewSession::Held(_) => return ReviewStep::Wait,
-        ReviewSession::Claude { stop_checked, .. } => !stop_checked,
-        ReviewSession::Settled => false,
+        ReviewSession::Claude { stop_checked, .. } | ReviewSession::Settled { stop_checked } => {
+            !stop_checked
+        }
     };
     match reply {
         Some(Err(problems)) => ReviewStep::FixReply(problems),
@@ -891,14 +919,17 @@ fn answers_for_task(job: &Job, from: &AnswersFrom) -> String {
     answers_section(discussion.as_ref().map(|d| d.answers.as_slice()), &from.findings_url)
 }
 
-fn prepare_worktree(job: &Job) -> anyhow::Result<()> {
+fn prepare_worktree(job: &mut Job) -> anyhow::Result<()> {
     if job.create {
         add_dispatch_worktree(&job.repo, &job.path, &job.branch, &job.remote)?;
     }
     exclude_handover_files(&job.path)?;
     match job.record.round {
         Round::Research => clear_findings(&job.path)?,
-        Round::Review => clear_reply(&job.path)?,
+        Round::Review => {
+            clear_reply(&job.path)?;
+            refresh_start_head(job);
+        }
         Round::Implementation => {}
     }
     let home = codescope_core::paths::home_dir();
@@ -910,6 +941,22 @@ fn prepare_worktree(job: &Job) -> anyhow::Result<()> {
     });
     let answers = job.answers_from.as_ref().map(|from| answers_for_task(job, from));
     write_task_file(&job.path, &task_file(&job.record, skill.as_deref(), answers.as_deref()))
+}
+
+fn refresh_start_head(job: &mut Job) {
+    let Some(number) = job.record.pull_request.as_ref().map(|pr| pr.number) else {
+        return;
+    };
+    let head = match github::fetch_pull_requests(&job.record.repository, &job.branch) {
+        Ok(found) => found.into_iter().find(|pr| pr.number == number).map(|pr| pr.head_oid),
+        Err(err) => {
+            eprintln!("warning: couldn't read the head of PR #{number}: {err:#}");
+            None
+        }
+    };
+    if let (Some(head), Some(review)) = (head, job.record.review.as_mut()) {
+        review.start_head = Some(head);
+    }
 }
 
 fn claim_on_board(job: &Job, viewer_id: &str) -> Vec<String> {
@@ -1305,20 +1352,18 @@ impl AppShell {
             })
         });
         let watch = self.board.dispatch.watches.get(&item.id);
-        let reported = watch.and_then(|w| w.reported.clone());
-        let review = (round == Round::Review).then(|| ReviewRound {
-            start_head: watch.and_then(|w| w.pull_request.as_ref()).map(|pr| pr.head_oid.clone()),
-            ..ReviewRound::default()
-        });
-        let pull_request = previous
+        let open = watch
+            .and_then(|w| w.pull_request.as_ref())
+            .filter(|pr| pr.state == PullRequestState::Open);
+        let posted = previous
             .as_ref()
             .and_then(|previous| previous.pull_request.clone())
-            .or(reported)
-            .filter(|_| round == Round::Review)
-            .map(|posted| PostedPullRequest {
-                in_review: false,
-                ..posted
-            });
+            .or_else(|| watch.and_then(|w| w.reported.clone()));
+        let pull_request = carried_pull_request(round, posted, open);
+        let review = (round == Round::Review).then(|| ReviewRound {
+            start_head: open.map(|pr| pr.head_oid.clone()),
+            ..ReviewRound::default()
+        });
         let mut title = codescope_core::TabTitle::project(project.name.clone());
         title.set_branch(&branch);
         let launch = Launch {
@@ -1363,7 +1408,8 @@ impl AppShell {
         cx.spawn_in(window, async move |this, cx| {
             let (job, prepared) = cx
                 .background_spawn(async move {
-                    let prepared = prepare_worktree(&job).map_err(|err| format!("{err:#}"));
+                    let mut job = job;
+                    let prepared = prepare_worktree(&mut job).map_err(|err| format!("{err:#}"));
                     (job, prepared)
                 })
                 .await;
@@ -1425,6 +1471,7 @@ impl AppShell {
             return None;
         }
         self.board.dispatch.starting.remove(&record.item_id);
+        self.board.dispatch.seen_from_start.insert(round_key(record));
         self.hand_over(&job.path, terminal, launch, record.number, window, cx);
         cx.notify();
         Some(job)
@@ -1923,15 +1970,15 @@ impl AppShell {
         Some((board.clone(), column.id.clone()))
     }
 
-    /// Watch the pull request of every implementation and review round: read it; report it on
-    /// the issue once per round, an implementation's as soon as it is open and a review's once
-    /// its session is done; then move the item to In review once it is ready. Ring the bell when
-    /// a session stopped without a result.
+    /// Watch the pull request of every implementation and review round, and of research on an
+    /// item that has one: read it; report it on the issue once per round, an implementation's as
+    /// soon as it is open and a review's once its session is done; then move the item to In
+    /// review once it is ready. Ring the bell when a session stopped without a result.
     pub(crate) fn watch_pull_requests(&mut self, cx: &mut Context<Self>) {
         let records: Vec<_> = self
             .dispatch_records(cx)
             .into_iter()
-            .filter(|(_, _, _, r)| matches!(r.round, Round::Implementation | Round::Review))
+            .filter(|(_, _, _, r)| r.round != Round::Research || r.pull_request.is_some())
             .collect();
         self.board
             .dispatch
@@ -1946,13 +1993,14 @@ impl AppShell {
                 .telemetry_at(&path)
                 .map(|snapshot| (super::notified_state(&snapshot), snapshot.turn_count));
             let claude = session.is_some();
+            let seen_from_start = self.board.dispatch.seen_from_start.contains(&round_key(&record));
             let watch = self
                 .board
                 .dispatch
                 .watches
                 .entry(record.item_id.clone())
                 .or_default();
-            watch.follow(&record.trigger_at);
+            watch.follow(&record.trigger_at, seen_from_start);
             watch.track(session);
             let posted = record.pull_request.as_ref().or(watch.reported.as_ref());
             let read = watch.read_due(role, posted.is_some());
@@ -2024,27 +2072,34 @@ impl AppShell {
         let Some(pr) = open.filter(|_| due) else {
             return;
         };
-        let stopped_after_work = watch.stopped_after_work();
-        let stop_checked = watch.stopped_without_result();
         let file = read_reply(path).filter(|_| review.reply_url.is_none());
         let reply = file.as_ref().map(|file| file.reply());
-        let (session, remind) = match self.session_at(path, cx) {
+        let gate = self.session_at(path, cx);
+        let Some(watch) = self.board.dispatch.watches.get_mut(&record.item_id) else {
+            return;
+        };
+        let settled = matches!(&gate, SessionAt::Done(remind)
+            if !claude && !matches!(remind, Remind::Typing(_)));
+        if settled {
+            watch.settled_since.get_or_insert_with(Instant::now);
+        } else {
+            watch.settled_since = None;
+        }
+        let stop_checked = watch.stopped_without_result();
+        let (session, remind) = match gate {
             SessionAt::Working => (ReviewSession::Working, Remind::Nothing),
             SessionAt::Held(by) => (ReviewSession::Held(by), Remind::Nothing),
-            SessionAt::Done(remind) if claude || matches!(remind, Remind::Typing(_)) => {
+            SessionAt::Done(remind) if settled => (ReviewSession::Settled { stop_checked }, remind),
+            SessionAt::Done(remind) => {
                 let session = ReviewSession::Claude {
-                    stopped_after_work,
+                    stopped_after_work: watch.stopped_after_work(),
                     stop_checked,
                 };
                 (session, remind)
             }
-            SessionAt::Done(remind) => (ReviewSession::Settled, remind),
         };
         let broken = matches!(reply, Some(Err(_)));
         let step = review_step(&pr, &review, reply, session);
-        let Some(watch) = self.board.dispatch.watches.get_mut(&record.item_id) else {
-            return;
-        };
         let held = match step {
             ReviewStep::Held(by) => Some(by),
             _ => None,
@@ -2082,7 +2137,7 @@ impl AppShell {
             return;
         };
         watch.ending_review = true;
-        let stop = watch.idle_since;
+        let stop = watch.review_stop();
         cx.notify();
         let key = round_key(record);
         let end = ReviewEnd {
@@ -2137,8 +2192,9 @@ impl AppShell {
                 Some(url)
             }
             Ok(None) => {
+                watch.review_end_error = None;
                 watch.stop_without_result = stop;
-                let ring = watch.idle_since == stop && watch.rang_for != stop;
+                let ring = stop.is_some() && watch.review_stop() == stop && watch.rang_for != stop;
                 if ring {
                     watch.rang_for = stop;
                     let tab_title = self.tab_title_at(&path);
@@ -3223,19 +3279,45 @@ mod tests {
     #[test]
     fn a_new_round_forgets_the_session_but_keeps_the_pull_request() {
         let mut watch = PullRequestWatch::default();
-        watch.follow("2026-11-25T09:00:00Z");
+        watch.follow("2026-11-25T09:00:00Z", true);
         watch.track(Some((SessionState::Busy, 4)));
         watch.track(Some((SessionState::Idle, 5)));
         watch.read_ok_at = Some(Instant::now());
         watch.pull_request = Some(open_pull_request(9, false, Checks::Passing));
-        watch.follow("2026-11-25T09:00:00Z");
+        watch.follow("2026-11-25T09:00:00Z", true);
         assert!(watch.busy_seen, "the same round");
-        watch.follow("2026-11-26T10:00:00Z");
+        watch.follow("2026-11-26T10:00:00Z", true);
         assert!(!watch.busy_seen);
         assert_eq!(watch.idle_since, None);
         assert_eq!(watch.turns, None);
         assert!(watch.read_ok_at.is_some());
         assert_eq!(watch.pull_request.as_ref().map(|pr| pr.number), Some(9));
+    }
+
+    #[test]
+    fn a_round_from_before_a_restart_counts_as_having_worked() {
+        let mut watch = PullRequestWatch::default();
+        watch.follow("2026-11-25T09:00:00Z", false);
+        assert!(watch.busy_seen);
+        watch.track(Some((SessionState::Idle, 5)));
+        watch.read_ok_at = Some(Instant::now());
+        assert!(watch.stopped_after_work());
+    }
+
+    #[test]
+    fn a_new_round_carries_the_pull_request_unless_it_implements_anew() {
+        let reported = || Some(posted(9));
+        let open = open_pull_request(9, false, Checks::Passing);
+        assert_eq!(carried_pull_request(Round::Implementation, reported(), Some(&open)), None);
+        let research = carried_pull_request(Round::Research, reported(), None).unwrap();
+        assert_eq!((research.number, research.in_review), (9, false));
+        let review = carried_pull_request(Round::Review, reported(), Some(&open)).unwrap();
+        assert_eq!(review, posted(9));
+        let newer = open_pull_request(12, false, Checks::Passing);
+        let review = carried_pull_request(Round::Review, reported(), Some(&newer)).unwrap();
+        assert_eq!((review.number, review.url.as_str()), (12, newer.url.as_str()));
+        assert_eq!(review.comment_url, "c");
+        assert_eq!(carried_pull_request(Round::Review, None, Some(&open)), None);
     }
 
     #[test]
@@ -3316,9 +3398,27 @@ mod tests {
     #[test]
     fn another_agents_review_round_ends_on_a_push_or_reply_once_its_tab_settles() {
         let pr = open_pull_request(415, false, Checks::Passing);
-        let settled = ReviewSession::Settled;
+        let settled = ReviewSession::Settled {
+            stop_checked: false,
+        };
         assert_eq!(review_step(&pr, &review_from("c1"), None, settled), end(None, false));
-        assert_eq!(review_step(&pr, &review_from("c415"), None, settled), ReviewStep::Wait);
+        let unpushed = review_from("c415");
+        assert_eq!(review_step(&pr, &unpushed, None, settled), end(None, true), "thread replies");
+        let checked = ReviewSession::Settled { stop_checked: true };
+        assert_eq!(review_step(&pr, &unpushed, None, checked), ReviewStep::Wait);
+    }
+
+    #[test]
+    fn a_settled_tab_is_a_stop_of_its_own() {
+        let mut watch = PullRequestWatch {
+            settled_since: Some(Instant::now()),
+            ..PullRequestWatch::default()
+        };
+        assert_eq!(watch.review_stop(), watch.settled_since);
+        watch.stop_without_result = watch.settled_since;
+        assert!(watch.stopped_without_result());
+        watch.settled_since = None;
+        assert!(!watch.stopped_without_result());
     }
 
     #[test]

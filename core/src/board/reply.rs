@@ -24,9 +24,8 @@ impl HandoverFile {
     }
 }
 
-/// The comment that posts the reply `text` on the pull request: quiet, with a `**Next step:**`
-/// line and the marker. `None` for a blank reply; otherwise what to fix first, refusing a marker
-/// of its own, more than a comment holds, and code blocks that would swallow the marker.
+/// The reply `text` as a quiet comment with a `**Next step:**` line and the marker; `None` when
+/// blank. Refuses a marker of its own, more than a comment holds, and an unclosed code block.
 pub fn reply_body(text: &str) -> Result<Option<String>, Vec<Problem>> {
     let text = normalised(text);
     if text.is_empty() {

@@ -280,6 +280,7 @@ pub enum OwnPullRequest {
     NotOpened,
     /// Reported, but not read since CodeScope started.
     Unread,
+    /// Open at the last read.
     Open,
     /// Merged or closed.
     Closed,
