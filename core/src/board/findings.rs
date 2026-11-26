@@ -15,6 +15,8 @@ const MAX_LISTED: usize = 4;
 const CAUSE: &str = "## Cause";
 const APPROACH: &str = "## Approach";
 const DECISION_POINTS: &str = "## Decision points";
+const MEDIA_TAGS: [&str; 6] = ["<img", "<image", "<picture", "<source", "<video", "<audio"];
+const ZERO_WIDTH_SPACE: char = '\u{200b}';
 
 /// What a research round produced, as the marker names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,8 +190,10 @@ fn read_text(path: &Path) -> Result<String, Problem> {
         return Err(Problem::TooLong(length));
     }
     let text = String::from_utf8(bytes).map_err(|_| Problem::NotText)?;
-    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-    Ok(text.replace("\r\n", "\n").replace('\r', "\n"))
+    Ok(text
+        .replace('\u{feff}', "")
+        .replace("\r\n", "\n")
+        .replace(['\r', '\u{2028}', '\u{2029}'], "\n"))
 }
 
 struct Section<'a> {
@@ -207,7 +211,7 @@ pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
     if text.split(['\n', '\r']).any(is_marker_line) {
         problems.push(Problem::Marker);
     }
-    let top = sections(text, "## ");
+    let top = sections(text, 2);
     let position = |heading: &str| top.iter().position(|s| s.heading.eq_ignore_ascii_case(heading));
 
     for heading in [CAUSE, APPROACH] {
@@ -244,7 +248,7 @@ pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
             problems.push(Problem::DecisionPointsNotLast);
         }
         let body = top[index].lines.join("\n");
-        for (number, point) in sections(&body, "### ").iter().enumerate() {
+        for (number, point) in sections(&body, 3).iter().enumerate() {
             match decision_point(point, number + 1) {
                 Ok(point) => decision_points.push(point),
                 Err(problem) => problems.push(problem),
@@ -273,8 +277,10 @@ struct Fences {
 
 impl Fences {
     fn is_code(&mut self, line: &str) -> bool {
-        let trimmed = line.trim_start();
-        let Some(mark) = trimmed.chars().next().filter(|c| matches!(c, '`' | '~')) else {
+        let trimmed = line.trim_start_matches(' ');
+        let fenced = line.len() - trimmed.len() <= 3;
+        let mark = trimmed.chars().next().filter(|c| fenced && matches!(c, '`' | '~'));
+        let Some(mark) = mark else {
             return self.open.is_some();
         };
         let run = trimmed.chars().take_while(|c| *c == mark).count();
@@ -303,15 +309,15 @@ fn ends_in_code(text: &str) -> bool {
     fences.open.is_some()
 }
 
-/// The sections that start with a heading of `prefix`'s level, outside fenced code blocks.
-/// Text before the first heading is left out.
-fn sections<'a>(text: &'a str, prefix: &str) -> Vec<Section<'a>> {
+/// The sections that start with an ATX heading of `level`, outside fenced code blocks, each
+/// heading as `## Text`. Text before the first heading is left out.
+fn sections(text: &str, level: usize) -> Vec<Section<'_>> {
     let mut sections: Vec<Section> = Vec::new();
     let mut fences = Fences::default();
     for line in text.lines() {
-        if !fences.is_code(line) && let Some(rest) = line.strip_prefix(prefix) {
+        if !fences.is_code(line) && let Some(title) = heading(line, level) {
             sections.push(Section {
-                heading: format!("{prefix}{}", rest.trim()),
+                heading: format!("{} {title}", "#".repeat(level)),
                 lines: Vec::new(),
             });
             continue;
@@ -323,8 +329,26 @@ fn sections<'a>(text: &'a str, prefix: &str) -> Vec<Section<'a>> {
     sections
 }
 
+/// CommonMark: up to three spaces, the `#`s, then a space or tab; a closing run of `#`s drops.
+fn heading(line: &str, level: usize) -> Option<&str> {
+    let rest = line.trim_start_matches(' ');
+    if line.len() - rest.len() > 3 {
+        return None;
+    }
+    let title = rest.strip_prefix(&"#".repeat(level))?;
+    if !(title.is_empty() || title.starts_with([' ', '\t'])) {
+        return None;
+    }
+    let title = title.trim();
+    let unclosed = title.trim_end_matches('#');
+    if unclosed.len() < title.len() && (unclosed.is_empty() || unclosed.ends_with([' ', '\t'])) {
+        return Some(unclosed.trim_end());
+    }
+    Some(title)
+}
+
 fn point_headings(text: &str) -> usize {
-    sections(text, "### ")
+    sections(text, 3)
         .iter()
         .filter(|s| {
             let id = s.heading.trim_start_matches('#').split_whitespace().next().unwrap_or("");
@@ -424,104 +448,114 @@ pub fn comment_body(text: &str, findings: &Findings) -> String {
         "<!-- dispatch v=1 phase=research outcome={} by=codescope -->",
         findings.outcome().marker_value()
     );
-    let mut fences = Fences::default();
-    let quiet: Vec<String> = text
-        .trim_end()
-        .lines()
-        .map(|line| {
-            if fences.is_code(line) {
-                line.to_string()
-            } else {
-                quiet_line(line)
-            }
-        })
-        .collect();
-    format!("{}\n\n**Next step:** {next_step}\n{marker}\n", quiet.join("\n"))
+    format!("{}\n\n**Next step:** {next_step}\n{marker}\n", quiet(text.trim_end()))
+}
+
+/// GitHub and bots act on `@name` and a leading `/command`, code too; a zero-width space stops it.
+fn quiet(text: &str) -> String {
+    let lines: Vec<String> = at_signs(text).lines().map(quiet_line).collect();
+    lines.join("\n")
 }
 
 fn quiet_line(line: &str) -> String {
-    let mut quiet: String = code_spans(line)
-        .into_iter()
-        .map(|(code, part)| if code { part.to_string() } else { quiet_mentions(part) })
-        .collect();
-    let indent = quiet.len() - quiet.trim_start().len();
-    if quiet[indent..].starts_with('/') {
-        quiet.insert(indent, '\\');
-    }
-    quiet
-}
-
-/// GitHub notifies `@name` in text, but not in a link, which a token with `://` or `](` becomes.
-fn quiet_mentions(text: &str) -> String {
-    let mut quiet = String::with_capacity(text.len());
-    for token in text.split_inclusive(char::is_whitespace) {
-        if token.contains("://") || token.contains("](") || token.contains("www.") {
-            quiet.push_str(token);
-            continue;
+    let mut quiet = String::with_capacity(line.len() + 3);
+    let indent = line.len() - line.trim_start().len();
+    let mut chars = line.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        let names = chars.peek().is_some_and(|(_, next)| next.is_ascii_alphanumeric());
+        if c == '/' && at == indent && names {
+            quiet.push(ZERO_WIDTH_SPACE);
         }
-        let chars: Vec<char> = token.chars().collect();
-        for (index, &c) in chars.iter().enumerate() {
-            quiet.push(c);
-            let names = chars.get(index + 1).is_some_and(char::is_ascii_alphanumeric);
-            let starts_word = index == 0
-                || !(chars[index - 1].is_alphanumeric() || chars[index - 1] == '_');
-            if c == '@' && names && starts_word {
-                quiet.push('\u{200b}');
-            }
+        quiet.push(c);
+        if c == '@' && names {
+            quiet.push(ZERO_WIDTH_SPACE);
         }
     }
     quiet
 }
 
-fn code_spans(line: &str) -> Vec<(bool, &str)> {
-    let mut parts = Vec::new();
-    let mut text_from = 0;
-    let mut at = 0;
-    while let Some(found) = line[at..].find('`') {
-        let open = at + found;
-        let run = backtick_run(&line[open..]);
-        match closing_run(&line[open + run..], run) {
-            Some(close) => {
-                let end = open + run + close + run;
-                parts.push((false, &line[text_from..open]));
-                parts.push((true, &line[open..end]));
-                text_from = end;
-                at = end;
+fn at_signs(text: &str) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('&') {
+        plain.push_str(&rest[..at]);
+        let reference = &rest[at..];
+        match at_reference(reference) {
+            Some(length) => {
+                plain.push('@');
+                rest = &reference[length..];
             }
-            None => at = open + run,
+            None => {
+                plain.push('&');
+                rest = &reference[1..];
+            }
         }
     }
-    parts.push((false, &line[text_from..]));
-    parts
+    plain.push_str(rest);
+    plain
 }
 
-fn backtick_run(text: &str) -> usize {
-    text.bytes().take_while(|b| *b == b'`').count()
+/// HTML reads `&commat;`, and `&#64` or `&#x40` with any leading zeros and an optional `;`, as `@`.
+fn at_reference(text: &str) -> Option<usize> {
+    if text.starts_with("&commat;") {
+        return Some("&commat;".len());
+    }
+    let number = text.strip_prefix("&#")?;
+    let (radix, digits) = match number.strip_prefix(['x', 'X']) {
+        Some(hex) => (16, hex),
+        None => (10, number),
+    };
+    let length = digits.find(|c: char| !c.is_digit(radix)).unwrap_or(digits.len());
+    let value = u32::from_str_radix(&digits[..length], radix).ok()?;
+    let end = text.len() - digits.len() + length;
+    (value == u32::from('@')).then(|| end + usize::from(text[end..].starts_with(';')))
 }
 
-fn closing_run(text: &str, length: usize) -> Option<usize> {
-    let mut at = 0;
-    while let Some(found) = text[at..].find('`') {
-        let start = at + found;
-        let run = backtick_run(&text[start..]);
-        if run == length {
-            return Some(start);
+fn has_image(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let media = MEDIA_TAGS.iter().any(|tag| {
+        lower.match_indices(tag).any(|(at, _)| {
+            lower[at + tag.len()..].starts_with(|c: char| c.is_ascii_whitespace() || c == '/')
+        })
+    });
+    let defined = definitions(text);
+    media
+        || text.match_indices("![").any(|(at, _)| {
+            let rest = &text[at + 2..];
+            label_end(rest).is_some_and(|end| {
+                rest[end + 1..].starts_with(['(', '['])
+                    || defined.contains(&label_key(&rest[..end]))
+            })
+        })
+}
+
+fn label_end(text: &str) -> Option<usize> {
+    let mut depth = 0;
+    let mut escaped = false;
+    for (at, c) in text.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '[' => depth += 1,
+            ']' if depth == 0 => return Some(at),
+            ']' => depth -= 1,
+            _ => {}
         }
-        at = start + run;
     }
     None
 }
 
-fn has_image(text: &str) -> bool {
-    let mut fences = Fences::default();
-    text.lines().filter(|line| !fences.is_code(line)).any(|line| {
-        code_spans(line).into_iter().any(|(code, part)| {
-            let lower = part.to_ascii_lowercase();
-            !code
-                && (part.contains("![")
-                    || ["<img", "<picture", "<source", "<video"].iter().any(|t| lower.contains(t)))
+fn definitions(text: &str) -> Vec<String> {
+    text.match_indices("]:")
+        .filter_map(|(end, _)| {
+            let start = text[..end].rfind('[')?;
+            Some(label_key(&text[start + 1..end]))
         })
-    })
+        .collect()
+}
+
+fn label_key(label: &str) -> String {
+    label.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
 /// The first few problems joined on one line, and how many more there are.
@@ -671,12 +705,13 @@ Advice: A, it keeps the slice small.
 
     #[test]
     fn reads_the_findings_with_plain_line_ends_and_no_byte_order_mark() {
-        let written = "\u{feff}## Cause\r\n\r\nX.\r\n\r\n## Approach\rY.\r\n";
+        let written =
+            "\u{feff}## Cause\r\n\r\nX.\u{2028}\u{feff}/Z.\r\n\r\n## Approach\rY.\u{2029}\r\n";
         let dir = worktree_with(written.as_bytes());
         let file = read_findings(dir.path()).unwrap();
         assert_eq!(file.stamp.1, written.len() as u64);
         let (text, findings) = file.check().unwrap();
-        assert_eq!(text, "## Cause\n\nX.\n\n## Approach\nY.\n");
+        assert_eq!(text, "## Cause\n\nX.\n/Z.\n\n## Approach\nY.\n\n");
         assert_eq!(findings.outcome(), Outcome::Findings);
     }
 
@@ -800,31 +835,63 @@ Advice: A, it keeps the slice small.
     }
 
     #[test]
-    fn the_comment_mentions_nobody_and_starts_no_command() {
-        let text = "## Cause\n\nAsk @octocat (and @github/team) about it; mail a@b.example.\n\n\
-                    ## Approach\n\n  /deploy production\nSee `@types/node`, ``a ` @x`` and \
-                    https://example.com/@user.\n\n```\n@kept\n/kept\n```\n";
+    fn the_comment_mentions_nobody_and_starts_no_command_in_text_or_code() {
+        let text = "## Cause\n\nAsk @octocat, _@org/team_ and \u{8c22}@octocat; mail a@b.example \
+                    &#64;x &#x40;y &commat;z.\n\n## Approach\n\n  /deploy production\n\
+                    // a comment\n\n```\n@claude run\n/close\n```\n";
         let findings = check_findings(text).unwrap();
         let body = comment_body(text, &findings);
-        assert!(body.contains("Ask @\u{200b}octocat (and @\u{200b}github/team) about"), "{body}");
-        assert!(body.contains("mail a@b.example."), "{body}");
-        assert!(body.contains("\n  \\/deploy production\n"), "{body}");
-        assert!(body.contains("See `@types/node`, ``a ` @x`` and https://example.com/@user."));
-        assert!(body.contains("\n@kept\n/kept\n"), "{body}");
+        let z = '\u{200b}';
+        let mentions = format!(
+            "Ask @{z}octocat, _@{z}org/team_ and \u{8c22}@{z}octocat; mail a@{z}b.example \
+             @{z}x @{z}y @{z}z."
+        );
+        assert!(body.contains(&mentions), "{body}");
+        assert!(body.contains(&format!("\n  {z}/deploy production\n// a comment\n")), "{body}");
+        assert!(body.contains(&format!("\n@{z}claude run\n{z}/close\n")), "{body}");
+        assert_eq!(
+            quiet("&#0064a &#X040;b &#65;c &amp;#64;d &commat e"),
+            format!("@{z}a @{z}b &#65;c &amp;#64;d &commat e")
+        );
     }
 
     #[test]
-    fn refuses_an_image_outside_code() {
+    fn refuses_an_image_wherever_it_is() {
         let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n";
-        for image in ["![x](https://example.com/?d=1)", "<img src=x>", "<IMG src=x>", "![x][r]"] {
+        let images = [
+            "![x](https://example.com/?d=1)",
+            "![x][r]",
+            "`![x](y)` in code",
+            "![x]\n\n[x]: https://example.com/",
+            "![Big  Logo]\n\n> [big logo]: https://example.com/",
+            "![a [b] c](https://example.com/)",
+            "<img src=x>",
+            "<IMG\tsrc=x>",
+            "<img/src=x>",
+            "<image src=x>",
+            "<video src=x>",
+            "```\n<img src=x>\n```",
+        ];
+        for image in images {
             assert_eq!(
                 check_findings(&format!("{base}{image}\n")).unwrap_err(),
                 vec![Problem::Image],
                 "{image}"
             );
         }
-        let in_code = format!("{base}`![x](y)` stays code.\n\n```\n<img src=x>\n```\n");
-        assert!(check_findings(&in_code).is_ok());
+        for prose in ["`vec![1, 2]` grows.", "It returns Vec<SourceFile>.", "The <video> tag."] {
+            assert!(check_findings(&format!("{base}{prose}\n")).is_ok(), "{prose}");
+        }
+    }
+
+    #[test]
+    fn headings_and_fences_are_read_the_way_github_reads_them() {
+        let spaced = "  ## Cause\n\nX.\n\n##\tApproach ##\n\nY.\n";
+        assert!(check_findings(spaced).is_ok());
+        let indented = "## Cause\n\nX.\n\n    ```\n\n## Approach\n\nY.\n\n    ```\n";
+        assert!(check_findings(indented).is_ok(), "four spaces make code, not a fence");
+        let code = "## Cause\n\nX.\n\n    ## Approach\n\nY.\n";
+        assert_eq!(check_findings(code).unwrap_err(), vec![Problem::Missing(APPROACH)]);
     }
 
     #[test]
