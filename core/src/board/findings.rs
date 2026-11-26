@@ -589,23 +589,44 @@ fn starts_web_address(text: &str) -> bool {
 
 /// GitHub draws a fenced block whose info string, references decoded, names a diagram or map.
 fn disarm_info_strings(line: &mut String) {
-    let lower = line.to_ascii_lowercase();
-    let Some(fence) = ["```", "~~~"].iter().filter_map(|run| lower.find(run)).min() else {
+    let Some(info) = info_string_at(line) else {
         return;
     };
-    let mut spaces: Vec<usize> =
-        lower[fence..].match_indices('&').map(|(at, _)| fence + at + 1).collect();
-    for diagram in DIAGRAMS {
-        spaces.extend(lower.match_indices(diagram).map(|(at, _)| at).filter(|&at| {
-            let before = lower[..at].trim_end_matches([' ', '\t']);
-            before.ends_with("```") || before.ends_with("~~~")
-        }));
+    let lower = line[info..].to_ascii_lowercase();
+    let mut spaces: Vec<usize> = lower.match_indices('&').map(|(at, _)| info + at + 1).collect();
+    let word = lower.len() - lower.trim_start_matches([' ', '\t']).len();
+    if DIAGRAMS.iter().any(|diagram| lower[word..].starts_with(diagram)) {
+        spaces.push(info + word);
     }
     spaces.sort_unstable();
-    spaces.dedup();
     for at in spaces.into_iter().rev() {
         line.insert(at, ZERO_WIDTH_SPACE);
     }
+}
+
+/// CommonMark opens a fence after any run of block quote and list markers.
+fn info_string_at(line: &str) -> Option<usize> {
+    let mut rest = line.trim_start_matches([' ', '\t']);
+    while let Some(inner) = container_content(rest) {
+        rest = inner.trim_start_matches([' ', '\t']);
+    }
+    let mark = rest.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+    let info = rest.trim_start_matches(mark);
+    let run = rest.len() - info.len();
+    (run >= 3 && !(mark == '`' && info.contains('`'))).then(|| line.len() - info.len())
+}
+
+fn container_content(line: &str) -> Option<&str> {
+    if let Some(quoted) = line.strip_prefix('>') {
+        return Some(quoted);
+    }
+    let digits = line.len() - line.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let marker = match digits {
+        0 => line.strip_prefix(['-', '*', '+']),
+        1..=9 => line[digits..].strip_prefix(['.', ')']),
+        _ => None,
+    };
+    marker.filter(|content| content.starts_with([' ', '\t']))
 }
 
 fn at_signs(text: &str) -> String {
@@ -903,6 +924,13 @@ Advice: A, it keeps the slice small.
             format!("```&{z}#109;ermaid\n~~~ m&{z}#x65;rmaid\n```&{z}#32;mermaid")
         );
         assert_eq!(quiet("R&D: a &amp; b"), "R&D: a &amp; b");
+        assert_eq!(
+            quiet("> - ```mermaid\n1) ~~~ m&#x65;rmaid\n- > ``` &#109;ermaid"),
+            format!("> - ```{z}mermaid\n1) ~~~ m&{z}#x65;rmaid\n- > ``` &{z}#109;ermaid")
+        );
+        for code in ["Run ```npm ci && npm test``` first", "echo '```' >> n.md && git add n.md"] {
+            assert_eq!(quiet(code), code, "no fence opens on this line");
+        }
         assert_eq!(quiet("```rust\nlet a = b!(c);"), "```rust\nlet a = b!(c);");
         let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n";
         for image in ["![x](u)", "![x]\n\n[x]: u", "rows![0][1]", "<img src=x>"] {
