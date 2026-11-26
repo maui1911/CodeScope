@@ -629,7 +629,7 @@ fn disarm_info_strings(line: &str) -> String {
     disarmed
 }
 
-/// CommonMark opens a fence after any run of block quote and list markers.
+/// GFM opens a fence after any run of block quote, list item and footnote definition markers.
 fn info_string_at(line: &str) -> Option<usize> {
     let mut rest = line.trim_start_matches([' ', '\t']);
     while let Some(inner) = container_content(rest) {
@@ -642,9 +642,16 @@ fn info_string_at(line: &str) -> Option<usize> {
 }
 
 fn container_content(line: &str) -> Option<&str> {
-    if let Some(quoted) = line.strip_prefix('>') {
-        return Some(quoted);
-    }
+    line.strip_prefix('>').or_else(|| footnote_content(line)).or_else(|| item_content(line))
+}
+
+fn footnote_content(line: &str) -> Option<&str> {
+    let label = line.strip_prefix("[^")?;
+    let end = label.find([']', ' ', '\t'])?;
+    label[end..].strip_prefix("]:").filter(|_| end > 0)
+}
+
+fn item_content(line: &str) -> Option<&str> {
     let digits = line.len() - line.trim_start_matches(|c: char| c.is_ascii_digit()).len();
     let marker = match digits {
         0 => line.strip_prefix(['-', '*', '+']),
@@ -952,6 +959,10 @@ Advice: A, it keeps the slice small.
         assert_eq!(
             quiet("> - ```mermaid\n1) ~~~ m&#x65;rmaid\n- > ``` &#109;ermaid"),
             format!("> - ```{z}mermaid\n1) ~~~ m&{z}#x65;rmaid\n- > ``` &{z}#109;ermaid")
+        );
+        assert_eq!(
+            quiet("[^d]: ```mermaid\n> [^e]: ~~~ m&#x65;rmaid"),
+            format!("[^d]: ```{z}mermaid\n> [^e]: ~~~ m&{z}#x65;rmaid")
         );
         for code in ["Run ```npm ci && npm test``` first", "echo '```' >> n.md && git add n.md"] {
             assert_eq!(quiet(code), code, "no fence opens on this line");
