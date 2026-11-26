@@ -1949,7 +1949,8 @@ impl AppShell {
             return;
         };
         if !path.is_dir() {
-            let detail = format!("Its worktree {} is gone.", path.display());
+            let folder = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+            let detail = format!("Its worktree folder {folder} is gone.");
             self.push_toast(ToastKind::Err, "Can't open its session", Some(detail.into()), cx);
             return;
         }
