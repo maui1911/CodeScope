@@ -82,6 +82,8 @@ pub enum Problem {
     Marker,
     TooLong(usize),
     OpenFence,
+    /// An HTML comment or `<details>` left open, which would hide the next step.
+    OpenHtml,
     /// The file, or the folder it is in, is a link.
     Link,
     /// A folder, a pipe or a device where the file should be.
@@ -129,6 +131,7 @@ impl fmt::Display for Problem {
                 write!(f, "it is {length} bytes, more than {MAX_LENGTH}")
             }
             Problem::OpenFence => write!(f, "a code block is not closed"),
+            Problem::OpenHtml => write!(f, "an HTML comment or a details block is not closed"),
             Problem::Link => write!(f, "it or its folder is a link"),
             Problem::NotAFile => write!(f, "it is not a plain file"),
             Problem::Unreadable => write!(f, "it cannot be read"),
@@ -268,6 +271,9 @@ pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
     if ends_in_code(text) {
         problems.push(Problem::OpenFence);
     }
+    if ends_in_html(text) {
+        problems.push(Problem::OpenHtml);
+    }
     if has_image(text) {
         problems.push(Problem::Image);
     }
@@ -316,6 +322,34 @@ fn ends_in_code(text: &str) -> bool {
         fences.is_code(line);
     }
     fences.open.is_some()
+}
+
+/// CommonMark: a line that starts `<!--` hides every line up to one holding `-->`.
+fn ends_in_html(text: &str) -> bool {
+    let mut fences = Fences::default();
+    let mut comment = false;
+    let mut details = 0usize;
+    for line in text.lines() {
+        if comment {
+            comment = !line.contains("-->");
+            continue;
+        }
+        if fences.is_code(line) {
+            continue;
+        }
+        let trimmed = line.trim_start_matches(' ');
+        comment = line.len() - trimmed.len() <= 3
+            && trimmed.starts_with("<!--")
+            && !line.contains("-->");
+        let prose = line.split('`').step_by(2).collect::<String>().to_ascii_lowercase();
+        let opened = prose.match_indices("<details").filter(|(at, _)| {
+            prose[at + "<details".len()..]
+                .starts_with(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')
+        });
+        details += opened.count();
+        details = details.saturating_sub(prose.matches("</details").count());
+    }
+    comment || details > 0
 }
 
 fn sections(text: &str, level: usize) -> Vec<Section<'_>> {
@@ -785,6 +819,31 @@ Advice: A, it keeps the slice small.
     }
 
     #[test]
+    fn an_open_html_comment_or_details_block_is_refused() {
+        let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n";
+        let open = ["<!-- note", "<details>\n<summary>Log</summary>\n\nZ.", "<DETAILS open>\n\nZ."];
+        for open in open {
+            assert_eq!(
+                check_findings(&format!("{base}{open}\n")).unwrap_err(),
+                vec![Problem::OpenHtml],
+                "{open}"
+            );
+        }
+        let closed = [
+            "<!-- note -->",
+            "<!--\nnote\n-->",
+            "<!-->",
+            "<details>\n\nZ.\n\n</details>",
+            "`<details>` folds a block.",
+            "Reject a `<!-- dispatch` line.",
+            "```html\n<!--\n<details>\n```",
+        ];
+        for text in closed {
+            assert!(check_findings(&format!("{base}{text}\n")).is_ok(), "{text}");
+        }
+    }
+
+    #[test]
     fn a_fence_closes_only_on_its_own_kind_and_an_open_one_is_refused() {
         let inline = "## Cause\n\n```x``` reads it.\n\n## Approach\n\nY.\n";
         assert!(check_findings(inline).is_ok());
@@ -974,6 +1033,7 @@ Advice: A, it keeps the slice small.
             Problem::Marker,
             Problem::TooLong(70_000),
             Problem::OpenFence,
+            Problem::OpenHtml,
             Problem::Link,
             Problem::NotAFile,
             Problem::Unreadable,
