@@ -491,7 +491,7 @@ fn normalised(text: &str) -> String {
     plain[blank_lead..].trim_end().to_string()
 }
 
-/// GitHub and bots act on `@name`, a leading `/command`, HTML, images and diagrams, in code too.
+/// GitHub and bots act on `@name`, a `/command`, HTML, images and diagrams, in code too.
 fn quiet(text: &str) -> String {
     let lines: Vec<String> = at_signs(text).lines().map(quiet_line).collect();
     lines.join("\n")
@@ -499,7 +499,6 @@ fn quiet(text: &str) -> String {
 
 fn quiet_line(line: &str) -> String {
     let addresses = web_addresses(line);
-    let indent = line.len() - line.trim_start().len();
     let mut quiet = String::with_capacity(line.len() + 8);
     let mut chars = line.char_indices().peekable();
     while let Some((at, c)) = chars.next() {
@@ -512,9 +511,9 @@ fn quiet_line(line: &str) -> String {
                 quiet.push('@');
                 quiet.push(ZERO_WIDTH_SPACE);
             }
-            '/' if at == indent && next.is_some_and(|n| n.is_ascii_alphanumeric()) => {
-                quiet.push(ZERO_WIDTH_SPACE);
+            '/' if next.is_some_and(|n| n.is_ascii_alphanumeric()) && starts_word(line, at) => {
                 quiet.push('/');
+                quiet.push(ZERO_WIDTH_SPACE);
             }
             '<' if next.is_some_and(|n| n.is_ascii_alphabetic() || matches!(n, '/' | '!' | '?'))
                 && !starts_web_address(&line[at + 1..]) =>
@@ -531,6 +530,13 @@ fn quiet_line(line: &str) -> String {
     }
     disarm_info_strings(&mut quiet);
     quiet
+}
+
+fn starts_word(line: &str, at: usize) -> bool {
+    let before = &line[..at];
+    let link_destination = before.ends_with("](");
+    let continues = |c: char| c.is_ascii_alphanumeric() || "/.-_~%:+=&#?@".contains(c);
+    !link_destination && !before.chars().next_back().is_some_and(continues)
 }
 
 /// GFM ends a web address it links at whitespace or `<`.
@@ -830,7 +836,7 @@ Advice: A, it keeps the slice small.
         assert_eq!(
             quiet(html),
             format!(
-                "<{z}!-- note\n<{z}details open>\n<{z}/details><{z}img src=x>\n\
+                "<{z}!-- note\n<{z}details open>\n<{z}/{z}details><{z}img src=x>\n\
                  <{z}?x <{z}!{z}[CDATA[ <{z}IMG\tsrc=x>"
             )
         );
@@ -877,6 +883,18 @@ Advice: A, it keeps the slice small.
             "HTTPS://cdn.example/npm/react%4018 www.example.com/%40x <https://e.example/%40y>"
         );
         assert_eq!(quiet("https://@octocat"), "https://%40octocat");
+    }
+
+    #[test]
+    fn a_slash_that_starts_a_word_starts_no_command_and_paths_stay_as_they_are() {
+        let z = '\u{200b}';
+        assert_eq!(
+            quiet("run /deploy, `/deploy`, (/deploy) or \"/deploy\""),
+            format!("run /{z}deploy, `/{z}deploy`, (/{z}deploy) or \"/{z}deploy\"")
+        );
+        let paths = "src/app.rs ./x ../y ~/z C:/w https://e.example/a [docs](/docs/a.md) a/b";
+        assert_eq!(quiet(paths), paths);
+        assert_eq!(quiet("// a comment and 1 / 2"), "// a comment and 1 / 2");
     }
 
     #[test]
@@ -1019,8 +1037,8 @@ Advice: A, it keeps the slice small.
              @{z}x @{z}y @{z}z @{z}&#111;ctocat."
         );
         assert!(body.contains(&mentions), "{body}");
-        assert!(body.contains(&format!("\n  {z}/deploy production\n// a comment\n")), "{body}");
-        assert!(body.contains(&format!("\n@{z}claude run\n{z}/close\n")), "{body}");
+        assert!(body.contains(&format!("\n  /{z}deploy production\n// a comment\n")), "{body}");
+        assert!(body.contains(&format!("\n@{z}claude run\n/{z}close\n")), "{body}");
         assert_eq!(
             quiet("&#0064a &#X040;b &#65;c &amp;#64;d &commat e"),
             format!("@{z}a @{z}b &#65;c &amp;#64;d &commat e")
