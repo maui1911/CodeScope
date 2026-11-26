@@ -539,15 +539,18 @@ fn starts_word(line: &str, at: usize) -> bool {
     !link_destination && !before.chars().next_back().is_some_and(continues)
 }
 
-/// GFM ends a web address it links at whitespace or `<`.
+/// The path, query and fragment of each web address; GFM links one up to whitespace or `<`.
 fn web_addresses(line: &str) -> Vec<std::ops::Range<usize>> {
     let lower = line.to_ascii_lowercase();
     ["https://", "http://", "www."]
         .iter()
-        .flat_map(|prefix| lower.match_indices(prefix).map(|(start, _)| start))
-        .map(|start| {
-            let length = line[start..].find(|c: char| c.is_whitespace() || c == '<');
-            start..length.map_or(line.len(), |length| start + length)
+        .flat_map(|prefix| lower.match_indices(prefix).map(|(at, prefix)| at + prefix.len()))
+        .map(|host| {
+            let end = line[host..]
+                .find(|c: char| c.is_whitespace() || "<\"'`)".contains(c))
+                .map_or(line.len(), |length| host + length);
+            let path = line[host..end].find(['/', '?', '#']).map_or(end, |length| host + length);
+            path..end
         })
         .collect()
 }
@@ -872,7 +875,7 @@ Advice: A, it keeps the slice small.
     }
 
     #[test]
-    fn an_at_sign_in_a_web_address_is_escaped_so_the_link_still_works() {
+    fn an_at_sign_in_a_web_address_path_is_escaped_so_the_link_still_works() {
         let z = '\u{200b}';
         assert_eq!(
             quiet("[types](https://www.npmjs.com/package/@types/node) and see @octocat"),
@@ -882,7 +885,15 @@ Advice: A, it keeps the slice small.
             quiet("HTTPS://cdn.example/npm/react@18 www.example.com/@x <https://e.example/@y>"),
             "HTTPS://cdn.example/npm/react%4018 www.example.com/%40x <https://e.example/%40y>"
         );
-        assert_eq!(quiet("https://@octocat"), "https://%40octocat");
+        assert_eq!(quiet("https://@octocat"), format!("https://@{z}octocat"));
+        assert_eq!(
+            quiet("git clone https://deploy@git.example.com/r.git"),
+            format!("git clone https://deploy@{z}git.example.com/r.git")
+        );
+        assert_eq!(
+            quiet(r#"{"url":"https://api.example/a","owner":"@octocat"}"#),
+            format!(r#"{{"url":"https://api.example/a","owner":"@{z}octocat"}}"#)
+        );
     }
 
     #[test]
