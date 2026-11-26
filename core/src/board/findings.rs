@@ -2,8 +2,13 @@
 //! and turned into the comment that carries the marker.
 
 use std::fmt;
+use std::io::Read as _;
+use std::path::Path;
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
+
+use super::dispatch::{FINDINGS_FILE, linked_part};
 
 const MAX_LENGTH: usize = 60_000;
 const MAX_LISTED: usize = 4;
@@ -73,6 +78,14 @@ pub enum Problem {
     Marker,
     TooLong(usize),
     OpenFence,
+    /// The file, or the folder it is in, is a link.
+    Link,
+    /// A folder, a pipe or a device where the file should be.
+    NotAFile,
+    /// Reading it failed, for want of permission or otherwise.
+    Unreadable,
+    /// Its bytes are not UTF-8, as a UTF-16 redirection writes them.
+    NotText,
 }
 
 impl fmt::Display for Problem {
@@ -107,8 +120,73 @@ impl fmt::Display for Problem {
                 write!(f, "it is {length} bytes, more than {MAX_LENGTH}")
             }
             Problem::OpenFence => write!(f, "a code block is not closed"),
+            Problem::Link => write!(f, "it or its folder is a link"),
+            Problem::NotAFile => write!(f, "it is not a plain file"),
+            Problem::Unreadable => write!(f, "it cannot be read"),
+            Problem::NotText => write!(f, "it is not UTF-8 text"),
         }
     }
+}
+
+/// Modified time and length, which tell one version of a file from the next.
+pub type FileStamp = (Option<SystemTime>, u64);
+
+/// [`FINDINGS_FILE`] as one read found it.
+#[derive(Debug)]
+pub struct FindingsFile {
+    /// Taken as it was read, so the session hears about each version once.
+    pub stamp: FileStamp,
+    read: Result<String, Problem>,
+}
+
+impl FindingsFile {
+    /// The text to post with its findings, or what to fix first.
+    pub fn check(&self) -> Result<(&str, Findings), Vec<Problem>> {
+        let text = self.read.as_ref().map_err(|problem| vec![problem.clone()])?;
+        check_findings(text).map(|findings| (text.as_str(), findings))
+    }
+}
+
+/// The findings in `worktree`, `None` when there are none. A link, anything but a plain file,
+/// more than a comment holds, or text that isn't UTF-8 reads as that problem; the text comes
+/// back with `\n` line ends and without a byte order mark.
+pub fn read_findings(worktree: &Path) -> Option<FindingsFile> {
+    let path = worktree.join(FINDINGS_FILE);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => {
+            return Some(FindingsFile {
+                stamp: (None, 0),
+                read: Err(Problem::Unreadable),
+            });
+        }
+    };
+    let read = if linked_part(worktree, FINDINGS_FILE).is_some() {
+        Err(Problem::Link)
+    } else if !metadata.is_file() {
+        Err(Problem::NotAFile)
+    } else {
+        read_text(&path)
+    };
+    Some(FindingsFile {
+        stamp: (metadata.modified().ok(), metadata.len()),
+        read,
+    })
+}
+
+fn read_text(path: &Path) -> Result<String, Problem> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(MAX_LENGTH as u64 + 1).read_to_end(&mut bytes))
+        .map_err(|_| Problem::Unreadable)?;
+    if bytes.len() > MAX_LENGTH {
+        let length = std::fs::metadata(path).map_or(bytes.len(), |m| m.len() as usize);
+        return Err(Problem::TooLong(length));
+    }
+    let text = String::from_utf8(bytes).map_err(|_| Problem::NotText)?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    Ok(text.replace("\r\n", "\n").replace('\r', "\n"))
 }
 
 struct Section<'a> {
@@ -481,6 +559,41 @@ Advice: A, it keeps the slice small.
         );
     }
 
+    fn worktree_with(content: &[u8]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".codescope")).unwrap();
+        std::fs::write(dir.path().join(FINDINGS_FILE), content).unwrap();
+        dir
+    }
+
+    #[test]
+    fn reads_the_findings_with_plain_line_ends_and_no_byte_order_mark() {
+        let written = "\u{feff}## Cause\r\n\r\nX.\r\n\r\n## Approach\rY.\r\n";
+        let dir = worktree_with(written.as_bytes());
+        let file = read_findings(dir.path()).unwrap();
+        assert_eq!(file.stamp.1, written.len() as u64);
+        let (text, findings) = file.check().unwrap();
+        assert_eq!(text, "## Cause\n\nX.\n\n## Approach\nY.\n");
+        assert_eq!(findings.outcome(), Outcome::Findings);
+    }
+
+    #[test]
+    fn no_file_is_no_findings_and_an_odd_one_is_a_problem() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_findings(dir.path()).is_none());
+        std::fs::create_dir_all(dir.path().join(FINDINGS_FILE)).unwrap();
+        let folder = read_findings(dir.path()).unwrap();
+        assert_eq!(folder.check().unwrap_err(), vec![Problem::NotAFile]);
+
+        let utf16 = worktree_with(&[0xff, 0xfe, b'#', 0, b'#', 0]);
+        let utf16 = read_findings(utf16.path()).unwrap();
+        assert_eq!(utf16.check().unwrap_err(), vec![Problem::NotText]);
+
+        let long = worktree_with(&vec![b'y'; MAX_LENGTH + 1]);
+        let long = read_findings(long.path()).unwrap();
+        assert_eq!(long.check().unwrap_err(), vec![Problem::TooLong(MAX_LENGTH + 1)]);
+    }
+
     #[test]
     fn refuses_the_marker_however_it_is_spelled() {
         let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n";
@@ -622,6 +735,10 @@ Advice: A, it keeps the slice small.
             Problem::Marker,
             Problem::TooLong(70_000),
             Problem::OpenFence,
+            Problem::Link,
+            Problem::NotAFile,
+            Problem::Unreadable,
+            Problem::NotText,
         ];
         let message = problems_message(&all);
         let plain = |c: char| (c.is_ascii_graphic() || c == ' ') && !matches!(c, '\'' | '"' | '`');

@@ -630,8 +630,12 @@ pub fn exclude_handover_files(worktree: &Path) -> Result<()> {
         .with_context(|| format!("write {}", path.display()))
 }
 
-/// Remove the findings of an earlier round, so they can't be taken for this round's.
+/// Remove the findings of an earlier round, so they can't be taken for this round's; refuses
+/// when the file or its folder is a link.
 pub fn clear_findings(worktree: &Path) -> Result<()> {
+    if let Some(part) = linked_part(worktree, FINDINGS_FILE) {
+        bail!("{} is a link", part.display());
+    }
     let path = worktree.join(FINDINGS_FILE);
     match std::fs::remove_file(&path) {
         Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
@@ -643,16 +647,23 @@ pub fn clear_findings(worktree: &Path) -> Result<()> {
 
 /// Write [`TASK_FILE`] into the worktree; refuses when the file or its folder is a link.
 pub fn write_task_file(worktree: &Path, content: &str) -> Result<()> {
-    let path = worktree.join(TASK_FILE);
-    for part in [path.parent(), Some(path.as_path())].into_iter().flatten() {
-        if std::fs::symlink_metadata(part).is_ok_and(|meta| meta.file_type().is_symlink()) {
-            bail!("{} is a link", part.display());
-        }
+    if let Some(part) = linked_part(worktree, TASK_FILE) {
+        bail!("{} is a link", part.display());
     }
+    let path = worktree.join(TASK_FILE);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     std::fs::write(&path, content).with_context(|| format!("write {}", path.display()))
+}
+
+pub(crate) fn linked_part(worktree: &Path, relative: &str) -> Option<PathBuf> {
+    let path = worktree.join(relative);
+    [path.parent(), Some(path.as_path())]
+        .into_iter()
+        .flatten()
+        .find(|part| std::fs::symlink_metadata(part).is_ok_and(|m| m.file_type().is_symlink()))
+        .map(Path::to_path_buf)
 }
 
 /// Create a dispatch's worktree at `path` on `branch`, from `remote`'s own default branch,
@@ -1549,7 +1560,23 @@ mod tests {
         add_dispatch_worktree(&repo, &path, "14-linked", "origin").unwrap();
     }
 
-    #[cfg(unix)]
+    fn link_folder(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "{made:?}");
+        }
+    }
+
     #[test]
     fn the_task_file_is_not_written_through_a_link() {
         let dir = tempfile::tempdir().unwrap();
@@ -1557,8 +1584,39 @@ mod tests {
         std::fs::create_dir_all(&target).unwrap();
         let worktree = dir.path().join("worktree");
         std::fs::create_dir_all(&worktree).unwrap();
-        std::os::unix::fs::symlink(&target, worktree.join(".codescope")).unwrap();
+        link_folder(&target, &worktree.join(".codescope"));
         assert!(write_task_file(&worktree, "# Research\n").is_err());
         assert!(!target.join("dispatch.md").exists());
+    }
+
+    #[test]
+    fn findings_are_not_read_or_removed_through_a_linked_folder() {
+        use crate::board::findings::{Problem, read_findings};
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let theirs = elsewhere.join("findings.md");
+        std::fs::write(&theirs, "## Cause\n\nX.\n\n## Approach\n\nY.\n").unwrap();
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        link_folder(&elsewhere, &worktree.join(".codescope"));
+        let file = read_findings(&worktree).unwrap();
+        assert_eq!(file.check().unwrap_err(), vec![Problem::Link]);
+        assert!(clear_findings(&worktree).is_err());
+        assert!(theirs.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn findings_that_are_a_link_are_not_read() {
+        use crate::board::findings::{Problem, read_findings};
+        let dir = tempfile::tempdir().unwrap();
+        let theirs = dir.path().join("theirs.md");
+        std::fs::write(&theirs, "## Cause\n\nX.\n\n## Approach\n\nY.\n").unwrap();
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(worktree.join(".codescope")).unwrap();
+        std::os::unix::fs::symlink(&theirs, worktree.join(FINDINGS_FILE)).unwrap();
+        let file = read_findings(&worktree).unwrap();
+        assert_eq!(file.check().unwrap_err(), vec![Problem::Link]);
     }
 }
