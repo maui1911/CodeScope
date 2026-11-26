@@ -1150,6 +1150,7 @@ impl AppShell {
         let records = self.dispatch_records(cx);
         let mut running = self.running_dispatches(cx);
         let limit = self.settings.dispatch_limit;
+        let now = codescope_core::time::now_iso8601();
         let mut holds = HashMap::new();
         let mut seen = HashSet::new();
         let mut decided = HashSet::new();
@@ -1185,6 +1186,7 @@ impl AppShell {
                     change,
                     mover_can_write,
                     board_added_at: &settings.added_at,
+                    now: &now,
                     projects: item
                         .repository
                         .as_deref()

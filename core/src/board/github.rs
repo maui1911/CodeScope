@@ -33,7 +33,7 @@ pub fn board_query(owner_kind: BoardOwner) -> String {
         pageInfo {{ hasNextPage endCursor }}
         nodes {{
           id isArchived updatedAt
-          fieldValueByName(name: "Status") {{ ... on ProjectV2ItemFieldSingleSelectValue {{ optionId }} }}
+          fieldValueByName(name: "Status") {{ ... on ProjectV2ItemFieldSingleSelectValue {{ optionId updatedAt }} }}
           content {{
             __typename
             ... on DraftIssue {{ title }}
@@ -620,7 +620,10 @@ fn into_item(node: ItemNode) -> Option<BoardItem> {
     if node.is_archived {
         return None;
     }
-    let column_id = node.field_value_by_name.and_then(|v| v.option_id);
+    let (column_id, column_set_at) = node
+        .field_value_by_name
+        .map(|v| (v.option_id, v.updated_at))
+        .unwrap_or_default();
     let (kind, linked) = match node.content? {
         Content::DraftIssue { title } => {
             return Some(BoardItem {
@@ -634,6 +637,7 @@ fn into_item(node: ItemNode) -> Option<BoardItem> {
                 assignees: Vec::new(),
                 state: ItemState::Open,
                 column_id,
+                column_set_at,
                 updated_at: node.updated_at,
             });
         }
@@ -655,6 +659,7 @@ fn into_item(node: ItemNode) -> Option<BoardItem> {
             .unwrap_or_default(),
         state: item_state(&linked.state),
         column_id,
+        column_set_at,
         updated_at: node.updated_at,
     })
 }
@@ -959,6 +964,7 @@ struct ItemNode {
 #[serde(rename_all = "camelCase")]
 struct StatusValue {
     option_id: Option<String>,
+    updated_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1006,7 +1012,7 @@ mod tests {
       "field":{"id":"PVTSSF_1","options":[{"id":"f1","name":"Todo"},{"id":"f2","name":"Ready"}]},
       "items":{"pageInfo":{"hasNextPage":true,"endCursor":"Y3Vy"},"nodes":[
         {"id":"PVTI_1","isArchived":false,"updatedAt":"2026-11-20T00:55:34Z",
-         "fieldValueByName":{"optionId":"f2"},
+         "fieldValueByName":{"optionId":"f2","updatedAt":"2026-11-20T00:55:30Z"},
          "content":{"__typename":"Issue","id":"I_411","number":411,"title":"Fuzzy paths",
            "url":"https://github.com/maui1911/CodeScope/issues/411","state":"OPEN",
            "repository":{"nameWithOwner":"maui1911/CodeScope"},
@@ -1061,6 +1067,7 @@ mod tests {
         assert_eq!(issue.number, Some(411));
         assert_eq!(issue.repository.as_deref(), Some("maui1911/CodeScope"));
         assert_eq!(issue.column_id.as_deref(), Some("f2"));
+        assert_eq!(issue.column_set_at.as_deref(), Some("2026-11-20T00:55:30Z"));
         assert_eq!(issue.state, ItemState::Open);
         assert_eq!(issue.content_id.as_deref(), Some("I_411"));
         assert_eq!(issue.assignees, vec!["maui1911"]);
@@ -1075,6 +1082,7 @@ mod tests {
         assert_eq!(draft.number, None);
         assert_eq!(draft.title, "Theme picker");
         assert_eq!(draft.column_id, None);
+        assert_eq!(draft.column_set_at, None);
         assert_eq!(draft.content_id, None);
     }
 

@@ -122,6 +122,8 @@ pub struct BoardItem {
     pub state: ItemState,
     /// Id of the [`Column`] the item is in; `None` when it has no status.
     pub column_id: Option<String>,
+    /// When the item was put in that column, ISO 8601; `None` when it has no status.
+    pub column_set_at: Option<String>,
     /// ISO 8601, as the host reports it.
     pub updated_at: String,
 }
@@ -496,6 +498,7 @@ mod tests {
             assignees: Vec::new(),
             state: ItemState::Open,
             column_id: column_id.map(str::to_string),
+            column_set_at: None,
             updated_at: String::new(),
         }
     }
