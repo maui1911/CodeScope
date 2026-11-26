@@ -34,8 +34,8 @@ use codescope_core::board::{
 };
 use codescope_core::path_canon::paths_match;
 use codescope_core::process_tree;
-use codescope_core::{SessionState, TelemetrySnapshot};
-use codescope_core::projects::{ProjectKind, ProjectsConfig};
+use codescope_core::{AgentProfile, SessionState, TelemetrySnapshot};
+use codescope_core::projects::{Project, ProjectKind, ProjectsConfig};
 use codescope_core::worktree_create::{PendingId, record_dispatch, record_posted_findings};
 use codescope_terminal::TerminalView;
 use gpui::{App, AppContext as _, Context, Entity, SharedString, Window};
@@ -1052,12 +1052,7 @@ impl AppShell {
             return;
         };
 
-        let profile = project
-            .default_agent_id
-            .as_deref()
-            .and_then(|id| self.agent_registry.get_by_id(id))
-            .or_else(|| self.agent_registry.get_default())
-            .cloned();
+        let profile = self.project_agent(&project);
         let command = profile.as_ref().and_then(|profile| {
             codescope_core::build_new_session_auto_type(profile)
                 .and_then(|launch| launch_with_task(&launch, &task_message(number)))
@@ -1928,6 +1923,59 @@ impl AppShell {
         }
         self.refresh_boards(cx);
         cx.notify();
+    }
+
+    fn project_agent(&self, project: &Project) -> Option<AgentProfile> {
+        project
+            .default_agent_id
+            .as_deref()
+            .and_then(|id| self.agent_registry.get_by_id(id))
+            .or_else(|| self.agent_registry.get_default())
+            .cloned()
+    }
+
+    pub(crate) fn open_dispatch_tab(
+        &mut self,
+        board_url: &str,
+        item_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((project_id, path, branch, _)) = self
+            .dispatch_records(cx)
+            .into_iter()
+            .find(|(_, _, _, r)| r.board_url == board_url && r.item_id == item_id)
+        else {
+            return;
+        };
+        if !path.is_dir() {
+            let detail = format!("Its worktree {} is gone.", path.display());
+            self.push_toast(ToastKind::Err, "Can't open its session", Some(detail.into()), cx);
+            return;
+        }
+        self.show_workspace(cx);
+        if self.focus_or_reopen(&path, window, cx) {
+            return;
+        }
+        let Some(project) = self.current_projects(cx).project(&project_id).cloned() else {
+            return;
+        };
+        let profile = self.project_agent(&project);
+        let auto_type = profile.as_ref().and_then(codescope_core::build_new_session_auto_type);
+        let mut title = codescope_core::TabTitle::project(project.name);
+        if let Some(branch) = branch.as_deref() {
+            title.set_branch(branch);
+        }
+        self.spawn_tab_in(
+            Some(path),
+            Some(title),
+            auto_type.map(Into::into),
+            profile.map(|profile| profile.id.into()),
+            None,
+            None,
+            window,
+            cx,
+        );
     }
 
     /// Mark the draft pull request of `item_id` ready for review; the next watch moves the item
