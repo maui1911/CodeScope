@@ -318,6 +318,9 @@ pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
     }
 }
 
+/// GitHub stops nesting list items about a hundred deep, so the check follows far fewer.
+const MAX_MARKERS: usize = 10;
+
 #[derive(Clone, Copy)]
 struct Fence {
     mark: char,
@@ -396,26 +399,40 @@ impl Fences {
             return false;
         }
         let after_blank = std::mem::take(&mut self.blank_before);
-        let (text, column) = after_markers(line);
-        self.deep |= indent > 3 && self.listed && Fence::at(text, column, 0, true).is_some();
+        let markers = after_markers(line);
+        let fenced = markers.map_or_else(
+            || line.contains("```") || line.contains("~~~"),
+            |(text, _)| Fence::at(text, 0, 0, false).is_some(),
+        );
+        self.deep |= indent > 3 && self.listed && fenced;
         self.open = if indent <= 3 && item_content(start).is_some() && !is_thematic_break(start) {
-            self.item(start, indent, text, column)
+            self.item(start, indent, markers, fenced)
         } else {
             self.other(line, indent, after_blank)
         };
         self.open.is_some()
     }
 
-    fn item(&mut self, start: &str, indent: usize, text: &str, column: usize) -> Option<Fence> {
+    fn item(
+        &mut self,
+        start: &str,
+        indent: usize,
+        markers: Option<(&str, usize)>,
+        fenced: bool,
+    ) -> Option<Fence> {
         let beside = self.items.last().is_some_and(|&open| indent < open);
-        let fence = Fence::at(text, column, column, true);
         self.listed = true;
         if !(self.last == LastLine::NoParagraph || beside || may_interrupt_text(start)) {
-            self.unsure_item |= fence.is_some();
+            self.unsure_item |= fenced;
             self.last = LastLine::Unknown;
             return None;
         }
         self.items.retain(|&open| open <= indent);
+        let Some((text, column)) = markers else {
+            self.deep |= fenced;
+            self.last = LastLine::Unknown;
+            return None;
+        };
         if !text.is_empty() {
             self.items.push(column);
         }
@@ -426,7 +443,7 @@ impl Fences {
         } else {
             LastLine::Unknown
         };
-        fence
+        Fence::at(text, column, column, true)
     }
 
     fn other(&mut self, line: &str, indent: usize, after_blank: bool) -> Option<Fence> {
@@ -480,19 +497,22 @@ fn may_interrupt_text(item: &str) -> bool {
 }
 
 /// CommonMark starts an item's content one to four columns past its marker, else one past it.
-fn after_markers(line: &str) -> (&str, usize) {
+fn after_markers(line: &str) -> Option<(&str, usize)> {
     let mut rest = line.trim_start_matches([' ', '\t']);
     let mut column = indent_width(line);
-    while let Some(content) = item_content(rest) {
+    for _ in 0..=MAX_MARKERS {
+        let Some(content) = item_content(rest) else {
+            return Some((rest, column));
+        };
         let marker_end = advance(column, &rest[..rest.len() - content.len()]);
         let text = content.trim_start_matches([' ', '\t']);
         let text_column = advance(marker_end, &content[..content.len() - text.len()]);
         if text.is_empty() || text_column - marker_end > 4 {
-            return ("", marker_end + 1);
+            return Some(("", marker_end + 1));
         }
         (rest, column) = (text, text_column);
     }
-    (rest, column)
+    None
 }
 
 fn is_prose(text: &str) -> bool {
@@ -1368,6 +1388,16 @@ Advice: A, it keeps the slice small.
             let text = format!("{base}{deep}");
             assert!(check_findings(&text).unwrap_err().contains(&Problem::DeepFence), "{deep:?}");
         }
+    }
+
+    #[test]
+    fn a_line_of_many_nested_markers_is_not_followed_deeper_than_github_nests() {
+        let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n";
+        let nested = format!("{}a\n\n{}x\ny\n2. ```\n   ```\n", "- ".repeat(120), " ".repeat(240));
+        assert_eq!(check_findings(&format!("{base}{nested}")).unwrap_err()[0], Problem::ListFence);
+        let fenced = format!("{base}{}```\n", "- ".repeat(20));
+        assert_eq!(check_findings(&fenced).unwrap_err(), vec![Problem::DeepFence]);
+        assert!(check_findings(&format!("{base}- 1. - a\n\n      b\n")).is_ok());
     }
 
     #[test]
