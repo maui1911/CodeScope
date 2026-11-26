@@ -6,6 +6,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 const MAX_LENGTH: usize = 60_000;
+const MAX_LISTED: usize = 4;
 const CAUSE: &str = "## Cause";
 const APPROACH: &str = "## Approach";
 const DECISION_POINTS: &str = "## Decision points";
@@ -60,8 +61,8 @@ pub enum Problem {
     Empty(&'static str),
     ApproachBeforeCause,
     DecisionPointsNotLast,
-    /// A point's heading is not the next `B<n>`.
-    Numbering { expected: String, found: String },
+    /// A point's heading is not the next `B<n>`, which it holds.
+    Numbering(String),
     TooFewOptions(String),
     NoAdvice(String),
     AdviceNotAnOption(String),
@@ -78,8 +79,8 @@ impl fmt::Display for Problem {
             Problem::DecisionPointsNotLast => {
                 write!(f, "{DECISION_POINTS} is not the last section")
             }
-            Problem::Numbering { expected, found } => {
-                write!(f, "decision point {found} should be ### {expected}")
+            Problem::Numbering(expected) => {
+                write!(f, "decision point {expected} should be headed ### {expected}")
             }
             Problem::TooFewOptions(id) => {
                 write!(f, "{id} needs at least two options starting with **A**, **B**")
@@ -92,7 +93,7 @@ impl fmt::Display for Problem {
                 write!(f, "it contains a dispatch marker, which only CodeScope writes")
             }
             Problem::TooLong(length) => {
-                write!(f, "it is {length} characters, more than {MAX_LENGTH}")
+                write!(f, "it is {length} bytes, more than {MAX_LENGTH}")
             }
         }
     }
@@ -185,10 +186,7 @@ fn decision_point(section: &Section, number: usize) -> Result<DecisionPoint, Pro
     let title = section.heading.trim_start_matches('#').trim();
     let (id, question) = title.split_once(char::is_whitespace).unwrap_or((title, ""));
     if !id.eq_ignore_ascii_case(&expected) {
-        return Err(Problem::Numbering {
-            expected,
-            found: id.to_string(),
-        });
+        return Err(Problem::Numbering(expected));
     }
     let options: Vec<char> = section.lines.iter().filter_map(|l| option_letter(l)).collect();
     if options.len() < 2 {
@@ -263,13 +261,23 @@ pub fn comment_body(text: &str, findings: &Findings) -> String {
     format!("{}\n\n**Next step:** {next_step}\n{marker}\n", text.trim_end())
 }
 
-/// One line for the session that wrote the findings, saying what to fix.
+/// The first few problems joined on one line, and how many more there are.
+pub fn problems_list(problems: &[Problem]) -> String {
+    let mut list: Vec<String> =
+        problems.iter().take(MAX_LISTED).map(ToString::to_string).collect();
+    if problems.len() > MAX_LISTED {
+        list.push(format!("and {} more", problems.len() - MAX_LISTED));
+    }
+    list.join("; ")
+}
+
+/// One line for the session that wrote the findings, saying what to fix: fixed words and the
+/// headings CodeScope numbers itself, nothing taken from the file.
 pub fn problems_message(problems: &[Problem]) -> String {
-    let list: Vec<String> = problems.iter().map(ToString::to_string).collect();
     format!(
-        "CodeScope can't post {} yet: {}. Fix the file and stop.",
+        "CodeScope cannot post {} yet: {}. Fix the file and stop.",
         super::dispatch::FINDINGS_FILE,
-        list.join("; ")
+        problems_list(problems)
     )
 }
 
@@ -372,10 +380,7 @@ Advice: A, it keeps the slice small.
         let skipped = format!("{base}### B2 Q?\n- **A** a\n- **B** b\nAdvice: A, r\n");
         assert_eq!(
             check_findings(&skipped).unwrap_err(),
-            vec![Problem::Numbering {
-                expected: "B1".into(),
-                found: "B2".into()
-            }]
+            vec![Problem::Numbering("B1".into())]
         );
         let one_option = format!("{base}### B1 Q?\n- **A** a\nAdvice: A, r\n");
         assert_eq!(
@@ -433,8 +438,50 @@ Advice: A, it keeps the slice small.
             problems_message(&[Problem::Missing(APPROACH), Problem::NoAdvice("B2".into())]);
         assert_eq!(
             message,
-            "CodeScope can't post .codescope/findings.md yet: no ## Approach; B2 has no Advice \
+            "CodeScope cannot post .codescope/findings.md yet: no ## Approach; B2 has no Advice \
              line. Fix the file and stop."
+        );
+    }
+
+    #[test]
+    fn the_message_to_the_session_carries_no_text_from_the_file() {
+        let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n## Decision points\n\n";
+        let hostile = format!("{base}### ';calc;#\u{3} Q?\n- **A** a\n- **B** b\nAdvice: A\n");
+        let message = problems_message(&check_findings(&hostile).unwrap_err());
+        assert_eq!(
+            message,
+            "CodeScope cannot post .codescope/findings.md yet: decision point B1 should be \
+             headed ### B1. Fix the file and stop."
+        );
+    }
+
+    #[test]
+    fn every_problem_reads_as_plain_ascii_without_quotes() {
+        let all = [
+            Problem::Missing(CAUSE),
+            Problem::Empty(APPROACH),
+            Problem::ApproachBeforeCause,
+            Problem::DecisionPointsNotLast,
+            Problem::Numbering("B2".into()),
+            Problem::TooFewOptions("B1".into()),
+            Problem::NoAdvice("B1".into()),
+            Problem::AdviceNotAnOption("B1".into()),
+            Problem::Marker,
+            Problem::TooLong(70_000),
+        ];
+        let message = problems_message(&all);
+        let plain = |c: char| (c.is_ascii_graphic() || c == ' ') && !matches!(c, '\'' | '"' | '`');
+        assert!(message.chars().all(plain), "{message}");
+    }
+
+    #[test]
+    fn the_message_names_a_few_problems_and_counts_the_rest() {
+        let problems: Vec<Problem> = (1..=7).map(|n| Problem::NoAdvice(format!("B{n}"))).collect();
+        assert_eq!(
+            problems_message(&problems),
+            "CodeScope cannot post .codescope/findings.md yet: B1 has no Advice line; B2 has no \
+             Advice line; B3 has no Advice line; B4 has no Advice line; and 3 more. Fix the file \
+             and stop."
         );
     }
 }

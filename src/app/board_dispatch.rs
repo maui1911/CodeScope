@@ -15,7 +15,7 @@ use codescope_core::board::dispatch::{
     trigger_content_ids, write_task_file,
 };
 use codescope_core::board::findings::{
-    Findings, Outcome, Problem, check_findings, comment_body, problems_message,
+    Findings, Outcome, Problem, check_findings, comment_body, problems_list, problems_message,
 };
 use codescope_core::board::github::{self, Viewer};
 use codescope_core::board::{
@@ -1035,11 +1035,7 @@ impl AppShell {
                 file: None,
                 sent: 0,
             });
-        reminder.problems = problems
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("; ");
+        reminder.problems = problems_list(problems);
         if reminder.file == Some(file) || reminder.sent >= MAX_REMINDERS {
             return;
         }
