@@ -92,6 +92,7 @@ enum Remind {
 
 struct Posting {
     record: WorktreeDispatch,
+    path: PathBuf,
     outcome: Outcome,
 }
 
@@ -1067,11 +1068,14 @@ impl AppShell {
                     let body = comment_body(text, &findings);
                     let posting = Posting {
                         record,
+                        path,
                         outcome: findings.outcome(),
                     };
                     self.post_findings(posting, body, board, mapping, cx);
                 }
-                Err(problems) => self.remind(&record, file.stamp, remind, &problems, cx),
+                Err(problems) => {
+                    self.remind(&record, &path, file.stamp, remind, &problems, cx);
+                }
             }
         }
         if self.board.dispatch.findings_held != held_before {
@@ -1107,9 +1111,14 @@ impl AppShell {
         }
     }
 
+    fn tab_title_at(&self, path: &Path) -> Option<SharedString> {
+        self.tabs_on(path).first().map(|tab| tab.title.clone())
+    }
+
     fn remind(
         &mut self,
         record: &WorktreeDispatch,
+        path: &Path,
         file: FileStamp,
         remind: Remind,
         problems: &[Problem],
@@ -1142,7 +1151,7 @@ impl AppShell {
                     crate::notifications::NotificationKind::SessionWaiting,
                     title,
                     detail,
-                    Some(record.title.clone().into()),
+                    self.tab_title_at(path),
                     cx,
                 );
             }
@@ -1208,7 +1217,11 @@ impl AppShell {
         result: Result<Posted, String>,
         cx: &mut Context<Self>,
     ) {
-        let Posting { record, outcome } = posting;
+        let Posting {
+            record,
+            path,
+            outcome,
+        } = posting;
         let key = round_key(&record);
         self.board.dispatch.posting.remove(&key);
         cx.notify();
@@ -1282,7 +1295,7 @@ impl AppShell {
             crate::notifications::NotificationKind::SessionReady,
             title,
             detail,
-            Some(record.title.clone().into()),
+            self.tab_title_at(&path),
             cx,
         );
     }
