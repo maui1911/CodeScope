@@ -5405,6 +5405,9 @@ impl AppShell {
                                                 .map(|t_idx| (g_idx, t_idx))
                                         });
                                     if let Some((g_idx, t_idx)) = target {
+                                        this.set_show_board(false, cx);
+                                        this.set_show_bots(false, cx);
+                                        this.set_show_overview(false, cx);
                                         this.activate_tab(g_idx, t_idx, window, cx);
                                     }
                                 }

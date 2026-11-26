@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use super::findings::Outcome;
+use super::pull_request::PostedPullRequest;
 use super::{Board, BoardItem, ColumnMapping, ColumnRole, ItemKind, ItemState, RoleKind};
 use super::{mapped_column, normalize_column_name};
 use crate::git::{parse_worktree_porcelain, run_git};
@@ -112,6 +113,9 @@ pub struct WorktreeDispatch {
     /// The research round's findings, once CodeScope posted them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub findings: Option<PostedFindings>,
+    /// The implementation round's pull request, once CodeScope reported it on the issue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<PostedPullRequest>,
 }
 
 impl WorktreeDispatch {
@@ -844,6 +848,7 @@ mod tests {
             round,
             trigger_at: trigger_at.into(),
             findings: None,
+            pull_request: None,
         }
     }
 
@@ -1211,6 +1216,22 @@ mod tests {
         });
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains(r#""outcome":"decision-points""#), "{json}");
+        assert_eq!(serde_json::from_str::<WorktreeDispatch>(&json).unwrap(), record);
+    }
+
+    #[test]
+    fn the_record_round_trips_with_and_without_a_reported_pull_request() {
+        let mut record = dispatch(Round::Implementation, MOVED);
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(!json.contains("pullRequest"), "{json}");
+        record.pull_request = Some(PostedPullRequest {
+            number: 415,
+            url: "https://github.com/maui1911/CodeScope/pull/415".into(),
+            comment_url: "https://github.com/maui1911/CodeScope/issues/411#issuecomment-2".into(),
+            in_review: true,
+        });
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains(r#""inReview":true"#), "{json}");
         assert_eq!(serde_json::from_str::<WorktreeDispatch>(&json).unwrap(), record);
     }
 

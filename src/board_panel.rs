@@ -121,6 +121,7 @@ impl AppShell {
                     this.stamp_board_added_at(cx);
                     this.run_dispatch(window, cx);
                     this.collect_findings(cx);
+                    this.watch_pull_requests(cx);
                     this.begin_board_read(false, cx)
                 }) else {
                     break;
@@ -914,10 +915,14 @@ fn render_card(
                 .text_color(color)
                 .child(note.text.clone());
             match note.action {
-                Some(CardAction::Decide) => {
+                Some(action) => {
                     let item_id = item.id.clone();
+                    let label = match action {
+                        CardAction::Decide => "Decide",
+                        CardAction::ReadyForReview => "Ready for review",
+                    };
                     let button = div()
-                        .id(("board-card-decide", index))
+                        .id(("board-card-action", index))
                         .flex_shrink_0()
                         .px(px(8.0))
                         .py(px(2.0))
@@ -930,10 +935,17 @@ fn render_card(
                             MouseButton::Left,
                             cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
-                                this.open_decide_dialog(&item_id, window, cx);
+                                match action {
+                                    CardAction::Decide => {
+                                        this.open_decide_dialog(&item_id, window, cx)
+                                    }
+                                    CardAction::ReadyForReview => {
+                                        this.ready_for_review(&item_id, cx)
+                                    }
+                                }
                             }),
                         )
-                        .child("Decide");
+                        .child(label);
                     div()
                         .flex()
                         .flex_row()
