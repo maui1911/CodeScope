@@ -61,6 +61,10 @@ pub enum Problem {
     Empty(&'static str),
     ApproachBeforeCause,
     DecisionPointsNotLast,
+    /// A `## ` heading about decision points that is not exactly `## Decision points`.
+    DecisionPointsHeading,
+    /// A `### B<n>` heading outside `## Decision points`.
+    StrayDecisionPoint,
     /// A point's heading is not the next `B<n>`, which it holds.
     Numbering(String),
     TooFewOptions(String),
@@ -79,6 +83,12 @@ impl fmt::Display for Problem {
             Problem::ApproachBeforeCause => write!(f, "{APPROACH} comes before {CAUSE}"),
             Problem::DecisionPointsNotLast => {
                 write!(f, "{DECISION_POINTS} is not the last section")
+            }
+            Problem::DecisionPointsHeading => {
+                write!(f, "decision points go under a heading that reads {DECISION_POINTS}")
+            }
+            Problem::StrayDecisionPoint => {
+                write!(f, "a ### B heading sits outside {DECISION_POINTS}")
             }
             Problem::Numbering(expected) => {
                 write!(f, "decision point {expected} should be headed ### {expected}")
@@ -132,6 +142,19 @@ pub fn check_findings(text: &str) -> Result<Findings, Vec<Problem>> {
         && approach < cause
     {
         problems.push(Problem::ApproachBeforeCause);
+    }
+
+    let near_miss = top.iter().any(|s| {
+        !s.heading.eq_ignore_ascii_case(DECISION_POINTS)
+            && s.heading.to_ascii_lowercase().contains("decision point")
+    });
+    let points_inside = position(DECISION_POINTS)
+        .map(|index| point_headings(&top[index].lines.join("\n")))
+        .unwrap_or(0);
+    if near_miss {
+        problems.push(Problem::DecisionPointsHeading);
+    } else if point_headings(text) > points_inside {
+        problems.push(Problem::StrayDecisionPoint);
     }
 
     let mut decision_points = Vec::new();
@@ -214,6 +237,19 @@ fn sections<'a>(text: &'a str, prefix: &str) -> Vec<Section<'a>> {
         }
     }
     sections
+}
+
+fn point_headings(text: &str) -> usize {
+    sections(text, "### ")
+        .iter()
+        .filter(|s| {
+            let id = s.heading.trim_start_matches('#').split_whitespace().next().unwrap_or("");
+            let mut chars = id.chars();
+            matches!(chars.next(), Some('B' | 'b'))
+                && !chars.as_str().is_empty()
+                && chars.all(|c| c.is_ascii_digit())
+        })
+        .count()
 }
 
 fn is_blank(lines: &[&str]) -> bool {
@@ -437,6 +473,28 @@ Advice: A, it keeps the slice small.
     }
 
     #[test]
+    fn decision_points_under_any_other_heading_are_refused() {
+        let base = "## Cause\n\nX.\n\n## Approach\n\nY.\n\n";
+        let point = "### B1 Q?\n- **A** a\n- **B** b\nAdvice: A\n";
+        for heading in ["## Decision points:", "## Open decision points", "## Decision Point"] {
+            assert_eq!(
+                check_findings(&format!("{base}{heading}\n\n{point}")).unwrap_err(),
+                vec![Problem::DecisionPointsHeading],
+                "{heading}"
+            );
+        }
+        let under_approach = format!("{base}{point}");
+        assert_eq!(
+            check_findings(&under_approach).unwrap_err(),
+            vec![Problem::StrayDecisionPoint]
+        );
+        let before_any = format!("{point}\n{base}");
+        assert_eq!(check_findings(&before_any).unwrap_err(), vec![Problem::StrayDecisionPoint]);
+        let other_points = "## Cause\n\nX.\n\n### Background\n\nZ.\n\n## Approach\n\nY.\n";
+        assert!(check_findings(other_points).is_ok());
+    }
+
+    #[test]
     fn a_fence_closes_only_on_its_own_kind_and_an_open_one_is_refused() {
         let inline = "## Cause\n\n```x``` reads it.\n\n## Approach\n\nY.\n";
         assert!(check_findings(inline).is_ok());
@@ -528,6 +586,8 @@ Advice: A, it keeps the slice small.
             Problem::Empty(APPROACH),
             Problem::ApproachBeforeCause,
             Problem::DecisionPointsNotLast,
+            Problem::DecisionPointsHeading,
+            Problem::StrayDecisionPoint,
             Problem::Numbering("B2".into()),
             Problem::TooFewOptions("B1".into()),
             Problem::NoAdvice("B1".into()),
