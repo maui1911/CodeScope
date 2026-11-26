@@ -259,6 +259,7 @@ enum FindingsGate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HeldBy {
     Program,
+    QuietAgent,
     StoppedSession,
 }
 
@@ -272,13 +273,14 @@ enum RemindBy {
 enum Turn {
     Ended,
     Running,
+    Quiet,
     Unknown,
 }
 
 fn turn_of(state: codescope_core::SessionState, quiet_timeout: bool) -> Turn {
     use codescope_core::SessionState;
     match state {
-        _ if quiet_timeout => Turn::Unknown,
+        _ if quiet_timeout => Turn::Quiet,
         SessionState::Idle => Turn::Ended,
         SessionState::Busy | SessionState::PendingToolUse => Turn::Running,
         SessionState::Unknown => Turn::Unknown,
@@ -292,6 +294,9 @@ fn findings_gate(tabs: &[(TabAtHandover, Turn)]) -> FindingsGate {
     }
     if other(Turn::Unknown) {
         return FindingsGate::Held(HeldBy::Program);
+    }
+    if other(Turn::Quiet) {
+        return FindingsGate::Held(HeldBy::QuietAgent);
     }
     if tabs.iter().any(|(state, _)| *state == TabAtHandover::Stopped) {
         return FindingsGate::Held(HeldBy::StoppedSession);
@@ -1369,15 +1374,24 @@ impl AppShell {
             );
         }
         for (key, by) in state.findings_held.iter().filter(|(key, _)| rounds.contains(*key)) {
-            let free_it = match by {
-                HeldBy::Program => "quit what runs in its worktree's tab",
-                HeldBy::StoppedSession => "type fg in its session's tab to resume it",
+            let text = match by {
+                HeldBy::Program => {
+                    "Findings written · to post them, quit what runs in its worktree's tab, or \
+                     close the tab"
+                }
+                HeldBy::QuietAgent => {
+                    "Findings written · its agent may not be done: to post them, quit it, or \
+                     close its tab"
+                }
+                HeldBy::StoppedSession => {
+                    "Findings written · to post them, type fg in its session's tab to resume \
+                     it, or close the tab"
+                }
             };
             notes.insert(
                 key.0.clone(),
                 CardNote {
-                    text: format!("Findings written · to post them, {free_it}, or close the tab")
-                        .into(),
+                    text: text.into(),
                     tone: NoteTone::Waiting,
                 },
             );
@@ -1546,7 +1560,7 @@ mod tests {
         assert_eq!(turn_of(Busy, false), Turn::Running);
         assert_eq!(turn_of(PendingToolUse, false), Turn::Running);
         assert_eq!(turn_of(Unknown, false), Turn::Unknown);
-        assert_eq!(turn_of(Idle, true), Turn::Unknown, "it went quiet while busy: nothing ended");
+        assert_eq!(turn_of(Idle, true), Turn::Quiet, "a guess at its end, or a killed agent");
     }
 
     #[test]
@@ -1554,7 +1568,7 @@ mod tests {
         use FindingsGate::{Held, Settled, Wait};
         use RemindBy::{Notice, Typing};
         use TabAtHandover::*;
-        use Turn::{Ended, Running, Unknown};
+        use Turn::{Ended, Quiet, Running, Unknown};
         assert_eq!(findings_gate(&[]), Settled(Notice), "with no session left, the user is told");
         assert_eq!(findings_gate(&[(Shell, Unknown), (IdleClaude, Ended)]), Settled(Typing(1)));
         assert_eq!(
@@ -1582,6 +1596,11 @@ mod tests {
             findings_gate(&[(Other, Unknown), (Shell, Unknown)]),
             Held(HeldBy::Program),
             "a program that is no agent only the user can stop"
+        );
+        assert_eq!(
+            findings_gate(&[(Other, Quiet), (Shell, Unknown)]),
+            Held(HeldBy::QuietAgent),
+            "an agent whose transcript went quiet may or may not be done"
         );
         assert_eq!(findings_gate(&[(Other, Unknown), (Busy, Running)]), Wait);
         assert_eq!(
