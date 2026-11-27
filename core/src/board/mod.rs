@@ -5,6 +5,7 @@
 pub mod answers;
 pub mod dispatch;
 pub mod findings;
+pub mod forward;
 pub mod github;
 pub mod pull_request;
 pub mod repair;

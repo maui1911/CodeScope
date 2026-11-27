@@ -53,6 +53,20 @@ pub struct PullRequest {
     pub head_oid: String,
     /// What keeps it from merging, as the last read found it.
     pub health: Health,
+    /// Its last 50 conversation comments, oldest first.
+    pub comments: Vec<PullRequestComment>,
+}
+
+/// A conversation comment on a pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestComment {
+    pub url: String,
+    /// `None` for a deleted account, a bot or an app.
+    pub author: Option<String>,
+    /// ISO 8601 in UTC, as GitHub writes it.
+    pub created_at: String,
+    /// Written by the user signed in to `gh`.
+    pub by_viewer: bool,
 }
 
 /// Whether GitHub can merge a pull request into its base without a conflict.
@@ -141,6 +155,10 @@ pub struct PostedPullRequest {
     /// again.
     #[serde(default)]
     pub in_review: bool,
+    /// When CodeScope reported it on the issue, ISO 8601; `None` when the item is the pull
+    /// request, or the report came before CodeScope kept its time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_at: Option<String>,
 }
 
 /// The comment that reports a pull request after `round` on the item of `kind`: what is open or
@@ -202,6 +220,7 @@ mod tests {
             checks: Checks::None,
             head_oid: "h1".into(),
             health: Health::default(),
+            comments: Vec::new(),
         }
     }
 
@@ -312,5 +331,6 @@ mod tests {
         let json = r#"{"number":415,"url":"u","commentUrl":"c"}"#;
         let posted: PostedPullRequest = serde_json::from_str(json).unwrap();
         assert!(!posted.in_review);
+        assert_eq!(posted.reported_at, None);
     }
 }
