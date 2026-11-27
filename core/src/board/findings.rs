@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::io::Read as _;
+use std::ops::Range;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -87,23 +88,76 @@ impl DecisionOption {
 }
 
 fn split_first_sentence(line: &str) -> (&str, &str) {
-    let mut in_code = false;
-    let mut chars = line.char_indices().peekable();
-    while let Some((index, c)) = chars.next() {
-        match c {
-            '`' => in_code = !in_code,
-            '.' if !in_code && chars.peek().is_some_and(|(_, next)| *next == ' ') => {
-                return line.split_at(index + 1);
-            }
-            _ => {}
+    let mut prose = 0;
+    let end = std::iter::once(line.len()..line.len());
+    for span in code_spans(line).into_iter().chain(end) {
+        if let Some(dot) = line[prose..span.start].find(". ") {
+            return line.split_at(prose + dot + 1);
         }
+        prose = span.end;
     }
     (line, "")
 }
 
-/// Markdown without `**` and backticks, trimmed.
+/// Markdown without `**` and without the backticks around code spans, trimmed; a code span
+/// keeps its text as written.
 pub fn plain_text(markdown: &str) -> String {
-    markdown.replace("**", "").replace('`', "").trim().to_string()
+    let mut plain = String::new();
+    let mut prose = 0;
+    for span in code_spans(markdown) {
+        plain.push_str(&markdown[prose..span.start].replace("**", ""));
+        let run = backtick_run(&markdown[span.start..]);
+        plain.push_str(code_span_text(&markdown[span.start + run..span.end - run]));
+        prose = span.end;
+    }
+    plain.push_str(&markdown[prose..].replace("**", ""));
+    plain.trim().to_string()
+}
+
+/// The code spans in `text`, backticks included, in order. A run of backticks without a
+/// closing run of the same length is text.
+fn code_spans(text: &str) -> Vec<Range<usize>> {
+    let mut spans = Vec::new();
+    let mut at = 0;
+    while let Some(found) = text[at..].find('`') {
+        let start = at + found;
+        let run = backtick_run(&text[start..]);
+        let code = start + run;
+        match closing_run(&text[code..], run) {
+            Some(end) => {
+                spans.push(start..code + end + run);
+                at = code + end + run;
+            }
+            None => at = code,
+        }
+    }
+    spans
+}
+
+fn backtick_run(text: &str) -> usize {
+    text.len() - text.trim_start_matches('`').len()
+}
+
+fn closing_run(text: &str, run: usize) -> Option<usize> {
+    let mut at = 0;
+    while let Some(found) = text[at..].find('`') {
+        let start = at + found;
+        let length = backtick_run(&text[start..]);
+        if length == run {
+            return Some(start);
+        }
+        at = start + length;
+    }
+    None
+}
+
+fn code_span_text(code: &str) -> &str {
+    let padded = code.len() >= 2 && code.starts_with(' ') && code.ends_with(' ');
+    if padded && !code.trim().is_empty() {
+        &code[1..code.len() - 1]
+    } else {
+        code
+    }
 }
 
 /// Findings that passed [`check_findings`].
@@ -1294,6 +1348,27 @@ Advice: A, it keeps the slice small.
         assert_eq!(
             point.options[1].label_and_detail(),
             ("Use cfg.first().".to_string(), "It is what the sidebar does.".to_string())
+        );
+    }
+
+    #[test]
+    fn plain_text_keeps_what_a_code_span_says() {
+        let exception = option(
+            'B',
+            "Make the exception explicit: replace `scratch/` with `**/scratch/*`, add \
+             `!docs/scratch/<note>`.",
+        );
+        assert_eq!(
+            exception.label_and_detail().0,
+            "Make the exception explicit: replace scratch/ with **/scratch/*, add \
+             !docs/scratch/<note>."
+        );
+        assert_eq!(plain_text("**Keep** `a**b` and **c**"), "Keep a**b and c");
+        assert_eq!(plain_text("``a ` b`` and `` `x` ``"), "a ` b and `x`");
+        assert_eq!(plain_text("an `open **span**"), "an `open span");
+        assert_eq!(
+            option('A', "Run ``a. b`` first. Then go.").label_and_detail(),
+            ("Run a. b first.".to_string(), "Then go.".to_string())
         );
     }
 
