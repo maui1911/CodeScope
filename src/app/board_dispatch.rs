@@ -421,6 +421,7 @@ pub(crate) struct Decision {
     pub item_id: String,
     pub board_url: String,
     pub content_id: String,
+    pub kind: ItemKind,
     pub number: u32,
     pub repository: String,
     pub title: String,
@@ -435,6 +436,7 @@ pub(crate) struct AnswerPost {
     pub item_id: String,
     pub board_url: String,
     pub content_id: String,
+    pub kind: ItemKind,
     pub number: u32,
     pub choices: Vec<(String, char)>,
     pub note: String,
@@ -902,7 +904,8 @@ fn discussion(
     Discussion { points, answers }
 }
 
-/// The `## Answers` section of an implementation round's task file, read fresh from the issue.
+/// The `## Answers` section of the task file of the round after research, read fresh from the
+/// item's comments.
 fn answers_for_task(job: &Job, from: &AnswersFrom) -> String {
     let record = &job.record;
     let comments = github::fetch_comments(std::slice::from_ref(&record.content_id))
@@ -922,7 +925,8 @@ fn answers_for_task(job: &Job, from: &AnswersFrom) -> String {
             &mut checked,
         )
     });
-    answers_section(discussion.as_ref().map(|d| d.answers.as_slice()), &from.findings_url)
+    let answers = discussion.as_ref().map(|d| d.answers.as_slice());
+    answers_section(answers, &from.findings_url, record.kind)
 }
 
 fn prepare_worktree(job: &mut Job) -> anyhow::Result<()> {
@@ -1714,7 +1718,7 @@ impl AppShell {
             };
             match file.check() {
                 Ok((text, findings)) => {
-                    let body = comment_body(text, &findings);
+                    let body = comment_body(text, &findings, record.kind);
                     let posting = Posting {
                         points: findings.decision_points.clone(),
                         record,
@@ -1956,10 +1960,7 @@ impl AppShell {
         }
 
         let title = format!("Findings on #{}", record.number);
-        let next_step = match outcome {
-            Outcome::DecisionPoints => "Answer the decision points on the issue.",
-            Outcome::Findings => "Move the item to Ready to implement it.",
-        };
+        let next_step = findings_next_step(outcome, record.kind);
         let detail = match &move_error {
             Some(err) => format!("{next_step} Couldn't move it to Needs decision: {err}"),
             None => next_step.to_string(),
@@ -2642,6 +2643,7 @@ impl AppShell {
                         state.discussions.get(&r.content_id),
                         viewer,
                         state.readied.contains(&r.item_id),
+                        r.kind,
                     ),
                     (Some(Outcome::Findings), _) => {
                         CardNote::new("Findings posted · move it to Ready", NoteTone::NeedsYou)
@@ -2720,6 +2722,7 @@ impl AppShell {
             item_id: record.item_id,
             board_url: record.board_url,
             content_id: record.content_id,
+            kind: record.kind,
             number: record.number,
             repository: record.repository,
             title: record.title,
@@ -2729,8 +2732,8 @@ impl AppShell {
         })
     }
 
-    /// Post the answer on the issue, then move the item to Ready when asked and it is still in
-    /// Needs decision, where CodeScope put it.
+    /// Post the answer where the findings are, then move the item to Ready when asked and it is
+    /// still in Needs decision, where CodeScope put it.
     pub(crate) fn send_answer(&mut self, post: AnswerPost, cx: &mut Context<Self>) {
         let ready = if post.move_to_ready {
             self.ready_target(&post.board_url, &post.item_id)
@@ -2807,6 +2810,7 @@ impl AppShell {
             state.readied.insert(post.item_id.clone());
         }
         let title = format!("Answer posted on #{}", post.number);
+        let work = work_after_research(post.kind);
         let (kind, detail) = match (&move_error, stayed, post.move_to_ready) {
             (Some(err), _, _) => (ToastKind::Err, format!("Couldn't move it to Ready: {err}")),
             (None, true, _) => (
@@ -2815,12 +2819,9 @@ impl AppShell {
             ),
             (None, false, true) => (
                 ToastKind::Ok,
-                "It moved to Ready; implementation starts at the next board read.".to_string(),
+                format!("It moved to Ready; {work} starts at the next board read."),
             ),
-            (None, false, false) => (
-                ToastKind::Ok,
-                "Move it to Ready to start implementation.".to_string(),
-            ),
+            (None, false, false) => (ToastKind::Ok, format!("Move it to Ready to start {work}.")),
         };
         self.push_toast(kind, title, Some(detail.into()), cx);
         if moved {
@@ -2830,22 +2831,50 @@ impl AppShell {
     }
 }
 
+fn findings_next_step(outcome: Outcome, kind: ItemKind) -> String {
+    match (outcome, kind) {
+        (Outcome::DecisionPoints, _) => {
+            format!("Answer the decision points on the {}.", kind.noun())
+        }
+        (Outcome::Findings, ItemKind::PullRequest) => {
+            "Move the item to Ready for a review round.".to_string()
+        }
+        (Outcome::Findings, ItemKind::Issue | ItemKind::Draft) => {
+            "Move the item to Ready to implement it.".to_string()
+        }
+    }
+}
+
+/// What Ready starts after research on an item of `kind`, as a sentence names it.
+fn work_after_research(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::PullRequest => "a review",
+        ItemKind::Issue | ItemKind::Draft => "implementation",
+    }
+}
+
 /// The card line of research that posted decision points: what to decide, or who answered.
-fn decision_note(discussion: Option<&Discussion>, viewer: Option<&str>, readied: bool) -> CardNote {
+fn decision_note(
+    discussion: Option<&Discussion>,
+    viewer: Option<&str>,
+    readied: bool,
+    kind: ItemKind,
+) -> CardNote {
+    let unanswered = || {
+        let text = format!("Decision points posted · answer on the {}", kind.noun());
+        CardNote::new(text, NoteTone::NeedsYou)
+    };
     let Some(discussion) = discussion else {
-        return CardNote::new("Decision points posted · answer on the issue", NoteTone::NeedsYou);
+        return unanswered();
     };
     let Some(last) = discussion.answers.last() else {
         let count = discussion.points.len();
         if count == 0 {
-            return CardNote::new(
-                "Decision points posted · answer on the issue",
-                NoteTone::NeedsYou,
-            );
+            return unanswered();
         }
-        let noun = if count == 1 { "decision point" } else { "decision points" };
+        let points = if count == 1 { "decision point" } else { "decision points" };
         return CardNote {
-            text: format!("{count} {noun} · decide here or on the issue").into(),
+            text: format!("{count} {points} · decide here or on the {}", kind.noun()).into(),
             tone: NoteTone::NeedsYou,
             action: Some(CardAction::Decide),
         };
@@ -2862,7 +2891,8 @@ fn decision_note(discussion: Option<&Discussion>, viewer: Option<&str>, readied:
         format!("Answered by {who}: {}", choices_text(&picked))
     };
     if readied {
-        CardNote::new(format!("{answered} · implementation starts"), NoteTone::Working)
+        let work = work_after_research(kind);
+        CardNote::new(format!("{answered} · {work} starts"), NoteTone::Working)
     } else {
         CardNote::new(format!("{answered} · move it to Ready"), NoteTone::NeedsYou)
     }
@@ -3204,10 +3234,10 @@ mod tests {
             points: vec![point("B1"), point("B2")],
             answers: Vec::new(),
         };
-        let note = decision_note(Some(&discussion), Some("maui1911"), false);
+        let note = decision_note(Some(&discussion), Some("maui1911"), false, ItemKind::Issue);
         assert_eq!(note.text.as_ref(), "2 decision points · decide here or on the issue");
         assert!(note.action == Some(CardAction::Decide));
-        let unknown = decision_note(None, Some("maui1911"), false);
+        let unknown = decision_note(None, Some("maui1911"), false, ItemKind::Issue);
         assert_eq!(unknown.text.as_ref(), "Decision points posted · answer on the issue");
         assert!(unknown.action.is_none());
     }
@@ -3218,14 +3248,51 @@ mod tests {
             points: vec![point("B1"), point("B2")],
             answers: vec![answer("Maui1911", &[("B1", 'B'), ("B2", 'A')])],
         };
-        let mine = decision_note(Some(&discussion), Some("maui1911"), false);
+        let mine = decision_note(Some(&discussion), Some("maui1911"), false, ItemKind::Issue);
         assert_eq!(mine.text.as_ref(), "Answered by you: B1 B, B2 A · move it to Ready");
         assert!(mine.action.is_none());
-        let readied = decision_note(Some(&discussion), Some("maui1911"), true);
+        let readied = decision_note(Some(&discussion), Some("maui1911"), true, ItemKind::Issue);
         assert_eq!(readied.text.as_ref(), "Answered by you: B1 B, B2 A · implementation starts");
         discussion.answers.push(answer("sanne", &[]));
-        let theirs = decision_note(Some(&discussion), Some("maui1911"), false);
+        let theirs = decision_note(Some(&discussion), Some("maui1911"), false, ItemKind::Issue);
         assert_eq!(theirs.text.as_ref(), "Answered by @sanne: B1 B, B2 A · move it to Ready");
+    }
+
+    #[test]
+    fn decision_points_on_a_pull_request_item_are_answered_there() {
+        let item = ItemKind::PullRequest;
+        let mut discussion = Discussion {
+            points: vec![point("B1"), point("B2")],
+            answers: Vec::new(),
+        };
+        let note = decision_note(Some(&discussion), Some("maui1911"), false, item);
+        assert_eq!(note.text.as_ref(), "2 decision points · decide here or on the pull request");
+        let unknown = decision_note(None, Some("maui1911"), false, item);
+        assert_eq!(unknown.text.as_ref(), "Decision points posted · answer on the pull request");
+        discussion.answers.push(answer("Maui1911", &[("B1", 'B')]));
+        let readied = decision_note(Some(&discussion), Some("maui1911"), true, item);
+        assert_eq!(readied.text.as_ref(), "Answered by you: B1 B · a review starts");
+    }
+
+    #[test]
+    fn the_findings_toast_says_what_comes_next_for_the_item() {
+        let next = findings_next_step;
+        assert_eq!(
+            next(Outcome::Findings, ItemKind::Issue),
+            "Move the item to Ready to implement it."
+        );
+        assert_eq!(
+            next(Outcome::Findings, ItemKind::PullRequest),
+            "Move the item to Ready for a review round."
+        );
+        assert_eq!(
+            next(Outcome::DecisionPoints, ItemKind::Issue),
+            "Answer the decision points on the issue."
+        );
+        assert_eq!(
+            next(Outcome::DecisionPoints, ItemKind::PullRequest),
+            "Answer the decision points on the pull request."
+        );
     }
 
     fn open_pull_request(number: u32, is_draft: bool, checks: Checks) -> PullRequest {

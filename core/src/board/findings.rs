@@ -8,6 +8,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+use super::ItemKind;
 use super::dispatch::{FINDINGS_FILE, linked_part};
 
 pub(super) const MAX_LENGTH: usize = 60_000;
@@ -25,7 +26,7 @@ const DIAGRAMS: [&str; 4] = ["mermaid", "geojson", "topojson", "stl"];
 pub enum Outcome {
     /// Cause and approach only: the item can go to Ready as it is.
     Findings,
-    /// At least one `### B<n>` point waits for an answer on the issue.
+    /// At least one `### B<n>` point waits for an answer where the findings are.
     DecisionPoints,
 }
 
@@ -938,11 +939,17 @@ pub fn is_marker_line(line: &str) -> bool {
         .is_some_and(|word| word.eq_ignore_ascii_case("dispatch"))
 }
 
-/// The comment that posts findings: the text, a `**Next step:**` line and the marker.
-pub fn comment_body(text: &str, findings: &Findings) -> String {
-    let next_step = match findings.outcome() {
-        Outcome::Findings => "move the item to Ready to implement this approach.".to_string(),
-        Outcome::DecisionPoints => {
+/// The comment that posts findings on an item of `kind`: the text, a `**Next step:**` line and
+/// the marker.
+pub fn comment_body(text: &str, findings: &Findings, kind: ItemKind) -> String {
+    let next_step = match (findings.outcome(), kind) {
+        (Outcome::Findings, ItemKind::PullRequest) => {
+            "move the item to Ready for a review round that takes this approach.".to_string()
+        }
+        (Outcome::Findings, ItemKind::Issue | ItemKind::Draft) => {
+            "move the item to Ready to implement this approach.".to_string()
+        }
+        (Outcome::DecisionPoints, _) => {
             let example: Vec<String> = findings
                 .decision_points
                 .iter()
@@ -1293,14 +1300,14 @@ Advice: A, it keeps the slice small.
     #[test]
     fn reads_the_findings_back_from_the_comment_that_posted_them() {
         let findings = check_findings(WITH_POINTS).unwrap();
-        let body = comment_body(WITH_POINTS, &findings);
+        let body = comment_body(WITH_POINTS, &findings, ItemKind::Issue);
         assert_eq!(posted_findings(&body), Some(findings));
         assert_eq!(posted_findings(WITH_POINTS), None);
         assert_eq!(posted_findings("B1 A, B2 B"), None);
 
         let quieted = WITH_POINTS.replace("Stack it.", "Ask @maui1911 to run /deploy <now>.");
         let findings = check_findings(&quieted).unwrap();
-        let body = comment_body(&quieted, &findings);
+        let body = comment_body(&quieted, &findings, ItemKind::Issue);
         assert!(body.contains(ZERO_WIDTH_SPACE));
         assert_eq!(posted_findings(&body), Some(findings));
     }
@@ -1594,17 +1601,19 @@ Advice: A, it keeps the slice small.
         assert_eq!(check_findings(&bell_point).unwrap_err(), vec![Problem::StrayDecisionPoint]);
         let indented = format!("\n    ```\n{base}");
         let findings = check_findings(&indented).unwrap();
-        assert!(comment_body(&indented, &findings).starts_with("    ```\n## Cause"));
+        let body = comment_body(&indented, &findings, ItemKind::Issue);
+        assert!(body.starts_with("    ```\n## Cause"));
         let split = format!("{base}Ask &#\u{1}64;x and &com\u{7f}mat;y.\n");
         let findings = check_findings(&split).unwrap();
-        assert!(comment_body(&split, &findings).contains(&format!("Ask @{z}x and @{z}y.")));
+        let body = comment_body(&split, &findings, ItemKind::Issue);
+        assert!(body.contains(&format!("Ask @{z}x and @{z}y.")));
     }
 
     #[test]
     fn the_comment_drops_control_characters_and_outer_blank_lines() {
         let text = "\n\n## Cause\n\nX\u{7}\u{1b}[31m.\tTab.\n\n## Approach\n\nY.\n\n";
         let findings = check_findings(text).unwrap();
-        let body = comment_body(text, &findings);
+        let body = comment_body(text, &findings, ItemKind::Issue);
         assert!(body.starts_with("## Cause\n\nX[31m.\tTab.\n"), "{body:?}");
         assert!(body.contains("Y.\n\n**Next step:**"), "{body:?}");
     }
@@ -1928,7 +1937,7 @@ Advice: A, it keeps the slice small.
     #[test]
     fn the_comment_ends_with_the_next_step_and_the_marker() {
         let findings = check_findings(WITH_POINTS).unwrap();
-        let body = comment_body(WITH_POINTS, &findings);
+        let body = comment_body(WITH_POINTS, &findings, ItemKind::Issue);
         let tail: Vec<&str> = body.lines().rev().take(2).collect();
         assert_eq!(
             tail,
@@ -1940,8 +1949,26 @@ Advice: A, it keeps the slice small.
         );
         let plain = check_findings("## Cause\n\nX.\n\n## Approach\n\nY.\n").unwrap();
         assert!(
-            comment_body("## Cause\n\nX.\n\n## Approach\n\nY.\n", &plain)
+            comment_body("## Cause\n\nX.\n\n## Approach\n\nY.\n", &plain, ItemKind::Issue)
                 .contains("outcome=findings by=codescope")
+        );
+    }
+
+    #[test]
+    fn findings_on_a_pull_request_item_lead_to_a_review_round() {
+        let text = "## Cause\n\nX.\n\n## Approach\n\nY.\n";
+        let plain = check_findings(text).unwrap();
+        assert!(
+            comment_body(text, &plain, ItemKind::Issue)
+                .contains("**Next step:** move the item to Ready to implement this approach.\n")
+        );
+        assert!(comment_body(text, &plain, ItemKind::PullRequest).contains(
+            "**Next step:** move the item to Ready for a review round that takes this approach.\n"
+        ));
+        let points = check_findings(WITH_POINTS).unwrap();
+        assert_eq!(
+            comment_body(WITH_POINTS, &points, ItemKind::PullRequest),
+            comment_body(WITH_POINTS, &points, ItemKind::Issue)
         );
     }
 
@@ -1952,7 +1979,7 @@ Advice: A, it keeps the slice small.
                     \u{20}\u{20}/deploy production\n// a comment\n\n```\n@claude run\n/close\n\
                     ```\n";
         let findings = check_findings(text).unwrap();
-        let body = comment_body(text, &findings);
+        let body = comment_body(text, &findings, ItemKind::Issue);
         let z = '\u{200b}';
         let mentions = format!(
             "Ask @{z}octocat, _@{z}org/team_ and \u{8c22}@{z}octocat; mail a@{z}b.example \

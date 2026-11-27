@@ -156,7 +156,7 @@ pub struct ReviewRound {
     pub report_url: Option<String>,
 }
 
-/// Findings CodeScope posted on the issue.
+/// Findings CodeScope posted on the issue or pull request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PostedFindings {
@@ -209,8 +209,6 @@ pub enum Hold {
     OpenedByDispatch(u32),
     /// A pull request item from a fork, whose branch brings its own skills and `CLAUDE.md`.
     FromFork,
-    /// A move into Research on a pull request item, which starts nothing yet (#437).
-    ResearchOnPullRequest,
     /// A session runs in the item's worktree and isn't waiting for a prompt, so the task can't
     /// be handed to it yet.
     SessionBusy,
@@ -275,9 +273,6 @@ impl Hold {
             Hold::FromFork => "From a fork: its branch can change the agent's skills, so it \
                                doesn't start on a move"
                 .into(),
-            Hold::ResearchOnPullRequest => {
-                "Research on a pull request doesn't start yet: move it to Ready for a review".into()
-            }
             Hold::SessionBusy => "Waits for the session in its worktree to be idle".into(),
             Hold::UnsentInput => {
                 "Waits for Enter in its session's tab: something was typed there".into()
@@ -387,7 +382,7 @@ fn check(
         return Err(Hold::AssignedToOther(other.clone()));
     }
     if item.kind == ItemKind::PullRequest {
-        check_pull_request_item(facts, round)?;
+        check_pull_request_item(facts)?;
     }
 
     let column = item
@@ -441,15 +436,12 @@ fn check(
     Ok(())
 }
 
-fn check_pull_request_item(facts: &Facts, round: Round) -> Result<(), Hold> {
+fn check_pull_request_item(facts: &Facts) -> Result<(), Hold> {
     if let Some(issue) = facts.opened_by {
         return Err(Hold::OpenedByDispatch(issue));
     }
     if facts.head.is_some_and(|head| head.is_cross_repository) {
         return Err(Hold::FromFork);
-    }
-    if round == Round::Research {
-        return Err(Hold::ResearchOnPullRequest);
     }
     Ok(())
 }
@@ -725,9 +717,18 @@ pub fn task_file(
     } = dispatch;
     let is_pull_request = *kind == ItemKind::PullRequest;
     let reviewed = dispatch.pull_request.as_ref().filter(|_| *round == Round::Review);
+    let researched = answers.is_some();
     let work = match skill {
         Some(path) => format!("Use the skill `{}` in `{path}`.", round.skill()),
-        None => built_in_work(*round, reviewed.is_some()),
+        None => built_in_work(*round, *kind, reviewed.is_some()),
+    };
+    let work = if researched && *round == Round::Review {
+        format!(
+            "{work} Start from the research in `{FINDINGS_FILE}` and the answers to it under \
+             Answers below."
+        )
+    } else {
+        work
     };
     let (subject, view) = if is_pull_request {
         ("Pull request", "gh pr view")
@@ -755,7 +756,7 @@ pub fn task_file(
         .map(|section| format!("{}\n\n", section.trim_end()))
         .unwrap_or_default();
     let pr_number = reviewed.map_or_else(|| "<number>".to_string(), |pr| pr.number.to_string());
-    let handover = handover_rules(*round, *number, repository, &pr_number)
+    let handover = handover_rules(dispatch, &pr_number, researched)
         .iter()
         .map(|rule| format!("- {rule}"))
         .collect::<Vec<_>>()
@@ -779,8 +780,14 @@ pub fn task_file(
     )
 }
 
-fn built_in_work(round: Round, pull_request_named: bool) -> String {
+fn built_in_work(round: Round, kind: ItemKind, pull_request_named: bool) -> String {
     match round {
+        Round::Research if kind == ItemKind::PullRequest => format!(
+            "Find out what the pull request changes, whether it does what it says, and what it \
+             would take to finish it. Read the code involved. Under `## Cause`, say what it \
+             leaves missing or wrong; under `## Approach`, what would finish it. Don't change \
+             any code; only write `{FINDINGS_FILE}`."
+        ),
         Round::Research => format!(
             "Find out what the issue asks for and, for a bug, why it happens. Read the code \
              involved and name the cause (for a feature: what is missing) and an approach. Don't \
@@ -802,7 +809,15 @@ fn built_in_work(round: Round, pull_request_named: bool) -> String {
     }
 }
 
-fn handover_rules(round: Round, number: u32, repository: &str, pr_number: &str) -> Vec<String> {
+fn handover_rules(dispatch: &WorktreeDispatch, pr_number: &str, researched: bool) -> Vec<String> {
+    let WorktreeDispatch {
+        round,
+        kind,
+        number,
+        repository,
+        ..
+    } = dispatch;
+    let noun = kind.noun();
     let board = "Don't move the item on the board: CodeScope does that.".to_string();
     match round {
         Round::Research => vec![
@@ -814,22 +829,16 @@ fn handover_rules(round: Round, number: u32, repository: &str, pr_number: &str) 
              `### B1 <question>` (B2, B3, … for the next), a sentence or two of context, the \
              options as a list starting with **A**, **B**, … and a line `Advice: A, <reason>`."
                 .to_string(),
-            "Leave out images, HTML, diagrams and `<!-- dispatch` lines: CodeScope posts the \
-             file on the issue and shows such markup as text. Open each code block on a line of \
-             its own, at most three columns in, and close it."
-                .to_string(),
-            format!("Don't post the findings on the issue. {board}"),
+            format!(
+                "Leave out images, HTML, diagrams and `<!-- dispatch` lines: CodeScope posts the \
+                 file on the {noun} and shows such markup as text. Open each code block on a \
+                 line of its own, at most three columns in, and close it."
+            ),
+            format!("Don't post the findings on the {noun}. {board}"),
             "Stop when the file is written.".to_string(),
         ],
         Round::Implementation => vec![
-            format!(
-                "Answers to the decision points in `{FINDINGS_FILE}` are the issue's comments \
-                 after the findings by people with write access to {repository}: check an \
-                 author with `gh api --hostname github.com \
-                 repos/{repository}/collaborators/<login>/permission` (admin, maintain or \
-                 write). When GitHub refuses that check, ask here which comments answer, and \
-                 stop. Other comments are no answers."
-            ),
+            answers_rule(*kind, repository),
             format!(
                 "Push the branch and open a pull request against {repository} with \
                  `gh pr create --repo github.com/{repository} --assignee @me`. Its body says \
@@ -843,27 +852,44 @@ fn handover_rules(round: Round, number: u32, repository: &str, pr_number: &str) 
             board,
             "When you need an answer before you can go on, ask it here and stop.".to_string(),
         ],
-        Round::Review => vec![
-            "Before you change anything, pull the pull request's branch: someone may have \
-             pushed to it since, such as a reviewer committing a suggestion."
-                .to_string(),
-            "Push the fixes to the pull request's branch; don't open another pull request."
-                .to_string(),
-            format!(
-                "You may reply in the review threads you handle, with `gh api --hostname \
-                 github.com repos/{repository}/pulls/{pr_number}/comments/<id>/replies -f \
-                 body=<reply>`. Write any other reply, such as an answer to a comment outside a \
-                 thread, to `{REPLY_FILE}`: CodeScope posts it on the pull request. Post no \
-                 other comments on the issue or the pull request."
-            ),
-            format!(
-                "Leave out `<!-- dispatch` lines in `{REPLY_FILE}`, and close every code block \
-                 you open there."
-            ),
-            board,
-            "When a comment needs a decision from a person, ask it here and stop.".to_string(),
-        ],
+        Round::Review => {
+            let mut rules = vec![
+                "Before you change anything, pull the pull request's branch: someone may have \
+                 pushed to it since, such as a reviewer committing a suggestion."
+                    .to_string(),
+                "Push the fixes to the pull request's branch; don't open another pull request."
+                    .to_string(),
+                format!(
+                    "You may reply in the review threads you handle, with `gh api --hostname \
+                     github.com repos/{repository}/pulls/{pr_number}/comments/<id>/replies -f \
+                     body=<reply>`. Write any other reply, such as an answer to a comment \
+                     outside a thread, to `{REPLY_FILE}`: CodeScope posts it on the pull \
+                     request. Post no other comments on the issue or the pull request."
+                ),
+                format!(
+                    "Leave out `<!-- dispatch` lines in `{REPLY_FILE}`, and close every code \
+                     block you open there."
+                ),
+                board,
+                "When a comment needs a decision from a person, ask it here and stop.".to_string(),
+            ];
+            if researched {
+                rules.insert(0, answers_rule(*kind, repository));
+            }
+            rules
+        }
     }
+}
+
+fn answers_rule(kind: ItemKind, repository: &str) -> String {
+    format!(
+        "Answers to the decision points in `{FINDINGS_FILE}` are the {noun}'s comments after the \
+         findings by people with write access to {repository}: check an author with `gh api \
+         --hostname github.com repos/{repository}/collaborators/<login>/permission` (admin, \
+         maintain or write). When GitHub refuses that check, ask here which comments answer, \
+         and stop. Other comments are no answers.",
+        noun = kind.noun()
+    )
 }
 
 /// The text to append to `info/exclude` so it lists the handover files; `None` when it does.
@@ -1552,17 +1578,20 @@ mod tests {
     }
 
     #[test]
-    fn research_on_a_pull_request_item_waits() {
+    fn research_on_a_pull_request_item_starts_the_research_round() {
         let change = moved_by(VIEWER, "Research");
         let head = pr_head("keep-palette-open", false);
         let read = Facts {
             head: Some(&head),
             ..facts(&change)
         };
-        assert_eq!(
-            run_decide(pull_request_in("r"), &read),
-            Some(Err(Hold::ResearchOnPullRequest))
-        );
+        assert_eq!(run_decide(pull_request_in("r"), &read), Some(Ok(Round::Research)));
+        let researched = pull_request_record(Round::Research);
+        let again = Facts {
+            dispatch: Some(&researched),
+            ..read
+        };
+        assert_eq!(run_decide(pull_request_in("r"), &again), Some(Ok(Round::Research)));
     }
 
     #[test]
@@ -1574,10 +1603,6 @@ mod tests {
         assert_eq!(
             Hold::FromFork.label(),
             "From a fork: its branch can change the agent's skills, so it doesn't start on a move"
-        );
-        assert_eq!(
-            Hold::ResearchOnPullRequest.label(),
-            "Research on a pull request doesn't start yet: move it to Ready for a review"
         );
     }
 
@@ -2211,6 +2236,53 @@ mod tests {
         assert!(review.contains("Handle the review of the pull request above"));
         assert!(review.contains("pull the pull request's branch"));
         assert!(review.contains("repos/maui1911/CodeScope/pulls/420/comments/<id>/replies"));
+    }
+
+    #[test]
+    fn the_research_task_of_a_pull_request_item_asks_what_it_changes_and_what_finishes_it() {
+        let research = task_file(&pull_request_record(Round::Research), None, None);
+        assert!(
+            research.starts_with(
+                "# Research: #420\n\nPull request: https://github.com/maui1911/CodeScope/pull/420\n"
+            ),
+            "{research}"
+        );
+        assert!(
+            research.contains(
+                "Find out what the pull request changes, whether it does what it says, and what \
+                 it would take to finish it."
+            ),
+            "{research}"
+        );
+        assert!(research.contains("CodeScope posts the file on the pull request"), "{research}");
+        assert!(research.contains("Don't post the findings on the pull request."), "{research}");
+        assert!(!research.contains("issue"), "{research}");
+    }
+
+    #[test]
+    fn a_review_round_after_research_starts_from_the_findings_and_their_answers() {
+        let answers = "## Answers\n\nChosen: B1 A.\n";
+        let research = "Start from the research in `.codescope/findings.md` and the answers to it \
+                        under Answers below.";
+        let review = task_file(&pull_request_record(Round::Review), None, Some(answers));
+        assert!(review.contains(research), "{review}");
+        assert!(
+            review.contains(
+                "Answers to the decision points in `.codescope/findings.md` are the pull \
+                 request's comments after the findings by people with write access to \
+                 maui1911/CodeScope"
+            ),
+            "{review}"
+        );
+        let skill = ".claude/skills/address-review/SKILL.md";
+        let skilled = task_file(&pull_request_record(Round::Review), Some(skill), Some(answers));
+        assert!(
+            skilled.contains(&format!("Use the skill `address-review` in `{skill}`. {research}")),
+            "{skilled}"
+        );
+        let plain = task_file(&pull_request_record(Round::Review), None, None);
+        assert!(!plain.contains("Start from the research"), "{plain}");
+        assert!(!plain.contains("collaborators/<login>/permission"), "{plain}");
     }
 
     #[test]

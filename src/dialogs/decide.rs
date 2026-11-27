@@ -1,11 +1,12 @@
 //! Needs-you dialog for decision points (ADR-0027): one option per point with the advice
 //! selected, an optional note, and *Move to Ready afterwards*. *Send answer* posts the choices
-//! on the issue; a ticked box then moves the item to Ready, and the next board read starts
-//! implementation.
+//! where the findings are; a ticked box then moves the item to Ready, and the next board read
+//! starts the round after research.
 
 use std::sync::Arc;
 
 use codescope_core::Theme;
+use codescope_core::board::ItemKind;
 use codescope_core::board::answers::choices_text;
 use codescope_core::board::findings::{DecisionPoint, plain_text};
 use gpui::prelude::FluentBuilder as _;
@@ -105,6 +106,7 @@ impl AppShell {
             item_id: dialog.decision.item_id.clone(),
             board_url: dialog.decision.board_url.clone(),
             content_id: dialog.decision.content_id.clone(),
+            kind: dialog.decision.kind,
             number: dialog.decision.number,
             choices: dialog.chosen(),
             note: dialog.note.text().to_string(),
@@ -152,6 +154,10 @@ impl AppShell {
             1 => "one choice".to_string(),
             _ => format!("{count} choices"),
         };
+        let looked = match decision.kind {
+            ItemKind::PullRequest => "looked into the pull request",
+            ItemKind::Issue | ItemKind::Draft => "found the cause",
+        };
         let findings_url = decision.findings_url.clone();
         let header = div()
             .flex()
@@ -179,8 +185,9 @@ impl AppShell {
                     .child(decision.title.clone()),
             )
             .child(div().text_size(px(12.0)).text_color(muted).child(format!(
-                "Research found the cause and left {choices_word}. Your answer goes onto the \
-                 issue and, when it moves to Ready, to the session."
+                "Research {looked} and left {choices_word}. Your answer goes onto the {noun} and, \
+                 when it moves to Ready, to the session.",
+                noun = decision.kind.noun(),
             )))
             .child(
                 div()
