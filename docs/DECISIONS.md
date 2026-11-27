@@ -1071,14 +1071,21 @@ board, each with their own CodeScope or another tool that follows the
   `.codescope/setup.sh` on macOS and Linux, one per OS so each is
   written for its own shell. The script comes from the remote's default
   branch, never from the item's branch, so a pull request cannot change
-  what runs. It runs in the worktree with `CODESCOPE_PROJECT` and
-  `CODESCOPE_WORKTREE` set, and its output goes to
-  `.codescope/setup.log`, which stays out of git like the handover
-  files. What it makes should be ignored by git, or cleanup keeps the
-  worktree for it. A setup that fails, or runs longer than 30 minutes,
-  stops the round, with its exit and the end of its log on the card;
-  the worktree stays, and the next move runs the setup again. Without a
-  script, the command in `projects.json` runs, else nothing.
+  what runs; a link there is refused. A copy of it runs from
+  `.codescope/` in the worktree, so it finds the worktree next to
+  itself, with `CODESCOPE_PROJECT` and `CODESCOPE_WORKTREE` set, and
+  its output goes to `.codescope/setup.log`; both stay out of git like
+  the handover files. The first failing command fails the setup:
+  PowerShell runs it with `$ErrorActionPreference = 'Stop'` and
+  `$PSNativeCommandUseErrorActionPreference` (Windows PowerShell 5.1,
+  without pwsh, only sees a failing program that is the last to run),
+  and a script without a shebang runs with `sh -e`. What it makes
+  should be ignored by git, or cleanup keeps the worktree for it. A
+  setup that fails, or runs longer than 30 minutes, stops the round,
+  with its exit and the end of its log on the card; the worktree stays,
+  and the next move runs the setup again. A worktree runs a script it
+  already ran successfully only once. Without a script nothing runs;
+  a command from the project's settings is to come (#464).
 * **Skills come from the item's branch.** The agent loads skills and
   `CLAUDE.md` from the worktree, so a branch can change them for its
   own dispatch. A pull request item from a fork therefore needs the
