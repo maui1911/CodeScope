@@ -28,6 +28,11 @@ pub const SETUP_LOG: &str = ".codescope/setup.log";
 const SETUP_COPY: &str = ".codescope/.setup.ps1";
 #[cfg(not(windows))]
 const SETUP_COPY: &str = ".codescope/.setup.sh";
+// Windows PowerShell 5.1 reads a script without a BOM in the ANSI code page.
+#[cfg(windows)]
+const COMMAND_ENCODING_MARK: &str = "\u{feff}";
+#[cfg(not(windows))]
+const COMMAND_ENCODING_MARK: &str = "";
 const SETUP_DONE: &str = "codescope-setup-done";
 const COMMAND: &str = "the setup command";
 const SETUP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -77,7 +82,7 @@ impl Setup {
     fn text(&self, repo: &Path) -> Result<Vec<u8>> {
         match self {
             Setup::Script { blob } => Ok(run_git(repo, &["cat-file", "blob", blob])?.stdout),
-            Setup::Command(command) => Ok(command.clone().into_bytes()),
+            Setup::Command(command) => Ok(format!("{COMMAND_ENCODING_MARK}{command}").into_bytes()),
         }
     }
 }
@@ -682,6 +687,14 @@ mod tests {
         let Some(repos) = repos() else { return };
         run_setup(&repos.repo, &repos.worktree, "origin", Some(" \n ")).unwrap();
         assert!(!repos.worktree.join(SETUP_LOG).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_command_tells_windows_powershell_it_is_utf_8() {
+        let command = Setup::Command("Write-Output 'José'".into());
+        let text = command.text(Path::new(".")).unwrap();
+        assert_eq!(text, "\u{feff}Write-Output 'José'".as_bytes());
     }
 
     #[test]
