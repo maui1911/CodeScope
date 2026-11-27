@@ -921,7 +921,9 @@ board, each with their own CodeScope or another tool that follows the
   move. An item GitHub has moved to *Done*
   is left alone. If a board has the older "Pull request linked to
   issue" workflow on, the board panel warns: it can move *In review*
-  back to *In progress*, and CodeScope then leaves it there.
+  back to *In progress*, and CodeScope then leaves it there. GitHub
+  shows a board's workflows only to whoever may change them, so only
+  they, who can also turn it off, see the warning.
 * **Several people, one board.** Each person's CodeScope works only
   for that person. Whatever others need to see lives on GitHub; only
   sessions and worktrees stay local. The assignee says who works on an

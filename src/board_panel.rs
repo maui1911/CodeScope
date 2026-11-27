@@ -214,9 +214,9 @@ impl AppShell {
                 Err(err) => read.error = Some(err),
             }
             if let Some(workflows) = fetch.workflows {
-                read.workflows = workflows
-                    .inspect_err(|err| eprintln!("warning: couldn't read workflows: {err}"))
-                    .ok();
+                if let Ok(workflows) = workflows {
+                    read.workflows = Some(workflows);
+                }
                 read.workflows_read_at = Some(Instant::now());
             }
         }

@@ -35,7 +35,7 @@ use codescope_core::board::forward::{
     ForwardFacts, ForwardStep, Forwarded, authors, comments_since, forward_message, forward_step,
     forward_task, new_comments,
 };
-use codescope_core::board::github::{self, NewComment, TriggerReads, Viewer};
+use codescope_core::board::github::{self, NewComment, TriggerReads, Viewer, moves_back_from_review};
 use codescope_core::board::pull_request::{
     Checks, PostedPullRequest, PullRequest, PullRequestComment, PullRequestHead, PullRequestState,
     moves_to_in_review, pull_request_comment, review_round_worked, round_pull_request,
@@ -897,7 +897,10 @@ pub(crate) fn read_boards(input: ReadInput) -> ReadOutput {
         }
         let workflows = match BoardRef::parse_url(&url) {
             Some(wanted) if board.is_ok() && input.workflows_due.contains(&url) => Some(
-                github::fetch_enabled_workflows(&wanted).map_err(|err| format!("{err:#}")),
+                github::fetch_enabled_workflows(&wanted).map_err(|err| {
+                    eprintln!("warning: couldn't read workflows on {url}: {err:#}");
+                    format!("{err:#}")
+                }),
             ),
             _ => None,
         };
@@ -1242,8 +1245,11 @@ impl AppShell {
                 .iter()
                 .filter(|b| {
                     let read = self.board.reads_by_url.get(&b.url);
+                    let warned = read
+                        .and_then(|read| read.workflows.as_deref())
+                        .is_some_and(moves_back_from_review);
                     let read_at = read.and_then(|read| read.workflows_read_at);
-                    read_at.is_none_or(|at| at.elapsed() >= WORKFLOWS_MAX_AGE)
+                    warned || read_at.is_none_or(|at| at.elapsed() >= WORKFLOWS_MAX_AGE)
                 })
                 .map(|b| b.url.clone())
                 .collect(),
