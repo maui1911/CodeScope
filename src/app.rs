@@ -1262,6 +1262,11 @@ impl AppShell {
             handle.focus(window);
         })
         .detach();
+        cx.on_app_quit(|_, _| {
+            codescope_core::board::setup::stop_running_setups();
+            async {}
+        })
+        .detach();
         // The sidebar reads sidebar-* fields and selectedProjectId
         // out of the same `LayoutState`; we keep our own clone for
         // the group fields so save-on-change here doesn't trample

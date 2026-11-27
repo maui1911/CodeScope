@@ -19,7 +19,7 @@ use codescope_core::board::dispatch::{
     counts_towards_limit, decide, exclude_handover_files, fetch_branch_head, fetch_pull_head,
     find_skill, fork_branch, fork_push, is_plain_branch, launch_with_task, mover_to_check,
     moves_to_needs_decision, opened_by, projects_for_repository, set_fork_push, task_file,
-    task_message, trigger_content_ids, write_task_file,
+    start_still_wanted, task_message, trigger_content_ids, write_task_file,
 };
 use codescope_core::board::answers::{
     Answer, Comment, after_findings, answer_body, answers_section, choices_text, chosen,
@@ -54,6 +54,7 @@ use codescope_core::{AgentProfile, SessionState, TelemetrySnapshot};
 use codescope_core::projects::{Project, ProjectKind, ProjectsConfig};
 use codescope_core::worktree_create::{PendingId, record_dispatch, record_posted_findings};
 use codescope_terminal::TerminalView;
+use futures_channel::oneshot;
 use gpui::{App, AppContext as _, Context, Entity, SharedString, Window};
 
 use super::{AppShell, ToastKind};
@@ -87,6 +88,8 @@ pub(crate) struct DispatchState {
     remotes_read_at: Option<Instant>,
     /// Item id → the round being started.
     starting: HashMap<String, Round>,
+    /// Items of `starting` whose new worktree runs its setup.
+    setting_up: HashSet<String>,
     /// Item id → the move that failed to start, and why.
     failed: HashMap<String, (String, String)>,
     /// Item id → the move of a fork's pull request the user confirmed starting.
@@ -1039,13 +1042,12 @@ fn answers_for_task(job: &Job, from: &AnswersFrom) -> String {
     answers_section(answers, &from.findings_url, record.kind)
 }
 
-fn prepare_worktree(job: &mut Job) -> anyhow::Result<()> {
+fn create_worktree(job: &Job) -> anyhow::Result<()> {
     let number = job.record.number;
-    let from_fork = job.record.fork.is_some();
     if job.create {
         let (repo, path, branch, remote) = (&job.repo, &job.path, &job.branch, &job.remote);
         match job.record.kind {
-            ItemKind::PullRequest if from_fork => {
+            ItemKind::PullRequest if job.record.fork.is_some() => {
                 add_fork_worktree(repo, path, branch, remote, number)?
             }
             ItemKind::PullRequest => add_pull_request_worktree(repo, path, branch, remote)?,
@@ -1055,10 +1057,15 @@ fn prepare_worktree(job: &mut Job) -> anyhow::Result<()> {
     if let Some(fork) = &job.record.fork {
         set_fork_push(&job.repo, &job.branch, number, fork)?;
     }
-    exclude_handover_files(&job.path)?;
+    exclude_handover_files(&job.path)
+}
+
+fn set_up_worktree(job: &mut Job) -> anyhow::Result<()> {
     if job.create {
         run_setup(&job.repo, &job.path, &job.remote)?;
     }
+    let number = job.record.number;
+    let from_fork = job.record.fork.is_some();
     match job.record.round {
         Round::Research => clear_findings(&job.path)?,
         Round::Review => {
@@ -1082,6 +1089,17 @@ fn prepare_worktree(job: &mut Job) -> anyhow::Result<()> {
     let skill = skill_in(&job.path, job.record.round.skill());
     let answers = job.answers_from.as_ref().map(|from| answers_for_task(job, from));
     write_task_file(&job.path, &task_file(&job.record, skill.as_deref(), answers.as_deref()))
+}
+
+async fn on_own_thread<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (done, result) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("dispatch-setup".into())
+        .spawn(move || {
+            let _ = done.send(work());
+        })
+        .ok()?;
+    result.await.ok()
 }
 
 fn skill_in(worktree: &Path, name: &str) -> Option<String> {
@@ -1431,6 +1449,7 @@ impl AppShell {
     ) {
         let state = &mut self.board.dispatch;
         state.starting.remove(item_id);
+        state.setting_up.remove(item_id);
         state
             .failed
             .insert(item_id.to_string(), (trigger_at.to_string(), message.clone()));
@@ -1615,14 +1634,32 @@ impl AppShell {
         cx.notify();
 
         let viewer_id = viewer.id.clone();
+        let item_id = item.id.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let (job, prepared) = cx
+            let (job, created) = cx
                 .background_spawn(async move {
-                    let mut job = job;
-                    let prepared = prepare_worktree(&mut job).map_err(|err| format!("{err:#}"));
-                    (job, prepared)
+                    let created = create_worktree(&job).map_err(|err| format!("{err:#}"));
+                    (job, created)
                 })
                 .await;
+            let Ok(Some(job)) =
+                this.update(cx, |this, cx| this.record_worktree_created(job, created, cx))
+            else {
+                return;
+            };
+            let set_up = on_own_thread(move || {
+                let mut job = job;
+                let prepared = set_up_worktree(&mut job).map_err(|err| format!("{err:#}"));
+                (job, prepared)
+            })
+            .await;
+            let Some((job, prepared)) = set_up else {
+                let _ = this.update(cx, |this, cx| {
+                    let message = "its setup stopped unexpectedly".to_string();
+                    this.fail_dispatch(&item_id, number, &trigger_at, message, cx);
+                });
+                return;
+            };
             let Ok(Some(job)) = this.update_in(cx, |this, window, cx| {
                 this.record_dispatch_start(job, launch, prepared, window, cx)
             }) else {
@@ -1641,6 +1678,46 @@ impl AppShell {
         .detach();
     }
 
+    fn record_worktree_created(
+        &mut self,
+        mut job: Job,
+        created: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) -> Option<Job> {
+        if let Some(id) = job.pending.take() {
+            self.sidebar.update(cx, |sidebar, cx| {
+                sidebar.pending_worktrees_mut().finish(id);
+                sidebar.note_worktree_edit();
+                cx.notify();
+            });
+        }
+        let record = &job.record;
+        if let Err(message) = created {
+            self.fail_dispatch(&record.item_id, record.number, &record.trigger_at, message, cx);
+            return None;
+        }
+        if job.create {
+            self.board.dispatch.setting_up.insert(record.item_id.clone());
+            cx.notify();
+        }
+        Some(job)
+    }
+
+    fn start_still_wanted(&self, record: &WorktreeDispatch) -> bool {
+        let Some(settings) = self.settings.boards.iter().find(|b| b.url == record.board_url) else {
+            return false;
+        };
+        let Some(read) = self.board.reads_by_url.get(&record.board_url) else {
+            return true;
+        };
+        let Some(board) = &read.last_good else {
+            return true;
+        };
+        let mapping = effective_mapping(board, &settings.columns);
+        let last_move = read.triggers.as_ref().and_then(|t| t.changes.get(&record.content_id));
+        start_still_wanted(board, &mapping, &record.item_id, last_move, &record.trigger_at)
+    }
+
     /// Keep the started round on the worktree's row and hand the session its task; the job comes
     /// back to be claimed on the board only once that is saved.
     fn record_dispatch_start(
@@ -1651,16 +1728,19 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Job> {
-        if let Some(id) = job.pending {
-            self.sidebar.update(cx, |sidebar, cx| {
-                sidebar.pending_worktrees_mut().finish(id);
-                sidebar.note_worktree_edit();
-                cx.notify();
-            });
-        }
         let record = &job.record;
+        self.board.dispatch.setting_up.remove(&record.item_id);
         if let Err(message) = prepared {
             self.fail_dispatch(&record.item_id, record.number, &record.trigger_at, message, cx);
+            return None;
+        }
+        if !self.start_still_wanted(record) {
+            self.board.dispatch.starting.remove(&record.item_id);
+            let round = record.round.label().to_lowercase();
+            let title = format!("Didn't start {round} on #{}", record.number);
+            let detail = "It moved or closed while its round was being prepared.";
+            self.push_toast(ToastKind::Info, title, Some(detail.into()), cx);
+            cx.notify();
             return None;
         }
         let terminal = match self.handover_target(&job.path, cx) {
@@ -3417,7 +3497,12 @@ impl AppShell {
             notes.insert(item_id.clone(), CardNote::new(text, NoteTone::Failed));
         }
         for (item_id, round) in &state.starting {
-            let text = format!("Starting {}…", round.label().to_lowercase());
+            let round = round.label().to_lowercase();
+            let text = if state.setting_up.contains(item_id) {
+                format!("Setting up its worktree for {round}…")
+            } else {
+                format!("Starting {round}…")
+            };
             notes.insert(item_id.clone(), CardNote::new(text, NoteTone::Working));
         }
         notes
