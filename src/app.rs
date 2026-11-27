@@ -7684,6 +7684,13 @@ impl AppShell {
         // to the right modifier per OS, so we just check both.
         let app_mod = mods.control || mods.platform;
 
+        let plain = !app_mod && !mods.alt && !mods.shift;
+        if plain && key == "escape" && self.show_board && self.board.drawer.is_some() {
+            cx.stop_propagation();
+            self.close_item_drawer(cx);
+            return;
+        }
+
         // Alt-only chords drive group-focus navigation (Alt+Left /
         // Right cycle, Alt+1..9 jump). Mirrors C#'s
         // `MainViewModel.FocusNextGroup` etc. Kept separate from the

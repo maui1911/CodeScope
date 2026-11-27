@@ -25,6 +25,7 @@ mod assets;
 mod command_palette;
 mod dialogs;
 mod board_panel;
+mod board_drawer;
 mod bots_inbox;
 mod diff_viewer;
 mod empty_state;

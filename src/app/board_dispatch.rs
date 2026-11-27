@@ -63,6 +63,8 @@ use gpui::{App, AppContext as _, Context, Entity, SharedString, Window};
 use super::{AppShell, ToastKind};
 
 mod cleanup;
+mod drawer;
+pub(crate) use drawer::{ItemDrawer, Mark, Needs};
 use crate::dialogs::confirm::ConfirmSpec;
 use crate::dialogs::new_worktree::sanitize_branch_to_folder;
 use crate::notifications::NotificationKind;
@@ -657,7 +659,7 @@ impl CardNote {
 }
 
 /// A button on a card.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CardAction {
     Decide,
     ReadyForReview,

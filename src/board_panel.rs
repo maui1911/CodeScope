@@ -39,6 +39,8 @@ pub(crate) struct BoardPanelState {
     pub reads_by_url: HashMap<String, BoardRead>,
     pub selected_url: Option<String>,
     pub show_all_done: bool,
+    /// The item whose drawer is open, on the selected board.
+    pub drawer: Option<String>,
     pub reading: bool,
     pub last_read: Option<Instant>,
     pub dispatch: DispatchState,
@@ -90,7 +92,11 @@ fn who_moves(role: Option<ColumnRole>, has_column: bool) -> &'static str {
 }
 
 fn state_color(item: &BoardItem, theme: &Theme) -> Hsla {
-    match (item.kind, item.state) {
+    kind_color(item.kind, item.state, theme)
+}
+
+fn kind_color(kind: ItemKind, state: ItemState, theme: &Theme) -> Hsla {
+    match (kind, state) {
         (ItemKind::Draft, _) => theme::text_faint(),
         (_, ItemState::Merged) | (ItemKind::Issue, ItemState::Closed) => {
             theme::rgb_to_hsla(codescope_core::Rgb::from_hex(DONE_PURPLE))
@@ -334,12 +340,30 @@ impl AppShell {
                 .into_any_element();
         };
         let read = self.board.reads_by_url.get(&settings.url);
-        let mut body = div().id("board-body").flex_grow().overflow_scroll();
+        let notes = self.card_notes(&settings.url, cx);
+        let mut body = div().id("board-body").flex_grow().h_full().overflow_scroll();
         body.style().min_size.height = Some(gpui::Length::Definite(px(0.0).into()));
+        body.style().min_size.width = Some(gpui::Length::Definite(px(0.0).into()));
         let body = match read.and_then(|r| r.last_good.as_ref()) {
-            Some(board) => body.child(self.render_board_columns(theme, &settings, board, cx)),
+            Some(board) => {
+                body.child(self.render_board_columns(theme, &settings, board, &notes, cx))
+            }
             None => body.child(self.render_board_message(theme, read)),
         };
+        let drawer = self
+            .board
+            .drawer
+            .as_deref()
+            .and_then(|item_id| self.item_drawer(&settings.url, item_id, &notes, cx))
+            .map(|drawer| self.render_item_drawer(theme, drawer, cx));
+        let stage = div()
+            .flex()
+            .flex_row()
+            .flex_grow()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .child(body)
+            .children(drawer);
         let missing = read
             .and_then(|r| r.last_good.as_ref())
             .map(|board| missing_roles(board, &effective_mapping(board, &settings.columns)))
@@ -353,6 +377,7 @@ impl AppShell {
             .flex_col()
             .flex_grow()
             .size_full()
+            .min_w(px(0.0))
             .bg(canvas)
             .text_color(ink)
             .font(theme::font_sans())
@@ -362,7 +387,7 @@ impl AppShell {
             })
             .when(moves_back, |s| s.child(render_workflow_warning(theme)))
             .children(self.dispatch_error().map(|err| render_dispatch_error(theme, err)))
-            .child(body)
+            .child(stage)
             .into_any_element()
     }
 
@@ -419,6 +444,7 @@ impl AppShell {
                         cx.listener(move |this, _, _, cx| {
                             this.board.selected_url = Some(url.clone());
                             this.board.show_all_done = false;
+                            this.board.drawer = None;
                             cx.notify();
                         }),
                     )
@@ -613,10 +639,11 @@ impl AppShell {
         theme: &Arc<Theme>,
         settings: &BoardSettings,
         board: &Board,
+        notes: &HashMap<String, CardNote>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let columns = panel_columns(board, &effective_mapping(board, &settings.columns));
-        let notes = self.card_notes(&settings.url, cx);
+        let selected = self.board.drawer.as_deref();
         div()
             .flex()
             .flex_row()
@@ -629,7 +656,8 @@ impl AppShell {
                     PanelGroup::Done => self
                         .render_done_column(theme, column, board, cx)
                         .into_any_element(),
-                    _ => render_group_column(theme, column, board, &notes, cx).into_any_element(),
+                    _ => render_group_column(theme, column, board, (notes, selected), cx)
+                        .into_any_element(),
                 }
             }))
             .into_any_element()
@@ -657,7 +685,8 @@ impl AppShell {
             .iter()
             .map(|&index| {
                 let item = &board.items[index];
-                let url = item.url.clone().unwrap_or_else(|| board.url.clone());
+                let item_id = item.id.clone();
+                let selected = self.board.drawer.as_deref() == Some(item.id.as_str());
                 div()
                     .id(("board-done", index))
                     .flex()
@@ -667,14 +696,18 @@ impl AppShell {
                     .px(px(10.0))
                     .py(px(8.0))
                     .border_1()
-                    .border_color(theme::frost_10(theme))
+                    .border_color(if selected {
+                        theme::accent(theme)
+                    } else {
+                        theme::frost_10(theme)
+                    })
                     .rounded(px(8.0))
                     .text_color(theme::ink_muted(theme))
                     .cursor_pointer()
                     .hover(|s| s.border_color(theme::frost_20(theme)))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |_, _, _, _| crate::sidebar::open_url_in_browser(&url)),
+                        cx.listener(move |this, _, _, cx| this.select_board_item(&item_id, cx)),
                     )
                     .child(state_dot(state_color(item, theme)))
                     .child(
@@ -781,7 +814,7 @@ fn render_group_column(
     theme: &Arc<Theme>,
     column: &PanelColumn,
     board: &Board,
-    notes: &HashMap<String, CardNote>,
+    cards: (&HashMap<String, CardNote>, Option<&str>),
     cx: &mut Context<AppShell>,
 ) -> impl IntoElement {
     let framed = matches!(
@@ -813,7 +846,7 @@ fn render_group_column(
         .when(column.sections.is_empty(), |s| s.child(not_on_board()))
         .children(column.sections.iter().map(|section| {
             let heading = !(lone_todo && section.role == Some(ColumnRole::Todo));
-            render_section(theme, section, board, heading, notes, cx).into_any_element()
+            render_section(theme, section, board, heading, cards, cx).into_any_element()
         }))
 }
 
@@ -822,7 +855,7 @@ fn render_section(
     section: &PanelSection,
     board: &Board,
     heading: bool,
-    notes: &HashMap<String, CardNote>,
+    (notes, selected): (&HashMap<String, CardNote>, Option<&str>),
     cx: &mut Context<AppShell>,
 ) -> impl IntoElement {
     let trigger = section.role.map(ColumnRole::kind) == Some(RoleKind::Trigger);
@@ -866,39 +899,37 @@ fn render_section(
         })
         .children(section.items.iter().map(|&index| {
             let item = &board.items[index];
-            render_card(theme, item, index, &board.url, notes.get(&item.id), cx).into_any_element()
+            let chosen = selected == Some(item.id.as_str());
+            render_card(theme, (item, index, chosen), notes.get(&item.id), cx).into_any_element()
         }))
 }
 
 fn render_card(
     theme: &Arc<Theme>,
-    item: &BoardItem,
-    index: usize,
-    board_url: &str,
+    (item, index, selected): (&BoardItem, usize, bool),
     dispatch: Option<&CardNote>,
     cx: &mut Context<AppShell>,
 ) -> impl IntoElement {
-    let url = item.url.clone().unwrap_or_else(|| board_url.to_string());
     let note = match item.state {
         ItemState::Closed => Some("closed"),
         ItemState::Merged => Some("merged"),
         ItemState::Open => None,
     };
     let accent = theme::accent(theme);
-    let dispatched = dispatch.is_some();
-    let issue_url = url.clone();
     let reference = div()
         .id(("board-card-reference", index))
-        .when(!dispatched, |s| s.child(item_reference(item)))
-        .when(dispatched, |s| {
-            s.child(format!("{} ↗", item_reference(item)))
-                .hover(move |s| s.text_color(accent))
+        .when_some(item.url.clone(), |s, url| {
+            s.hover(move |s| s.text_color(accent))
                 .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                     cx.stop_propagation();
-                    crate::sidebar::open_url_in_browser(&issue_url);
+                    crate::sidebar::open_url_in_browser(&url);
                 })
+        })
+        .child(match item.url {
+            Some(_) => format!("{} ↗", item_reference(item)).into(),
+            None => item_reference(item),
         });
-    let (item_id, board_url) = (item.id.clone(), board_url.to_string());
+    let item_id = item.id.clone();
     div()
         .id(("board-card", index))
         .flex()
@@ -908,19 +939,17 @@ fn render_card(
         .py(px(10.0))
         .bg(theme::elevated(theme))
         .border_1()
-        .border_color(theme::divider(theme))
+        .border_color(if selected {
+            accent
+        } else {
+            theme::divider(theme)
+        })
         .rounded(px(8.0))
         .cursor_pointer()
         .hover(move |s| s.border_color(accent))
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |this, _, window, cx| {
-                if dispatched {
-                    this.open_dispatch_tab(&board_url, &item_id, window, cx);
-                } else {
-                    crate::sidebar::open_url_in_browser(&url);
-                }
-            }),
+            cx.listener(move |this, _, _, cx| this.select_board_item(&item_id, cx)),
         )
         .child(
             div()
@@ -1002,6 +1031,11 @@ fn render_card(
                 None => line.into_any_element(),
             }
         }))
+}
+
+/// The dot that shows an item's kind and state, as its card has it.
+pub(crate) fn item_dot(kind: ItemKind, state: ItemState, theme: &Theme) -> impl IntoElement {
+    state_dot(kind_color(kind, state, theme))
 }
 
 fn state_dot(color: Hsla) -> impl IntoElement {
