@@ -120,7 +120,7 @@ const TRIGGER_ITEMS_QUERY: &str = r#"query($ids: [ID!]!) {
       closedByPullRequestsReferences(first: 10, includeClosedPrs: true) { nodes { ...linked } }
     }
     ... on PullRequest {
-      id headRefName isCrossRepository
+      id headRefName isCrossRepository maintainerCanModify headRepository { nameWithOwner }
       timelineItems(last: 100, itemTypes: [PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]) { nodes { ...change } }
     }
   }
@@ -190,6 +190,8 @@ pub fn parse_trigger_reads(json: &str, board_id: &str) -> Result<TriggerReads> {
             let head = PullRequestHead {
                 branch,
                 is_cross_repository,
+                repository: node.head_repository.map(|r| r.name_with_owner),
+                maintainer_can_modify: node.maintainer_can_modify.unwrap_or(false),
             };
             reads.heads.insert(id.clone(), head);
         }
@@ -828,6 +830,8 @@ struct TimelineOwner {
     closed_by_pull_requests_references: Option<LinkedList>,
     head_ref_name: Option<String>,
     is_cross_repository: Option<bool>,
+    maintainer_can_modify: Option<bool>,
+    head_repository: Option<Repository>,
 }
 
 #[derive(Deserialize)]
@@ -1312,22 +1316,38 @@ mod tests {
     fn reads_the_branch_each_pull_request_merges_from() {
         let json = r#"{"data":{"nodes":[
           {"__typename":"PullRequest","id":"PR_420","headRefName":"keep-palette-open",
-           "isCrossRepository":false,"timelineItems":{"nodes":[]}},
+           "isCrossRepository":false,"maintainerCanModify":false,
+           "headRepository":{"nameWithOwner":"maui1911/CodeScope"},"timelineItems":{"nodes":[]}},
           {"__typename":"PullRequest","id":"PR_421","headRefName":"main",
-           "isCrossRepository":true,"timelineItems":{"nodes":[]}},
+           "isCrossRepository":true,"maintainerCanModify":true,
+           "headRepository":{"nameWithOwner":"octo/CodeScope"},"timelineItems":{"nodes":[]}},
+          {"__typename":"PullRequest","id":"PR_422","headRefName":"fix",
+           "isCrossRepository":true,"maintainerCanModify":false,"headRepository":null,
+           "timelineItems":{"nodes":[]}},
           {"__typename":"Issue","id":"I_432","timelineItems":{"nodes":[]},
            "closedByPullRequestsReferences":{"nodes":[]}}
         ]}}"#;
         let heads = parse_trigger_reads(json, "PVT_1").unwrap().heads;
-        assert_eq!(heads.len(), 2, "an issue has no branch");
+        assert_eq!(heads.len(), 3, "an issue has no branch");
         assert_eq!(
             heads["PR_420"],
             PullRequestHead {
                 branch: "keep-palette-open".into(),
                 is_cross_repository: false,
+                repository: Some("maui1911/CodeScope".into()),
+                maintainer_can_modify: false,
             }
         );
-        assert!(heads["PR_421"].is_cross_repository);
+        assert_eq!(
+            heads["PR_421"],
+            PullRequestHead {
+                branch: "main".into(),
+                is_cross_repository: true,
+                repository: Some("octo/CodeScope".into()),
+                maintainer_can_modify: true,
+            }
+        );
+        assert_eq!(heads["PR_422"].repository, None, "a deleted fork");
     }
 
     #[test]

