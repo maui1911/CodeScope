@@ -280,6 +280,11 @@ fn main() -> Result<()> {
         // `Sidebar::select` / `add_project` — selection changes are
         // user-driven and slow, no debounce needed.
 
+        cx.on_app_quit(|_| {
+            codescope_core::board::setup::stop_running_setups();
+            async {}
+        })
+        .detach();
         cx.spawn(async move |cx| {
             cx.open_window(
                 WindowOptions {
