@@ -14,7 +14,9 @@ use codescope_core::process_tree;
 use codescope_core::projects::ProjectsConfig;
 use gpui::{App, AppContext as _, AsyncApp, Context, Window};
 
-use super::{AppShell, CardNote, NoteTone, RoundKey, TabAtHandover, ToastKind, Turn, round_key};
+use super::{
+    AppShell, CardNote, NoteTone, RoundKey, TabAtHandover, ToastKind, Turn, round_key, tab_free,
+};
 
 const CHECK_EVERY: Duration = Duration::from_secs(60);
 const CHECK_OWN_COMMITS_EVERY: Duration = Duration::from_secs(600);
@@ -351,14 +353,7 @@ impl AppShell {
 }
 
 fn tabs_free(tabs: &[(TabAtHandover, Turn, bool)]) -> bool {
-    tabs.iter().all(|&(state, turn, typed)| {
-        !typed
-            && match state {
-                TabAtHandover::Shell | TabAtHandover::IdleClaude => true,
-                TabAtHandover::Other => turn == Turn::Ended,
-                TabAtHandover::Draft | TabAtHandover::Busy | TabAtHandover::Stopped => false,
-            }
-    })
+    tabs.iter().all(|&(state, turn, typed)| tab_free(state, turn, typed))
 }
 
 fn unreadable_tab(tabs: &[(TabAtHandover, Turn, bool)]) -> Option<usize> {

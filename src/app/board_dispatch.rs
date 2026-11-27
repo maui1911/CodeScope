@@ -53,7 +53,7 @@ use codescope_core::board::{
 };
 use codescope_core::path_canon::paths_match;
 use codescope_core::process_tree;
-use codescope_core::{AgentId, AgentProfile, SessionState, TelemetrySnapshot};
+use codescope_core::{AgentProfile, SessionState, TelemetrySnapshot};
 use codescope_core::projects::{Project, ProjectKind, ProjectsConfig};
 use codescope_core::worktree_create::{PendingId, record_dispatch, record_posted_findings};
 use codescope_terminal::TerminalView;
@@ -850,18 +850,34 @@ struct Place {
 }
 
 struct SessionOf {
-    agent: Option<AgentId>,
+    agent: Option<String>,
     working: Option<bool>,
 }
 
-fn runs_another_agent(tab: Option<AgentId>, wanted: Option<AgentId>) -> bool {
+fn runs_another_agent(tab: Option<&str>, wanted: Option<&str>) -> bool {
     matches!((tab, wanted), (Some(tab), Some(wanted)) if tab != wanted)
 }
 
-fn agent_kind(profile: &AgentProfile) -> Option<AgentId> {
-    codescope_core::agent_id_from_auto_type(
-        codescope_core::build_new_session_auto_type(profile).as_deref(),
-    )
+fn tab_free(state: TabAtHandover, turn: Turn, typed: bool) -> bool {
+    !typed
+        && match state {
+            TabAtHandover::Shell | TabAtHandover::IdleClaude => true,
+            TabAtHandover::Other => turn == Turn::Ended,
+            TabAtHandover::Draft | TabAtHandover::Busy | TabAtHandover::Stopped => false,
+        }
+}
+
+fn passed_over(
+    tab: Option<&str>,
+    round: Option<&str>,
+    (state, turn, typed): (TabAtHandover, Turn, bool),
+) -> bool {
+    runs_another_agent(tab, round) && tab_free(state, turn, typed)
+}
+
+fn takes_a_task(profile: &AgentProfile) -> bool {
+    codescope_core::build_new_session_auto_type(profile)
+        .is_some_and(|launch| launch_with_task(&launch, "").is_some())
 }
 
 fn fresh_access(
@@ -1502,7 +1518,7 @@ impl AppShell {
                         }
                         let target = self.place_of(&settings.url, item, head, cx).map(|place| {
                             let agent = self.round_agent_of(&place.project_id, round, cx);
-                            let wanted = agent.as_ref().and_then(agent_kind);
+                            let wanted = agent.as_ref().map(|profile| profile.id.as_str());
                             self.handover_target(&place.path, wanted, cx)
                         });
                         if let Some(HandoverTarget::Wait(hold)) = target {
@@ -1707,6 +1723,7 @@ impl AppShell {
                 url,
                 round,
                 trigger_at: trigger_at.clone(),
+                agent: Some(profile.id.clone()),
                 findings: None,
                 pull_request,
                 review,
@@ -1846,8 +1863,7 @@ impl AppShell {
             self.drop_start(record, why, cx);
             return None;
         }
-        let wanted = codescope_core::agent_id_from_auto_type(Some(&launch.command));
-        let terminal = match self.handover_target(&job.path, wanted, cx) {
+        let terminal = match self.handover_target(&job.path, record.agent.as_deref(), cx) {
             HandoverTarget::Type(terminal) => Some(terminal),
             HandoverTarget::NewTab => None,
             HandoverTarget::Wait(hold) => {
@@ -1940,9 +1956,24 @@ impl AppShell {
             .collect()
     }
 
-    fn round_tabs(&self, path: &Path, agent: Option<AgentId>) -> Vec<&super::Tab> {
-        let tabs = self.tabs_on(path).into_iter();
-        tabs.filter(|tab| !runs_another_agent(tab.agent_id, agent)).collect()
+    fn round_tabs(&self, path: &Path, agent: Option<&str>, cx: &App) -> Vec<&super::Tab> {
+        let tabs = self.tabs_on(path);
+        let others: Vec<&super::Tab> = tabs
+            .iter()
+            .copied()
+            .filter(|tab| runs_another_agent(tab.agent_profile_id.as_deref(), agent))
+            .collect();
+        let states = self.tab_states(&others, path, cx);
+        let passed: HashSet<u64> = others
+            .iter()
+            .zip(states)
+            .filter(|(tab, state)| {
+                let probed = (*state, self.turn(tab), tab.terminal.read(cx).typed_since_submit());
+                passed_over(tab.agent_profile_id.as_deref(), agent, probed)
+            })
+            .map(|(tab, _)| tab.id)
+            .collect();
+        tabs.into_iter().filter(|tab| !passed.contains(&tab.id)).collect()
     }
 
     fn tab_states(&self, tabs: &[&super::Tab], path: &Path, cx: &App) -> Vec<TabAtHandover> {
@@ -1978,9 +2009,9 @@ impl AppShell {
 
     /// Where a task for the worktree at `path` goes: into a tab where Claude Code waits for a
     /// prompt, into a new tab when nothing runs there, or nowhere yet, with the reason. A tab
-    /// known to run another agent than `wanted` doesn't count.
-    fn handover_target(&self, path: &Path, wanted: Option<AgentId>, cx: &App) -> HandoverTarget {
-        let on_path = self.round_tabs(path, wanted);
+    /// started with another agent profile than `wanted` doesn't count once nothing works there.
+    fn handover_target(&self, path: &Path, wanted: Option<&str>, cx: &App) -> HandoverTarget {
+        let on_path = self.round_tabs(path, wanted, cx);
         if on_path.is_empty() {
             return HandoverTarget::NewTab;
         }
@@ -2022,7 +2053,7 @@ impl AppShell {
         state.findings_announced.retain(|key| awaiting.contains(key));
         let held_before = std::mem::take(&mut state.findings_held);
 
-        for (project_id, path, _, record) in records {
+        for (_, path, _, record) in records {
             let key = round_key(&record);
             let state = &self.board.dispatch;
             let waiting_to_retry = state
@@ -2045,8 +2076,7 @@ impl AppShell {
             let Some(file) = read_findings(&path) else {
                 continue;
             };
-            let agent = self.round_agent_kind(&project_id, record.round, cx);
-            let remind = match self.session_at(&path, agent, cx) {
+            let remind = match self.session_at(&path, record.agent.as_deref(), cx) {
                 SessionAt::Working => continue,
                 SessionAt::Held(by) => {
                     self.board.dispatch.findings_held.insert(key, by);
@@ -2076,8 +2106,8 @@ impl AppShell {
         }
     }
 
-    fn session_at(&self, path: &Path, agent: Option<AgentId>, cx: &App) -> SessionAt {
-        let tabs = self.round_tabs(path, agent);
+    fn session_at(&self, path: &Path, agent: Option<&str>, cx: &App) -> SessionAt {
+        let tabs = self.round_tabs(path, agent, cx);
         let states = self.tab_states(&tabs, path, cx);
         let probed: Vec<(TabAtHandover, Turn)> = tabs
             .iter()
@@ -2099,15 +2129,39 @@ impl AppShell {
         snapshot.map_or(Turn::Unknown, |snap| turn_of(snap.state, snap.quiet_timeout))
     }
 
-    fn telemetry_at(&self, path: &Path, agent: Option<AgentId>) -> Option<TelemetrySnapshot> {
-        let mut sessions = self.round_tabs(path, agent).into_iter().filter_map(|tab| {
+    fn telemetry_at(
+        &self,
+        path: &Path,
+        agent: Option<&str>,
+        cx: &App,
+    ) -> Option<TelemetrySnapshot> {
+        let mut sessions = self.round_tabs(path, agent, cx).into_iter().filter_map(|tab| {
             tab.adopted_session_id.as_deref().and_then(|sid| self.telemetry_for(sid))
         });
         sessions.next()
     }
 
-    fn tab_title_at(&self, path: &Path) -> Option<SharedString> {
-        self.tabs_on(path).first().map(|tab| tab.title.clone())
+    fn tab_title_at(&self, path: &Path, agent: Option<&str>) -> Option<SharedString> {
+        let tabs = self.tabs_on(path);
+        let own = tabs
+            .iter()
+            .find(|tab| !runs_another_agent(tab.agent_profile_id.as_deref(), agent));
+        own.or(tabs.first()).map(|tab| tab.title.clone())
+    }
+
+    fn round_tab_at(&self, path: &Path, agent: Option<&str>) -> Option<(usize, usize)> {
+        let wanted = path.to_string_lossy();
+        self.groups.iter().enumerate().find_map(|(group_idx, group)| {
+            let tab_idx = group.tabs.iter().position(|tab| {
+                tab.remote_project_id.is_none()
+                    && tab
+                        .working_directory
+                        .as_deref()
+                        .is_some_and(|wd| paths_match(&wd.to_string_lossy(), &wanted))
+                    && !runs_another_agent(tab.agent_profile_id.as_deref(), agent)
+            })?;
+            Some((group_idx, tab_idx))
+        })
     }
 
     fn remind(
@@ -2131,7 +2185,8 @@ impl AppShell {
             title: format!("Findings on #{} can't be posted yet", record.number),
             detail: format!("{listed}. Fix {FINDINGS_FILE}, or have its session fix it."),
         };
-        self.send_reminder(remind, problems_message(problems), notice, path, cx);
+        let at = (path, record.agent.as_deref());
+        self.send_reminder(remind, problems_message(problems), notice, at, cx);
     }
 
     fn remind_reply(
@@ -2157,7 +2212,8 @@ impl AppShell {
             title: format!("The reply on #{} can't be posted yet", record.number),
             detail: format!("{listed}. Fix {REPLY_FILE}, or have its session fix it."),
         };
-        self.send_reminder(remind, reply_problems_message(problems), notice, path, cx);
+        let at = (path, record.agent.as_deref());
+        self.send_reminder(remind, reply_problems_message(problems), notice, at, cx);
     }
 
     fn send_reminder(
@@ -2165,7 +2221,7 @@ impl AppShell {
         remind: Remind,
         message: String,
         notice: Notice,
-        path: &Path,
+        (path, agent): (&Path, Option<&str>),
         cx: &mut Context<Self>,
     ) {
         match remind {
@@ -2173,7 +2229,7 @@ impl AppShell {
             Remind::Notice => {
                 let Notice { title, detail } = notice;
                 self.push_toast(ToastKind::Err, title.clone(), Some(detail.clone().into()), cx);
-                let tab_title = self.tab_title_at(path);
+                let tab_title = self.tab_title_at(path, agent);
                 let kind = NotificationKind::SessionWaiting;
                 self.push_notification(kind, title, detail, tab_title, cx);
             }
@@ -2310,7 +2366,7 @@ impl AppShell {
             ToastKind::Ok
         };
         self.push_toast(kind, title.clone(), Some(detail.clone().into()), cx);
-        let tab_title = self.tab_title_at(&path);
+        let tab_title = self.tab_title_at(&path, record.agent.as_deref());
         self.push_notification(NotificationKind::SessionReady, title, detail, tab_title, cx);
         cx.notify();
     }
@@ -2383,14 +2439,13 @@ impl AppShell {
             .dispatch
             .watches
             .retain(|id, _| records.iter().any(|(_, _, _, r)| r.item_id == *id));
-        for (project_id, path, branch, record) in records {
+        for (_, path, branch, record) in records {
             let Some(branch) = branch else {
                 continue;
             };
             let role = self.item_role(&record.board_url, &record.item_id);
-            let agent = self.round_agent_kind(&project_id, record.round, cx);
             let session = self
-                .telemetry_at(&path, agent)
+                .telemetry_at(&path, record.agent.as_deref(), cx)
                 .map(|snapshot| (super::notified_state(&snapshot), snapshot.turn_count));
             let claude = session.is_some();
             let seen_from_start = self.board.dispatch.seen_from_start.contains(&round_key(&record));
@@ -2444,7 +2499,7 @@ impl AppShell {
                 self.move_to_in_review(&record, cx);
             }
             if ring {
-                let tab_title = self.tab_title_at(&path);
+                let tab_title = self.tab_title_at(&path, record.agent.as_deref());
                 self.push_notification(
                     NotificationKind::SessionWaiting,
                     format!("#{} waits for you", record.number),
@@ -2454,7 +2509,7 @@ impl AppShell {
                 );
             }
             if record.round == Round::Review {
-                self.check_review_round(&record, &path, (claude, agent), cx);
+                self.check_review_round(&record, &path, claude, cx);
             }
         }
     }
@@ -2463,7 +2518,7 @@ impl AppShell {
         &mut self,
         record: &WorktreeDispatch,
         path: &Path,
-        (claude, agent): (bool, Option<AgentId>),
+        claude: bool,
         cx: &mut Context<Self>,
     ) {
         let Some(watch) = self.board.dispatch.watches.get(&record.item_id) else {
@@ -2479,7 +2534,7 @@ impl AppShell {
         };
         let file = read_reply(path).filter(|_| review.reply_url.is_none());
         let reply = file.as_ref().map(|file| file.reply());
-        let gate = self.session_at(path, agent, cx);
+        let gate = self.session_at(path, record.agent.as_deref(), cx);
         let Some(watch) = self.board.dispatch.watches.get_mut(&record.item_id) else {
             return;
         };
@@ -2603,7 +2658,7 @@ impl AppShell {
                 let ring = stop.is_some() && watch.review_stop() == stop && watch.rang_for != stop;
                 if ring {
                     watch.rang_for = stop;
-                    let tab_title = self.tab_title_at(&path);
+                    let tab_title = self.tab_title_at(&path, record.agent.as_deref());
                     self.push_notification(
                         NotificationKind::SessionWaiting,
                         format!("#{} waits for you", record.number),
@@ -2789,7 +2844,7 @@ impl AppShell {
             )
         };
         self.push_toast(toast, title.clone(), Some(detail.clone().into()), cx);
-        let tab_title = self.tab_title_at(path);
+        let tab_title = self.tab_title_at(path, record.agent.as_deref());
         self.push_notification(kind, title, detail, tab_title, cx);
         cx.notify();
     }
@@ -2874,19 +2929,20 @@ impl AppShell {
     }
 
     fn round_agent(&self, project: &Project, round: Round) -> Option<AgentProfile> {
-        let set = project.dispatch.agent(round);
-        set.and_then(|id| self.agent_registry.get_by_id(id))
+        let set = project.dispatch.agent(round).and_then(|id| self.agent_registry.get_by_id(id));
+        set.filter(|profile| takes_a_task(profile))
             .cloned()
             .or_else(|| self.project_agent(project))
+    }
+
+    fn pinned_agent(&self, record: &WorktreeDispatch) -> Option<AgentProfile> {
+        let pinned = record.agent.as_deref().and_then(|id| self.agent_registry.get_by_id(id));
+        pinned.filter(|profile| takes_a_task(profile)).cloned()
     }
 
     fn round_agent_of(&self, project_id: &str, round: Round, cx: &App) -> Option<AgentProfile> {
         let project = self.current_projects(cx).project(project_id)?;
         self.round_agent(project, round)
-    }
-
-    fn round_agent_kind(&self, project_id: &str, round: Round, cx: &App) -> Option<AgentId> {
-        self.round_agent_of(project_id, round, cx).as_ref().and_then(agent_kind)
     }
 
     pub(crate) fn round_agents(
@@ -2897,10 +2953,7 @@ impl AppShell {
             .agent_registry
             .get_all()
             .iter()
-            .filter(|profile| {
-                codescope_core::build_new_session_auto_type(profile)
-                    .is_some_and(|launch| launch_with_task(&launch, "").is_some())
-            })
+            .filter(|profile| takes_a_task(profile))
             .map(|profile| (profile.id.clone(), profile.display_name.clone()))
             .collect();
         (choices, self.project_agent(project).map(|profile| profile.display_name))
@@ -2927,13 +2980,18 @@ impl AppShell {
             return;
         }
         self.show_workspace(cx);
-        if self.focus_or_reopen(&path, window, cx) {
+        if let Some((group, tab)) = self.round_tab_at(&path, record.agent.as_deref()) {
+            self.activate_tab(group, tab, window, cx);
+            return;
+        }
+        if self.tabs_on(&path).is_empty() && self.focus_or_reopen(&path, window, cx) {
             return;
         }
         let Some(project) = self.current_projects(cx).project(&project_id).cloned() else {
             return;
         };
-        let profile = self.round_agent(&project, record.round);
+        let pinned = self.pinned_agent(&record);
+        let profile = pinned.or_else(|| self.round_agent(&project, record.round));
         let auto_type = profile.as_ref().and_then(codescope_core::build_new_session_auto_type);
         let mut title = codescope_core::TabTitle::project(project.name);
         if let Some(branch) = branch.as_deref() {
@@ -3063,7 +3121,7 @@ impl AppShell {
             };
             let place = (project_id.as_str(), path.as_path(), branch.as_str());
             let mut working = SessionOf {
-                agent: self.round_agent_kind(&project_id, record.round, cx),
+                agent: record.agent.clone(),
                 working: None,
             };
             let record = self.forward_comments(place, record, &mut working, window, cx);
@@ -3072,7 +3130,7 @@ impl AppShell {
     }
 
     fn is_working(&self, path: &Path, cx: &App, session: &mut SessionOf) -> bool {
-        let agent = session.agent;
+        let agent = session.agent.as_deref();
         *session.working.get_or_insert_with(|| {
             matches!(self.session_at(path, agent, cx), SessionAt::Working | SessionAt::Held(_))
         })
@@ -3081,17 +3139,18 @@ impl AppShell {
     fn handover_route(
         &self,
         (project_id, path, branch): (&str, &Path, &str),
-        (round, message): (Round, &str),
+        (record, message): (&WorktreeDispatch, &str),
         cx: &App,
     ) -> Option<Route> {
-        let profile = self.round_agent_of(project_id, round, cx);
-        match self.handover_target(path, profile.as_ref().and_then(agent_kind), cx) {
+        let pinned = self.pinned_agent(record);
+        let wanted = pinned.as_ref().map(|profile| profile.id.as_str());
+        match self.handover_target(path, wanted, cx) {
             HandoverTarget::Type(terminal) => return Some(Route::Type(terminal)),
             HandoverTarget::NewTab => {}
             HandoverTarget::Wait(_) => return None,
         }
         let project = self.current_projects(cx).project(project_id)?;
-        let profile = profile?;
+        let profile = pinned.or_else(|| self.round_agent(project, record.round))?;
         let command = codescope_core::build_new_session_auto_type(&profile)
             .and_then(|launch| launch_with_task(&launch, message))?;
         let mut title = codescope_core::TabTitle::project(project.name.clone());
@@ -3141,7 +3200,7 @@ impl AppShell {
                 Some(ForwardNote::Posting)
             }
             ForwardStep::FixReply(problems) => {
-                self.fix_forward_reply(&record, (path, working.agent), &problems, cx);
+                self.fix_forward_reply(&record, path, &problems, cx);
                 Some(ForwardNote::FixReply)
             }
             ForwardStep::Forward(comments) => {
@@ -3226,7 +3285,7 @@ impl AppShell {
             return None;
         }
         let message = forward_message(record.number, comments.len());
-        let route = self.handover_route(place, (record.round, &message), cx)?;
+        let route = self.handover_route(place, (record, &message), cx)?;
         let names = authors(comments);
         let at = codescope_core::time::now_iso8601();
         let handed = WorktreeDispatch {
@@ -3348,14 +3407,14 @@ impl AppShell {
     fn fix_forward_reply(
         &mut self,
         record: &WorktreeDispatch,
-        (path, agent): (&Path, Option<AgentId>),
+        path: &Path,
         problems: &[Problem],
         cx: &mut Context<Self>,
     ) {
         let Some(file) = read_reply(path) else {
             return;
         };
-        let remind = match self.session_at(path, agent, cx) {
+        let remind = match self.session_at(path, record.agent.as_deref(), cx) {
             SessionAt::Done(remind) => remind,
             SessionAt::Working | SessionAt::Held(_) => Remind::Nothing,
         };
@@ -3369,7 +3428,7 @@ impl AppShell {
         note: Option<ForwardNote>,
         cx: &mut Context<Self>,
     ) {
-        let tab_title = self.tab_title_at(path);
+        let tab_title = self.tab_title_at(path, record.agent.as_deref());
         let Some(watch) = self.board.dispatch.watches.get_mut(&record.item_id) else {
             return;
         };
@@ -3508,7 +3567,7 @@ impl AppShell {
             return waits;
         }
         let message = repair_message(record.number);
-        let Some(route) = self.handover_route(place, (record.round, &message), cx) else {
+        let Some(route) = self.handover_route(place, (record, &message), cx) else {
             return waits;
         };
         let settings = self
@@ -3558,7 +3617,7 @@ impl AppShell {
         note: Option<RepairNote>,
         cx: &mut Context<Self>,
     ) {
-        let tab_title = self.tab_title_at(path);
+        let tab_title = self.tab_title_at(path, record.agent.as_deref());
         let Some(watch) = self.board.dispatch.watches.get_mut(&record.item_id) else {
             return;
         };
@@ -4406,12 +4465,21 @@ mod tests {
     }
 
     #[test]
-    fn a_tab_counts_for_a_handover_unless_it_is_known_to_run_another_agent() {
-        use AgentId::{Claude, Codex};
-        assert!(runs_another_agent(Some(Claude), Some(Codex)));
-        assert!(!runs_another_agent(Some(Codex), Some(Codex)));
-        assert!(!runs_another_agent(None, Some(Codex)), "a shell, or an agent it can't name");
-        assert!(!runs_another_agent(Some(Claude), None), "the round's agent is one it can't name");
+    fn a_tab_of_another_agent_is_passed_over_once_nothing_works_there() {
+        use TabAtHandover::{Busy, Draft, IdleClaude, Other};
+        let idle = (IdleClaude, Turn::Ended, false);
+        assert!(passed_over(Some("claude"), Some("copilot"), idle));
+        assert!(passed_over(Some("claude"), Some("claude-opus"), idle), "same CLI");
+        assert!(!passed_over(Some("copilot"), Some("copilot"), idle), "the round's own");
+        assert!(!passed_over(None, Some("copilot"), idle), "a shell");
+        assert!(!passed_over(Some("claude"), None, idle), "a round from before agents were kept");
+        let busy = (Busy, Turn::Running, false);
+        assert!(!passed_over(Some("claude"), Some("copilot"), busy), "still working");
+        let draft = (Draft, Turn::Ended, true);
+        assert!(!passed_over(Some("claude"), Some("copilot"), draft), "a prompt not sent");
+        let unread = (Other, Turn::Unknown, false);
+        assert!(!passed_over(Some("codex"), Some("claude"), unread), "can't tell");
+        assert!(passed_over(Some("codex"), Some("claude"), (Other, Turn::Ended, false)));
     }
 
     #[test]
@@ -4654,6 +4722,7 @@ mod tests {
             url: "https://github.com/maui1911/CodeScope/issues/426".into(),
             round: Round::Implementation,
             trigger_at: "2026-11-25T09:00:00Z".into(),
+            agent: None,
             findings: None,
             pull_request,
             review: None,

@@ -308,6 +308,7 @@ struct Tab {
     /// dispatch — mirrors the `agentId` string the C#
     /// `MainViewModel.RegisterAgentTelemetry` branches on.
     agent_id: Option<codescope_core::AgentId>,
+    agent_profile_id: Option<String>,
 }
 
 impl Tab {
@@ -4569,6 +4570,7 @@ impl AppShell {
             fired_session_ids: std::collections::HashSet::new(),
             adopted_by_guess: false,
             agent_id,
+            agent_profile_id: persist_agent_id.map(|id| id.to_string()),
         });
         let new_idx = group.tabs.len() - 1;
         self.activate_tab(group_idx, new_idx, window, cx);
