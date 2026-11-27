@@ -3007,6 +3007,7 @@ impl AppShell {
         if let Some(watch) = self.board.dispatch.watches.get_mut(&record.item_id) {
             let turns = watch.turns;
             watch.forward_follow.start(at, turns);
+            watch.reply_reminder = None;
         }
         self.deliver(path, route, message, window, cx);
         let title = format!("{} commented on PR #{}", named(&names), pr.number);
@@ -3124,9 +3125,6 @@ impl AppShell {
         let Some(watch) = self.board.dispatch.watches.get_mut(&record.item_id) else {
             return;
         };
-        if note != Some(ForwardNote::FixReply) && watch.reply_reminder.take().is_some() {
-            cx.notify();
-        }
         if watch.forward_note != note {
             watch.forward_note = note.clone();
             cx.notify();
@@ -3210,10 +3208,11 @@ impl AppShell {
         let working = self.is_working(path, cx, working);
         let forward_open = record.forwarded.as_ref().is_some_and(|last| last.is_open(&pr));
         let watch = self.board.dispatch.watches.get_mut(&record.item_id)?;
+        let forward_holds = forward_open || watch.forward_note == Some(ForwardNote::FixReply);
         let turns = watch.turns;
         watch.repair_follow.look(repair.map(|r| r.started_at.clone()), working, turns);
         let active = repair.is_some_and(|r| r.head == pr.head_oid);
-        let session = if forward_open {
+        let session = if forward_holds {
             HandoverSession::Busy
         } else {
             watch.repair_follow.session(working, active, watch.read_ok_at)
