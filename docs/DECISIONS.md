@@ -1149,12 +1149,16 @@ board, each with their own CodeScope or another tool that follows the
   when nothing there is its own: no uncommitted changes, and no commits,
   on the branch or where the worktree stands, that neither the merged
   head nor the remote's default branch holds. Otherwise nothing is
-  removed, and the row is marked with the reason. When git refuses the
-  removal, the card says why and the tabs are not closed again. Moved by the
-  user to a column that is not a trigger column: no round starts,
-  nothing more is sent into the session and nothing is removed; what
-  the round already produced is still posted. CodeScope never stops an
-  agent that is working.
+  removed, and the row is marked with the reason. The branch CodeScope
+  linked on GitHub goes too while nothing was pushed to it; once
+  something was, it is left to the pull request. When GitHub refuses
+  that, the toast says the branch stays there. A worktree the user
+  removes by hand keeps both branches, as any removed worktree does.
+  When git refuses the removal, the card says why and the tabs are not
+  closed again. Moved by the user to a column that is not a trigger
+  column: no round starts, nothing more is sent into the session and
+  nothing is removed; what the round already produced is still
+  posted. CodeScope never stops an agent that is working.
 * **GitHub first, other hosts behind one seam.** The first version
   supports GitHub through `gh` only. Board access (read a board, move
   an item, link an item to a branch) sits behind one seam that does

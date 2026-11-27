@@ -11,15 +11,17 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use codescope_core::agents::claude::live_session;
 use codescope_core::board::dispatch::{
     FINDINGS_FILE, Facts, HandoverSession, Hold, OwnPullRequest, PostedFindings, ProjectRemotes,
     REPLY_FILE, ReviewRound, Round, StatusChange, WorktreeDispatch, add_dispatch_worktree,
-    add_fork_worktree, add_pull_request_worktree, branch_name, clear_findings, clear_reply,
-    counts_towards_limit, decide, exclude_handover_files, fetch_branch_head, fetch_pull_head,
-    find_skill, fork_branch, fork_push, is_plain_branch, launch_with_task, mover_to_check,
-    moves_to_needs_decision, opened_by, projects_for_repository, set_fork_push, task_file,
-    start_still_wanted, task_message, trigger_content_ids, write_task_file,
+    add_fork_worktree, add_pull_request_worktree, branch_base, branch_name, clear_findings,
+    clear_reply, counts_towards_limit, decide, exclude_handover_files, fetch_branch_head,
+    fetch_pull_head, find_skill, fork_branch, fork_push, is_plain_branch, launch_with_task,
+    mover_to_check, moves_to_needs_decision, opened_by, projects_for_repository,
+    remote_branch_tip, set_fork_push, start_still_wanted, task_file, task_message,
+    track_remote_branch, tracks_same_name, trigger_content_ids, write_task_file,
 };
 use codescope_core::board::answers::{
     Answer, Comment, after_findings, answer_body, answers_section, choices_text, chosen,
@@ -689,6 +691,8 @@ struct Job {
     progress_column_id: String,
     answers_from: Option<AnswersFrom>,
     known_access: HashMap<(String, String), bool>,
+    viewer_login: String,
+    link_error: Option<String>,
 }
 
 struct Launch {
@@ -1084,11 +1088,45 @@ fn set_up_worktree(job: &mut Job) -> anyhow::Result<()> {
                 ItemKind::Issue | ItemKind::Draft => refresh_start_head(job),
             }
         }
-        Round::Implementation => {}
+        Round::Implementation => {
+            if let Err(err) = link_branch(job) {
+                job.link_error = Some(format!("{err:#}"));
+            }
+        }
     }
     let skill = skill_in(&job.path, job.record.round.skill());
     let answers = job.answers_from.as_ref().map(|from| answers_for_task(job, from));
     write_task_file(&job.path, &task_file(&job.record, skill.as_deref(), answers.as_deref()))
+}
+
+fn link_branch(job: &mut Job) -> anyhow::Result<()> {
+    let (repo, remote, branch) = (&job.repo, &job.remote, &job.branch);
+    if job.record.kind != ItemKind::Issue {
+        return Ok(());
+    }
+    let unlinked = "couldn't link its branch to the issue";
+    if let Some(tip) = remote_branch_tip(repo, remote, branch).context(unlinked)? {
+        let linked_here = job.record.linked_at.is_none()
+            && tracks_same_name(repo, remote, branch)
+            && tip == branch_base(repo, &job.path, remote).context(unlinked)?;
+        if linked_here {
+            job.record.linked_at = Some(tip);
+        }
+        return Ok(());
+    }
+    let repository = &job.record.repository;
+    let can_write = match job.known_access.get(&access_key(repository, &job.viewer_login)) {
+        Some(known) => *known,
+        None => github::can_write(repository, &job.viewer_login).context(unlinked)?,
+    };
+    if !can_write {
+        return Ok(());
+    }
+    let base = branch_base(repo, &job.path, remote).context(unlinked)?;
+    github::create_linked_branch(&job.record.content_id, &base, branch).context(unlinked)?;
+    job.record.linked_at = Some(base);
+    track_remote_branch(repo, remote, branch)
+        .context("linked its branch to the issue, but the local branch doesn't track it")
 }
 
 async fn on_own_thread<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
@@ -1137,6 +1175,9 @@ fn claim_on_board(job: &Job, viewer_id: &str) -> Vec<String> {
     }
     if let Err(err) = github::set_status(&job.board, &job.record.item_id, &job.progress_column_id) {
         errors.push(format!("couldn't move it: {err:#}"));
+    }
+    if let Some(err) = &job.link_error {
+        errors.push(err.clone());
     }
     errors
 }
@@ -1620,12 +1661,15 @@ impl AppShell {
                 repair: None,
                 forwarded: None,
                 kept: None,
+                linked_at: previous.as_ref().and_then(|p| p.linked_at.clone()),
             },
             assign_to: item.assignees.is_empty().then_some(content_id),
             board,
             progress_column_id,
             answers_from,
             known_access: fresh_access(&self.board.dispatch.access),
+            viewer_login: viewer.login.clone(),
+            link_error: None,
         };
         self.board.dispatch.readied.remove(&item.id);
         self.board.dispatch.fork_confirmed.remove(&item.id);
@@ -4500,6 +4544,7 @@ mod tests {
             repair: None,
             forwarded: None,
             kept: None,
+            linked_at: None,
         }
     }
 

@@ -149,6 +149,10 @@ pub struct WorktreeDispatch {
     /// Set when its work ended but the worktree stays, so cleanup removed nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kept: Option<Kept>,
+    /// The commit CodeScope made the branch at on the host, linked to the issue; set when it
+    /// did, so cleanup removes that branch again while nothing was pushed to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_at: Option<String>,
 }
 
 /// The dispatch's session, after CodeScope handed it a repair or comments.
@@ -1120,6 +1124,10 @@ pub fn add_pull_request_worktree(
 ) -> Result<()> {
     let base = fetch_branch(repo, remote, branch)?;
     add_worktree_from(repo, path, branch, &base, &format!("{remote}/{branch}"))?;
+    set_upstream_of_same_name(repo, remote, branch)
+}
+
+fn set_upstream_of_same_name(repo: &Path, remote: &str, branch: &str) -> Result<()> {
     run_git(repo, &["config", &format!("branch.{branch}.remote"), remote])?;
     run_git(repo, &["config", &format!("branch.{branch}.pushRemote"), remote])?;
     let merge = format!("refs/heads/{branch}");
@@ -1239,6 +1247,48 @@ fn fetch_branch(repo: &Path, remote: &str, branch: &str) -> Result<String> {
     let fetched = format!("refs/remotes/{remote}/{branch}");
     fetch(repo, remote, &format!("+refs/heads/{branch}:{fetched}"))?;
     Ok(fetched)
+}
+
+/// The commit where the branch of `worktree` left `remote`'s default branch, fetched now: a branch
+/// made there on the host takes a push of the local branch as a fast-forward.
+pub fn branch_base(repo: &Path, worktree: &Path, remote: &str) -> Result<String> {
+    let default_branch = remote_default_branch(repo, remote)?;
+    let fetched = fetch_branch(repo, remote, &default_branch)?;
+    let output = run_git(worktree, &["merge-base", "HEAD", &fetched])?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// The commit `remote`'s branch `branch` is at, read from the remote now; `None` when it has no
+/// such branch.
+pub fn remote_branch_tip(repo: &Path, remote: &str, branch: &str) -> Result<Option<String>> {
+    let reference = format!("refs/heads/{branch}");
+    let output = run_git(repo, &["ls-remote", "--heads", remote, &reference])?;
+    let listed = String::from_utf8_lossy(&output.stdout);
+    let tip = listed.lines().find_map(|line| match line.split_once('\t') {
+        Some((oid, name)) if name == reference => Some(oid.to_string()),
+        _ => None,
+    });
+    Ok(tip)
+}
+
+/// Whether the local `branch` pulls from and pushes to the branch of that name on `remote`.
+pub fn tracks_same_name(repo: &Path, remote: &str, branch: &str) -> bool {
+    let setting = |key: &str| {
+        run_git(repo, &["config", "--get", &format!("branch.{branch}.{key}")])
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .ok()
+    };
+    let merge = format!("refs/heads/{branch}");
+    setting("remote").as_deref() == Some(remote)
+        && setting("pushRemote").as_deref() == Some(remote)
+        && setting("merge") == Some(merge)
+}
+
+/// Fetch `branch` of `remote` and make the local branch of that name track it, so a plain
+/// `git push` goes there.
+pub fn track_remote_branch(repo: &Path, remote: &str, branch: &str) -> Result<()> {
+    fetch_branch(repo, remote, branch)?;
+    set_upstream_of_same_name(repo, remote, branch)
 }
 
 const FETCH_ATTEMPTS: u32 = 3;
@@ -1456,6 +1506,7 @@ mod tests {
             repair: None,
             forwarded: None,
             kept: None,
+            linked_at: None,
         }
     }
 
@@ -2999,6 +3050,48 @@ mod tests {
         git(&upstream, &["checkout", "-q", "main"]);
         let fetched = fetch_branch_head(&repo, "origin", "keep-palette-open").unwrap();
         assert_eq!(fetched, head(&upstream, "keep-palette-open"));
+    }
+
+    #[test]
+    fn a_linked_branch_starts_where_the_dispatch_s_branch_left_the_default_branch() {
+        if no_window_command("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (upstream, repo) = upstream_with_branch(dir.path(), "keep-palette-open");
+        let issue = dir.path().join("repo.worktrees").join("14-palette");
+        add_dispatch_worktree(&repo, &issue, "14-palette", "origin").unwrap();
+        let left_at = head(&issue, "HEAD");
+        git(&issue, &["commit", "--allow-empty", "-m", "mine", "-q"]);
+        git(&upstream, &["commit", "--allow-empty", "-m", "merged meanwhile", "-q"]);
+        assert_eq!(branch_base(&repo, &issue, "origin").unwrap(), left_at);
+    }
+
+    #[test]
+    fn a_branch_the_host_made_is_tracked_so_a_plain_push_goes_there() {
+        if no_window_command("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (upstream, repo) = upstream_with_branch(dir.path(), "keep-palette-open");
+        let issue = dir.path().join("repo.worktrees").join("14-palette");
+        add_dispatch_worktree(&repo, &issue, "14-palette", "origin").unwrap();
+        assert_eq!(remote_branch_tip(&repo, "origin", "14-palette").unwrap(), None);
+        let base = branch_base(&repo, &issue, "origin").unwrap();
+        git(&upstream, &["branch", "14-palette", &base]);
+        git(&upstream, &["branch", "x/refs/heads/14-palette"]);
+        let tip = remote_branch_tip(&repo, "origin", "14-palette").unwrap();
+        assert_eq!(tip, Some(base));
+        let one_branch = "+refs/heads/main:refs/remotes/origin/main";
+        git(&repo, &["config", "remote.origin.fetch", one_branch]);
+        git(&repo, &["config", "remote.pushDefault", "elsewhere"]);
+        assert!(!tracks_same_name(&repo, "origin", "14-palette"));
+        track_remote_branch(&repo, "origin", "14-palette").unwrap();
+        assert!(tracks_same_name(&repo, "origin", "14-palette"));
+        assert!(!tracks_same_name(&repo, "upstream", "14-palette"));
+        git(&issue, &["commit", "--allow-empty", "-m", "mine", "-q"]);
+        git(&issue, &["push", "-q"]);
+        assert_eq!(head(&upstream, "14-palette"), head(&issue, "HEAD"));
     }
 
     #[test]

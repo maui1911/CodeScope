@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::ItemState;
 use super::pull_request::{PullRequest, PullRequestState};
-use super::dispatch::{fetch_branch_head, fetch_pull_head, remote_default_branch};
+use super::dispatch::{fetch_branch_head, fetch_pull_head, remote_branch_tip, remote_default_branch};
 use crate::git::{list_worktrees, remove_worktree, run_git};
 use crate::projects::{PathOnDisk, worktree_is_listed};
 
@@ -71,6 +71,8 @@ pub struct Dispatched {
     pub branch: String,
     /// The project's remote for the item's repository.
     pub remote: String,
+    /// The commit CodeScope made the branch at on the remote; set when it did.
+    pub linked_at: Option<String>,
 }
 
 /// What the worktree or its branch holds that `ended` doesn't keep elsewhere; `None` when
@@ -165,6 +167,21 @@ pub fn clean_up(d: &Dispatched, ended: &Ended) -> Result<Option<Kept>> {
     }
     remove_folder(&d.path)?;
     Ok(None)
+}
+
+/// Remove the branch CodeScope made on the remote while it is still at [`Dispatched::linked_at`];
+/// nothing when it moved, is gone, or wasn't made here.
+pub fn remove_linked_branch(d: &Dispatched) -> Result<()> {
+    let Some(linked_at) = &d.linked_at else {
+        return Ok(());
+    };
+    if remote_branch_tip(&d.repo, &d.remote, &d.branch)?.as_ref() != Some(linked_at) {
+        return Ok(());
+    }
+    let reference = format!("refs/heads/{}", d.branch);
+    let lease = format!("--force-with-lease={reference}:{linked_at}");
+    let delete = format!(":{reference}");
+    run_git(&d.repo, &["push", "--quiet", &lease, &d.remote, &delete]).map(|_| ())
 }
 
 fn remove_folder(path: &Path) -> Result<()> {
@@ -281,6 +298,7 @@ mod tests {
             path,
             branch: "456-clean-up".into(),
             remote: "origin".into(),
+            linked_at: None,
         };
         Some(Repos {
             dir,
@@ -386,6 +404,46 @@ mod tests {
         assert_eq!(listed.matches("worktree ").count(), 1);
     }
 
+    fn on_the_remote(repos: &Repos) -> Option<String> {
+        let branch = format!("refs/heads/{}", repos.dispatched.branch);
+        let found = git(&repos.upstream, &["for-each-ref", "--format=%(objectname)", &branch]);
+        (!found.is_empty()).then_some(found)
+    }
+
+    #[test]
+    fn the_branch_it_made_on_the_remote_goes_while_nothing_was_pushed_to_it() {
+        let Some(mut repos) = dispatched() else { return };
+        let base = git(&repos.dispatched.path, &["rev-parse", "HEAD"]);
+        git(&repos.upstream, &["branch", &repos.dispatched.branch, &base]);
+        repos.dispatched.linked_at = Some(base.clone());
+        assert_eq!(clean_up(&repos.dispatched, &Ended::Closed).unwrap(), None);
+        assert_eq!(on_the_remote(&repos), Some(base), "cleaning up leaves the remote alone");
+        remove_linked_branch(&repos.dispatched).unwrap();
+        assert_eq!(on_the_remote(&repos), None);
+        remove_linked_branch(&repos.dispatched).unwrap();
+    }
+
+    #[test]
+    fn a_branch_on_the_remote_stays_when_it_moved_or_wasn_t_made_here() {
+        let Some(repos) = dispatched() else { return };
+        let base = git(&repos.dispatched.path, &["rev-parse", "HEAD"]);
+        let branch = repos.dispatched.branch.clone();
+        git(&repos.upstream, &["branch", &branch, &base]);
+        assert_eq!(clean_up(&repos.dispatched, &Ended::Closed).unwrap(), None);
+        remove_linked_branch(&repos.dispatched).unwrap();
+        assert_eq!(on_the_remote(&repos), Some(base), "not made by CodeScope");
+
+        let Some(mut repos) = dispatched() else { return };
+        let base = git(&repos.dispatched.path, &["rev-parse", "HEAD"]);
+        let tree = format!("{base}^{{tree}}");
+        let pushed = git(&repos.upstream, &["commit-tree", "-p", &base, "-m", "pushed", &tree]);
+        git(&repos.upstream, &["branch", &branch, &pushed]);
+        repos.dispatched.linked_at = Some(base);
+        assert_eq!(clean_up(&repos.dispatched, &Ended::Closed).unwrap(), None);
+        remove_linked_branch(&repos.dispatched).unwrap();
+        assert_eq!(on_the_remote(&repos), Some(pushed), "someone pushed to it");
+    }
+
     fn link_folder(target: &Path, link: &Path) {
         #[cfg(windows)]
         {
@@ -472,6 +530,7 @@ mod tests {
             repair: None,
             forwarded: None,
             kept: None,
+            linked_at: None,
         };
         assert!(!serde_json::to_string(&row).unwrap().contains("kept"));
         row.kept = Some(Kept::OwnCommits);
