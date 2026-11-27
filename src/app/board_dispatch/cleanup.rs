@@ -5,7 +5,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use codescope_core::board::ItemKind;
-use codescope_core::board::cleanup::{Dispatched, Ended, Kept, clean_up, ended, kept};
+use codescope_core::board::cleanup::{
+    Dispatched, Ended, Kept, clean_up, ended, kept, remove_linked_branch,
+};
 use codescope_core::board::dispatch::{Hold, WorktreeDispatch, projects_for_repository};
 use codescope_core::path_canon::paths_match;
 use codescope_core::process_tree;
@@ -32,6 +34,12 @@ pub(super) struct Cleanup {
 struct Target {
     project_id: String,
     dispatched: Dispatched,
+}
+
+struct Swept {
+    target: Target,
+    found: anyhow::Result<Option<Kept>>,
+    on_remote: anyhow::Result<()>,
 }
 
 impl AppShell {
@@ -153,7 +161,11 @@ impl AppShell {
                     } else {
                         kept(&target.dispatched, &ended)
                     };
-                    (target, found)
+                    let on_remote = match found {
+                        Ok(None) if removable => remove_linked_branch(&target.dispatched),
+                        _ => Ok(()),
+                    };
+                    Swept { target, found, on_remote }
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -213,7 +225,7 @@ impl AppShell {
         item_id: &str,
         round: &RoundKey,
         removed: bool,
-        (target, result): (Target, anyhow::Result<Option<Kept>>),
+        Swept { target, found: result, on_remote }: Swept,
         cx: &mut Context<Self>,
     ) {
         let current = self.dispatch_record(item_id, cx).map(|(_, _, _, record)| record);
@@ -251,9 +263,16 @@ impl AppShell {
                 self.board.dispatch.cleanups.remove(item_id);
                 self.forget_worktree(&target, cx);
                 let title = format!("Cleaned up #{number}");
-                let branch = &target.dispatched.branch;
-                let detail = format!("Removed its worktree and the branch {branch}.");
-                self.push_toast(ToastKind::Ok, title, Some(detail.into()), cx);
+                let (branch, remote) = (&target.dispatched.branch, &target.dispatched.remote);
+                let done = format!("Removed its worktree and the branch {branch}");
+                let (kind, detail) = match on_remote {
+                    Ok(()) => (ToastKind::Ok, format!("{done}.")),
+                    Err(err) => (
+                        ToastKind::Info,
+                        format!("{done} here; it stays on {remote}: {err:#}"),
+                    ),
+                };
+                self.push_toast(kind, title, Some(detail.into()), cx);
             }
             Some(kept) => {
                 state.removable = false;

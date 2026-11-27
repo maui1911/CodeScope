@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::ItemState;
 use super::pull_request::{PullRequest, PullRequestState};
-use super::dispatch::{fetch_branch_head, fetch_pull_head, remote_default_branch};
+use super::dispatch::{fetch_branch_head, fetch_pull_head, remote_branch_tip, remote_default_branch};
 use crate::git::{list_worktrees, remove_worktree, run_git};
 use crate::projects::{PathOnDisk, worktree_is_listed};
 
@@ -148,9 +148,8 @@ fn is_ancestor(repo: &Path, commit: &str, of: &str) -> bool {
     run_git(repo, &["merge-base", "--is-ancestor", commit, of]).is_ok()
 }
 
-/// Remove the worktree and its branch once [`kept`] finds nothing, and the branch CodeScope made
-/// on the remote while it is where CodeScope made it; otherwise remove nothing and say what it
-/// found. A folder git let go of but Windows still holds gets 10 s to come free.
+/// Remove the worktree and its branch once [`kept`] finds nothing; otherwise remove nothing and
+/// say what it found. A folder git let go of but Windows still holds gets 10 s to come free.
 pub fn clean_up(d: &Dispatched, ended: &Ended) -> Result<Option<Kept>> {
     if let Some(found) = kept(d, ended)? {
         return Ok(Some(found));
@@ -166,26 +165,20 @@ pub fn clean_up(d: &Dispatched, ended: &Ended) -> Result<Option<Kept>> {
         let branch = &d.branch;
         eprintln!("warning: removed the worktree of {branch} but kept the branch: {err:#}");
     }
-    if let Some(linked_at) = &d.linked_at
-        && let Err(err) = remove_untouched_remote_branch(d, linked_at)
-    {
-        let (remote, branch) = (&d.remote, &d.branch);
-        eprintln!("warning: kept {branch} on {remote}: {err:#}");
-    }
     remove_folder(&d.path)?;
     Ok(None)
 }
 
-fn remove_untouched_remote_branch(d: &Dispatched, linked_at: &str) -> Result<()> {
-    let reference = format!("refs/heads/{}", d.branch);
-    let listed = run_git(&d.repo, &["ls-remote", "--heads", &d.remote, &reference])?;
-    let listed = String::from_utf8_lossy(&listed.stdout);
-    let untouched = listed
-        .lines()
-        .any(|line| line.split_once('\t') == Some((linked_at, reference.as_str())));
-    if !untouched {
+/// Remove the branch CodeScope made on the remote while it is still at [`Dispatched::linked_at`];
+/// nothing when it moved, is gone, or wasn't made here.
+pub fn remove_linked_branch(d: &Dispatched) -> Result<()> {
+    let Some(linked_at) = &d.linked_at else {
+        return Ok(());
+    };
+    if remote_branch_tip(&d.repo, &d.remote, &d.branch)?.as_ref() != Some(linked_at) {
         return Ok(());
     }
+    let reference = format!("refs/heads/{}", d.branch);
     let lease = format!("--force-with-lease={reference}:{linked_at}");
     let delete = format!(":{reference}");
     run_git(&d.repo, &["push", "--quiet", &lease, &d.remote, &delete]).map(|_| ())
@@ -422,9 +415,12 @@ mod tests {
         let Some(mut repos) = dispatched() else { return };
         let base = git(&repos.dispatched.path, &["rev-parse", "HEAD"]);
         git(&repos.upstream, &["branch", &repos.dispatched.branch, &base]);
-        repos.dispatched.linked_at = Some(base);
+        repos.dispatched.linked_at = Some(base.clone());
         assert_eq!(clean_up(&repos.dispatched, &Ended::Closed).unwrap(), None);
+        assert_eq!(on_the_remote(&repos), Some(base), "cleaning up leaves the remote alone");
+        remove_linked_branch(&repos.dispatched).unwrap();
         assert_eq!(on_the_remote(&repos), None);
+        remove_linked_branch(&repos.dispatched).unwrap();
     }
 
     #[test]
@@ -434,6 +430,7 @@ mod tests {
         let branch = repos.dispatched.branch.clone();
         git(&repos.upstream, &["branch", &branch, &base]);
         assert_eq!(clean_up(&repos.dispatched, &Ended::Closed).unwrap(), None);
+        remove_linked_branch(&repos.dispatched).unwrap();
         assert_eq!(on_the_remote(&repos), Some(base), "not made by CodeScope");
 
         let Some(mut repos) = dispatched() else { return };
@@ -443,6 +440,7 @@ mod tests {
         git(&repos.upstream, &["branch", &branch, &pushed]);
         repos.dispatched.linked_at = Some(base);
         assert_eq!(clean_up(&repos.dispatched, &Ended::Closed).unwrap(), None);
+        remove_linked_branch(&repos.dispatched).unwrap();
         assert_eq!(on_the_remote(&repos), Some(pushed), "someone pushed to it");
     }
 
