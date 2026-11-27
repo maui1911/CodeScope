@@ -11,6 +11,7 @@ use serde::de::DeserializeOwned;
 
 use super::answers::Comment;
 use super::dispatch::StatusChange;
+use super::dispatch_settings::ReviewRequest;
 use super::pull_request::{
     Checks, FailedCheck, Health, LinkedPullRequest, Mergeable, PullRequest, PullRequestComment,
     PullRequestHead, PullRequestState,
@@ -719,6 +720,36 @@ pub fn mark_ready_for_review(pull_request_id: &str) -> Result<()> {
         &[],
     )?;
     parse_data::<serde_json::Value>(&stdout).map(|_| ())
+}
+
+/// Ask for a review of pull request `number` of `repository` (`owner/name`); one who already
+/// reviewed it is asked again.
+pub fn request_reviews(repository: &str, number: u32, request: &ReviewRequest) -> Result<()> {
+    let (args, body) = review_request_call(repository, number, request);
+    run_gh_api_with_input(&args, Some(body)).map(|_| ())
+}
+
+fn review_request_call(
+    repository: &str,
+    number: u32,
+    request: &ReviewRequest,
+) -> (Vec<String>, String) {
+    let args = [
+        "--method",
+        "POST",
+        &format!("repos/{repository}/pulls/{number}/requested_reviewers"),
+        "--input",
+        "-",
+    ]
+    .map(String::from)
+    .to_vec();
+    let slugs: Vec<&str> = request
+        .teams
+        .iter()
+        .map(|team| team.split_once('/').map_or(team.as_str(), |(_, slug)| slug))
+        .collect();
+    let body = serde_json::json!({ "reviewers": request.users, "team_reviewers": slugs });
+    (args, body.to_string())
 }
 
 fn run_graphql(raw_fields: &[String], typed_fields: &[String]) -> Result<String> {
@@ -1985,5 +2016,17 @@ mod tests {
         ] {
             assert!(write_access(Err(anyhow::anyhow!(refused))).is_err(), "{refused}");
         }
+    }
+
+    #[test]
+    fn a_review_request_posts_people_and_teams_to_the_pull_request() {
+        let request = ReviewRequest {
+            users: vec!["ana".into()],
+            teams: vec!["acme/web".into()],
+        };
+        let (args, body) = review_request_call("acme/app", 12, &request);
+        let path = "repos/acme/app/pulls/12/requested_reviewers";
+        assert_eq!(args, ["--method", "POST", path, "--input", "-"]);
+        assert_eq!(body, r#"{"reviewers":["ana"],"team_reviewers":["web"]}"#);
     }
 }
