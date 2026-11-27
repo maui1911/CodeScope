@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use super::findings::Outcome;
+use super::repair::Repair;
 use super::pull_request::{LinkedPullRequest, PostedPullRequest, PullRequestHead};
 use super::{Board, BoardItem, ColumnMapping, ColumnRole, ItemKind, ItemState, RoleKind};
 use super::{mapped_column, normalize_column_name};
@@ -133,6 +134,9 @@ pub struct WorktreeDispatch {
     /// Set for a pull request item from a fork.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork: Option<ForkPush>,
+    /// The repairs on the pull request the dispatch opened, since it was last healthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair: Option<Repair>,
 }
 
 /// Where a round on a fork's pull request pushes.
@@ -1347,6 +1351,7 @@ mod tests {
             pull_request: None,
             review: None,
             fork: None,
+            repair: None,
         }
     }
 

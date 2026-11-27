@@ -12,7 +12,8 @@ use serde::de::DeserializeOwned;
 use super::answers::Comment;
 use super::dispatch::StatusChange;
 use super::pull_request::{
-    Checks, LinkedPullRequest, PullRequest, PullRequestHead, PullRequestState,
+    Checks, FailedCheck, Health, LinkedPullRequest, Mergeable, PullRequest, PullRequestHead,
+    PullRequestState,
 };
 use super::{Board, BoardItem, BoardOwner, BoardRef, Column, ItemKind, ItemState};
 use crate::process::no_window_command;
@@ -424,7 +425,15 @@ const PULL_REQUESTS_QUERY: &str = r#"query($owner: String!, $name: String!, $bra
       orderBy: { field: CREATED_AT, direction: DESC }) {
       nodes {
         id number url state isDraft isCrossRepository headRefOid
-        commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+        baseRefName mergeable mergeStateStatus
+        reviews(states: [APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED]) { totalCount }
+        commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) {
+          nodes {
+            __typename
+            ... on CheckRun { name status conclusion detailsUrl }
+            ... on StatusContext { context state targetUrl }
+          }
+        } } } } }
       }
     }
   }
@@ -477,14 +486,32 @@ fn into_pull_request(node: PullRequestNode) -> Option<PullRequest> {
         .flatten()
         .next()
         .and_then(|c| c.commit.status_check_rollup);
+    let checks = Checks::from_rollup(rollup.as_ref().map(|r| r.state.as_str()));
+    let contexts = rollup
+        .and_then(|r| r.contexts)
+        .map(|c| c.nodes.into_iter().flatten().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let health = Health {
+        base: node.base_ref_name.unwrap_or_default(),
+        mergeable: match node.mergeable.as_deref() {
+            Some("MERGEABLE") => Mergeable::Yes,
+            Some("CONFLICTING") => Mergeable::Conflicts,
+            _ => Mergeable::Unknown,
+        },
+        behind: node.merge_state_status.as_deref() == Some("BEHIND"),
+        reviewed: node.reviews.is_some_and(|r| r.total_count > 0),
+        checks_running: contexts.iter().any(CheckContext::running),
+        failed_checks: contexts.into_iter().filter_map(CheckContext::failed).collect(),
+    };
     Some(PullRequest {
         id: node.id,
         number: node.number,
         url: node.url,
         state,
         is_draft: node.is_draft,
-        checks: Checks::from_rollup(rollup.as_ref().map(|r| r.state.as_str())),
+        checks,
         head_oid: node.head_ref_oid,
+        health,
     })
 }
 
@@ -492,7 +519,15 @@ const PULL_REQUEST_QUERY: &str = r#"query($id: ID!) {
   node(id: $id) {
     ... on PullRequest {
       id number url state isDraft isCrossRepository headRefOid
-      commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+      baseRefName mergeable mergeStateStatus
+      reviews(states: [APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED]) { totalCount }
+      commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) {
+        nodes {
+          __typename
+          ... on CheckRun { name status conclusion detailsUrl }
+          ... on StatusContext { context state targetUrl }
+        }
+      } } } } }
     }
   }
 }"#;
@@ -927,6 +962,76 @@ struct PullRequestNode {
     is_cross_repository: bool,
     head_ref_oid: String,
     commits: CommitList,
+    #[serde(default)]
+    base_ref_name: Option<String>,
+    #[serde(default)]
+    mergeable: Option<String>,
+    #[serde(default)]
+    merge_state_status: Option<String>,
+    #[serde(default)]
+    reviews: Option<Count>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Count {
+    total_count: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "__typename")]
+enum CheckContext {
+    #[serde(rename_all = "camelCase")]
+    CheckRun {
+        name: String,
+        status: String,
+        conclusion: Option<String>,
+        details_url: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    StatusContext {
+        context: String,
+        state: String,
+        target_url: Option<String>,
+    },
+}
+
+impl CheckContext {
+    fn running(&self) -> bool {
+        match self {
+            CheckContext::CheckRun { status, .. } => status != "COMPLETED",
+            CheckContext::StatusContext { state, .. } => {
+                matches!(state.as_str(), "PENDING" | "EXPECTED")
+            }
+        }
+    }
+
+    fn failed(self) -> Option<FailedCheck> {
+        let (name, url) = match self {
+            CheckContext::CheckRun {
+                name,
+                conclusion: Some(conclusion),
+                details_url,
+                ..
+            } if matches!(
+                conclusion.as_str(),
+                "FAILURE" | "TIMED_OUT" | "CANCELLED" | "STARTUP_FAILURE" | "ACTION_REQUIRED"
+            ) =>
+            {
+                (name, details_url)
+            }
+            CheckContext::StatusContext {
+                context,
+                state,
+                target_url,
+            } if matches!(state.as_str(), "FAILURE" | "ERROR") => (context, target_url),
+            _ => return None,
+        };
+        Some(FailedCheck {
+            name,
+            url: url.unwrap_or_default(),
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -981,6 +1086,13 @@ struct Commit {
 #[derive(Deserialize)]
 struct Rollup {
     state: String,
+    #[serde(default)]
+    contexts: Option<ContextList>,
+}
+
+#[derive(Deserialize)]
+struct ContextList {
+    nodes: Vec<Option<CheckContext>>,
 }
 
 #[derive(Deserialize)]
@@ -1478,6 +1590,7 @@ mod tests {
                     is_draft: true,
                     checks: Checks::Running,
                     head_oid: "c417".into(),
+                    health: Health::default(),
                 },
                 PullRequest {
                     id: "PR_1".into(),
@@ -1487,6 +1600,7 @@ mod tests {
                     is_draft: false,
                     checks: Checks::None,
                     head_oid: "c415".into(),
+                    health: Health::default(),
                 },
             ]
         );
@@ -1516,12 +1630,65 @@ mod tests {
                 is_draft: true,
                 checks: Checks::Passing,
                 head_oid: "c420".into(),
+                health: Health::default(),
             })
         );
         let merged = parse_pull_request(&node("MERGED")).unwrap().unwrap();
         assert_eq!(merged.state, PullRequestState::Merged);
         assert_eq!(parse_pull_request(&node("CLOSED")).unwrap(), None);
         assert!(parse_pull_request(r#"{"data":{"node":null}}"#).is_err());
+    }
+
+    #[test]
+    fn reads_what_stands_between_a_pull_request_and_its_merge() {
+        let node = |mergeable: &str, merge_state: &str, reviews: u32| {
+            format!(
+                r#"{{"data":{{"node":{{"id":"PR_420","number":420,
+                  "url":"https://github.com/maui1911/CodeScope/pull/420","state":"OPEN",
+                  "isDraft":false,"isCrossRepository":false,"headRefOid":"c420",
+                  "baseRefName":"main","mergeable":"{mergeable}",
+                  "mergeStateStatus":"{merge_state}","reviews":{{"totalCount":{reviews}}},
+                  "commits":{{"nodes":[{{"commit":{{"statusCheckRollup":{{"state":"FAILURE",
+                    "contexts":{{"nodes":[
+                      {{"__typename":"CheckRun","name":"build","status":"COMPLETED",
+                        "conclusion":"FAILURE","detailsUrl":"https://ci/build"}},
+                      {{"__typename":"CheckRun","name":"lint","status":"IN_PROGRESS",
+                        "conclusion":null,"detailsUrl":null}},
+                      {{"__typename":"CheckRun","name":"docs","status":"COMPLETED",
+                        "conclusion":"SKIPPED","detailsUrl":"https://ci/docs"}},
+                      {{"__typename":"CheckRun","name":"slow","status":"COMPLETED",
+                        "conclusion":"TIMED_OUT","detailsUrl":"https://ci/slow"}},
+                      {{"__typename":"StatusContext","context":"ci/legacy","state":"ERROR",
+                        "targetUrl":"https://ci/legacy"}},
+                      {{"__typename":"StatusContext","context":"deploy","state":"SUCCESS",
+                        "targetUrl":null}}
+                    ]}}}}}}}}]}}
+                }}}}}}"#
+            )
+        };
+        let health = |json: &str| parse_pull_request(json).unwrap().unwrap().health;
+        let check = |name: &str, url: &str| FailedCheck {
+            name: name.into(),
+            url: url.into(),
+        };
+        assert_eq!(
+            health(&node("CONFLICTING", "BEHIND", 1)),
+            Health {
+                base: "main".into(),
+                mergeable: Mergeable::Conflicts,
+                behind: true,
+                reviewed: true,
+                failed_checks: vec![
+                    check("build", "https://ci/build"),
+                    check("slow", "https://ci/slow"),
+                    check("ci/legacy", "https://ci/legacy"),
+                ],
+                checks_running: true,
+            }
+        );
+        let clean = health(&node("MERGEABLE", "UNSTABLE", 0));
+        assert_eq!((clean.mergeable, clean.behind, clean.reviewed), (Mergeable::Yes, false, false));
+        assert_eq!(health(&node("UNKNOWN", "UNKNOWN", 0)).mergeable, Mergeable::Unknown);
     }
 
     #[test]

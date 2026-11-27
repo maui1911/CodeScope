@@ -51,6 +51,44 @@ pub struct PullRequest {
     pub checks: Checks,
     /// The commit its branch points at.
     pub head_oid: String,
+    /// What keeps it from merging, as the last read found it.
+    pub health: Health,
+}
+
+/// Whether GitHub can merge a pull request into its base without a conflict.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Mergeable {
+    /// GitHub hasn't worked it out yet.
+    #[default]
+    Unknown,
+    Yes,
+    Conflicts,
+}
+
+/// A check that failed on a pull request's last commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedCheck {
+    /// The check run's name, or the status's context.
+    pub name: String,
+    /// Its page on GitHub; empty when it has none.
+    pub url: String,
+}
+
+/// What stands between a pull request and its merge, as the last read found it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Health {
+    /// The branch it merges into.
+    pub base: String,
+    /// `Unknown` for a while after a push.
+    pub mergeable: Mergeable,
+    /// GitHub asks it to catch up with its base before it can merge.
+    pub behind: bool,
+    /// Someone submitted a review on it.
+    pub reviewed: bool,
+    /// The checks that failed on its last commit.
+    pub failed_checks: Vec<FailedCheck>,
+    /// Whether a check on its last commit hasn't finished.
+    pub checks_running: bool,
 }
 
 /// The pull request a round produced, from those on its branch newest first: the newest open
@@ -163,6 +201,7 @@ mod tests {
             is_draft,
             checks: Checks::None,
             head_oid: "h1".into(),
+            health: Health::default(),
         }
     }
 
