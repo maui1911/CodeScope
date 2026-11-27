@@ -1065,9 +1065,32 @@ board, each with their own CodeScope or another tool that follows the
   worktree, as skills do, so a skill can hand work to them. The CLI
   per phase stays local, because it depends on what the user has
   installed.
-* **Setup command.** A new worktree runs `.codescope/setup` from the
-  repository's default branch in the project folder, else the one in
-  `projects.json`, else nothing.
+* **Setup command.** A worktree the dispatch creates first runs the
+  repository's setup script, before the session gets its task:
+  `.codescope/setup.ps1` on Windows (with PowerShell) and
+  `.codescope/setup.sh` on macOS and Linux, one per OS so each is
+  written for its own shell. The script comes from the remote's default
+  branch, never from the item's branch, so a pull request cannot change
+  what runs; a link there is refused. A copy of it runs from
+  `.codescope/` in the worktree, so it finds the worktree next to
+  itself, with `CODESCOPE_PROJECT` and `CODESCOPE_WORKTREE` set, and
+  its output goes to `.codescope/setup.log`; both stay out of git like
+  the handover files. PowerShell runs it with
+  `$ErrorActionPreference = 'Stop'` and
+  `$PSNativeCommandUseErrorActionPreference`, so pwsh 7.4 and later
+  stop at the first failing command or program; Windows PowerShell 5.1
+  and older pwsh stop at a failing command, but see a failing program
+  only when it is the last to run. A script without a shebang runs
+  with `sh -e`; one with a shebang decides that itself. What the script
+  makes should be ignored by git, or cleanup keeps the worktree for it.
+  A setup that fails, or runs longer than 30 minutes, stops the round,
+  with its exit and the end of its log on the card; the worktree stays,
+  and the next move runs the setup again. A worktree that already ran
+  the same script successfully at the same commit doesn't run it again.
+  A reused worktree is first brought up to what was just fetched,
+  unless it has changes of its own, which it keeps. Without a script
+  nothing runs; a command from the project's settings is to come
+  (#464).
 * **Skills come from the item's branch.** The agent loads skills and
   `CLAUDE.md` from the worktree, so a branch can change them for its
   own dispatch. A pull request item from a fork therefore needs the

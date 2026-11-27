@@ -3,6 +3,7 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -37,10 +38,13 @@ const SKILL_FOLDERS: [&str; 6] = [
     ".opencode",
     ".github",
 ];
-const EXCLUDED_FILES: [&str; 3] = [
+const EXCLUDED_FILES: [&str; 6] = [
     "/.codescope/dispatch.md",
     "/.codescope/findings.md",
     "/.codescope/reply.md",
+    "/.codescope/setup.log",
+    "/.codescope/.setup.ps1",
+    "/.codescope/.setup.sh",
 ];
 
 /// The last move of an item on one board, from its issue's timeline.
@@ -412,6 +416,32 @@ pub fn decide(
         check(board, mapping, item, facts, moved_to)
             .and_then(|()| round_on(item.kind, moved_to, facts.pull_request)),
     )
+}
+
+/// Whether `round`, started on the move at `trigger_at`, still has its item as `board` has it
+/// now: open, in the column that starts that round, and not moved since. `last_move` is `None`
+/// when unread.
+pub fn start_still_wanted(
+    board: &Board,
+    mapping: &ColumnMapping,
+    item_id: &str,
+    round: Round,
+    last_move: Option<&StatusChange>,
+    trigger_at: &str,
+) -> bool {
+    let Some(item) = board.items.iter().find(|item| item.id == item_id) else {
+        return false;
+    };
+    let moved_to = board.role_of(item, mapping).and_then(Round::after_move);
+    let unmoved = last_move.is_none_or(|change| change.created_at == trigger_at);
+    item.state == ItemState::Open && moved_to == Some(started_by(round)) && unmoved
+}
+
+fn started_by(round: Round) -> Round {
+    match round {
+        Round::Review => Round::Implementation,
+        round => round,
+    }
 }
 
 fn round_on(kind: ItemKind, moved_to: Round, pull_request: OwnPullRequest) -> Result<Round, Hold> {
@@ -1194,8 +1224,7 @@ pub fn fetch_pull_head(repo: &Path, remote: &str, number: u32) -> Result<String>
 
 fn fetch_pull(repo: &Path, remote: &str, number: u32) -> Result<String> {
     let fetched = format!("refs/remotes/{remote}/pull/{number}");
-    let refspec = format!("+refs/pull/{number}/head:{fetched}");
-    run_git(repo, &["fetch", "--quiet", remote, &refspec])?;
+    fetch(repo, remote, &format!("+refs/pull/{number}/head:{fetched}"))?;
     Ok(fetched)
 }
 
@@ -1208,9 +1237,28 @@ pub fn fetch_branch_head(repo: &Path, remote: &str, branch: &str) -> Result<Stri
 
 fn fetch_branch(repo: &Path, remote: &str, branch: &str) -> Result<String> {
     let fetched = format!("refs/remotes/{remote}/{branch}");
-    let refspec = format!("+refs/heads/{branch}:{fetched}");
-    run_git(repo, &["fetch", "--quiet", remote, &refspec])?;
+    fetch(repo, remote, &format!("+refs/heads/{branch}:{fetched}"))?;
     Ok(fetched)
+}
+
+const FETCH_ATTEMPTS: u32 = 3;
+const FETCH_RETRY_AFTER: Duration = Duration::from_millis(500);
+
+fn fetch(repo: &Path, remote: &str, refspec: &str) -> Result<()> {
+    let mut attempt = 1;
+    loop {
+        match run_git(repo, &["fetch", "--quiet", remote, refspec]) {
+            Err(err) if attempt < FETCH_ATTEMPTS && is_ref_lock_error(&format!("{err:#}")) => {
+                attempt += 1;
+                std::thread::sleep(FETCH_RETRY_AFTER);
+            }
+            fetched => return fetched.map(|_| ()),
+        }
+    }
+}
+
+fn is_ref_lock_error(message: &str) -> bool {
+    message.contains("cannot lock ref")
 }
 
 fn add_worktree_from(
@@ -1221,18 +1269,32 @@ fn add_worktree_from(
     base_name: &str,
 ) -> Result<()> {
     let local = format!("refs/heads/{branch}");
+    let held_here = path.exists() && is_worktree_on(repo, path, branch);
     if ref_exists(repo, &local)
         && run_git(repo, &["merge-base", "--is-ancestor", &local, base]).is_err()
     {
+        if held_here {
+            bail!(
+                "the local branch {branch} has commits {base_name} doesn't, and {} has it \
+                 checked out: keep what you need, remove that worktree and the branch, then \
+                 move the item again",
+                path.display()
+            );
+        }
         bail!(
             "the local branch {branch} has commits {base_name} doesn't: remove or rename it, \
              then move the item again"
         );
     }
-    if path.exists() {
-        if is_worktree_on(repo, path, branch) {
+    if held_here {
+        if has_changes(path)? {
             return Ok(());
         }
+        return run_git(path, &["merge", "--ff-only", "--quiet", base])
+            .map(|_| ())
+            .with_context(|| format!("bring {} up to {base_name}", path.display()));
+    }
+    if path.exists() {
         bail!("{} already exists", path.display());
     }
     let path_arg = path.to_string_lossy();
@@ -1241,6 +1303,11 @@ fn add_worktree_from(
         &["worktree", "add", "--no-track", "-B", branch, &path_arg, base],
     )
     .map(|_| ())
+}
+
+fn has_changes(worktree: &Path) -> Result<bool> {
+    let status = run_git(worktree, &["status", "--porcelain", "--untracked-files=no"])?;
+    Ok(!status.stdout.is_empty())
 }
 
 pub(crate) fn remote_default_branch(repo: &Path, remote: &str) -> Result<String> {
@@ -2668,19 +2735,16 @@ mod tests {
     fn excludes_the_handover_files_once() {
         let existing = "# git ls-files\n*.log";
         let added = handover_exclude_lines(existing).unwrap();
-        assert_eq!(
-            added,
-            "\n/.codescope/dispatch.md\n/.codescope/findings.md\n/.codescope/reply.md\n"
-        );
+        let all = "/.codescope/dispatch.md\n/.codescope/findings.md\n/.codescope/reply.md\n\
+                   /.codescope/setup.log\n/.codescope/.setup.ps1\n/.codescope/.setup.sh\n";
+        assert_eq!(added, format!("\n{all}"));
         assert_eq!(handover_exclude_lines(&format!("{existing}{added}")), None);
         assert_eq!(
             handover_exclude_lines("/.codescope/dispatch.md\n/.codescope/findings.md\n").unwrap(),
-            "/.codescope/reply.md\n"
+            "/.codescope/reply.md\n/.codescope/setup.log\n/.codescope/.setup.ps1\n\
+             /.codescope/.setup.sh\n"
         );
-        assert_eq!(
-            handover_exclude_lines("").unwrap(),
-            "/.codescope/dispatch.md\n/.codescope/findings.md\n/.codescope/reply.md\n"
-        );
+        assert_eq!(handover_exclude_lines("").unwrap(), all);
     }
 
     #[test]
@@ -2695,7 +2759,8 @@ mod tests {
         exclude_handover_files(repo).unwrap();
         assert_eq!(
             std::fs::read_to_string(&exclude).unwrap(),
-            "*.log\n/.codescope/dispatch.md\n/.codescope/findings.md\n/.codescope/reply.md\n"
+            "*.log\n/.codescope/dispatch.md\n/.codescope/findings.md\n/.codescope/reply.md\n\
+             /.codescope/setup.log\n/.codescope/.setup.ps1\n/.codescope/.setup.sh\n"
         );
     }
 
@@ -2934,6 +2999,115 @@ mod tests {
         git(&upstream, &["checkout", "-q", "main"]);
         let fetched = fetch_branch_head(&repo, "origin", "keep-palette-open").unwrap();
         assert_eq!(fetched, head(&upstream, "keep-palette-open"));
+    }
+
+    #[test]
+    fn a_reused_worktree_is_brought_up_to_what_was_fetched() {
+        if no_window_command("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (upstream, repo) = upstream_with_branch(dir.path(), "keep-palette-open");
+        let path = dir.path().join("repo.worktrees").join("keep-palette-open");
+        add_pull_request_worktree(&repo, &path, "keep-palette-open", "origin").unwrap();
+        git(&upstream, &["checkout", "-q", "keep-palette-open"]);
+        git(&upstream, &["commit", "--allow-empty", "-m", "pushed after a failed start", "-q"]);
+        git(&upstream, &["checkout", "-q", "main"]);
+        add_pull_request_worktree(&repo, &path, "keep-palette-open", "origin").unwrap();
+        assert_eq!(head(&path, "HEAD"), head(&upstream, "keep-palette-open"));
+
+        let issue = dir.path().join("repo.worktrees").join("14-palette");
+        add_dispatch_worktree(&repo, &issue, "14-palette", "origin").unwrap();
+        git(&upstream, &["commit", "--allow-empty", "-m", "merged meanwhile", "-q"]);
+        add_dispatch_worktree(&repo, &issue, "14-palette", "origin").unwrap();
+        assert_eq!(head(&issue, "HEAD"), head(&upstream, "main"));
+    }
+
+    #[test]
+    fn a_force_pushed_branch_names_the_worktree_that_holds_it() {
+        if no_window_command("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (upstream, repo) = upstream_with_branch(dir.path(), "keep-palette-open");
+        let path = dir.path().join("repo.worktrees").join("keep-palette-open");
+        add_pull_request_worktree(&repo, &path, "keep-palette-open", "origin").unwrap();
+        git(&upstream, &["checkout", "-q", "keep-palette-open"]);
+        git(&upstream, &["reset", "-q", "--hard", "main"]);
+        git(&upstream, &["commit", "--allow-empty", "-m", "rewritten", "-q"]);
+        git(&upstream, &["checkout", "-q", "main"]);
+        let err = add_pull_request_worktree(&repo, &path, "keep-palette-open", "origin")
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains(&path.display().to_string()), "{message}");
+    }
+
+    #[test]
+    fn a_start_is_still_wanted_while_its_item_stays_where_the_move_put_it() {
+        let board = board_with(issue_in("y"));
+        let mapping = suggest_mapping(&board.columns);
+        let change = moved_by("maui1911", "Ready");
+        let wanted = |board: &Board, round, change: Option<&StatusChange>| {
+            start_still_wanted(board, &mapping, "PVTI_1", round, change, MOVED)
+        };
+        assert!(wanted(&board, Round::Implementation, Some(&change)));
+        assert!(wanted(&board, Round::Review, Some(&change)), "Ready starts a review too");
+        assert!(wanted(&board, Round::Implementation, None), "moves unread");
+        let again = StatusChange {
+            created_at: NOW.into(),
+            ..change.clone()
+        };
+        assert!(!wanted(&board, Round::Implementation, Some(&again)));
+        assert!(!wanted(&board, Round::Research, None), "Ready doesn't start research");
+        let research = board_with(issue_in("r"));
+        assert!(wanted(&research, Round::Research, None));
+        assert!(!wanted(&research, Round::Implementation, None));
+        let backlog = board_with(issue_in("t"));
+        assert!(!wanted(&backlog, Round::Implementation, Some(&change)));
+        let closed = board_with(BoardItem {
+            state: ItemState::Closed,
+            ..issue_in("y")
+        });
+        assert!(!wanted(&closed, Round::Implementation, Some(&change)));
+        let gone = Board {
+            items: Vec::new(),
+            ..board.clone()
+        };
+        assert!(!wanted(&gone, Round::Implementation, Some(&change)));
+    }
+
+    #[test]
+    fn a_fetch_that_lost_a_ref_lock_race_is_tried_again() {
+        let raced = "git fetch --quiet origin main exited 1: error: cannot lock ref \
+                     'refs/remotes/origin/main': is at 1a2b but expected 3c4d";
+        assert!(is_ref_lock_error(raced));
+        let locked = "error: cannot lock ref 'refs/remotes/origin/main': Unable to create \
+                      'D:/repo/.git/refs/remotes/origin/main.lock': File exists.";
+        assert!(is_ref_lock_error(locked));
+        let gone = "fatal: couldn't find remote ref refs/heads/gone";
+        assert!(!is_ref_lock_error(gone));
+    }
+
+    #[test]
+    fn a_reused_worktree_with_changes_of_its_own_is_used_as_it_is() {
+        if no_window_command("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (upstream, repo) = upstream_with_branch(dir.path(), "keep-palette-open");
+        std::fs::write(upstream.join("notes.txt"), "one\n").unwrap();
+        git(&upstream, &["add", "notes.txt"]);
+        git(&upstream, &["commit", "-q", "-m", "notes"]);
+        let issue = dir.path().join("repo.worktrees").join("14-palette");
+        add_dispatch_worktree(&repo, &issue, "14-palette", "origin").unwrap();
+        let started = head(&issue, "HEAD");
+        std::fs::write(issue.join("notes.txt"), "mine\n").unwrap();
+        std::fs::write(upstream.join("notes.txt"), "theirs\n").unwrap();
+        git(&upstream, &["commit", "-q", "-am", "merged meanwhile"]);
+        add_dispatch_worktree(&repo, &issue, "14-palette", "origin").unwrap();
+        assert_eq!(head(&issue, "HEAD"), started);
+        let notes = std::fs::read_to_string(issue.join("notes.txt")).unwrap();
+        assert_eq!(notes, "mine\n");
     }
 
     #[test]
