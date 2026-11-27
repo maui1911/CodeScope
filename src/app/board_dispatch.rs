@@ -615,6 +615,9 @@ pub(crate) struct ReadInput {
     known_access: HashMap<(String, String), bool>,
     /// Local projects as `(id, path)`, when their remotes are due for a read.
     projects: Option<Vec<(String, String)>>,
+    /// Set while a worktree holds a dispatch, whose cleanup needs the remotes even when no item
+    /// is in a trigger column.
+    dispatched: bool,
     discussions: Vec<DiscussionRead>,
     workflows_due: Vec<String>,
 }
@@ -869,7 +872,8 @@ fn access_key(repository: &str, login: &str) -> (String, String) {
 }
 
 /// Read every board, and for items in trigger columns their last moves, who is signed in to
-/// `gh`, the write access of teammates who moved them, and the projects' remotes.
+/// `gh`, the write access of teammates who moved them, and the projects' remotes while an item
+/// is in a trigger column or a worktree holds a dispatch.
 pub(crate) fn read_boards(input: ReadInput) -> ReadOutput {
     let mut output = ReadOutput::default();
     let mut viewer = input.viewer;
@@ -920,7 +924,7 @@ pub(crate) fn read_boards(input: ReadInput) -> ReadOutput {
         output.discussions =
             read_discussions(&input.discussions, &input.known_access, &mut output.access);
     }
-    if any_trigger && let Some(projects) = input.projects {
+    if (any_trigger || input.dispatched) && let Some(projects) = input.projects {
         output.remotes = Some(
             projects
                 .into_iter()
@@ -1213,8 +1217,9 @@ impl AppShell {
             && local.iter().all(|(id, path)| read_projects.contains(&(id.as_str(), path.as_str())));
         let remotes_due = !same_projects
             || state.remotes_read_at.is_none_or(|at| at.elapsed() >= REMOTES_MAX_AGE);
-        let discussions = self
-            .dispatch_records(cx)
+        let records = self.dispatch_records(cx);
+        let dispatched = !records.is_empty();
+        let discussions = records
             .into_iter()
             .filter_map(|(_, _, _, record)| {
                 let posted = record.findings.clone()?;
@@ -1242,6 +1247,7 @@ impl AppShell {
                 .flatten(),
             known_access: fresh_access(&state.access),
             projects: remotes_due.then_some(local),
+            dispatched,
             discussions,
             workflows_due: self
                 .settings
@@ -4059,6 +4065,37 @@ mod tests {
             stopped: false,
             typed,
         })
+    }
+
+    #[test]
+    fn the_remotes_are_read_while_a_dispatch_waits_with_no_item_in_a_trigger_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(dir.path()).output()
+        };
+        if git(&["init", "-q"]).is_err() {
+            return;
+        }
+        git(&["remote", "add", "origin", "https://github.com/acme/app.git"]).unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let input = |dispatched| ReadInput {
+            boards: Vec::new(),
+            viewer: Some(Viewer {
+                login: "ana".to_string(),
+                id: "U_1".to_string(),
+            }),
+            known_access: HashMap::new(),
+            projects: Some(vec![("p1".to_string(), path.clone())]),
+            discussions: Vec::new(),
+            workflows_due: Vec::new(),
+            dispatched,
+        };
+        assert!(read_boards(input(false)).remotes.is_none(), "nothing to start or clean up");
+        let remotes = read_boards(input(true)).remotes.expect("the cleanup needs them");
+        assert_eq!(remotes.len(), 1);
+        assert_eq!(remotes[0].project_id, "p1");
+        let origin = ("origin".to_string(), "https://github.com/acme/app.git".to_string());
+        assert_eq!(remotes[0].remotes, vec![origin]);
     }
 
     #[test]
