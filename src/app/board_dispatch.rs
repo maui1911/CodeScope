@@ -40,7 +40,7 @@ use codescope_core::board::pull_request::{
     Checks, PostedPullRequest, PullRequest, PullRequestComment, PullRequestHead, PullRequestState,
     moves_to_in_review, pull_request_comment, review_round_worked, round_pull_request,
 };
-use codescope_core::board::dispatch_settings::DispatchSettings;
+use codescope_core::board::dispatch_settings::{DispatchSettings, ReviewRequest};
 use codescope_core::board::setup::run_setup;
 use codescope_core::board::reply::{read_reply, reply_problems_message};
 use codescope_core::board::repair::{
@@ -2913,10 +2913,51 @@ impl AppShell {
             .and_then(|(_, _, _, record)| record.pull_request)
             .or(reported);
         if let Some(posted) = posted {
+            let number = posted.number;
             self.keep_posted(item_id, PostedPullRequest { in_review: true, ..posted }, cx);
+            self.ask_reviewers(item_id, number, cx);
         }
         self.refresh_boards(cx);
         cx.notify();
+    }
+
+    fn review_request(
+        &self,
+        project_id: &str,
+        record: &WorktreeDispatch,
+        cx: &App,
+    ) -> Option<ReviewRequest> {
+        if record.kind == ItemKind::PullRequest {
+            return None;
+        }
+        let author = self.board.dispatch.viewer.as_ref().map_or("", |v| v.login.as_str());
+        let project = self.current_projects(cx).project(project_id)?;
+        Some(project.dispatch.review_request(author)).filter(|request| !request.is_empty())
+    }
+
+    fn ask_reviewers(&mut self, item_id: &str, number: u32, cx: &mut Context<Self>) {
+        let Some((project_id, _, _, record)) = self.dispatch_record(item_id, cx) else {
+            return;
+        };
+        let Some(request) = self.review_request(&project_id, &record, cx) else {
+            return;
+        };
+        let repository = record.repository;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    github::request_reviews(&repository, number, &request)
+                        .map_err(|err| format!("{err:#}"))
+                })
+                .await;
+            if let Err(message) = result {
+                let _ = this.update(cx, |this, cx| {
+                    let title = format!("Couldn't ask for a review of PR #{number}");
+                    this.push_toast(ToastKind::Err, title, Some(message.into()), cx);
+                });
+            }
+        })
+        .detach();
     }
 
     fn project_agent(&self, project: &Project) -> Option<AgentProfile> {
@@ -3098,13 +3139,18 @@ impl AppShell {
             ..pr
         };
         watch.pull_request = Some(ready.clone());
-        let role = self
-            .dispatch_record(item_id, cx)
-            .and_then(|(_, _, _, r)| self.item_role(&r.board_url, item_id));
-        let detail = moves_to_in_review(&ready, role)
-            .then(|| SharedString::from("It moves to In review."));
+        let record = self.dispatch_record(item_id, cx);
+        let role = record.as_ref().and_then(|(_, _, _, r)| self.item_role(&r.board_url, item_id));
+        let asks =
+            record.and_then(|(project_id, _, _, r)| self.review_request(&project_id, &r, cx));
+        let detail = moves_to_in_review(&ready, role).then(|| match asks {
+            Some(request) => {
+                format!("It moves to In review and asks {} for a review.", request.names())
+            }
+            None => "It moves to In review.".to_string(),
+        });
         let title = format!("PR #{} is ready for review", ready.number);
-        self.push_toast(ToastKind::Ok, title, detail, cx);
+        self.push_toast(ToastKind::Ok, title, detail.map(SharedString::from), cx);
         self.watch_pull_requests(cx);
         cx.notify();
     }

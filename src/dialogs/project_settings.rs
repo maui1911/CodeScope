@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use codescope_core::board::dispatch::Round;
 use codescope_core::board::dispatch_settings::{
-    DispatchSettings, PhaseAgents, REPAIR_SKILL, SkillNames, is_skill_name,
+    DispatchSettings, PhaseAgents, REPAIR_SKILL, SkillNames, is_skill_name, reviewers_in,
 };
 use codescope_core::board::setup::SETUP_SCRIPT;
 use codescope_core::{ProjectsConfig, Theme};
@@ -27,14 +27,16 @@ enum Input {
     Implement,
     AddressReview,
     Repair,
+    Reviewers,
 }
 
-const INPUTS: [Input; 5] = [
+const INPUTS: [Input; 6] = [
     Input::SetupCommand,
     Input::Research,
     Input::Implement,
     Input::AddressReview,
     Input::Repair,
+    Input::Reviewers,
 ];
 
 impl Input {
@@ -54,12 +56,13 @@ impl Input {
             Input::Implement => "Implementation",
             Input::AddressReview => "Review",
             Input::Repair => "Repair",
+            Input::Reviewers => "Reviewers",
         }
     }
 
     fn default_skill(self) -> &'static str {
         match self {
-            Input::SetupCommand => "",
+            Input::SetupCommand | Input::Reviewers => "",
             Input::Research => Round::Research.skill(),
             Input::Implement => Round::Implementation.skill(),
             Input::AddressReview => Round::Review.skill(),
@@ -74,6 +77,7 @@ impl Input {
             Input::Implement => "project-settings-implement",
             Input::AddressReview => "project-settings-review",
             Input::Repair => "project-settings-repair",
+            Input::Reviewers => "project-settings-reviewers",
         }
     }
 }
@@ -153,7 +157,7 @@ pub(crate) struct ProjectSettingsDialogState {
     project_id: String,
     project_name: String,
     focused: Input,
-    fields: [TextField; 5],
+    fields: [TextField; 6],
     stored_command: Option<String>,
     agents: PhaseAgents,
     agent_choices: Vec<(String, String)>,
@@ -178,6 +182,9 @@ fn one_line(text: &str) -> String {
 
 fn pasted_line(input: Input, text: &str) -> Result<String, String> {
     let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    if input == Input::Reviewers {
+        return Ok(lines.collect::<Vec<_>>().join(", "));
+    }
     let first = lines.next().unwrap_or_default().to_string();
     if lines.next().is_none() {
         return Ok(first);
@@ -191,7 +198,7 @@ fn pasted_line(input: Input, text: &str) -> Result<String, String> {
     })
 }
 
-fn fields_of(settings: &DispatchSettings) -> [TextField; 5] {
+fn fields_of(settings: &DispatchSettings) -> [TextField; 6] {
     let text = |value: &Option<String>| {
         TextField::with_text(value.as_deref().map(one_line).unwrap_or_default())
     };
@@ -202,6 +209,7 @@ fn fields_of(settings: &DispatchSettings) -> [TextField; 5] {
         text(&skills.implement),
         text(&skills.address_review),
         text(&skills.repair),
+        TextField::with_text(settings.reviewers.join(", ")),
     ]
 }
 
@@ -221,10 +229,10 @@ fn skill_name(input: Input, text: &str) -> Result<Option<String>, String> {
 }
 
 fn read_settings(
-    texts: [&str; 5],
+    texts: [&str; 6],
     stored_command: Option<&str>,
 ) -> Result<DispatchSettings, String> {
-    let [command, research, implement, address_review, repair] = texts;
+    let [command, research, implement, address_review, repair, reviewers] = texts;
     let command = match stored_command {
         Some(stored) if command == one_line(stored) => stored.trim(),
         _ => command.trim(),
@@ -237,6 +245,12 @@ fn read_settings(
             repair: skill_name(Input::Repair, repair)?,
         },
         setup_command: (!command.is_empty()).then(|| command.to_string()),
+        reviewers: reviewers_in(reviewers).map_err(|name| {
+            format!(
+                "\u{201c}{name}\u{201d} can't be a reviewer: a reviewer is a GitHub login, or \
+                 a team as org/team."
+            )
+        })?,
         ..DispatchSettings::default()
     })
 }
@@ -389,6 +403,7 @@ impl AppShell {
             style.show_caret = focused && blink_phase;
             let placeholder = match input {
                 Input::SetupCommand => "Nothing runs",
+                Input::Reviewers => "Nobody is asked",
                 _ => input.default_skill(),
             };
             div()
@@ -547,6 +562,18 @@ impl AppShell {
                     .to_string(),
             ));
 
+        let reviewers = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(heading("REVIEWERS"))
+            .child(input_box(Input::Reviewers))
+            .child(hint(
+                "GitHub logins, or teams as org/team. When CodeScope moves an item on to In \
+                 review, they are asked to review the pull request its dispatch opened."
+                    .to_string(),
+            ));
+
         let body = div()
             .px_5()
             .flex()
@@ -554,7 +581,8 @@ impl AppShell {
             .gap_3()
             .child(setup)
             .child(agents)
-            .child(skills);
+            .child(skills)
+            .child(reviewers);
 
         let cancel_btn = div()
             .id("project-settings-cancel")
@@ -715,13 +743,13 @@ mod tests {
 
     #[test]
     fn an_empty_form_sets_nothing() {
-        let settings = read_settings(["", " ", "", "", ""], None).unwrap();
+        let settings = read_settings(["", " ", "", "", "", " "], None).unwrap();
         assert!(settings.is_empty());
     }
 
     #[test]
     fn a_command_and_names_are_kept_without_the_spaces_around_them() {
-        let texts = [" npm ci ", "dig", "", " answer-review", "fix-ci "];
+        let texts = [" npm ci ", "dig", "", " answer-review", "fix-ci ", ""];
         let settings = read_settings(texts, None).unwrap();
         assert_eq!(settings.setup_command.as_deref(), Some("npm ci"));
         assert_eq!(settings.skills.research.as_deref(), Some("dig"));
@@ -732,13 +760,13 @@ mod tests {
 
     #[test]
     fn a_default_name_typed_out_sets_nothing() {
-        let texts = ["", "research", "implement", "address-review", "repair"];
+        let texts = ["", "research", "implement", "address-review", "repair", ""];
         assert!(read_settings(texts, None).unwrap().is_empty());
     }
 
     #[test]
     fn a_name_that_can_t_name_a_skill_says_which_and_why() {
-        let err = read_settings(["", "", "", "", "Fix CI"], None).unwrap_err();
+        let err = read_settings(["", "", "", "", "Fix CI", ""], None).unwrap_err();
         assert_eq!(
             err,
             "\u{201c}Fix CI\u{201d} can't be the Repair skill: a skill's name has lowercase \
@@ -754,11 +782,12 @@ mod tests {
                 ..SkillNames::default()
             },
             setup_command: Some("npm ci".into()),
+            reviewers: vec!["ana".into(), "acme/web".into()],
             ..DispatchSettings::default()
         };
         let fields = fields_of(&settings);
         let texts = INPUTS.map(|input| fields[input.index()].text());
-        assert_eq!(texts, ["npm ci", "", "build-it", "", ""]);
+        assert_eq!(texts, ["npm ci", "", "build-it", "", "", "ana, acme/web"]);
         assert_eq!(read_settings(texts, None).unwrap(), settings);
     }
 
@@ -772,11 +801,11 @@ mod tests {
         let fields = fields_of(&settings);
         let shown = fields[Input::SetupCommand.index()].text();
         assert_eq!(shown, "npm ci; npm run build");
-        let kept = read_settings([shown, "", "", "", ""], Some(stored)).unwrap();
+        let kept = read_settings([shown, "", "", "", "", ""], Some(stored)).unwrap();
         assert_eq!(kept.setup_command.as_deref(), Some(stored.trim()));
-        let changed = read_settings(["npm ci", "", "", "", ""], Some(stored)).unwrap();
+        let changed = read_settings(["npm ci", "", "", "", "", ""], Some(stored)).unwrap();
         assert_eq!(changed.setup_command.as_deref(), Some("npm ci"));
-        let cleared = read_settings(["", "", "", "", ""], Some(stored)).unwrap();
+        let cleared = read_settings(["", "", "", "", "", ""], Some(stored)).unwrap();
         assert_eq!(cleared.setup_command, None);
     }
 
@@ -787,6 +816,21 @@ mod tests {
         let err = pasted_line(Input::SetupCommand, "npm ci\nnpm run build").unwrap_err();
         assert!(err.starts_with("The setup command is one line"), "{err}");
         assert!(pasted_line(Input::Repair, "fix\nci").is_err());
+        let list = pasted_line(Input::Reviewers, "ana\r\n\n@bob\n");
+        assert_eq!(list, Ok("ana, @bob".to_string()));
+    }
+
+    #[test]
+    fn reviewers_are_kept_without_an_at_and_one_that_isn_t_a_login_says_which() {
+        let texts = ["", "", "", "", "", " @ana acme/web, "];
+        let settings = read_settings(texts, None).unwrap();
+        assert_eq!(settings.reviewers, ["ana", "acme/web"]);
+        let err = read_settings(["", "", "", "", "", "ana, b@b"], None).unwrap_err();
+        assert_eq!(
+            err,
+            "\u{201c}b@b\u{201d} can't be a reviewer: a reviewer is a GitHub login, or a team \
+             as org/team."
+        );
     }
 
     #[test]
@@ -821,7 +865,8 @@ mod tests {
     #[test]
     fn tab_goes_round_the_fields_both_ways() {
         assert_eq!(Input::SetupCommand.after(1), Input::Research);
-        assert_eq!(Input::Repair.after(1), Input::SetupCommand);
-        assert_eq!(Input::SetupCommand.after(-1), Input::Repair);
+        assert_eq!(Input::Repair.after(1), Input::Reviewers);
+        assert_eq!(Input::Reviewers.after(1), Input::SetupCommand);
+        assert_eq!(Input::SetupCommand.after(-1), Input::Reviewers);
     }
 }
