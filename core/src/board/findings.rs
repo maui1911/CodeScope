@@ -1219,6 +1219,34 @@ pub fn problems_list(problems: &[Problem]) -> String {
 /// The findings in a comment [`comment_body`] made, read back without its next step, its marker
 /// and the zero-width spaces `quiet` put in.
 pub fn posted_findings(body: &str) -> Option<Findings> {
+    check_findings(&posted_text(body)?).ok()
+}
+
+/// The `## Cause` and `## Approach` of findings, as they were written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostedSummary {
+    pub cause: String,
+    pub approach: String,
+}
+
+/// The cause and the approach in a comment [`comment_body`] made; `None` for any other comment.
+pub fn posted_summary(body: &str) -> Option<PostedSummary> {
+    let text = posted_text(body)?;
+    check_findings(&text).ok()?;
+    let (lines, _) = read_lines(&text);
+    let top = sections(&lines, 2);
+    let section = |heading: &str| {
+        let section = top.iter().find(|s| s.heading.eq_ignore_ascii_case(heading))?;
+        let lines: Vec<&str> = section.lines.iter().map(|line| line.text).collect();
+        Some(lines.join("\n").trim_matches('\n').to_string())
+    };
+    Some(PostedSummary {
+        cause: section(CAUSE)?,
+        approach: section(APPROACH)?,
+    })
+}
+
+fn posted_text(body: &str) -> Option<String> {
     let lines: Vec<&str> = body.lines().collect();
     let marker =
         lines.iter().rposition(|line| is_marker_line(line) && line.contains("phase=research"))?;
@@ -1226,7 +1254,83 @@ pub fn posted_findings(body: &str) -> Option<Findings> {
         .iter()
         .rposition(|line| line.starts_with("**Next step:**"))
         .unwrap_or(marker);
-    check_findings(&lines[..end].join("\n").replace(ZERO_WIDTH_SPACE, "")).ok()
+    Some(lines[..end].join("\n").replace(ZERO_WIDTH_SPACE, ""))
+}
+
+/// A paragraph of markdown as plain text, for a view that shows no markdown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Paragraph {
+    pub text: String,
+    /// A line of a code block, kept as written.
+    pub code: bool,
+}
+
+/// `markdown` as paragraphs of [`plain_text`]: wrapped lines joined, a heading or a list item a
+/// paragraph of its own with `•` for a bullet, and each line of a code block apart.
+pub fn plain_paragraphs(markdown: &str) -> Vec<Paragraph> {
+    let mut paragraphs = Vec::new();
+    let mut open: Option<String> = None;
+    let mut fence: Option<&str> = None;
+    for line in markdown.lines() {
+        let line = line.trim_end_matches('\r');
+        let start = line.trim_start();
+        if let Some(mark) = fence {
+            if start.starts_with(mark) {
+                fence = None;
+            } else {
+                paragraphs.push(Paragraph {
+                    text: line.to_string(),
+                    code: true,
+                });
+            }
+            continue;
+        }
+        let closes_open = start.is_empty()
+            || start.starts_with("```")
+            || start.starts_with("~~~")
+            || heading_with_level(start).is_some()
+            || list_item(start).is_some();
+        if closes_open {
+            close_paragraph(&mut open, &mut paragraphs);
+        }
+        if start.starts_with("```") || start.starts_with("~~~") {
+            fence = Some(&start[..3]);
+        } else if let Some((_, title)) = heading_with_level(start) {
+            open = Some(title.to_string());
+            close_paragraph(&mut open, &mut paragraphs);
+        } else if let Some(item) = list_item(start) {
+            open = Some(item);
+        } else if let Some(text) = open.as_mut() {
+            text.push(' ');
+            text.push_str(start);
+        } else if !start.is_empty() {
+            open = Some(start.to_string());
+        }
+    }
+    close_paragraph(&mut open, &mut paragraphs);
+    paragraphs
+}
+
+fn close_paragraph(open: &mut Option<String>, paragraphs: &mut Vec<Paragraph>) {
+    let Some(text) = open.take().map(|text| plain_text(&text)) else {
+        return;
+    };
+    if !text.is_empty() {
+        paragraphs.push(Paragraph { text, code: false });
+    }
+}
+
+/// A list item's text after its marker: `• ` for a bullet, the number for an ordered item.
+fn list_item(line: &str) -> Option<String> {
+    if let Some(text) = line.strip_prefix(['-', '*', '+'])
+        && text.starts_with([' ', '\t'])
+    {
+        return Some(format!("• {}", text.trim_start()));
+    }
+    let digits = line.len() - line.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let text = line[digits..].strip_prefix(['.', ')'])?;
+    (digits > 0 && text.starts_with([' ', '\t']))
+        .then(|| format!("{}. {}", &line[..digits], text.trim_start()))
 }
 
 /// One line for the session that wrote the findings, saying what to fix: fixed words and the
@@ -1385,6 +1489,50 @@ Advice: A, it keeps the slice small.
         let body = comment_body(&quieted, &findings, ItemKind::Issue);
         assert!(body.contains(ZERO_WIDTH_SPACE));
         assert_eq!(posted_findings(&body), Some(findings));
+    }
+
+    #[test]
+    fn reads_the_cause_and_the_approach_back_as_they_were_written() {
+        let quieted = WITH_POINTS.replace("Post it.", "Ask @maui1911 to post it.\nThen stop.");
+        let findings = check_findings(&quieted).unwrap();
+        let body = comment_body(&quieted, &findings, ItemKind::Issue);
+        assert_eq!(
+            posted_summary(&body),
+            Some(PostedSummary {
+                cause: "Nothing reads the file.".into(),
+                approach: "Ask @maui1911 to post it.\nThen stop.".into(),
+            })
+        );
+        assert_eq!(posted_summary(WITH_POINTS), None);
+        assert_eq!(posted_summary("B1 A, B2 B"), None);
+    }
+
+    #[test]
+    fn plain_paragraphs_join_wrapped_lines_and_keep_list_items_and_code_apart() {
+        let markdown = "Nothing **reads**\nthe `file`.\n\n### On Linux\n\n- **A** One.\n- Two,\n  \
+                        wrapped.\n1. Three.\n\n```sh\ncargo run\n  --bin x\n```\nDone.";
+        let text = |text: &str| Paragraph {
+            text: text.into(),
+            code: false,
+        };
+        let code = |text: &str| Paragraph {
+            text: text.into(),
+            code: true,
+        };
+        assert_eq!(
+            plain_paragraphs(markdown),
+            vec![
+                text("Nothing reads the file."),
+                text("On Linux"),
+                text("• A One."),
+                text("• Two, wrapped."),
+                text("1. Three."),
+                code("cargo run"),
+                code("  --bin x"),
+                text("Done."),
+            ]
+        );
+        assert_eq!(plain_paragraphs("\r\n \r\n"), vec![]);
     }
 
     #[test]

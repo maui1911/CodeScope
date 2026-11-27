@@ -144,6 +144,45 @@ pub struct PullRequestHead {
     pub maintainer_can_modify: bool,
 }
 
+/// The text under a pull request body's `## Test by hand` heading, up to the next heading of
+/// level one or two; `None` when the body has no such section or it is empty.
+pub fn test_by_hand(body: &str) -> Option<String> {
+    let mut lines = body.lines().map(|line| line.trim_end_matches('\r'));
+    lines.find(|line| top_heading(line).is_some_and(|t| t.eq_ignore_ascii_case("test by hand")))?;
+    let mut fence: Option<&str> = None;
+    let mut section = Vec::new();
+    for line in lines {
+        let start = line.trim_start();
+        match fence {
+            Some(mark) if start.starts_with(mark) => fence = None,
+            Some(_) => {}
+            None if start.starts_with("```") => fence = Some("```"),
+            None if start.starts_with("~~~") => fence = Some("~~~"),
+            None if top_heading(line).is_some() => break,
+            None => {}
+        }
+        section.push(line);
+    }
+    let blank = |line: &&str| line.trim().is_empty();
+    let first = section.iter().position(|line| !blank(line))?;
+    let last = section.iter().rposition(|line| !blank(line))?;
+    Some(section[first..=last].join("\n"))
+}
+
+/// The title of a heading of level one or two, as CommonMark reads it.
+fn top_heading(line: &str) -> Option<&str> {
+    let rest = line.trim_start_matches(' ');
+    if line.len() - rest.len() > 3 {
+        return None;
+    }
+    let level = rest.len() - rest.trim_start_matches('#').len();
+    let title = &rest[level..];
+    if !(1..=2).contains(&level) || !(title.is_empty() || title.starts_with([' ', '\t'])) {
+        return None;
+    }
+    Some(title.trim().trim_end_matches('#').trim_end())
+}
+
 /// A pull request CodeScope reported on the issue, or the pull request that is the item, kept on
 /// the worktree's `projects.json` row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -327,6 +366,34 @@ mod tests {
         for role in [Some(ColumnRole::InReview), Some(ColumnRole::Ready), None] {
             assert!(!moves_to_in_review(&pull_request(1, Open, false), role));
         }
+    }
+
+    #[test]
+    fn the_test_by_hand_section_runs_to_the_next_heading_of_its_level() {
+        let body = "Closes #487\r\n\r\n## Summary\r\n\r\nRenames it.\r\n\r\n\
+                    ## Test by hand\r\n\r\n- Open the board.\r\n\r\n### On Linux\r\n\r\n\
+                    - Click the card.\r\n\r\n## Notes\r\n\r\nNone.\r\n";
+        assert_eq!(
+            test_by_hand(body).as_deref(),
+            Some("- Open the board.\n\n### On Linux\n\n- Click the card.")
+        );
+    }
+
+    #[test]
+    fn a_heading_in_a_code_block_stays_in_the_test_by_hand_section() {
+        let body = "## test by hand ##\n\n```sh\n## not a heading\ncargo run\n```\n\nThen look.\n";
+        assert_eq!(
+            test_by_hand(body).as_deref(),
+            Some("```sh\n## not a heading\ncargo run\n```\n\nThen look.")
+        );
+    }
+
+    #[test]
+    fn a_body_without_test_by_hand_or_with_an_empty_one_has_none() {
+        assert_eq!(test_by_hand("## Summary\n\nRenames it.\n"), None);
+        assert_eq!(test_by_hand("## Test by hand\n\n\n## Notes\n\nNone.\n"), None);
+        assert_eq!(test_by_hand("### Test by hand\n\n- Click.\n"), None);
+        assert_eq!(test_by_hand(""), None);
     }
 
     #[test]
