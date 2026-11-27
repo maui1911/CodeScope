@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::ColumnRole;
+use super::{ColumnRole, RoleKind};
 use super::dispatch::{HandoverSession, REPLY_FILE, TASK_FILE, WorktreeDispatch};
 use super::findings::Problem;
 use super::pull_request::{PullRequest, PullRequestComment, PullRequestState};
@@ -88,7 +88,8 @@ pub struct ForwardFacts<'a> {
 }
 
 /// The next step for comments on `pr`, which a dispatch opened, given who can write to the
-/// repository (`None` while unchecked). A reply is posted before new comments are handed over.
+/// repository (`None` while unchecked). A reply is posted before new comments are handed over,
+/// and neither happens while the item rests in a column such as Todo.
 pub fn forward_step(
     pr: &PullRequest,
     facts: ForwardFacts,
@@ -101,7 +102,7 @@ pub fn forward_step(
         reply,
         role,
     } = facts;
-    if pr.state != PullRequestState::Open {
+    if pr.state != PullRequestState::Open || role.map(ColumnRole::kind) == Some(RoleKind::Rest) {
         return ForwardStep::Nothing;
     }
     let unreplied = forwarded.is_some_and(|last| last.reply_url.is_none());
@@ -408,6 +409,25 @@ mod tests {
             step(&more, Some(&pushed), HandoverSession::Idle),
             ForwardStep::Forward(vec![second])
         );
+    }
+
+    #[test]
+    fn an_item_moved_to_todo_gets_no_reply_posted_and_no_comment_handed_over() {
+        let first = comment(1, Some("sanne"), "2026-11-27T10:01:00Z");
+        let second = comment(2, Some("piet"), "2026-11-27T10:07:00Z");
+        let found = pr(vec![first, second]);
+        let last = handed("2026-11-27T10:01:00Z", "c2");
+        let todo = Some(ColumnRole::Todo);
+        let parked = |reply| ForwardFacts {
+            reply,
+            role: todo,
+            ..facts(Some(&last), HandoverSession::Stopped)
+        };
+        let written = Some(Ok(Some("Thanks @sanne, it is renamed.".to_string())));
+        assert_eq!(forward_step(&found, parked(written), writers), ForwardStep::Nothing);
+        let broken = Some(Err(vec![Problem::OpenFence]));
+        assert_eq!(forward_step(&found, parked(broken), writers), ForwardStep::Nothing);
+        assert_eq!(forward_step(&found, parked(None), writers), ForwardStep::Nothing);
     }
 
     #[test]

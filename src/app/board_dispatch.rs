@@ -2486,6 +2486,7 @@ impl AppShell {
                 && retry_due(&watch.move_error);
             watch.moving |= move_it;
             let ring = record.round == Round::Implementation
+                && !rests(role)
                 && watch.waits_for_you()
                 && watch.rang_for != watch.idle_since;
             if ring {
@@ -2510,7 +2511,7 @@ impl AppShell {
                     cx,
                 );
             }
-            if record.round == Round::Review {
+            if record.round == Round::Review && !rests(role) {
                 self.check_review_round(&record, &path, claude, cx);
             }
         }
@@ -4034,10 +4035,16 @@ fn handover_card(watch: &PullRequestWatch) -> Option<CardNote> {
     }
 }
 
+/// Whether a column with `role` is one where nothing runs, such as Todo: a dispatch whose item
+/// sits there gets nothing typed into its session, posted for it or rung for it.
+fn rests(role: Option<ColumnRole>) -> bool {
+    role.map(ColumnRole::kind) == Some(RoleKind::Rest)
+}
+
 /// The card line of a dispatch whose item sits in a column where nothing runs, such as Todo:
 /// CodeScope moves it no more and asks nothing of the user until a person moves it again.
 fn parked_note(role: Option<ColumnRole>) -> Option<CardNote> {
-    let role = role.filter(|role| role.kind() == RoleKind::Rest)?;
+    let role = role.filter(|&role| rests(Some(role)))?;
     let text = format!("Moved to {} · nothing more runs until it moves again", role.label());
     Some(CardNote::new(text, NoteTone::Waiting))
 }
@@ -4816,8 +4823,10 @@ mod tests {
         assert!(note.tone == NoteTone::Waiting && note.action.is_none());
         for role in [ColumnRole::InProgress, ColumnRole::Ready, ColumnRole::Done] {
             assert!(parked_note(Some(role)).is_none(), "{role:?}");
+            assert!(!rests(Some(role)), "{role:?}");
         }
         assert!(parked_note(None).is_none());
+        assert!(rests(Some(ColumnRole::Todo)) && !rests(None));
     }
 
     #[test]
