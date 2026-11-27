@@ -12,13 +12,16 @@ use codescope_core::{ProjectsConfig, Theme};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, ParentElement, SharedString, Styled, Window, anchored, deferred, div, point,
-    px,
+    MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window,
+    anchored, deferred, div, point, px,
 };
 
 use crate::app::{AppShell, ToastKind};
 use crate::text_field::{TextField, focused_caret_style, render_input_content};
 use crate::theme;
+
+const BESIDE_THE_BODY: f32 = 250.0;
+const BODY_AT_LEAST: f32 = 160.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Input {
@@ -574,7 +577,11 @@ impl AppShell {
                     .to_string(),
             ));
 
+        let fits = f32::from(viewport.height) - BESIDE_THE_BODY;
         let body = div()
+            .id("project-settings-body")
+            .max_h(px(fits.max(BODY_AT_LEAST)))
+            .overflow_y_scroll()
             .px_5()
             .flex()
             .flex_col()
