@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::ColumnRole;
-use super::dispatch::{TASK_FILE, WorktreeDispatch};
+use super::dispatch::{HandoverSession, TASK_FILE, WorktreeDispatch};
 use super::pull_request::{Checks, FailedCheck, Mergeable, PullRequest, PullRequestState};
 
 /// How many repairs run in a row before the dispatch needs the user.
@@ -67,17 +67,6 @@ pub struct Repair {
     pub head: String,
 }
 
-/// The dispatch's session, as a repair sees it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RepairSession {
-    /// It works, or something else keeps it from taking a task.
-    Busy,
-    /// It waits for a prompt, or there is none and a new one can start.
-    Idle,
-    /// It worked on the last repair and stopped, and a read since then saw the same head.
-    StoppedAfterRepair,
-}
-
 /// What to do about repairs after a read of the pull request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepairStep {
@@ -120,7 +109,7 @@ fn is_healthy(pr: &PullRequest) -> bool {
 pub fn repair_step(
     pr: &PullRequest,
     repair: Option<&Repair>,
-    session: RepairSession,
+    session: HandoverSession,
     role: Option<ColumnRole>,
 ) -> RepairStep {
     let in_its_columns = matches!(role, Some(ColumnRole::InProgress | ColumnRole::InReview));
@@ -132,15 +121,15 @@ pub fn repair_step(
     }
     if repair.is_some_and(|last| last.head == pr.head_oid) {
         return match session {
-            RepairSession::StoppedAfterRepair => RepairStep::StoppedWithoutPush,
-            RepairSession::Busy | RepairSession::Idle => RepairStep::Running,
+            HandoverSession::Stopped => RepairStep::StoppedWithoutPush,
+            HandoverSession::Busy | HandoverSession::Idle => RepairStep::Running,
         };
     }
     let attempts = repair.map_or(0, |last| last.attempts);
     match fault(pr) {
         None => RepairStep::Nothing,
         Some(fault) if attempts >= REPAIR_ATTEMPTS => RepairStep::GaveUp(fault),
-        Some(fault) if session == RepairSession::Idle => RepairStep::Start {
+        Some(fault) if session == HandoverSession::Idle => RepairStep::Start {
             fault,
             attempt: attempts + 1,
         },
@@ -261,6 +250,7 @@ mod tests {
             checks,
             head_oid: "c2".into(),
             health,
+            comments: Vec::new(),
         }
     }
 
@@ -283,7 +273,7 @@ mod tests {
 
     const IN_PROGRESS: Option<ColumnRole> = Some(ColumnRole::InProgress);
 
-    fn step(pr: &PullRequest, repair: Option<&Repair>, session: RepairSession) -> RepairStep {
+    fn step(pr: &PullRequest, repair: Option<&Repair>, session: HandoverSession) -> RepairStep {
         repair_step(pr, repair, session, IN_PROGRESS)
     }
 
@@ -320,24 +310,24 @@ mod tests {
             fault: Fault::Checks(vec![check("build")]),
             attempt: 1,
         };
-        assert_eq!(step(&failing(), None, RepairSession::Idle), start);
+        assert_eq!(step(&failing(), None, HandoverSession::Idle), start);
         assert_eq!(
-            repair_step(&failing(), None, RepairSession::Idle, Some(ColumnRole::InReview)),
+            repair_step(&failing(), None, HandoverSession::Idle, Some(ColumnRole::InReview)),
             start
         );
-        assert_eq!(step(&failing(), None, RepairSession::Busy), RepairStep::Nothing);
+        assert_eq!(step(&failing(), None, HandoverSession::Busy), RepairStep::Nothing);
         let reviewed = Health {
             reviewed: true,
             ..failing().health
         };
         assert_eq!(
-            step(&pr(Checks::Failing, reviewed), None, RepairSession::Idle),
+            step(&pr(Checks::Failing, reviewed), None, HandoverSession::Idle),
             RepairStep::Nothing,
             "a push after a review invalidates approvals"
         );
         for role in [None, Some(ColumnRole::Ready), Some(ColumnRole::Todo)] {
             assert_eq!(
-                repair_step(&failing(), None, RepairSession::Idle, role),
+                repair_step(&failing(), None, HandoverSession::Idle, role),
                 RepairStep::Nothing,
                 "the user moved it out of CodeScope's columns: {role:?}"
             );
@@ -346,21 +336,21 @@ mod tests {
             state: PullRequestState::Merged,
             ..failing()
         };
-        assert_eq!(step(&merged, None, RepairSession::Idle), RepairStep::Nothing);
+        assert_eq!(step(&merged, None, HandoverSession::Idle), RepairStep::Nothing);
     }
 
     #[test]
     fn a_repair_runs_until_it_pushes_and_stops_short_without_a_push() {
         let started = repaired(1, "c2");
-        assert_eq!(step(&failing(), Some(&started), RepairSession::Busy), RepairStep::Running);
-        assert_eq!(step(&failing(), Some(&started), RepairSession::Idle), RepairStep::Running);
+        assert_eq!(step(&failing(), Some(&started), HandoverSession::Busy), RepairStep::Running);
+        assert_eq!(step(&failing(), Some(&started), HandoverSession::Idle), RepairStep::Running);
         assert_eq!(
-            step(&failing(), Some(&started), RepairSession::StoppedAfterRepair),
+            step(&failing(), Some(&started), HandoverSession::Stopped),
             RepairStep::StoppedWithoutPush
         );
         let rerun = pr(Checks::Passing, healthy());
         assert_eq!(
-            step(&rerun, Some(&started), RepairSession::StoppedAfterRepair),
+            step(&rerun, Some(&started), HandoverSession::Stopped),
             RepairStep::Clear,
             "a failed check ran again and passed, without a push"
         );
@@ -370,24 +360,25 @@ mod tests {
     fn two_repairs_in_a_row_are_the_most_and_a_healthy_read_starts_the_count_again() {
         let fault = Fault::Checks(vec![check("build")]);
         assert_eq!(
-            step(&failing(), Some(&repaired(1, "c1")), RepairSession::Idle),
+            step(&failing(), Some(&repaired(1, "c1")), HandoverSession::Idle),
             RepairStep::Start {
                 fault: fault.clone(),
                 attempt: 2
             }
         );
         assert_eq!(
-            step(&failing(), Some(&repaired(2, "c1")), RepairSession::Busy),
+            step(&failing(), Some(&repaired(2, "c1")), HandoverSession::Busy),
             RepairStep::GaveUp(fault)
         );
         let rerun = pr(Checks::Running, healthy());
         let twice = repaired(2, "c1");
-        assert_eq!(step(&rerun, Some(&twice), RepairSession::Idle), RepairStep::Nothing);
+        assert_eq!(step(&rerun, Some(&twice), HandoverSession::Idle), RepairStep::Nothing);
         let fixed = pr(Checks::Passing, healthy());
-        assert_eq!(step(&fixed, Some(&repaired(1, "c1")), RepairSession::Idle), RepairStep::Clear);
+        let healed = step(&fixed, Some(&repaired(1, "c1")), HandoverSession::Idle);
+        assert_eq!(healed, RepairStep::Clear);
         let no_checks = pr(Checks::None, healthy());
-        assert_eq!(step(&no_checks, Some(&twice), RepairSession::Busy), RepairStep::Clear);
-        assert_eq!(step(&fixed, None, RepairSession::Idle), RepairStep::Nothing);
+        assert_eq!(step(&no_checks, Some(&twice), HandoverSession::Busy), RepairStep::Clear);
+        assert_eq!(step(&fixed, None, HandoverSession::Idle), RepairStep::Nothing);
     }
 
     fn record() -> WorktreeDispatch {
@@ -407,6 +398,7 @@ mod tests {
             review: None,
             fork: None,
             repair: None,
+            forwarded: None,
         }
     }
 

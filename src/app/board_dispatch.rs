@@ -2,9 +2,10 @@
 //! into a trigger column, in a worktree of its own with an agent session on it. When a research
 //! round's session is idle with its findings written, post them on the issue, then read the
 //! answers to its decision points and hand them to the implementation round. Watch that round's
-//! pull request, report it on the issue and move the item to In review when it is ready. A
-//! review round on it posts the agent's reply on the pull request and reports it again once its
-//! session is done.
+//! pull request, report it on the issue and move the item to In review when it is ready. While
+//! nobody reviewed it, hand the round's session a repair when it can't merge, and each comment a
+//! teammate with write access writes on it, and post the agent's answer. A review round on it
+//! posts the agent's reply on the pull request and reports it again once its session is done.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -12,13 +13,13 @@ use std::time::{Duration, Instant};
 
 use codescope_core::agents::claude::live_session;
 use codescope_core::board::dispatch::{
-    FINDINGS_FILE, Facts, Hold, OwnPullRequest, PostedFindings, ProjectRemotes, REPLY_FILE,
-    ReviewRound, Round, StatusChange, WorktreeDispatch, add_dispatch_worktree, add_fork_worktree,
-    add_pull_request_worktree, branch_name, clear_findings, clear_reply, counts_towards_limit,
-    decide, exclude_handover_files, fetch_branch_head, fetch_pull_head, find_skill, fork_branch,
-    fork_push, is_plain_branch, launch_with_task, mover_to_check, moves_to_needs_decision,
-    opened_by, projects_for_repository, set_fork_push, task_file, task_message,
-    trigger_content_ids, write_task_file,
+    FINDINGS_FILE, Facts, HandoverSession, Hold, OwnPullRequest, PostedFindings, ProjectRemotes,
+    REPLY_FILE, ReviewRound, Round, StatusChange, WorktreeDispatch, add_dispatch_worktree,
+    add_fork_worktree, add_pull_request_worktree, branch_name, clear_findings, clear_reply,
+    counts_towards_limit, decide, exclude_handover_files, fetch_branch_head, fetch_pull_head,
+    find_skill, fork_branch, fork_push, is_plain_branch, launch_with_task, mover_to_check,
+    moves_to_needs_decision, opened_by, projects_for_repository, set_fork_push, task_file,
+    task_message, trigger_content_ids, write_task_file,
 };
 use codescope_core::board::answers::{
     Answer, Comment, after_findings, answer_body, answers_section, choices_text, chosen,
@@ -28,15 +29,19 @@ use codescope_core::board::findings::{
     DecisionPoint, FileStamp, Outcome, Problem, comment_body, posted_findings, problems_list,
     problems_message, read_findings,
 };
-use codescope_core::board::github::{self, TriggerReads, Viewer};
+use codescope_core::board::forward::{
+    ForwardFacts, ForwardStep, Forwarded, authors, comments_since, forward_message, forward_step,
+    forward_task, new_comments,
+};
+use codescope_core::board::github::{self, NewComment, TriggerReads, Viewer};
 use codescope_core::board::pull_request::{
-    Checks, PostedPullRequest, PullRequest, PullRequestHead, PullRequestState, moves_to_in_review,
-    pull_request_comment, review_round_worked, round_pull_request,
+    Checks, PostedPullRequest, PullRequest, PullRequestComment, PullRequestHead, PullRequestState,
+    moves_to_in_review, pull_request_comment, review_round_worked, round_pull_request,
 };
 use codescope_core::board::reply::{read_reply, reply_problems_message};
 use codescope_core::board::repair::{
-    Fault, FaultKind, REPAIR_ATTEMPTS, Repair, RepairSession, RepairStep, fault,
-    repair_message, repair_step, repair_task,
+    Fault, FaultKind, REPAIR_ATTEMPTS, Repair, RepairStep, fault, repair_message, repair_step,
+    repair_task,
 };
 use codescope_core::board::{
     Board, BoardItem, BoardRef, ColumnMapping, ColumnRole, ItemKind, effective_mapping,
@@ -139,14 +144,33 @@ struct PullRequestWatch {
     reply_reminder: Option<Reminder>,
     review_held: Option<HeldBy>,
     settled_since: Option<Instant>,
-    repair_started: Option<String>,
-    repair_worked: bool,
-    repair_stopped_at: Option<Instant>,
-    repair_turns: Option<u32>,
+    repair_follow: HandoverFollow,
     repair_note: Option<RepairNote>,
     repair_rang: Option<(Option<String>, RepairNote)>,
     healthy_since: Option<(String, Instant)>,
     repair_failed_at: Option<Instant>,
+    forward_follow: HandoverFollow,
+    forward_note: Option<ForwardNote>,
+    forward_rang: Option<String>,
+    forward_failed_at: Option<Instant>,
+    forward_posting: bool,
+    forward_post_error: Option<(Instant, String)>,
+}
+
+impl DispatchState {
+    fn can_write(&self, repository: &str, login: &str, now: Instant) -> Option<bool> {
+        usable_access(self.access.get(&access_key(repository, login)), now)
+    }
+
+    fn keep_access(&mut self, checked: Vec<((String, String), Option<bool>)>) {
+        let now = Instant::now();
+        for (key, answer) in checked {
+            match answer {
+                Some(can_write) => self.access.insert(key, (can_write, now)),
+                None => self.access.remove(&key),
+            };
+        }
+    }
 }
 
 impl PullRequestWatch {
@@ -165,6 +189,7 @@ impl PullRequestWatch {
             moving: self.moving,
             marking_ready: self.marking_ready,
             ending_review: self.ending_review,
+            forward_posting: self.forward_posting,
             ..PullRequestWatch::default()
         };
     }
@@ -240,6 +265,11 @@ impl PullRequestWatch {
                 .is_some_and(|(idle, read)| read > idle)
     }
 
+    fn read_after_stop(&self) -> bool {
+        self.idle_since
+            .is_none_or(|idle| self.read_ok_at.is_some_and(|read| read > idle))
+    }
+
     fn review_stop(&self) -> Option<Instant> {
         self.idle_since.or(self.settled_since)
     }
@@ -247,6 +277,62 @@ impl PullRequestWatch {
     fn stopped_without_result(&self) -> bool {
         self.stop_without_result.is_some() && self.stop_without_result == self.review_stop()
     }
+}
+
+#[derive(Default)]
+struct HandoverFollow {
+    started: Option<String>,
+    worked: bool,
+    stopped_at: Option<Instant>,
+    turns: Option<u32>,
+}
+
+impl HandoverFollow {
+    fn start(&mut self, started: String, turns: Option<u32>) {
+        *self = HandoverFollow {
+            started: Some(started),
+            turns,
+            ..HandoverFollow::default()
+        };
+    }
+
+    fn look(&mut self, started: Option<String>, working: bool, turns: Option<u32>) {
+        if self.started != started {
+            self.started = started;
+            self.worked = true;
+            self.stopped_at = None;
+        }
+        let new_turn = turns > self.turns;
+        self.turns = turns;
+        self.worked |= working || new_turn;
+        if working {
+            self.stopped_at = None;
+        } else if new_turn {
+            self.stopped_at = Some(Instant::now());
+        } else {
+            self.stopped_at.get_or_insert_with(Instant::now);
+        }
+    }
+
+    fn session(&self, working: bool, active: bool, read_ok_at: Option<Instant>) -> HandoverSession {
+        if working {
+            return HandoverSession::Busy;
+        }
+        let read_since_stop = self
+            .stopped_at
+            .zip(read_ok_at)
+            .is_some_and(|(stop, read)| read > stop);
+        if active && self.worked && read_since_stop {
+            HandoverSession::Stopped
+        } else {
+            HandoverSession::Idle
+        }
+    }
+}
+
+enum Route {
+    Type(Entity<TerminalView>),
+    Launch(Launch),
 }
 
 fn carried_pull_request(
@@ -384,7 +470,7 @@ fn post_once(item_id: &str, subject_id: &str, since: &str, body: &str) -> Result
     let before = github::before_posting(item_id, subject_id, since, body).map_err(failed)?;
     match before.posted {
         Some(url) => Ok(url),
-        None => github::add_comment(subject_id, body).map_err(failed),
+        None => github::add_comment(subject_id, body).map(|new| new.url).map_err(failed),
     }
 }
 
@@ -1111,13 +1197,7 @@ impl AppShell {
             Some(Err(err)) => state.viewer_error = Some(err),
             None => {}
         }
-        let now = Instant::now();
-        for (key, answer) in output.access.drain(..) {
-            match answer {
-                Some(can_write) => state.access.insert(key, (can_write, now)),
-                None => state.access.remove(&key),
-            };
-        }
+        state.keep_access(std::mem::take(&mut output.access));
         if let Some(discussions) = output.discussions.take() {
             state.discussions.extend(discussions);
         }
@@ -1468,6 +1548,7 @@ impl AppShell {
                 url: url.clone(),
                 comment_url: String::new(),
                 in_review: false,
+                reported_at: None,
             }),
             ItemKind::Issue | ItemKind::Draft => carried_pull_request(round, posted, open),
         };
@@ -1510,6 +1591,7 @@ impl AppShell {
                 review,
                 fork,
                 repair: None,
+                forwarded: None,
             },
             assign_to: item.assignees.is_empty().then_some(content_id),
             board,
@@ -1922,7 +2004,7 @@ impl AppShell {
                         .map_err(failed)?;
                     let url = match before.posted {
                         Some(url) => url,
-                        None => github::add_comment(&content_id, &body).map_err(failed)?,
+                        None => github::add_comment(&content_id, &body).map_err(failed)?.url,
                     };
                     let role = before
                         .column_id
@@ -2120,6 +2202,11 @@ impl AppShell {
             watch.follow(&record.trigger_at, seen_from_start);
             watch.track(session);
             let posted = record.pull_request.as_ref().or(watch.reported.as_ref());
+            let forwards = record.kind == ItemKind::Issue && record.round == Round::Implementation;
+            let reported_at = posted.and_then(|p| p.reported_at.as_deref());
+            let comments_from = comments_since(reported_at, record.forwarded.as_ref())
+                .filter(|_| forwards)
+                .map(String::from);
             let read = watch.read_due(role, posted.is_some());
             watch.reading |= read;
             let found = watch
@@ -2147,7 +2234,7 @@ impl AppShell {
                 watch.rang_for = watch.idle_since;
             }
             if read {
-                self.read_pull_request(&record, branch, cx);
+                self.read_pull_request(&record, branch, comments_from, cx);
             }
             if let Some(pr) = report {
                 self.report_pull_request(&record, pr, cx);
@@ -2355,15 +2442,17 @@ impl AppShell {
         &mut self,
         record: &WorktreeDispatch,
         branch: String,
+        comments_from: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let item_id = record.item_id.clone();
         let repository = record.repository.clone();
         let kind = record.kind;
         let content_id = record.content_id.clone();
+        let known = fresh_access(&self.board.dispatch.access);
         let started = Instant::now();
         cx.spawn(async move |this, cx| {
-            let (branch, result) = cx
+            let (branch, result, checked) = cx
                 .background_spawn(async move {
                     let found = match kind {
                         ItemKind::PullRequest => github::fetch_pull_request(&content_id),
@@ -2372,10 +2461,18 @@ impl AppShell {
                                 .map(round_pull_request)
                         }
                     };
-                    (branch, found)
+                    let mut checked = Vec::new();
+                    if let (Ok(Some(pr)), Some(since)) = (&found, &comments_from) {
+                        let comments = new_comments(pr, since);
+                        for login in comments.iter().filter_map(|c| c.author.as_deref()) {
+                            check_write_access(&repository, login, &known, &mut checked);
+                        }
+                    }
+                    (branch, found, checked)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                this.board.dispatch.keep_access(checked);
                 let Some(watch) = this.board.dispatch.watches.get_mut(&item_id) else {
                     return;
                 };
@@ -2425,15 +2522,15 @@ impl AppShell {
         &mut self,
         item_id: &str,
         pr: PullRequest,
-        result: Result<String, String>,
+        result: Result<NewComment, String>,
         cx: &mut Context<Self>,
     ) {
         let Some(watch) = self.board.dispatch.watches.get_mut(item_id) else {
             return;
         };
         watch.reporting = false;
-        let comment_url = match result {
-            Ok(url) => url,
+        let comment = match result {
+            Ok(comment) => comment,
             Err(message) => {
                 watch.report_error = Some((Instant::now(), message.clone()));
                 let title = format!("Couldn't report PR #{} on the issue", pr.number);
@@ -2444,8 +2541,9 @@ impl AppShell {
         let posted = PostedPullRequest {
             number: pr.number,
             url: pr.url.clone(),
-            comment_url,
+            comment_url: comment.url,
             in_review: false,
+            reported_at: Some(comment.created_at),
         };
         self.keep_posted(item_id, posted, cx);
         let Some((_, path, _, record)) = self.dispatch_record(item_id, cx) else {
@@ -2719,7 +2817,7 @@ impl AppShell {
         cx.notify();
     }
 
-    pub(crate) fn run_repairs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn run_handovers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let records: Vec<_> = self
             .dispatch_records(cx)
             .into_iter()
@@ -2729,43 +2827,383 @@ impl AppShell {
             let Some(branch) = branch else {
                 continue;
             };
-            let Some((pr, step)) = self.next_repair(&record, &path, cx) else {
-                self.note_repair(&record, &path, None, cx);
-                continue;
-            };
-            let note = match step {
-                RepairStep::Nothing => None,
-                RepairStep::Clear => {
-                    let healthy = WorktreeDispatch {
-                        repair: None,
-                        ..record.clone()
-                    };
-                    if let Err(err) = self.save_record(&project_id, &path, &branch, healthy, cx) {
-                        let number = record.number;
-                        eprintln!("warning: couldn't forget the repairs of #{number}: {err}");
-                    }
-                    None
-                }
-                RepairStep::Running => {
-                    record.repair.as_ref().map(|r| RepairNote::Running(r.fault, r.attempts))
-                }
-                RepairStep::StoppedWithoutPush => {
-                    record.repair.as_ref().map(|r| RepairNote::Stopped(r.fault))
-                }
-                RepairStep::GaveUp(fault) => Some(RepairNote::GaveUp(fault.kind())),
-                RepairStep::Start { fault, attempt } => {
-                    let place = (project_id.as_str(), path.as_path(), branch.as_str());
-                    self.start_repair(place, &record, &pr, (fault, attempt), window, cx)
-                }
-            };
-            self.note_repair(&record, &path, note, cx);
+            let place = (project_id.as_str(), path.as_path(), branch.as_str());
+            let mut working = None;
+            let record = self.forward_comments(place, record, &mut working, window, cx);
+            self.run_repair(place, &record, &mut working, window, cx);
         }
+    }
+
+    fn is_working(&self, path: &Path, cx: &App, known: &mut Option<bool>) -> bool {
+        *known.get_or_insert_with(|| {
+            matches!(self.session_at(path, cx), SessionAt::Working | SessionAt::Held(_))
+        })
+    }
+
+    fn handover_route(
+        &self,
+        (project_id, path, branch): (&str, &Path, &str),
+        message: &str,
+        cx: &App,
+    ) -> Option<Route> {
+        match self.handover_target(path, cx) {
+            HandoverTarget::Type(terminal) => return Some(Route::Type(terminal)),
+            HandoverTarget::NewTab => {}
+            HandoverTarget::Wait(_) => return None,
+        }
+        let project = self.current_projects(cx).project(project_id)?;
+        let profile = self.project_agent(project)?;
+        let command = codescope_core::build_new_session_auto_type(&profile)
+            .and_then(|launch| launch_with_task(&launch, message))?;
+        let mut title = codescope_core::TabTitle::project(project.name.clone());
+        title.set_branch(branch);
+        Some(Route::Launch(Launch {
+            project_id: project_id.to_string(),
+            title,
+            agent_id: profile.id.clone(),
+            command,
+        }))
+    }
+
+    fn deliver(
+        &mut self,
+        path: &Path,
+        route: Route,
+        message: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match route {
+            Route::Type(terminal) => Self::submit_line(&terminal, message, cx),
+            Route::Launch(launch) => self.hand_over(path, None, launch, message, window, cx),
+        }
+    }
+
+    fn forward_comments(
+        &mut self,
+        place: (&str, &Path, &str),
+        record: WorktreeDispatch,
+        working: &mut Option<bool>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> WorktreeDispatch {
+        let path = place.1;
+        let Some((pr, step)) = self.next_forward(&record, path, working, cx) else {
+            self.note_forward(&record, path, None, cx);
+            return record;
+        };
+        let note = match step {
+            ForwardStep::Nothing => None,
+            ForwardStep::Waits(names) => Some(ForwardNote::Waits(names)),
+            ForwardStep::Working(names) => Some(ForwardNote::Working(names)),
+            ForwardStep::Stopped(names) => Some(ForwardNote::Stopped(names)),
+            ForwardStep::PostReply(body) => {
+                self.post_forward_reply(&record, &pr, body, cx);
+                Some(ForwardNote::Posting)
+            }
+            ForwardStep::FixReply(problems) => {
+                self.fix_forward_reply(&record, path, &problems, cx);
+                Some(ForwardNote::FixReply)
+            }
+            ForwardStep::Forward(comments) => {
+                let names = authors(&comments);
+                match self.start_forward(place, &record, &pr, &comments, window, cx) {
+                    Some(handed) => {
+                        self.note_forward(&handed, path, Some(ForwardNote::Working(names)), cx);
+                        return handed;
+                    }
+                    None => Some(ForwardNote::Waits(names)),
+                }
+            }
+        };
+        self.note_forward(&record, path, note, cx);
+        record
+    }
+
+    fn next_forward(
+        &mut self,
+        record: &WorktreeDispatch,
+        path: &Path,
+        working: &mut Option<bool>,
+        cx: &App,
+    ) -> Option<(PullRequest, ForwardStep)> {
+        let watch = self.board.dispatch.watches.get(&record.item_id)?;
+        let posted = record.pull_request.as_ref().or(watch.reported.as_ref())?;
+        let pr = watch.pull_request.clone()?;
+        let forwarded = record.forwarded.as_ref();
+        let since = comments_since(posted.reported_at.as_deref(), forwarded).map(String::from);
+        let unreplied = forwarded.is_some_and(|last| last.reply_url.is_none());
+        let reply = read_reply(path).filter(|_| unreplied);
+        let open = forwarded.is_some_and(|last| last.is_open(&pr));
+        let now = Instant::now();
+        let outsider = |login: &str| {
+            self.board.dispatch.can_write(&record.repository, login, now) == Some(false)
+        };
+        let fresh = since.as_deref().is_some_and(|since| {
+            new_comments(&pr, since)
+                .iter()
+                .filter_map(|comment| comment.author.as_deref())
+                .any(|login| !outsider(login))
+        });
+        if !open && reply.is_none() && !fresh {
+            return Some((pr, ForwardStep::Nothing));
+        }
+        let role = self.item_role(&record.board_url, &record.item_id);
+        let working = self.is_working(path, cx, working);
+        let state = &mut self.board.dispatch;
+        let watch = state.watches.get_mut(&record.item_id)?;
+        let turns = watch.turns;
+        watch.forward_follow.look(forwarded.map(|last| last.at.clone()), working, turns);
+        let session = watch.forward_follow.session(working, unreplied, watch.read_ok_at);
+        let current = watch.read_after_stop();
+        let can_write = |login: &str| state.can_write(&record.repository, login, now);
+        let facts = ForwardFacts {
+            since: since.as_deref(),
+            forwarded,
+            session,
+            reply: reply.as_ref().map(|file| file.reply()),
+            role,
+        };
+        let step = match forward_step(&pr, facts, can_write) {
+            ForwardStep::Forward(comments) if !current => ForwardStep::Waits(authors(&comments)),
+            step => step,
+        };
+        Some((pr, step))
+    }
+
+    fn start_forward(
+        &mut self,
+        place: (&str, &Path, &str),
+        record: &WorktreeDispatch,
+        pr: &PullRequest,
+        comments: &[PullRequestComment],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<WorktreeDispatch> {
+        let (project_id, path, branch) = place;
+        let watch = self.board.dispatch.watches.get(&record.item_id);
+        let failed_at = watch.and_then(|watch| watch.forward_failed_at);
+        if failed_at.is_some_and(|at| at.elapsed() < POST_RETRY) {
+            return None;
+        }
+        let message = forward_message(record.number, comments.len());
+        let route = self.handover_route(place, &message, cx)?;
+        let names = authors(comments);
+        let at = codescope_core::time::now_iso8601();
+        let handed = WorktreeDispatch {
+            forwarded: Some(Forwarded {
+                until: comments.last()?.created_at.clone(),
+                at: at.clone(),
+                authors: names.clone(),
+                head: pr.head_oid.clone(),
+                reply_url: None,
+            }),
+            repair: None,
+            ..record.clone()
+        };
+        let saved = clear_reply(path)
+            .and_then(|()| write_task_file(path, &forward_task(record, pr, comments)))
+            .map_err(|err| format!("{err:#}"))
+            .and_then(|()| self.save_record(project_id, path, branch, handed.clone(), cx));
+        if let Err(message) = saved {
+            if let Some(watch) = self.board.dispatch.watches.get_mut(&record.item_id) {
+                watch.forward_failed_at = Some(Instant::now());
+            }
+            let title = format!("Couldn't hand the comments on #{} to its session", record.number);
+            self.push_toast(ToastKind::Err, title, Some(message.into()), cx);
+            return None;
+        }
+        if let Some(watch) = self.board.dispatch.watches.get_mut(&record.item_id) {
+            let turns = watch.turns;
+            watch.forward_follow.start(at, turns);
+            watch.reply_reminder = None;
+        }
+        self.deliver(path, route, message, window, cx);
+        let title = format!("{} commented on PR #{}", named(&names), pr.number);
+        let detail = format!("Handed to the session of #{}.", record.number);
+        self.push_toast(ToastKind::Ok, title, Some(detail.into()), cx);
+        Some(handed)
+    }
+
+    fn post_forward_reply(
+        &mut self,
+        record: &WorktreeDispatch,
+        pr: &PullRequest,
+        body: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(handed_at) = record.forwarded.as_ref().map(|last| last.at.clone()) else {
+            return;
+        };
+        let Some(watch) = self.board.dispatch.watches.get_mut(&record.item_id) else {
+            return;
+        };
+        if watch.forward_posting || !retry_due(&watch.forward_post_error) {
+            return;
+        }
+        watch.forward_posting = true;
+        cx.notify();
+        let item_id = record.item_id.clone();
+        let subject = pr.id.clone();
+        let number = pr.number;
+        cx.spawn(async move |this, cx| {
+            let (target, since) = (item_id.clone(), handed_at.clone());
+            let posted = cx
+                .background_spawn(async move { post_once(&target, &subject, &since, &body) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.finish_forward_reply(&item_id, number, &handed_at, posted, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_forward_reply(
+        &mut self,
+        item_id: &str,
+        number: u32,
+        handed_at: &str,
+        posted: Result<String, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(watch) = self.board.dispatch.watches.get_mut(item_id) else {
+            return;
+        };
+        watch.forward_posting = false;
+        cx.notify();
+        let url = match posted {
+            Ok(url) => {
+                watch.forward_post_error = None;
+                url
+            }
+            Err(message) => {
+                let first = watch.forward_post_error.is_none();
+                watch.forward_post_error = Some((Instant::now(), message.clone()));
+                if first {
+                    let title = format!("Couldn't post the reply on PR #{number}");
+                    self.push_toast(ToastKind::Err, title, Some(message.into()), cx);
+                }
+                return;
+            }
+        };
+        let Some((project_id, path, branch, mut record)) = self.dispatch_record(item_id, cx) else {
+            return;
+        };
+        let Some(last) = record.forwarded.as_mut().filter(|last| last.at == handed_at) else {
+            return;
+        };
+        last.reply_url = Some(url);
+        let names = named(&last.authors);
+        let branch = branch.unwrap_or_default();
+        if let Err(err) = self.save_record(&project_id, &path, &branch, record, cx) {
+            eprintln!("warning: couldn't record the reply on PR #{number}: {err}");
+            return;
+        }
+        if let Err(err) = clear_reply(&path) {
+            eprintln!("warning: couldn't remove {REPLY_FILE}: {err:#}");
+        }
+        let title = format!("Reply posted on PR #{number}");
+        self.push_toast(ToastKind::Ok, title, Some(format!("It answers {names}.").into()), cx);
+    }
+
+    fn fix_forward_reply(
+        &mut self,
+        record: &WorktreeDispatch,
+        path: &Path,
+        problems: &[Problem],
+        cx: &mut Context<Self>,
+    ) {
+        let Some(file) = read_reply(path) else {
+            return;
+        };
+        let remind = match self.session_at(path, cx) {
+            SessionAt::Done(remind) => remind,
+            SessionAt::Working | SessionAt::Held(_) => Remind::Nothing,
+        };
+        self.remind_reply(record, path, file.stamp, remind, problems, cx);
+    }
+
+    fn note_forward(
+        &mut self,
+        record: &WorktreeDispatch,
+        path: &Path,
+        note: Option<ForwardNote>,
+        cx: &mut Context<Self>,
+    ) {
+        let tab_title = self.tab_title_at(path);
+        let Some(watch) = self.board.dispatch.watches.get_mut(&record.item_id) else {
+            return;
+        };
+        if watch.forward_note != note {
+            watch.forward_note = note.clone();
+            cx.notify();
+        }
+        let Some(ForwardNote::Stopped(names)) = note else {
+            return;
+        };
+        let handed_at = record.forwarded.as_ref().map(|last| last.at.clone());
+        if handed_at.is_none() || watch.forward_rang == handed_at {
+            return;
+        }
+        watch.forward_rang = handed_at;
+        let detail = format!(
+            "Its session stopped without a push or a reply after {} commented.",
+            named(&names)
+        );
+        self.push_notification(
+            NotificationKind::SessionWaiting,
+            format!("#{} waits for you", record.number),
+            detail,
+            tab_title,
+            cx,
+        );
+    }
+
+    fn run_repair(
+        &mut self,
+        place: (&str, &Path, &str),
+        record: &WorktreeDispatch,
+        working: &mut Option<bool>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (project_id, path, branch) = place;
+        let Some((pr, step)) = self.next_repair(record, path, working, cx) else {
+            self.note_repair(record, path, None, cx);
+            return;
+        };
+        let note = match step {
+            RepairStep::Nothing => None,
+            RepairStep::Clear => {
+                let healthy = WorktreeDispatch {
+                    repair: None,
+                    ..record.clone()
+                };
+                if let Err(err) = self.save_record(project_id, path, branch, healthy, cx) {
+                    let number = record.number;
+                    eprintln!("warning: couldn't forget the repairs of #{number}: {err}");
+                }
+                None
+            }
+            RepairStep::Running => {
+                record.repair.as_ref().map(|r| RepairNote::Running(r.fault, r.attempts))
+            }
+            RepairStep::StoppedWithoutPush => {
+                record.repair.as_ref().map(|r| RepairNote::Stopped(r.fault))
+            }
+            RepairStep::GaveUp(fault) => Some(RepairNote::GaveUp(fault.kind())),
+            RepairStep::Start { fault, attempt } => {
+                self.start_repair(place, record, &pr, (fault, attempt), window, cx)
+            }
+        };
+        self.note_repair(record, path, note, cx);
     }
 
     fn next_repair(
         &mut self,
         record: &WorktreeDispatch,
         path: &Path,
+        working: &mut Option<bool>,
         cx: &App,
     ) -> Option<(PullRequest, RepairStep)> {
         let watch = self.board.dispatch.watches.get(&record.item_id)?;
@@ -2776,32 +3214,18 @@ impl AppShell {
             return Some((pr, RepairStep::Nothing));
         }
         let role = self.item_role(&record.board_url, &record.item_id);
-        let working = matches!(self.session_at(path, cx), SessionAt::Working | SessionAt::Held(_));
-        let started = repair.map(|r| r.started_at.clone());
+        let working = self.is_working(path, cx, working);
+        let forward_open = record.forwarded.as_ref().is_some_and(|last| last.is_open(&pr));
         let watch = self.board.dispatch.watches.get_mut(&record.item_id)?;
-        if watch.repair_started != started {
-            watch.repair_started = started;
-            watch.repair_worked = true;
-            watch.repair_stopped_at = None;
-        }
-        let new_turn = watch.turns > watch.repair_turns;
-        watch.repair_turns = watch.turns;
-        watch.repair_worked |= working || new_turn;
-        if working {
-            watch.repair_stopped_at = None;
-        } else if new_turn {
-            watch.repair_stopped_at = Some(Instant::now());
-        } else {
-            watch.repair_stopped_at.get_or_insert_with(Instant::now);
-        }
+        let forward_holds = forward_open || watch.forward_note == Some(ForwardNote::FixReply);
+        let turns = watch.turns;
+        watch.repair_follow.look(repair.map(|r| r.started_at.clone()), working, turns);
         let active = repair.is_some_and(|r| r.head == pr.head_oid);
-        let session = repair_session(
-            working,
-            active,
-            watch.repair_worked,
-            watch.repair_stopped_at,
-            watch.read_ok_at,
-        );
+        let session = if forward_holds {
+            HandoverSession::Busy
+        } else {
+            watch.repair_follow.session(working, active, watch.read_ok_at)
+        };
         let step = match repair_step(&pr, repair, session, role) {
             RepairStep::Clear => {
                 let read = watch.read_ok_at?;
@@ -2816,6 +3240,10 @@ impl AppShell {
                     RepairStep::Nothing
                 }
             }
+            RepairStep::Start { .. } if !watch.read_after_stop() => {
+                watch.healthy_since = None;
+                RepairStep::Nothing
+            }
             step => {
                 watch.healthy_since = None;
                 step
@@ -2826,41 +3254,24 @@ impl AppShell {
 
     fn start_repair(
         &mut self,
-        (project_id, path, branch): (&str, &Path, &str),
+        place: (&str, &Path, &str),
         record: &WorktreeDispatch,
         pr: &PullRequest,
         (fault, attempt): (Fault, u32),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<RepairNote> {
+        let (project_id, path, branch) = place;
         let waits = Some(RepairNote::Waits(fault.kind()));
         let watch = self.board.dispatch.watches.get(&record.item_id);
         let failed_at = watch.and_then(|watch| watch.repair_failed_at);
         if failed_at.is_some_and(|at| at.elapsed() < POST_RETRY) {
             return waits;
         }
-        let terminal = match self.handover_target(path, cx) {
-            HandoverTarget::Type(terminal) => Some(terminal),
-            HandoverTarget::NewTab => None,
-            HandoverTarget::Wait(_) => return waits,
-        };
-        let project = self.current_projects(cx).project(project_id).cloned()?;
         let message = repair_message(record.number);
-        let launch = self.project_agent(&project).and_then(|profile| {
-            let command = codescope_core::build_new_session_auto_type(&profile)
-                .and_then(|launch| launch_with_task(&launch, &message))?;
-            let mut title = codescope_core::TabTitle::project(project.name.clone());
-            title.set_branch(branch);
-            Some(Launch {
-                project_id: project_id.to_string(),
-                title,
-                agent_id: profile.id.clone(),
-                command,
-            })
-        });
-        if terminal.is_none() && launch.is_none() {
+        let Some(route) = self.handover_route(place, &message, cx) else {
             return waits;
-        }
+        };
         let skill = skill_in(path, "repair");
         let task = repair_task(record, pr, &fault, skill.as_deref());
         let started_at = codescope_core::time::now_iso8601();
@@ -2885,16 +3296,10 @@ impl AppShell {
             return waits;
         }
         if let Some(watch) = self.board.dispatch.watches.get_mut(&record.item_id) {
-            watch.repair_started = Some(started_at);
-            watch.repair_worked = false;
-            watch.repair_stopped_at = None;
-            watch.repair_turns = watch.turns;
+            let turns = watch.turns;
+            watch.repair_follow.start(started_at, turns);
         }
-        match (terminal, launch) {
-            (Some(terminal), _) => Self::submit_line(&terminal, message, cx),
-            (None, Some(launch)) => self.hand_over(path, None, launch, message, window, cx),
-            (None, None) => {}
-        }
+        self.deliver(path, route, message, window, cx);
         let title = format!("Repair started on #{}", record.number);
         self.push_toast(ToastKind::Ok, title, Some(fault.kind().label().into()), cx);
         Some(RepairNote::Running(fault.kind(), attempt))
@@ -2975,12 +3380,8 @@ impl AppShell {
                         }
                     }
                 });
-                let repair = state
-                    .watches
-                    .get(&r.item_id)
-                    .and_then(|watch| watch.repair_note)
-                    .map(repair_card);
-                (r.item_id, repair.or(watched).unwrap_or(note))
+                let handover = state.watches.get(&r.item_id).and_then(handover_card);
+                (r.item_id, handover.or(watched).unwrap_or(note))
             })
             .collect();
         for key in state.posting.iter().filter(|key| rounds.contains(*key)) {
@@ -3065,7 +3466,8 @@ impl AppShell {
             let result = cx
                 .background_spawn(async move {
                     let url = github::add_comment(&content_id, &posted_body)
-                        .map_err(|err| format!("{err:#}"))?;
+                        .map_err(|err| format!("{err:#}"))?
+                        .url;
                     let moved = ready.and_then(|(board, column)| {
                         github::set_status(&board, &item_id, &column)
                             .map_err(|err| format!("{err:#}"))
@@ -3213,23 +3615,58 @@ fn repair_bell(note: RepairNote) -> Option<String> {
     }
 }
 
-fn repair_session(
-    working: bool,
-    active: bool,
-    worked: bool,
-    stopped_at: Option<Instant>,
-    read_ok_at: Option<Instant>,
-) -> RepairSession {
-    if working {
-        return RepairSession::Busy;
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ForwardNote {
+    Waits(Vec<String>),
+    Working(Vec<String>),
+    Posting,
+    FixReply,
+    Stopped(Vec<String>),
+}
+
+fn named(authors: &[String]) -> String {
+    let named: Vec<String> = authors.iter().map(|author| format!("@{author}")).collect();
+    match named.as_slice() {
+        [rest @ .., last] if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => named.concat(),
     }
-    let read_since_stop = stopped_at
-        .zip(read_ok_at)
-        .is_some_and(|(stop, read)| read > stop);
-    if active && worked && read_since_stop {
-        RepairSession::StoppedAfterRepair
+}
+
+fn forward_card(watch: &PullRequestWatch) -> Option<CardNote> {
+    let commented =
+        |authors: &[String], how: &str| format!("{} commented · {how}", named(authors));
+    let card = match watch.forward_note.as_ref()? {
+        ForwardNote::Waits(authors) => {
+            CardNote::new(commented(authors, "waits for its session"), NoteTone::Waiting)
+        }
+        ForwardNote::Working(authors) => {
+            CardNote::new(commented(authors, "handed to its session"), NoteTone::Working)
+        }
+        ForwardNote::Posting => match &watch.forward_post_error {
+            Some((_, message)) => {
+                CardNote::new(format!("Couldn't post the reply: {message}"), NoteTone::Failed)
+            }
+            None => CardNote::new("Posting the reply…", NoteTone::Working),
+        },
+        ForwardNote::FixReply => {
+            let problems = watch.reply_reminder.as_ref().map_or("", |r| r.problems.as_str());
+            CardNote::new(format!("Reply incomplete: {problems}"), NoteTone::Failed)
+        }
+        ForwardNote::Stopped(authors) => CardNote::new(
+            commented(authors, "its session stopped without a push or a reply"),
+            NoteTone::NeedsYou,
+        ),
+    };
+    Some(card)
+}
+
+fn handover_card(watch: &PullRequestWatch) -> Option<CardNote> {
+    let forward = forward_card(watch);
+    let repair = watch.repair_note.map(repair_card);
+    if matches!(watch.forward_note, Some(ForwardNote::Waits(_))) {
+        repair.or(forward)
     } else {
-        RepairSession::Idle
+        forward.or(repair)
     }
 }
 
@@ -3717,26 +4154,117 @@ mod tests {
     }
 
     #[test]
-    fn a_repair_stopped_short_only_when_a_read_after_its_stop_saw_the_same_head() {
+    fn a_handover_stopped_short_only_when_a_read_after_its_stop_saw_it_still_open() {
         let stop = Instant::now();
         let later = stop + Duration::from_secs(5);
-        assert!(repair_session(true, true, true, None, Some(stop)) == RepairSession::Busy);
+        let follow = |worked, stopped_at| HandoverFollow {
+            worked,
+            stopped_at,
+            ..HandoverFollow::default()
+        };
+        assert!(follow(true, None).session(true, true, Some(stop)) == HandoverSession::Busy);
         assert!(
-            repair_session(false, true, true, Some(stop), Some(later))
-                == RepairSession::StoppedAfterRepair
+            follow(true, Some(stop)).session(false, true, Some(later)) == HandoverSession::Stopped
         );
         assert!(
-            repair_session(false, true, true, Some(later), Some(stop)) == RepairSession::Idle,
+            follow(true, Some(later)).session(false, true, Some(stop)) == HandoverSession::Idle,
             "no read since it stopped"
         );
         assert!(
-            repair_session(false, true, false, Some(stop), Some(later)) == RepairSession::Idle,
-            "it hasn't worked on the repair yet"
+            follow(false, Some(stop)).session(false, true, Some(later)) == HandoverSession::Idle,
+            "it hasn't worked on the handover yet"
         );
         assert!(
-            repair_session(false, false, true, Some(stop), Some(later)) == RepairSession::Idle,
-            "no repair on this head"
+            follow(true, Some(stop)).session(false, false, Some(later)) == HandoverSession::Idle,
+            "what was handed over is done"
         );
+    }
+
+    #[test]
+    fn a_handover_is_worked_on_once_a_prompt_follows_it_or_this_run_did_not_start_it() {
+        let at = "2026-11-27T10:00:00Z".to_string();
+        let mut follow = HandoverFollow::default();
+        follow.start(at.clone(), Some(3));
+        follow.look(Some(at.clone()), false, Some(3));
+        assert!(!follow.worked, "typed, not taken yet");
+        assert!(follow.stopped_at.is_some());
+        follow.look(Some(at.clone()), false, Some(4));
+        assert!(follow.worked, "a prompt went by between two looks");
+        follow.look(Some(at), true, Some(4));
+        assert!(follow.stopped_at.is_none());
+        let mut restarted = HandoverFollow::default();
+        restarted.look(Some("2026-11-27T09:00:00Z".into()), false, Some(7));
+        assert!(restarted.worked);
+    }
+
+    #[test]
+    fn a_forwarded_comment_s_card_says_who_commented_and_where_it_stands() {
+        let card = |note: ForwardNote| {
+            let watch = PullRequestWatch {
+                forward_note: Some(note),
+                ..PullRequestWatch::default()
+            };
+            let card = forward_card(&watch).unwrap();
+            (card.text.to_string(), card.tone)
+        };
+        let sanne = || vec!["sanne".to_string()];
+        assert!(
+            card(ForwardNote::Working(sanne()))
+                == ("@sanne commented · handed to its session".into(), NoteTone::Working)
+        );
+        assert!(
+            card(ForwardNote::Waits(vec!["sanne".into(), "piet".into()]))
+                == ("@sanne and @piet commented · waits for its session".into(), NoteTone::Waiting)
+        );
+        assert!(
+            card(ForwardNote::Stopped(vec!["a".into(), "b".into(), "c".into()]))
+                == (
+                    "@a, @b and @c commented · its session stopped without a push or a reply"
+                        .into(),
+                    NoteTone::NeedsYou
+                )
+        );
+        assert!(card(ForwardNote::Posting) == ("Posting the reply…".into(), NoteTone::Working));
+        let failed = PullRequestWatch {
+            forward_note: Some(ForwardNote::Posting),
+            forward_post_error: Some((Instant::now(), "HTTP 502".into())),
+            ..PullRequestWatch::default()
+        };
+        let text = forward_card(&failed).unwrap().text;
+        assert_eq!(text.as_ref(), "Couldn't post the reply: HTTP 502");
+        let broken = PullRequestWatch {
+            forward_note: Some(ForwardNote::FixReply),
+            reply_reminder: Some(Reminder {
+                problems: "a code block is not closed".into(),
+                ..Reminder::default()
+            }),
+            ..PullRequestWatch::default()
+        };
+        let text = forward_card(&broken).unwrap().text;
+        assert_eq!(text.as_ref(), "Reply incomplete: a code block is not closed");
+    }
+
+    #[test]
+    fn a_waiting_comment_leaves_the_card_to_a_repair() {
+        let waits = || Some(ForwardNote::Waits(vec!["sanne".into()]));
+        let text = |watch: &PullRequestWatch| handover_card(watch).unwrap().text.to_string();
+        let repairing = PullRequestWatch {
+            forward_note: waits(),
+            repair_note: Some(RepairNote::Running(FaultKind::Checks, 1)),
+            ..PullRequestWatch::default()
+        };
+        assert_eq!(text(&repairing), "Repairing failed checks · 1 of 2");
+        let waiting = PullRequestWatch {
+            forward_note: waits(),
+            ..PullRequestWatch::default()
+        };
+        assert_eq!(text(&waiting), "@sanne commented · waits for its session");
+        let handed = PullRequestWatch {
+            forward_note: Some(ForwardNote::Working(vec!["sanne".into()])),
+            repair_note: Some(RepairNote::Stopped(FaultKind::Checks)),
+            ..PullRequestWatch::default()
+        };
+        assert_eq!(text(&handed), "@sanne commented · handed to its session");
     }
 
     #[test]
@@ -3839,6 +4367,7 @@ mod tests {
             checks,
             head_oid: format!("c{number}"),
             health: Default::default(),
+            comments: Vec::new(),
         }
     }
 
@@ -3848,6 +4377,7 @@ mod tests {
             url: "u".into(),
             comment_url: "c".into(),
             in_review: false,
+            reported_at: None,
         }
     }
 
@@ -3868,6 +4398,7 @@ mod tests {
             review: None,
             fork: None,
             repair: None,
+            forwarded: None,
         }
     }
 
@@ -3931,6 +4462,22 @@ mod tests {
         assert!(note.tone == NoteTone::NeedsYou);
         watch.track(None);
         assert!(!watch.waits_for_you(), "the tab is closed");
+    }
+
+    #[test]
+    fn a_handover_waits_for_a_read_that_started_after_the_session_stopped() {
+        let mut watch = PullRequestWatch::default();
+        assert!(watch.read_after_stop(), "no tab, so nothing that can push and stop");
+        watch.read_ok_at = Some(Instant::now());
+        watch.track(Some((SessionState::Busy, 4)));
+        watch.track(Some((SessionState::Idle, 4)));
+        let stopped = watch.idle_since.unwrap();
+        watch.read_ok_at = Some(stopped - Duration::from_millis(1));
+        assert!(!watch.read_after_stop(), "the read may predate a push before the stop");
+        watch.read_ok_at = Some(stopped + Duration::from_millis(1));
+        assert!(watch.read_after_stop());
+        watch.read_ok_at = None;
+        assert!(!watch.read_after_stop(), "never read");
     }
 
     #[test]

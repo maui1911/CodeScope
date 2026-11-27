@@ -12,8 +12,8 @@ use serde::de::DeserializeOwned;
 use super::answers::Comment;
 use super::dispatch::StatusChange;
 use super::pull_request::{
-    Checks, FailedCheck, Health, LinkedPullRequest, Mergeable, PullRequest, PullRequestHead,
-    PullRequestState,
+    Checks, FailedCheck, Health, LinkedPullRequest, Mergeable, PullRequest, PullRequestComment,
+    PullRequestHead, PullRequestState,
 };
 use super::{Board, BoardItem, BoardOwner, BoardRef, Column, ItemKind, ItemState};
 use crate::process::no_window_command;
@@ -300,9 +300,11 @@ pub fn assign(content_id: &str, user_id: &str) -> Result<()> {
 
 /// Comment on an issue or pull request by its node id; returns the comment's URL. The request
 /// goes through stdin, so a long body is not cut off by the command line's length limit.
-pub fn add_comment(subject_id: &str, body: &str) -> Result<String> {
+pub fn add_comment(subject_id: &str, body: &str) -> Result<NewComment> {
     let query = r#"mutation($subject: ID!, $body: String!) {
-  addComment(input: { subjectId: $subject, body: $body }) { commentEdge { node { url } } }
+  addComment(input: { subjectId: $subject, body: $body }) {
+    commentEdge { node { url createdAt } }
+  }
 }"#;
     let request = serde_json::json!({
         "query": query,
@@ -310,13 +312,22 @@ pub fn add_comment(subject_id: &str, body: &str) -> Result<String> {
     });
     let args = ["graphql", "--input", "-"].map(String::from);
     let stdout = run_gh_api_with_input(&args, Some(request.to_string()))?;
-    parse_comment_url(&stdout)
+    parse_new_comment(&stdout)
+}
+
+/// A comment [`add_comment`] posted.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewComment {
+    pub url: String,
+    /// ISO 8601 in UTC, by GitHub's clock.
+    pub created_at: String,
 }
 
 /// Parse [`add_comment`]'s response.
-pub fn parse_comment_url(json: &str) -> Result<String> {
+pub fn parse_new_comment(json: &str) -> Result<NewComment> {
     let data: AddCommentData = parse_data(json)?;
-    Ok(data.add_comment.comment_edge.node.url)
+    Ok(data.add_comment.comment_edge.node)
 }
 
 const BEFORE_POSTING_QUERY: &str = r#"query($item: ID!, $subject: ID!) {
@@ -427,6 +438,7 @@ const PULL_REQUESTS_QUERY: &str = r#"query($owner: String!, $name: String!, $bra
         id number url state isDraft isCrossRepository headRefOid
         baseRefName mergeable mergeStateStatus
         reviews(states: [APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED]) { totalCount }
+        comments(last: 50) { ...conversation }
         commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) {
           nodes {
             __typename
@@ -437,6 +449,9 @@ const PULL_REQUESTS_QUERY: &str = r#"query($owner: String!, $name: String!, $bra
       }
     }
   }
+}
+fragment conversation on IssueCommentConnection {
+  nodes { url createdAt viewerDidAuthor author { __typename login } }
 }"#;
 
 /// The open and merged pull requests from `branch` of `repository` (`owner/name`) itself, newest
@@ -512,7 +527,22 @@ fn into_pull_request(node: PullRequestNode) -> Option<PullRequest> {
         checks,
         head_oid: node.head_ref_oid,
         health,
+        comments: node.comments.map(conversation).unwrap_or_default(),
     })
+}
+
+fn conversation(comments: PullRequestComments) -> Vec<PullRequestComment> {
+    comments
+        .nodes
+        .into_iter()
+        .flatten()
+        .map(|comment| PullRequestComment {
+            url: comment.url,
+            author: comment.author.filter(|a| a.typename == "User").map(|a| a.login),
+            created_at: comment.created_at,
+            by_viewer: comment.viewer_did_author,
+        })
+        .collect()
 }
 
 const PULL_REQUEST_QUERY: &str = r#"query($id: ID!) {
@@ -521,6 +551,7 @@ const PULL_REQUEST_QUERY: &str = r#"query($id: ID!) {
       id number url state isDraft isCrossRepository headRefOid
       baseRefName mergeable mergeStateStatus
       reviews(states: [APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED]) { totalCount }
+      comments(last: 50) { ...conversation }
       commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) {
         nodes {
           __typename
@@ -530,6 +561,9 @@ const PULL_REQUEST_QUERY: &str = r#"query($id: ID!) {
       } } } } }
     }
   }
+}
+fragment conversation on IssueCommentConnection {
+  nodes { url createdAt viewerDidAuthor author { __typename login } }
 }"#;
 
 /// The pull request with node id `id`; `None` when it was closed without a merge.
@@ -802,12 +836,7 @@ struct AddCommentPayload {
 
 #[derive(Deserialize)]
 struct CommentEdge {
-    node: CommentNode,
-}
-
-#[derive(Deserialize)]
-struct CommentNode {
-    url: String,
+    node: NewComment,
 }
 
 #[derive(Deserialize)]
@@ -970,6 +999,29 @@ struct PullRequestNode {
     merge_state_status: Option<String>,
     #[serde(default)]
     reviews: Option<Count>,
+    #[serde(default)]
+    comments: Option<PullRequestComments>,
+}
+
+#[derive(Deserialize)]
+struct PullRequestComments {
+    nodes: Vec<Option<PullRequestCommentNode>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestCommentNode {
+    url: String,
+    created_at: String,
+    viewer_did_author: bool,
+    author: Option<Actor>,
+}
+
+#[derive(Deserialize)]
+struct Actor {
+    #[serde(rename = "__typename")]
+    typename: String,
+    login: String,
 }
 
 #[derive(Deserialize)]
@@ -1463,12 +1515,16 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_url_of_a_new_comment() {
+    fn reads_the_url_and_github_s_time_of_a_new_comment() {
         let json = r#"{"data":{"addComment":{"commentEdge":{"node":{
-          "url":"https://github.com/maui1911/CodeScope/issues/408#issuecomment-1"}}}}}"#;
+          "url":"https://github.com/maui1911/CodeScope/issues/408#issuecomment-1",
+          "createdAt":"2026-11-27T13:18:24Z"}}}}}"#;
         assert_eq!(
-            parse_comment_url(json).unwrap(),
-            "https://github.com/maui1911/CodeScope/issues/408#issuecomment-1"
+            parse_new_comment(json).unwrap(),
+            NewComment {
+                url: "https://github.com/maui1911/CodeScope/issues/408#issuecomment-1".into(),
+                created_at: "2026-11-27T13:18:24Z".into(),
+            }
         );
     }
 
@@ -1591,6 +1647,7 @@ mod tests {
                     checks: Checks::Running,
                     head_oid: "c417".into(),
                     health: Health::default(),
+                    comments: Vec::new(),
                 },
                 PullRequest {
                     id: "PR_1".into(),
@@ -1601,6 +1658,7 @@ mod tests {
                     checks: Checks::None,
                     head_oid: "c415".into(),
                     health: Health::default(),
+                    comments: Vec::new(),
                 },
             ]
         );
@@ -1631,6 +1689,7 @@ mod tests {
                 checks: Checks::Passing,
                 head_oid: "c420".into(),
                 health: Health::default(),
+                comments: Vec::new(),
             })
         );
         let merged = parse_pull_request(&node("MERGED")).unwrap().unwrap();
@@ -1689,6 +1748,43 @@ mod tests {
         let clean = health(&node("MERGEABLE", "UNSTABLE", 0));
         assert_eq!((clean.mergeable, clean.behind, clean.reviewed), (Mergeable::Yes, false, false));
         assert_eq!(health(&node("UNKNOWN", "UNKNOWN", 0)).mergeable, Mergeable::Unknown);
+    }
+
+    #[test]
+    fn reads_who_wrote_each_conversation_comment_on_a_pull_request() {
+        let json = r#"{"data":{"node":{"id":"PR_420","number":420,
+          "url":"https://github.com/maui1911/CodeScope/pull/420","state":"OPEN",
+          "isDraft":false,"isCrossRepository":false,"headRefOid":"c420","commits":{"nodes":[]},
+          "comments":{"nodes":[
+            {"url":"https://c/1","createdAt":"2026-11-27T10:00:00Z","viewerDidAuthor":false,
+             "author":{"__typename":"User","login":"sanne"}},
+            {"url":"https://c/2","createdAt":"2026-11-27T10:01:00Z","viewerDidAuthor":true,
+             "author":{"__typename":"User","login":"maui1911"}},
+            {"url":"https://c/3","createdAt":"2026-11-27T10:02:00Z","viewerDidAuthor":false,
+             "author":{"__typename":"Bot","login":"github-actions"}},
+            {"url":"https://c/4","createdAt":"2026-11-27T10:03:00Z","viewerDidAuthor":false,
+             "author":null},
+            null
+          ]}
+        }}}"#;
+        let comment = |n: u32, author: Option<&str>, by_viewer: bool| PullRequestComment {
+            url: format!("https://c/{n}"),
+            author: author.map(String::from),
+            created_at: format!("2026-11-27T10:0{}:00Z", n - 1),
+            by_viewer,
+        };
+        assert_eq!(
+            parse_pull_request(json).unwrap().unwrap().comments,
+            vec![
+                comment(1, Some("sanne"), false),
+                comment(2, Some("maui1911"), true),
+                comment(3, None, false),
+                comment(4, None, false),
+            ]
+        );
+        for query in [PULL_REQUEST_QUERY, PULL_REQUESTS_QUERY] {
+            assert!(query.contains("comments(last: 50) { ...conversation }"), "{query}");
+        }
     }
 
     #[test]

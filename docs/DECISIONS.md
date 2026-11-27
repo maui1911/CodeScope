@@ -1057,7 +1057,8 @@ board, each with their own CodeScope or another tool that follows the
   no comments of the agent's own on the issue or the pull request,
   because CodeScope posts what a round produces; in a review round
   the agent may reply in the review threads it handles, and writes any
-  other reply to `.codescope/reply.md`), so a skill describes the work
+  other reply to `.codescope/reply.md`, as it does its answer to a
+  forwarded comment), so a skill describes the work
   and cannot break the handover.
   CodeScope sets no agent per phase: agent definitions in the
   repository (such as `.claude/agents/`) reach the session through the

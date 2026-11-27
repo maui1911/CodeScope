@@ -55,7 +55,7 @@ One stage of a dispatch: research, which ends with the findings, or implementati
 _Avoid_: step, stage
 
 **Round**:
-One stretch of work in a dispatch that a single event starts and a single result ends: the research round, the implementation round, a review round or a repair.
+One stretch of work in a dispatch that a single event starts and a single result ends: the research round, the implementation round, a review round, a repair, or the round of a forwarded comment.
 _Avoid_: run, job, iteration
 
 **Research**:
@@ -81,6 +81,10 @@ _Avoid_: rework, address review
 **Repair**:
 A round in implementation in which the agent makes its own pull request mergeable again after a red check, a merge conflict or a base branch that moved on, without handling review comments.
 _Avoid_: fix-up, auto-fix, retry
+
+**Forwarded comment**:
+A conversation comment that a teammate with write access writes on the pull request a dispatch opened, before its first review, and that goes into the dispatch's session; the agent handles it in a round of its own, and it starts the count of repairs again.
+_Avoid_: relayed comment, comment round
 
 **Needs you**:
 The state of a dispatch that cannot go on without the person it is assigned to: its session waits for input, findings wait for a decision, a draft pull request waits to be tested by hand, or a choice is needed before it can start. Part of it only that person's own tool knows, so only they see it.

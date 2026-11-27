@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use super::findings::Outcome;
+use super::forward::Forwarded;
 use super::repair::Repair;
 use super::pull_request::{LinkedPullRequest, PostedPullRequest, PullRequestHead};
 use super::{Board, BoardItem, ColumnMapping, ColumnRole, ItemKind, ItemState, RoleKind};
@@ -137,6 +138,20 @@ pub struct WorktreeDispatch {
     /// The repairs on the pull request the dispatch opened, since it was last healthy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repair: Option<Repair>,
+    /// The comments on that pull request last handed to the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded: Option<Forwarded>,
+}
+
+/// The dispatch's session, after CodeScope handed it a repair or comments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoverSession {
+    /// It works, or something else keeps it from taking a task.
+    Busy,
+    /// It waits for a prompt, or there is none and a new one can start.
+    Idle,
+    /// It worked on the last handover and stopped, and a read since then saw the same head.
+    Stopped,
 }
 
 /// Where a round on a fork's pull request pushes.
@@ -1352,6 +1367,7 @@ mod tests {
             review: None,
             fork: None,
             repair: None,
+            forwarded: None,
         }
     }
 
@@ -1390,6 +1406,7 @@ mod tests {
             url: format!("https://github.com/maui1911/CodeScope/pull/{number}"),
             comment_url: comment_url.into(),
             in_review: false,
+            reported_at: None,
         }
     }
 
@@ -1531,6 +1548,7 @@ mod tests {
             url: "https://github.com/maui1911/CodeScope/pull/15".into(),
             comment_url: "https://github.com/maui1911/CodeScope/issues/411#issuecomment-2".into(),
             in_review: true,
+            reported_at: None,
         });
         let own = |pull_request, linked| Facts {
             dispatch: Some(&implemented),
@@ -2273,9 +2291,11 @@ mod tests {
             url: "https://github.com/maui1911/CodeScope/pull/415".into(),
             comment_url: "https://github.com/maui1911/CodeScope/issues/411#issuecomment-2".into(),
             in_review: true,
+            reported_at: Some("2026-11-27T10:00:00Z".into()),
         });
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains(r#""inReview":true"#), "{json}");
+        assert!(json.contains(r#""reportedAt":"2026-11-27T10:00:00Z""#), "{json}");
         assert!(!json.contains("review\""), "{json}");
         assert_eq!(serde_json::from_str::<WorktreeDispatch>(&json).unwrap(), record);
         record.review = Some(ReviewRound {
@@ -2297,6 +2317,7 @@ mod tests {
             url: "https://github.com/maui1911/CodeScope/pull/415".into(),
             comment_url: "c".into(),
             in_review: false,
+            reported_at: None,
         });
         let task = task_file(&record, None, None);
         assert!(task.starts_with("# Review: #411\n"), "{task}");
