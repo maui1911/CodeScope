@@ -58,6 +58,8 @@ impl AppShell {
         };
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
+        // gpui hands the focus to the root's `track_focus` on the click that opened this.
+        window.prevent_default();
         self.decide_dialog = Some(DecideDialogState {
             focus_handle,
             choices: decision.choices.clone(),
