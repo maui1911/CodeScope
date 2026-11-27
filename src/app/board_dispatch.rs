@@ -4492,7 +4492,7 @@ mod tests {
         let mut watch = PullRequestWatch::default();
         assert!(watch.read_due(Some(ColumnRole::InProgress), false));
         assert!(!watch.read_due(Some(ColumnRole::Done), false), "no open pull request to follow");
-        watch.read_at = Some(Instant::now());
+        watch.read_at = Some(Instant::now() - Duration::from_secs(1));
         assert!(!watch.read_due(Some(ColumnRole::InProgress), false));
         watch.track(Some((SessionState::Busy, 4)));
         watch.track(Some((SessionState::Idle, 4)));
