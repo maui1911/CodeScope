@@ -441,6 +441,7 @@ mod tests {
             findings: None,
             pull_request: None,
             review: None,
+            fork: None,
         };
         let path = "/repo.worktrees/411-fuzzy-paths";
         assert!(record_dispatch(&mut cfg, &id, path, "411-fuzzy-paths", research.clone()));
@@ -481,6 +482,7 @@ mod tests {
             findings: None,
             pull_request: None,
             review: None,
+            fork: None,
         };
         let path = "/repo.worktrees/411-fuzzy-paths";
         assert!(record_dispatch(&mut cfg, &id, path, "411-fuzzy-paths", research.clone()));

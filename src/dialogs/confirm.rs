@@ -79,9 +79,6 @@ pub struct ConfirmSpec {
     pub cancel_label: SharedString,
 }
 
-#[allow(dead_code)] // `confirm` + `with_cancel_label` exist on the API surface
-                    // for future callers; today every destructive site is a
-                    // `Destructive`-flavor dialog with the default "Cancel" label.
 impl ConfirmSpec {
     /// Shorthand for a reversible "Confirm" prompt.
     pub fn confirm(

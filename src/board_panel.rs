@@ -941,6 +941,7 @@ fn render_card(
                     let label = match action {
                         CardAction::Decide => "Decide",
                         CardAction::ReadyForReview => "Ready for review",
+                        CardAction::StartFromFork => "Start…",
                     };
                     let button = div()
                         .id(("board-card-action", index))
@@ -962,6 +963,9 @@ fn render_card(
                                     }
                                     CardAction::ReadyForReview => {
                                         this.ready_for_review(&item_id, cx)
+                                    }
+                                    CardAction::StartFromFork => {
+                                        this.confirm_fork_start(&item_id, window, cx)
                                     }
                                 }
                             }),

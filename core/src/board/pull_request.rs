@@ -84,6 +84,10 @@ pub struct PullRequestHead {
     pub branch: String,
     /// Set when the branch lives in another repository, such as a fork.
     pub is_cross_repository: bool,
+    /// The repository the branch lives in, `owner/name`; `None` once it is deleted.
+    pub repository: Option<String>,
+    /// Whether its author lets the base repository's maintainers push to the branch.
+    pub maintainer_can_modify: bool,
 }
 
 /// A pull request CodeScope reported on the issue, or the pull request that is the item, kept on
