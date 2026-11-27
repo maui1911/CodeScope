@@ -155,8 +155,8 @@ pub struct PostedPullRequest {
     /// again.
     #[serde(default)]
     pub in_review: bool,
-    /// When CodeScope reported it on the issue, ISO 8601; `None` when the item is the pull
-    /// request, or the report came before CodeScope kept its time.
+    /// When CodeScope reported it on the issue, ISO 8601 by GitHub's clock; `None` when the item
+    /// is the pull request, or the report came before CodeScope kept its time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reported_at: Option<String>,
 }

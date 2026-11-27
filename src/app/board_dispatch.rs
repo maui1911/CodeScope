@@ -33,7 +33,7 @@ use codescope_core::board::forward::{
     ForwardFacts, ForwardStep, Forwarded, authors, comments_since, forward_message, forward_step,
     forward_task, new_comments,
 };
-use codescope_core::board::github::{self, TriggerReads, Viewer};
+use codescope_core::board::github::{self, NewComment, TriggerReads, Viewer};
 use codescope_core::board::pull_request::{
     Checks, PostedPullRequest, PullRequest, PullRequestComment, PullRequestHead, PullRequestState,
     moves_to_in_review, pull_request_comment, review_round_worked, round_pull_request,
@@ -461,7 +461,7 @@ fn post_once(item_id: &str, subject_id: &str, since: &str, body: &str) -> Result
     let before = github::before_posting(item_id, subject_id, since, body).map_err(failed)?;
     match before.posted {
         Some(url) => Ok(url),
-        None => github::add_comment(subject_id, body).map_err(failed),
+        None => github::add_comment(subject_id, body).map(|new| new.url).map_err(failed),
     }
 }
 
@@ -1995,7 +1995,7 @@ impl AppShell {
                         .map_err(failed)?;
                     let url = match before.posted {
                         Some(url) => url,
-                        None => github::add_comment(&content_id, &body).map_err(failed)?,
+                        None => github::add_comment(&content_id, &body).map_err(failed)?.url,
                     };
                     let role = before
                         .column_id
@@ -2493,7 +2493,6 @@ impl AppShell {
         let item_id = record.item_id.clone();
         let content_id = record.content_id.clone();
         let body = pull_request_comment(&pr, record.round, record.kind);
-        let reported_at = codescope_core::time::now_iso8601();
         if let Some(watch) = self.board.dispatch.watches.get_mut(&item_id) {
             watch.reporting = true;
             watch.report_error = None;
@@ -2505,9 +2504,7 @@ impl AppShell {
                     github::add_comment(&content_id, &body).map_err(|err| format!("{err:#}"))
                 })
                 .await;
-            let _ = this.update(cx, |this, cx| {
-                this.finish_report(&item_id, pr, reported_at, result, cx);
-            });
+            let _ = this.update(cx, |this, cx| this.finish_report(&item_id, pr, result, cx));
         })
         .detach();
     }
@@ -2516,16 +2513,15 @@ impl AppShell {
         &mut self,
         item_id: &str,
         pr: PullRequest,
-        reported_at: String,
-        result: Result<String, String>,
+        result: Result<NewComment, String>,
         cx: &mut Context<Self>,
     ) {
         let Some(watch) = self.board.dispatch.watches.get_mut(item_id) else {
             return;
         };
         watch.reporting = false;
-        let comment_url = match result {
-            Ok(url) => url,
+        let comment = match result {
+            Ok(comment) => comment,
             Err(message) => {
                 watch.report_error = Some((Instant::now(), message.clone()));
                 let title = format!("Couldn't report PR #{} on the issue", pr.number);
@@ -2536,9 +2532,9 @@ impl AppShell {
         let posted = PostedPullRequest {
             number: pr.number,
             url: pr.url.clone(),
-            comment_url,
+            comment_url: comment.url,
             in_review: false,
-            reported_at: Some(reported_at),
+            reported_at: Some(comment.created_at),
         };
         self.keep_posted(item_id, posted, cx);
         let Some((_, path, _, record)) = self.dispatch_record(item_id, cx) else {
@@ -3449,7 +3445,8 @@ impl AppShell {
             let result = cx
                 .background_spawn(async move {
                     let url = github::add_comment(&content_id, &posted_body)
-                        .map_err(|err| format!("{err:#}"))?;
+                        .map_err(|err| format!("{err:#}"))?
+                        .url;
                     let moved = ready.and_then(|(board, column)| {
                         github::set_status(&board, &item_id, &column)
                             .map_err(|err| format!("{err:#}"))

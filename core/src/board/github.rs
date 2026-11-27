@@ -300,9 +300,11 @@ pub fn assign(content_id: &str, user_id: &str) -> Result<()> {
 
 /// Comment on an issue or pull request by its node id; returns the comment's URL. The request
 /// goes through stdin, so a long body is not cut off by the command line's length limit.
-pub fn add_comment(subject_id: &str, body: &str) -> Result<String> {
+pub fn add_comment(subject_id: &str, body: &str) -> Result<NewComment> {
     let query = r#"mutation($subject: ID!, $body: String!) {
-  addComment(input: { subjectId: $subject, body: $body }) { commentEdge { node { url } } }
+  addComment(input: { subjectId: $subject, body: $body }) {
+    commentEdge { node { url createdAt } }
+  }
 }"#;
     let request = serde_json::json!({
         "query": query,
@@ -310,13 +312,22 @@ pub fn add_comment(subject_id: &str, body: &str) -> Result<String> {
     });
     let args = ["graphql", "--input", "-"].map(String::from);
     let stdout = run_gh_api_with_input(&args, Some(request.to_string()))?;
-    parse_comment_url(&stdout)
+    parse_new_comment(&stdout)
+}
+
+/// A comment [`add_comment`] posted.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewComment {
+    pub url: String,
+    /// ISO 8601 in UTC, by GitHub's clock.
+    pub created_at: String,
 }
 
 /// Parse [`add_comment`]'s response.
-pub fn parse_comment_url(json: &str) -> Result<String> {
+pub fn parse_new_comment(json: &str) -> Result<NewComment> {
     let data: AddCommentData = parse_data(json)?;
-    Ok(data.add_comment.comment_edge.node.url)
+    Ok(data.add_comment.comment_edge.node)
 }
 
 const BEFORE_POSTING_QUERY: &str = r#"query($item: ID!, $subject: ID!) {
@@ -825,12 +836,7 @@ struct AddCommentPayload {
 
 #[derive(Deserialize)]
 struct CommentEdge {
-    node: CommentNode,
-}
-
-#[derive(Deserialize)]
-struct CommentNode {
-    url: String,
+    node: NewComment,
 }
 
 #[derive(Deserialize)]
@@ -1509,12 +1515,16 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_url_of_a_new_comment() {
+    fn reads_the_url_and_github_s_time_of_a_new_comment() {
         let json = r#"{"data":{"addComment":{"commentEdge":{"node":{
-          "url":"https://github.com/maui1911/CodeScope/issues/408#issuecomment-1"}}}}}"#;
+          "url":"https://github.com/maui1911/CodeScope/issues/408#issuecomment-1",
+          "createdAt":"2026-11-27T13:18:24Z"}}}}}"#;
         assert_eq!(
-            parse_comment_url(json).unwrap(),
-            "https://github.com/maui1911/CodeScope/issues/408#issuecomment-1"
+            parse_new_comment(json).unwrap(),
+            NewComment {
+                url: "https://github.com/maui1911/CodeScope/issues/408#issuecomment-1".into(),
+                created_at: "2026-11-27T13:18:24Z".into(),
+            }
         );
     }
 
