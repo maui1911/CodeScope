@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use codescope_core::board::github::TriggerReads;
+use codescope_core::board::github::{
+    LINKED_PULL_REQUEST_WORKFLOW, TriggerReads, moves_back_from_review,
+};
 use codescope_core::board::{
     Board, BoardItem, BoardRef, BoardSettings, ColumnRole, ItemKind, ItemState, PanelColumn,
     PanelGroup, PanelSection, RoleKind, effective_mapping, missing_roles, panel_columns,
@@ -50,6 +52,8 @@ pub(crate) struct BoardRead {
     pub read_at: Option<Instant>,
     /// Last moves and linked pull requests of the items in trigger columns; `None` until read.
     pub triggers: Option<TriggerReads>,
+    pub workflows: Option<Vec<String>>,
+    pub workflows_read_at: Option<Instant>,
 }
 
 fn read_age(read_at: Option<Instant>) -> SharedString {
@@ -209,6 +213,12 @@ impl AppShell {
                 }
                 Err(err) => read.error = Some(err),
             }
+            if let Some(workflows) = fetch.workflows {
+                read.workflows = workflows
+                    .inspect_err(|err| eprintln!("warning: couldn't read workflows: {err}"))
+                    .ok();
+                read.workflows_read_at = Some(Instant::now());
+            }
         }
         let configured: Vec<&str> = self
             .settings
@@ -232,6 +242,8 @@ impl AppShell {
                 error: None,
                 read_at: Some(Instant::now()),
                 triggers: None,
+                workflows: None,
+                workflows_read_at: None,
             },
         );
         self.board.selected_url = Some(url);
@@ -332,6 +344,9 @@ impl AppShell {
             .and_then(|r| r.last_good.as_ref())
             .map(|board| missing_roles(board, &effective_mapping(board, &settings.columns)))
             .unwrap_or_default();
+        let moves_back = read
+            .and_then(|r| r.workflows.as_deref())
+            .is_some_and(moves_back_from_review);
 
         div()
             .flex()
@@ -345,6 +360,7 @@ impl AppShell {
             .when(!missing.is_empty(), |s| {
                 s.child(render_missing_roles(theme, &missing))
             })
+            .when(moves_back, |s| s.child(render_workflow_warning(theme)))
             .children(self.dispatch_error().map(|err| render_dispatch_error(theme, err)))
             .child(body)
             .into_any_element()
@@ -1002,6 +1018,22 @@ fn render_dispatch_error(theme: &Arc<Theme>, error: &str) -> impl IntoElement {
         .text_color(theme::danger())
         .child(format!(
             "Nothing starts: CodeScope couldn't ask gh who is signed in ({error})."
+        ))
+}
+
+fn render_workflow_warning(theme: &Arc<Theme>) -> impl IntoElement {
+    div()
+        .px(px(24.0))
+        .py(px(8.0))
+        .border_b_1()
+        .border_color(theme::divider(theme))
+        .text_size(px(12.0))
+        .text_color(theme::ink_muted(theme))
+        .child(format!(
+            "The board's \u{201c}{LINKED_PULL_REQUEST_WORKFLOW}\u{201d} workflow is on. When a \
+             pull request gets linked, it can move the item from In review back to In \
+             progress, and CodeScope leaves it there. Turn it off under the board's Workflows \
+             on GitHub."
         ))
 }
 
