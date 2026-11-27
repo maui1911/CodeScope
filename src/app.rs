@@ -1257,10 +1257,12 @@ impl AppShell {
         // stop dispatching entirely until the user clicks something
         // (#270). Catch that here and hand focus back to the active
         // tab's terminal, falling back to the AppShell root handle so
-        // the chords keep working when no tab is open.
+        // the chords keep working when no tab is open or the board
+        // panel stands in for the tabs.
         cx.on_focus_lost(window, |this: &mut AppShell, window, cx| {
             let handle = this
                 .focused_tab_terminal_handle(cx)
+                .filter(|_| !this.show_board)
                 .unwrap_or_else(|| this.focus_handle.clone());
             handle.focus(window);
         })
