@@ -790,12 +790,21 @@ pub fn find_skill(worktree: &Path, home: Option<&Path>, name: &str) -> Option<Pa
         })
 }
 
+/// A skill the agent will find: the name a task tells it to use, and where its `SKILL.md` is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoundSkill<'a> {
+    /// As the project names it.
+    pub name: &'a str,
+    /// Relative to the worktree when it lies there, absolute otherwise.
+    pub path: &'a str,
+}
+
 /// What [`TASK_FILE`] says for a round: the item, the skill or CodeScope's own prompt, the
 /// answers to the research when there are any, and the handover rules the board protocol
-/// depends on. `skill` is where the skill's `SKILL.md` is; `answers` is a whole section.
+/// depends on. `answers` is a whole section.
 pub fn task_file(
     dispatch: &WorktreeDispatch,
-    skill: Option<&str>,
+    skill: Option<FoundSkill<'_>>,
     answers: Option<&str>,
 ) -> String {
     let WorktreeDispatch {
@@ -810,7 +819,7 @@ pub fn task_file(
     let reviewed = dispatch.pull_request.as_ref().filter(|_| *round == Round::Review);
     let researched = answers.is_some();
     let work = match skill {
-        Some(path) => format!("Use the skill `{}` in `{path}`.", round.skill()),
+        Some(FoundSkill { name, path }) => format!("Use the skill `{name}` in `{path}`."),
         None => built_in_work(*round, *kind, reviewed.is_some()),
     };
     let work = if researched && *round == Round::Review {
@@ -2637,7 +2646,7 @@ mod tests {
     fn the_task_file_names_the_skill_or_the_built_in_work_and_always_the_handover() {
         let research = task_file(
             &dispatch(Round::Research, MOVED),
-            Some(".claude/skills/research/SKILL.md"),
+            Some(FoundSkill { name: "research", path: ".claude/skills/research/SKILL.md" }),
             None,
         );
         assert!(research.starts_with("# Research: #411\n"), "{research}");
@@ -2741,10 +2750,11 @@ mod tests {
             ),
             "{review}"
         );
-        let skill = ".claude/skills/address-review/SKILL.md";
+        let path = ".claude/skills/answer-review/SKILL.md";
+        let skill = FoundSkill { name: "answer-review", path };
         let skilled = task_file(&pull_request_record(Round::Review), Some(skill), Some(answers));
         assert!(
-            skilled.contains(&format!("Use the skill `address-review` in `{skill}`. {research}")),
+            skilled.contains(&format!("Use the skill `answer-review` in `{path}`. {research}")),
             "{skilled}"
         );
         let plain = task_file(&pull_request_record(Round::Review), None, None);

@@ -1090,9 +1090,20 @@ board, each with their own CodeScope or another tool that follows the
   and the next move runs the setup again. A worktree that already ran
   the same script successfully at the same commit doesn't run it again.
   A reused worktree is first brought up to what was just fetched,
-  unless it has changes of its own, which it keeps. Without a script
-  nothing runs; a command from the project's settings is to come
-  (#464).
+  unless it has changes of its own, which it keeps. A repository
+  without a script can get a setup command in the project's settings
+  instead. It runs the same way, but only in that user's CodeScope, and
+  runs again once it changes. When the default branch has a script, the
+  script runs and the command doesn't, so one user's command never
+  replaces a team's setup.
+* **Project settings.** *Project settings…* in a repository project's
+  context menu holds what one user's CodeScope sets for that project:
+  the setup command and the name of each round's skill. They live in
+  `projects.json` with the project, not in the repository, because
+  they depend on what the user has installed. The dialog refuses a
+  name that isn't a skill name (lowercase letters, digits and single
+  hyphens); such a name written into `projects.json` by hand gets the
+  default.
 * **Skills come from the item's branch.** The agent loads skills and
   `CLAUDE.md` from the worktree, so a branch can change them for its
   own dispatch. A pull request item from a fork therefore needs the

@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::board::dispatch::WorktreeDispatch;
+use crate::board::dispatch_settings::DispatchSettings;
 use crate::git::WorktreeInfo;
 use crate::paths::AppPaths;
 
@@ -97,6 +98,13 @@ pub struct Project {
     /// treated as `None` — see [`crate::project_groups::sidebar_sections`].
     #[serde(default)]
     pub group_id: Option<String>,
+    /// What the project sets for board dispatches on it (ADR-0027); empty by default.
+    #[serde(
+        default,
+        skip_serializing_if = "DispatchSettings::is_empty",
+        deserialize_with = "crate::board::dispatch_settings::or_default"
+    )]
+    pub dispatch: DispatchSettings,
 }
 
 fn default_branch() -> String { "main".to_string() }
@@ -141,6 +149,7 @@ impl Project {
             sessions: Vec::new(),
             worktrees: vec![primary],
             group_id: None,
+            dispatch: DispatchSettings::default(),
         }
     }
 
@@ -164,6 +173,7 @@ impl Project {
             sessions: Vec::new(),
             worktrees: Vec::new(),
             group_id: None,
+            dispatch: DispatchSettings::default(),
         }
     }
 
@@ -752,6 +762,49 @@ mod tests {
     use super::*;
     use crate::process::no_window_command;
 
+    #[test]
+    fn a_project_keeps_its_dispatch_settings_and_writes_none_it_doesn_t_have() {
+        let project = Project::new("/src/repo".into());
+        let json = serde_json::to_value(&project).unwrap();
+        assert!(json.get("dispatch").is_none(), "{json}");
+        let mut set = project.clone();
+        set.dispatch.setup_command = Some("npm ci".into());
+        let json = serde_json::to_string(&set).unwrap();
+        let back: Project = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.dispatch.setup_command.as_deref(), Some("npm ci"));
+    }
+
+    #[test]
+    fn dispatch_settings_this_build_can_t_read_leave_the_rest_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.json");
+        let project = |id: &str, dispatch: &str| {
+            format!(r#"{{"id":"{id}","name":"{id}","path":"/{id}","dispatch":{dispatch}}}"#)
+        };
+        let projects = [
+            project(
+                "fields",
+                r#"{"setupCommand":["npm ci"],"skills":{"research":5,"implement":"build-it"}}"#,
+            ),
+            project("skills", r#"{"skills":"dig","setupCommand":"npm ci"}"#),
+            project("null", "null"),
+            project("list", r#"["npm ci"]"#),
+        ];
+        let file = format!(r#"{{"version":1,"projects":[{}]}}"#, projects.join(","));
+        std::fs::write(&path, file).unwrap();
+        let loaded = ProjectsConfig::load_from(&path).unwrap();
+        let dispatch_of = |id: &str| loaded.project(id).unwrap().dispatch.clone();
+        let fields = dispatch_of("fields");
+        assert_eq!(fields.setup_command, None);
+        assert_eq!(fields.skills.research, None);
+        assert_eq!(fields.skills.implement.as_deref(), Some("build-it"));
+        let skills = dispatch_of("skills");
+        assert!(skills.skills.is_empty());
+        assert_eq!(skills.setup_command.as_deref(), Some("npm ci"));
+        assert!(dispatch_of("null").is_empty());
+        assert!(dispatch_of("list").is_empty());
+    }
+
     /// Skip-aware test helper — initialises a real git repo under a
     /// tempdir and runs an empty seed commit so HEAD is real. Returns
     /// `None` when `git` isn't on PATH so a CI image without git in
@@ -1276,6 +1329,7 @@ mod tests {
                     dispatch: None,
                 }],
                 group_id: None,
+                dispatch: DispatchSettings::default(),
             }],
             project_groups: Vec::new(),
         };
@@ -1550,6 +1604,7 @@ mod tests {
                 sessions: Vec::new(),
                 worktrees: Vec::new(),
                 group_id: None,
+                dispatch: DispatchSettings::default(),
             }],
             project_groups: Vec::new(),
         };
@@ -1859,6 +1914,7 @@ mod tests {
                     dispatch: None,
                 }],
                 group_id: None,
+                dispatch: DispatchSettings::default(),
             }],
             project_groups: Vec::new(),
         };

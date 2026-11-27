@@ -253,6 +253,7 @@ mod tests {
                 dispatch: None,
             }],
             group_id: None,
+            dispatch: Default::default(),
         }
     }
 

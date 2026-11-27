@@ -1,5 +1,6 @@
 //! The setup command (ADR-0027): a dispatch's new worktree runs the repository's own setup
-//! script, as the remote's default branch has it, before its session gets the task.
+//! script, as the remote's default branch has it, or else the project's setup command, before
+//! its session gets the task.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -27,7 +28,13 @@ pub const SETUP_LOG: &str = ".codescope/setup.log";
 const SETUP_COPY: &str = ".codescope/.setup.ps1";
 #[cfg(not(windows))]
 const SETUP_COPY: &str = ".codescope/.setup.sh";
+// Windows PowerShell 5.1 reads a script without a BOM in the ANSI code page.
+#[cfg(windows)]
+const COMMAND_ENCODING_MARK: &str = "\u{feff}";
+#[cfg(not(windows))]
+const COMMAND_ENCODING_MARK: &str = "";
 const SETUP_DONE: &str = "codescope-setup-done";
+const COMMAND: &str = "the setup command";
 const SETUP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const SETUP_POLL: Duration = Duration::from_millis(200);
 const TAIL_LINES: usize = 2;
@@ -36,11 +43,12 @@ const TAIL_BYTES: u64 = 64 * 1024;
 
 static RUNNING: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
-/// Run the setup script of `remote`'s default branch in the new `worktree` of `repo`, with its
-/// output in [`SETUP_LOG`]; nothing when that branch has none or this worktree already ran that
-/// same script at its current commit. An error says why it failed.
-pub fn run_setup(repo: &Path, worktree: &Path, remote: &str) -> Result<()> {
-    run_setup_within(repo, worktree, remote, SETUP_TIMEOUT)
+/// Run the setup script of `remote`'s default branch in the new `worktree` of `repo`, or the
+/// project's `command` when that branch has none, with the output in [`SETUP_LOG`]; nothing when
+/// neither is there or this worktree already ran that same one at its current commit. An error
+/// says why it failed.
+pub fn run_setup(repo: &Path, worktree: &Path, remote: &str, command: Option<&str>) -> Result<()> {
+    run_setup_within(repo, worktree, remote, command, SETUP_TIMEOUT)
 }
 
 /// Stop every setup still running, with all it started; for when CodeScope quits.
@@ -51,33 +59,73 @@ pub fn stop_running_setups() {
     }
 }
 
-fn run_setup_within(repo: &Path, worktree: &Path, remote: &str, limit: Duration) -> Result<()> {
+enum Setup {
+    Script { blob: String },
+    Command(String),
+}
+
+impl Setup {
+    fn name(&self) -> &'static str {
+        match self {
+            Setup::Script { .. } => SETUP_SCRIPT,
+            Setup::Command(_) => COMMAND,
+        }
+    }
+
+    fn ran_for(&self, head: &str) -> String {
+        match self {
+            Setup::Script { blob } => format!("{blob} {head}"),
+            Setup::Command(command) => format!("{head} {command}"),
+        }
+    }
+
+    fn text(&self, repo: &Path) -> Result<Vec<u8>> {
+        match self {
+            Setup::Script { blob } => Ok(run_git(repo, &["cat-file", "blob", blob])?.stdout),
+            Setup::Command(command) => Ok(format!("{COMMAND_ENCODING_MARK}{command}").into_bytes()),
+        }
+    }
+}
+
+fn run_setup_within(
+    repo: &Path,
+    worktree: &Path,
+    remote: &str,
+    command: Option<&str>,
+    limit: Duration,
+) -> Result<()> {
     let default_branch = remote_default_branch(repo, remote)?;
     let base = fetch_branch_head(repo, remote, &default_branch)?;
-    let Some(blob) = script_at(repo, &base)? else {
-        return Ok(());
+    let command = command.map(str::trim).filter(|command| !command.is_empty());
+    let setup = match (script_at(repo, &base)?, command) {
+        (Some(blob), _) => Setup::Script { blob },
+        (None, Some(command)) => Setup::Command(command.to_string()),
+        (None, None) => return Ok(()),
     };
     let done = git_dir(worktree)?.join(SETUP_DONE);
     let head = run_git(worktree, &["rev-parse", "HEAD"])?.stdout;
-    let ran_for = format!("{blob} {}", String::from_utf8_lossy(&head).trim());
+    let ran_for = setup.ran_for(String::from_utf8_lossy(&head).trim());
     if std::fs::read_to_string(&done).is_ok_and(|ran| ran.trim() == ran_for) {
         return Ok(());
     }
-    let script = run_git(repo, &["cat-file", "blob", &blob])?.stdout;
+    let script = setup.text(repo)?;
     let (copy, mut file) = create_fresh(worktree, SETUP_COPY)?;
     let written = file
         .write_all(&script)
         .with_context(|| format!("write {}", copy.display()));
     drop(file);
-    let ran = written.and_then(|()| run_script(repo, worktree, &copy, limit));
+    let name = setup.name();
+    let ran = written.and_then(|()| run_script(repo, worktree, &copy, name, limit));
     let _ = std::fs::remove_file(&copy);
     match ran? {
         Ran::Exited(status) if status.success() => {
             let _ = std::fs::write(&done, &ran_for);
             Ok(())
         }
-        Ran::Exited(status) => Err(failed(worktree, &exit_text(status))),
-        Ran::Stopped => Err(failed(worktree, &format!("was stopped after {}", duration(limit)))),
+        Ran::Exited(status) => Err(failed(worktree, name, &exit_text(status))),
+        Ran::Stopped => {
+            Err(failed(worktree, name, &format!("was stopped after {}", duration(limit))))
+        }
     }
 }
 
@@ -143,9 +191,15 @@ impl Drop for Running {
     }
 }
 
-fn run_script(repo: &Path, worktree: &Path, script: &Path, limit: Duration) -> Result<Ran> {
+fn run_script(
+    repo: &Path,
+    worktree: &Path,
+    script: &Path,
+    name: &str,
+    limit: Duration,
+) -> Result<Ran> {
     let (_, output) = create_fresh(worktree, SETUP_LOG)?;
-    let mut child = spawn_script(script, |command| {
+    let mut child = spawn_script(script, name, |command| {
         command
             .current_dir(worktree)
             .env("CODESCOPE_PROJECT", repo)
@@ -171,7 +225,11 @@ fn run_script(repo: &Path, worktree: &Path, script: &Path, limit: Duration) -> R
 }
 
 #[cfg(windows)]
-fn spawn_script(script: &Path, prepare: impl Fn(&mut Command) -> Result<()>) -> Result<Child> {
+fn spawn_script(
+    script: &Path,
+    name: &str,
+    prepare: impl Fn(&mut Command) -> Result<()>,
+) -> Result<Child> {
     let run = "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; \
                if ($PSStyle) { $PSStyle.OutputRendering = 'PlainText' }; \
                & $env:CODESCOPE_SETUP_SCRIPT; \
@@ -183,14 +241,19 @@ fn spawn_script(script: &Path, prepare: impl Fn(&mut Command) -> Result<()>) -> 
         prepare(&mut command)?;
         match command.spawn() {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            spawned => return spawned.with_context(|| format!("run {SETUP_SCRIPT} with {program}")),
+            spawned => return spawned.with_context(|| format!("run {name} with {program}")),
         }
     }
-    Err(anyhow!("{SETUP_SCRIPT} needs PowerShell, and neither pwsh nor powershell is on PATH"))
+    let name = sentence(name);
+    Err(anyhow!("{name} needs PowerShell, and neither pwsh nor powershell is on PATH"))
 }
 
 #[cfg(not(windows))]
-fn spawn_script(script: &Path, prepare: impl Fn(&mut Command) -> Result<()>) -> Result<Child> {
+fn spawn_script(
+    script: &Path,
+    name: &str,
+    prepare: impl Fn(&mut Command) -> Result<()>,
+) -> Result<Child> {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
     let text = std::fs::read(script).with_context(|| format!("read {}", script.display()))?;
@@ -211,12 +274,13 @@ fn spawn_script(script: &Path, prepare: impl Fn(&mut Command) -> Result<()>) -> 
         if shebang && err.kind() == std::io::ErrorKind::NotFound {
             let first = text.split(|byte| *byte == b'\n').next().unwrap_or_default();
             let first = String::from_utf8_lossy(first);
+            let name = sentence(name);
             anyhow!(
-                "{SETUP_SCRIPT} starts with {first:?}, a program that isn't there (or the file \
-                 has Windows line endings)"
+                "{name} starts with {first:?}, a program that isn't there (or the file has \
+                 Windows line endings)"
             )
         } else {
-            anyhow::Error::new(err).context(format!("run {SETUP_SCRIPT}"))
+            anyhow::Error::new(err).context(format!("run {name}"))
         }
     })
 }
@@ -253,7 +317,12 @@ fn duration(limit: Duration) -> String {
     }
 }
 
-fn failed(worktree: &Path, what: &str) -> anyhow::Error {
+fn sentence(name: &str) -> String {
+    let mut chars = name.chars();
+    chars.next().map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect())
+}
+
+fn failed(worktree: &Path, name: &str, what: &str) -> anyhow::Error {
     let log = match linked_part(worktree, SETUP_LOG) {
         Some(_) => String::new(),
         None => log_tail(&worktree.join(SETUP_LOG)),
@@ -266,7 +335,8 @@ fn failed(worktree: &Path, what: &str) -> anyhow::Error {
         .collect();
     let tail = lines[lines.len().saturating_sub(TAIL_LINES)..].join(" · ");
     let tail = if tail.is_empty() { String::new() } else { format!(": {tail}") };
-    anyhow!("{SETUP_SCRIPT} {what}{tail} (see {SETUP_LOG})")
+    let name = sentence(name);
+    anyhow!("{name} {what}{tail} (see {SETUP_LOG})")
 }
 
 fn log_tail(path: &Path) -> String {
@@ -411,7 +481,7 @@ mod tests {
         let (powershell, shell) = writes("ran.txt");
         write_setup(&repos.upstream, &powershell, &shell);
         exclude_handover_files(&repos.worktree).unwrap();
-        run_setup(&repos.repo, &repos.worktree, "origin").unwrap();
+        run_setup(&repos.repo, &repos.worktree, "origin", None).unwrap();
         let project = repos.repo.to_string_lossy();
         assert_eq!(ran(&repos, "ran.txt").as_deref(), Some(project.as_ref()));
         assert!(repos.worktree.join(SETUP_LOG).exists());
@@ -432,7 +502,7 @@ mod tests {
                           -Value x\n";
         let shell = "cd \"$(dirname \"$0\")/..\" && echo x > ran.txt\n";
         write_setup(&repos.upstream, powershell, shell);
-        run_setup(&repos.repo, &repos.worktree, "origin").unwrap();
+        run_setup(&repos.repo, &repos.worktree, "origin", None).unwrap();
         assert!(ran(&repos, "ran.txt").is_some());
     }
 
@@ -443,7 +513,7 @@ mod tests {
         };
         let (powershell, shell) = writes("ran.txt");
         write_setup(&repos.upstream, &powershell, &shell);
-        run_setup(&repos.repo, &repos.worktree, "origin").unwrap();
+        run_setup(&repos.repo, &repos.worktree, "origin", None).unwrap();
         assert!(ran(&repos, "ran.txt").is_some());
         assert!(ran(&repos, "hacked.txt").is_none());
     }
@@ -455,11 +525,11 @@ mod tests {
         write_setup(&repos.upstream, once.0, once.1);
         git(&repos.worktree, &["fetch", "-q", "origin"]);
         git(&repos.worktree, &["merge", "-q", "--ff-only", "origin/main"]);
-        run_setup(&repos.repo, &repos.worktree, "origin").unwrap();
+        run_setup(&repos.repo, &repos.worktree, "origin", None).unwrap();
         git(&repos.upstream, &["commit", "--allow-empty", "-m", "later", "-q"]);
         git(&repos.worktree, &["fetch", "-q", "origin"]);
         git(&repos.worktree, &["merge", "-q", "--ff-only", "origin/main"]);
-        run_setup(&repos.repo, &repos.worktree, "origin").unwrap();
+        run_setup(&repos.repo, &repos.worktree, "origin", None).unwrap();
         assert_eq!(lines_in(&repos, "count.txt"), 2);
     }
 
@@ -482,7 +552,7 @@ mod tests {
         let outside = repos.repo.with_file_name("outside");
         std::fs::create_dir_all(&outside).unwrap();
         link_folder(&outside, &repos.worktree.join(".codescope"));
-        let err = run_setup(&repos.repo, &repos.worktree, "origin").unwrap_err();
+        let err = run_setup(&repos.repo, &repos.worktree, "origin", None).unwrap_err();
         assert!(format!("{err:#}").contains("is a link"), "{err:#}");
         assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
         assert!(ran(&repos, "ran.txt").is_none());
@@ -498,7 +568,7 @@ mod tests {
             git(&repos.upstream, &["update-index", "--add", "--cacheinfo", &entry]);
         }
         git(&repos.upstream, &["commit", "-q", "-m", "linked setup"]);
-        let err = run_setup(&repos.repo, &repos.worktree, "origin").unwrap_err();
+        let err = run_setup(&repos.repo, &repos.worktree, "origin", None).unwrap_err();
         assert!(format!("{err:#}").contains("is a link"), "{err:#}");
         assert!(!repos.worktree.join(SETUP_LOG).exists());
     }
@@ -509,7 +579,7 @@ mod tests {
         let powershell = "Get-Item no-such-file\nSet-Content -Path ran.txt -Value x\n";
         let shell = "ls no-such-file\necho x > ran.txt\n";
         write_setup(&repos.upstream, powershell, shell);
-        let err = run_setup(&repos.repo, &repos.worktree, "origin").unwrap_err();
+        let err = run_setup(&repos.repo, &repos.worktree, "origin", None).unwrap_err();
         assert!(ran(&repos, "ran.txt").is_none(), "it stops at the failing command");
         let message = format!("{err:#}");
         assert!(message.contains("no-such-file") && !message.contains('\u{1b}'), "{message:?}");
@@ -522,7 +592,7 @@ mod tests {
         let powershell = format!("{fails}\nSet-Content -Path ran.txt -Value x\n");
         let shell = format!("{fails}\necho x > ran.txt\n");
         write_setup(&repos.upstream, &powershell, &shell);
-        assert!(run_setup(&repos.repo, &repos.worktree, "origin").is_err());
+        assert!(run_setup(&repos.repo, &repos.worktree, "origin", None).is_err());
     }
 
     #[test]
@@ -530,12 +600,12 @@ mod tests {
         let Some(repos) = repos() else { return };
         let once = ("Add-Content -Path count.txt -Value one\n", "echo one >> count.txt\n");
         write_setup(&repos.upstream, once.0, once.1);
-        run_setup(&repos.repo, &repos.worktree, "origin").unwrap();
-        run_setup(&repos.repo, &repos.worktree, "origin").unwrap();
+        run_setup(&repos.repo, &repos.worktree, "origin", None).unwrap();
+        run_setup(&repos.repo, &repos.worktree, "origin", None).unwrap();
         assert_eq!(lines_in(&repos, "count.txt"), 1);
         let changed = ("Add-Content -Path count.txt -Value two\n", "echo two >> count.txt\n");
         write_setup(&repos.upstream, changed.0, changed.1);
-        run_setup(&repos.repo, &repos.worktree, "origin").unwrap();
+        run_setup(&repos.repo, &repos.worktree, "origin", None).unwrap();
         assert_eq!(lines_in(&repos, "count.txt"), 2);
     }
 
@@ -545,7 +615,7 @@ mod tests {
         let powershell = "Write-Output ('x' * 5000)\nexit 1\n";
         let shell = "awk 'BEGIN { while (n++ < 5000) printf \"x\"; print \"\" }'\nexit 1\n";
         write_setup(&repos.upstream, powershell, shell);
-        let err = run_setup(&repos.repo, &repos.worktree, "origin").unwrap_err();
+        let err = run_setup(&repos.repo, &repos.worktree, "origin", None).unwrap_err();
         let message = format!("{err:#}");
         assert!(message.chars().count() < 400, "{} chars", message.chars().count());
         assert!(message.contains("x…"), "{message}");
@@ -558,15 +628,79 @@ mod tests {
         write_setup(&repos.upstream, &powershell, &shell);
         let (powershell, shell) = writes("branch.txt");
         write_setup(&repos.worktree, &powershell, &shell);
-        run_setup(&repos.repo, &repos.worktree, "origin").unwrap();
+        run_setup(&repos.repo, &repos.worktree, "origin", None).unwrap();
         assert!(ran(&repos, "ran.txt").is_some());
         assert!(ran(&repos, "branch.txt").is_none());
+    }
+
+    fn this_os<'a>(powershell: &'a str, shell: &'a str) -> &'a str {
+        if cfg!(windows) { powershell } else { shell }
+    }
+
+    #[test]
+    fn without_a_setup_script_the_project_s_command_runs() {
+        let Some(repos) = repos() else { return };
+        let (powershell, shell) = writes("ran.txt");
+        let command = this_os(&powershell, &shell);
+        run_setup(&repos.repo, &repos.worktree, "origin", Some(command)).unwrap();
+        let project = repos.repo.to_string_lossy();
+        assert_eq!(ran(&repos, "ran.txt").as_deref(), Some(project.as_ref()));
+        assert!(!repos.worktree.join(SETUP_COPY).exists(), "its copy is gone");
+    }
+
+    #[test]
+    fn a_command_runs_again_only_once_it_changed() {
+        let Some(repos) = repos() else { return };
+        let one = this_os("Add-Content -Path count.txt -Value one", "echo one >> count.txt");
+        run_setup(&repos.repo, &repos.worktree, "origin", Some(one)).unwrap();
+        run_setup(&repos.repo, &repos.worktree, "origin", Some(one)).unwrap();
+        assert_eq!(lines_in(&repos, "count.txt"), 1);
+        let two = this_os("Add-Content -Path count.txt -Value two", "echo two >> count.txt");
+        run_setup(&repos.repo, &repos.worktree, "origin", Some(two)).unwrap();
+        assert_eq!(lines_in(&repos, "count.txt"), 2);
+    }
+
+    #[test]
+    fn the_default_branch_s_script_runs_instead_of_the_command() {
+        let Some(repos) = repos() else { return };
+        let (powershell, shell) = writes("script.txt");
+        write_setup(&repos.upstream, &powershell, &shell);
+        let (powershell, shell) = writes("command.txt");
+        let command = this_os(&powershell, &shell);
+        run_setup(&repos.repo, &repos.worktree, "origin", Some(command)).unwrap();
+        assert!(ran(&repos, "script.txt").is_some());
+        assert_eq!(ran(&repos, "command.txt"), None);
+    }
+
+    #[test]
+    fn a_failed_command_says_it_was_the_command() {
+        let Some(repos) = repos() else { return };
+        let command = this_os("Write-Output 'no node here'; exit 4", "echo 'no node here'; exit 4");
+        let err = run_setup(&repos.repo, &repos.worktree, "origin", Some(command)).unwrap_err();
+        let message = format!("{err:#}");
+        let expected = "The setup command exited with 4: no node here";
+        assert!(message.starts_with(expected), "{message}");
+    }
+
+    #[test]
+    fn a_blank_command_runs_nothing() {
+        let Some(repos) = repos() else { return };
+        run_setup(&repos.repo, &repos.worktree, "origin", Some(" \n ")).unwrap();
+        assert!(!repos.worktree.join(SETUP_LOG).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_command_tells_windows_powershell_it_is_utf_8() {
+        let command = Setup::Command("Write-Output 'José'".into());
+        let text = command.text(Path::new(".")).unwrap();
+        assert_eq!(text, "\u{feff}Write-Output 'José'".as_bytes());
     }
 
     #[test]
     fn without_a_setup_script_nothing_runs() {
         let Some(repos) = repos() else { return };
-        run_setup(&repos.repo, &repos.worktree, "origin").unwrap();
+        run_setup(&repos.repo, &repos.worktree, "origin", None).unwrap();
         assert!(!repos.worktree.join(SETUP_LOG).exists());
     }
 
@@ -576,15 +710,15 @@ mod tests {
         let powershell = "Write-Output 'installing'\nWrite-Output 'no node here'\nexit 3\n";
         let shell = "echo installing\necho 'no node here'\nexit 3\n";
         write_setup(&repos.upstream, powershell, shell);
-        let err = run_setup(&repos.repo, &repos.worktree, "origin").unwrap_err();
+        let err = run_setup(&repos.repo, &repos.worktree, "origin", None).unwrap_err();
         let message = format!("{err:#}");
         assert!(message.contains("exited with 3"), "{message}");
         assert!(message.contains("installing · no node here"), "{message}");
         assert!(message.contains(SETUP_LOG), "{message}");
-        assert!(run_setup(&repos.repo, &repos.worktree, "origin").is_err(), "it runs again");
+        assert!(run_setup(&repos.repo, &repos.worktree, "origin", None).is_err(), "it runs again");
         let (powershell, shell) = writes("ran.txt");
         write_setup(&repos.upstream, &powershell, &shell);
-        run_setup(&repos.repo, &repos.worktree, "origin").unwrap();
+        run_setup(&repos.repo, &repos.worktree, "origin", None).unwrap();
         assert!(ran(&repos, "ran.txt").is_some(), "the fixed setup runs on the next try");
     }
 
@@ -594,7 +728,8 @@ mod tests {
         write_setup(&repos.upstream, "Start-Sleep -Seconds 60\n", "sleep 60\n");
         let started = Instant::now();
         let limit = Duration::from_secs(3);
-        let err = run_setup_within(&repos.repo, &repos.worktree, "origin", limit).unwrap_err();
+        let err =
+            run_setup_within(&repos.repo, &repos.worktree, "origin", None, limit).unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(30));
         let message = format!("{err:#}");
         assert!(message.contains("was stopped after 3 s"), "{message}");

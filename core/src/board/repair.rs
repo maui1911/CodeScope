@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::ColumnRole;
-use super::dispatch::{HandoverSession, TASK_FILE, WorktreeDispatch};
+use super::dispatch::{FoundSkill, HandoverSession, TASK_FILE, WorktreeDispatch};
 use super::pull_request::{Checks, FailedCheck, Mergeable, PullRequest, PullRequestState};
 
 /// How many repairs run in a row before the dispatch needs the user.
@@ -142,13 +142,13 @@ pub fn repair_message(number: u32) -> String {
     format!("Repair the pull request of issue #{number}: read {TASK_FILE} and follow it.")
 }
 
-/// The task file of a repair of `pr`, which `dispatch` opened; `skill` is the path of the
-/// `repair` skill when there is one.
+/// The task file of a repair of `pr`, which `dispatch` opened; `skill` is the project's repair
+/// skill when the agent will find it.
 pub fn repair_task(
     dispatch: &WorktreeDispatch,
     pr: &PullRequest,
     fault: &Fault,
-    skill: Option<&str>,
+    skill: Option<FoundSkill<'_>>,
 ) -> String {
     let wrong = match fault {
         Fault::Conflict(base) => format!("It conflicts with `{base}`.\n"),
@@ -172,7 +172,7 @@ pub fn repair_task(
         }
     };
     let work = match (skill, fault) {
-        (Some(path), _) => format!("Use the skill `repair` in `{path}`."),
+        (Some(FoundSkill { name, path }), _) => format!("Use the skill `{name}` in `{path}`."),
         (None, Fault::Checks(_)) => {
             "Find out why each check failed and fix the cause on this branch.".to_string()
         }
@@ -445,10 +445,11 @@ mod tests {
         );
         assert!(task.contains("Merge the latest `main` into the branch."), "{task}");
 
-        let skill = Some(".claude/skills/repair/SKILL.md");
+        let path = ".claude/skills/fix-ci/SKILL.md";
+        let skill = Some(FoundSkill { name: "fix-ci", path });
         let task = repair_task(&record(), &failing(), &checks, skill);
         assert!(
-            task.contains("## Work\n\nUse the skill `repair` in `.claude/skills/repair/SKILL.md`."),
+            task.contains("## Work\n\nUse the skill `fix-ci` in `.claude/skills/fix-ci/SKILL.md`."),
             "{task}"
         );
         assert_eq!(
