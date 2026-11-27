@@ -3,7 +3,7 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -1232,10 +1232,24 @@ fn fetch_branch(repo: &Path, remote: &str, branch: &str) -> Result<String> {
     Ok(fetched)
 }
 
+const FETCH_ATTEMPTS: u32 = 3;
+const FETCH_RETRY_AFTER: Duration = Duration::from_millis(500);
+
 fn fetch(repo: &Path, remote: &str, refspec: &str) -> Result<()> {
-    static FETCHING: Mutex<()> = Mutex::new(());
-    let _one_at_a_time = FETCHING.lock().unwrap_or_else(PoisonError::into_inner);
-    run_git(repo, &["fetch", "--quiet", remote, refspec]).map(|_| ())
+    let mut attempt = 1;
+    loop {
+        match run_git(repo, &["fetch", "--quiet", remote, refspec]) {
+            Err(err) if attempt < FETCH_ATTEMPTS && is_ref_lock_error(&format!("{err:#}")) => {
+                attempt += 1;
+                std::thread::sleep(FETCH_RETRY_AFTER);
+            }
+            fetched => return fetched.map(|_| ()),
+        }
+    }
+}
+
+fn is_ref_lock_error(message: &str) -> bool {
+    message.contains("cannot lock ref")
 }
 
 fn add_worktree_from(
@@ -3043,6 +3057,18 @@ mod tests {
             ..board.clone()
         };
         assert!(!start_still_wanted(&gone, &mapping, "PVTI_1", Some(&change), MOVED));
+    }
+
+    #[test]
+    fn a_fetch_that_lost_a_ref_lock_race_is_tried_again() {
+        let raced = "git fetch --quiet origin main exited 1: error: cannot lock ref \
+                     'refs/remotes/origin/main': is at 1a2b but expected 3c4d";
+        assert!(is_ref_lock_error(raced));
+        let locked = "error: cannot lock ref 'refs/remotes/origin/main': Unable to create \
+                      'D:/repo/.git/refs/remotes/origin/main.lock': File exists.";
+        assert!(is_ref_lock_error(locked));
+        let gone = "fatal: couldn't find remote ref refs/heads/gone";
+        assert!(!is_ref_lock_error(gone));
     }
 
     #[test]
