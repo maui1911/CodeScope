@@ -17,7 +17,7 @@ use gpui::{
 };
 
 use crate::app::AppShell;
-use crate::app::board_dispatch::{AnswerPost, Decision};
+use crate::app::board_dispatch::{AnswerPost, Decision, work_after_research};
 use crate::text_field::{TextField, focused_caret_style, render_input_content};
 use crate::theme;
 
@@ -280,7 +280,10 @@ impl AppShell {
                 }),
             )
             .child(checkbox(dialog.move_to_ready, accent, divider, canvas))
-            .child("Move to Ready afterwards, so implementation starts");
+            .child(format!(
+                "Move to Ready afterwards, so {} starts",
+                work_after_research(decision.kind)
+            ));
 
         let message: Option<(SharedString, Hsla)> = match (&dialog.error, dialog.sending) {
             (_, true) => Some(("Posting the answer…".into(), theme::ink_dim(theme))),

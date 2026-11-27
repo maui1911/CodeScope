@@ -2846,7 +2846,7 @@ fn findings_next_step(outcome: Outcome, kind: ItemKind) -> String {
 }
 
 /// What Ready starts after research on an item of `kind`, as a sentence names it.
-fn work_after_research(kind: ItemKind) -> &'static str {
+pub(crate) fn work_after_research(kind: ItemKind) -> &'static str {
     match kind {
         ItemKind::PullRequest => "a review",
         ItemKind::Issue | ItemKind::Draft => "implementation",
