@@ -1264,6 +1264,9 @@ fn add_worktree_from(
         );
     }
     if held_here {
+        if has_changes(path)? {
+            return Ok(());
+        }
         return run_git(path, &["merge", "--ff-only", "--quiet", base])
             .map(|_| ())
             .with_context(|| format!("bring {} up to {base_name}", path.display()));
@@ -1277,6 +1280,11 @@ fn add_worktree_from(
         &["worktree", "add", "--no-track", "-B", branch, &path_arg, base],
     )
     .map(|_| ())
+}
+
+fn has_changes(worktree: &Path) -> Result<bool> {
+    let status = run_git(worktree, &["status", "--porcelain", "--untracked-files=no"])?;
+    Ok(!status.stdout.is_empty())
 }
 
 pub(crate) fn remote_default_branch(repo: &Path, remote: &str) -> Result<String> {
@@ -3035,6 +3043,28 @@ mod tests {
             ..board.clone()
         };
         assert!(!start_still_wanted(&gone, &mapping, "PVTI_1", Some(&change), MOVED));
+    }
+
+    #[test]
+    fn a_reused_worktree_with_changes_of_its_own_is_used_as_it_is() {
+        if no_window_command("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (upstream, repo) = upstream_with_branch(dir.path(), "keep-palette-open");
+        std::fs::write(upstream.join("notes.txt"), "one\n").unwrap();
+        git(&upstream, &["add", "notes.txt"]);
+        git(&upstream, &["commit", "-q", "-m", "notes"]);
+        let issue = dir.path().join("repo.worktrees").join("14-palette");
+        add_dispatch_worktree(&repo, &issue, "14-palette", "origin").unwrap();
+        let started = head(&issue, "HEAD");
+        std::fs::write(issue.join("notes.txt"), "mine\n").unwrap();
+        std::fs::write(upstream.join("notes.txt"), "theirs\n").unwrap();
+        git(&upstream, &["commit", "-q", "-am", "merged meanwhile"]);
+        add_dispatch_worktree(&repo, &issue, "14-palette", "origin").unwrap();
+        assert_eq!(head(&issue, "HEAD"), started);
+        let notes = std::fs::read_to_string(issue.join("notes.txt")).unwrap();
+        assert_eq!(notes, "mine\n");
     }
 
     #[test]
