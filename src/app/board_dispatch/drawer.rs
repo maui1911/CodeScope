@@ -146,12 +146,18 @@ impl AppShell {
             if let Some(agent) = agent {
                 rows.push(Row::new("Agent", agent));
             }
-            let session = self.round_tab_at(path, record.agent.as_deref()).map(|(group, tab)| {
-                let tab = &self.groups[group].tabs[tab];
-                tab.adopted_session_id.as_deref().and_then(|sid| self.telemetry_for(sid))
+            let agent = record.agent.as_deref();
+            let tabs: Vec<_> = self
+                .tabs_on(path)
+                .into_iter()
+                .filter(|tab| !super::runs_another_agent(tab.agent_profile_id.as_deref(), agent))
+                .collect();
+            let state = tabs.iter().find_map(|tab| {
+                let sid = tab.adopted_session_id.as_deref()?;
+                self.telemetry_for(sid).map(|snapshot| crate::app::notified_state(&snapshot))
             });
             let idle_for = watch.and_then(|w| w.idle_since).map(|since| since.elapsed());
-            let session = session_row(session.map(|s| s.map(|s| s.state)), idle_for);
+            let session = session_row((!tabs.is_empty()).then_some(state), idle_for);
             rows.push(Row::new("Session", session));
             rows.push(Row::new("Started", started_row(record.round, &record.trigger_at, now())));
             needs_link = match note.and_then(|n| n.action) {
