@@ -211,6 +211,7 @@ mod tests {
             id: format!("PR_{number}"),
             number,
             url: format!("https://github.com/maui1911/CodeScope/pull/{number}"),
+            author: None,
             state,
             is_draft: false,
             checks: Checks::Passing,

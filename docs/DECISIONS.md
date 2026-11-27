@@ -1019,9 +1019,17 @@ board, each with their own CodeScope or another tool that follows the
   and the item moves to *In review*. When something needs testing by
   hand (UI, another OS), it opens a draft with a test instruction in
   the body; the item stays in *In progress* and needs the user. *Ready
-  for review* in the item drawer marks the PR ready and requests the
-  reviewers from the project's settings; the item then moves to
-  *In review* as it does for any draft marked ready.
+  for review* in the item drawer marks the PR ready; the item then
+  moves to *In review* as it does for any draft marked ready. When
+  CodeScope moves an item on to *In review*, it asks the reviewers from
+  the project's settings to review the pull request the dispatch
+  opened: people by login, and teams as `org/team` of the organisation
+  that owns the repository, since GitHub would take a team of another
+  one for the owner's team of the same name. The pull request's author
+  is never asked; GitHub refuses that. That happens each time a round
+  moves it there, so a review round asks them again, the way GitHub's
+  *Re-request review* does. A person who moves the item there asks whom
+  they like.
 * **Turn.** Every dispatched item shows whose turn it is and since
   when, worked out from what is on GitHub alone, so it is the same on
   every teammate's screen: an agent (and whose), CI, a person (*you*,
@@ -1107,16 +1115,17 @@ board, each with their own CodeScope or another tool that follows the
   replaces a team's setup.
 * **Project settings.** *Project settings…* in a repository project's
   context menu holds what one user's CodeScope sets for that project:
-  the setup command, the CLI per phase and the name of each round's
-  skill. The CLIs to choose from are the agents CodeScope can hand a
-  task to; one that is gone, or can no longer be handed a task, runs
-  the project's agent. They live in `projects.json` with the project,
-  not in the repository, because they depend on what the user has
-  installed; a build from before these settings drops them when it
-  saves that file. The dialog refuses a
-  name that isn't a skill name (lowercase letters, digits and single
-  hyphens); such a name written into `projects.json` by hand gets the
-  default.
+  the setup command, the CLI per phase, the name of each round's skill
+  and the reviewers. The CLIs to choose from are the agents CodeScope
+  can hand a task to; one that is gone, or can no longer be handed a
+  task, runs the project's agent. They live in `projects.json` with the
+  project, not in the repository: the CLIs depend on what the user has
+  installed, and the reviewers are whom this user asks. A build from
+  before these settings drops them when it saves that file. The dialog
+  refuses a name that isn't a skill name (lowercase letters, digits and
+  single hyphens), or a reviewer that isn't a GitHub login or
+  `org/team`; such a value written into `projects.json` by hand gets
+  the default, or is left out.
 * **Skills come from the item's branch.** The agent loads skills and
   `CLAUDE.md` from the worktree, so a branch can change them for its
   own dispatch. A pull request item from a fork therefore needs the
@@ -1203,7 +1212,7 @@ board, each with their own CodeScope or another tool that follows the
 * CodeScope writes to GitHub for the first time: statuses, assignees,
   linked branches, findings, answers to decision points, the comment
   that reports a pull request, a review round's reply on the pull
-  request, and marking a draft ready with its reviewers. Pull
+  request, marking a draft ready, and asking the reviewers. Pull
   requests and pushes come from the agent, so implementation needs an
   agent that can run `gh`; research works with any agent that can
   write a file.

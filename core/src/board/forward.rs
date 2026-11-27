@@ -256,6 +256,7 @@ mod tests {
             id: "PR_417".into(),
             number: 417,
             url: "https://github.com/maui1911/CodeScope/pull/417".into(),
+            author: None,
             state: PullRequestState::Open,
             is_draft: false,
             checks: Checks::Passing,

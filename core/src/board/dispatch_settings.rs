@@ -1,6 +1,7 @@
 //! What a project sets for the dispatches on it (ADR-0027): the skill each round runs, the setup
-//! command for a repository whose default branch has no setup script, and the agent each phase
-//! runs. Kept on the project in `projects.json`, empty by default.
+//! command for a repository whose default branch has no setup script, the agent each phase
+//! runs and who reviews the pull requests. Kept on the project in `projects.json`, empty by
+//! default.
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -29,6 +30,10 @@ pub struct DispatchSettings {
         deserialize_with = "or_default"
     )]
     pub agents: PhaseAgents,
+    /// Asked to review a pull request a dispatch opened once CodeScope moves its item to In
+    /// review: GitHub logins, and teams as `org/team`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "or_default")]
+    pub reviewers: Vec<String>,
 }
 
 /// Agents a project sets per phase, by their id in the agent list; `None` or an empty id runs
@@ -48,6 +53,31 @@ impl PhaseAgents {
     /// Whether no agent is set.
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
+    }
+}
+
+/// The people and teams a pull request asks for a review.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewRequest {
+    /// GitHub logins.
+    pub users: Vec<String>,
+    /// Teams as `org/team`, of the organisation that owns the repository.
+    pub teams: Vec<String>,
+}
+
+impl ReviewRequest {
+    /// Whether it asks nobody.
+    pub fn is_empty(&self) -> bool {
+        self.users.is_empty() && self.teams.is_empty()
+    }
+
+    /// Whom it asks, as a sentence lists them: `ana, bob and acme/web`.
+    pub fn names(&self) -> String {
+        let names: Vec<&str> = self.users.iter().chain(&self.teams).map(String::as_str).collect();
+        match names.split_last() {
+            Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+            _ => names.concat(),
+        }
     }
 }
 
@@ -106,6 +136,26 @@ impl DispatchSettings {
         };
         set.as_deref().filter(|id| !id.is_empty())
     }
+
+    /// Whom a pull request of `repository` (`owner/name`) by `author` asks for a review: the
+    /// reviewers set, once each, without the author, whom GitHub refuses to ask, and without a
+    /// team of another organisation, which GitHub takes for the owner's team of that name.
+    pub fn review_request(&self, repository: &str, author: &str) -> ReviewRequest {
+        let owner = repository.split_once('/').map_or(repository, |(owner, _)| owner);
+        let mut request = ReviewRequest::default();
+        for name in self.reviewers.iter().filter(|name| is_reviewer(name)) {
+            let list = match name.split_once('/') {
+                Some((org, _)) if org.eq_ignore_ascii_case(owner) => &mut request.teams,
+                Some(_) => continue,
+                None if name.eq_ignore_ascii_case(author) => continue,
+                None => &mut request.users,
+            };
+            if !list.iter().any(|known| known.eq_ignore_ascii_case(name)) {
+                list.push(name.to_string());
+            }
+        }
+        request
+    }
 }
 
 pub(crate) fn or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
@@ -128,6 +178,37 @@ pub fn is_skill_name(name: &str) -> bool {
         !part.is_empty() && part.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
     };
     name.len() <= 64 && name.split('-').all(plain)
+}
+
+/// Whether `name` is a GitHub login, such as `ana`, or `ana_acme` for an Enterprise Managed
+/// User, or a team as `org/team`.
+pub fn is_reviewer(name: &str) -> bool {
+    match name.split_once('/') {
+        Some((org, team)) => is_login(org) && is_team_slug(team),
+        None => is_login(name),
+    }
+}
+
+fn is_login(name: &str) -> bool {
+    let plain = name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+    plain && !name.is_empty() && name.len() <= 39 && !name.starts_with('-')
+}
+
+fn is_team_slug(slug: &str) -> bool {
+    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
+    !slug.is_empty() && slug.chars().all(plain)
+}
+
+/// The reviewers in `text`, separated by commas or spaces, each without a leading `@`; else the
+/// first that [`is_reviewer`] refuses.
+pub fn reviewers_in(text: &str) -> Result<Vec<String>, String> {
+    text.split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let name = part.strip_prefix('@').unwrap_or(part);
+            if is_reviewer(name) { Ok(name.to_string()) } else { Err(part.to_string()) }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -239,5 +320,68 @@ mod tests {
         let json = serde_json::to_string(&agents).unwrap();
         assert_eq!(json, r#"{"agents":{"implementation":"codex"}}"#);
         assert_eq!(serde_json::from_str::<DispatchSettings>(&json).unwrap(), agents);
+        let reviewers = DispatchSettings {
+            reviewers: vec!["ana".into(), "acme/web".into()],
+            ..DispatchSettings::default()
+        };
+        let json = serde_json::to_string(&reviewers).unwrap();
+        assert_eq!(json, r#"{"reviewers":["ana","acme/web"]}"#);
+        assert_eq!(serde_json::from_str::<DispatchSettings>(&json).unwrap(), reviewers);
+    }
+
+    #[test]
+    fn reviewers_are_logins_or_teams_of_an_organisation() {
+        let long = "x".repeat(39);
+        for good in ["ana", "Ana-K", "x1", long.as_str(), "acme/web", "acme/web_team.2"] {
+            assert!(is_reviewer(good), "{good}");
+        }
+        for bad in ["", "@ana", "-ana", "ana k", "ana/", "/web", "a/b/c", "ana!"] {
+            assert!(!is_reviewer(bad), "{bad}");
+        }
+        assert!(!is_reviewer(&"x".repeat(40)));
+        assert!(is_reviewer("ana_acme"), "an Enterprise Managed User");
+    }
+
+    #[test]
+    fn reviewers_are_read_from_commas_or_spaces_with_or_without_an_at() {
+        assert_eq!(reviewers_in(""), Ok(Vec::new()));
+        let read = reviewers_in(" @ana, bob  acme/web,,").unwrap();
+        assert_eq!(read, ["ana", "bob", "acme/web"]);
+        assert_eq!(reviewers_in("ana, b@b"), Err("b@b".to_string()));
+    }
+
+    #[test]
+    fn a_review_request_asks_people_and_teams_but_never_the_author() {
+        let settings = DispatchSettings {
+            reviewers: ["ana", "Maui1911", "acme/web", "bob", "ANA", "not a login"]
+                .map(String::from)
+                .to_vec(),
+            ..DispatchSettings::default()
+        };
+        let request = settings.review_request("Acme/app", "maui1911");
+        assert_eq!(request.users, ["ana", "bob"]);
+        assert_eq!(request.teams, ["acme/web"]);
+        assert_eq!(request.names(), "ana, bob and acme/web");
+        assert!(!request.is_empty());
+        let unset = DispatchSettings::default();
+        assert!(unset.review_request("acme/app", "maui1911").is_empty());
+        let only_author = DispatchSettings {
+            reviewers: vec!["maui1911".into()],
+            ..DispatchSettings::default()
+        };
+        assert!(only_author.review_request("acme/app", "maui1911").is_empty());
+    }
+
+    #[test]
+    fn a_team_of_another_organisation_is_left_out_of_the_request() {
+        let settings = DispatchSettings {
+            reviewers: vec!["ana".into(), "platform/web".into(), "acme/web".into()],
+            ..DispatchSettings::default()
+        };
+        let request = settings.review_request("acme/app", "maui1911");
+        assert_eq!(request.users, ["ana"]);
+        assert_eq!(request.teams, ["acme/web"]);
+        let on_a_user_s_repository = settings.review_request("maui1911/CodeScope", "maui1911");
+        assert!(on_a_user_s_repository.teams.is_empty());
     }
 }

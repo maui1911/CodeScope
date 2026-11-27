@@ -40,7 +40,7 @@ use codescope_core::board::pull_request::{
     Checks, PostedPullRequest, PullRequest, PullRequestComment, PullRequestHead, PullRequestState,
     moves_to_in_review, pull_request_comment, review_round_worked, round_pull_request,
 };
-use codescope_core::board::dispatch_settings::DispatchSettings;
+use codescope_core::board::dispatch_settings::{DispatchSettings, ReviewRequest};
 use codescope_core::board::setup::run_setup;
 use codescope_core::board::reply::{read_reply, reply_problems_message};
 use codescope_core::board::repair::{
@@ -2907,6 +2907,7 @@ impl AppShell {
             return;
         }
         watch.move_error = None;
+        let moved = watch.pull_request.clone().filter(|pr| pr.state == PullRequestState::Open);
         let reported = watch.reported.clone();
         let posted = self
             .dispatch_record(item_id, cx)
@@ -2915,8 +2916,51 @@ impl AppShell {
         if let Some(posted) = posted {
             self.keep_posted(item_id, PostedPullRequest { in_review: true, ..posted }, cx);
         }
+        if let Some(pr) = moved {
+            self.ask_reviewers(item_id, &pr, cx);
+        }
         self.refresh_boards(cx);
         cx.notify();
+    }
+
+    fn review_request(
+        &self,
+        (project_id, record): (&str, &WorktreeDispatch),
+        pr: &PullRequest,
+        cx: &App,
+    ) -> Option<ReviewRequest> {
+        if record.kind == ItemKind::PullRequest {
+            return None;
+        }
+        let project = self.current_projects(cx).project(project_id)?;
+        let author = pr.author.as_deref().unwrap_or_default();
+        let request = project.dispatch.review_request(&record.repository, author);
+        Some(request).filter(|request| !request.is_empty())
+    }
+
+    fn ask_reviewers(&mut self, item_id: &str, pr: &PullRequest, cx: &mut Context<Self>) {
+        let Some((project_id, _, _, record)) = self.dispatch_record(item_id, cx) else {
+            return;
+        };
+        let Some(request) = self.review_request((&project_id, &record), pr, cx) else {
+            return;
+        };
+        let (repository, number) = (record.repository, pr.number);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    github::request_reviews(&repository, number, &request)
+                        .map_err(|err| format!("{err:#}"))
+                })
+                .await;
+            if let Err(message) = result {
+                let _ = this.update(cx, |this, cx| {
+                    let title = format!("Couldn't ask for a review of PR #{number}");
+                    this.push_toast(ToastKind::Err, title, Some(message.into()), cx);
+                });
+            }
+        })
+        .detach();
     }
 
     fn project_agent(&self, project: &Project) -> Option<AgentProfile> {
@@ -3098,13 +3142,18 @@ impl AppShell {
             ..pr
         };
         watch.pull_request = Some(ready.clone());
-        let role = self
-            .dispatch_record(item_id, cx)
-            .and_then(|(_, _, _, r)| self.item_role(&r.board_url, item_id));
-        let detail = moves_to_in_review(&ready, role)
-            .then(|| SharedString::from("It moves to In review."));
+        let record = self.dispatch_record(item_id, cx);
+        let role = record.as_ref().and_then(|(_, _, _, r)| self.item_role(&r.board_url, item_id));
+        let asks = record
+            .and_then(|(project_id, _, _, r)| self.review_request((&project_id, &r), &ready, cx));
+        let detail = moves_to_in_review(&ready, role).then(|| match asks {
+            Some(request) => {
+                format!("It moves to In review and asks {} for a review.", request.names())
+            }
+            None => "It moves to In review.".to_string(),
+        });
         let title = format!("PR #{} is ready for review", ready.number);
-        self.push_toast(ToastKind::Ok, title, detail, cx);
+        self.push_toast(ToastKind::Ok, title, detail.map(SharedString::from), cx);
         self.watch_pull_requests(cx);
         cx.notify();
     }
@@ -4691,6 +4740,7 @@ mod tests {
             id: format!("PR_{number}"),
             number,
             url: format!("https://github.com/maui1911/CodeScope/pull/{number}"),
+            author: Some("maui1911".into()),
             state: PullRequestState::Open,
             is_draft,
             checks,

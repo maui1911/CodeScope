@@ -46,6 +46,8 @@ pub struct PullRequest {
     pub id: String,
     pub number: u32,
     pub url: String,
+    /// Its author's login; `None` for a deleted account.
+    pub author: Option<String>,
     pub state: PullRequestState,
     pub is_draft: bool,
     pub checks: Checks,
@@ -215,6 +217,7 @@ mod tests {
             id: format!("PR_{number}"),
             number,
             url: format!("https://github.com/maui1911/CodeScope/pull/{number}"),
+            author: None,
             state,
             is_draft,
             checks: Checks::None,
