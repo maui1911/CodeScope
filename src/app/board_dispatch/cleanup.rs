@@ -208,7 +208,9 @@ impl AppShell {
         match unreadable_tab(&probed) {
             Some(index) => {
                 let tab = tabs[index];
-                let name = tab.title_parts.label().map(str::to_owned);
+                let profile = tab.agent_profile_id.as_deref();
+                let agent = profile.and_then(|id| self.agent_registry.get_by_id(id));
+                let name = agent.map(|agent| agent.display_name.clone());
                 InTheWay::Unreadable(name.unwrap_or_else(|| tab.title.to_string()))
             }
             None => InTheWay::Working,
@@ -398,7 +400,7 @@ fn cleanup_note(kept: Option<Kept>, state: Option<&Cleanup>) -> Option<CardNote>
     let text = match kept {
         Some(Kept::Changes) => "Kept its worktree · uncommitted changes".to_string(),
         Some(Kept::OwnCommits) => "Kept its worktree · commits of its own".to_string(),
-        None => format!("Close {} to clean up", state?.waits_on.as_deref()?),
+        None => format!("Close the {} tab to clean up", state?.waits_on.as_deref()?),
     };
     Some(CardNote::new(text, NoteTone::Waiting))
 }
@@ -460,7 +462,7 @@ mod tests {
             ..Cleanup::default()
         };
         let note = cleanup_note(None, Some(&waiting)).unwrap();
-        assert_eq!(note.text.as_ref(), "Close Copilot CLI to clean up");
+        assert_eq!(note.text.as_ref(), "Close the Copilot CLI tab to clean up");
         assert!(note.tone == NoteTone::Waiting);
         let kept = cleanup_note(Some(Kept::Changes), Some(&waiting)).unwrap();
         assert_eq!(kept.text.as_ref(), "Kept its worktree · uncommitted changes");
