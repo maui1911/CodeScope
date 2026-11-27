@@ -13,10 +13,11 @@ use std::time::{Duration, Instant};
 use codescope_core::agents::claude::live_session;
 use codescope_core::board::dispatch::{
     FINDINGS_FILE, Facts, Hold, OwnPullRequest, PostedFindings, ProjectRemotes, REPLY_FILE,
-    ReviewRound, Round, StatusChange, WorktreeDispatch, add_dispatch_worktree, branch_name,
-    clear_findings, clear_reply, counts_towards_limit, decide, exclude_handover_files,
-    find_skill, launch_with_task, mover_to_check, moves_to_needs_decision,
-    projects_for_repository, task_file, task_message, trigger_content_ids, write_task_file,
+    ReviewRound, Round, StatusChange, WorktreeDispatch, add_dispatch_worktree,
+    add_pull_request_worktree, branch_name, clear_findings, clear_reply, counts_towards_limit,
+    decide, exclude_handover_files, fetch_branch_head, find_skill, launch_with_task,
+    mover_to_check, moves_to_needs_decision, opened_by, projects_for_repository, task_file,
+    task_message, trigger_content_ids, write_task_file,
 };
 use codescope_core::board::answers::{
     Answer, Comment, after_findings, answer_body, answers_section, choices_text, chosen,
@@ -28,12 +29,13 @@ use codescope_core::board::findings::{
 };
 use codescope_core::board::github::{self, TriggerReads, Viewer};
 use codescope_core::board::pull_request::{
-    Checks, PostedPullRequest, PullRequest, PullRequestState, moves_to_in_review,
+    Checks, PostedPullRequest, PullRequest, PullRequestHead, PullRequestState, moves_to_in_review,
     pull_request_comment, review_round_worked, round_pull_request,
 };
 use codescope_core::board::reply::{read_reply, reply_problems_message};
 use codescope_core::board::{
-    Board, BoardItem, BoardRef, ColumnMapping, ColumnRole, effective_mapping, mapped_column,
+    Board, BoardItem, BoardRef, ColumnMapping, ColumnRole, ItemKind, effective_mapping,
+    mapped_column,
 };
 use codescope_core::path_canon::paths_match;
 use codescope_core::process_tree;
@@ -44,6 +46,7 @@ use codescope_terminal::TerminalView;
 use gpui::{App, AppContext as _, Context, Entity, SharedString, Window};
 
 use super::{AppShell, ToastKind};
+use crate::dialogs::new_worktree::sanitize_branch_to_folder;
 use crate::notifications::NotificationKind;
 
 const REMOTES_MAX_AGE: Duration = Duration::from_secs(300);
@@ -317,6 +320,7 @@ fn review_step(
 struct ReviewEnd {
     item_id: String,
     content_id: String,
+    kind: ItemKind,
     since: String,
     pr: PullRequest,
     start_head: Option<String>,
@@ -353,7 +357,7 @@ fn report_review_end(
     if let Some(body) = &end.reply {
         *reply_url = Some(post_once(&end.item_id, &end.pr.id, &end.since, body)?);
     }
-    let report = pull_request_comment(&end.pr, Round::Review);
+    let report = pull_request_comment(&end.pr, Round::Review, end.kind);
     post_once(&end.item_id, &end.content_id, &end.since, &report).map(Some)
 }
 
@@ -551,6 +555,7 @@ struct Start {
     board: Board,
     board_url: String,
     item: BoardItem,
+    head: Option<PullRequestHead>,
     round: Round,
     trigger_at: String,
 }
@@ -922,14 +927,26 @@ fn answers_for_task(job: &Job, from: &AnswersFrom) -> String {
 
 fn prepare_worktree(job: &mut Job) -> anyhow::Result<()> {
     if job.create {
-        add_dispatch_worktree(&job.repo, &job.path, &job.branch, &job.remote)?;
+        let add = match job.record.kind {
+            ItemKind::PullRequest => add_pull_request_worktree,
+            ItemKind::Issue | ItemKind::Draft => add_dispatch_worktree,
+        };
+        add(&job.repo, &job.path, &job.branch, &job.remote)?;
     }
     exclude_handover_files(&job.path)?;
     match job.record.round {
         Round::Research => clear_findings(&job.path)?,
         Round::Review => {
             clear_reply(&job.path)?;
-            refresh_start_head(job);
+            match job.record.kind {
+                ItemKind::PullRequest => {
+                    let head = fetch_branch_head(&job.repo, &job.remote, &job.branch)?;
+                    if let Some(review) = job.record.review.as_mut() {
+                        review.start_head = Some(head);
+                    }
+                }
+                ItemKind::Issue | ItemKind::Draft => refresh_start_head(job),
+            }
         }
         Round::Implementation => {}
     }
@@ -1091,27 +1108,37 @@ impl AppShell {
             .collect()
     }
 
-    fn place_of(&self, board_url: &str, item: &BoardItem, cx: &App) -> Option<Place> {
+    fn place_of(
+        &self,
+        board_url: &str,
+        item: &BoardItem,
+        head: Option<&PullRequestHead>,
+        cx: &App,
+    ) -> Option<Place> {
         let number = item.number?;
+        let new_branch = match item.kind {
+            ItemKind::PullRequest => head.map(|head| head.branch.clone()),
+            ItemKind::Issue | ItemKind::Draft => Some(branch_name(number, &item.title)),
+        };
         let existing = self
             .dispatch_records(cx)
             .into_iter()
             .find(|(_, _, _, r)| r.board_url == board_url && r.item_id == item.id);
         if let Some((_, path, branch, _)) = existing {
-            let branch = branch.unwrap_or_else(|| branch_name(number, &item.title));
             return Some(Place {
                 create: false,
                 path,
-                branch,
+                branch: branch.or(new_branch)?,
             });
         }
         let remotes = &self.board.dispatch.remotes;
         let (matched, _) = *projects_for_repository(remotes, item.repository.as_deref()?).first()?;
         let project = self.current_projects(cx).project(&matched.project_id)?;
-        let branch = branch_name(number, &item.title);
+        let branch = new_branch?;
+        let folder = sanitize_branch_to_folder(&branch);
         Some(Place {
             create: true,
-            path: PathBuf::from(project.worktree_root_path()).join(&branch),
+            path: PathBuf::from(project.worktree_root_path()).join(folder),
             branch,
         })
     }
@@ -1183,6 +1210,9 @@ impl AppShell {
                     .as_ref()
                     .and_then(|id| triggers.linked.get(id))
                     .map_or(&[][..], Vec::as_slice);
+                let head = item.content_id.as_ref().and_then(|id| triggers.heads.get(id));
+                let dispatches = records.iter().map(|(_, _, branch, r)| (branch.as_deref(), r));
+                let opener = opened_by(item, head, dispatches);
                 let mover_can_write = change
                     .and_then(|c| mover_to_check(item, c, &viewer.login))
                     .zip(item.repository.as_deref())
@@ -1205,6 +1235,8 @@ impl AppShell {
                     pull_request: own_pull_request(record, state.watches.get(&item.id)),
                     linked,
                     branch: worktree.and_then(|(_, _, branch, _)| branch.as_deref()),
+                    head,
+                    opened_by: opener,
                     running,
                     limit,
                 };
@@ -1227,7 +1259,7 @@ impl AppShell {
                             continue;
                         }
                         let target = self
-                            .place_of(&settings.url, item, cx)
+                            .place_of(&settings.url, item, head, cx)
                             .map(|place| self.handover_target(&place.path, cx));
                         if let Some(HandoverTarget::Wait(hold)) = target {
                             holds.insert(item.id.clone(), hold);
@@ -1238,6 +1270,7 @@ impl AppShell {
                             board: board.clone(),
                             board_url: settings.url.clone(),
                             item: item.clone(),
+                            head: head.cloned(),
                             round,
                             trigger_at: change.created_at.clone(),
                         });
@@ -1286,6 +1319,7 @@ impl AppShell {
             board,
             board_url,
             item,
+            head,
             round,
             trigger_at,
         } = start;
@@ -1322,7 +1356,7 @@ impl AppShell {
         let profile = self.project_agent(&project);
         let command = profile.as_ref().and_then(|profile| {
             codescope_core::build_new_session_auto_type(profile)
-                .and_then(|launch| launch_with_task(&launch, &task_message(number)))
+                .and_then(|launch| launch_with_task(&launch, &task_message(item.kind, number)))
         });
         let (Some(profile), Some(command)) = (profile, command) else {
             let message = "The project's agent can't be handed a task yet. Claude Code, Codex, \
@@ -1332,7 +1366,9 @@ impl AppShell {
             return;
         };
 
-        let Some(Place { create, path, branch }) = self.place_of(&board_url, &item, cx) else {
+        let Some(Place { create, path, branch }) =
+            self.place_of(&board_url, &item, head.as_ref(), cx)
+        else {
             return;
         };
         let pending = if create {
@@ -1372,7 +1408,15 @@ impl AppShell {
             .as_ref()
             .and_then(|previous| previous.pull_request.clone())
             .or_else(|| watch.and_then(|w| w.reported.clone()));
-        let pull_request = carried_pull_request(round, posted, open);
+        let pull_request = match item.kind {
+            ItemKind::PullRequest => Some(PostedPullRequest {
+                number,
+                url: url.clone(),
+                comment_url: String::new(),
+                in_review: false,
+            }),
+            ItemKind::Issue | ItemKind::Draft => carried_pull_request(round, posted, open),
+        };
         let review = (round == Round::Review).then(|| ReviewRound {
             start_head: open.map(|pr| pr.head_oid.clone()),
             ..ReviewRound::default()
@@ -1396,6 +1440,7 @@ impl AppShell {
                 board_url,
                 item_id: item.id.clone(),
                 content_id: content_id.clone(),
+                kind: item.kind,
                 repository,
                 number,
                 title: item.title.clone(),
@@ -1485,7 +1530,8 @@ impl AppShell {
         }
         self.board.dispatch.starting.remove(&record.item_id);
         self.board.dispatch.seen_from_start.insert(round_key(record));
-        self.hand_over(&job.path, terminal, launch, record.number, window, cx);
+        let task = task_message(record.kind, record.number);
+        self.hand_over(&job.path, terminal, launch, task, window, cx);
         cx.notify();
         Some(job)
     }
@@ -1513,12 +1559,12 @@ impl AppShell {
         path: &Path,
         terminal: Option<Entity<TerminalView>>,
         launch: Launch,
-        number: u32,
+        task: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(terminal) = terminal {
-            Self::submit_line(&terminal, task_message(number), cx);
+            Self::submit_line(&terminal, task, cx);
             return;
         }
         let before = self
@@ -2156,6 +2202,7 @@ impl AppShell {
         let end = ReviewEnd {
             item_id: record.item_id.clone(),
             content_id: record.content_id.clone(),
+            kind: record.kind,
             since: record.trigger_at.clone(),
             pr: pr.clone(),
             start_head: record.review.as_ref().and_then(|r| r.start_head.clone()),
@@ -2254,12 +2301,20 @@ impl AppShell {
     ) {
         let item_id = record.item_id.clone();
         let repository = record.repository.clone();
+        let kind = record.kind;
+        let content_id = record.content_id.clone();
         let started = Instant::now();
         cx.spawn(async move |this, cx| {
             let (branch, result) = cx
                 .background_spawn(async move {
-                    let found = github::fetch_pull_requests(&repository, &branch);
-                    (branch, found.map(round_pull_request))
+                    let found = match kind {
+                        ItemKind::PullRequest => github::fetch_pull_request(&content_id),
+                        ItemKind::Issue | ItemKind::Draft => {
+                            github::fetch_pull_requests(&repository, &branch)
+                                .map(round_pull_request)
+                        }
+                    };
+                    (branch, found)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -2291,7 +2346,7 @@ impl AppShell {
     ) {
         let item_id = record.item_id.clone();
         let content_id = record.content_id.clone();
-        let body = pull_request_comment(&pr, record.round);
+        let body = pull_request_comment(&pr, record.round, record.kind);
         if let Some(watch) = self.board.dispatch.watches.get_mut(&item_id) {
             watch.reporting = true;
             watch.report_error = None;
@@ -2349,18 +2404,30 @@ impl AppShell {
         relation: &str,
         cx: &mut Context<Self>,
     ) {
+        let subject = match record.kind {
+            ItemKind::PullRequest => format!("PR #{} updated", pr.number),
+            ItemKind::Issue | ItemKind::Draft => {
+                format!("PR #{} {relation} #{}", pr.number, record.number)
+            }
+        };
         let (kind, toast, title, detail) = if pr.is_draft {
+            let detail = match record.kind {
+                ItemKind::PullRequest => "It moves to In review once it is marked ready.",
+                ItemKind::Issue | ItemKind::Draft => {
+                    "Test it by hand, then mark it ready for review."
+                }
+            };
             (
                 NotificationKind::SessionWaiting,
                 ToastKind::Info,
-                format!("Draft PR #{} {relation} #{}", pr.number, record.number),
-                "Test it by hand, then mark it ready for review.".to_string(),
+                format!("Draft {subject}"),
+                detail.to_string(),
             )
         } else {
             (
                 NotificationKind::SessionReady,
                 ToastKind::Ok,
-                format!("PR #{} {relation} #{}", pr.number, record.number),
+                subject,
                 record.title.clone(),
             )
         };
@@ -2589,8 +2656,10 @@ impl AppShell {
                     let posted = r.pull_request.as_ref().or(watch.reported.as_ref());
                     match r.round {
                         Round::Research => None,
-                        Round::Implementation => pull_request_note(watch, posted),
-                        Round::Review => review_note(watch, &review_round(&r, watch), posted),
+                        Round::Implementation => pull_request_note(watch, posted, r.kind),
+                        Round::Review => {
+                            review_note(watch, &review_round(&r, watch), posted, r.kind)
+                        }
                     }
                 });
                 (r.item_id, watched.unwrap_or(note))
@@ -2819,6 +2888,7 @@ fn review_note(
     watch: &PullRequestWatch,
     review: &ReviewRound,
     posted: Option<&PostedPullRequest>,
+    kind: ItemKind,
 ) -> Option<CardNote> {
     if watch.ending_review {
         return Some(CardNote::new("Reporting the review…", NoteTone::Working));
@@ -2833,7 +2903,7 @@ fn review_note(
     }
     let open = watch.pull_request.as_ref().is_some_and(|pr| pr.state == PullRequestState::Open);
     if review.report_url.is_some() || !open {
-        return pull_request_note(watch, posted);
+        return pull_request_note(watch, posted, kind);
     }
     if let Some(by) = watch.review_held {
         return Some(held_note("Review answered", "report it", by));
@@ -2851,6 +2921,7 @@ fn review_note(
 fn pull_request_note(
     watch: &PullRequestWatch,
     posted: Option<&PostedPullRequest>,
+    kind: ItemKind,
 ) -> Option<CardNote> {
     if watch.reporting {
         return Some(CardNote::new("Reporting the pull request…", NoteTone::Working));
@@ -2881,6 +2952,11 @@ fn pull_request_note(
             format!("Marking PR #{number} ready for review…"),
             NoteTone::Working,
         ),
+        (PullRequestState::Open, true) if kind == ItemKind::PullRequest => CardNote {
+            text: format!("Draft PR #{number} · moves to In review once marked ready").into(),
+            tone: NoteTone::Waiting,
+            action: Some(CardAction::ReadyForReview),
+        },
         (PullRequestState::Open, true) => CardNote {
             text: format!("Draft PR #{number} · test by hand").into(),
             tone: NoteTone::NeedsYou,
@@ -3178,6 +3254,7 @@ mod tests {
             board_url: "https://github.com/users/maui1911/projects/1".into(),
             item_id: "PVTI_1".into(),
             content_id: "I_1".into(),
+            kind: ItemKind::Issue,
             repository: "maui1911/CodeScope".into(),
             number: 426,
             title: "Review round".into(),
@@ -3197,9 +3274,22 @@ mod tests {
             read_ok_at: Some(Instant::now()),
             ..PullRequestWatch::default()
         };
-        let note = pull_request_note(&watch, Some(&posted(415))).unwrap();
+        let note = pull_request_note(&watch, Some(&posted(415)), ItemKind::Issue).unwrap();
         assert_eq!(note.text.as_ref(), "Draft PR #415 · test by hand");
         assert!(note.tone == NoteTone::NeedsYou);
+        assert!(note.action == Some(CardAction::ReadyForReview));
+    }
+
+    #[test]
+    fn a_draft_pull_request_item_waits_to_be_marked_ready() {
+        let watch = PullRequestWatch {
+            pull_request: Some(open_pull_request(420, true, Checks::Running)),
+            read_ok_at: Some(Instant::now()),
+            ..PullRequestWatch::default()
+        };
+        let note = pull_request_note(&watch, Some(&posted(420)), ItemKind::PullRequest).unwrap();
+        assert_eq!(note.text.as_ref(), "Draft PR #420 · moves to In review once marked ready");
+        assert!(note.tone == NoteTone::Waiting);
         assert!(note.action == Some(CardAction::ReadyForReview));
     }
 
@@ -3210,11 +3300,11 @@ mod tests {
             read_ok_at: Some(Instant::now()),
             ..PullRequestWatch::default()
         };
-        let note = pull_request_note(&watch, Some(&posted(415))).unwrap();
+        let note = pull_request_note(&watch, Some(&posted(415)), ItemKind::Issue).unwrap();
         assert_eq!(note.text.as_ref(), "PR #415 · checks passing");
         assert!(note.tone == NoteTone::Waiting && note.action.is_none());
         watch.pull_request = Some(open_pull_request(415, false, Checks::Failing));
-        let note = pull_request_note(&watch, Some(&posted(415))).unwrap();
+        let note = pull_request_note(&watch, Some(&posted(415)), ItemKind::Issue).unwrap();
         assert_eq!(note.text.as_ref(), "PR #415 · checks failing");
         assert!(note.tone == NoteTone::Failed);
     }
@@ -3232,7 +3322,7 @@ mod tests {
         assert!(!watch.waits_for_you(), "no read since it stopped");
         watch.read_ok_at = Some(stopped + Duration::from_millis(1));
         assert!(watch.waits_for_you());
-        let note = pull_request_note(&watch, None).unwrap();
+        let note = pull_request_note(&watch, None, ItemKind::Issue).unwrap();
         assert_eq!(note.text.as_ref(), "Waiting for you in the tab");
         assert!(note.tone == NoteTone::NeedsYou);
         watch.track(None);
@@ -3456,9 +3546,10 @@ mod tests {
             ..PullRequestWatch::default()
         };
         let review = review_from("c415");
-        assert!(review_note(&watch, &review, None).is_none(), "the round's own line");
+        let own_line = review_note(&watch, &review, None, ItemKind::Issue);
+        assert!(own_line.is_none(), "the round's own line");
         watch.review_held = Some(HeldBy::Program);
-        let note = review_note(&watch, &review, None).unwrap();
+        let note = review_note(&watch, &review, None, ItemKind::Issue).unwrap();
         assert_eq!(
             note.text.as_ref(),
             "Review answered · to report it, quit what runs in its worktree's tab, or close the tab"
@@ -3467,7 +3558,7 @@ mod tests {
         let stop = Instant::now();
         watch.idle_since = Some(stop);
         watch.stop_without_result = Some(stop);
-        let note = review_note(&watch, &review, None).unwrap();
+        let note = review_note(&watch, &review, None, ItemKind::Issue).unwrap();
         assert_eq!(
             note.text.as_ref(),
             "Review stopped without a push or a reply · waiting for you in the tab"
@@ -3477,11 +3568,11 @@ mod tests {
             problems: "a code block is not closed".into(),
             ..Reminder::default()
         });
-        let note = review_note(&watch, &review, None).unwrap();
+        let note = review_note(&watch, &review, None, ItemKind::Issue).unwrap();
         assert_eq!(note.text.as_ref(), "Reply incomplete: a code block is not closed");
         assert!(note.tone == NoteTone::Failed);
         watch.ending_review = true;
-        let note = review_note(&watch, &review, None).unwrap();
+        let note = review_note(&watch, &review, None, ItemKind::Issue).unwrap();
         assert_eq!(note.text.as_ref(), "Reporting the review…");
         watch.ending_review = false;
         watch.reply_reminder = None;
@@ -3489,7 +3580,7 @@ mod tests {
             report_url: Some("c".into()),
             ..review
         };
-        let note = review_note(&watch, &reported, Some(&posted(415))).unwrap();
+        let note = review_note(&watch, &reported, Some(&posted(415)), ItemKind::Issue).unwrap();
         assert_eq!(note.text.as_ref(), "PR #415 · checks passing");
     }
 

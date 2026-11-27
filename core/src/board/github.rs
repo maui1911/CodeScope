@@ -11,7 +11,9 @@ use serde::de::DeserializeOwned;
 
 use super::answers::Comment;
 use super::dispatch::StatusChange;
-use super::pull_request::{Checks, LinkedPullRequest, PullRequest, PullRequestState};
+use super::pull_request::{
+    Checks, LinkedPullRequest, PullRequest, PullRequestHead, PullRequestState,
+};
 use super::{Board, BoardItem, BoardOwner, BoardRef, Column, ItemKind, ItemState};
 use crate::process::no_window_command;
 
@@ -117,7 +119,10 @@ const TRIGGER_ITEMS_QUERY: &str = r#"query($ids: [ID!]!) {
       id timelineItems(last: 100, itemTypes: [PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]) { nodes { ...change } }
       closedByPullRequestsReferences(first: 10, includeClosedPrs: true) { nodes { ...linked } }
     }
-    ... on PullRequest { id timelineItems(last: 100, itemTypes: [PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]) { nodes { ...change } } }
+    ... on PullRequest {
+      id headRefName isCrossRepository
+      timelineItems(last: 100, itemTypes: [PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]) { nodes { ...change } }
+    }
   }
 }
 fragment change on ProjectV2ItemStatusChangedEvent {
@@ -135,10 +140,12 @@ pub struct TriggerReads {
     pub changes: HashMap<String, StatusChange>,
     /// Each issue's linked pull requests, open or not, up to ten.
     pub linked: HashMap<String, Vec<LinkedPullRequest>>,
+    /// The branch each pull request merges from.
+    pub heads: HashMap<String, PullRequestHead>,
 }
 
-/// The last status change on board `board_id`, and the linked pull requests, of each issue or
-/// pull request in `content_ids`.
+/// The last status change on board `board_id` of each issue or pull request in `content_ids`, the
+/// linked pull requests of each issue, and the branch of each pull request.
 pub fn fetch_trigger_reads(board_id: &str, content_ids: &[String]) -> Result<TriggerReads> {
     let mut reads = TriggerReads::default();
     for chunk in content_ids.chunks(100) {
@@ -148,6 +155,7 @@ pub fn fetch_trigger_reads(board_id: &str, content_ids: &[String]) -> Result<Tri
         let page = parse_trigger_reads(&stdout, board_id)?;
         reads.changes.extend(page.changes);
         reads.linked.extend(page.linked);
+        reads.heads.extend(page.heads);
     }
     Ok(reads)
 }
@@ -175,6 +183,15 @@ pub fn parse_trigger_reads(json: &str, board_id: &str) -> Result<TriggerReads> {
                 created_at: change.created_at,
             };
             reads.changes.insert(id.clone(), change);
+        }
+        if let (Some(branch), Some(is_cross_repository)) =
+            (node.head_ref_name, node.is_cross_repository)
+        {
+            let head = PullRequestHead {
+                branch,
+                is_cross_repository,
+            };
+            reads.heads.insert(id.clone(), head);
         }
         if let Some(linked) = node.closed_by_pull_requests_references {
             let linked = linked
@@ -441,30 +458,54 @@ pub fn parse_pull_requests(json: &str) -> Result<Vec<PullRequest>> {
         .into_iter()
         .flatten()
         .filter(|node| !node.is_cross_repository)
-        .filter_map(|node| {
-            let state = match node.state.as_str() {
-                "OPEN" => PullRequestState::Open,
-                "MERGED" => PullRequestState::Merged,
-                _ => return None,
-            };
-            let rollup = node
-                .commits
-                .nodes
-                .into_iter()
-                .flatten()
-                .next()
-                .and_then(|c| c.commit.status_check_rollup);
-            Some(PullRequest {
-                id: node.id,
-                number: node.number,
-                url: node.url,
-                state,
-                is_draft: node.is_draft,
-                checks: Checks::from_rollup(rollup.as_ref().map(|r| r.state.as_str())),
-                head_oid: node.head_ref_oid,
-            })
-        })
+        .filter_map(into_pull_request)
         .collect())
+}
+
+fn into_pull_request(node: PullRequestNode) -> Option<PullRequest> {
+    let state = match node.state.as_str() {
+        "OPEN" => PullRequestState::Open,
+        "MERGED" => PullRequestState::Merged,
+        _ => return None,
+    };
+    let rollup = node
+        .commits
+        .nodes
+        .into_iter()
+        .flatten()
+        .next()
+        .and_then(|c| c.commit.status_check_rollup);
+    Some(PullRequest {
+        id: node.id,
+        number: node.number,
+        url: node.url,
+        state,
+        is_draft: node.is_draft,
+        checks: Checks::from_rollup(rollup.as_ref().map(|r| r.state.as_str())),
+        head_oid: node.head_ref_oid,
+    })
+}
+
+const PULL_REQUEST_QUERY: &str = r#"query($id: ID!) {
+  node(id: $id) {
+    ... on PullRequest {
+      id number url state isDraft isCrossRepository headRefOid
+      commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+    }
+  }
+}"#;
+
+/// The pull request with node id `id`; `None` when it was closed without a merge.
+pub fn fetch_pull_request(id: &str) -> Result<Option<PullRequest>> {
+    let stdout = run_graphql(&[format!("query={PULL_REQUEST_QUERY}"), format!("id={id}")], &[])?;
+    parse_pull_request(&stdout)
+}
+
+/// Parse [`fetch_pull_request`]'s response.
+pub fn parse_pull_request(json: &str) -> Result<Option<PullRequest>> {
+    let data: PullRequestData = parse_data(json)?;
+    let node = data.node.ok_or_else(|| anyhow!("pull request not found"))?;
+    Ok(into_pull_request(node))
 }
 
 const THREAD_REPLIES_QUERY: &str = r#"query($id: ID!) {
@@ -785,6 +826,8 @@ struct TimelineOwner {
     id: Option<String>,
     timeline_items: Option<TimelineItems>,
     closed_by_pull_requests_references: Option<LinkedList>,
+    head_ref_name: Option<String>,
+    is_cross_repository: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -846,6 +889,11 @@ struct IssueCommentNode {
     body: String,
     created_at: String,
     author: Option<Login>,
+}
+
+#[derive(Deserialize)]
+struct PullRequestData {
+    node: Option<PullRequestNode>,
 }
 
 #[derive(Deserialize)]
@@ -1236,6 +1284,7 @@ mod tests {
         ]}}"#;
         let linked = parse_trigger_reads(json, "PVT_1").unwrap().linked;
         assert_eq!(linked.len(), 1, "a pull request item has no linked pull requests");
+        assert!(linked.contains_key("I_432"));
         assert_eq!(
             linked["I_432"],
             vec![
@@ -1257,6 +1306,28 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn reads_the_branch_each_pull_request_merges_from() {
+        let json = r#"{"data":{"nodes":[
+          {"__typename":"PullRequest","id":"PR_420","headRefName":"keep-palette-open",
+           "isCrossRepository":false,"timelineItems":{"nodes":[]}},
+          {"__typename":"PullRequest","id":"PR_421","headRefName":"main",
+           "isCrossRepository":true,"timelineItems":{"nodes":[]}},
+          {"__typename":"Issue","id":"I_432","timelineItems":{"nodes":[]},
+           "closedByPullRequestsReferences":{"nodes":[]}}
+        ]}}"#;
+        let heads = parse_trigger_reads(json, "PVT_1").unwrap().heads;
+        assert_eq!(heads.len(), 2, "an issue has no branch");
+        assert_eq!(
+            heads["PR_420"],
+            PullRequestHead {
+                branch: "keep-palette-open".into(),
+                is_cross_repository: false,
+            }
+        );
+        assert!(heads["PR_421"].is_cross_repository);
     }
 
     #[test]
@@ -1401,6 +1472,36 @@ mod tests {
         );
         let missing = parse_pull_requests(r#"{"data":{"repository":null}}"#).unwrap_err();
         assert_eq!(missing.to_string(), "repository not found");
+    }
+
+    #[test]
+    fn reads_one_pull_request_by_its_id() {
+        let node = |state: &str| {
+            format!(
+                r#"{{"data":{{"node":{{"id":"PR_420","number":420,
+                  "url":"https://github.com/maui1911/CodeScope/pull/420","state":"{state}",
+                  "isDraft":true,"isCrossRepository":false,"headRefOid":"c420",
+                  "commits":{{"nodes":[{{"commit":{{"statusCheckRollup":{{"state":"SUCCESS"}}}}}}]}}
+                }}}}}}"#
+            )
+        };
+        let open = parse_pull_request(&node("OPEN")).unwrap();
+        assert_eq!(
+            open,
+            Some(PullRequest {
+                id: "PR_420".into(),
+                number: 420,
+                url: "https://github.com/maui1911/CodeScope/pull/420".into(),
+                state: PullRequestState::Open,
+                is_draft: true,
+                checks: Checks::Passing,
+                head_oid: "c420".into(),
+            })
+        );
+        let merged = parse_pull_request(&node("MERGED")).unwrap().unwrap();
+        assert_eq!(merged.state, PullRequestState::Merged);
+        assert_eq!(parse_pull_request(&node("CLOSED")).unwrap(), None);
+        assert!(parse_pull_request(r#"{"data":{"node":null}}"#).is_err());
     }
 
     #[test]
