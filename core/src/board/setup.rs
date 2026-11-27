@@ -2,7 +2,7 @@
 //! script, as the remote's default branch has it, before its session gets the task.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Mutex, PoisonError};
@@ -32,6 +32,7 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const SETUP_POLL: Duration = Duration::from_millis(200);
 const TAIL_LINES: usize = 2;
 const TAIL_LINE_CHARS: usize = 200;
+const TAIL_BYTES: u64 = 64 * 1024;
 
 static RUNNING: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
@@ -252,10 +253,9 @@ fn duration(limit: Duration) -> String {
 
 fn failed(worktree: &Path, what: &str) -> anyhow::Error {
     let log = match linked_part(worktree, SETUP_LOG) {
-        Some(_) => Vec::new(),
-        None => std::fs::read(worktree.join(SETUP_LOG)).unwrap_or_default(),
+        Some(_) => String::new(),
+        None => log_tail(&worktree.join(SETUP_LOG)),
     };
-    let log = String::from_utf8_lossy(&log);
     let lines: Vec<String> = log
         .lines()
         .map(|line| plain(line).trim().to_string())
@@ -265,6 +265,21 @@ fn failed(worktree: &Path, what: &str) -> anyhow::Error {
     let tail = lines[lines.len().saturating_sub(TAIL_LINES)..].join(" · ");
     let tail = if tail.is_empty() { String::new() } else { format!(": {tail}") };
     anyhow!("{SETUP_SCRIPT} {what}{tail} (see {SETUP_LOG})")
+}
+
+fn log_tail(path: &Path) -> String {
+    let mut bytes = Vec::new();
+    let start = File::open(path).and_then(|mut file| {
+        let start = file.metadata()?.len().saturating_sub(TAIL_BYTES);
+        file.seek(SeekFrom::Start(start))?;
+        file.read_to_end(&mut bytes)?;
+        Ok(start)
+    });
+    let text = String::from_utf8_lossy(&bytes);
+    match (start, text.split_once('\n')) {
+        (Ok(start), Some((_, rest))) if start > 0 => rest.to_string(),
+        _ => text.into_owned(),
+    }
 }
 
 fn plain(line: &str) -> String {
@@ -429,6 +444,17 @@ mod tests {
         run_setup(&repos.repo, &repos.worktree, "origin").unwrap();
         assert!(ran(&repos, "ran.txt").is_some());
         assert!(ran(&repos, "hacked.txt").is_none());
+    }
+
+    #[test]
+    fn only_the_end_of_a_big_log_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("setup.log");
+        std::fs::write(&log, "short\nlog\n").unwrap();
+        assert_eq!(log_tail(&log), "short\nlog\n");
+        let big = format!("{}\nsecond to last\nlast\n", "y".repeat(200_000));
+        std::fs::write(&log, big).unwrap();
+        assert_eq!(log_tail(&log), "second to last\nlast\n");
     }
 
     #[test]
