@@ -158,6 +158,10 @@ struct PullRequestWatch {
 }
 
 impl DispatchState {
+    fn can_write(&self, repository: &str, login: &str, now: Instant) -> Option<bool> {
+        usable_access(self.access.get(&access_key(repository, login)), now)
+    }
+
     fn keep_access(&mut self, checked: Vec<((String, String), Option<bool>)>) {
         let now = Instant::now();
         for (key, answer) in checked {
@@ -2931,7 +2935,16 @@ impl AppShell {
         let unreplied = forwarded.is_some_and(|last| last.reply_url.is_none());
         let reply = read_reply(path).filter(|_| unreplied);
         let open = forwarded.is_some_and(|last| last.is_open(&pr));
-        let fresh = since.as_deref().is_some_and(|since| !new_comments(&pr, since).is_empty());
+        let now = Instant::now();
+        let outsider = |login: &str| {
+            self.board.dispatch.can_write(&record.repository, login, now) == Some(false)
+        };
+        let fresh = since.as_deref().is_some_and(|since| {
+            new_comments(&pr, since)
+                .iter()
+                .filter_map(|comment| comment.author.as_deref())
+                .any(|login| !outsider(login))
+        });
         if !open && reply.is_none() && !fresh {
             return Some((pr, ForwardStep::Nothing));
         }
@@ -2943,11 +2956,7 @@ impl AppShell {
         watch.forward_follow.look(forwarded.map(|last| last.at.clone()), working, turns);
         let session = watch.forward_follow.session(working, unreplied, watch.read_ok_at);
         let current = watch.read_after_stop();
-        let access = &state.access;
-        let now = Instant::now();
-        let can_write = |login: &str| {
-            usable_access(access.get(&access_key(&record.repository, login)), now)
-        };
+        let can_write = |login: &str| state.can_write(&record.repository, login, now);
         let facts = ForwardFacts {
             since: since.as_deref(),
             forwarded,
@@ -3624,7 +3633,8 @@ fn named(authors: &[String]) -> String {
 }
 
 fn forward_card(watch: &PullRequestWatch) -> Option<CardNote> {
-    let commented = |authors: &[String], how: &str| format!("{} commented · {how}", named(authors));
+    let commented =
+        |authors: &[String], how: &str| format!("{} commented · {how}", named(authors));
     let card = match watch.forward_note.as_ref()? {
         ForwardNote::Waits(authors) => {
             CardNote::new(commented(authors, "waits for its session"), NoteTone::Waiting)
