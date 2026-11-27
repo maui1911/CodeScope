@@ -127,6 +127,9 @@ pub struct WorktreeDispatch {
     pub round: Round,
     /// When the move that started that round was made, as the host reports it.
     pub trigger_at: String,
+    /// The id of the agent profile that round started with; absent from a row written before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// The research round's findings, once CodeScope posted them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub findings: Option<PostedFindings>,
@@ -1508,6 +1511,7 @@ mod tests {
             url: "https://github.com/maui1911/CodeScope/issues/411".into(),
             round,
             trigger_at: trigger_at.into(),
+            agent: None,
             findings: None,
             pull_request: None,
             review: None,
@@ -2773,6 +2777,21 @@ mod tests {
         assert!(json.contains(r#""kind":"pullRequest""#), "{json}");
         assert!(json.contains(r#""commentUrl":"""#), "a build that requires it reads the row");
         assert_eq!(serde_json::from_str::<WorktreeDispatch>(&json).unwrap(), item);
+    }
+
+    #[test]
+    fn a_round_keeps_the_agent_it_started_with() {
+        let before = serde_json::to_string(&dispatch(Round::Research, MOVED)).unwrap();
+        assert!(!before.contains("agent"), "{before}");
+        let read: WorktreeDispatch = serde_json::from_str(&before).unwrap();
+        assert_eq!(read.agent, None, "a row from before rounds kept their agent");
+        let started = WorktreeDispatch {
+            agent: Some("copilot".into()),
+            ..dispatch(Round::Implementation, MOVED)
+        };
+        let json = serde_json::to_string(&started).unwrap();
+        assert!(json.contains(r#""agent":"copilot""#), "{json}");
+        assert_eq!(serde_json::from_str::<WorktreeDispatch>(&json).unwrap(), started);
     }
 
     #[test]

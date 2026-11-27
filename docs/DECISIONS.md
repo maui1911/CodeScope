@@ -1066,7 +1066,16 @@ board, each with their own CodeScope or another tool that follows the
   repository (such as `.claude/agents/`) reach the session through the
   worktree, as skills do, so a skill can hand work to them. The CLI
   per phase stays local, because it depends on what the user has
-  installed.
+  installed: a project can set one CLI for research and one for
+  implementation, which also runs the review rounds and the repairs,
+  and each defaults to the project's agent. A round keeps the agent it
+  started with, so a changed setting applies from the next round. A
+  handover passes over a tab started with another agent once nothing
+  works or waits there, so the first round of a phase with another CLI
+  starts a new session in the same worktree, from the findings, and the
+  earlier session stays as it is. While that tab still works, the round
+  waits for it; a CLI whose turns CodeScope can't read counts as working
+  until its tab is closed.
 * **Setup command.** A worktree the dispatch creates first runs the
   repository's setup script, before the session gets its task:
   `.codescope/setup.ps1` on Windows (with PowerShell) and
@@ -1098,9 +1107,13 @@ board, each with their own CodeScope or another tool that follows the
   replaces a team's setup.
 * **Project settings.** *Project settings…* in a repository project's
   context menu holds what one user's CodeScope sets for that project:
-  the setup command and the name of each round's skill. They live in
-  `projects.json` with the project, not in the repository, because
-  they depend on what the user has installed. The dialog refuses a
+  the setup command, the CLI per phase and the name of each round's
+  skill. The CLIs to choose from are the agents CodeScope can hand a
+  task to; one that is gone, or can no longer be handed a task, runs
+  the project's agent. They live in `projects.json` with the project,
+  not in the repository, because they depend on what the user has
+  installed; a build from before these settings drops them when it
+  saves that file. The dialog refuses a
   name that isn't a skill name (lowercase letters, digits and single
   hyphens); such a name written into `projects.json` by hand gets the
   default.
@@ -1171,7 +1184,10 @@ board, each with their own CodeScope or another tool that follows the
   closed again. Moved by the user to a column that is not a trigger
   column: no round starts, nothing more is sent into the session and
   nothing is removed; what the round already produced is still
-  posted. CodeScope never stops an agent that is working.
+  posted. CodeScope never stops an agent that is working. A tab running
+  a program whose turns CodeScope can't read, such as an agent CLI
+  without telemetry, counts as working until the user closes it; the
+  card asks for that.
 * **GitHub first, other hosts behind one seam.** The first version
   supports GitHub through `gh` only. Board access (read a board, move
   an item, link an item to a branch) sits behind one seam that does

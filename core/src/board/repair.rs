@@ -393,6 +393,7 @@ mod tests {
             url: "https://github.com/maui1911/CodeScope/issues/411".into(),
             round: Round::Implementation,
             trigger_at: "2026-11-27T10:00:00Z".into(),
+            agent: None,
             findings: None,
             pull_request: None,
             review: None,

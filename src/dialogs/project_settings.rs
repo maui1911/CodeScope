@@ -5,10 +5,11 @@ use std::sync::Arc;
 
 use codescope_core::board::dispatch::Round;
 use codescope_core::board::dispatch_settings::{
-    DispatchSettings, REPAIR_SKILL, SkillNames, is_skill_name,
+    DispatchSettings, PhaseAgents, REPAIR_SKILL, SkillNames, is_skill_name,
 };
 use codescope_core::board::setup::SETUP_SCRIPT;
 use codescope_core::{ProjectsConfig, Theme};
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
     Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
     MouseDownEvent, ParentElement, SharedString, Styled, Window, anchored, deferred, div, point,
@@ -77,6 +78,76 @@ impl Input {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Research,
+    Implementation,
+}
+
+impl Phase {
+    fn label(self) -> &'static str {
+        match self {
+            Phase::Research => "Research",
+            Phase::Implementation => "Implementation",
+        }
+    }
+
+    fn chip_id(self) -> &'static str {
+        match self {
+            Phase::Research => "project-settings-research-agent",
+            Phase::Implementation => "project-settings-implementation-agent",
+        }
+    }
+
+    fn agent(self, agents: &PhaseAgents) -> Option<&str> {
+        match self {
+            Phase::Research => agents.research.as_deref(),
+            Phase::Implementation => agents.implementation.as_deref(),
+        }
+    }
+
+    fn set_agent(self, agents: &mut PhaseAgents, id: Option<String>) {
+        match self {
+            Phase::Research => agents.research = id,
+            Phase::Implementation => agents.implementation = id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentChip {
+    id: Option<String>,
+    label: String,
+    chosen: bool,
+}
+
+fn agent_chips(
+    set: Option<&str>,
+    choices: &[(String, String)],
+    own: Option<&str>,
+) -> Vec<AgentChip> {
+    let set = set.filter(|id| !id.is_empty());
+    let own = own.map_or("Project's agent".to_string(), |name| format!("Project's agent ({name})"));
+    let mut chips = vec![AgentChip {
+        id: None,
+        label: own,
+        chosen: set.is_none(),
+    }];
+    chips.extend(choices.iter().map(|(id, name)| AgentChip {
+        id: Some(id.clone()),
+        label: name.clone(),
+        chosen: set == Some(id.as_str()),
+    }));
+    if let Some(set) = set.filter(|set| choices.iter().all(|(id, _)| id != set)) {
+        chips.push(AgentChip {
+            id: Some(set.to_string()),
+            label: format!("{set} (unavailable)"),
+            chosen: true,
+        });
+    }
+    chips
+}
+
 pub(crate) struct ProjectSettingsDialogState {
     focus_handle: FocusHandle,
     project_id: String,
@@ -84,6 +155,9 @@ pub(crate) struct ProjectSettingsDialogState {
     focused: Input,
     fields: [TextField; 5],
     stored_command: Option<String>,
+    agents: PhaseAgents,
+    agent_choices: Vec<(String, String)>,
+    own_agent: Option<String>,
     error: Option<String>,
 }
 
@@ -163,6 +237,7 @@ fn read_settings(
             repair: skill_name(Input::Repair, repair)?,
         },
         setup_command: (!command.is_empty()).then(|| command.to_string()),
+        ..DispatchSettings::default()
     })
 }
 
@@ -192,6 +267,7 @@ impl AppShell {
         let Some(project) = self.projects.project(project_id).cloned() else {
             return;
         };
+        let (agent_choices, own_agent) = self.round_agents(&project);
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
         self.project_settings_dialog = Some(ProjectSettingsDialogState {
@@ -201,6 +277,9 @@ impl AppShell {
             focused: Input::SetupCommand,
             fields: fields_of(&project.dispatch),
             stored_command: project.dispatch.setup_command.clone(),
+            agents: project.dispatch.agents.clone(),
+            agent_choices,
+            own_agent,
             error: None,
         });
         cx.notify();
@@ -218,7 +297,10 @@ impl AppShell {
         };
         let texts = INPUTS.map(|input| state.field(input).text());
         let settings = match read_settings(texts, state.stored_command.as_deref()) {
-            Ok(settings) => settings,
+            Ok(settings) => DispatchSettings {
+                agents: state.agents.clone(),
+                ..settings
+            },
             Err(err) => {
                 state.error = Some(err);
                 cx.notify();
@@ -247,6 +329,14 @@ impl AppShell {
             }
         }
         cx.notify();
+    }
+
+    fn choose_round_agent(&mut self, phase: Phase, id: Option<String>, cx: &mut Context<Self>) {
+        if let Some(state) = self.project_settings_dialog.as_mut() {
+            phase.set_agent(&mut state.agents, id);
+            state.error = None;
+            cx.notify();
+        }
     }
 
     fn focus_project_settings_input(&mut self, input: Input, cx: &mut Context<Self>) {
@@ -370,6 +460,63 @@ impl AppShell {
                  {SETUP_SCRIPT}, before the agent starts."
             )));
 
+        let agent_row = |phase: Phase| {
+            let chips = agent_chips(
+                phase.agent(&state.agents),
+                &state.agent_choices,
+                state.own_agent.as_deref(),
+            );
+            let chips = chips.into_iter().enumerate().map(|(index, chip)| {
+                let AgentChip { id, label, chosen } = chip;
+                div()
+                    .id((phase.chip_id(), index))
+                    .px_2()
+                    .py(px(3.0))
+                    .text_size(px(12.0))
+                    .rounded(px(5.0))
+                    .border_1()
+                    .border_color(if chosen { accent } else { divider })
+                    .text_color(if chosen { ink } else { ink_dim })
+                    .when(chosen, |chip| chip.bg(frost))
+                    .cursor_pointer()
+                    .hover(move |style| style.text_color(ink))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.choose_round_agent(phase, id.clone(), cx);
+                        }),
+                    )
+                    .child(label)
+            });
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap_3()
+                .child(
+                    div()
+                        .w(px(110.0))
+                        .pt(px(3.0))
+                        .text_size(px(12.0))
+                        .text_color(ink_dim)
+                        .child(phase.label()),
+                )
+                .child(div().flex_1().flex().flex_row().flex_wrap().gap_1().children(chips))
+        };
+        let agents = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(heading("AGENTS"))
+            .child(agent_row(Phase::Research))
+            .child(agent_row(Phase::Implementation))
+            .child(hint(
+                "Implementation also runs the review rounds and the repairs. An agent other \
+                 than research's starts a new session in the same worktree, from the findings."
+                    .to_string(),
+            ));
+
         let skill_row = |input: Input| {
             div()
                 .flex()
@@ -406,6 +553,7 @@ impl AppShell {
             .flex_col()
             .gap_3()
             .child(setup)
+            .child(agents)
             .child(skills);
 
         let cancel_btn = div()
@@ -606,6 +754,7 @@ mod tests {
                 ..SkillNames::default()
             },
             setup_command: Some("npm ci".into()),
+            ..DispatchSettings::default()
         };
         let fields = fields_of(&settings);
         let texts = INPUTS.map(|input| fields[input.index()].text());
@@ -638,6 +787,35 @@ mod tests {
         let err = pasted_line(Input::SetupCommand, "npm ci\nnpm run build").unwrap_err();
         assert!(err.starts_with("The setup command is one line"), "{err}");
         assert!(pasted_line(Input::Repair, "fix\nci").is_err());
+    }
+
+    #[test]
+    fn the_project_s_agent_is_chosen_until_a_phase_names_another() {
+        let choices = [
+            ("claude-code".to_string(), "Claude Code".to_string()),
+            ("codex".to_string(), "Codex".to_string()),
+        ];
+        let chosen = |chips: Vec<AgentChip>| {
+            let labels = chips.iter().map(|chip| chip.label.as_str());
+            let chosen: Vec<_> = chips.iter().filter(|chip| chip.chosen).collect();
+            assert_eq!(chosen.len(), 1, "{:?}", labels.collect::<Vec<_>>());
+            chosen[0].clone()
+        };
+        let unset = chosen(agent_chips(None, &choices, Some("Claude Code")));
+        assert_eq!(unset.id, None);
+        assert_eq!(unset.label, "Project's agent (Claude Code)");
+        assert_eq!(chosen(agent_chips(Some(""), &choices, None)).id, None);
+        let codex = chosen(agent_chips(Some("codex"), &choices, None));
+        assert_eq!((codex.id.as_deref(), codex.label.as_str()), (Some("codex"), "Codex"));
+    }
+
+    #[test]
+    fn an_agent_the_list_lacks_shows_as_unavailable() {
+        let choices = [("codex".to_string(), "Codex".to_string())];
+        let chips = agent_chips(Some("opencode"), &choices, None);
+        let labels: Vec<_> = chips.iter().map(|chip| chip.label.as_str()).collect();
+        assert_eq!(labels, ["Project's agent", "Codex", "opencode (unavailable)"]);
+        assert!(chips[2].chosen);
     }
 
     #[test]
