@@ -1178,7 +1178,10 @@ board, each with their own CodeScope or another tool that follows the
   closed again. Moved by the user to a column that is not a trigger
   column: no round starts, nothing more is sent into the session and
   nothing is removed; what the round already produced is still
-  posted. CodeScope never stops an agent that is working.
+  posted. CodeScope never stops an agent that is working. A tab running
+  a program whose turns CodeScope can't read, such as an agent CLI
+  without telemetry, counts as working until the user closes it; the
+  card asks for that.
 * **GitHub first, other hosts behind one seam.** The first version
   supports GitHub through `gh` only. Board access (read a board, move
   an item, link an item to a branch) sits behind one seam that does

@@ -29,6 +29,13 @@ pub(super) struct Cleanup {
     failed: Option<(Instant, String)>,
     refused: bool,
     told: Option<String>,
+    waits_on: Option<String>,
+}
+
+enum InTheWay {
+    Nothing,
+    Working,
+    Unreadable(String),
 }
 
 struct Target {
@@ -120,13 +127,21 @@ impl AppShell {
     ) {
         let path = target.dispatched.path.clone();
         let tabs_open = !self.tabs_on(&path).is_empty();
-        let free = !tabs_open || self.tabs_free_on(&path, cx);
+        let in_the_way = self.tabs_in_the_way(&path, cx);
         let every = match record.kept {
             Some(Kept::OwnCommits) => CHECK_OWN_COMMITS_EVERY,
             _ => CHECK_EVERY,
         };
         let state = self.board.dispatch.cleanups.entry(record.item_id.clone()).or_default();
-        if !free {
+        let waits_on = match in_the_way {
+            InTheWay::Unreadable(ref tab) => Some(tab.clone()),
+            InTheWay::Nothing | InTheWay::Working => None,
+        };
+        if state.waits_on != waits_on {
+            state.waits_on = waits_on;
+            cx.notify();
+        }
+        if !matches!(in_the_way, InTheWay::Nothing) {
             state.removable = false;
             return;
         }
@@ -175,7 +190,7 @@ impl AppShell {
         .detach();
     }
 
-    fn tabs_free_on(&self, path: &Path, cx: &App) -> bool {
+    fn tabs_in_the_way(&self, path: &Path, cx: &App) -> InTheWay {
         let tabs = self.tabs_on(path);
         let states = self.tab_states(&tabs, path, cx);
         let probed: Vec<(TabAtHandover, Turn, bool)> = tabs
@@ -185,7 +200,17 @@ impl AppShell {
                 (state, self.turn(tab), tab.terminal.read(cx).typed_since_submit())
             })
             .collect();
-        tabs_free(&probed)
+        if tabs_free(&probed) {
+            return InTheWay::Nothing;
+        }
+        match unreadable_tab(&probed) {
+            Some(index) => {
+                let tab = tabs[index];
+                let name = tab.title_parts.label().map(str::to_owned);
+                InTheWay::Unreadable(name.unwrap_or_else(|| tab.title.to_string()))
+            }
+            None => InTheWay::Working,
+        }
     }
 
     fn tab_processes(&self, path: &Path, cx: &App) -> Vec<u32> {
@@ -336,6 +361,12 @@ fn tabs_free(tabs: &[(TabAtHandover, Turn, bool)]) -> bool {
     })
 }
 
+fn unreadable_tab(tabs: &[(TabAtHandover, Turn, bool)]) -> Option<usize> {
+    tabs.iter().position(|&(state, turn, typed)| {
+        !typed && state == TabAtHandover::Other && turn == Turn::Unknown
+    })
+}
+
 async fn wait_for_exit(processes: Vec<u32>, cx: &mut AsyncApp) {
     let started = Instant::now();
     while !processes.is_empty() && started.elapsed() < EXIT_WAIT {
@@ -369,9 +400,10 @@ fn cleanup_note(kept: Option<Kept>, state: Option<&Cleanup>) -> Option<CardNote>
     if state.is_some_and(|state| state.removable) {
         return Some(CardNote::new("Cleaning up…", NoteTone::Working));
     }
-    let text = match kept? {
-        Kept::Changes => "Kept its worktree · uncommitted changes",
-        Kept::OwnCommits => "Kept its worktree · commits of its own",
+    let text = match kept {
+        Some(Kept::Changes) => "Kept its worktree · uncommitted changes".to_string(),
+        Some(Kept::OwnCommits) => "Kept its worktree · commits of its own".to_string(),
+        None => format!("Close {} to clean up", state?.waits_on.as_deref()?),
     };
     Some(CardNote::new(text, NoteTone::Waiting))
 }
@@ -418,5 +450,24 @@ mod tests {
         assert!(!tabs_free(&[(Busy, Turn::Running, false)]));
         assert!(!tabs_free(&[(Stopped, Turn::Ended, false)]));
         assert!(!tabs_free(&[(IdleClaude, Turn::Ended, false), (Busy, Turn::Running, false)]));
+    }
+
+    #[test]
+    fn only_a_program_it_can_t_read_waits_for_the_user_to_close_it() {
+        use TabAtHandover::{Busy, IdleClaude, Other};
+        assert_eq!(unreadable_tab(&[(Busy, Turn::Running, false)]), None, "ends by itself");
+        assert_eq!(unreadable_tab(&[(Other, Turn::Unknown, true)]), None, "the user is there");
+        assert_eq!(unreadable_tab(&[(Other, Turn::Quiet, false)]), None);
+        let tabs = [(IdleClaude, Turn::Ended, false), (Other, Turn::Unknown, false)];
+        assert_eq!(unreadable_tab(&tabs), Some(1));
+        let waiting = Cleanup {
+            waits_on: Some("Copilot CLI".into()),
+            ..Cleanup::default()
+        };
+        let note = cleanup_note(None, Some(&waiting)).unwrap();
+        assert_eq!(note.text.as_ref(), "Close Copilot CLI to clean up");
+        assert!(note.tone == NoteTone::Waiting);
+        let kept = cleanup_note(Some(Kept::Changes), Some(&waiting)).unwrap();
+        assert_eq!(kept.text.as_ref(), "Kept its worktree · uncommitted changes");
     }
 }
