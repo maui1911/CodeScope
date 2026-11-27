@@ -175,7 +175,6 @@ pub fn moves_to_needs_decision(role: Option<ColumnRole>) -> bool {
 pub enum Hold {
     Closed,
     Draft,
-    PullRequest,
     AssignedToOther(String),
     /// The timeline has no move into the item's current column, two minutes or more after the
     /// item was put there.
@@ -237,7 +236,6 @@ impl Hold {
         match self {
             Hold::Closed => "Closed, so nothing starts".into(),
             Hold::Draft => "A draft: convert it to an issue to start".into(),
-            Hold::PullRequest => "Pull request items don't start yet".into(),
             Hold::AssignedToOther(login) => format!("Assigned to @{login}"),
             Hold::NoMove => "No move on its timeline: move it again to start".into(),
             Hold::MoveNotShownYet => "Waits for its move to show on its timeline".into(),
@@ -536,7 +534,7 @@ pub fn trigger_content_ids(board: &Board, mapping: &ColumnMapping) -> Vec<String
 }
 
 /// For a pull request item, the number of the issue whose dispatch opened it: the dispatch that
-/// reported it, or one whose worktree's branch it merges from in the same repository.
+/// reported it, or one past research whose worktree's branch it merges from in the same repository.
 /// `dispatches` are the user's, each with its worktree's branch.
 pub fn opened_by<'a>(
     item: &BoardItem,
@@ -556,7 +554,8 @@ pub fn opened_by<'a>(
         .filter(|(_, d)| d.kind == ItemKind::Issue && d.repository.eq_ignore_ascii_case(repository))
         .find(|(branch, d)| {
             let reported = d.pull_request.as_ref().is_some_and(|pr| pr.number == number);
-            reported || own_branch.is_some_and(|own| *branch == Some(own))
+            let pushes = d.round != Round::Research;
+            reported || (pushes && own_branch.is_some_and(|own| *branch == Some(own)))
         })
         .map(|(_, d)| d.number)
 }
@@ -991,8 +990,16 @@ pub fn add_pull_request_worktree(
     let base = fetch_branch(repo, remote, branch)?;
     add_worktree_from(repo, path, branch, &base, &format!("{remote}/{branch}"))?;
     run_git(repo, &["config", &format!("branch.{branch}.remote"), remote])?;
+    run_git(repo, &["config", &format!("branch.{branch}.pushRemote"), remote])?;
     let merge = format!("refs/heads/{branch}");
     run_git(repo, &["config", &format!("branch.{branch}.merge"), &merge]).map(|_| ())
+}
+
+/// The commit `branch` of `remote` points at, fetched now.
+pub fn fetch_branch_head(repo: &Path, remote: &str, branch: &str) -> Result<String> {
+    let fetched = fetch_branch(repo, remote, branch)?;
+    let output = run_git(repo, &["rev-parse", &fetched])?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn fetch_branch(repo: &Path, remote: &str, branch: &str) -> Result<String> {
@@ -1195,11 +1202,11 @@ mod tests {
         }
     }
 
-    fn posted(number: u32, comment_url: Option<&str>) -> PostedPullRequest {
+    fn posted(number: u32, comment_url: &str) -> PostedPullRequest {
         PostedPullRequest {
             number,
             url: format!("https://github.com/maui1911/CodeScope/pull/{number}"),
-            comment_url: comment_url.map(str::to_string),
+            comment_url: comment_url.into(),
             in_review: false,
         }
     }
@@ -1212,7 +1219,7 @@ mod tests {
             number: 420,
             title: "Keep the palette open".into(),
             url: "https://github.com/maui1911/CodeScope/pull/420".into(),
-            pull_request: Some(posted(420, None)),
+            pull_request: Some(posted(420, "")),
             ..dispatch(round, "2026-11-25T09:30:00Z")
         }
     }
@@ -1340,9 +1347,7 @@ mod tests {
         implemented.pull_request = Some(PostedPullRequest {
             number: 15,
             url: "https://github.com/maui1911/CodeScope/pull/15".into(),
-            comment_url: Some(
-                "https://github.com/maui1911/CodeScope/issues/411#issuecomment-2".into(),
-            ),
+            comment_url: "https://github.com/maui1911/CodeScope/issues/411#issuecomment-2".into(),
             in_review: true,
         });
         let own = |pull_request, linked| Facts {
@@ -1580,7 +1585,7 @@ mod tests {
     fn a_pull_request_item_was_opened_by_the_dispatch_that_reported_it_or_works_on_its_branch() {
         let item = pull_request_in("y");
         let mut reported = dispatch(Round::Review, MOVED);
-        reported.pull_request = Some(posted(420, Some("c")));
+        reported.pull_request = Some(posted(420, "c"));
         let other = WorktreeDispatch {
             item_id: "PVTI_3".into(),
             number: 412,
@@ -1598,6 +1603,15 @@ mod tests {
             ..reported.clone()
         };
         assert_eq!(opened_by(&item, None, [(None, &in_fork)]), None, "another repository");
+        let researching = WorktreeDispatch {
+            round: Round::Research,
+            ..other.clone()
+        };
+        assert_eq!(
+            opened_by(&item, Some(&same_branch), [(Some("412-other"), &researching)]),
+            None,
+            "research pushes nothing, so a branch of that name is someone else's"
+        );
         let as_item = pull_request_record(Round::Review);
         let its_branch = pr_head("keep-palette-open", false);
         assert_eq!(
@@ -1942,9 +1956,7 @@ mod tests {
         record.pull_request = Some(PostedPullRequest {
             number: 415,
             url: "https://github.com/maui1911/CodeScope/pull/415".into(),
-            comment_url: Some(
-                "https://github.com/maui1911/CodeScope/issues/411#issuecomment-2".into(),
-            ),
+            comment_url: "https://github.com/maui1911/CodeScope/issues/411#issuecomment-2".into(),
             in_review: true,
         });
         let json = serde_json::to_string(&record).unwrap();
@@ -1968,7 +1980,7 @@ mod tests {
         record.pull_request = Some(PostedPullRequest {
             number: 415,
             url: "https://github.com/maui1911/CodeScope/pull/415".into(),
-            comment_url: Some("c".into()),
+            comment_url: "c".into(),
             in_review: false,
         });
         let task = task_file(&record, None, None);
@@ -2210,6 +2222,7 @@ mod tests {
         let item = pull_request_record(Round::Review);
         let json = serde_json::to_string(&item).unwrap();
         assert!(json.contains(r#""kind":"pullRequest""#), "{json}");
+        assert!(json.contains(r#""commentUrl":"""#), "a build that requires it reads the row");
         assert_eq!(serde_json::from_str::<WorktreeDispatch>(&json).unwrap(), item);
     }
 
@@ -2424,9 +2437,17 @@ mod tests {
         assert_eq!(head(&path, "HEAD"), head(&upstream, "keep-palette-open"));
         let tracked = run_git(&path, &["rev-parse", "--abbrev-ref", "@{upstream}"]).unwrap();
         assert_eq!(String::from_utf8_lossy(&tracked.stdout).trim(), "origin/keep-palette-open");
+        let push = run_git(&repo, &["config", "branch.keep-palette-open.pushRemote"]).unwrap();
+        assert_eq!(String::from_utf8_lossy(&push.stdout).trim(), "origin", "over pushDefault");
 
         add_pull_request_worktree(&repo, &path, "keep-palette-open", "origin").unwrap();
         assert_eq!(head(&path, "HEAD"), head(&upstream, "keep-palette-open"), "kept");
+
+        git(&upstream, &["checkout", "-q", "keep-palette-open"]);
+        git(&upstream, &["commit", "--allow-empty", "-m", "pushed during the round", "-q"]);
+        git(&upstream, &["checkout", "-q", "main"]);
+        let fetched = fetch_branch_head(&repo, "origin", "keep-palette-open").unwrap();
+        assert_eq!(fetched, head(&upstream, "keep-palette-open"));
     }
 
     #[test]

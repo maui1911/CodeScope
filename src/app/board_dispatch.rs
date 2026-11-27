@@ -15,9 +15,9 @@ use codescope_core::board::dispatch::{
     FINDINGS_FILE, Facts, Hold, OwnPullRequest, PostedFindings, ProjectRemotes, REPLY_FILE,
     ReviewRound, Round, StatusChange, WorktreeDispatch, add_dispatch_worktree,
     add_pull_request_worktree, branch_name, clear_findings, clear_reply, counts_towards_limit,
-    decide, exclude_handover_files, find_skill, launch_with_task, mover_to_check,
-    moves_to_needs_decision, opened_by, projects_for_repository, task_file, task_message,
-    trigger_content_ids, write_task_file,
+    decide, exclude_handover_files, fetch_branch_head, find_skill, launch_with_task,
+    mover_to_check, moves_to_needs_decision, opened_by, projects_for_repository, task_file,
+    task_message, trigger_content_ids, write_task_file,
 };
 use codescope_core::board::answers::{
     Answer, Comment, after_findings, answer_body, answers_section, choices_text, chosen,
@@ -320,6 +320,7 @@ fn review_step(
 struct ReviewEnd {
     item_id: String,
     content_id: String,
+    kind: ItemKind,
     since: String,
     pr: PullRequest,
     start_head: Option<String>,
@@ -356,7 +357,7 @@ fn report_review_end(
     if let Some(body) = &end.reply {
         *reply_url = Some(post_once(&end.item_id, &end.pr.id, &end.since, body)?);
     }
-    let report = pull_request_comment(&end.pr, Round::Review);
+    let report = pull_request_comment(&end.pr, Round::Review, end.kind);
     post_once(&end.item_id, &end.content_id, &end.since, &report).map(Some)
 }
 
@@ -937,7 +938,15 @@ fn prepare_worktree(job: &mut Job) -> anyhow::Result<()> {
         Round::Research => clear_findings(&job.path)?,
         Round::Review => {
             clear_reply(&job.path)?;
-            refresh_start_head(job);
+            match job.record.kind {
+                ItemKind::PullRequest => {
+                    let head = fetch_branch_head(&job.repo, &job.remote, &job.branch)?;
+                    if let Some(review) = job.record.review.as_mut() {
+                        review.start_head = Some(head);
+                    }
+                }
+                ItemKind::Issue | ItemKind::Draft => refresh_start_head(job),
+            }
         }
         Round::Implementation => {}
     }
@@ -1403,7 +1412,7 @@ impl AppShell {
             ItemKind::PullRequest => Some(PostedPullRequest {
                 number,
                 url: url.clone(),
-                comment_url: None,
+                comment_url: String::new(),
                 in_review: false,
             }),
             ItemKind::Issue | ItemKind::Draft => carried_pull_request(round, posted, open),
@@ -2193,6 +2202,7 @@ impl AppShell {
         let end = ReviewEnd {
             item_id: record.item_id.clone(),
             content_id: record.content_id.clone(),
+            kind: record.kind,
             since: record.trigger_at.clone(),
             pr: pr.clone(),
             start_head: record.review.as_ref().and_then(|r| r.start_head.clone()),
@@ -2291,12 +2301,20 @@ impl AppShell {
     ) {
         let item_id = record.item_id.clone();
         let repository = record.repository.clone();
+        let kind = record.kind;
+        let content_id = record.content_id.clone();
         let started = Instant::now();
         cx.spawn(async move |this, cx| {
             let (branch, result) = cx
                 .background_spawn(async move {
-                    let found = github::fetch_pull_requests(&repository, &branch);
-                    (branch, found.map(round_pull_request))
+                    let found = match kind {
+                        ItemKind::PullRequest => github::fetch_pull_request(&content_id),
+                        ItemKind::Issue | ItemKind::Draft => {
+                            github::fetch_pull_requests(&repository, &branch)
+                                .map(round_pull_request)
+                        }
+                    };
+                    (branch, found)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -2328,7 +2346,7 @@ impl AppShell {
     ) {
         let item_id = record.item_id.clone();
         let content_id = record.content_id.clone();
-        let body = pull_request_comment(&pr, record.round);
+        let body = pull_request_comment(&pr, record.round, record.kind);
         if let Some(watch) = self.board.dispatch.watches.get_mut(&item_id) {
             watch.reporting = true;
             watch.report_error = None;
@@ -2368,7 +2386,7 @@ impl AppShell {
         let posted = PostedPullRequest {
             number: pr.number,
             url: pr.url.clone(),
-            comment_url: Some(comment_url),
+            comment_url,
             in_review: false,
         };
         self.keep_posted(item_id, posted, cx);
@@ -2393,11 +2411,17 @@ impl AppShell {
             }
         };
         let (kind, toast, title, detail) = if pr.is_draft {
+            let detail = match record.kind {
+                ItemKind::PullRequest => "It moves to In review once it is marked ready.",
+                ItemKind::Issue | ItemKind::Draft => {
+                    "Test it by hand, then mark it ready for review."
+                }
+            };
             (
                 NotificationKind::SessionWaiting,
                 ToastKind::Info,
                 format!("Draft {subject}"),
-                "Test it by hand, then mark it ready for review.".to_string(),
+                detail.to_string(),
             )
         } else {
             (
@@ -2632,8 +2656,10 @@ impl AppShell {
                     let posted = r.pull_request.as_ref().or(watch.reported.as_ref());
                     match r.round {
                         Round::Research => None,
-                        Round::Implementation => pull_request_note(watch, posted),
-                        Round::Review => review_note(watch, &review_round(&r, watch), posted),
+                        Round::Implementation => pull_request_note(watch, posted, r.kind),
+                        Round::Review => {
+                            review_note(watch, &review_round(&r, watch), posted, r.kind)
+                        }
                     }
                 });
                 (r.item_id, watched.unwrap_or(note))
@@ -2862,6 +2888,7 @@ fn review_note(
     watch: &PullRequestWatch,
     review: &ReviewRound,
     posted: Option<&PostedPullRequest>,
+    kind: ItemKind,
 ) -> Option<CardNote> {
     if watch.ending_review {
         return Some(CardNote::new("Reporting the review…", NoteTone::Working));
@@ -2876,7 +2903,7 @@ fn review_note(
     }
     let open = watch.pull_request.as_ref().is_some_and(|pr| pr.state == PullRequestState::Open);
     if review.report_url.is_some() || !open {
-        return pull_request_note(watch, posted);
+        return pull_request_note(watch, posted, kind);
     }
     if let Some(by) = watch.review_held {
         return Some(held_note("Review answered", "report it", by));
@@ -2894,6 +2921,7 @@ fn review_note(
 fn pull_request_note(
     watch: &PullRequestWatch,
     posted: Option<&PostedPullRequest>,
+    kind: ItemKind,
 ) -> Option<CardNote> {
     if watch.reporting {
         return Some(CardNote::new("Reporting the pull request…", NoteTone::Working));
@@ -2924,6 +2952,11 @@ fn pull_request_note(
             format!("Marking PR #{number} ready for review…"),
             NoteTone::Working,
         ),
+        (PullRequestState::Open, true) if kind == ItemKind::PullRequest => CardNote {
+            text: format!("Draft PR #{number} · moves to In review once marked ready").into(),
+            tone: NoteTone::Waiting,
+            action: Some(CardAction::ReadyForReview),
+        },
         (PullRequestState::Open, true) => CardNote {
             text: format!("Draft PR #{number} · test by hand").into(),
             tone: NoteTone::NeedsYou,
@@ -3211,7 +3244,7 @@ mod tests {
         PostedPullRequest {
             number,
             url: "u".into(),
-            comment_url: Some("c".into()),
+            comment_url: "c".into(),
             in_review: false,
         }
     }
@@ -3241,9 +3274,22 @@ mod tests {
             read_ok_at: Some(Instant::now()),
             ..PullRequestWatch::default()
         };
-        let note = pull_request_note(&watch, Some(&posted(415))).unwrap();
+        let note = pull_request_note(&watch, Some(&posted(415)), ItemKind::Issue).unwrap();
         assert_eq!(note.text.as_ref(), "Draft PR #415 · test by hand");
         assert!(note.tone == NoteTone::NeedsYou);
+        assert!(note.action == Some(CardAction::ReadyForReview));
+    }
+
+    #[test]
+    fn a_draft_pull_request_item_waits_to_be_marked_ready() {
+        let watch = PullRequestWatch {
+            pull_request: Some(open_pull_request(420, true, Checks::Running)),
+            read_ok_at: Some(Instant::now()),
+            ..PullRequestWatch::default()
+        };
+        let note = pull_request_note(&watch, Some(&posted(420)), ItemKind::PullRequest).unwrap();
+        assert_eq!(note.text.as_ref(), "Draft PR #420 · moves to In review once marked ready");
+        assert!(note.tone == NoteTone::Waiting);
         assert!(note.action == Some(CardAction::ReadyForReview));
     }
 
@@ -3254,11 +3300,11 @@ mod tests {
             read_ok_at: Some(Instant::now()),
             ..PullRequestWatch::default()
         };
-        let note = pull_request_note(&watch, Some(&posted(415))).unwrap();
+        let note = pull_request_note(&watch, Some(&posted(415)), ItemKind::Issue).unwrap();
         assert_eq!(note.text.as_ref(), "PR #415 · checks passing");
         assert!(note.tone == NoteTone::Waiting && note.action.is_none());
         watch.pull_request = Some(open_pull_request(415, false, Checks::Failing));
-        let note = pull_request_note(&watch, Some(&posted(415))).unwrap();
+        let note = pull_request_note(&watch, Some(&posted(415)), ItemKind::Issue).unwrap();
         assert_eq!(note.text.as_ref(), "PR #415 · checks failing");
         assert!(note.tone == NoteTone::Failed);
     }
@@ -3276,7 +3322,7 @@ mod tests {
         assert!(!watch.waits_for_you(), "no read since it stopped");
         watch.read_ok_at = Some(stopped + Duration::from_millis(1));
         assert!(watch.waits_for_you());
-        let note = pull_request_note(&watch, None).unwrap();
+        let note = pull_request_note(&watch, None, ItemKind::Issue).unwrap();
         assert_eq!(note.text.as_ref(), "Waiting for you in the tab");
         assert!(note.tone == NoteTone::NeedsYou);
         watch.track(None);
@@ -3374,7 +3420,7 @@ mod tests {
         let newer = open_pull_request(12, false, Checks::Passing);
         let review = carried_pull_request(Round::Review, reported(), Some(&newer)).unwrap();
         assert_eq!((review.number, review.url.as_str()), (12, newer.url.as_str()));
-        assert_eq!(review.comment_url.as_deref(), Some("c"));
+        assert_eq!(review.comment_url, "c");
         assert_eq!(carried_pull_request(Round::Review, None, Some(&open)), None);
     }
 
@@ -3500,9 +3546,10 @@ mod tests {
             ..PullRequestWatch::default()
         };
         let review = review_from("c415");
-        assert!(review_note(&watch, &review, None).is_none(), "the round's own line");
+        let own_line = review_note(&watch, &review, None, ItemKind::Issue);
+        assert!(own_line.is_none(), "the round's own line");
         watch.review_held = Some(HeldBy::Program);
-        let note = review_note(&watch, &review, None).unwrap();
+        let note = review_note(&watch, &review, None, ItemKind::Issue).unwrap();
         assert_eq!(
             note.text.as_ref(),
             "Review answered · to report it, quit what runs in its worktree's tab, or close the tab"
@@ -3511,7 +3558,7 @@ mod tests {
         let stop = Instant::now();
         watch.idle_since = Some(stop);
         watch.stop_without_result = Some(stop);
-        let note = review_note(&watch, &review, None).unwrap();
+        let note = review_note(&watch, &review, None, ItemKind::Issue).unwrap();
         assert_eq!(
             note.text.as_ref(),
             "Review stopped without a push or a reply · waiting for you in the tab"
@@ -3521,11 +3568,11 @@ mod tests {
             problems: "a code block is not closed".into(),
             ..Reminder::default()
         });
-        let note = review_note(&watch, &review, None).unwrap();
+        let note = review_note(&watch, &review, None, ItemKind::Issue).unwrap();
         assert_eq!(note.text.as_ref(), "Reply incomplete: a code block is not closed");
         assert!(note.tone == NoteTone::Failed);
         watch.ending_review = true;
-        let note = review_note(&watch, &review, None).unwrap();
+        let note = review_note(&watch, &review, None, ItemKind::Issue).unwrap();
         assert_eq!(note.text.as_ref(), "Reporting the review…");
         watch.ending_review = false;
         watch.reply_reminder = None;
@@ -3533,7 +3580,7 @@ mod tests {
             report_url: Some("c".into()),
             ..review
         };
-        let note = review_note(&watch, &reported, Some(&posted(415))).unwrap();
+        let note = review_note(&watch, &reported, Some(&posted(415)), ItemKind::Issue).unwrap();
         assert_eq!(note.text.as_ref(), "PR #415 · checks passing");
     }
 

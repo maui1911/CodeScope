@@ -3,8 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::ColumnRole;
 use super::dispatch::Round;
+use super::{ColumnRole, ItemKind};
 use crate::time::parse_iso8601_secs;
 
 const MARKER: &str =
@@ -93,31 +93,33 @@ pub struct PullRequestHead {
 pub struct PostedPullRequest {
     pub number: u32,
     pub url: String,
-    /// The comment that reported it on the issue; `None` when the item is the pull request.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment_url: Option<String>,
+    /// The comment that reported it on the issue; empty when the item is the pull request.
+    pub comment_url: String,
     /// Set once CodeScope moved the item to In review, or found it there; it never moves it
     /// again.
     #[serde(default)]
     pub in_review: bool,
 }
 
-/// The comment that reports a pull request on its issue after `round`: what is open or was
-/// updated, a `**Next step:**` line and the marker.
-pub fn pull_request_comment(pr: &PullRequest, round: Round) -> String {
+/// The comment that reports a pull request after `round` on the item of `kind`: what is open or
+/// was updated, a `**Next step:**` line and the marker. Only a dispatch's draft is tested by hand.
+pub fn pull_request_comment(pr: &PullRequest, round: Round, kind: ItemKind) -> String {
     let (state, again) = match round {
         Round::Review => ("is updated for the review", " again"),
         Round::Research | Round::Implementation => ("is open", ""),
     };
     let number = pr.number;
-    let (opened, next_step) = if pr.is_draft {
-        (
+    let (opened, next_step) = match (pr.is_draft, kind) {
+        (true, ItemKind::PullRequest) => (
+            format!("Draft pull request #{number} {state}."),
+            format!("review it{again}, and mark it ready for review once it is."),
+        ),
+        (true, ItemKind::Issue | ItemKind::Draft) => (
             format!("Draft pull request #{number} {state}: part of it needs testing by hand."),
             "test it as its *Test by hand* section says, then mark it ready for review."
                 .to_string(),
-        )
-    } else {
-        (format!("Pull request #{number} {state}."), format!("review it{again}."))
+        ),
+        (false, _) => (format!("Pull request #{number} {state}."), format!("review it{again}.")),
     };
     format!("{opened}\n\n**Next step:** {next_step}\n{MARKER}\n")
 }
@@ -175,19 +177,35 @@ mod tests {
     fn after_a_review_round_the_comment_says_the_pull_request_was_updated() {
         let ready = pull_request(415, PullRequestState::Open, false);
         assert_eq!(
-            pull_request_comment(&ready, Round::Review),
+            pull_request_comment(&ready, Round::Review, ItemKind::Issue),
             "Pull request #415 is updated for the review.\n\n\
              **Next step:** review it again.\n\
              <!-- dispatch v=1 phase=implementation outcome=pull-request by=codescope -->\n"
         );
         let draft = pull_request(415, PullRequestState::Open, true);
         assert_eq!(
-            pull_request_comment(&draft, Round::Review),
+            pull_request_comment(&draft, Round::Review, ItemKind::Issue),
             "Draft pull request #415 is updated for the review: part of it needs testing by \
              hand.\n\n\
              **Next step:** test it as its *Test by hand* section says, then mark it ready for \
              review.\n\
              <!-- dispatch v=1 phase=implementation outcome=pull-request by=codescope -->\n"
+        );
+    }
+
+    #[test]
+    fn a_draft_pull_request_item_is_not_said_to_need_testing_by_hand() {
+        let draft = pull_request(420, PullRequestState::Open, true);
+        assert_eq!(
+            pull_request_comment(&draft, Round::Review, ItemKind::PullRequest),
+            "Draft pull request #420 is updated for the review.\n\n\
+             **Next step:** review it again, and mark it ready for review once it is.\n\
+             <!-- dispatch v=1 phase=implementation outcome=pull-request by=codescope -->\n"
+        );
+        let ready = pull_request(420, PullRequestState::Open, false);
+        assert_eq!(
+            pull_request_comment(&ready, Round::Review, ItemKind::PullRequest),
+            pull_request_comment(&ready, Round::Review, ItemKind::Issue)
         );
     }
 
@@ -219,14 +237,14 @@ mod tests {
     fn the_comment_says_what_is_open_and_what_comes_next() {
         let ready = pull_request(415, PullRequestState::Open, false);
         assert_eq!(
-            pull_request_comment(&ready, Round::Implementation),
+            pull_request_comment(&ready, Round::Implementation, ItemKind::Issue),
             "Pull request #415 is open.\n\n\
              **Next step:** review it.\n\
              <!-- dispatch v=1 phase=implementation outcome=pull-request by=codescope -->\n"
         );
         let draft = pull_request(415, PullRequestState::Open, true);
         assert_eq!(
-            pull_request_comment(&draft, Round::Implementation),
+            pull_request_comment(&draft, Round::Implementation, ItemKind::Issue),
             "Draft pull request #415 is open: part of it needs testing by hand.\n\n\
              **Next step:** test it as its *Test by hand* section says, then mark it ready for \
              review.\n\
@@ -251,19 +269,5 @@ mod tests {
         let json = r#"{"number":415,"url":"u","commentUrl":"c"}"#;
         let posted: PostedPullRequest = serde_json::from_str(json).unwrap();
         assert!(!posted.in_review);
-        assert_eq!(posted.comment_url.as_deref(), Some("c"));
-    }
-
-    #[test]
-    fn the_pull_request_that_is_the_item_has_no_report_comment() {
-        let item = PostedPullRequest {
-            number: 420,
-            url: "https://github.com/maui1911/CodeScope/pull/420".into(),
-            comment_url: None,
-            in_review: false,
-        };
-        let json = serde_json::to_string(&item).unwrap();
-        assert!(!json.contains("commentUrl"), "{json}");
-        assert_eq!(serde_json::from_str::<PostedPullRequest>(&json).unwrap(), item);
     }
 }
