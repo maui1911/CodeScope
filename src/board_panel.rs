@@ -3,7 +3,7 @@
 //! share; opening one closes the others. Boards are read every 30 s whether or not the panel is
 //! on stage.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,7 @@ use crate::dialogs::confirm::ConfirmSpec;
 use crate::theme;
 
 const BOARD_READ_INTERVAL: Duration = Duration::from_secs(30);
+const MOVE_BACK_SHOWN_WITHIN: Duration = Duration::from_secs(60);
 const READ_AGE_REFRESH: Duration = Duration::from_secs(5);
 const DONE_PREVIEW: usize = 5;
 /// GitHub's colour for a merged pull request or a completed issue.
@@ -41,14 +42,23 @@ pub(crate) struct BoardPanelState {
     pub show_all_done: bool,
     /// The item whose drawer is open, on the selected board.
     pub drawer: Option<String>,
-    /// Items CodeScope is moving back to Todo for the user.
-    pub moving_back: HashSet<String>,
-    /// Item → the Todo column CodeScope moved it to for the user, and when, until a read that
-    /// began after that shows where it is.
-    pub moved_back: HashMap<String, (String, Instant)>,
+    /// Items CodeScope moved back to Todo for the user, until a read shows the move.
+    pub moved_back: HashMap<String, MoveBack>,
     pub reading: bool,
     pub last_read: Option<Instant>,
     pub dispatch: DispatchState,
+}
+
+/// A move back to Todo the panel already shows, before a board read does.
+pub(crate) struct MoveBack {
+    /// The Todo column's option id.
+    pub column: String,
+    /// The item's column and when it was set there, as the panel had them before the move.
+    pub from: (Option<String>, Option<String>),
+    /// When the user moved it, and once GitHub took the move, when it did.
+    pub at: Instant,
+    /// Set until GitHub answers the move.
+    pub pending: bool,
 }
 
 #[derive(Default)]
@@ -75,20 +85,22 @@ fn read_age(read_at: Option<Instant>) -> SharedString {
     }
 }
 
-/// Puts an item CodeScope moved back to Todo after this read `began` in Todo, as a read that
-/// began earlier can't have seen that move, and forgets the moves a later read shows.
-fn keep_moves_back(
-    board: &mut Board,
-    moved_back: &mut HashMap<String, (String, Instant)>,
-    began: Option<Instant>,
-) {
-    moved_back.retain(|item_id, (column, at)| {
-        if began.is_none_or(|began| began >= *at) {
+/// Keeps an item CodeScope moved back to Todo in Todo while the read still has it where it was
+/// before the move, as a read can be older than the move. A read that shows the move, or a later
+/// one, is taken as it is, and so is the item's old place once the move has had
+/// [`MOVE_BACK_SHOWN_WITHIN`] to show.
+fn keep_moves_back(board: &mut Board, moved_back: &mut HashMap<String, MoveBack>, now: Instant) {
+    moved_back.retain(|item_id, back| {
+        let waiting =
+            back.pending || now.saturating_duration_since(back.at) < MOVE_BACK_SHOWN_WITHIN;
+        let Some(item) = board.items.iter_mut().find(|item| item.id == *item_id) else {
+            return waiting;
+        };
+        let as_before = (&item.column_id, &item.column_set_at) == (&back.from.0, &back.from.1);
+        if !(as_before && waiting) {
             return false;
         }
-        if let Some(item) = board.items.iter_mut().find(|item| item.id == *item_id) {
-            item.column_id = Some(column.clone());
-        }
+        item.column_id = Some(back.column.clone());
         true
     });
 }
@@ -231,12 +243,11 @@ impl AppShell {
         self.accept_dispatch_read(&mut output);
         let state = &mut self.board;
         state.reading = false;
-        let began = state.last_read;
         for fetch in output.boards {
             let read = state.reads_by_url.entry(fetch.url).or_default();
             match fetch.board {
                 Ok(mut board) => {
-                    keep_moves_back(&mut board, &mut state.moved_back, began);
+                    keep_moves_back(&mut board, &mut state.moved_back, Instant::now());
                     read.last_good = Some(board);
                     read.error = None;
                     read.read_at = Some(Instant::now());
@@ -1116,7 +1127,7 @@ fn render_missing_roles(theme: &Arc<Theme>, missing: &[ColumnRole]) -> impl Into
 mod tests {
     use super::*;
 
-    fn board_with_item_in(column: &str) -> Board {
+    fn board_with_item_in(column: &str, set_at: &str) -> Board {
         let item = BoardItem {
             id: "PVTI_1".into(),
             kind: ItemKind::Issue,
@@ -1128,7 +1139,7 @@ mod tests {
             assignees: Vec::new(),
             state: ItemState::Open,
             column_id: Some(column.into()),
-            column_set_at: None,
+            column_set_at: Some(set_at.into()),
             updated_at: String::new(),
         };
         Board {
@@ -1143,19 +1154,69 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_read_from_before_a_move_back_keeps_the_item_in_todo_and_a_later_one_shows_it_as_is() {
-        let moved_at = Instant::now();
-        let todo = ("todo".to_string(), moved_at);
-        let mut moved_back = HashMap::from([("PVTI_1".to_string(), todo)]);
-        let mut early = board_with_item_in("in-progress");
-        keep_moves_back(&mut early, &mut moved_back, Some(moved_at - Duration::from_secs(5)));
-        assert_eq!(early.items[0].column_id.as_deref(), Some("todo"));
-        assert!(moved_back.contains_key("PVTI_1"));
+    const BEFORE: &str = "2026-11-27T10:00:00Z";
 
-        let mut later = board_with_item_in("ready");
-        keep_moves_back(&mut later, &mut moved_back, Some(moved_at + Duration::from_secs(5)));
-        assert_eq!(later.items[0].column_id.as_deref(), Some("ready"));
-        assert!(moved_back.is_empty());
+    fn moved_back(at: Instant, pending: bool) -> HashMap<String, MoveBack> {
+        let back = MoveBack {
+            column: "todo".into(),
+            from: (Some("in-progress".into()), Some(BEFORE.into())),
+            at,
+            pending,
+        };
+        HashMap::from([("PVTI_1".to_string(), back)])
+    }
+
+    fn column(board: &Board) -> &str {
+        board.items[0].column_id.as_deref().unwrap()
+    }
+
+    #[test]
+    fn a_read_that_still_has_the_item_where_it_was_keeps_it_in_todo() {
+        let now = Instant::now();
+        for pending in [true, false] {
+            let mut moves = moved_back(now, pending);
+            let mut stale = board_with_item_in("in-progress", BEFORE);
+            keep_moves_back(&mut stale, &mut moves, now + Duration::from_secs(5));
+            assert_eq!(column(&stale), "todo");
+            assert!(moves.contains_key("PVTI_1"));
+        }
+        let mut moves = moved_back(now, false);
+        let mut other_board = board_with_item_in("in-progress", BEFORE);
+        other_board.items[0].id = "PVTI_2".into();
+        keep_moves_back(&mut other_board, &mut moves, now);
+        assert_eq!(column(&other_board), "in-progress");
+        assert!(moves.contains_key("PVTI_1"), "its item is on another board");
+    }
+
+    #[test]
+    fn a_read_that_shows_the_move_or_a_later_one_is_taken_as_it_is() {
+        let now = Instant::now();
+        let mut moves = moved_back(now, false);
+        let mut shown = board_with_item_in("todo", "2026-11-27T10:06:00Z");
+        keep_moves_back(&mut shown, &mut moves, now);
+        assert_eq!(column(&shown), "todo");
+        assert!(moves.is_empty());
+
+        let mut moves = moved_back(now, true);
+        let mut later = board_with_item_in("ready", "2026-11-27T10:07:00Z");
+        keep_moves_back(&mut later, &mut moves, now);
+        assert_eq!(column(&later), "ready", "a teammate moved it on since");
+        assert!(moves.is_empty());
+    }
+
+    #[test]
+    fn a_move_that_never_shows_lets_the_read_stand_once_github_has_answered() {
+        let long_ago = Instant::now();
+        let later = long_ago + MOVE_BACK_SHOWN_WITHIN + Duration::from_secs(1);
+        let mut moves = moved_back(long_ago, true);
+        let mut stale = board_with_item_in("in-progress", BEFORE);
+        keep_moves_back(&mut stale, &mut moves, later);
+        assert_eq!(column(&stale), "todo", "GitHub hasn't answered yet");
+
+        let mut moves = moved_back(long_ago, false);
+        let mut stale = board_with_item_in("in-progress", BEFORE);
+        keep_moves_back(&mut stale, &mut moves, later);
+        assert_eq!(column(&stale), "in-progress");
+        assert!(moves.is_empty());
     }
 }

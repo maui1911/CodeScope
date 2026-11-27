@@ -9,11 +9,12 @@ use codescope_core::board::dispatch::Round;
 use codescope_core::board::github;
 use codescope_core::board::pull_request::{Checks, PullRequest, PullRequestState};
 use codescope_core::board::repair::{FaultKind, REPAIR_ATTEMPTS, Repair};
-use codescope_core::board::{ColumnRole, ItemKind, ItemState, RoleKind};
+use codescope_core::board::{BoardItem, ColumnRole, ItemKind, ItemState, RoleKind};
 use codescope_core::SessionState;
 use gpui::{App, AppContext as _, Context, SharedString};
 
 use super::{AppShell, CardAction, CardNote, NoteTone, ToastKind};
+use crate::board_panel::{BoardRead, MoveBack};
 
 /// One board item, as the drawer shows it.
 pub(crate) struct ItemDrawer {
@@ -176,7 +177,8 @@ impl AppShell {
             .filter(|_| needs.is_none())
             .map(|note| (note.text.clone(), note.tone));
         let open = item.state == ItemState::Open;
-        let back_to_todo = (open && can_move_back(role))
+        let moving = self.board.moved_back.get(item_id).is_some_and(|back| back.pending);
+        let back_to_todo = (open && (moving || can_move_back(role)))
             .then(|| self.column_target(board_url, ColumnRole::Todo))
             .flatten()
             .map(|_| BackToTodo {
@@ -185,7 +187,7 @@ impl AppShell {
                 } else {
                     "Nothing starts from it until it is moved again."
                 },
-                moving: self.board.moving_back.contains(item_id),
+                moving,
             });
 
         Some(ItemDrawer {
@@ -214,7 +216,7 @@ impl AppShell {
 
 impl AppShell {
     /// Move `item_id` back to Todo for the user. It is their own move, so CodeScope's moves for
-    /// the round end there.
+    /// the round end there; the panel shows it in Todo at once, and CodeScope acts on that.
     pub(crate) fn move_back_to_todo(
         &mut self,
         board_url: &str,
@@ -224,9 +226,20 @@ impl AppShell {
         let Some((board, column)) = self.column_target(board_url, ColumnRole::Todo) else {
             return;
         };
-        if !self.board.moving_back.insert(item_id.to_string()) {
+        if self.board.moved_back.get(item_id).is_some_and(|back| back.pending) {
             return;
         }
+        let Some(item) = read_item_mut(&mut self.board.reads_by_url, board_url, item_id) else {
+            return;
+        };
+        let from = (item.column_id.replace(column.clone()), item.column_set_at.clone());
+        let back = MoveBack {
+            column: column.clone(),
+            from,
+            at: Instant::now(),
+            pending: true,
+        };
+        self.board.moved_back.insert(item_id.to_string(), back);
         cx.notify();
         let (board_url, item_id) = (board_url.to_string(), item_id.to_string());
         cx.spawn(async move |this, cx| {
@@ -237,7 +250,7 @@ impl AppShell {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.finish_move_back(&board_url, &item_id, column, result, cx);
+                this.finish_move_back(&board_url, &item_id, result, cx);
             });
         })
         .detach();
@@ -247,18 +260,19 @@ impl AppShell {
         &mut self,
         board_url: &str,
         item_id: &str,
-        column: String,
         result: Result<(), String>,
         cx: &mut Context<Self>,
     ) {
-        self.board.moving_back.remove(item_id);
         cx.notify();
-        let read = self.board.reads_by_url.get_mut(board_url);
-        let item = read
-            .and_then(|read| read.last_good.as_mut())
-            .and_then(|board| board.items.iter_mut().find(|item| item.id == item_id));
+        let item = read_item_mut(&mut self.board.reads_by_url, board_url, item_id);
         if let Err(message) = result {
-            let number = item.and_then(|item| item.number);
+            let back = self.board.moved_back.remove(item_id);
+            let number = item.as_ref().and_then(|item| item.number);
+            if let (Some(item), Some(back)) = (item, back)
+                && item.column_id.as_ref() == Some(&back.column)
+            {
+                item.column_id = back.from.0;
+            }
             let title = number.map_or_else(
                 || "Couldn't move it back to Todo".to_string(),
                 |n| format!("Couldn't move #{n} back to Todo"),
@@ -266,13 +280,25 @@ impl AppShell {
             self.push_toast(ToastKind::Err, title, Some(message.into()), cx);
             return;
         }
-        if let Some(item) = item {
-            item.column_id = Some(column.clone());
-            item.column_set_at = Some(codescope_core::time::now_iso8601());
+        if let Some(back) = self.board.moved_back.get_mut(item_id) {
+            back.pending = false;
+            back.at = Instant::now();
+            if let Some(item) = item {
+                item.column_id = Some(back.column.clone());
+                item.column_set_at = Some(codescope_core::time::now_iso8601());
+            }
         }
-        self.board.moved_back.insert(item_id.to_string(), (column, Instant::now()));
         self.refresh_boards(cx);
     }
+}
+
+fn read_item_mut<'a>(
+    reads: &'a mut HashMap<String, BoardRead>,
+    board_url: &str,
+    item_id: &str,
+) -> Option<&'a mut BoardItem> {
+    let board = reads.get_mut(board_url)?.last_good.as_mut()?;
+    board.items.iter_mut().find(|item| item.id == item_id)
 }
 
 fn now() -> f64 {
