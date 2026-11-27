@@ -845,6 +845,9 @@ fn handover_rules(round: Round, number: u32, repository: &str, pr_number: &str) 
             "When you need an answer before you can go on, ask it here and stop.".to_string(),
         ],
         Round::Review => vec![
+            "Before you change anything, pull the pull request's branch: someone may have \
+             pushed to it since, such as a reviewer committing a suggestion."
+                .to_string(),
             "Push the fixes to the pull request's branch; don't open another pull request."
                 .to_string(),
             format!(
@@ -2171,6 +2174,7 @@ mod tests {
 
         let review = task_file(&dispatch(Round::Review, MOVED), None, None);
         assert!(review.contains("Handle the review"), "{review}");
+        assert!(review.contains("pull the pull request's branch"), "{review}");
     }
 
     #[test]
@@ -2193,6 +2197,7 @@ mod tests {
         assert!(!review.contains("Issue: "), "{review}");
         assert!(!review.contains("gh issue view"), "{review}");
         assert!(review.contains("Handle the review of the pull request above"));
+        assert!(review.contains("pull the pull request's branch"));
         assert!(review.contains("repos/maui1911/CodeScope/pulls/420/comments/<id>/replies"));
     }
 
