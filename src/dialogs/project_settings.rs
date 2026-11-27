@@ -572,8 +572,9 @@ impl AppShell {
             .child(heading("REVIEWERS"))
             .child(input_box(Input::Reviewers))
             .child(hint(
-                "GitHub logins, or teams as org/team. When CodeScope moves an item on to In \
-                 review, they are asked to review the pull request its dispatch opened."
+                "GitHub logins, or the repository's teams as org/team. When CodeScope moves an \
+                 item on to In review, they are asked to review the pull request its dispatch \
+                 opened."
                     .to_string(),
             ));
 

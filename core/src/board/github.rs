@@ -486,7 +486,7 @@ const PULL_REQUESTS_QUERY: &str = r#"query($owner: String!, $name: String!, $bra
     pullRequests(headRefName: $branch, states: [OPEN, MERGED], first: 5,
       orderBy: { field: CREATED_AT, direction: DESC }) {
       nodes {
-        id number url state isDraft isCrossRepository headRefOid
+        id number url state isDraft isCrossRepository headRefOid author { login }
         baseRefName mergeable mergeStateStatus
         reviews(states: [APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED]) { totalCount }
         comments(last: 50) { ...conversation }
@@ -573,6 +573,7 @@ fn into_pull_request(node: PullRequestNode) -> Option<PullRequest> {
         id: node.id,
         number: node.number,
         url: node.url,
+        author: node.author.map(|author| author.login),
         state,
         is_draft: node.is_draft,
         checks,
@@ -599,7 +600,7 @@ fn conversation(comments: PullRequestComments) -> Vec<PullRequestComment> {
 const PULL_REQUEST_QUERY: &str = r#"query($id: ID!) {
   node(id: $id) {
     ... on PullRequest {
-      id number url state isDraft isCrossRepository headRefOid
+      id number url state isDraft isCrossRepository headRefOid author { login }
       baseRefName mergeable mergeStateStatus
       reviews(states: [APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED]) { totalCount }
       comments(last: 50) { ...conversation }
@@ -1110,6 +1111,8 @@ struct PullRequestNode {
     is_draft: bool,
     is_cross_repository: bool,
     head_ref_oid: String,
+    #[serde(default)]
+    author: Option<Login>,
     commits: CommitList,
     #[serde(default)]
     base_ref_name: Option<String>,
@@ -1805,6 +1808,7 @@ mod tests {
         let json = r#"{"data":{"repository":{"pullRequests":{"nodes":[
           {"id":"PR_3","number":417,"url":"https://github.com/maui1911/CodeScope/pull/417",
            "state":"OPEN","isDraft":true,"isCrossRepository":false,"headRefOid":"c417",
+           "author":{"login":"maui1911"},
            "commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"PENDING"}}}]}},
           {"id":"PR_2","number":416,"url":"https://github.com/maui1911/CodeScope/pull/416",
            "state":"OPEN","isDraft":false,"isCrossRepository":true,"headRefOid":"c416",
@@ -1821,6 +1825,7 @@ mod tests {
                     id: "PR_3".into(),
                     number: 417,
                     url: "https://github.com/maui1911/CodeScope/pull/417".into(),
+                    author: Some("maui1911".into()),
                     state: PullRequestState::Open,
                     is_draft: true,
                     checks: Checks::Running,
@@ -1832,6 +1837,7 @@ mod tests {
                     id: "PR_1".into(),
                     number: 415,
                     url: "https://github.com/maui1911/CodeScope/pull/415".into(),
+                    author: None,
                     state: PullRequestState::Merged,
                     is_draft: false,
                     checks: Checks::None,
@@ -1863,6 +1869,7 @@ mod tests {
                 id: "PR_420".into(),
                 number: 420,
                 url: "https://github.com/maui1911/CodeScope/pull/420".into(),
+                author: None,
                 state: PullRequestState::Open,
                 is_draft: true,
                 checks: Checks::Passing,

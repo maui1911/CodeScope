@@ -61,7 +61,7 @@ impl PhaseAgents {
 pub struct ReviewRequest {
     /// GitHub logins.
     pub users: Vec<String>,
-    /// Teams as `org/team`; GitHub asks only those of the organisation that owns the repository.
+    /// Teams as `org/team`, of the organisation that owns the repository.
     pub teams: Vec<String>,
 }
 
@@ -137,17 +137,18 @@ impl DispatchSettings {
         set.as_deref().filter(|id| !id.is_empty())
     }
 
-    /// Whom a pull request by `author` asks for a review: the reviewers set, once each, without
-    /// the author, whom GitHub refuses to ask, and without a name [`is_reviewer`] refuses.
-    pub fn review_request(&self, author: &str) -> ReviewRequest {
+    /// Whom a pull request of `repository` (`owner/name`) by `author` asks for a review: the
+    /// reviewers set, once each, without the author, whom GitHub refuses to ask, and without a
+    /// team of another organisation, which GitHub takes for the owner's team of that name.
+    pub fn review_request(&self, repository: &str, author: &str) -> ReviewRequest {
+        let owner = repository.split_once('/').map_or(repository, |(owner, _)| owner);
         let mut request = ReviewRequest::default();
         for name in self.reviewers.iter().filter(|name| is_reviewer(name)) {
-            let list = if name.contains('/') {
-                &mut request.teams
-            } else if name.eq_ignore_ascii_case(author) {
-                continue;
-            } else {
-                &mut request.users
+            let list = match name.split_once('/') {
+                Some((org, _)) if org.eq_ignore_ascii_case(owner) => &mut request.teams,
+                Some(_) => continue,
+                None if name.eq_ignore_ascii_case(author) => continue,
+                None => &mut request.users,
             };
             if !list.iter().any(|known| known.eq_ignore_ascii_case(name)) {
                 list.push(name.to_string());
@@ -179,7 +180,8 @@ pub fn is_skill_name(name: &str) -> bool {
     name.len() <= 64 && name.split('-').all(plain)
 }
 
-/// Whether `name` is a GitHub login, or a team as `org/team`.
+/// Whether `name` is a GitHub login, such as `ana`, or `ana_acme` for an Enterprise Managed
+/// User, or a team as `org/team`.
 pub fn is_reviewer(name: &str) -> bool {
     match name.split_once('/') {
         Some((org, team)) => is_login(org) && is_team_slug(team),
@@ -188,7 +190,7 @@ pub fn is_reviewer(name: &str) -> bool {
 }
 
 fn is_login(name: &str) -> bool {
-    let plain = name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    let plain = name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
     plain && !name.is_empty() && name.len() <= 39 && !name.starts_with('-')
 }
 
@@ -337,6 +339,7 @@ mod tests {
             assert!(!is_reviewer(bad), "{bad}");
         }
         assert!(!is_reviewer(&"x".repeat(40)));
+        assert!(is_reviewer("ana_acme"), "an Enterprise Managed User");
     }
 
     #[test]
@@ -355,16 +358,30 @@ mod tests {
                 .to_vec(),
             ..DispatchSettings::default()
         };
-        let request = settings.review_request("maui1911");
+        let request = settings.review_request("Acme/app", "maui1911");
         assert_eq!(request.users, ["ana", "bob"]);
         assert_eq!(request.teams, ["acme/web"]);
         assert_eq!(request.names(), "ana, bob and acme/web");
         assert!(!request.is_empty());
-        assert!(DispatchSettings::default().review_request("maui1911").is_empty());
+        let unset = DispatchSettings::default();
+        assert!(unset.review_request("acme/app", "maui1911").is_empty());
         let only_author = DispatchSettings {
             reviewers: vec!["maui1911".into()],
             ..DispatchSettings::default()
         };
-        assert!(only_author.review_request("maui1911").is_empty());
+        assert!(only_author.review_request("acme/app", "maui1911").is_empty());
+    }
+
+    #[test]
+    fn a_team_of_another_organisation_is_left_out_of_the_request() {
+        let settings = DispatchSettings {
+            reviewers: vec!["ana".into(), "platform/web".into(), "acme/web".into()],
+            ..DispatchSettings::default()
+        };
+        let request = settings.review_request("acme/app", "maui1911");
+        assert_eq!(request.users, ["ana"]);
+        assert_eq!(request.teams, ["acme/web"]);
+        let on_a_user_s_repository = settings.review_request("maui1911/CodeScope", "maui1911");
+        assert!(on_a_user_s_repository.teams.is_empty());
     }
 }

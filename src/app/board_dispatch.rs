@@ -2907,15 +2907,17 @@ impl AppShell {
             return;
         }
         watch.move_error = None;
+        let moved = watch.pull_request.clone().filter(|pr| pr.state == PullRequestState::Open);
         let reported = watch.reported.clone();
         let posted = self
             .dispatch_record(item_id, cx)
             .and_then(|(_, _, _, record)| record.pull_request)
             .or(reported);
         if let Some(posted) = posted {
-            let number = posted.number;
             self.keep_posted(item_id, PostedPullRequest { in_review: true, ..posted }, cx);
-            self.ask_reviewers(item_id, number, cx);
+        }
+        if let Some(pr) = moved {
+            self.ask_reviewers(item_id, &pr, cx);
         }
         self.refresh_boards(cx);
         cx.notify();
@@ -2923,26 +2925,27 @@ impl AppShell {
 
     fn review_request(
         &self,
-        project_id: &str,
-        record: &WorktreeDispatch,
+        (project_id, record): (&str, &WorktreeDispatch),
+        pr: &PullRequest,
         cx: &App,
     ) -> Option<ReviewRequest> {
         if record.kind == ItemKind::PullRequest {
             return None;
         }
-        let author = self.board.dispatch.viewer.as_ref().map_or("", |v| v.login.as_str());
         let project = self.current_projects(cx).project(project_id)?;
-        Some(project.dispatch.review_request(author)).filter(|request| !request.is_empty())
+        let author = pr.author.as_deref().unwrap_or_default();
+        let request = project.dispatch.review_request(&record.repository, author);
+        Some(request).filter(|request| !request.is_empty())
     }
 
-    fn ask_reviewers(&mut self, item_id: &str, number: u32, cx: &mut Context<Self>) {
+    fn ask_reviewers(&mut self, item_id: &str, pr: &PullRequest, cx: &mut Context<Self>) {
         let Some((project_id, _, _, record)) = self.dispatch_record(item_id, cx) else {
             return;
         };
-        let Some(request) = self.review_request(&project_id, &record, cx) else {
+        let Some(request) = self.review_request((&project_id, &record), pr, cx) else {
             return;
         };
-        let repository = record.repository;
+        let (repository, number) = (record.repository, pr.number);
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
@@ -3141,8 +3144,8 @@ impl AppShell {
         watch.pull_request = Some(ready.clone());
         let record = self.dispatch_record(item_id, cx);
         let role = record.as_ref().and_then(|(_, _, _, r)| self.item_role(&r.board_url, item_id));
-        let asks =
-            record.and_then(|(project_id, _, _, r)| self.review_request(&project_id, &r, cx));
+        let asks = record
+            .and_then(|(project_id, _, _, r)| self.review_request((&project_id, &r), &ready, cx));
         let detail = moves_to_in_review(&ready, role).then(|| match asks {
             Some(request) => {
                 format!("It moves to In review and asks {} for a review.", request.names())
@@ -4737,6 +4740,7 @@ mod tests {
             id: format!("PR_{number}"),
             number,
             url: format!("https://github.com/maui1911/CodeScope/pull/{number}"),
+            author: Some("maui1911".into()),
             state: PullRequestState::Open,
             is_draft,
             checks,

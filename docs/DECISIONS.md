@@ -1023,10 +1023,13 @@ board, each with their own CodeScope or another tool that follows the
   moves to *In review* as it does for any draft marked ready. When
   CodeScope moves an item on to *In review*, it asks the reviewers from
   the project's settings to review the pull request the dispatch
-  opened: people by login, teams as `org/team`, never the user, whose
-  pull request it is. That happens each time a round moves it there, so
-  a review round asks them again, the way GitHub's *Re-request review*
-  does. A person who moves the item there asks whom they like.
+  opened: people by login, and teams as `org/team` of the organisation
+  that owns the repository, since GitHub would take a team of another
+  one for the owner's team of the same name. The pull request's author
+  is never asked; GitHub refuses that. That happens each time a round
+  moves it there, so a review round asks them again, the way GitHub's
+  *Re-request review* does. A person who moves the item there asks whom
+  they like.
 * **Turn.** Every dispatched item shows whose turn it is and since
   when, worked out from what is on GitHub alone, so it is the same on
   every teammate's screen: an agent (and whose), CI, a person (*you*,
