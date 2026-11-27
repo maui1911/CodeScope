@@ -169,16 +169,14 @@ fn run_script(repo: &Path, worktree: &Path, script: &Path, limit: Duration) -> R
 
 #[cfg(windows)]
 fn spawn_script(script: &Path, prepare: impl Fn(&mut Command) -> Result<()>) -> Result<Child> {
-    let quoted = script.to_string_lossy().replace('\'', "''");
-    let run = format!(
-        "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; \
-         if ($PSStyle) {{ $PSStyle.OutputRendering = 'PlainText' }}; & '{quoted}'; \
-         if (Test-Path variable:LASTEXITCODE) {{ exit $LASTEXITCODE }}"
-    );
+    let run = "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; \
+               if ($PSStyle) { $PSStyle.OutputRendering = 'PlainText' }; \
+               & $env:CODESCOPE_SETUP_SCRIPT; \
+               if (Test-Path variable:LASTEXITCODE) { exit $LASTEXITCODE }";
     let options = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"];
     for program in ["pwsh", "powershell"] {
         let mut command = no_window_command(program);
-        command.args(options).arg(&run);
+        command.args(options).arg(run).env("CODESCOPE_SETUP_SCRIPT", script);
         prepare(&mut command)?;
         match command.spawn() {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -324,6 +322,10 @@ mod tests {
     }
 
     fn repos() -> Option<Repos> {
+        repos_in("462-setup")
+    }
+
+    fn repos_in(folder: &str) -> Option<Repos> {
         no_window_command("git").arg("--version").output().ok()?;
         let dir = tempfile::tempdir().unwrap();
         let upstream = dir.path().join("upstream");
@@ -336,7 +338,7 @@ mod tests {
         let repo = dir.path().join("repo");
         git(&repo, &["config", "user.email", "test@example.invalid"]);
         git(&repo, &["config", "user.name", "Test"]);
-        let worktree = dir.path().join("repo.worktrees").join("462-setup");
+        let worktree = dir.path().join("repo.worktrees").join(folder);
         let path = worktree.to_string_lossy().to_string();
         git(&repo, &["worktree", "add", "-q", "-b", "462-setup", &path, "origin/main"]);
         Some(Repos {
@@ -415,6 +417,18 @@ mod tests {
         write_setup(&repos.upstream, powershell, shell);
         run_setup(&repos.repo, &repos.worktree, "origin").unwrap();
         assert!(ran(&repos, "ran.txt").is_some());
+    }
+
+    #[test]
+    fn a_worktree_path_with_quotes_runs_only_the_script() {
+        let Some(repos) = repos_in("462-x’; Set-Content hacked.txt 1; ’'") else {
+            return;
+        };
+        let (powershell, shell) = writes("ran.txt");
+        write_setup(&repos.upstream, &powershell, &shell);
+        run_setup(&repos.repo, &repos.worktree, "origin").unwrap();
+        assert!(ran(&repos, "ran.txt").is_some());
+        assert!(ran(&repos, "hacked.txt").is_none());
     }
 
     #[test]
