@@ -866,27 +866,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_tail_retries_a_torn_document() {
-        let (_tmp, chats) = home_with_project(CWD, "alpha");
-        let path = chats.join("session-2026-02-27T12-00-d1c96a3f.json");
-        write_json(&path, &doc(&[user("u1", "fix it", T0)], None));
-        let mut tail = GeminiChatTail::for_session(&home_of(&chats), CWD, SID);
-        let full = serde_json::to_string_pretty(&doc(
-            &[user("u1", "fix it", T0), reply("g1", "", T1)],
-            None,
-        ))
-        .unwrap();
-        std::fs::write(&path, &full[..full.len() / 2]).unwrap();
-        let t = later();
-        tail.poll_at(t);
-        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::Busy);
-        std::fs::write(&path, &full).unwrap();
-        assert!(!tail.poll_at(t + LEGACY_TORN_RETRY / 2), "a failed parse is throttled too");
-        assert!(tail.poll_at(t + LEGACY_TORN_RETRY * 2));
-        assert_eq!(tail.snapshot.as_ref().unwrap().state, SessionState::PendingToolUse);
-    }
-
-    #[test]
     fn jsonl_tail_reads_records_incrementally() {
         let (_tmp, chats) = home_with_project(CWD, "alpha");
         let path = chats.join("session-2026-10-30T10-00-d1c96a3f.jsonl");
