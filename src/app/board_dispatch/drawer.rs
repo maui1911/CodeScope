@@ -3,16 +3,17 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use codescope_core::board::dispatch::Round;
+use codescope_core::board::github;
 use codescope_core::board::pull_request::{Checks, PullRequest, PullRequestState};
 use codescope_core::board::repair::{FaultKind, REPAIR_ATTEMPTS, Repair};
-use codescope_core::board::{ColumnRole, ItemKind, ItemState};
+use codescope_core::board::{ColumnRole, ItemKind, ItemState, RoleKind};
 use codescope_core::SessionState;
-use gpui::{App, SharedString};
+use gpui::{App, AppContext as _, Context, SharedString};
 
-use super::{AppShell, CardAction, CardNote, NoteTone};
+use super::{AppShell, CardAction, CardNote, NoteTone, ToastKind};
 
 /// One board item, as the drawer shows it.
 pub(crate) struct ItemDrawer {
@@ -37,6 +38,8 @@ pub(crate) struct ItemDrawer {
     pub dispatched: bool,
     /// The dispatch's pull request on GitHub, once read.
     pub pull_request_url: Option<String>,
+    /// Set while it can move back to Todo.
+    pub back_to_todo: Option<BackToTodo>,
 }
 
 /// What the card's button asks of the user, in the drawer's own words.
@@ -68,6 +71,11 @@ pub(crate) enum Mark {
     Plain,
 }
 
+pub(crate) struct BackToTodo {
+    pub hint: &'static str,
+    pub moving: bool,
+}
+
 impl Row {
     fn new(label: &'static str, value: impl Into<String>) -> Self {
         Self {
@@ -92,8 +100,9 @@ impl AppShell {
         notes: &HashMap<String, CardNote>,
         cx: &App,
     ) -> Option<ItemDrawer> {
-        let (board, _) = self.read_board(board_url)?;
+        let (board, mapping) = self.read_board(board_url)?;
         let item = board.items.iter().find(|item| item.id == item_id)?;
+        let role = board.role_of(item, &mapping);
         let viewer = self.board.dispatch.viewer.as_ref().map(|v| v.login.as_str());
         let dispatch = self
             .dispatch_records(cx)
@@ -166,6 +175,18 @@ impl AppShell {
         let note = note
             .filter(|_| needs.is_none())
             .map(|note| (note.text.clone(), note.tone));
+        let open = item.state == ItemState::Open;
+        let back_to_todo = (open && can_move_back(role))
+            .then(|| self.column_target(board_url, ColumnRole::Todo))
+            .flatten()
+            .map(|_| BackToTodo {
+                hint: if dispatch.is_some() {
+                    "CodeScope sends nothing more into its session. The tab and the worktree stay."
+                } else {
+                    "Nothing starts from it until it is moved again."
+                },
+                moving: self.board.moving_back.contains(item_id),
+            });
 
         Some(ItemDrawer {
             board_url: board_url.to_string(),
@@ -186,12 +207,82 @@ impl AppShell {
             rows,
             dispatched: dispatch.is_some(),
             pull_request_url: dispatch.as_ref().and(read_pr).map(|pr| pr.url.clone()),
+            back_to_todo,
         })
+    }
+}
+
+impl AppShell {
+    /// Move `item_id` back to Todo for the user. It is their own move, so CodeScope's moves for
+    /// the round end there.
+    pub(crate) fn move_back_to_todo(
+        &mut self,
+        board_url: &str,
+        item_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((board, column)) = self.column_target(board_url, ColumnRole::Todo) else {
+            return;
+        };
+        if !self.board.moving_back.insert(item_id.to_string()) {
+            return;
+        }
+        cx.notify();
+        let (board_url, item_id) = (board_url.to_string(), item_id.to_string());
+        cx.spawn(async move |this, cx| {
+            let (moved_id, target) = (item_id.clone(), column.clone());
+            let result = cx
+                .background_spawn(async move {
+                    github::set_status(&board, &moved_id, &target).map_err(|err| format!("{err:#}"))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.finish_move_back(&board_url, &item_id, column, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_move_back(
+        &mut self,
+        board_url: &str,
+        item_id: &str,
+        column: String,
+        result: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.board.moving_back.remove(item_id);
+        cx.notify();
+        let read = self.board.reads_by_url.get_mut(board_url);
+        let item = read
+            .and_then(|read| read.last_good.as_mut())
+            .and_then(|board| board.items.iter_mut().find(|item| item.id == item_id));
+        if let Err(message) = result {
+            let number = item.and_then(|item| item.number);
+            let title = number.map_or_else(
+                || "Couldn't move it back to Todo".to_string(),
+                |n| format!("Couldn't move #{n} back to Todo"),
+            );
+            self.push_toast(ToastKind::Err, title, Some(message.into()), cx);
+            return;
+        }
+        if let Some(item) = item {
+            item.column_id = Some(column.clone());
+            item.column_set_at = Some(codescope_core::time::now_iso8601());
+        }
+        self.board.moved_back.insert(item_id.to_string(), (column, Instant::now()));
+        self.refresh_boards(cx);
     }
 }
 
 fn now() -> f64 {
     codescope_core::time::parse_iso8601_secs(&codescope_core::time::now_iso8601()).unwrap_or(0.0)
+}
+
+/// Whether an item in a column with `role` can move back to Todo: not from Todo itself, and not
+/// from a column GitHub's workflows fill.
+fn can_move_back(role: Option<ColumnRole>) -> bool {
+    !matches!(role, Some(ColumnRole::Todo)) && role.map(ColumnRole::kind) != Some(RoleKind::Host)
 }
 
 /// What [`needs`] says about the item besides the button.
@@ -492,5 +583,14 @@ mod tests {
         );
         let fork = needs(CardAction::StartFromFork, ItemKind::PullRequest, facts(None), "Fork");
         assert_eq!(fork.text, "Fork");
+    }
+
+    #[test]
+    fn only_an_item_outside_todo_and_done_moves_back_to_todo() {
+        assert!(can_move_back(Some(ColumnRole::InProgress)));
+        assert!(can_move_back(Some(ColumnRole::Ready)));
+        assert!(can_move_back(None));
+        assert!(!can_move_back(Some(ColumnRole::Todo)));
+        assert!(!can_move_back(Some(ColumnRole::Done)));
     }
 }

@@ -71,6 +71,42 @@ impl AppShell {
             .border_color(divider)
             .child(render_header(theme, &drawer, cx))
             .child(body)
+            .children(drawer.back_to_todo.as_ref().map(|back| {
+                let (board_url, item_id) = (drawer.board_url.clone(), drawer.item_id.clone());
+                let label = if back.moving {
+                    "Moving back to Todo…"
+                } else {
+                    "Move back to Todo"
+                };
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .gap(px(6.0))
+                    .px(px(20.0))
+                    .py(px(14.0))
+                    .border_t_1()
+                    .border_color(divider)
+                    .child(
+                        secondary_button(theme, "item-drawer-todo", label).when(
+                            !back.moving,
+                            |button| {
+                                button.on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.move_back_to_todo(&board_url, &item_id, cx);
+                                    }),
+                                )
+                            },
+                        ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme::text_faint())
+                            .child(back.hint),
+                    )
+            }))
             .into_any_element()
     }
 }

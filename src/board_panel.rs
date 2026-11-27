@@ -3,7 +3,7 @@
 //! share; opening one closes the others. Boards are read every 30 s whether or not the panel is
 //! on stage.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -41,6 +41,11 @@ pub(crate) struct BoardPanelState {
     pub show_all_done: bool,
     /// The item whose drawer is open, on the selected board.
     pub drawer: Option<String>,
+    /// Items CodeScope is moving back to Todo for the user.
+    pub moving_back: HashSet<String>,
+    /// Item → the Todo column CodeScope moved it to for the user, and when, until a read that
+    /// began after that shows where it is.
+    pub moved_back: HashMap<String, (String, Instant)>,
     pub reading: bool,
     pub last_read: Option<Instant>,
     pub dispatch: DispatchState,
@@ -68,6 +73,24 @@ fn read_age(read_at: Option<Instant>) -> SharedString {
         5..60 => format!("read {} s ago", secs / 5 * 5).into(),
         _ => format!("read {} min ago", secs / 60).into(),
     }
+}
+
+/// Puts an item CodeScope moved back to Todo after this read `began` in Todo, as a read that
+/// began earlier can't have seen that move, and forgets the moves a later read shows.
+fn keep_moves_back(
+    board: &mut Board,
+    moved_back: &mut HashMap<String, (String, Instant)>,
+    began: Option<Instant>,
+) {
+    moved_back.retain(|item_id, (column, at)| {
+        if began.is_none_or(|began| began >= *at) {
+            return false;
+        }
+        if let Some(item) = board.items.iter_mut().find(|item| item.id == *item_id) {
+            item.column_id = Some(column.clone());
+        }
+        true
+    });
 }
 
 fn board_label(settings: &BoardSettings, read: Option<&BoardRead>) -> SharedString {
@@ -208,10 +231,12 @@ impl AppShell {
         self.accept_dispatch_read(&mut output);
         let state = &mut self.board;
         state.reading = false;
+        let began = state.last_read;
         for fetch in output.boards {
             let read = state.reads_by_url.entry(fetch.url).or_default();
             match fetch.board {
-                Ok(board) => {
+                Ok(mut board) => {
+                    keep_moves_back(&mut board, &mut state.moved_back, began);
                     read.last_good = Some(board);
                     read.error = None;
                     read.read_at = Some(Instant::now());
@@ -1085,4 +1110,52 @@ fn render_missing_roles(theme: &Arc<Theme>, missing: &[ColumnRole]) -> impl Into
              CodeScope finds them by name.",
             names.join(", ")
         ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn board_with_item_in(column: &str) -> Board {
+        let item = BoardItem {
+            id: "PVTI_1".into(),
+            kind: ItemKind::Issue,
+            number: Some(411),
+            title: "Command palette: fuzzy match on paths".into(),
+            url: None,
+            repository: Some("acme/app".into()),
+            content_id: Some("I_411".into()),
+            assignees: Vec::new(),
+            state: ItemState::Open,
+            column_id: Some(column.into()),
+            column_set_at: None,
+            updated_at: String::new(),
+        };
+        Board {
+            id: "PVT_1".into(),
+            status_field_id: "PVTSSF_1".into(),
+            title: "Board".into(),
+            url: "https://github.com/users/acme/projects/1".into(),
+            closed: false,
+            columns: Vec::new(),
+            items: vec![item],
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn a_read_from_before_a_move_back_keeps_the_item_in_todo_and_a_later_one_shows_it_as_is() {
+        let moved_at = Instant::now();
+        let todo = ("todo".to_string(), moved_at);
+        let mut moved_back = HashMap::from([("PVTI_1".to_string(), todo)]);
+        let mut early = board_with_item_in("in-progress");
+        keep_moves_back(&mut early, &mut moved_back, Some(moved_at - Duration::from_secs(5)));
+        assert_eq!(early.items[0].column_id.as_deref(), Some("todo"));
+        assert!(moved_back.contains_key("PVTI_1"));
+
+        let mut later = board_with_item_in("ready");
+        keep_moves_back(&mut later, &mut moved_back, Some(moved_at + Duration::from_secs(5)));
+        assert_eq!(later.items[0].column_id.as_deref(), Some("ready"));
+        assert!(moved_back.is_empty());
+    }
 }

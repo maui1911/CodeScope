@@ -48,7 +48,7 @@ use codescope_core::board::repair::{
     repair_task,
 };
 use codescope_core::board::{
-    Board, BoardItem, BoardRef, ColumnMapping, ColumnRole, ItemKind, effective_mapping,
+    Board, BoardItem, BoardRef, ColumnMapping, ColumnRole, ItemKind, RoleKind, effective_mapping,
     mapped_column,
 };
 use codescope_core::path_canon::paths_match;
@@ -3738,7 +3738,9 @@ impl AppShell {
                 });
                 let handover = state.watches.get(&r.item_id).and_then(handover_card);
                 let cleanup = self.cleanup_card(&r);
-                (r.item_id, cleanup.or(handover).or(watched).unwrap_or(note))
+                let parked = parked_note(self.item_role(&r.board_url, &r.item_id));
+                let note = cleanup.or(parked).or(handover).or(watched).unwrap_or(note);
+                (r.item_id, note)
             })
             .collect();
         for key in state.posting.iter().filter(|key| rounds.contains(*key)) {
@@ -4030,6 +4032,14 @@ fn handover_card(watch: &PullRequestWatch) -> Option<CardNote> {
     } else {
         forward.or(repair)
     }
+}
+
+/// The card line of a dispatch whose item sits in a column where nothing runs, such as Todo:
+/// CodeScope moves it no more and asks nothing of the user until a person moves it again.
+fn parked_note(role: Option<ColumnRole>) -> Option<CardNote> {
+    let role = role.filter(|role| role.kind() == RoleKind::Rest)?;
+    let text = format!("Moved to {} · nothing more runs until it moves again", role.label());
+    Some(CardNote::new(text, NoteTone::Waiting))
 }
 
 /// The card line of an item that waits.
@@ -4797,6 +4807,17 @@ mod tests {
         assert_eq!(note.text.as_ref(), "Draft PR #415 · test by hand");
         assert!(note.tone == NoteTone::NeedsYou);
         assert!(note.action == Some(CardAction::ReadyForReview));
+    }
+
+    #[test]
+    fn a_dispatch_moved_to_todo_asks_nothing_more() {
+        let note = parked_note(Some(ColumnRole::Todo)).unwrap();
+        assert_eq!(note.text.as_ref(), "Moved to Todo · nothing more runs until it moves again");
+        assert!(note.tone == NoteTone::Waiting && note.action.is_none());
+        for role in [ColumnRole::InProgress, ColumnRole::Ready, ColumnRole::Done] {
+            assert!(parked_note(Some(role)).is_none(), "{role:?}");
+        }
+        assert!(parked_note(None).is_none());
     }
 
     #[test]
