@@ -3,6 +3,7 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -1197,8 +1198,7 @@ pub fn fetch_pull_head(repo: &Path, remote: &str, number: u32) -> Result<String>
 
 fn fetch_pull(repo: &Path, remote: &str, number: u32) -> Result<String> {
     let fetched = format!("refs/remotes/{remote}/pull/{number}");
-    let refspec = format!("+refs/pull/{number}/head:{fetched}");
-    run_git(repo, &["fetch", "--quiet", remote, &refspec])?;
+    fetch(repo, remote, &format!("+refs/pull/{number}/head:{fetched}"))?;
     Ok(fetched)
 }
 
@@ -1211,9 +1211,14 @@ pub fn fetch_branch_head(repo: &Path, remote: &str, branch: &str) -> Result<Stri
 
 fn fetch_branch(repo: &Path, remote: &str, branch: &str) -> Result<String> {
     let fetched = format!("refs/remotes/{remote}/{branch}");
-    let refspec = format!("+refs/heads/{branch}:{fetched}");
-    run_git(repo, &["fetch", "--quiet", remote, &refspec])?;
+    fetch(repo, remote, &format!("+refs/heads/{branch}:{fetched}"))?;
     Ok(fetched)
+}
+
+fn fetch(repo: &Path, remote: &str, refspec: &str) -> Result<()> {
+    static FETCHING: Mutex<()> = Mutex::new(());
+    let _one_at_a_time = FETCHING.lock().unwrap_or_else(PoisonError::into_inner);
+    run_git(repo, &["fetch", "--quiet", remote, refspec]).map(|_| ())
 }
 
 fn add_worktree_from(
@@ -1224,18 +1229,29 @@ fn add_worktree_from(
     base_name: &str,
 ) -> Result<()> {
     let local = format!("refs/heads/{branch}");
+    let held_here = path.exists() && is_worktree_on(repo, path, branch);
     if ref_exists(repo, &local)
         && run_git(repo, &["merge-base", "--is-ancestor", &local, base]).is_err()
     {
+        if held_here {
+            bail!(
+                "the local branch {branch} has commits {base_name} doesn't, and {} has it \
+                 checked out: keep what you need, remove that worktree and the branch, then \
+                 move the item again",
+                path.display()
+            );
+        }
         bail!(
             "the local branch {branch} has commits {base_name} doesn't: remove or rename it, \
              then move the item again"
         );
     }
+    if held_here {
+        return run_git(path, &["merge", "--ff-only", "--quiet", base])
+            .map(|_| ())
+            .with_context(|| format!("bring {} up to {base_name}", path.display()));
+    }
     if path.exists() {
-        if is_worktree_on(repo, path, branch) {
-            return Ok(());
-        }
         bail!("{} already exists", path.display());
     }
     let path_arg = path.to_string_lossy();
@@ -2935,6 +2951,47 @@ mod tests {
         git(&upstream, &["checkout", "-q", "main"]);
         let fetched = fetch_branch_head(&repo, "origin", "keep-palette-open").unwrap();
         assert_eq!(fetched, head(&upstream, "keep-palette-open"));
+    }
+
+    #[test]
+    fn a_reused_worktree_is_brought_up_to_what_was_fetched() {
+        if no_window_command("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (upstream, repo) = upstream_with_branch(dir.path(), "keep-palette-open");
+        let path = dir.path().join("repo.worktrees").join("keep-palette-open");
+        add_pull_request_worktree(&repo, &path, "keep-palette-open", "origin").unwrap();
+        git(&upstream, &["checkout", "-q", "keep-palette-open"]);
+        git(&upstream, &["commit", "--allow-empty", "-m", "pushed after a failed start", "-q"]);
+        git(&upstream, &["checkout", "-q", "main"]);
+        add_pull_request_worktree(&repo, &path, "keep-palette-open", "origin").unwrap();
+        assert_eq!(head(&path, "HEAD"), head(&upstream, "keep-palette-open"));
+
+        let issue = dir.path().join("repo.worktrees").join("14-palette");
+        add_dispatch_worktree(&repo, &issue, "14-palette", "origin").unwrap();
+        git(&upstream, &["commit", "--allow-empty", "-m", "merged meanwhile", "-q"]);
+        add_dispatch_worktree(&repo, &issue, "14-palette", "origin").unwrap();
+        assert_eq!(head(&issue, "HEAD"), head(&upstream, "main"));
+    }
+
+    #[test]
+    fn a_force_pushed_branch_names_the_worktree_that_holds_it() {
+        if no_window_command("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (upstream, repo) = upstream_with_branch(dir.path(), "keep-palette-open");
+        let path = dir.path().join("repo.worktrees").join("keep-palette-open");
+        add_pull_request_worktree(&repo, &path, "keep-palette-open", "origin").unwrap();
+        git(&upstream, &["checkout", "-q", "keep-palette-open"]);
+        git(&upstream, &["reset", "-q", "--hard", "main"]);
+        git(&upstream, &["commit", "--allow-empty", "-m", "rewritten", "-q"]);
+        git(&upstream, &["checkout", "-q", "main"]);
+        let err = add_pull_request_worktree(&repo, &path, "keep-palette-open", "origin")
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains(&path.display().to_string()), "{message}");
     }
 
     #[test]
