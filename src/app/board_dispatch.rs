@@ -14,12 +14,12 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use codescope_core::agents::claude::live_session;
 use codescope_core::board::dispatch::{
-    FINDINGS_FILE, Facts, HandoverSession, Hold, OwnPullRequest, PostedFindings, ProjectRemotes,
-    REPLY_FILE, ReviewRound, Round, StatusChange, WorktreeDispatch, add_dispatch_worktree,
-    add_fork_worktree, add_pull_request_worktree, branch_base, branch_name, clear_findings,
-    clear_reply, counts_towards_limit, decide, exclude_handover_files, fetch_branch_head,
-    fetch_pull_head, find_skill, fork_branch, fork_push, is_plain_branch, launch_with_task,
-    mover_to_check, moves_to_needs_decision, opened_by, projects_for_repository,
+    FINDINGS_FILE, Facts, FoundSkill, HandoverSession, Hold, OwnPullRequest, PostedFindings,
+    ProjectRemotes, REPLY_FILE, ReviewRound, Round, StatusChange, WorktreeDispatch,
+    add_dispatch_worktree, add_fork_worktree, add_pull_request_worktree, branch_base, branch_name,
+    clear_findings, clear_reply, counts_towards_limit, decide, exclude_handover_files,
+    fetch_branch_head, fetch_pull_head, find_skill, fork_branch, fork_push, is_plain_branch,
+    launch_with_task, mover_to_check, moves_to_needs_decision, opened_by, projects_for_repository,
     remote_branch_tip, set_fork_push, start_still_wanted, task_file, task_message,
     track_remote_branch, tracks_same_name, trigger_content_ids, write_task_file,
 };
@@ -40,6 +40,7 @@ use codescope_core::board::pull_request::{
     Checks, PostedPullRequest, PullRequest, PullRequestComment, PullRequestHead, PullRequestState,
     moves_to_in_review, pull_request_comment, review_round_worked, round_pull_request,
 };
+use codescope_core::board::dispatch_settings::DispatchSettings;
 use codescope_core::board::setup::run_setup;
 use codescope_core::board::reply::{read_reply, reply_problems_message};
 use codescope_core::board::repair::{
@@ -696,6 +697,7 @@ struct Job {
     known_access: HashMap<(String, String), bool>,
     viewer_login: String,
     link_error: Option<String>,
+    settings: DispatchSettings,
 }
 
 struct Launch {
@@ -1079,7 +1081,7 @@ fn create_worktree(job: &Job) -> anyhow::Result<()> {
 
 fn set_up_worktree(job: &mut Job) -> anyhow::Result<()> {
     if job.create {
-        run_setup(&job.repo, &job.path, &job.remote)?;
+        run_setup(&job.repo, &job.path, &job.remote, job.settings.setup_command.as_deref())?;
     }
     let number = job.record.number;
     let from_fork = job.record.fork.is_some();
@@ -1107,9 +1109,11 @@ fn set_up_worktree(job: &mut Job) -> anyhow::Result<()> {
             }
         }
     }
-    let skill = skill_in(&job.path, job.record.round.skill());
+    let name = job.settings.skill(job.record.round);
+    let path = skill_in(&job.path, name);
+    let skill = path.as_deref().map(|path| FoundSkill { name, path });
     let answers = job.answers_from.as_ref().map(|from| answers_for_task(job, from));
-    write_task_file(&job.path, &task_file(&job.record, skill.as_deref(), answers.as_deref()))
+    write_task_file(&job.path, &task_file(&job.record, skill, answers.as_deref()))
 }
 
 fn link_branch(job: &mut Job) -> anyhow::Result<()> {
@@ -1697,6 +1701,7 @@ impl AppShell {
             known_access: fresh_access(&self.board.dispatch.access),
             viewer_login: viewer.login.clone(),
             link_error: None,
+            settings: project.dispatch.clone(),
         };
         self.board.dispatch.readied.remove(&item.id);
         self.board.dispatch.fork_confirmed.remove(&item.id);
@@ -3437,8 +3442,15 @@ impl AppShell {
         let Some(route) = self.handover_route(place, &message, cx) else {
             return waits;
         };
-        let skill = skill_in(path, "repair");
-        let task = repair_task(record, pr, &fault, skill.as_deref());
+        let settings = self
+            .current_projects(cx)
+            .project(project_id)
+            .map(|project| project.dispatch.clone())
+            .unwrap_or_default();
+        let name = settings.repair_skill();
+        let found = skill_in(path, name);
+        let skill = found.as_deref().map(|path| FoundSkill { name, path });
+        let task = repair_task(record, pr, &fault, skill);
         let started_at = codescope_core::time::now_iso8601();
         let repaired = WorktreeDispatch {
             repair: Some(Repair {

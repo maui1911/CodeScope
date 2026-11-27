@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::board::dispatch::WorktreeDispatch;
+use crate::board::dispatch_settings::DispatchSettings;
 use crate::git::WorktreeInfo;
 use crate::paths::AppPaths;
 
@@ -97,6 +98,9 @@ pub struct Project {
     /// treated as `None` — see [`crate::project_groups::sidebar_sections`].
     #[serde(default)]
     pub group_id: Option<String>,
+    /// What the project sets for board dispatches on it (ADR-0027); empty by default.
+    #[serde(default, skip_serializing_if = "DispatchSettings::is_empty")]
+    pub dispatch: DispatchSettings,
 }
 
 fn default_branch() -> String { "main".to_string() }
@@ -141,6 +145,7 @@ impl Project {
             sessions: Vec::new(),
             worktrees: vec![primary],
             group_id: None,
+            dispatch: DispatchSettings::default(),
         }
     }
 
@@ -164,6 +169,7 @@ impl Project {
             sessions: Vec::new(),
             worktrees: Vec::new(),
             group_id: None,
+            dispatch: DispatchSettings::default(),
         }
     }
 
@@ -752,6 +758,18 @@ mod tests {
     use super::*;
     use crate::process::no_window_command;
 
+    #[test]
+    fn a_project_keeps_its_dispatch_settings_and_writes_none_it_doesn_t_have() {
+        let project = Project::new("/src/repo".into());
+        let json = serde_json::to_value(&project).unwrap();
+        assert!(json.get("dispatch").is_none(), "{json}");
+        let mut set = project.clone();
+        set.dispatch.setup_command = Some("npm ci".into());
+        let json = serde_json::to_string(&set).unwrap();
+        let back: Project = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.dispatch.setup_command.as_deref(), Some("npm ci"));
+    }
+
     /// Skip-aware test helper — initialises a real git repo under a
     /// tempdir and runs an empty seed commit so HEAD is real. Returns
     /// `None` when `git` isn't on PATH so a CI image without git in
@@ -1276,6 +1294,7 @@ mod tests {
                     dispatch: None,
                 }],
                 group_id: None,
+                dispatch: DispatchSettings::default(),
             }],
             project_groups: Vec::new(),
         };
@@ -1550,6 +1569,7 @@ mod tests {
                 sessions: Vec::new(),
                 worktrees: Vec::new(),
                 group_id: None,
+                dispatch: DispatchSettings::default(),
             }],
             project_groups: Vec::new(),
         };
@@ -1859,6 +1879,7 @@ mod tests {
                     dispatch: None,
                 }],
                 group_id: None,
+                dispatch: DispatchSettings::default(),
             }],
             project_groups: Vec::new(),
         };
