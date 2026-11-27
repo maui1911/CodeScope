@@ -51,6 +51,56 @@ pub fn board_query(owner_kind: BoardOwner) -> String {
     )
 }
 
+/// The board workflow that moves an issue to a column of its own when a pull request is linked to
+/// it, which can take the item back out of *In review*.
+pub const LINKED_PULL_REQUEST_WORKFLOW: &str = "Pull request linked to issue";
+
+/// The query for the board's built-in workflows, apart from [`board_query`]: GitHub refuses them
+/// to anyone who can't change the board, and that refusal empties the whole board.
+pub fn workflows_query(owner_kind: BoardOwner) -> String {
+    let owner = match owner_kind {
+        BoardOwner::User => "user",
+        BoardOwner::Organization => "organization",
+    };
+    format!(
+        r#"query($owner: String!, $number: Int!) {{
+  {owner}(login: $owner) {{
+    projectV2(number: $number) {{ workflows(first: 50) {{ nodes {{ name enabled }} }} }}
+  }}
+}}"#
+    )
+}
+
+/// The names of the board's built-in workflows that are on.
+pub fn fetch_enabled_workflows(board: &BoardRef) -> Result<Vec<String>> {
+    let query = workflows_query(board.owner_kind);
+    let fields = [format!("query={query}"), format!("owner={}", board.owner)];
+    parse_enabled_workflows(&run_graphql(&fields, &[format!("number={}", board.number)])?)
+}
+
+/// Parse [`workflows_query`]'s response.
+pub fn parse_enabled_workflows(json: &str) -> Result<Vec<String>> {
+    let data: WorkflowsData = parse_data(json)?;
+    let project = data
+        .user
+        .or(data.organization)
+        .and_then(|owner| owner.project_v2)
+        .ok_or_else(|| anyhow!("board not found"))?;
+    Ok(project
+        .workflows
+        .nodes
+        .into_iter()
+        .flatten()
+        .filter(|workflow| workflow.enabled)
+        .map(|workflow| workflow.name)
+        .collect())
+}
+
+/// Whether workflows that are on include [`LINKED_PULL_REQUEST_WORKFLOW`].
+pub fn moves_back_from_review(enabled: &[String]) -> bool {
+    enabled.iter().any(|name| name == LINKED_PULL_REQUEST_WORKFLOW)
+}
+
 /// One page of a board: the board with this page's items, and the cursor of the next page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoardPage {
@@ -1219,6 +1269,34 @@ struct Owner {
 }
 
 #[derive(Deserialize)]
+struct WorkflowsData {
+    user: Option<WorkflowsOwner>,
+    organization: Option<WorkflowsOwner>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkflowsOwner {
+    project_v2: Option<WorkflowsProject>,
+}
+
+#[derive(Deserialize)]
+struct WorkflowsProject {
+    workflows: WorkflowList,
+}
+
+#[derive(Deserialize)]
+struct WorkflowList {
+    nodes: Vec<Option<WorkflowNode>>,
+}
+
+#[derive(Deserialize)]
+struct WorkflowNode {
+    name: String,
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
 struct Project {
     id: String,
     title: String,
@@ -1346,6 +1424,26 @@ mod tests {
         assert_eq!(err.to_string(), "GitHub didn't make 14-palette");
         let nothing = r#"{"data":{"createLinkedBranch":null}}"#;
         assert!(parse_linked_branch(nothing, "14-palette").is_err());
+    }
+
+    #[test]
+    fn reads_which_of_the_board_s_workflows_are_on() {
+        let json = r#"{"data":{"organization":{"projectV2":{"workflows":{"nodes":[
+          {"name":"Item closed","enabled":true},
+          {"name":"Pull request linked to issue","enabled":false},
+          null,
+          {"name":"Pull request merged","enabled":true}
+        ]}}}}}"#;
+        let on = parse_enabled_workflows(json).unwrap();
+        assert_eq!(on, ["Item closed", "Pull request merged"]);
+        assert!(!moves_back_from_review(&on));
+        let linked = vec![LINKED_PULL_REQUEST_WORKFLOW.to_string()];
+        assert!(moves_back_from_review(&linked));
+        let refused = r#"{"data":{"organization":{"projectV2":null}},"errors":[
+          {"type":"FORBIDDEN","message":"You do not have permission to access workflows"}]}"#;
+        let err = parse_enabled_workflows(refused).unwrap_err();
+        assert!(format!("{err:#}").contains("permission"), "{err:#}");
+        assert!(workflows_query(BoardOwner::User).contains("user(login: $owner)"));
     }
 
     #[test]

@@ -35,7 +35,7 @@ use codescope_core::board::forward::{
     ForwardFacts, ForwardStep, Forwarded, authors, comments_since, forward_message, forward_step,
     forward_task, new_comments,
 };
-use codescope_core::board::github::{self, NewComment, TriggerReads, Viewer};
+use codescope_core::board::github::{self, NewComment, TriggerReads, Viewer, moves_back_from_review};
 use codescope_core::board::pull_request::{
     Checks, PostedPullRequest, PullRequest, PullRequestComment, PullRequestHead, PullRequestState,
     moves_to_in_review, pull_request_comment, review_round_worked, round_pull_request,
@@ -68,6 +68,7 @@ use crate::notifications::NotificationKind;
 
 const REMOTES_MAX_AGE: Duration = Duration::from_secs(300);
 const VIEWER_MAX_AGE: Duration = Duration::from_secs(300);
+const WORKFLOWS_MAX_AGE: Duration = Duration::from_secs(600);
 const ACCESS_RECHECK_AFTER: Duration = Duration::from_secs(300);
 const ACCESS_EXPIRES_AFTER: Duration = Duration::from_secs(600);
 /// Text and Enter in one write can reach an agent's prompt as a paste, whose Enter is a newline.
@@ -614,6 +615,7 @@ pub(crate) struct ReadInput {
     /// Local projects as `(id, path)`, when their remotes are due for a read.
     projects: Option<Vec<(String, String)>>,
     discussions: Vec<DiscussionRead>,
+    workflows_due: Vec<String>,
 }
 
 #[derive(Default)]
@@ -633,6 +635,7 @@ pub(crate) struct BoardFetch {
     /// Last moves and linked pull requests of the items in trigger columns; `None` when they
     /// couldn't be read.
     pub triggers: Option<TriggerReads>,
+    pub workflows: Option<Result<Vec<String>, String>>,
 }
 
 /// A card's line about dispatch.
@@ -892,10 +895,20 @@ pub(crate) fn read_boards(input: ReadInput) -> ReadOutput {
         if let (Ok(board), Some(found), Some(viewer)) = (&board, &triggers, &viewer) {
             check_access(board, &found.changes, viewer, &input.known_access, &mut output.access);
         }
+        let workflows = match BoardRef::parse_url(&url) {
+            Some(wanted) if board.is_ok() && input.workflows_due.contains(&url) => Some(
+                github::fetch_enabled_workflows(&wanted).map_err(|err| {
+                    eprintln!("warning: couldn't read workflows on {url}: {err:#}");
+                    format!("{err:#}")
+                }),
+            ),
+            _ => None,
+        };
         output.boards.push(BoardFetch {
             url,
             board,
             triggers,
+            workflows,
         });
     }
     if !input.discussions.is_empty() {
@@ -1226,6 +1239,20 @@ impl AppShell {
             known_access: fresh_access(&state.access),
             projects: remotes_due.then_some(local),
             discussions,
+            workflows_due: self
+                .settings
+                .boards
+                .iter()
+                .filter(|b| {
+                    let read = self.board.reads_by_url.get(&b.url);
+                    let warned = read
+                        .and_then(|read| read.workflows.as_deref())
+                        .is_some_and(moves_back_from_review);
+                    let read_at = read.and_then(|read| read.workflows_read_at);
+                    warned || read_at.is_none_or(|at| at.elapsed() >= WORKFLOWS_MAX_AGE)
+                })
+                .map(|b| b.url.clone())
+                .collect(),
         }
     }
 
