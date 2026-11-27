@@ -635,7 +635,28 @@ pub fn create_linked_branch(issue_id: &str, oid: &str, branch: &str) -> Result<(
         ],
         &[],
     )?;
-    parse_data::<serde_json::Value>(&stdout).map(|_| ())
+    parse_linked_branch(&stdout, branch)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinkedBranchData {
+    create_linked_branch: Option<LinkedBranchPayload>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinkedBranchPayload {
+    linked_branch: Option<serde_json::Value>,
+}
+
+fn parse_linked_branch(json: &str, branch: &str) -> Result<()> {
+    let data: LinkedBranchData = parse_data(json)?;
+    let made = data.create_linked_branch.and_then(|p| p.linked_branch);
+    if made.is_none() {
+        bail!("GitHub didn't make {branch}");
+    }
+    Ok(())
 }
 
 /// Mark a draft pull request ready for review, by its node id.
@@ -1315,6 +1336,17 @@ mod tests {
         {"id":"PVTI_5","isArchived":false,"updatedAt":"2026-11-22T00:00:00Z",
          "fieldValueByName":null,"content":null}
       ]}}}}}"#;
+
+    #[test]
+    fn a_linked_branch_counts_only_when_github_returns_it() {
+        let made = r#"{"data":{"createLinkedBranch":{"linkedBranch":{"id":"LB_1"}}}}"#;
+        assert!(parse_linked_branch(made, "14-palette").is_ok());
+        let refused = r#"{"data":{"createLinkedBranch":{"linkedBranch":null}}}"#;
+        let err = parse_linked_branch(refused, "14-palette").unwrap_err();
+        assert_eq!(err.to_string(), "GitHub didn't make 14-palette");
+        let nothing = r#"{"data":{"createLinkedBranch":null}}"#;
+        assert!(parse_linked_branch(nothing, "14-palette").is_err());
+    }
 
     #[test]
     fn query_asks_the_owner_kind_the_url_names() {
