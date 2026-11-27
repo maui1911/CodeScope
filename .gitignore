@@ -45,7 +45,11 @@ Desktop.ini
 # Scratch area (never commit). Throwaway captures, session logs, and any
 # tooling output that shouldn't ship. docs/screenshots/ is the tracked
 # home for README imagery — only that folder is published.
-scratch/
+# Exception: docs/scratch/README.txt says what the folder is for and is
+# tracked. git can't re-include a file under an excluded folder, so the
+# rule excludes the contents of scratch folders, not the folders.
+**/scratch/*
+!docs/scratch/README.txt
 .scratch/
 
 # Tool-state directories surfaced by AI / automation runners
