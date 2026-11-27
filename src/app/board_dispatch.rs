@@ -261,6 +261,11 @@ impl PullRequestWatch {
                 .is_some_and(|(idle, read)| read > idle)
     }
 
+    fn read_after_stop(&self) -> bool {
+        self.idle_since
+            .is_none_or(|idle| self.read_ok_at.is_some_and(|read| read > idle))
+    }
+
     fn review_stop(&self) -> Option<Instant> {
         self.idle_since.or(self.settled_since)
     }
@@ -2937,6 +2942,7 @@ impl AppShell {
         let turns = watch.turns;
         watch.forward_follow.look(forwarded.map(|last| last.at.clone()), working, turns);
         let session = watch.forward_follow.session(working, unreplied, watch.read_ok_at);
+        let current = watch.read_after_stop();
         let access = &state.access;
         let now = Instant::now();
         let can_write = |login: &str| {
@@ -2949,7 +2955,10 @@ impl AppShell {
             reply: reply.as_ref().map(|file| file.reply()),
             role,
         };
-        let step = forward_step(&pr, facts, can_write);
+        let step = match forward_step(&pr, facts, can_write) {
+            ForwardStep::Forward(comments) if !current => ForwardStep::Waits(authors(&comments)),
+            step => step,
+        };
         Some((pr, step))
     }
 
@@ -3222,6 +3231,10 @@ impl AppShell {
                 } else {
                     RepairStep::Nothing
                 }
+            }
+            RepairStep::Start { .. } if !watch.read_after_stop() => {
+                watch.healthy_since = None;
+                RepairStep::Nothing
             }
             step => {
                 watch.healthy_since = None;
@@ -4440,6 +4453,22 @@ mod tests {
         assert!(note.tone == NoteTone::NeedsYou);
         watch.track(None);
         assert!(!watch.waits_for_you(), "the tab is closed");
+    }
+
+    #[test]
+    fn a_handover_waits_for_a_read_that_started_after_the_session_stopped() {
+        let mut watch = PullRequestWatch::default();
+        assert!(watch.read_after_stop(), "no tab, so nothing that can push and stop");
+        watch.read_ok_at = Some(Instant::now());
+        watch.track(Some((SessionState::Busy, 4)));
+        watch.track(Some((SessionState::Idle, 4)));
+        let stopped = watch.idle_since.unwrap();
+        watch.read_ok_at = Some(stopped - Duration::from_millis(1));
+        assert!(!watch.read_after_stop(), "the read may predate a push before the stop");
+        watch.read_ok_at = Some(stopped + Duration::from_millis(1));
+        assert!(watch.read_after_stop());
+        watch.read_ok_at = None;
+        assert!(!watch.read_after_stop(), "never read");
     }
 
     #[test]
