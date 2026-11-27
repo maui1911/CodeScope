@@ -78,13 +78,24 @@ pub struct LinkedPullRequest {
     pub closed_at: Option<String>,
 }
 
-/// A pull request CodeScope reported on the issue, kept on the worktree's `projects.json` row.
+/// The branch a pull request item merges from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestHead {
+    pub branch: String,
+    /// Set when the branch lives in another repository, such as a fork.
+    pub is_cross_repository: bool,
+}
+
+/// A pull request CodeScope reported on the issue, or the pull request that is the item, kept on
+/// the worktree's `projects.json` row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PostedPullRequest {
     pub number: u32,
     pub url: String,
-    pub comment_url: String,
+    /// The comment that reported it on the issue; `None` when the item is the pull request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_url: Option<String>,
     /// Set once CodeScope moved the item to In review, or found it there; it never moves it
     /// again.
     #[serde(default)]
@@ -240,5 +251,19 @@ mod tests {
         let json = r#"{"number":415,"url":"u","commentUrl":"c"}"#;
         let posted: PostedPullRequest = serde_json::from_str(json).unwrap();
         assert!(!posted.in_review);
+        assert_eq!(posted.comment_url.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn the_pull_request_that_is_the_item_has_no_report_comment() {
+        let item = PostedPullRequest {
+            number: 420,
+            url: "https://github.com/maui1911/CodeScope/pull/420".into(),
+            comment_url: None,
+            in_review: false,
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(!json.contains("commentUrl"), "{json}");
+        assert_eq!(serde_json::from_str::<PostedPullRequest>(&json).unwrap(), item);
     }
 }

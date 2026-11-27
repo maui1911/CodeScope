@@ -11,7 +11,9 @@ use serde::de::DeserializeOwned;
 
 use super::answers::Comment;
 use super::dispatch::StatusChange;
-use super::pull_request::{Checks, LinkedPullRequest, PullRequest, PullRequestState};
+use super::pull_request::{
+    Checks, LinkedPullRequest, PullRequest, PullRequestHead, PullRequestState,
+};
 use super::{Board, BoardItem, BoardOwner, BoardRef, Column, ItemKind, ItemState};
 use crate::process::no_window_command;
 
@@ -117,7 +119,10 @@ const TRIGGER_ITEMS_QUERY: &str = r#"query($ids: [ID!]!) {
       id timelineItems(last: 100, itemTypes: [PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]) { nodes { ...change } }
       closedByPullRequestsReferences(first: 10, includeClosedPrs: true) { nodes { ...linked } }
     }
-    ... on PullRequest { id timelineItems(last: 100, itemTypes: [PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]) { nodes { ...change } } }
+    ... on PullRequest {
+      id headRefName isCrossRepository
+      timelineItems(last: 100, itemTypes: [PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]) { nodes { ...change } }
+    }
   }
 }
 fragment change on ProjectV2ItemStatusChangedEvent {
@@ -135,10 +140,12 @@ pub struct TriggerReads {
     pub changes: HashMap<String, StatusChange>,
     /// Each issue's linked pull requests, open or not, up to ten.
     pub linked: HashMap<String, Vec<LinkedPullRequest>>,
+    /// The branch each pull request merges from.
+    pub heads: HashMap<String, PullRequestHead>,
 }
 
-/// The last status change on board `board_id`, and the linked pull requests, of each issue or
-/// pull request in `content_ids`.
+/// The last status change on board `board_id` of each issue or pull request in `content_ids`, the
+/// linked pull requests of each issue, and the branch of each pull request.
 pub fn fetch_trigger_reads(board_id: &str, content_ids: &[String]) -> Result<TriggerReads> {
     let mut reads = TriggerReads::default();
     for chunk in content_ids.chunks(100) {
@@ -148,6 +155,7 @@ pub fn fetch_trigger_reads(board_id: &str, content_ids: &[String]) -> Result<Tri
         let page = parse_trigger_reads(&stdout, board_id)?;
         reads.changes.extend(page.changes);
         reads.linked.extend(page.linked);
+        reads.heads.extend(page.heads);
     }
     Ok(reads)
 }
@@ -175,6 +183,15 @@ pub fn parse_trigger_reads(json: &str, board_id: &str) -> Result<TriggerReads> {
                 created_at: change.created_at,
             };
             reads.changes.insert(id.clone(), change);
+        }
+        if let (Some(branch), Some(is_cross_repository)) =
+            (node.head_ref_name, node.is_cross_repository)
+        {
+            let head = PullRequestHead {
+                branch,
+                is_cross_repository,
+            };
+            reads.heads.insert(id.clone(), head);
         }
         if let Some(linked) = node.closed_by_pull_requests_references {
             let linked = linked
@@ -785,6 +802,8 @@ struct TimelineOwner {
     id: Option<String>,
     timeline_items: Option<TimelineItems>,
     closed_by_pull_requests_references: Option<LinkedList>,
+    head_ref_name: Option<String>,
+    is_cross_repository: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1236,6 +1255,7 @@ mod tests {
         ]}}"#;
         let linked = parse_trigger_reads(json, "PVT_1").unwrap().linked;
         assert_eq!(linked.len(), 1, "a pull request item has no linked pull requests");
+        assert!(linked.contains_key("I_432"));
         assert_eq!(
             linked["I_432"],
             vec![
@@ -1257,6 +1277,28 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn reads_the_branch_each_pull_request_merges_from() {
+        let json = r#"{"data":{"nodes":[
+          {"__typename":"PullRequest","id":"PR_420","headRefName":"keep-palette-open",
+           "isCrossRepository":false,"timelineItems":{"nodes":[]}},
+          {"__typename":"PullRequest","id":"PR_421","headRefName":"main",
+           "isCrossRepository":true,"timelineItems":{"nodes":[]}},
+          {"__typename":"Issue","id":"I_432","timelineItems":{"nodes":[]},
+           "closedByPullRequestsReferences":{"nodes":[]}}
+        ]}}"#;
+        let heads = parse_trigger_reads(json, "PVT_1").unwrap().heads;
+        assert_eq!(heads.len(), 2, "an issue has no branch");
+        assert_eq!(
+            heads["PR_420"],
+            PullRequestHead {
+                branch: "keep-palette-open".into(),
+                is_cross_repository: false,
+            }
+        );
+        assert!(heads["PR_421"].is_cross_repository);
     }
 
     #[test]

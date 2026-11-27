@@ -13,10 +13,11 @@ use std::time::{Duration, Instant};
 use codescope_core::agents::claude::live_session;
 use codescope_core::board::dispatch::{
     FINDINGS_FILE, Facts, Hold, OwnPullRequest, PostedFindings, ProjectRemotes, REPLY_FILE,
-    ReviewRound, Round, StatusChange, WorktreeDispatch, add_dispatch_worktree, branch_name,
-    clear_findings, clear_reply, counts_towards_limit, decide, exclude_handover_files,
-    find_skill, launch_with_task, mover_to_check, moves_to_needs_decision,
-    projects_for_repository, task_file, task_message, trigger_content_ids, write_task_file,
+    ReviewRound, Round, StatusChange, WorktreeDispatch, add_dispatch_worktree,
+    add_pull_request_worktree, branch_name, clear_findings, clear_reply, counts_towards_limit,
+    decide, exclude_handover_files, find_skill, launch_with_task, mover_to_check,
+    moves_to_needs_decision, opened_by, projects_for_repository, task_file, task_message,
+    trigger_content_ids, write_task_file,
 };
 use codescope_core::board::answers::{
     Answer, Comment, after_findings, answer_body, answers_section, choices_text, chosen,
@@ -28,12 +29,13 @@ use codescope_core::board::findings::{
 };
 use codescope_core::board::github::{self, TriggerReads, Viewer};
 use codescope_core::board::pull_request::{
-    Checks, PostedPullRequest, PullRequest, PullRequestState, moves_to_in_review,
+    Checks, PostedPullRequest, PullRequest, PullRequestHead, PullRequestState, moves_to_in_review,
     pull_request_comment, review_round_worked, round_pull_request,
 };
 use codescope_core::board::reply::{read_reply, reply_problems_message};
 use codescope_core::board::{
-    Board, BoardItem, BoardRef, ColumnMapping, ColumnRole, effective_mapping, mapped_column,
+    Board, BoardItem, BoardRef, ColumnMapping, ColumnRole, ItemKind, effective_mapping,
+    mapped_column,
 };
 use codescope_core::path_canon::paths_match;
 use codescope_core::process_tree;
@@ -44,6 +46,7 @@ use codescope_terminal::TerminalView;
 use gpui::{App, AppContext as _, Context, Entity, SharedString, Window};
 
 use super::{AppShell, ToastKind};
+use crate::dialogs::new_worktree::sanitize_branch_to_folder;
 use crate::notifications::NotificationKind;
 
 const REMOTES_MAX_AGE: Duration = Duration::from_secs(300);
@@ -551,6 +554,7 @@ struct Start {
     board: Board,
     board_url: String,
     item: BoardItem,
+    head: Option<PullRequestHead>,
     round: Round,
     trigger_at: String,
 }
@@ -922,7 +926,11 @@ fn answers_for_task(job: &Job, from: &AnswersFrom) -> String {
 
 fn prepare_worktree(job: &mut Job) -> anyhow::Result<()> {
     if job.create {
-        add_dispatch_worktree(&job.repo, &job.path, &job.branch, &job.remote)?;
+        let add = match job.record.kind {
+            ItemKind::PullRequest => add_pull_request_worktree,
+            ItemKind::Issue | ItemKind::Draft => add_dispatch_worktree,
+        };
+        add(&job.repo, &job.path, &job.branch, &job.remote)?;
     }
     exclude_handover_files(&job.path)?;
     match job.record.round {
@@ -1091,27 +1099,37 @@ impl AppShell {
             .collect()
     }
 
-    fn place_of(&self, board_url: &str, item: &BoardItem, cx: &App) -> Option<Place> {
+    fn place_of(
+        &self,
+        board_url: &str,
+        item: &BoardItem,
+        head: Option<&PullRequestHead>,
+        cx: &App,
+    ) -> Option<Place> {
         let number = item.number?;
+        let new_branch = match item.kind {
+            ItemKind::PullRequest => head.map(|head| head.branch.clone()),
+            ItemKind::Issue | ItemKind::Draft => Some(branch_name(number, &item.title)),
+        };
         let existing = self
             .dispatch_records(cx)
             .into_iter()
             .find(|(_, _, _, r)| r.board_url == board_url && r.item_id == item.id);
         if let Some((_, path, branch, _)) = existing {
-            let branch = branch.unwrap_or_else(|| branch_name(number, &item.title));
             return Some(Place {
                 create: false,
                 path,
-                branch,
+                branch: branch.or(new_branch)?,
             });
         }
         let remotes = &self.board.dispatch.remotes;
         let (matched, _) = *projects_for_repository(remotes, item.repository.as_deref()?).first()?;
         let project = self.current_projects(cx).project(&matched.project_id)?;
-        let branch = branch_name(number, &item.title);
+        let branch = new_branch?;
+        let folder = sanitize_branch_to_folder(&branch);
         Some(Place {
             create: true,
-            path: PathBuf::from(project.worktree_root_path()).join(&branch),
+            path: PathBuf::from(project.worktree_root_path()).join(folder),
             branch,
         })
     }
@@ -1183,6 +1201,9 @@ impl AppShell {
                     .as_ref()
                     .and_then(|id| triggers.linked.get(id))
                     .map_or(&[][..], Vec::as_slice);
+                let head = item.content_id.as_ref().and_then(|id| triggers.heads.get(id));
+                let dispatches = records.iter().map(|(_, _, branch, r)| (branch.as_deref(), r));
+                let opener = opened_by(item, head, dispatches);
                 let mover_can_write = change
                     .and_then(|c| mover_to_check(item, c, &viewer.login))
                     .zip(item.repository.as_deref())
@@ -1205,6 +1226,8 @@ impl AppShell {
                     pull_request: own_pull_request(record, state.watches.get(&item.id)),
                     linked,
                     branch: worktree.and_then(|(_, _, branch, _)| branch.as_deref()),
+                    head,
+                    opened_by: opener,
                     running,
                     limit,
                 };
@@ -1227,7 +1250,7 @@ impl AppShell {
                             continue;
                         }
                         let target = self
-                            .place_of(&settings.url, item, cx)
+                            .place_of(&settings.url, item, head, cx)
                             .map(|place| self.handover_target(&place.path, cx));
                         if let Some(HandoverTarget::Wait(hold)) = target {
                             holds.insert(item.id.clone(), hold);
@@ -1238,6 +1261,7 @@ impl AppShell {
                             board: board.clone(),
                             board_url: settings.url.clone(),
                             item: item.clone(),
+                            head: head.cloned(),
                             round,
                             trigger_at: change.created_at.clone(),
                         });
@@ -1286,6 +1310,7 @@ impl AppShell {
             board,
             board_url,
             item,
+            head,
             round,
             trigger_at,
         } = start;
@@ -1322,7 +1347,7 @@ impl AppShell {
         let profile = self.project_agent(&project);
         let command = profile.as_ref().and_then(|profile| {
             codescope_core::build_new_session_auto_type(profile)
-                .and_then(|launch| launch_with_task(&launch, &task_message(number)))
+                .and_then(|launch| launch_with_task(&launch, &task_message(item.kind, number)))
         });
         let (Some(profile), Some(command)) = (profile, command) else {
             let message = "The project's agent can't be handed a task yet. Claude Code, Codex, \
@@ -1332,7 +1357,9 @@ impl AppShell {
             return;
         };
 
-        let Some(Place { create, path, branch }) = self.place_of(&board_url, &item, cx) else {
+        let Some(Place { create, path, branch }) =
+            self.place_of(&board_url, &item, head.as_ref(), cx)
+        else {
             return;
         };
         let pending = if create {
@@ -1372,7 +1399,15 @@ impl AppShell {
             .as_ref()
             .and_then(|previous| previous.pull_request.clone())
             .or_else(|| watch.and_then(|w| w.reported.clone()));
-        let pull_request = carried_pull_request(round, posted, open);
+        let pull_request = match item.kind {
+            ItemKind::PullRequest => Some(PostedPullRequest {
+                number,
+                url: url.clone(),
+                comment_url: None,
+                in_review: false,
+            }),
+            ItemKind::Issue | ItemKind::Draft => carried_pull_request(round, posted, open),
+        };
         let review = (round == Round::Review).then(|| ReviewRound {
             start_head: open.map(|pr| pr.head_oid.clone()),
             ..ReviewRound::default()
@@ -1396,6 +1431,7 @@ impl AppShell {
                 board_url,
                 item_id: item.id.clone(),
                 content_id: content_id.clone(),
+                kind: item.kind,
                 repository,
                 number,
                 title: item.title.clone(),
@@ -1485,7 +1521,8 @@ impl AppShell {
         }
         self.board.dispatch.starting.remove(&record.item_id);
         self.board.dispatch.seen_from_start.insert(round_key(record));
-        self.hand_over(&job.path, terminal, launch, record.number, window, cx);
+        let task = task_message(record.kind, record.number);
+        self.hand_over(&job.path, terminal, launch, task, window, cx);
         cx.notify();
         Some(job)
     }
@@ -1513,12 +1550,12 @@ impl AppShell {
         path: &Path,
         terminal: Option<Entity<TerminalView>>,
         launch: Launch,
-        number: u32,
+        task: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(terminal) = terminal {
-            Self::submit_line(&terminal, task_message(number), cx);
+            Self::submit_line(&terminal, task, cx);
             return;
         }
         let before = self
@@ -2331,7 +2368,7 @@ impl AppShell {
         let posted = PostedPullRequest {
             number: pr.number,
             url: pr.url.clone(),
-            comment_url,
+            comment_url: Some(comment_url),
             in_review: false,
         };
         self.keep_posted(item_id, posted, cx);
@@ -2349,18 +2386,24 @@ impl AppShell {
         relation: &str,
         cx: &mut Context<Self>,
     ) {
+        let subject = match record.kind {
+            ItemKind::PullRequest => format!("PR #{} updated", pr.number),
+            ItemKind::Issue | ItemKind::Draft => {
+                format!("PR #{} {relation} #{}", pr.number, record.number)
+            }
+        };
         let (kind, toast, title, detail) = if pr.is_draft {
             (
                 NotificationKind::SessionWaiting,
                 ToastKind::Info,
-                format!("Draft PR #{} {relation} #{}", pr.number, record.number),
+                format!("Draft {subject}"),
                 "Test it by hand, then mark it ready for review.".to_string(),
             )
         } else {
             (
                 NotificationKind::SessionReady,
                 ToastKind::Ok,
-                format!("PR #{} {relation} #{}", pr.number, record.number),
+                subject,
                 record.title.clone(),
             )
         };
@@ -3168,7 +3211,7 @@ mod tests {
         PostedPullRequest {
             number,
             url: "u".into(),
-            comment_url: "c".into(),
+            comment_url: Some("c".into()),
             in_review: false,
         }
     }
@@ -3178,6 +3221,7 @@ mod tests {
             board_url: "https://github.com/users/maui1911/projects/1".into(),
             item_id: "PVTI_1".into(),
             content_id: "I_1".into(),
+            kind: ItemKind::Issue,
             repository: "maui1911/CodeScope".into(),
             number: 426,
             title: "Review round".into(),
@@ -3330,7 +3374,7 @@ mod tests {
         let newer = open_pull_request(12, false, Checks::Passing);
         let review = carried_pull_request(Round::Review, reported(), Some(&newer)).unwrap();
         assert_eq!((review.number, review.url.as_str()), (12, newer.url.as_str()));
-        assert_eq!(review.comment_url, "c");
+        assert_eq!(review.comment_url.as_deref(), Some("c"));
         assert_eq!(carried_pull_request(Round::Review, None, Some(&open)), None);
     }
 

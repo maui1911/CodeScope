@@ -89,12 +89,25 @@ pub struct Column {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ItemKind {
+    #[default]
     Issue,
     PullRequest,
     /// A draft issue, which has no number, URL or repository yet.
     Draft,
+}
+
+impl ItemKind {
+    /// The word for it in a sentence.
+    pub fn noun(self) -> &'static str {
+        match self {
+            ItemKind::Issue => "issue",
+            ItemKind::PullRequest => "pull request",
+            ItemKind::Draft => "draft issue",
+        }
+    }
 }
 
 /// The state of the issue or pull request behind an item; a draft is `Open`.
