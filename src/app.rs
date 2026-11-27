@@ -5154,6 +5154,7 @@ impl AppShell {
                     .child(
                         div()
                             .flex_grow()
+                            .min_w(px(0.0))
                             .flex()
                             .flex_col()
                             .gap_1()
