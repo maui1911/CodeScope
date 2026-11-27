@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use codescope_core::board::dispatch::Round;
 use codescope_core::board::github;
-use codescope_core::board::pull_request::{Checks, PullRequest, PullRequestState};
+use codescope_core::board::pull_request::{
+    Checks, PullRequest, PullRequestState, moves_to_in_review,
+};
 use codescope_core::board::repair::{FaultKind, REPAIR_ATTEMPTS, Repair};
 use codescope_core::board::{BoardItem, ColumnRole, ItemKind, ItemState, RoleKind};
 use codescope_core::SessionState;
@@ -171,7 +173,25 @@ impl AppShell {
             });
             let link = needs_link.clone().or_else(|| item.url.clone().map(|url| ("Open PR", url)));
             let pr = read_pr.map(|pr| pr.number);
-            Some(needs(action, item.kind, Facts { pr, points, asks, link }, &note.text))
+            let posted = dispatch.as_ref().and_then(|(_, _, _, r)| {
+                r.pull_request.as_ref().or(watch.and_then(|w| w.reported.as_ref()))
+            });
+            let moves = posted.is_some_and(|posted| !posted.in_review)
+                && read_pr.is_some_and(|pr| {
+                    let ready = PullRequest {
+                        is_draft: false,
+                        ..pr.clone()
+                    };
+                    moves_to_in_review(&ready, role)
+                });
+            let facts = Facts {
+                pr,
+                moves,
+                points,
+                asks,
+                link,
+            };
+            Some(needs(action, item.kind, facts, &note.text))
         });
         let note = note
             .filter(|_| needs.is_none())
@@ -315,6 +335,8 @@ fn can_move_back(role: Option<ColumnRole>) -> bool {
 struct Facts {
     /// The dispatch's pull request, once read.
     pr: Option<u32>,
+    /// Whether marking it ready moves the item on to In review, as it does from In progress.
+    moves: bool,
     /// How many decision points the findings ask.
     points: usize,
     /// Whom the move to In review asks for a review.
@@ -324,17 +346,25 @@ struct Facts {
 
 fn needs(action: CardAction, kind: ItemKind, facts: Facts, note: &str) -> Needs {
     let pr = facts.pr.map_or_else(|| "the pull request".to_string(), |n| format!("PR #{n}"));
-    let ready_hint = match facts.asks {
-        Some(names) => format!(
+    let ready_hint = match (facts.moves, facts.asks) {
+        (false, _) => "Ready for review marks the PR ready.".to_string(),
+        (true, Some(names)) => format!(
             "Ready for review marks the PR ready, moves the item to In review and asks {names} \
              for a review."
         ),
-        None => "Ready for review marks the PR ready and moves the item to In review.".to_string(),
+        (true, None) => {
+            "Ready for review marks the PR ready and moves the item to In review.".to_string()
+        }
+    };
+    let then = if facts.moves {
+        " The item moves to In review once it is marked ready."
+    } else {
+        ""
     };
     let (title, text, hint) = match (action, kind) {
         (CardAction::ReadyForReview, ItemKind::PullRequest) => (
             "Draft pull request".to_string(),
-            format!("{pr} is a draft. The item moves to In review once it is marked ready."),
+            format!("{pr} is a draft.{then}"),
             ready_hint,
         ),
         (CardAction::ReadyForReview, _) => (
@@ -485,6 +515,7 @@ mod tests {
     fn facts(asks: Option<&str>) -> Facts {
         Facts {
             pr: Some(419),
+            moves: true,
             points: 2,
             asks: asks.map(str::to_string),
             link: Some(("Open PR", "https://github.com/acme/app/pull/419".into())),
@@ -609,6 +640,19 @@ mod tests {
         );
         let fork = needs(CardAction::StartFromFork, ItemKind::PullRequest, facts(None), "Fork");
         assert_eq!(fork.text, "Fork");
+    }
+
+    #[test]
+    fn ready_for_review_outside_in_progress_promises_only_the_ready_pull_request() {
+        let stays = || Facts {
+            moves: false,
+            ..facts(Some("ana"))
+        };
+        let issue = needs(CardAction::ReadyForReview, ItemKind::Issue, stays(), "");
+        assert_eq!(issue.hint, "Ready for review marks the PR ready.");
+        let draft = needs(CardAction::ReadyForReview, ItemKind::PullRequest, stays(), "");
+        assert_eq!(draft.text, "PR #419 is a draft.");
+        assert_eq!(draft.hint, "Ready for review marks the PR ready.");
     }
 
     #[test]
