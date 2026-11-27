@@ -38,7 +38,7 @@ static RUNNING: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 /// Run the setup script of `remote`'s default branch in the new `worktree` of `repo`, with its
 /// output in [`SETUP_LOG`]; nothing when that branch has none or this worktree already ran that
-/// same script. An error says why it failed.
+/// same script at its current commit. An error says why it failed.
 pub fn run_setup(repo: &Path, worktree: &Path, remote: &str) -> Result<()> {
     run_setup_within(repo, worktree, remote, SETUP_TIMEOUT)
 }
@@ -58,7 +58,9 @@ fn run_setup_within(repo: &Path, worktree: &Path, remote: &str, limit: Duration)
         return Ok(());
     };
     let done = git_dir(worktree)?.join(SETUP_DONE);
-    if std::fs::read_to_string(&done).is_ok_and(|ran| ran.trim() == blob) {
+    let head = run_git(worktree, &["rev-parse", "HEAD"])?.stdout;
+    let ran_for = format!("{blob} {}", String::from_utf8_lossy(&head).trim());
+    if std::fs::read_to_string(&done).is_ok_and(|ran| ran.trim() == ran_for) {
         return Ok(());
     }
     let script = run_git(repo, &["cat-file", "blob", &blob])?.stdout;
@@ -71,7 +73,7 @@ fn run_setup_within(repo: &Path, worktree: &Path, remote: &str, limit: Duration)
     let _ = std::fs::remove_file(&copy);
     match ran? {
         Ran::Exited(status) if status.success() => {
-            let _ = std::fs::write(&done, &blob);
+            let _ = std::fs::write(&done, &ran_for);
             Ok(())
         }
         Ran::Exited(status) => Err(failed(worktree, &exit_text(status))),
@@ -444,6 +446,21 @@ mod tests {
         run_setup(&repos.repo, &repos.worktree, "origin").unwrap();
         assert!(ran(&repos, "ran.txt").is_some());
         assert!(ran(&repos, "hacked.txt").is_none());
+    }
+
+    #[test]
+    fn a_setup_runs_again_once_the_worktree_moved_on() {
+        let Some(repos) = repos() else { return };
+        let once = ("Add-Content -Path count.txt -Value one\n", "echo one >> count.txt\n");
+        write_setup(&repos.upstream, once.0, once.1);
+        git(&repos.worktree, &["fetch", "-q", "origin"]);
+        git(&repos.worktree, &["merge", "-q", "--ff-only", "origin/main"]);
+        run_setup(&repos.repo, &repos.worktree, "origin").unwrap();
+        git(&repos.upstream, &["commit", "--allow-empty", "-m", "later", "-q"]);
+        git(&repos.worktree, &["fetch", "-q", "origin"]);
+        git(&repos.worktree, &["merge", "-q", "--ff-only", "origin/main"]);
+        run_setup(&repos.repo, &repos.worktree, "origin").unwrap();
+        assert_eq!(lines_in(&repos, "count.txt"), 2);
     }
 
     #[test]
