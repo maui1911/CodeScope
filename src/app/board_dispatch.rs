@@ -38,6 +38,7 @@ use codescope_core::board::pull_request::{
     Checks, PostedPullRequest, PullRequest, PullRequestComment, PullRequestHead, PullRequestState,
     moves_to_in_review, pull_request_comment, review_round_worked, round_pull_request,
 };
+use codescope_core::board::setup::run_setup;
 use codescope_core::board::reply::{read_reply, reply_problems_message};
 use codescope_core::board::repair::{
     Fault, FaultKind, REPAIR_ATTEMPTS, Repair, RepairStep, fault, repair_message, repair_step,
@@ -1055,6 +1056,9 @@ fn prepare_worktree(job: &mut Job) -> anyhow::Result<()> {
         set_fork_push(&job.repo, &job.branch, number, fork)?;
     }
     exclude_handover_files(&job.path)?;
+    if job.create {
+        run_setup(&job.repo, &job.path, &job.remote)?;
+    }
     match job.record.round {
         Round::Research => clear_findings(&job.path)?,
         Round::Review => {

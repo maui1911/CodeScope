@@ -1065,9 +1065,20 @@ board, each with their own CodeScope or another tool that follows the
   worktree, as skills do, so a skill can hand work to them. The CLI
   per phase stays local, because it depends on what the user has
   installed.
-* **Setup command.** A new worktree runs `.codescope/setup` from the
-  repository's default branch in the project folder, else the one in
-  `projects.json`, else nothing.
+* **Setup command.** A worktree the dispatch creates first runs the
+  repository's setup script, before the session gets its task:
+  `.codescope/setup.ps1` on Windows (with PowerShell) and
+  `.codescope/setup.sh` on macOS and Linux, one per OS so each is
+  written for its own shell. The script comes from the remote's default
+  branch, never from the item's branch, so a pull request cannot change
+  what runs. It runs in the worktree with `CODESCOPE_PROJECT` and
+  `CODESCOPE_WORKTREE` set, and its output goes to
+  `.codescope/setup.log`, which stays out of git like the handover
+  files. What it makes should be ignored by git, or cleanup keeps the
+  worktree for it. A setup that fails, or runs longer than 30 minutes,
+  stops the round, with its exit and the end of its log on the card;
+  the worktree stays, and the next move runs the setup again. Without a
+  script, the command in `projects.json` runs, else nothing.
 * **Skills come from the item's branch.** The agent loads skills and
   `CLAUDE.md` from the worktree, so a branch can change them for its
   own dispatch. A pull request item from a fork therefore needs the

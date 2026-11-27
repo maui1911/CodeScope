@@ -11,6 +11,7 @@ pub mod github;
 pub mod pull_request;
 pub mod repair;
 pub mod reply;
+pub mod setup;
 
 use std::collections::BTreeMap;
 

@@ -37,10 +37,11 @@ const SKILL_FOLDERS: [&str; 6] = [
     ".opencode",
     ".github",
 ];
-const EXCLUDED_FILES: [&str; 3] = [
+const EXCLUDED_FILES: [&str; 4] = [
     "/.codescope/dispatch.md",
     "/.codescope/findings.md",
     "/.codescope/reply.md",
+    "/.codescope/setup.log",
 ];
 
 /// The last move of an item on one board, from its issue's timeline.
@@ -2668,19 +2669,15 @@ mod tests {
     fn excludes_the_handover_files_once() {
         let existing = "# git ls-files\n*.log";
         let added = handover_exclude_lines(existing).unwrap();
-        assert_eq!(
-            added,
-            "\n/.codescope/dispatch.md\n/.codescope/findings.md\n/.codescope/reply.md\n"
-        );
+        let all = "/.codescope/dispatch.md\n/.codescope/findings.md\n/.codescope/reply.md\n\
+                   /.codescope/setup.log\n";
+        assert_eq!(added, format!("\n{all}"));
         assert_eq!(handover_exclude_lines(&format!("{existing}{added}")), None);
         assert_eq!(
             handover_exclude_lines("/.codescope/dispatch.md\n/.codescope/findings.md\n").unwrap(),
-            "/.codescope/reply.md\n"
+            "/.codescope/reply.md\n/.codescope/setup.log\n"
         );
-        assert_eq!(
-            handover_exclude_lines("").unwrap(),
-            "/.codescope/dispatch.md\n/.codescope/findings.md\n/.codescope/reply.md\n"
-        );
+        assert_eq!(handover_exclude_lines("").unwrap(), all);
     }
 
     #[test]
@@ -2695,7 +2692,8 @@ mod tests {
         exclude_handover_files(repo).unwrap();
         assert_eq!(
             std::fs::read_to_string(&exclude).unwrap(),
-            "*.log\n/.codescope/dispatch.md\n/.codescope/findings.md\n/.codescope/reply.md\n"
+            "*.log\n/.codescope/dispatch.md\n/.codescope/findings.md\n/.codescope/reply.md\n\
+             /.codescope/setup.log\n"
         );
     }
 
