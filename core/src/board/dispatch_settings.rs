@@ -1,6 +1,6 @@
-//! What a project sets for the dispatches on it (ADR-0027): the skill each round runs, and the
-//! setup command for a repository whose default branch has no setup script. Kept on the project
-//! in `projects.json`, empty by default.
+//! What a project sets for the dispatches on it (ADR-0027): the skill each round runs, the setup
+//! command for a repository whose default branch has no setup script, and the agent each phase
+//! runs. Kept on the project in `projects.json`, empty by default.
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -22,6 +22,33 @@ pub struct DispatchSettings {
     /// Windows, `sh -e` elsewhere.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "or_default")]
     pub setup_command: Option<String>,
+    /// The agent each phase's session runs, in place of the project's agent.
+    #[serde(
+        default,
+        skip_serializing_if = "PhaseAgents::is_empty",
+        deserialize_with = "or_default"
+    )]
+    pub agents: PhaseAgents,
+}
+
+/// Agents a project sets per phase, by their id in the agent list; `None` or an empty id runs
+/// the project's agent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhaseAgents {
+    /// Runs the research round.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "or_default")]
+    pub research: Option<String>,
+    /// Runs the implementation round, the review rounds and the repairs.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "or_default")]
+    pub implementation: Option<String>,
+}
+
+impl PhaseAgents {
+    /// Whether no agent is set.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Skill names a project sets; `None`, or a name [`is_skill_name`] refuses, keeps the default.
@@ -68,6 +95,16 @@ impl DispatchSettings {
     /// The skill a repair runs on this project.
     pub fn repair_skill(&self) -> &str {
         chosen(&self.skills.repair, REPAIR_SKILL)
+    }
+
+    /// The id of the agent that runs `round` on this project, when the project names one; a
+    /// repair runs the agent of the round it repairs.
+    pub fn agent(&self, round: Round) -> Option<&str> {
+        let set = match round {
+            Round::Research => &self.agents.research,
+            Round::Implementation | Round::Review => &self.agents.implementation,
+        };
+        set.as_deref().filter(|id| !id.is_empty())
     }
 }
 
@@ -121,7 +158,7 @@ mod tests {
     fn a_project_s_skill_names_replace_the_defaults() {
         let settings = DispatchSettings {
             skills: named("dig", "build-it", "answer-review", "fix-ci"),
-            setup_command: None,
+            ..DispatchSettings::default()
         };
         assert_eq!(settings.skill(Round::Research), "dig");
         assert_eq!(settings.skill(Round::Implementation), "build-it");
@@ -134,7 +171,7 @@ mod tests {
     fn a_name_that_can_t_name_a_skill_keeps_the_default() {
         let settings = DispatchSettings {
             skills: named("", "../outside", "Address-Review", "fix ci"),
-            setup_command: None,
+            ..DispatchSettings::default()
         };
         assert_eq!(settings.skill(Round::Research), "research");
         assert_eq!(settings.skill(Round::Implementation), "implement");
@@ -155,6 +192,29 @@ mod tests {
     }
 
     #[test]
+    fn each_phase_runs_the_agent_the_project_names_for_it() {
+        let settings = DispatchSettings {
+            agents: PhaseAgents {
+                research: Some("codex".into()),
+                implementation: Some("claude-code".into()),
+            },
+            ..DispatchSettings::default()
+        };
+        assert_eq!(settings.agent(Round::Research), Some("codex"));
+        assert_eq!(settings.agent(Round::Implementation), Some("claude-code"));
+        assert_eq!(settings.agent(Round::Review), Some("claude-code"), "review is implementation");
+        let unset = DispatchSettings {
+            agents: PhaseAgents {
+                research: Some(String::new()),
+                implementation: None,
+            },
+            ..DispatchSettings::default()
+        };
+        assert_eq!(unset.agent(Round::Research), None);
+        assert_eq!(unset.agent(Round::Implementation), None);
+    }
+
+    #[test]
     fn only_what_is_set_reaches_projects_json() {
         let empty = serde_json::to_string(&DispatchSettings::default()).unwrap();
         assert_eq!(empty, "{}");
@@ -164,9 +224,20 @@ mod tests {
                 ..SkillNames::default()
             },
             setup_command: Some("npm ci".into()),
+            ..DispatchSettings::default()
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert_eq!(json, r#"{"skills":{"addressReview":"answer-review"},"setupCommand":"npm ci"}"#);
         assert_eq!(serde_json::from_str::<DispatchSettings>(&json).unwrap(), settings);
+        let agents = DispatchSettings {
+            agents: PhaseAgents {
+                implementation: Some("codex".into()),
+                ..PhaseAgents::default()
+            },
+            ..DispatchSettings::default()
+        };
+        let json = serde_json::to_string(&agents).unwrap();
+        assert_eq!(json, r#"{"agents":{"implementation":"codex"}}"#);
+        assert_eq!(serde_json::from_str::<DispatchSettings>(&json).unwrap(), agents);
     }
 }

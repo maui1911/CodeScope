@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use codescope_core::board::dispatch::Round;
 use codescope_core::board::dispatch_settings::{
-    DispatchSettings, REPAIR_SKILL, SkillNames, is_skill_name,
+    DispatchSettings, PhaseAgents, REPAIR_SKILL, SkillNames, is_skill_name,
 };
 use codescope_core::board::setup::SETUP_SCRIPT;
 use codescope_core::{ProjectsConfig, Theme};
@@ -84,6 +84,7 @@ pub(crate) struct ProjectSettingsDialogState {
     focused: Input,
     fields: [TextField; 5],
     stored_command: Option<String>,
+    agents: PhaseAgents,
     error: Option<String>,
 }
 
@@ -163,6 +164,7 @@ fn read_settings(
             repair: skill_name(Input::Repair, repair)?,
         },
         setup_command: (!command.is_empty()).then(|| command.to_string()),
+        ..DispatchSettings::default()
     })
 }
 
@@ -201,6 +203,7 @@ impl AppShell {
             focused: Input::SetupCommand,
             fields: fields_of(&project.dispatch),
             stored_command: project.dispatch.setup_command.clone(),
+            agents: project.dispatch.agents.clone(),
             error: None,
         });
         cx.notify();
@@ -218,7 +221,7 @@ impl AppShell {
         };
         let texts = INPUTS.map(|input| state.field(input).text());
         let settings = match read_settings(texts, state.stored_command.as_deref()) {
-            Ok(settings) => settings,
+            Ok(settings) => DispatchSettings { agents: state.agents.clone(), ..settings },
             Err(err) => {
                 state.error = Some(err);
                 cx.notify();
@@ -606,6 +609,7 @@ mod tests {
                 ..SkillNames::default()
             },
             setup_command: Some("npm ci".into()),
+            ..DispatchSettings::default()
         };
         let fields = fields_of(&settings);
         let texts = INPUTS.map(|input| fields[input.index()].text());

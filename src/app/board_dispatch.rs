@@ -53,7 +53,7 @@ use codescope_core::board::{
 };
 use codescope_core::path_canon::paths_match;
 use codescope_core::process_tree;
-use codescope_core::{AgentProfile, SessionState, TelemetrySnapshot};
+use codescope_core::{AgentId, AgentProfile, SessionState, TelemetrySnapshot};
 use codescope_core::projects::{Project, ProjectKind, ProjectsConfig};
 use codescope_core::worktree_create::{PendingId, record_dispatch, record_posted_findings};
 use codescope_terminal::TerminalView;
@@ -844,8 +844,19 @@ fn findings_gate(tabs: &[(TabAtHandover, Turn)]) -> FindingsGate {
 
 struct Place {
     create: bool,
+    project_id: String,
     path: PathBuf,
     branch: String,
+}
+
+fn runs_another_agent(tab: Option<AgentId>, wanted: Option<AgentId>) -> bool {
+    matches!((tab, wanted), (Some(tab), Some(wanted)) if tab != wanted)
+}
+
+fn agent_kind(profile: &AgentProfile) -> Option<AgentId> {
+    codescope_core::agent_id_from_auto_type(
+        codescope_core::build_new_session_auto_type(profile).as_deref(),
+    )
 }
 
 fn fresh_access(
@@ -1347,9 +1358,10 @@ impl AppShell {
             .dispatch_records(cx)
             .into_iter()
             .find(|(_, _, _, r)| r.board_url == board_url && r.item_id == item.id);
-        if let Some((_, path, branch, _)) = existing {
+        if let Some((project_id, path, branch, _)) = existing {
             return Some(Place {
                 create: false,
+                project_id,
                 path,
                 branch: branch.or(new_branch)?,
             });
@@ -1361,6 +1373,7 @@ impl AppShell {
         let folder = sanitize_branch_to_folder(&branch);
         Some(Place {
             create: true,
+            project_id: project.id.clone(),
             path: PathBuf::from(project.worktree_root_path()).join(folder),
             branch,
         })
@@ -1482,9 +1495,11 @@ impl AppShell {
                         if failed_before {
                             continue;
                         }
-                        let target = self
-                            .place_of(&settings.url, item, head, cx)
-                            .map(|place| self.handover_target(&place.path, cx));
+                        let target = self.place_of(&settings.url, item, head, cx).map(|place| {
+                            let agent = self.round_agent_of(&place.project_id, round, cx);
+                            let wanted = agent.as_ref().and_then(agent_kind);
+                            self.handover_target(&place.path, wanted, cx)
+                        });
                         if let Some(HandoverTarget::Wait(hold)) = target {
                             holds.insert(item.id.clone(), hold);
                             continue;
@@ -1586,20 +1601,22 @@ impl AppShell {
             return;
         };
 
-        let profile = self.project_agent(&project);
+        let profile = self.round_agent(&project, round);
         let command = profile.as_ref().and_then(|profile| {
             codescope_core::build_new_session_auto_type(profile)
                 .and_then(|launch| launch_with_task(&launch, &task_message(item.kind, number)))
         });
-        let (Some(profile), Some(command)) = (profile, command) else {
-            let message = "The project's agent can't be handed a task yet. Claude Code, Codex, \
-                           Gemini CLI, Copilot and Pi can."
-                .to_string();
+        let (Some(profile), Some(command)) = (profile.clone(), command) else {
+            let agent = profile.map_or("The project's agent".to_string(), |p| p.display_name);
+            let message = format!(
+                "{agent} can't be handed a task yet. Claude Code, Codex, Gemini CLI, Copilot \
+                 and Pi can."
+            );
             self.fail_dispatch(&item.id, number, &trigger_at, message, cx);
             return;
         };
 
-        let Some(Place { create, path, branch }) =
+        let Some(Place { create, path, branch, .. }) =
             self.place_of(&board_url, &item, head.as_ref(), cx)
         else {
             return;
@@ -1824,7 +1841,8 @@ impl AppShell {
             self.drop_start(record, why, cx);
             return None;
         }
-        let terminal = match self.handover_target(&job.path, cx) {
+        let wanted = codescope_core::agent_id_from_auto_type(Some(&launch.command));
+        let terminal = match self.handover_target(&job.path, wanted, cx) {
             HandoverTarget::Type(terminal) => Some(terminal),
             HandoverTarget::NewTab => None,
             HandoverTarget::Wait(hold) => {
@@ -1949,9 +1967,14 @@ impl AppShell {
     }
 
     /// Where a task for the worktree at `path` goes: into a tab where Claude Code waits for a
-    /// prompt, into a new tab when nothing runs there, or nowhere yet, with the reason.
-    fn handover_target(&self, path: &Path, cx: &App) -> HandoverTarget {
-        let on_path = self.tabs_on(path);
+    /// prompt, into a new tab when nothing runs there, or nowhere yet, with the reason. A tab
+    /// known to run another agent than `wanted` doesn't count.
+    fn handover_target(&self, path: &Path, wanted: Option<AgentId>, cx: &App) -> HandoverTarget {
+        let on_path: Vec<_> = self
+            .tabs_on(path)
+            .into_iter()
+            .filter(|tab| !runs_another_agent(tab.agent_id, wanted))
+            .collect();
         if on_path.is_empty() {
             return HandoverTarget::NewTab;
         }
@@ -2842,6 +2865,18 @@ impl AppShell {
             .cloned()
     }
 
+    fn round_agent(&self, project: &Project, round: Round) -> Option<AgentProfile> {
+        let set = project.dispatch.agent(round);
+        set.and_then(|id| self.agent_registry.get_by_id(id))
+            .cloned()
+            .or_else(|| self.project_agent(project))
+    }
+
+    fn round_agent_of(&self, project_id: &str, round: Round, cx: &App) -> Option<AgentProfile> {
+        let project = self.current_projects(cx).project(project_id)?;
+        self.round_agent(project, round)
+    }
+
     pub(crate) fn open_dispatch_tab(
         &mut self,
         board_url: &str,
@@ -2849,7 +2884,7 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((project_id, path, branch, _)) = self
+        let Some((project_id, path, branch, record)) = self
             .dispatch_records(cx)
             .into_iter()
             .find(|(_, _, _, r)| r.board_url == board_url && r.item_id == item_id)
@@ -2869,7 +2904,7 @@ impl AppShell {
         let Some(project) = self.current_projects(cx).project(&project_id).cloned() else {
             return;
         };
-        let profile = self.project_agent(&project);
+        let profile = self.round_agent(&project, record.round);
         let auto_type = profile.as_ref().and_then(codescope_core::build_new_session_auto_type);
         let mut title = codescope_core::TabTitle::project(project.name);
         if let Some(branch) = branch.as_deref() {
@@ -3013,16 +3048,17 @@ impl AppShell {
     fn handover_route(
         &self,
         (project_id, path, branch): (&str, &Path, &str),
-        message: &str,
+        (round, message): (Round, &str),
         cx: &App,
     ) -> Option<Route> {
-        match self.handover_target(path, cx) {
+        let profile = self.round_agent_of(project_id, round, cx);
+        match self.handover_target(path, profile.as_ref().and_then(agent_kind), cx) {
             HandoverTarget::Type(terminal) => return Some(Route::Type(terminal)),
             HandoverTarget::NewTab => {}
             HandoverTarget::Wait(_) => return None,
         }
         let project = self.current_projects(cx).project(project_id)?;
-        let profile = self.project_agent(project)?;
+        let profile = profile?;
         let command = codescope_core::build_new_session_auto_type(&profile)
             .and_then(|launch| launch_with_task(&launch, message))?;
         let mut title = codescope_core::TabTitle::project(project.name.clone());
@@ -3157,7 +3193,7 @@ impl AppShell {
             return None;
         }
         let message = forward_message(record.number, comments.len());
-        let route = self.handover_route(place, &message, cx)?;
+        let route = self.handover_route(place, (record.round, &message), cx)?;
         let names = authors(comments);
         let at = codescope_core::time::now_iso8601();
         let handed = WorktreeDispatch {
@@ -3439,7 +3475,7 @@ impl AppShell {
             return waits;
         }
         let message = repair_message(record.number);
-        let Some(route) = self.handover_route(place, &message, cx) else {
+        let Some(route) = self.handover_route(place, (record.round, &message), cx) else {
             return waits;
         };
         let settings = self
@@ -4334,6 +4370,15 @@ mod tests {
                     NoteTone::NeedsYou
                 )
         );
+    }
+
+    #[test]
+    fn a_tab_counts_for_a_handover_unless_it_is_known_to_run_another_agent() {
+        use AgentId::{Claude, Codex};
+        assert!(runs_another_agent(Some(Claude), Some(Codex)));
+        assert!(!runs_another_agent(Some(Codex), Some(Codex)));
+        assert!(!runs_another_agent(None, Some(Codex)), "a shell, or an agent it can't name");
+        assert!(!runs_another_agent(Some(Claude), None), "the round's agent is one it can't name");
     }
 
     #[test]
