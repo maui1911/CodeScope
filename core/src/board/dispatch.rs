@@ -418,21 +418,30 @@ pub fn decide(
     )
 }
 
-/// Whether a round started on the move at `trigger_at` still has its item as `board` has it now:
-/// open, in a column that starts a round, and not moved since. `last_move` is `None` when unread.
+/// Whether `round`, started on the move at `trigger_at`, still has its item as `board` has it
+/// now: open, in the column that starts that round, and not moved since. `last_move` is `None`
+/// when unread.
 pub fn start_still_wanted(
     board: &Board,
     mapping: &ColumnMapping,
     item_id: &str,
+    round: Round,
     last_move: Option<&StatusChange>,
     trigger_at: &str,
 ) -> bool {
     let Some(item) = board.items.iter().find(|item| item.id == item_id) else {
         return false;
     };
-    let starts_a_round = board.role_of(item, mapping).and_then(Round::after_move).is_some();
+    let moved_to = board.role_of(item, mapping).and_then(Round::after_move);
     let unmoved = last_move.is_none_or(|change| change.created_at == trigger_at);
-    item.state == ItemState::Open && starts_a_round && unmoved
+    item.state == ItemState::Open && moved_to == Some(started_by(round)) && unmoved
+}
+
+fn started_by(round: Round) -> Round {
+    match round {
+        Round::Review => Round::Implementation,
+        round => round,
+    }
 }
 
 fn round_on(kind: ItemKind, moved_to: Round, pull_request: OwnPullRequest) -> Result<Round, Hold> {
@@ -3038,25 +3047,33 @@ mod tests {
         let board = board_with(issue_in("y"));
         let mapping = suggest_mapping(&board.columns);
         let change = moved_by("maui1911", "Ready");
-        assert!(start_still_wanted(&board, &mapping, "PVTI_1", Some(&change), MOVED));
-        assert!(start_still_wanted(&board, &mapping, "PVTI_1", None, MOVED), "moves unread");
+        let wanted = |board: &Board, round, change: Option<&StatusChange>| {
+            start_still_wanted(board, &mapping, "PVTI_1", round, change, MOVED)
+        };
+        assert!(wanted(&board, Round::Implementation, Some(&change)));
+        assert!(wanted(&board, Round::Review, Some(&change)), "Ready starts a review too");
+        assert!(wanted(&board, Round::Implementation, None), "moves unread");
         let again = StatusChange {
             created_at: NOW.into(),
             ..change.clone()
         };
-        assert!(!start_still_wanted(&board, &mapping, "PVTI_1", Some(&again), MOVED));
+        assert!(!wanted(&board, Round::Implementation, Some(&again)));
+        assert!(!wanted(&board, Round::Research, None), "Ready doesn't start research");
+        let research = board_with(issue_in("r"));
+        assert!(wanted(&research, Round::Research, None));
+        assert!(!wanted(&research, Round::Implementation, None));
         let backlog = board_with(issue_in("t"));
-        assert!(!start_still_wanted(&backlog, &mapping, "PVTI_1", Some(&change), MOVED));
+        assert!(!wanted(&backlog, Round::Implementation, Some(&change)));
         let closed = board_with(BoardItem {
             state: ItemState::Closed,
             ..issue_in("y")
         });
-        assert!(!start_still_wanted(&closed, &mapping, "PVTI_1", Some(&change), MOVED));
+        assert!(!wanted(&closed, Round::Implementation, Some(&change)));
         let gone = Board {
             items: Vec::new(),
             ..board.clone()
         };
-        assert!(!start_still_wanted(&gone, &mapping, "PVTI_1", Some(&change), MOVED));
+        assert!(!wanted(&gone, Round::Implementation, Some(&change)));
     }
 
     #[test]

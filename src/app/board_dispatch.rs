@@ -1696,6 +1696,10 @@ impl AppShell {
             self.fail_dispatch(&record.item_id, record.number, &record.trigger_at, message, cx);
             return None;
         }
+        if let Some(why) = self.unwanted_start(record) {
+            self.drop_start(record, why, cx);
+            return None;
+        }
         if job.create {
             self.board.dispatch.setting_up.insert(record.item_id.clone());
             cx.notify();
@@ -1703,19 +1707,25 @@ impl AppShell {
         Some(job)
     }
 
-    fn start_still_wanted(&self, record: &WorktreeDispatch) -> bool {
+    fn unwanted_start(&self, record: &WorktreeDispatch) -> Option<&'static str> {
         let Some(settings) = self.settings.boards.iter().find(|b| b.url == record.board_url) else {
-            return false;
+            return Some("Its board was removed.");
         };
-        let Some(read) = self.board.reads_by_url.get(&record.board_url) else {
-            return true;
-        };
-        let Some(board) = &read.last_good else {
-            return true;
-        };
+        let read = self.board.reads_by_url.get(&record.board_url)?;
+        let board = read.last_good.as_ref()?;
         let mapping = effective_mapping(board, &settings.columns);
         let last_move = read.triggers.as_ref().and_then(|t| t.changes.get(&record.content_id));
-        start_still_wanted(board, &mapping, &record.item_id, last_move, &record.trigger_at)
+        let (item_id, round, trigger_at) = (&record.item_id, record.round, &record.trigger_at);
+        let wanted = start_still_wanted(board, &mapping, item_id, round, last_move, trigger_at);
+        (!wanted).then_some("It moved or closed while its round was being prepared.")
+    }
+
+    fn drop_start(&mut self, record: &WorktreeDispatch, why: &'static str, cx: &mut Context<Self>) {
+        self.board.dispatch.starting.remove(&record.item_id);
+        let round = record.round.label().to_lowercase();
+        let title = format!("Didn't start {round} on #{}", record.number);
+        self.push_toast(ToastKind::Info, title, Some(why.into()), cx);
+        cx.notify();
     }
 
     /// Keep the started round on the worktree's row and hand the session its task; the job comes
@@ -1734,13 +1744,8 @@ impl AppShell {
             self.fail_dispatch(&record.item_id, record.number, &record.trigger_at, message, cx);
             return None;
         }
-        if !self.start_still_wanted(record) {
-            self.board.dispatch.starting.remove(&record.item_id);
-            let round = record.round.label().to_lowercase();
-            let title = format!("Didn't start {round} on #{}", record.number);
-            let detail = "It moved or closed while its round was being prepared.";
-            self.push_toast(ToastKind::Info, title, Some(detail.into()), cx);
-            cx.notify();
+        if let Some(why) = self.unwanted_start(record) {
+            self.drop_start(record, why, cx);
             return None;
         }
         let terminal = match self.handover_target(&job.path, cx) {
