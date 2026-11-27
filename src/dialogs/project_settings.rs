@@ -5,15 +5,16 @@ use std::sync::Arc;
 
 use codescope_core::board::dispatch::Round;
 use codescope_core::board::dispatch_settings::{
-    DispatchSettings, PhaseAgents, REPAIR_SKILL, SkillNames, is_skill_name, reviewers_in,
+    DispatchSettings, PhaseAgents, REPAIR_SKILL, SkillNames, is_reviewer, is_skill_name,
+    reviewers_in,
 };
 use codescope_core::board::setup::SETUP_SCRIPT;
 use codescope_core::{ProjectsConfig, Theme};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window,
-    anchored, deferred, div, point, px,
+    MouseDownEvent, ParentElement, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
+    Window, anchored, deferred, div, point, px,
 };
 
 use crate::app::{AppShell, ToastKind};
@@ -70,6 +71,14 @@ impl Input {
             Input::Implement => Round::Implementation.skill(),
             Input::AddressReview => Round::Review.skill(),
             Input::Repair => REPAIR_SKILL,
+        }
+    }
+
+    fn section(self) -> usize {
+        match self {
+            Input::SetupCommand => 0,
+            Input::Research | Input::Implement | Input::AddressReview | Input::Repair => 2,
+            Input::Reviewers => 3,
         }
     }
 
@@ -161,6 +170,7 @@ pub(crate) struct ProjectSettingsDialogState {
     project_name: String,
     focused: Input,
     fields: [TextField; 6],
+    scroll: ScrollHandle,
     stored_command: Option<String>,
     agents: PhaseAgents,
     agent_choices: Vec<(String, String)>,
@@ -212,8 +222,18 @@ fn fields_of(settings: &DispatchSettings) -> [TextField; 6] {
         text(&skills.implement),
         text(&skills.address_review),
         text(&skills.repair),
-        TextField::with_text(settings.reviewers.join(", ")),
+        TextField::with_text(reviewers_of(settings)),
     ]
+}
+
+fn reviewers_of(settings: &DispatchSettings) -> String {
+    let valid: Vec<&str> = settings
+        .reviewers
+        .iter()
+        .map(String::as_str)
+        .filter(|name| is_reviewer(name))
+        .collect();
+    valid.join(", ")
 }
 
 fn skill_name(input: Input, text: &str) -> Result<Option<String>, String> {
@@ -293,6 +313,7 @@ impl AppShell {
             project_name: project.name.clone(),
             focused: Input::SetupCommand,
             fields: fields_of(&project.dispatch),
+            scroll: ScrollHandle::new(),
             stored_command: project.dispatch.setup_command.clone(),
             agents: project.dispatch.agents.clone(),
             agent_choices,
@@ -359,6 +380,7 @@ impl AppShell {
     fn focus_project_settings_input(&mut self, input: Input, cx: &mut Context<Self>) {
         if let Some(state) = self.project_settings_dialog.as_mut() {
             state.focused = input;
+            state.scroll.scroll_to_item(input.section());
             self.wake_text_blink(cx);
             cx.notify();
         }
@@ -583,6 +605,7 @@ impl AppShell {
             .id("project-settings-body")
             .max_h(px(fits.max(BODY_AT_LEAST)))
             .overflow_y_scroll()
+            .track_scroll(&state.scroll)
             .px_5()
             .flex()
             .flex_col()
@@ -797,6 +820,16 @@ mod tests {
         let texts = INPUTS.map(|input| fields[input.index()].text());
         assert_eq!(texts, ["npm ci", "", "build-it", "", "", "ana, acme/web"]);
         assert_eq!(read_settings(texts, None).unwrap(), settings);
+    }
+
+    #[test]
+    fn a_stored_reviewer_that_isn_t_one_stays_out_of_the_field_and_isn_t_split() {
+        let settings = DispatchSettings {
+            reviewers: vec!["ana".into(), "ana k".into(), "acme/web".into()],
+            ..DispatchSettings::default()
+        };
+        let fields = fields_of(&settings);
+        assert_eq!(fields[Input::Reviewers.index()].text(), "ana, acme/web");
     }
 
     #[test]
