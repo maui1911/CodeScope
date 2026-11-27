@@ -1,6 +1,7 @@
 //! Answers to decision points, as the board protocol shapes them: the comment CodeScope posts
-//! for the user, and which comments on the issue count as answers.
+//! for the user, and which comments on the issue or pull request count as answers.
 
+use super::ItemKind;
 use super::findings::{DecisionPoint, is_marker_line};
 
 /// A comment on an issue or pull request.
@@ -150,21 +151,28 @@ pub fn chosen(answers: &[Answer]) -> Vec<(String, char)> {
 
 /// The `## Answers` section of the implementation task file. `None` when the comments couldn't
 /// be read.
-pub fn answers_section(answers: Option<&[Answer]>, findings_url: &str) -> String {
+pub fn answers_section(
+    answers: Option<&[Answer]>,
+    findings_url: &str,
+    kind: ItemKind,
+) -> String {
+    let noun = kind.noun();
     let Some(answers) = answers else {
         return format!(
-            "## Answers\n\nCodeScope couldn't read them. They are in the issue's comments after \
+            "## Answers\n\nCodeScope couldn't read them. They are in the {noun}'s comments after \
              the findings: {findings_url}\n"
         );
     };
     if answers.is_empty() {
-        return "## Answers\n\nNobody answered the findings on the issue before it moved to \
-                Ready. Where they leave a choice, take the advice.\n"
-            .to_string();
+        return format!(
+            "## Answers\n\nNobody answered the findings on the {noun} before it moved to Ready. \
+             Where they leave a choice, take the advice.\n"
+        );
     }
-    let mut section = "## Answers\n\nThese comments on the issue answer the findings, oldest \
-                       first. Where they choose an option, it replaces the advice.\n"
-        .to_string();
+    let mut section = format!(
+        "## Answers\n\nThese comments on the {noun} answer the findings, oldest first. Where \
+         they choose an option, it replaces the advice.\n"
+    );
     for answer in answers {
         let quoted: Vec<String> = answer
             .body
@@ -321,14 +329,44 @@ mod tests {
             body: "B1 B\n\nKeep it small.\n".into(),
         }];
         assert_eq!(
-            answers_section(Some(&answers), "https://f"),
+            answers_section(Some(&answers), "https://f", ItemKind::Issue),
             "## Answers\n\nThese comments on the issue answer the findings, oldest first. Where \
              they choose an option, it replaces the advice.\n\n\
              From @sanne at 2026-11-25T18:00:00Z (https://c/1):\n\n\
              > B1 B\n>\n> Keep it small.\n\n\
              Chosen: B1 B.\n"
         );
-        assert!(answers_section(Some(&[]), "https://f").contains("Nobody answered"));
-        assert!(answers_section(None, "https://f").ends_with("after the findings: https://f\n"));
+        assert!(
+            answers_section(Some(&[]), "https://f", ItemKind::Issue).contains("Nobody answered")
+        );
+        assert!(
+            answers_section(None, "https://f", ItemKind::Issue)
+                .ends_with("after the findings: https://f\n")
+        );
+    }
+
+    #[test]
+    fn the_answers_to_research_on_a_pull_request_item_are_on_the_pull_request() {
+        let answers = [Answer {
+            author: "sanne".into(),
+            created_at: "2026-11-25T18:00:00Z".into(),
+            url: "https://c/1".into(),
+            choices: pairs(&[("B1", 'B')]),
+            body: "B1 B\n".into(),
+        }];
+        let item = ItemKind::PullRequest;
+        let section = answers_section(Some(&answers), "https://f", item);
+        assert!(
+            section.starts_with("## Answers\n\nThese comments on the pull request answer"),
+            "{section}"
+        );
+        assert!(
+            answers_section(Some(&[]), "https://f", item)
+                .contains("Nobody answered the findings on the pull request before")
+        );
+        assert!(
+            answers_section(None, "https://f", item)
+                .contains("They are in the pull request's comments after the findings")
+        );
     }
 }
