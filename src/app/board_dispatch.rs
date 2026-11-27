@@ -849,6 +849,11 @@ struct Place {
     branch: String,
 }
 
+struct SessionOf {
+    agent: Option<AgentId>,
+    working: Option<bool>,
+}
+
 fn runs_another_agent(tab: Option<AgentId>, wanted: Option<AgentId>) -> bool {
     matches!((tab, wanted), (Some(tab), Some(wanted)) if tab != wanted)
 }
@@ -1935,6 +1940,11 @@ impl AppShell {
             .collect()
     }
 
+    fn round_tabs(&self, path: &Path, agent: Option<AgentId>) -> Vec<&super::Tab> {
+        let tabs = self.tabs_on(path).into_iter();
+        tabs.filter(|tab| !runs_another_agent(tab.agent_id, agent)).collect()
+    }
+
     fn tab_states(&self, tabs: &[&super::Tab], path: &Path, cx: &App) -> Vec<TabAtHandover> {
         if tabs.is_empty() {
             return Vec::new();
@@ -1970,11 +1980,7 @@ impl AppShell {
     /// prompt, into a new tab when nothing runs there, or nowhere yet, with the reason. A tab
     /// known to run another agent than `wanted` doesn't count.
     fn handover_target(&self, path: &Path, wanted: Option<AgentId>, cx: &App) -> HandoverTarget {
-        let on_path: Vec<_> = self
-            .tabs_on(path)
-            .into_iter()
-            .filter(|tab| !runs_another_agent(tab.agent_id, wanted))
-            .collect();
+        let on_path = self.round_tabs(path, wanted);
         if on_path.is_empty() {
             return HandoverTarget::NewTab;
         }
@@ -2016,7 +2022,7 @@ impl AppShell {
         state.findings_announced.retain(|key| awaiting.contains(key));
         let held_before = std::mem::take(&mut state.findings_held);
 
-        for (_, path, _, record) in records {
+        for (project_id, path, _, record) in records {
             let key = round_key(&record);
             let state = &self.board.dispatch;
             let waiting_to_retry = state
@@ -2039,7 +2045,8 @@ impl AppShell {
             let Some(file) = read_findings(&path) else {
                 continue;
             };
-            let remind = match self.session_at(&path, cx) {
+            let agent = self.round_agent_kind(&project_id, record.round, cx);
+            let remind = match self.session_at(&path, agent, cx) {
                 SessionAt::Working => continue,
                 SessionAt::Held(by) => {
                     self.board.dispatch.findings_held.insert(key, by);
@@ -2069,8 +2076,8 @@ impl AppShell {
         }
     }
 
-    fn session_at(&self, path: &Path, cx: &App) -> SessionAt {
-        let tabs = self.tabs_on(path);
+    fn session_at(&self, path: &Path, agent: Option<AgentId>, cx: &App) -> SessionAt {
+        let tabs = self.round_tabs(path, agent);
         let states = self.tab_states(&tabs, path, cx);
         let probed: Vec<(TabAtHandover, Turn)> = tabs
             .iter()
@@ -2092,8 +2099,8 @@ impl AppShell {
         snapshot.map_or(Turn::Unknown, |snap| turn_of(snap.state, snap.quiet_timeout))
     }
 
-    fn telemetry_at(&self, path: &Path) -> Option<TelemetrySnapshot> {
-        let mut sessions = self.tabs_on(path).into_iter().filter_map(|tab| {
+    fn telemetry_at(&self, path: &Path, agent: Option<AgentId>) -> Option<TelemetrySnapshot> {
+        let mut sessions = self.round_tabs(path, agent).into_iter().filter_map(|tab| {
             tab.adopted_session_id.as_deref().and_then(|sid| self.telemetry_for(sid))
         });
         sessions.next()
@@ -2376,13 +2383,14 @@ impl AppShell {
             .dispatch
             .watches
             .retain(|id, _| records.iter().any(|(_, _, _, r)| r.item_id == *id));
-        for (_, path, branch, record) in records {
+        for (project_id, path, branch, record) in records {
             let Some(branch) = branch else {
                 continue;
             };
             let role = self.item_role(&record.board_url, &record.item_id);
+            let agent = self.round_agent_kind(&project_id, record.round, cx);
             let session = self
-                .telemetry_at(&path)
+                .telemetry_at(&path, agent)
                 .map(|snapshot| (super::notified_state(&snapshot), snapshot.turn_count));
             let claude = session.is_some();
             let seen_from_start = self.board.dispatch.seen_from_start.contains(&round_key(&record));
@@ -2446,7 +2454,7 @@ impl AppShell {
                 );
             }
             if record.round == Round::Review {
-                self.check_review_round(&record, &path, claude, cx);
+                self.check_review_round(&record, &path, (claude, agent), cx);
             }
         }
     }
@@ -2455,7 +2463,7 @@ impl AppShell {
         &mut self,
         record: &WorktreeDispatch,
         path: &Path,
-        claude: bool,
+        (claude, agent): (bool, Option<AgentId>),
         cx: &mut Context<Self>,
     ) {
         let Some(watch) = self.board.dispatch.watches.get(&record.item_id) else {
@@ -2471,7 +2479,7 @@ impl AppShell {
         };
         let file = read_reply(path).filter(|_| review.reply_url.is_none());
         let reply = file.as_ref().map(|file| file.reply());
-        let gate = self.session_at(path, cx);
+        let gate = self.session_at(path, agent, cx);
         let Some(watch) = self.board.dispatch.watches.get_mut(&record.item_id) else {
             return;
         };
@@ -2877,6 +2885,10 @@ impl AppShell {
         self.round_agent(project, round)
     }
 
+    fn round_agent_kind(&self, project_id: &str, round: Round, cx: &App) -> Option<AgentId> {
+        self.round_agent_of(project_id, round, cx).as_ref().and_then(agent_kind)
+    }
+
     pub(crate) fn open_dispatch_tab(
         &mut self,
         board_url: &str,
@@ -3033,15 +3045,19 @@ impl AppShell {
                 continue;
             };
             let place = (project_id.as_str(), path.as_path(), branch.as_str());
-            let mut working = None;
+            let mut working = SessionOf {
+                agent: self.round_agent_kind(&project_id, record.round, cx),
+                working: None,
+            };
             let record = self.forward_comments(place, record, &mut working, window, cx);
             self.run_repair(place, &record, &mut working, window, cx);
         }
     }
 
-    fn is_working(&self, path: &Path, cx: &App, known: &mut Option<bool>) -> bool {
-        *known.get_or_insert_with(|| {
-            matches!(self.session_at(path, cx), SessionAt::Working | SessionAt::Held(_))
+    fn is_working(&self, path: &Path, cx: &App, session: &mut SessionOf) -> bool {
+        let agent = session.agent;
+        *session.working.get_or_insert_with(|| {
+            matches!(self.session_at(path, agent, cx), SessionAt::Working | SessionAt::Held(_))
         })
     }
 
@@ -3089,7 +3105,7 @@ impl AppShell {
         &mut self,
         place: (&str, &Path, &str),
         record: WorktreeDispatch,
-        working: &mut Option<bool>,
+        working: &mut SessionOf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> WorktreeDispatch {
@@ -3108,7 +3124,7 @@ impl AppShell {
                 Some(ForwardNote::Posting)
             }
             ForwardStep::FixReply(problems) => {
-                self.fix_forward_reply(&record, path, &problems, cx);
+                self.fix_forward_reply(&record, (path, working.agent), &problems, cx);
                 Some(ForwardNote::FixReply)
             }
             ForwardStep::Forward(comments) => {
@@ -3130,7 +3146,7 @@ impl AppShell {
         &mut self,
         record: &WorktreeDispatch,
         path: &Path,
-        working: &mut Option<bool>,
+        working: &mut SessionOf,
         cx: &App,
     ) -> Option<(PullRequest, ForwardStep)> {
         let watch = self.board.dispatch.watches.get(&record.item_id)?;
@@ -3315,14 +3331,14 @@ impl AppShell {
     fn fix_forward_reply(
         &mut self,
         record: &WorktreeDispatch,
-        path: &Path,
+        (path, agent): (&Path, Option<AgentId>),
         problems: &[Problem],
         cx: &mut Context<Self>,
     ) {
         let Some(file) = read_reply(path) else {
             return;
         };
-        let remind = match self.session_at(path, cx) {
+        let remind = match self.session_at(path, agent, cx) {
             SessionAt::Done(remind) => remind,
             SessionAt::Working | SessionAt::Held(_) => Remind::Nothing,
         };
@@ -3369,7 +3385,7 @@ impl AppShell {
         &mut self,
         place: (&str, &Path, &str),
         record: &WorktreeDispatch,
-        working: &mut Option<bool>,
+        working: &mut SessionOf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -3409,7 +3425,7 @@ impl AppShell {
         &mut self,
         record: &WorktreeDispatch,
         path: &Path,
-        working: &mut Option<bool>,
+        working: &mut SessionOf,
         cx: &App,
     ) -> Option<(PullRequest, RepairStep)> {
         let watch = self.board.dispatch.watches.get(&record.item_id)?;
