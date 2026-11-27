@@ -205,7 +205,7 @@ pub fn repair_task(
          request.",
         "When a conflict needs a choice about what the code should do, or the failure doesn't \
          come from this branch (the base is red too, or a test is flaky), push nothing: say why \
-         here and stop.",
+         in the session and stop.",
         "Post no comments on the issue or the pull request. Don't move the item on the board: \
          CodeScope does that.",
     ]
@@ -430,7 +430,7 @@ mod tests {
              another pull request.",
             "- When a conflict needs a choice about what the code should do, or the failure \
              doesn't come from this branch (the base is red too, or a test is flaky), push \
-             nothing: say why here and stop.",
+             nothing: say why in the session and stop.",
             "- Post no comments on the issue or the pull request. Don't move the item on the \
              board: CodeScope does that.",
         ] {
