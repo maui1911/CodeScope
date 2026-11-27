@@ -1066,7 +1066,12 @@ board, each with their own CodeScope or another tool that follows the
   repository (such as `.claude/agents/`) reach the session through the
   worktree, as skills do, so a skill can hand work to them. The CLI
   per phase stays local, because it depends on what the user has
-  installed.
+  installed: a project can set one CLI for research and one for
+  implementation, which also runs the review rounds and the repairs,
+  and each defaults to the project's agent. A handover passes over a
+  tab known to run another CLI, so the first round of a phase with
+  another CLI starts a new session in the same worktree, from the
+  findings, and the earlier session stays as it is.
 * **Setup command.** A worktree the dispatch creates first runs the
   repository's setup script, before the session gets its task:
   `.codescope/setup.ps1` on Windows (with PowerShell) and
@@ -1098,7 +1103,9 @@ board, each with their own CodeScope or another tool that follows the
   replaces a team's setup.
 * **Project settings.** *Project settings…* in a repository project's
   context menu holds what one user's CodeScope sets for that project:
-  the setup command and the name of each round's skill. They live in
+  the setup command, the CLI per phase and the name of each round's
+  skill. The CLIs to choose from are the agents CodeScope can hand a
+  task to; one that is gone runs the project's agent. They live in
   `projects.json` with the project, not in the repository, because
   they depend on what the user has installed. The dialog refuses a
   name that isn't a skill name (lowercase letters, digits and single

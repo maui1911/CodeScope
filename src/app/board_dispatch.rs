@@ -2889,6 +2889,23 @@ impl AppShell {
         self.round_agent_of(project_id, round, cx).as_ref().and_then(agent_kind)
     }
 
+    pub(crate) fn round_agents(
+        &self,
+        project: &Project,
+    ) -> (Vec<(String, String)>, Option<String>) {
+        let choices = self
+            .agent_registry
+            .get_all()
+            .iter()
+            .filter(|profile| {
+                codescope_core::build_new_session_auto_type(profile)
+                    .is_some_and(|launch| launch_with_task(&launch, "").is_some())
+            })
+            .map(|profile| (profile.id.clone(), profile.display_name.clone()))
+            .collect();
+        (choices, self.project_agent(project).map(|profile| profile.display_name))
+    }
+
     pub(crate) fn open_dispatch_tab(
         &mut self,
         board_url: &str,
