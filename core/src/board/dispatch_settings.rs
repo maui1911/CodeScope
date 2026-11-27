@@ -2,23 +2,25 @@
 //! setup command for a repository whose default branch has no setup script. Kept on the project
 //! in `projects.json`, empty by default.
 
-use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::dispatch::Round;
 
 /// The skill a repair runs unless the project names another.
 pub const REPAIR_SKILL: &str = "repair";
 
-/// What a project sets for its dispatches; left empty, dispatches run as without it.
+/// What a project sets for its dispatches; left empty, dispatches run as without it. A value of
+/// a shape this build can't read counts as not set.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DispatchSettings {
     /// Skill names that replace `research`, `implement`, `address-review` and `repair`.
-    #[serde(default, skip_serializing_if = "SkillNames::is_empty")]
+    #[serde(default, skip_serializing_if = "SkillNames::is_empty", deserialize_with = "or_default")]
     pub skills: SkillNames,
     /// Runs in a new worktree whose default branch has no setup script: with PowerShell on
     /// Windows, `sh -e` elsewhere.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "or_default")]
     pub setup_command: Option<String>,
 }
 
@@ -27,16 +29,16 @@ pub struct DispatchSettings {
 #[serde(rename_all = "camelCase")]
 pub struct SkillNames {
     /// Replaces `research`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "or_default")]
     pub research: Option<String>,
     /// Replaces `implement`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "or_default")]
     pub implement: Option<String>,
     /// Replaces `address-review`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "or_default")]
     pub address_review: Option<String>,
     /// Replaces [`REPAIR_SKILL`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "or_default")]
     pub repair: Option<String>,
 }
 
@@ -67,6 +69,15 @@ impl DispatchSettings {
     pub fn repair_skill(&self) -> &str {
         chosen(&self.skills.repair, REPAIR_SKILL)
     }
+}
+
+pub(crate) fn or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: DeserializeOwned + Default,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 fn chosen<'a>(set: &'a Option<String>, default: &'a str) -> &'a str {
