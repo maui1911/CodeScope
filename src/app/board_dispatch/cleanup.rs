@@ -70,6 +70,7 @@ impl AppShell {
             path: path.to_path_buf(),
             branch,
             remote,
+            linked_at: record.linked_at.clone(),
         };
         Some(Target {
             project_id,

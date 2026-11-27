@@ -620,6 +620,24 @@ pub fn parse_last_thread_reply(json: &str) -> Result<Option<String>> {
         }))
 }
 
+/// Create `branch` at commit `oid` on the repository of issue `issue_id` (a node id), linked to
+/// that issue, so a pull request from it closes the issue.
+pub fn create_linked_branch(issue_id: &str, oid: &str, branch: &str) -> Result<()> {
+    let query = r#"mutation($issue: ID!, $oid: GitObjectID!, $name: String!) {
+  createLinkedBranch(input: { issueId: $issue, oid: $oid, name: $name }) { linkedBranch { id } }
+}"#;
+    let stdout = run_graphql(
+        &[
+            format!("query={query}"),
+            format!("issue={issue_id}"),
+            format!("oid={oid}"),
+            format!("name={branch}"),
+        ],
+        &[],
+    )?;
+    parse_data::<serde_json::Value>(&stdout).map(|_| ())
+}
+
 /// Mark a draft pull request ready for review, by its node id.
 pub fn mark_ready_for_review(pull_request_id: &str) -> Result<()> {
     let query = r#"mutation($id: ID!) {

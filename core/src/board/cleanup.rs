@@ -71,6 +71,8 @@ pub struct Dispatched {
     pub branch: String,
     /// The project's remote for the item's repository.
     pub remote: String,
+    /// The commit CodeScope made the branch at on the remote; set when it did.
+    pub linked_at: Option<String>,
 }
 
 /// What the worktree or its branch holds that `ended` doesn't keep elsewhere; `None` when
@@ -146,8 +148,9 @@ fn is_ancestor(repo: &Path, commit: &str, of: &str) -> bool {
     run_git(repo, &["merge-base", "--is-ancestor", commit, of]).is_ok()
 }
 
-/// Remove the worktree and its branch once [`kept`] finds nothing; otherwise remove nothing and
-/// say what it found. A folder git let go of but Windows still holds gets 10 s to come free.
+/// Remove the worktree and its branch once [`kept`] finds nothing, and the branch CodeScope made
+/// on the remote while it is where CodeScope made it; otherwise remove nothing and say what it
+/// found. A folder git let go of but Windows still holds gets 10 s to come free.
 pub fn clean_up(d: &Dispatched, ended: &Ended) -> Result<Option<Kept>> {
     if let Some(found) = kept(d, ended)? {
         return Ok(Some(found));
@@ -163,8 +166,29 @@ pub fn clean_up(d: &Dispatched, ended: &Ended) -> Result<Option<Kept>> {
         let branch = &d.branch;
         eprintln!("warning: removed the worktree of {branch} but kept the branch: {err:#}");
     }
+    if let Some(linked_at) = &d.linked_at
+        && let Err(err) = remove_untouched_remote_branch(d, linked_at)
+    {
+        let (remote, branch) = (&d.remote, &d.branch);
+        eprintln!("warning: kept {branch} on {remote}: {err:#}");
+    }
     remove_folder(&d.path)?;
     Ok(None)
+}
+
+fn remove_untouched_remote_branch(d: &Dispatched, linked_at: &str) -> Result<()> {
+    let reference = format!("refs/heads/{}", d.branch);
+    let listed = run_git(&d.repo, &["ls-remote", "--heads", &d.remote, &reference])?;
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    let untouched = listed
+        .lines()
+        .any(|line| line.split_once('\t') == Some((linked_at, reference.as_str())));
+    if !untouched {
+        return Ok(());
+    }
+    let lease = format!("--force-with-lease={reference}:{linked_at}");
+    let delete = format!(":{reference}");
+    run_git(&d.repo, &["push", "--quiet", &lease, &d.remote, &delete]).map(|_| ())
 }
 
 fn remove_folder(path: &Path) -> Result<()> {
@@ -281,6 +305,7 @@ mod tests {
             path,
             branch: "456-clean-up".into(),
             remote: "origin".into(),
+            linked_at: None,
         };
         Some(Repos {
             dir,
@@ -386,6 +411,41 @@ mod tests {
         assert_eq!(listed.matches("worktree ").count(), 1);
     }
 
+    fn on_the_remote(repos: &Repos) -> Option<String> {
+        let branch = format!("refs/heads/{}", repos.dispatched.branch);
+        let found = git(&repos.upstream, &["for-each-ref", "--format=%(objectname)", &branch]);
+        (!found.is_empty()).then_some(found)
+    }
+
+    #[test]
+    fn the_branch_it_made_on_the_remote_goes_while_nothing_was_pushed_to_it() {
+        let Some(mut repos) = dispatched() else { return };
+        let base = git(&repos.dispatched.path, &["rev-parse", "HEAD"]);
+        git(&repos.upstream, &["branch", &repos.dispatched.branch, &base]);
+        repos.dispatched.linked_at = Some(base);
+        assert_eq!(clean_up(&repos.dispatched, &Ended::Closed).unwrap(), None);
+        assert_eq!(on_the_remote(&repos), None);
+    }
+
+    #[test]
+    fn a_branch_on_the_remote_stays_when_it_moved_or_wasn_t_made_here() {
+        let Some(repos) = dispatched() else { return };
+        let base = git(&repos.dispatched.path, &["rev-parse", "HEAD"]);
+        let branch = repos.dispatched.branch.clone();
+        git(&repos.upstream, &["branch", &branch, &base]);
+        assert_eq!(clean_up(&repos.dispatched, &Ended::Closed).unwrap(), None);
+        assert_eq!(on_the_remote(&repos), Some(base), "not made by CodeScope");
+
+        let Some(mut repos) = dispatched() else { return };
+        let base = git(&repos.dispatched.path, &["rev-parse", "HEAD"]);
+        let tree = format!("{base}^{{tree}}");
+        let pushed = git(&repos.upstream, &["commit-tree", "-p", &base, "-m", "pushed", &tree]);
+        git(&repos.upstream, &["branch", &branch, &pushed]);
+        repos.dispatched.linked_at = Some(base);
+        assert_eq!(clean_up(&repos.dispatched, &Ended::Closed).unwrap(), None);
+        assert_eq!(on_the_remote(&repos), Some(pushed), "someone pushed to it");
+    }
+
     fn link_folder(target: &Path, link: &Path) {
         #[cfg(windows)]
         {
@@ -472,6 +532,7 @@ mod tests {
             repair: None,
             forwarded: None,
             kept: None,
+            linked_at: None,
         };
         assert!(!serde_json::to_string(&row).unwrap().contains("kept"));
         row.kept = Some(Kept::OwnCommits);

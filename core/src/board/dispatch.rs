@@ -149,6 +149,10 @@ pub struct WorktreeDispatch {
     /// Set when its work ended but the worktree stays, so cleanup removed nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kept: Option<Kept>,
+    /// The commit CodeScope made the branch at on the host, linked to the issue; set when it
+    /// did, so cleanup removes that branch again while nothing was pushed to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_at: Option<String>,
 }
 
 /// The dispatch's session, after CodeScope handed it a repair or comments.
@@ -1241,6 +1245,30 @@ fn fetch_branch(repo: &Path, remote: &str, branch: &str) -> Result<String> {
     Ok(fetched)
 }
 
+/// The commit where the branch of `worktree` left `remote`'s default branch, fetched now: a branch
+/// made there on the host takes a push of the local branch as a fast-forward.
+pub fn branch_base(repo: &Path, worktree: &Path, remote: &str) -> Result<String> {
+    let default_branch = remote_default_branch(repo, remote)?;
+    let fetched = fetch_branch(repo, remote, &default_branch)?;
+    let output = run_git(worktree, &["merge-base", "HEAD", &fetched])?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Whether `remote` has a branch named `branch`.
+pub fn remote_has_branch(repo: &Path, remote: &str, branch: &str) -> Result<bool> {
+    let reference = format!("refs/heads/{branch}");
+    let output = run_git(repo, &["ls-remote", "--heads", remote, &reference])?;
+    Ok(!output.stdout.is_empty())
+}
+
+/// Fetch `branch` of `remote` and make the local branch of that name track it, so a plain
+/// `git push` goes there.
+pub fn track_remote_branch(repo: &Path, remote: &str, branch: &str) -> Result<()> {
+    fetch_branch(repo, remote, branch)?;
+    let upstream = format!("{remote}/{branch}");
+    run_git(repo, &["branch", "--set-upstream-to", &upstream, branch]).map(|_| ())
+}
+
 const FETCH_ATTEMPTS: u32 = 3;
 const FETCH_RETRY_AFTER: Duration = Duration::from_millis(500);
 
@@ -1456,6 +1484,7 @@ mod tests {
             repair: None,
             forwarded: None,
             kept: None,
+            linked_at: None,
         }
     }
 
@@ -2999,6 +3028,41 @@ mod tests {
         git(&upstream, &["checkout", "-q", "main"]);
         let fetched = fetch_branch_head(&repo, "origin", "keep-palette-open").unwrap();
         assert_eq!(fetched, head(&upstream, "keep-palette-open"));
+    }
+
+    #[test]
+    fn a_linked_branch_starts_where_the_dispatch_s_branch_left_the_default_branch() {
+        if no_window_command("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (upstream, repo) = upstream_with_branch(dir.path(), "keep-palette-open");
+        let issue = dir.path().join("repo.worktrees").join("14-palette");
+        add_dispatch_worktree(&repo, &issue, "14-palette", "origin").unwrap();
+        let left_at = head(&issue, "HEAD");
+        git(&issue, &["commit", "--allow-empty", "-m", "mine", "-q"]);
+        git(&upstream, &["commit", "--allow-empty", "-m", "merged meanwhile", "-q"]);
+        assert_eq!(branch_base(&repo, &issue, "origin").unwrap(), left_at);
+    }
+
+    #[test]
+    fn a_branch_the_host_made_is_tracked_so_a_plain_push_goes_there() {
+        if no_window_command("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (upstream, repo) = upstream_with_branch(dir.path(), "keep-palette-open");
+        let issue = dir.path().join("repo.worktrees").join("14-palette");
+        add_dispatch_worktree(&repo, &issue, "14-palette", "origin").unwrap();
+        assert!(!remote_has_branch(&repo, "origin", "14-palette").unwrap());
+        assert!(remote_has_branch(&repo, "origin", "keep-palette-open").unwrap());
+        let base = branch_base(&repo, &issue, "origin").unwrap();
+        git(&upstream, &["branch", "14-palette", &base]);
+        assert!(remote_has_branch(&repo, "origin", "14-palette").unwrap());
+        track_remote_branch(&repo, "origin", "14-palette").unwrap();
+        git(&issue, &["commit", "--allow-empty", "-m", "mine", "-q"]);
+        git(&issue, &["push", "-q"]);
+        assert_eq!(head(&upstream, "14-palette"), head(&issue, "HEAD"));
     }
 
     #[test]

@@ -445,6 +445,7 @@ mod tests {
             repair: None,
             forwarded: None,
             kept: None,
+            linked_at: None,
         };
         let path = "/repo.worktrees/411-fuzzy-paths";
         assert!(record_dispatch(&mut cfg, &id, path, "411-fuzzy-paths", research.clone()));
@@ -489,6 +490,7 @@ mod tests {
             repair: None,
             forwarded: None,
             kept: None,
+            linked_at: None,
         };
         let path = "/repo.worktrees/411-fuzzy-paths";
         assert!(record_dispatch(&mut cfg, &id, path, "411-fuzzy-paths", research.clone()));
