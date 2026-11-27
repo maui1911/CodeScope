@@ -15,7 +15,7 @@ use gpui::{
     px,
 };
 
-use crate::app::AppShell;
+use crate::app::{AppShell, ToastKind};
 use crate::text_field::{TextField, focused_caret_style, render_input_content};
 use crate::theme;
 
@@ -83,6 +83,7 @@ pub(crate) struct ProjectSettingsDialogState {
     project_name: String,
     focused: Input,
     fields: [TextField; 5],
+    stored_command: Option<String>,
     error: Option<String>,
 }
 
@@ -96,8 +97,30 @@ impl ProjectSettingsDialogState {
     }
 }
 
+fn one_line(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+    lines.join("; ")
+}
+
+fn pasted_line(input: Input, text: &str) -> Result<String, String> {
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let first = lines.next().unwrap_or_default().to_string();
+    if lines.next().is_none() {
+        return Ok(first);
+    }
+    Err(match input {
+        Input::SetupCommand => format!(
+            "The setup command is one line: separate commands with ; or put them in \
+             {SETUP_SCRIPT}."
+        ),
+        _ => "A skill's name is one line.".to_string(),
+    })
+}
+
 fn fields_of(settings: &DispatchSettings) -> [TextField; 5] {
-    let text = |value: &Option<String>| TextField::with_text(value.clone().unwrap_or_default());
+    let text = |value: &Option<String>| {
+        TextField::with_text(value.as_deref().map(one_line).unwrap_or_default())
+    };
     let skills = &settings.skills;
     [
         text(&settings.setup_command),
@@ -123,9 +146,15 @@ fn skill_name(input: Input, text: &str) -> Result<Option<String>, String> {
     Ok(Some(name.to_string()))
 }
 
-fn read_settings(texts: [&str; 5]) -> Result<DispatchSettings, String> {
+fn read_settings(
+    texts: [&str; 5],
+    stored_command: Option<&str>,
+) -> Result<DispatchSettings, String> {
     let [command, research, implement, address_review, repair] = texts;
-    let command = command.trim();
+    let command = match stored_command {
+        Some(stored) if command == one_line(stored) => stored.trim(),
+        _ => command.trim(),
+    };
     Ok(DispatchSettings {
         skills: SkillNames {
             research: skill_name(Input::Research, research)?,
@@ -147,6 +176,19 @@ impl AppShell {
         if self.project_settings_dialog.is_some() {
             return;
         }
+        match ProjectsConfig::load(self.paths_ref()) {
+            Ok(projects) => self.projects = projects,
+            Err(err) => {
+                let detail = format!("Couldn't read projects.json: {err:#}");
+                self.push_toast(
+                    ToastKind::Err,
+                    "Can't open project settings",
+                    Some(detail.into()),
+                    cx,
+                );
+                return;
+            }
+        }
         let Some(project) = self.projects.project(project_id).cloned() else {
             return;
         };
@@ -158,6 +200,7 @@ impl AppShell {
             project_name: project.name.clone(),
             focused: Input::SetupCommand,
             fields: fields_of(&project.dispatch),
+            stored_command: project.dispatch.setup_command.clone(),
             error: None,
         });
         cx.notify();
@@ -174,7 +217,7 @@ impl AppShell {
             return;
         };
         let texts = INPUTS.map(|input| state.field(input).text());
-        let settings = match read_settings(texts) {
+        let settings = match read_settings(texts, state.stored_command.as_deref()) {
             Ok(settings) => settings,
             Err(err) => {
                 state.error = Some(err);
@@ -473,9 +516,18 @@ fn handle_key_down(
     cx.stop_propagation();
     let keystroke = &event.keystroke;
     if crate::text_field::is_paste_chord(keystroke) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            let line = text.lines().next().unwrap_or_default().trim().to_string();
-            shell.edit_project_settings_input(cx, |field| field.insert_str(&line));
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        let Some(state) = shell.project_settings_dialog.as_mut() else {
+            return;
+        };
+        match pasted_line(state.focused, &text) {
+            Ok(line) => shell.edit_project_settings_input(cx, |field| field.insert_str(&line)),
+            Err(err) => {
+                state.error = Some(err);
+                cx.notify();
+            }
         }
         return;
     }
@@ -515,13 +567,14 @@ mod tests {
 
     #[test]
     fn an_empty_form_sets_nothing() {
-        let settings = read_settings(["", " ", "", "", ""]).unwrap();
+        let settings = read_settings(["", " ", "", "", ""], None).unwrap();
         assert!(settings.is_empty());
     }
 
     #[test]
     fn a_command_and_names_are_kept_without_the_spaces_around_them() {
-        let settings = read_settings([" npm ci ", "dig", "", " answer-review", "fix-ci "]).unwrap();
+        let texts = [" npm ci ", "dig", "", " answer-review", "fix-ci "];
+        let settings = read_settings(texts, None).unwrap();
         assert_eq!(settings.setup_command.as_deref(), Some("npm ci"));
         assert_eq!(settings.skills.research.as_deref(), Some("dig"));
         assert_eq!(settings.skills.implement, None);
@@ -531,13 +584,13 @@ mod tests {
 
     #[test]
     fn a_default_name_typed_out_sets_nothing() {
-        let settings = read_settings(["", "research", "implement", "address-review", "repair"]);
-        assert!(settings.unwrap().is_empty());
+        let texts = ["", "research", "implement", "address-review", "repair"];
+        assert!(read_settings(texts, None).unwrap().is_empty());
     }
 
     #[test]
     fn a_name_that_can_t_name_a_skill_says_which_and_why() {
-        let err = read_settings(["", "", "", "", "Fix CI"]).unwrap_err();
+        let err = read_settings(["", "", "", "", "Fix CI"], None).unwrap_err();
         assert_eq!(
             err,
             "\u{201c}Fix CI\u{201d} can't be the Repair skill: a skill's name has lowercase \
@@ -557,7 +610,34 @@ mod tests {
         let fields = fields_of(&settings);
         let texts = INPUTS.map(|input| fields[input.index()].text());
         assert_eq!(texts, ["npm ci", "", "build-it", "", ""]);
-        assert_eq!(read_settings(texts).unwrap(), settings);
+        assert_eq!(read_settings(texts, None).unwrap(), settings);
+    }
+
+    #[test]
+    fn a_command_of_several_lines_shows_on_one_line_and_stays_as_it_was() {
+        let stored = "npm ci\r\n\n  npm run build\n";
+        let settings = DispatchSettings {
+            setup_command: Some(stored.into()),
+            ..DispatchSettings::default()
+        };
+        let fields = fields_of(&settings);
+        let shown = fields[Input::SetupCommand.index()].text();
+        assert_eq!(shown, "npm ci; npm run build");
+        let kept = read_settings([shown, "", "", "", ""], Some(stored)).unwrap();
+        assert_eq!(kept.setup_command.as_deref(), Some(stored.trim()));
+        let changed = read_settings(["npm ci", "", "", "", ""], Some(stored)).unwrap();
+        assert_eq!(changed.setup_command.as_deref(), Some("npm ci"));
+        let cleared = read_settings(["", "", "", "", ""], Some(stored)).unwrap();
+        assert_eq!(cleared.setup_command, None);
+    }
+
+    #[test]
+    fn a_paste_takes_one_line() {
+        assert_eq!(pasted_line(Input::Research, "dig\r\n"), Ok("dig".to_string()));
+        assert_eq!(pasted_line(Input::SetupCommand, "\n npm ci \n"), Ok("npm ci".to_string()));
+        let err = pasted_line(Input::SetupCommand, "npm ci\nnpm run build").unwrap_err();
+        assert!(err.starts_with("The setup command is one line"), "{err}");
+        assert!(pasted_line(Input::Repair, "fix\nci").is_err());
     }
 
     #[test]
