@@ -3,6 +3,7 @@
 //! GitHub Projects board through `gh`.
 
 pub mod answers;
+pub mod cleanup;
 pub mod dispatch;
 pub mod findings;
 pub mod forward;

@@ -123,6 +123,7 @@ impl AppShell {
                     this.collect_findings(cx);
                     this.watch_pull_requests(cx);
                     this.run_handovers(window, cx);
+                    this.run_cleanups(window, cx);
                     this.begin_board_read(false, cx)
                 }) else {
                     break;

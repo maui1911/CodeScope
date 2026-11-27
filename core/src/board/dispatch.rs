@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use super::findings::Outcome;
+use super::cleanup::Kept;
 use super::forward::Forwarded;
 use super::repair::Repair;
 use super::pull_request::{LinkedPullRequest, PostedPullRequest, PullRequestHead};
@@ -141,6 +142,9 @@ pub struct WorktreeDispatch {
     /// The comments on that pull request last handed to the session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarded: Option<Forwarded>,
+    /// Set when its work ended but the worktree stays, so cleanup removed nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept: Option<Kept>,
 }
 
 /// The dispatch's session, after CodeScope handed it a repair or comments.
@@ -262,6 +266,22 @@ impl Hold {
     /// Whether the item is none of the user's business, so its card shows nothing.
     pub fn is_quiet(&self) -> bool {
         matches!(self, Hold::AssignedToOther(_) | Hold::Handled)
+    }
+
+    /// Whether a round still starts without another move, once what holds it clears: a busy
+    /// session, a read to come, or a free slot.
+    pub fn starts_later(&self) -> bool {
+        matches!(
+            self,
+            Hold::SessionBusy
+                | Hold::UnsentInput
+                | Hold::SessionStopped
+                | Hold::OtherProgram
+                | Hold::LimitReached(_)
+                | Hold::MoveNotShownYet
+                | Hold::AccessUnknown(_)
+                | Hold::PullRequestUnread
+        )
     }
 
     /// One line for the item's card.
@@ -1223,7 +1243,7 @@ fn add_worktree_from(
     .map(|_| ())
 }
 
-fn remote_default_branch(repo: &Path, remote: &str) -> Result<String> {
+pub(crate) fn remote_default_branch(repo: &Path, remote: &str) -> Result<String> {
     let output = run_git(repo, &["ls-remote", "--symref", remote, "HEAD"])?;
     String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -1368,6 +1388,7 @@ mod tests {
             fork: None,
             repair: None,
             forwarded: None,
+            kept: None,
         }
     }
 
@@ -2190,6 +2211,23 @@ mod tests {
             ..facts(&change)
         };
         assert_eq!(run_decide(issue_in("y"), &full), Some(Err(Hold::LimitReached(3))));
+    }
+
+    #[test]
+    fn a_hold_that_clears_by_itself_still_starts_a_round() {
+        let later = [
+            Hold::SessionBusy,
+            Hold::UnsentInput,
+            Hold::SessionStopped,
+            Hold::OtherProgram,
+            Hold::LimitReached(3),
+            Hold::MoveNotShownYet,
+            Hold::AccessUnknown("octo".into()),
+            Hold::PullRequestUnread,
+        ];
+        assert!(later.iter().all(Hold::starts_later));
+        let never = [Hold::Closed, Hold::Handled, Hold::NoMove, Hold::MovedByOther("octo".into())];
+        assert!(!never.iter().any(Hold::starts_later));
     }
 
     #[test]

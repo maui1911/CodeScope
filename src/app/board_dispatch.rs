@@ -56,6 +56,8 @@ use codescope_terminal::TerminalView;
 use gpui::{App, AppContext as _, Context, Entity, SharedString, Window};
 
 use super::{AppShell, ToastKind};
+
+mod cleanup;
 use crate::dialogs::confirm::ConfirmSpec;
 use crate::dialogs::new_worktree::sanitize_branch_to_folder;
 use crate::notifications::NotificationKind;
@@ -106,6 +108,8 @@ pub(crate) struct DispatchState {
     /// research round on an item with a pull request.
     watches: HashMap<String, PullRequestWatch>,
     seen_from_start: HashSet<RoundKey>,
+    /// Item id → the cleanup of a dispatch whose work ended.
+    cleanups: HashMap<String, cleanup::Cleanup>,
 }
 
 /// What the board poll knows about the pull request of an implementation or review round, and
@@ -1592,6 +1596,7 @@ impl AppShell {
                 fork,
                 repair: None,
                 forwarded: None,
+                kept: None,
             },
             assign_to: item.assignees.is_empty().then_some(content_id),
             board,
@@ -3381,7 +3386,8 @@ impl AppShell {
                     }
                 });
                 let handover = state.watches.get(&r.item_id).and_then(handover_card);
-                (r.item_id, handover.or(watched).unwrap_or(note))
+                let cleanup = self.cleanup_card(&r);
+                (r.item_id, cleanup.or(handover).or(watched).unwrap_or(note))
             })
             .collect();
         for key in state.posting.iter().filter(|key| rounds.contains(*key)) {
@@ -4399,6 +4405,7 @@ mod tests {
             fork: None,
             repair: None,
             forwarded: None,
+            kept: None,
         }
     }
 
@@ -4485,7 +4492,7 @@ mod tests {
         let mut watch = PullRequestWatch::default();
         assert!(watch.read_due(Some(ColumnRole::InProgress), false));
         assert!(!watch.read_due(Some(ColumnRole::Done), false), "no open pull request to follow");
-        watch.read_at = Some(Instant::now());
+        watch.read_at = Some(Instant::now() - Duration::from_secs(1));
         assert!(!watch.read_due(Some(ColumnRole::InProgress), false));
         watch.track(Some((SessionState::Busy, 4)));
         watch.track(Some((SessionState::Idle, 4)));
