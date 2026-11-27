@@ -122,6 +122,7 @@ impl AppShell {
                     this.run_dispatch(window, cx);
                     this.collect_findings(cx);
                     this.watch_pull_requests(cx);
+                    this.run_repairs(window, cx);
                     this.begin_board_read(false, cx)
                 }) else {
                     break;

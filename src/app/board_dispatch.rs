@@ -34,6 +34,10 @@ use codescope_core::board::pull_request::{
     pull_request_comment, review_round_worked, round_pull_request,
 };
 use codescope_core::board::reply::{read_reply, reply_problems_message};
+use codescope_core::board::repair::{
+    Fault, FaultKind, REPAIR_ATTEMPTS, Repair, RepairSession, RepairStep, fault,
+    repair_message, repair_step, repair_task,
+};
 use codescope_core::board::{
     Board, BoardItem, BoardRef, ColumnMapping, ColumnRole, ItemKind, effective_mapping,
     mapped_column,
@@ -61,6 +65,8 @@ const LAUNCH_GRACE: Duration = Duration::from_secs(30);
 const MAX_REMINDERS: u32 = 3;
 const POST_RETRY: Duration = Duration::from_secs(120);
 const PULL_REQUEST_READ_EVERY: Duration = Duration::from_secs(30);
+/// GitHub registers a push's checks and works out its mergeability a while after the push.
+const HEALTHY_BEFORE_REPAIRS_RESET: Duration = Duration::from_secs(120);
 
 #[derive(Default)]
 pub(crate) struct DispatchState {
@@ -133,6 +139,14 @@ struct PullRequestWatch {
     reply_reminder: Option<Reminder>,
     review_held: Option<HeldBy>,
     settled_since: Option<Instant>,
+    repair_started: Option<String>,
+    repair_worked: bool,
+    repair_stopped_at: Option<Instant>,
+    repair_turns: Option<u32>,
+    repair_note: Option<RepairNote>,
+    repair_rang: Option<(Option<String>, RepairNote)>,
+    healthy_since: Option<(String, Instant)>,
+    repair_failed_at: Option<Instant>,
 }
 
 impl PullRequestWatch {
@@ -971,15 +985,19 @@ fn prepare_worktree(job: &mut Job) -> anyhow::Result<()> {
         }
         Round::Implementation => {}
     }
-    let home = codescope_core::paths::home_dir();
-    let skill = find_skill(&job.path, home.as_deref(), job.record.round.skill()).map(|skill| {
-        skill
-            .strip_prefix(&job.path)
-            .map(|relative| relative.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|_| skill.to_string_lossy().into_owned())
-    });
+    let skill = skill_in(&job.path, job.record.round.skill());
     let answers = job.answers_from.as_ref().map(|from| answers_for_task(job, from));
     write_task_file(&job.path, &task_file(&job.record, skill.as_deref(), answers.as_deref()))
+}
+
+fn skill_in(worktree: &Path, name: &str) -> Option<String> {
+    let home = codescope_core::paths::home_dir();
+    let skill = find_skill(worktree, home.as_deref(), name)?;
+    let shown = match skill.strip_prefix(worktree) {
+        Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
+        Err(_) => skill.to_string_lossy().into_owned(),
+    };
+    Some(shown)
 }
 
 fn refresh_start_head(job: &mut Job) {
@@ -1491,6 +1509,7 @@ impl AppShell {
                 pull_request,
                 review,
                 fork,
+                repair: None,
             },
             assign_to: item.assignees.is_empty().then_some(content_id),
             board,
@@ -2700,6 +2719,222 @@ impl AppShell {
         cx.notify();
     }
 
+    pub(crate) fn run_repairs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let records: Vec<_> = self
+            .dispatch_records(cx)
+            .into_iter()
+            .filter(|(_, _, _, r)| r.kind == ItemKind::Issue && r.round == Round::Implementation)
+            .collect();
+        for (project_id, path, branch, record) in records {
+            let Some(branch) = branch else {
+                continue;
+            };
+            let Some((pr, step)) = self.next_repair(&record, &path, cx) else {
+                self.note_repair(&record, &path, None, cx);
+                continue;
+            };
+            let note = match step {
+                RepairStep::Nothing => None,
+                RepairStep::Clear => {
+                    let healthy = WorktreeDispatch {
+                        repair: None,
+                        ..record.clone()
+                    };
+                    if let Err(err) = self.save_record(&project_id, &path, &branch, healthy, cx) {
+                        let number = record.number;
+                        eprintln!("warning: couldn't forget the repairs of #{number}: {err}");
+                    }
+                    None
+                }
+                RepairStep::Running => {
+                    record.repair.as_ref().map(|r| RepairNote::Running(r.fault, r.attempts))
+                }
+                RepairStep::StoppedWithoutPush => {
+                    record.repair.as_ref().map(|r| RepairNote::Stopped(r.fault))
+                }
+                RepairStep::GaveUp(fault) => Some(RepairNote::GaveUp(fault.kind())),
+                RepairStep::Start { fault, attempt } => {
+                    let place = (project_id.as_str(), path.as_path(), branch.as_str());
+                    self.start_repair(place, &record, &pr, (fault, attempt), window, cx)
+                }
+            };
+            self.note_repair(&record, &path, note, cx);
+        }
+    }
+
+    fn next_repair(
+        &mut self,
+        record: &WorktreeDispatch,
+        path: &Path,
+        cx: &App,
+    ) -> Option<(PullRequest, RepairStep)> {
+        let watch = self.board.dispatch.watches.get(&record.item_id)?;
+        let reported = record.pull_request.is_some() || watch.reported.is_some();
+        let pr = watch.pull_request.clone().filter(|_| reported)?;
+        let repair = record.repair.as_ref();
+        if repair.is_none() && fault(&pr).is_none() {
+            return Some((pr, RepairStep::Nothing));
+        }
+        let role = self.item_role(&record.board_url, &record.item_id);
+        let working = matches!(self.session_at(path, cx), SessionAt::Working | SessionAt::Held(_));
+        let started = repair.map(|r| r.started_at.clone());
+        let watch = self.board.dispatch.watches.get_mut(&record.item_id)?;
+        if watch.repair_started != started {
+            watch.repair_started = started;
+            watch.repair_worked = true;
+            watch.repair_stopped_at = None;
+        }
+        let new_turn = watch.turns > watch.repair_turns;
+        watch.repair_turns = watch.turns;
+        watch.repair_worked |= working || new_turn;
+        if working {
+            watch.repair_stopped_at = None;
+        } else if new_turn {
+            watch.repair_stopped_at = Some(Instant::now());
+        } else {
+            watch.repair_stopped_at.get_or_insert_with(Instant::now);
+        }
+        let active = repair.is_some_and(|r| r.head == pr.head_oid);
+        let session = repair_session(
+            working,
+            active,
+            watch.repair_worked,
+            watch.repair_stopped_at,
+            watch.read_ok_at,
+        );
+        let step = match repair_step(&pr, repair, session, role) {
+            RepairStep::Clear => {
+                let read = watch.read_ok_at?;
+                let first = match &watch.healthy_since {
+                    Some((head, at)) if *head == pr.head_oid => *at,
+                    _ => read,
+                };
+                watch.healthy_since = Some((pr.head_oid.clone(), first));
+                if read.duration_since(first) >= HEALTHY_BEFORE_REPAIRS_RESET {
+                    RepairStep::Clear
+                } else {
+                    RepairStep::Nothing
+                }
+            }
+            step => {
+                watch.healthy_since = None;
+                step
+            }
+        };
+        Some((pr, step))
+    }
+
+    fn start_repair(
+        &mut self,
+        (project_id, path, branch): (&str, &Path, &str),
+        record: &WorktreeDispatch,
+        pr: &PullRequest,
+        (fault, attempt): (Fault, u32),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<RepairNote> {
+        let waits = Some(RepairNote::Waits(fault.kind()));
+        let watch = self.board.dispatch.watches.get(&record.item_id);
+        let failed_at = watch.and_then(|watch| watch.repair_failed_at);
+        if failed_at.is_some_and(|at| at.elapsed() < POST_RETRY) {
+            return waits;
+        }
+        let terminal = match self.handover_target(path, cx) {
+            HandoverTarget::Type(terminal) => Some(terminal),
+            HandoverTarget::NewTab => None,
+            HandoverTarget::Wait(_) => return waits,
+        };
+        let project = self.current_projects(cx).project(project_id).cloned()?;
+        let message = repair_message(record.number);
+        let launch = self.project_agent(&project).and_then(|profile| {
+            let command = codescope_core::build_new_session_auto_type(&profile)
+                .and_then(|launch| launch_with_task(&launch, &message))?;
+            let mut title = codescope_core::TabTitle::project(project.name.clone());
+            title.set_branch(branch);
+            Some(Launch {
+                project_id: project_id.to_string(),
+                title,
+                agent_id: profile.id.clone(),
+                command,
+            })
+        });
+        if terminal.is_none() && launch.is_none() {
+            return waits;
+        }
+        let skill = skill_in(path, "repair");
+        let task = repair_task(record, pr, &fault, skill.as_deref());
+        let started_at = codescope_core::time::now_iso8601();
+        let repaired = WorktreeDispatch {
+            repair: Some(Repair {
+                attempts: attempt,
+                fault: fault.kind(),
+                started_at: started_at.clone(),
+                head: pr.head_oid.clone(),
+            }),
+            ..record.clone()
+        };
+        let saved = write_task_file(path, &task)
+            .map_err(|err| format!("{err:#}"))
+            .and_then(|()| self.save_record(project_id, path, branch, repaired, cx));
+        if let Err(message) = saved {
+            if let Some(watch) = self.board.dispatch.watches.get_mut(&record.item_id) {
+                watch.repair_failed_at = Some(Instant::now());
+            }
+            let title = format!("Couldn't start the repair of #{}", record.number);
+            self.push_toast(ToastKind::Err, title, Some(message.into()), cx);
+            return waits;
+        }
+        if let Some(watch) = self.board.dispatch.watches.get_mut(&record.item_id) {
+            watch.repair_started = Some(started_at);
+            watch.repair_worked = false;
+            watch.repair_stopped_at = None;
+            watch.repair_turns = watch.turns;
+        }
+        match (terminal, launch) {
+            (Some(terminal), _) => Self::submit_line(&terminal, message, cx),
+            (None, Some(launch)) => self.hand_over(path, None, launch, message, window, cx),
+            (None, None) => {}
+        }
+        let title = format!("Repair started on #{}", record.number);
+        self.push_toast(ToastKind::Ok, title, Some(fault.kind().label().into()), cx);
+        Some(RepairNote::Running(fault.kind(), attempt))
+    }
+
+    fn note_repair(
+        &mut self,
+        record: &WorktreeDispatch,
+        path: &Path,
+        note: Option<RepairNote>,
+        cx: &mut Context<Self>,
+    ) {
+        let tab_title = self.tab_title_at(path);
+        let Some(watch) = self.board.dispatch.watches.get_mut(&record.item_id) else {
+            return;
+        };
+        if watch.repair_note != note {
+            watch.repair_note = note;
+            cx.notify();
+        }
+        let Some(note) = note else {
+            return;
+        };
+        let rang_for = (record.repair.as_ref().map(|r| r.started_at.clone()), note);
+        if watch.repair_rang.as_ref() == Some(&rang_for) {
+            return;
+        }
+        let Some(detail) = repair_bell(note) else {
+            return;
+        };
+        watch.repair_rang = Some(rang_for);
+        self.push_notification(
+            NotificationKind::SessionWaiting,
+            format!("#{} waits for you", record.number),
+            detail,
+            tab_title,
+            cx,
+        );
+    }
+
     /// What each card on the board at `board_url` says about dispatch, by item id.
     pub(crate) fn card_notes(&self, board_url: &str, cx: &App) -> HashMap<String, CardNote> {
         let state = &self.board.dispatch;
@@ -2740,7 +2975,12 @@ impl AppShell {
                         }
                     }
                 });
-                (r.item_id, watched.unwrap_or(note))
+                let repair = state
+                    .watches
+                    .get(&r.item_id)
+                    .and_then(|watch| watch.repair_note)
+                    .map(repair_card);
+                (r.item_id, repair.or(watched).unwrap_or(note))
             })
             .collect();
         for key in state.posting.iter().filter(|key| rounds.contains(*key)) {
@@ -2926,6 +3166,70 @@ pub(crate) fn work_after_research(kind: ItemKind) -> &'static str {
     match kind {
         ItemKind::PullRequest => "a review",
         ItemKind::Issue | ItemKind::Draft => "implementation",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepairNote {
+    Running(FaultKind, u32),
+    Waits(FaultKind),
+    Stopped(FaultKind),
+    GaveUp(FaultKind),
+}
+
+fn repair_card(note: RepairNote) -> CardNote {
+    match note {
+        RepairNote::Running(kind, attempt) => {
+            let doing = match kind {
+                FaultKind::Checks => "Repairing failed checks",
+                FaultKind::Conflict => "Resolving a conflict with its base",
+                FaultKind::Behind => "Catching up with its base",
+            };
+            let text = format!("{doing} · {attempt} of {REPAIR_ATTEMPTS}");
+            CardNote::new(text, NoteTone::Working)
+        }
+        RepairNote::Waits(kind) => {
+            let text = format!("{} · the repair waits for its session", kind.label());
+            CardNote::new(text, NoteTone::Waiting)
+        }
+        RepairNote::Stopped(_) => CardNote::new(
+            "The repair stopped without a push · see its session",
+            NoteTone::NeedsYou,
+        ),
+        RepairNote::GaveUp(kind) => {
+            let text = format!("{} after {REPAIR_ATTEMPTS} repairs · it needs you", kind.label());
+            CardNote::new(text, NoteTone::NeedsYou)
+        }
+    }
+}
+
+fn repair_bell(note: RepairNote) -> Option<String> {
+    match note {
+        RepairNote::Stopped(_) => Some("The repair stopped without a push.".into()),
+        RepairNote::GaveUp(kind) => {
+            Some(format!("{} after {REPAIR_ATTEMPTS} repairs.", kind.label()))
+        }
+        RepairNote::Running(..) | RepairNote::Waits(_) => None,
+    }
+}
+
+fn repair_session(
+    working: bool,
+    active: bool,
+    worked: bool,
+    stopped_at: Option<Instant>,
+    read_ok_at: Option<Instant>,
+) -> RepairSession {
+    if working {
+        return RepairSession::Busy;
+    }
+    let read_since_stop = stopped_at
+        .zip(read_ok_at)
+        .is_some_and(|(stop, read)| read > stop);
+    if active && worked && read_since_stop {
+        RepairSession::StoppedAfterRepair
+    } else {
+        RepairSession::Idle
     }
 }
 
@@ -3375,6 +3679,67 @@ mod tests {
     }
 
     #[test]
+    fn a_repair_s_card_says_what_it_repairs_and_when_it_needs_you() {
+        let card = |note| {
+            let card = repair_card(note);
+            (card.text.to_string(), card.tone)
+        };
+        assert!(
+            card(RepairNote::Running(FaultKind::Checks, 1))
+                == ("Repairing failed checks · 1 of 2".into(), NoteTone::Working)
+        );
+        assert!(
+            card(RepairNote::Running(FaultKind::Conflict, 2))
+                == ("Resolving a conflict with its base · 2 of 2".into(), NoteTone::Working)
+        );
+        assert!(
+            card(RepairNote::Running(FaultKind::Behind, 1))
+                == ("Catching up with its base · 1 of 2".into(), NoteTone::Working)
+        );
+        assert!(
+            card(RepairNote::Waits(FaultKind::Checks))
+                == ("Checks failed · the repair waits for its session".into(), NoteTone::Waiting)
+        );
+        assert!(
+            card(RepairNote::Stopped(FaultKind::Checks))
+                == (
+                    "The repair stopped without a push · see its session".into(),
+                    NoteTone::NeedsYou
+                )
+        );
+        assert!(
+            card(RepairNote::GaveUp(FaultKind::Conflict))
+                == (
+                    "It conflicts with its base after 2 repairs · it needs you".into(),
+                    NoteTone::NeedsYou
+                )
+        );
+    }
+
+    #[test]
+    fn a_repair_stopped_short_only_when_a_read_after_its_stop_saw_the_same_head() {
+        let stop = Instant::now();
+        let later = stop + Duration::from_secs(5);
+        assert!(repair_session(true, true, true, None, Some(stop)) == RepairSession::Busy);
+        assert!(
+            repair_session(false, true, true, Some(stop), Some(later))
+                == RepairSession::StoppedAfterRepair
+        );
+        assert!(
+            repair_session(false, true, true, Some(later), Some(stop)) == RepairSession::Idle,
+            "no read since it stopped"
+        );
+        assert!(
+            repair_session(false, true, false, Some(stop), Some(later)) == RepairSession::Idle,
+            "it hasn't worked on the repair yet"
+        );
+        assert!(
+            repair_session(false, false, true, Some(stop), Some(later)) == RepairSession::Idle,
+            "no repair on this head"
+        );
+    }
+
+    #[test]
     fn a_fork_s_card_offers_to_start_it() {
         let note = hold_note(&Hold::FromFork);
         assert!(note.tone == NoteTone::NeedsYou);
@@ -3473,6 +3838,7 @@ mod tests {
             is_draft,
             checks,
             head_oid: format!("c{number}"),
+            health: Default::default(),
         }
     }
 
@@ -3501,6 +3867,7 @@ mod tests {
             pull_request,
             review: None,
             fork: None,
+            repair: None,
         }
     }
 
