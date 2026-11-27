@@ -1,20 +1,21 @@
 //! Cleanup (ADR-0027): once the work of a dispatch ended and its session is done, its tabs close
 //! and its worktree and branch go, unless something there is its own; then the row says why.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use codescope_core::board::ItemKind;
-use codescope_core::board::cleanup::{Ended, Kept, clean_up, ended, kept};
-use codescope_core::board::dispatch::WorktreeDispatch;
+use codescope_core::board::cleanup::{Dispatched, Ended, Kept, clean_up, ended, kept};
+use codescope_core::board::dispatch::{Hold, WorktreeDispatch, projects_for_repository};
 use codescope_core::path_canon::paths_match;
 use codescope_core::process_tree;
 use codescope_core::projects::ProjectsConfig;
-use gpui::{App, AppContext as _, Context, Window};
+use gpui::{App, AppContext as _, AsyncApp, Context, Window};
 
-use super::{AppShell, CardNote, NoteTone, SessionAt, ToastKind};
+use super::{AppShell, CardNote, NoteTone, RoundKey, TabAtHandover, ToastKind, Turn, round_key};
 
 const CHECK_EVERY: Duration = Duration::from_secs(60);
+const CHECK_OWN_COMMITS_EVERY: Duration = Duration::from_secs(600);
 const EXIT_WAIT: Duration = Duration::from_secs(20);
 const EXIT_POLL: Duration = Duration::from_millis(250);
 
@@ -24,38 +25,62 @@ pub(super) struct Cleanup {
     removable: bool,
     checked_at: Option<Instant>,
     failed: Option<(Instant, String)>,
+    refused: bool,
     told: Option<String>,
 }
 
 struct Target {
     project_id: String,
-    repo: PathBuf,
-    path: PathBuf,
-    branch: String,
-    default_branch: String,
+    dispatched: Dispatched,
 }
 
 impl AppShell {
     pub(crate) fn run_cleanups(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for (project_id, path, branch, record) in self.dispatch_records(cx) {
-            let target = branch.and_then(|branch| {
-                let project = self.current_projects(cx).project(&project_id)?;
-                let primary = paths_match(&project.path, &path.to_string_lossy());
-                (!primary).then(|| Target {
-                    project_id: project_id.clone(),
-                    repo: PathBuf::from(&project.path),
-                    path: path.clone(),
-                    branch,
-                    default_branch: project.default_branch.clone(),
-                })
-            });
-            let target = target.filter(|target| target.path.exists());
+            let target = branch
+                .and_then(|branch| self.cleanup_target(project_id, &path, branch, &record, cx))
+                .filter(|target| target.dispatched.path.exists())
+                .filter(|_| !self.round_to_come(&record.item_id));
             let Some((target, ended)) = target.zip(self.dispatch_ended(&record)) else {
                 self.board.dispatch.cleanups.remove(&record.item_id);
                 continue;
             };
             self.clean_up_dispatch(target, &record, ended, window, cx);
         }
+    }
+
+    fn cleanup_target(
+        &self,
+        project_id: String,
+        path: &Path,
+        branch: String,
+        record: &WorktreeDispatch,
+        cx: &App,
+    ) -> Option<Target> {
+        let project = self.current_projects(cx).project(&project_id)?;
+        if paths_match(&project.path, &path.to_string_lossy()) {
+            return None;
+        }
+        let remote = projects_for_repository(&self.board.dispatch.remotes, &record.repository)
+            .into_iter()
+            .find(|(remotes, _)| remotes.project_id == project_id)
+            .map(|(_, remote)| remote.to_string())?;
+        let dispatched = Dispatched {
+            repo: project.path.clone().into(),
+            path: path.to_path_buf(),
+            branch,
+            remote,
+        };
+        Some(Target {
+            project_id,
+            dispatched,
+        })
+    }
+
+    fn round_to_come(&self, item_id: &str) -> bool {
+        let state = &self.board.dispatch;
+        let held = state.holds.get(item_id);
+        state.starting.contains_key(item_id) || held.is_some_and(Hold::starts_later)
     }
 
     fn dispatch_ended(&self, record: &WorktreeDispatch) -> Option<Ended> {
@@ -84,56 +109,70 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let item_id = record.item_id.clone();
-        let state = self.board.dispatch.cleanups.entry(item_id.clone()).or_default();
-        let lately = |at: Option<Instant>| at.is_some_and(|at| at.elapsed() < CHECK_EVERY);
-        let failed_lately = lately(state.failed.as_ref().map(|(at, _)| *at));
+        let path = target.dispatched.path.clone();
+        let tabs_open = !self.tabs_on(&path).is_empty();
+        let free = !tabs_open || self.tabs_free_on(&path, cx);
+        let every = match record.kept {
+            Some(Kept::OwnCommits) => CHECK_OWN_COMMITS_EVERY,
+            _ => CHECK_EVERY,
+        };
+        let state = self.board.dispatch.cleanups.entry(record.item_id.clone()).or_default();
+        if !free {
+            state.removable = false;
+            return;
+        }
+        let lately =
+            |at: Option<Instant>, every: Duration| at.is_some_and(|at| at.elapsed() < every);
+        let failed_at = state.failed.as_ref().map(|(at, _)| *at);
         let removable = state.removable;
-        if state.running || failed_lately || (!removable && lately(state.checked_at)) {
+        if state.running
+            || lately(failed_at, CHECK_EVERY)
+            || (!removable && lately(state.checked_at, every))
+            || (removable && state.refused && tabs_open)
+        {
             return;
         }
-        let in_use = !self.tabs_on(&target.path).is_empty()
-            && !matches!(self.session_at(&target.path, cx), SessionAt::Done(_));
-        if in_use {
-            return;
-        }
+        state.running = true;
         let processes = if removable {
-            let processes = self.tab_processes(&target.path, cx);
-            self.close_tabs_on(&target.path, window, cx);
+            let processes = self.tab_processes(&path, cx);
+            self.close_tabs_on(&path, window, cx);
             processes
         } else {
             Vec::new()
         };
-        if let Some(state) = self.board.dispatch.cleanups.get_mut(&item_id) {
-            state.running = true;
-        }
         cx.notify();
+        let item_id = record.item_id.clone();
+        let round = round_key(record);
         cx.spawn(async move |this, cx| {
-            let result = if removable {
-                cx.background_spawn(async move {
-                    wait_for_exit(&processes);
-                    let found = clean_up(
-                        &target.repo,
-                        &target.path,
-                        &target.branch,
-                        &ended,
-                        &target.default_branch,
-                    );
+            wait_for_exit(processes, cx).await;
+            let found = cx
+                .background_spawn(async move {
+                    let found = if removable {
+                        clean_up(&target.dispatched, &ended)
+                    } else {
+                        kept(&target.dispatched, &ended)
+                    };
                     (target, found)
                 })
-                .await
-            } else {
-                cx.background_spawn(async move {
-                    let found = kept(&target.path, &ended, &target.default_branch);
-                    (target, found)
-                })
-                .await
-            };
+                .await;
             let _ = this.update(cx, |this, cx| {
-                this.finish_cleanup(&item_id, removable, result, cx);
+                this.finish_cleanup(&item_id, &round, removable, found, cx);
             });
         })
         .detach();
+    }
+
+    fn tabs_free_on(&self, path: &Path, cx: &App) -> bool {
+        let tabs = self.tabs_on(path);
+        let states = self.tab_states(&tabs, path, cx);
+        let probed: Vec<(TabAtHandover, Turn, bool)> = tabs
+            .iter()
+            .zip(states)
+            .map(|(tab, state)| {
+                (state, self.turn(tab), tab.terminal.read(cx).typed_since_submit())
+            })
+            .collect();
+        tabs_free(&probed)
     }
 
     fn tab_processes(&self, path: &Path, cx: &App) -> Vec<u32> {
@@ -171,11 +210,13 @@ impl AppShell {
     fn finish_cleanup(
         &mut self,
         item_id: &str,
+        round: &RoundKey,
         removed: bool,
         (target, result): (Target, anyhow::Result<Option<Kept>>),
         cx: &mut Context<Self>,
     ) {
-        let Some((_, _, _, record)) = self.dispatch_record(item_id, cx) else {
+        let current = self.dispatch_record(item_id, cx).map(|(_, _, _, record)| record);
+        let Some(record) = current.filter(|record| round_key(record) == *round) else {
             self.board.dispatch.cleanups.remove(item_id);
             return;
         };
@@ -189,6 +230,7 @@ impl AppShell {
             Err(err) => {
                 let message = format!("{err:#}");
                 state.failed = Some((Instant::now(), message.clone()));
+                state.refused |= removed;
                 state.removable = false;
                 if state.told.as_ref() == Some(&message) {
                     return;
@@ -199,27 +241,33 @@ impl AppShell {
                 return;
             }
         };
-        state.failed = None;
+        if !state.refused {
+            state.failed = None;
+        }
         match found {
             None if !removed => state.removable = true,
             None => {
                 self.board.dispatch.cleanups.remove(item_id);
                 self.forget_worktree(&target, cx);
                 let title = format!("Cleaned up #{number}");
-                let detail = format!("Removed its worktree and the branch {}.", target.branch);
+                let branch = &target.dispatched.branch;
+                let detail = format!("Removed its worktree and the branch {branch}.");
                 self.push_toast(ToastKind::Ok, title, Some(detail.into()), cx);
             }
             Some(kept) => {
                 state.removable = false;
+                state.refused = false;
+                state.failed = None;
                 if record.kept == Some(kept) {
                     return;
                 }
-                let place = (target.project_id.as_str(), target.path.as_path());
+                let d = &target.dispatched;
                 let marked = WorktreeDispatch {
                     kept: Some(kept),
                     ..record
                 };
-                if let Err(err) = self.save_record(place.0, place.1, &target.branch, marked, cx) {
+                let saved = self.save_record(&target.project_id, &d.path, &d.branch, marked, cx);
+                if let Err(err) = saved {
                     eprintln!("warning: couldn't mark the worktree of #{number} as kept: {err}");
                 }
                 let title = format!("Kept the worktree of #{number}");
@@ -229,7 +277,7 @@ impl AppShell {
     }
 
     fn forget_worktree(&mut self, target: &Target, cx: &mut Context<Self>) {
-        let path = target.path.to_string_lossy().to_string();
+        let path = target.dispatched.path.to_string_lossy().to_string();
         let result = ProjectsConfig::reload_and_edit(self.paths.as_ref(), |config| {
             let Some(project) = config.projects.iter_mut().find(|p| p.id == target.project_id)
             else {
@@ -257,14 +305,31 @@ impl AppShell {
     }
 }
 
-fn wait_for_exit(processes: &[u32]) {
+fn tabs_free(tabs: &[(TabAtHandover, Turn, bool)]) -> bool {
+    tabs.iter().all(|&(state, turn, typed)| {
+        !typed
+            && match state {
+                TabAtHandover::Shell | TabAtHandover::IdleClaude => true,
+                TabAtHandover::Other => turn == Turn::Ended,
+                TabAtHandover::Draft | TabAtHandover::Busy | TabAtHandover::Stopped => false,
+            }
+    })
+}
+
+async fn wait_for_exit(processes: Vec<u32>, cx: &mut AsyncApp) {
     let started = Instant::now();
-    while started.elapsed() < EXIT_WAIT {
-        let table = process_tree::process_table();
-        if processes.iter().all(|pid| table.iter().all(|&(alive, _)| alive != *pid)) {
+    while !processes.is_empty() && started.elapsed() < EXIT_WAIT {
+        let pids = processes.clone();
+        let alive = cx
+            .background_spawn(async move {
+                let table = process_tree::process_table();
+                pids.iter().any(|pid| table.iter().any(|&(alive, _)| alive == *pid))
+            })
+            .await;
+        if !alive {
             return;
         }
-        std::thread::sleep(EXIT_POLL);
+        cx.background_executor().timer(EXIT_POLL).await;
     }
 }
 
@@ -317,5 +382,21 @@ mod tests {
         let note = cleanup_note(None, Some(&failed)).unwrap();
         assert_eq!(note.text.as_ref(), "Couldn't clean up: the folder is in use");
         assert!(note.tone == NoteTone::Failed);
+    }
+
+    #[test]
+    fn cleanup_closes_only_tabs_where_nothing_works_or_waits_for_enter() {
+        use TabAtHandover::{Busy, Draft, IdleClaude, Other, Shell, Stopped};
+        assert!(tabs_free(&[]));
+        assert!(tabs_free(&[(Shell, Turn::Unknown, false), (IdleClaude, Turn::Ended, false)]));
+        assert!(tabs_free(&[(Other, Turn::Ended, false)]), "an agent whose turn ended");
+        assert!(!tabs_free(&[(Shell, Turn::Unknown, true)]), "a command typed in a shell");
+        assert!(!tabs_free(&[(Draft, Turn::Ended, true)]), "a prompt not sent yet");
+        assert!(!tabs_free(&[(Other, Turn::Ended, true)]));
+        assert!(!tabs_free(&[(Other, Turn::Unknown, false)]), "a program it can't read");
+        assert!(!tabs_free(&[(Other, Turn::Quiet, false)]));
+        assert!(!tabs_free(&[(Busy, Turn::Running, false)]));
+        assert!(!tabs_free(&[(Stopped, Turn::Ended, false)]));
+        assert!(!tabs_free(&[(IdleClaude, Turn::Ended, false), (Busy, Turn::Running, false)]));
     }
 }
