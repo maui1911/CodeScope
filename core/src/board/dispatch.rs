@@ -1320,7 +1320,8 @@ fn fetch(repo: &Path, remote: &str, refspec: &str) -> Result<()> {
 }
 
 fn is_ref_lock_error(message: &str) -> bool {
-    message.contains("cannot lock ref")
+    // Git 2.51's batched ref updates report the same lost race as an incorrect old value.
+    message.contains("cannot lock ref") || message.contains("incorrect old value provided")
 }
 
 fn add_worktree_from(
@@ -2905,6 +2906,42 @@ mod tests {
     }
 
     #[test]
+    fn two_dispatches_that_start_at_once_in_one_repository_both_start() {
+        if no_window_command("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&upstream).unwrap();
+        git(&upstream, &["-c", "init.defaultBranch=main", "init", "-q"]);
+        git(&upstream, &["config", "user.email", "test@example.invalid"]);
+        git(&upstream, &["config", "user.name", "Test"]);
+        git(&upstream, &["commit", "--allow-empty", "-m", "one", "-q"]);
+        git(dir.path(), &["clone", "-q", "upstream", "repo"]);
+
+        for round in 1..=3 {
+            git(&upstream, &["commit", "--allow-empty", "-m", "next", "-q"]);
+            let start = std::sync::Barrier::new(2);
+            let paths = std::thread::scope(|scope| {
+                let starts = ["a", "b"].map(|name| {
+                    let (repo, start) = (&repo, &start);
+                    let branch = format!("{round}-{name}");
+                    let path = dir.path().join("repo.worktrees").join(&branch);
+                    scope.spawn(move || {
+                        start.wait();
+                        add_dispatch_worktree(repo, &path, &branch, "origin").map(|()| path)
+                    })
+                });
+                starts.map(|started| started.join().unwrap().unwrap_or_else(|e| panic!("{e:#}")))
+            });
+            for path in paths {
+                assert_eq!(head(&path, "HEAD"), head(&upstream, "HEAD"));
+            }
+        }
+    }
+
+    #[test]
     fn a_dispatch_worktree_starts_from_the_remotes_own_default_branch() {
         if no_window_command("git").arg("--version").output().is_err() {
             return;
@@ -3206,6 +3243,9 @@ mod tests {
         let locked = "error: cannot lock ref 'refs/remotes/origin/main': Unable to create \
                       'D:/repo/.git/refs/remotes/origin/main.lock': File exists.";
         assert!(is_ref_lock_error(locked));
+        let batched = "git fetch --quiet origin main exited 1: error: fetching ref \
+                       refs/remotes/origin/main failed: incorrect old value provided";
+        assert!(is_ref_lock_error(batched));
         let gone = "fatal: couldn't find remote ref refs/heads/gone";
         assert!(!is_ref_lock_error(gone));
     }
