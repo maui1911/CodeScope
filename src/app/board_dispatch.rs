@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use codescope_core::agents::claude::live_session;
 use codescope_core::board::dispatch::{
     FINDINGS_FILE, Facts, HandoverSession, Hold, OwnPullRequest, PostedFindings, ProjectRemotes,
@@ -19,8 +20,8 @@ use codescope_core::board::dispatch::{
     clear_reply, counts_towards_limit, decide, exclude_handover_files, fetch_branch_head,
     fetch_pull_head, find_skill, fork_branch, fork_push, is_plain_branch, launch_with_task,
     mover_to_check, moves_to_needs_decision, opened_by, projects_for_repository,
-    remote_has_branch, set_fork_push, start_still_wanted, task_file, task_message,
-    track_remote_branch, trigger_content_ids, write_task_file,
+    remote_branch_tip, set_fork_push, start_still_wanted, task_file, task_message,
+    track_remote_branch, tracks_same_name, trigger_content_ids, write_task_file,
 };
 use codescope_core::board::answers::{
     Answer, Comment, after_findings, answer_body, answers_section, choices_text, chosen,
@@ -1087,33 +1088,45 @@ fn set_up_worktree(job: &mut Job) -> anyhow::Result<()> {
                 ItemKind::Issue | ItemKind::Draft => refresh_start_head(job),
             }
         }
-        Round::Implementation => match link_branch(job) {
-            Ok(Some(linked_at)) => job.record.linked_at = Some(linked_at),
-            Ok(None) => {}
-            Err(err) => job.link_error = Some(format!("{err:#}")),
-        },
+        Round::Implementation => {
+            if let Err(err) = link_branch(job) {
+                job.link_error = Some(format!("{err:#}"));
+            }
+        }
     }
     let skill = skill_in(&job.path, job.record.round.skill());
     let answers = job.answers_from.as_ref().map(|from| answers_for_task(job, from));
     write_task_file(&job.path, &task_file(&job.record, skill.as_deref(), answers.as_deref()))
 }
 
-fn link_branch(job: &Job) -> anyhow::Result<Option<String>> {
-    let (repo, remote, branch, record) = (&job.repo, &job.remote, &job.branch, &job.record);
-    if record.kind != ItemKind::Issue || remote_has_branch(repo, remote, branch)? {
-        return Ok(None);
+fn link_branch(job: &mut Job) -> anyhow::Result<()> {
+    let (repo, remote, branch) = (&job.repo, &job.remote, &job.branch);
+    if job.record.kind != ItemKind::Issue {
+        return Ok(());
     }
-    let can_write = match job.known_access.get(&access_key(&record.repository, &job.viewer_login)) {
+    let unlinked = "couldn't link its branch to the issue";
+    if let Some(tip) = remote_branch_tip(repo, remote, branch).context(unlinked)? {
+        let linked_here = job.record.linked_at.is_none()
+            && tracks_same_name(repo, remote, branch)
+            && tip == branch_base(repo, &job.path, remote).context(unlinked)?;
+        if linked_here {
+            job.record.linked_at = Some(tip);
+        }
+        return Ok(());
+    }
+    let repository = &job.record.repository;
+    let can_write = match job.known_access.get(&access_key(repository, &job.viewer_login)) {
         Some(known) => *known,
-        None => github::can_write(&record.repository, &job.viewer_login)?,
+        None => github::can_write(repository, &job.viewer_login).context(unlinked)?,
     };
     if !can_write {
-        return Ok(None);
+        return Ok(());
     }
-    let base = branch_base(repo, &job.path, remote)?;
-    github::create_linked_branch(&record.content_id, &base, branch)?;
-    track_remote_branch(repo, remote, branch)?;
-    Ok(Some(base))
+    let base = branch_base(repo, &job.path, remote).context(unlinked)?;
+    github::create_linked_branch(&job.record.content_id, &base, branch).context(unlinked)?;
+    job.record.linked_at = Some(base);
+    track_remote_branch(repo, remote, branch)
+        .context("linked its branch to the issue, but the local branch doesn't track it")
 }
 
 async fn on_own_thread<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
@@ -1164,7 +1177,7 @@ fn claim_on_board(job: &Job, viewer_id: &str) -> Vec<String> {
         errors.push(format!("couldn't move it: {err:#}"));
     }
     if let Some(err) = &job.link_error {
-        errors.push(format!("couldn't link its branch to the issue: {err}"));
+        errors.push(err.clone());
     }
     errors
 }
