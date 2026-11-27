@@ -17,8 +17,8 @@ use codescope_core::board::dispatch::{
     add_pull_request_worktree, branch_name, clear_findings, clear_reply, counts_towards_limit,
     decide, exclude_handover_files, fetch_branch_head, fetch_pull_head, find_skill, fork_branch,
     fork_push, is_plain_branch, launch_with_task, mover_to_check, moves_to_needs_decision,
-    opened_by, projects_for_repository, task_file, task_message, trigger_content_ids,
-    write_task_file,
+    opened_by, projects_for_repository, set_fork_push, task_file, task_message,
+    trigger_content_ids, write_task_file,
 };
 use codescope_core::board::answers::{
     Answer, Comment, after_findings, answer_body, answers_section, choices_text, chosen,
@@ -946,6 +946,9 @@ fn prepare_worktree(job: &mut Job) -> anyhow::Result<()> {
             ItemKind::PullRequest => add_pull_request_worktree(repo, path, branch, remote)?,
             ItemKind::Issue | ItemKind::Draft => add_dispatch_worktree(repo, path, branch, remote)?,
         }
+    }
+    if let Some(fork) = &job.record.fork {
+        set_fork_push(&job.repo, &job.branch, number, fork)?;
     }
     exclude_handover_files(&job.path)?;
     match job.record.round {

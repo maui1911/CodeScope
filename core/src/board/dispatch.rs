@@ -833,13 +833,11 @@ fn push_rule(fork: Option<&ForkPush>) -> String {
             "Push the fixes to the pull request's branch; don't open another pull request."
                 .to_string()
         }
-        Some(ForkPush {
-            branch,
-            url: Some(url),
-        }) => format!(
-            "Push the fixes to the pull request's branch in its fork with `git push {url} \
-             HEAD:{branch}`: a plain `git push` doesn't reach it. Don't open another pull request."
-        ),
+        Some(ForkPush { url: Some(_), .. }) => {
+            "Push the fixes to the pull request's branch with a plain `git push`: CodeScope set \
+             this branch up to push to its fork. Don't open another pull request."
+                .to_string()
+        }
         Some(ForkPush { url: None, .. }) => format!(
             "You can't push to this pull request: it comes from a fork that doesn't take pushes \
              from you. Commit nothing, and write what you would change to `{REPLY_FILE}` for its \
@@ -1130,6 +1128,22 @@ pub fn add_fork_worktree(
     run_git(repo, &["config", &format!("branch.{branch}.remote"), remote])?;
     let merge = format!("refs/pull/{number}/head");
     run_git(repo, &["config", &format!("branch.{branch}.merge"), &merge]).map(|_| ())
+}
+
+/// Point a plain `git push` on the local `branch` of fork pull request `number` at the fork's
+/// branch through the remote `pr-<number>`, or take that away when `fork` has no URL.
+pub fn set_fork_push(repo: &Path, branch: &str, number: u32, fork: &ForkPush) -> Result<()> {
+    let remote = format!("pr-{number}");
+    let push_remote = format!("branch.{branch}.pushRemote");
+    let Some(url) = &fork.url else {
+        let _ = run_git(repo, &["config", "--unset", &push_remote]);
+        let _ = run_git(repo, &["config", "--remove-section", &format!("remote.{remote}")]);
+        return Ok(());
+    };
+    run_git(repo, &["config", &format!("remote.{remote}.url"), url])?;
+    let refspec = format!("refs/heads/{branch}:refs/heads/{}", fork.branch);
+    run_git(repo, &["config", "--replace-all", &format!("remote.{remote}.push"), &refspec])?;
+    run_git(repo, &["config", &push_remote, &remote]).map(|_| ())
 }
 
 /// The commit pull request `number`'s head is at on `remote`, fetched now.
@@ -1848,12 +1862,12 @@ mod tests {
         let task = task_file(&record, None, None);
         assert!(
             task.contains(
-                "Push the fixes to the pull request's branch in its fork with `git push \
-                 git@github.com:octo/CodeScope.git HEAD:main`: a plain `git push` doesn't reach \
-                 it."
+                "Push the fixes to the pull request's branch with a plain `git push`: CodeScope \
+                 set this branch up to push to its fork. Don't open another pull request."
             ),
             "{task}"
         );
+        assert!(!task.contains("git@github.com"), "{task}");
         assert!(!task.contains("Push the fixes to the pull request's branch;"), "{task}");
 
         record.fork = Some(ForkPush {
@@ -2781,7 +2795,7 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&merge.stdout).trim(), "refs/pull/421/head");
         assert!(
             run_git(&repo, &["config", "branch.octo/main.pushRemote"]).is_err(),
-            "the task names where to push"
+            "set_fork_push sets it"
         );
 
         git(&upstream, &["checkout", "-q", "theirs"]);
@@ -2792,6 +2806,41 @@ mod tests {
         assert_eq!(fetch_pull_head(&repo, "origin", 421).unwrap(), pushed);
         git(&path, &["pull", "--ff-only", "-q"]);
         assert_eq!(head(&path, "HEAD"), pushed, "git pull follows the pull request");
+    }
+
+    #[test]
+    fn a_plain_push_in_a_fork_s_worktree_reaches_its_branch_only_when_the_fork_takes_pushes() {
+        if no_window_command("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (upstream, repo) = upstream_with_branch(dir.path(), "theirs");
+        let first = head(&upstream, "theirs");
+        git(&upstream, &["update-ref", "refs/pull/421/head", &first]);
+        git(dir.path(), &["clone", "-q", "--bare", "upstream", "fork.git"]);
+        let fork = dir.path().join("fork.git");
+        let path = dir.path().join("repo.worktrees").join("octo-theirs");
+        add_fork_worktree(&repo, &path, "octo/theirs", "origin", 421).unwrap();
+
+        let push = ForkPush {
+            branch: "theirs".into(),
+            url: Some(fork.to_string_lossy().into_owned()),
+        };
+        set_fork_push(&repo, "octo/theirs", 421, &push).unwrap();
+        set_fork_push(&repo, "octo/theirs", 421, &push).unwrap();
+        git(&path, &["commit", "--allow-empty", "-m", "a fix", "-q"]);
+        git(&path, &["push", "-q"]);
+        assert_eq!(head(&fork, "theirs"), head(&path, "HEAD"), "on the fork's branch");
+        assert!(
+            run_git(&fork, &["rev-parse", "--verify", "-q", "refs/heads/octo/theirs"]).is_err(),
+            "not under the local name"
+        );
+
+        let closed = ForkPush { url: None, ..push };
+        set_fork_push(&repo, "octo/theirs", 421, &closed).unwrap();
+        assert!(run_git(&repo, &["config", "branch.octo/theirs.pushRemote"]).is_err());
+        assert!(run_git(&repo, &["config", "remote.pr-421.url"]).is_err());
+        set_fork_push(&repo, "octo/theirs", 421, &closed).unwrap();
     }
 
     #[test]
