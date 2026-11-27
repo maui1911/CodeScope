@@ -463,6 +463,9 @@ pub enum SidebarEvent {
     /// No payload: the dialog edits global `settings.json`, not
     /// per-project state, so the row is identical for every project.
     OpenSettings,
+    /// "Project settings…" in a repository project's context menu: what the project sets for
+    /// board dispatches, in a dialog AppShell owns.
+    OpenProjectSettings { project_id: String },
     /// User asked for a destructive (or otherwise confirm-gated)
     /// sidebar action. AppShell opens its themed [`ConfirmDialog`],
     /// awaits the result, and — on confirm — dispatches the carried
@@ -5632,6 +5635,20 @@ impl Sidebar {
                         this.close_menu(cx);
                     }),
                 )
+            })
+            .when(is_repo, |menu| {
+                let project_id = project.id.clone();
+                menu.child(item(
+                    "menu-project-settings",
+                    "Project settings…",
+                    false,
+                    Box::new(move |this, _window, cx| {
+                        cx.emit(SidebarEvent::OpenProjectSettings {
+                            project_id: project_id.clone(),
+                        });
+                        this.close_menu(cx);
+                    }),
+                ))
             })
             .child(item(
                 "menu-remove",

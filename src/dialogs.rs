@@ -6,5 +6,6 @@ pub mod confirm;
 pub mod decide;
 pub mod new_project;
 pub mod new_worktree;
+pub mod project_settings;
 pub mod rename;
 pub mod settings;
