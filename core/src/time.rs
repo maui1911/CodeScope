@@ -195,9 +195,48 @@ pub fn now_iso8601() -> String {
     iso8601_from_unix_secs(secs)
 }
 
+/// Seconds from `earlier` (ISO 8601, as [`parse_iso8601_secs`] reads it) to `now` (Unix seconds),
+/// never below zero; `None` when `earlier` doesn't parse.
+pub fn secs_since(earlier: &str, now: f64) -> Option<f64> {
+    parse_iso8601_secs(earlier).map(|then| (now - then).max(0.0))
+}
+
+/// `secs` in the largest unit that fits, rounded down: "under a minute", "6 min", "3 h", and
+/// days from 48 hours on.
+pub fn span(secs: f64) -> String {
+    let minutes = (secs.max(0.0) / 60.0) as u64;
+    match minutes {
+        0 => "under a minute".to_string(),
+        1..60 => format!("{minutes} min"),
+        60..2_880 => format!("{} h", minutes / 60),
+        _ => format!("{} d", minutes / 1_440),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_span_reads_in_the_largest_unit_that_fits() {
+        assert_eq!(span(0.0), "under a minute");
+        assert_eq!(span(59.9), "under a minute");
+        assert_eq!(span(60.0), "1 min");
+        assert_eq!(span(6.0 * 60.0 + 59.0), "6 min");
+        assert_eq!(span(3_599.0), "59 min");
+        assert_eq!(span(3_600.0), "1 h");
+        assert_eq!(span(47.0 * 3_600.0 + 3_599.0), "47 h");
+        assert_eq!(span(48.0 * 3_600.0), "2 d");
+        assert_eq!(span(-30.0), "under a minute");
+    }
+
+    #[test]
+    fn seconds_since_a_moment_never_run_backwards_and_need_a_moment_to_count_from() {
+        let now = parse_iso8601_secs("2026-11-27T10:06:30Z").unwrap();
+        assert_eq!(secs_since("2026-11-27T10:00:00Z", now), Some(390.0));
+        assert_eq!(secs_since("2026-11-27T10:07:00Z", now), Some(0.0));
+        assert_eq!(secs_since("yesterday", now), None);
+    }
 
     #[test]
     fn round_trips_z_suffix() {

@@ -1257,10 +1257,12 @@ impl AppShell {
         // stop dispatching entirely until the user clicks something
         // (#270). Catch that here and hand focus back to the active
         // tab's terminal, falling back to the AppShell root handle so
-        // the chords keep working when no tab is open.
+        // the chords keep working when no tab is open or the board
+        // panel stands in for the tabs.
         cx.on_focus_lost(window, |this: &mut AppShell, window, cx| {
             let handle = this
                 .focused_tab_terminal_handle(cx)
+                .filter(|_| !this.show_board)
                 .unwrap_or_else(|| this.focus_handle.clone());
             handle.focus(window);
         })
@@ -7683,6 +7685,13 @@ impl AppShell {
         // Cmd on macOS, Ctrl elsewhere — gpui already maps `platform`
         // to the right modifier per OS, so we just check both.
         let app_mod = mods.control || mods.platform;
+
+        let plain = !app_mod && !mods.alt && !mods.shift;
+        if plain && key == "escape" && self.show_board && self.board.drawer.is_some() {
+            cx.stop_propagation();
+            self.close_item_drawer(cx);
+            return;
+        }
 
         // Alt-only chords drive group-focus navigation (Alt+Left /
         // Right cycle, Alt+1..9 jump). Mirrors C#'s

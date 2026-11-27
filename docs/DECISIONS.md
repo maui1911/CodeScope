@@ -917,9 +917,10 @@ board, each with their own CodeScope or another tool that follows the
   *In review*), once per round. A person's move into a trigger column
   hands the item to CodeScope again; a move to any other column ends
   CodeScope's moves for that round. A move the user makes through
-  CodeScope, such as *Ready* in the needs-you dialog, is the user's own
-  move. An item GitHub has moved to *Done*
-  is left alone. If a board has the older "Pull request linked to
+  CodeScope, such as *Ready* in the needs-you dialog or *Move back to
+  Todo* in the item drawer, is the user's own move. An item GitHub has
+  moved to *Done* is left alone.
+  If a board has the older "Pull request linked to
   issue" workflow on, the board panel warns: it can move *In review*
   back to *In progress*, and CodeScope then leaves it there. GitHub
   shows a board's workflows only to whoever may change them, so only

@@ -29,6 +29,7 @@ use crate::dialogs::confirm::ConfirmSpec;
 use crate::theme;
 
 const BOARD_READ_INTERVAL: Duration = Duration::from_secs(30);
+const MOVE_BACK_SHOWN_WITHIN: Duration = Duration::from_secs(60);
 const READ_AGE_REFRESH: Duration = Duration::from_secs(5);
 const DONE_PREVIEW: usize = 5;
 /// GitHub's colour for a merged pull request or a completed issue.
@@ -39,9 +40,25 @@ pub(crate) struct BoardPanelState {
     pub reads_by_url: HashMap<String, BoardRead>,
     pub selected_url: Option<String>,
     pub show_all_done: bool,
+    /// The item whose drawer is open, on the selected board.
+    pub drawer: Option<String>,
+    /// Items CodeScope moved back to Todo for the user, until a read shows the move.
+    pub moved_back: HashMap<String, MoveBack>,
     pub reading: bool,
     pub last_read: Option<Instant>,
     pub dispatch: DispatchState,
+}
+
+/// A move back to Todo the panel already shows, before a board read does.
+pub(crate) struct MoveBack {
+    /// The Todo column's option id.
+    pub column: String,
+    /// The item's column and when it was set there, as the panel had them before the move.
+    pub from: (Option<String>, Option<String>),
+    /// When the user moved it, and once GitHub took the move, when it did.
+    pub at: Instant,
+    /// Set until GitHub answers the move.
+    pub pending: bool,
 }
 
 #[derive(Default)]
@@ -68,6 +85,26 @@ fn read_age(read_at: Option<Instant>) -> SharedString {
     }
 }
 
+/// Keeps an item CodeScope moved back to Todo in Todo while the read still has it where it was
+/// before the move, as a read can be older than the move. A read that shows the move, or a later
+/// one, is taken as it is, and so is the item's old place once the move has had
+/// [`MOVE_BACK_SHOWN_WITHIN`] to show.
+fn keep_moves_back(board: &mut Board, moved_back: &mut HashMap<String, MoveBack>, now: Instant) {
+    moved_back.retain(|item_id, back| {
+        let waiting =
+            back.pending || now.saturating_duration_since(back.at) < MOVE_BACK_SHOWN_WITHIN;
+        let Some(item) = board.items.iter_mut().find(|item| item.id == *item_id) else {
+            return waiting;
+        };
+        let as_before = (&item.column_id, &item.column_set_at) == (&back.from.0, &back.from.1);
+        if !(as_before && waiting) {
+            return false;
+        }
+        item.column_id = Some(back.column.clone());
+        true
+    });
+}
+
 fn board_label(settings: &BoardSettings, read: Option<&BoardRead>) -> SharedString {
     if let Some(board) = read.and_then(|r| r.last_good.as_ref()) {
         return board.title.clone().into();
@@ -90,7 +127,11 @@ fn who_moves(role: Option<ColumnRole>, has_column: bool) -> &'static str {
 }
 
 fn state_color(item: &BoardItem, theme: &Theme) -> Hsla {
-    match (item.kind, item.state) {
+    kind_color(item.kind, item.state, theme)
+}
+
+fn kind_color(kind: ItemKind, state: ItemState, theme: &Theme) -> Hsla {
+    match (kind, state) {
         (ItemKind::Draft, _) => theme::text_faint(),
         (_, ItemState::Merged) | (ItemKind::Issue, ItemState::Closed) => {
             theme::rgb_to_hsla(codescope_core::Rgb::from_hex(DONE_PURPLE))
@@ -205,7 +246,8 @@ impl AppShell {
         for fetch in output.boards {
             let read = state.reads_by_url.entry(fetch.url).or_default();
             match fetch.board {
-                Ok(board) => {
+                Ok(mut board) => {
+                    keep_moves_back(&mut board, &mut state.moved_back, Instant::now());
                     read.last_good = Some(board);
                     read.error = None;
                     read.read_at = Some(Instant::now());
@@ -334,12 +376,30 @@ impl AppShell {
                 .into_any_element();
         };
         let read = self.board.reads_by_url.get(&settings.url);
-        let mut body = div().id("board-body").flex_grow().overflow_scroll();
+        let notes = self.card_notes(&settings.url, cx);
+        let mut body = div().id("board-body").flex_grow().h_full().overflow_scroll();
         body.style().min_size.height = Some(gpui::Length::Definite(px(0.0).into()));
+        body.style().min_size.width = Some(gpui::Length::Definite(px(0.0).into()));
         let body = match read.and_then(|r| r.last_good.as_ref()) {
-            Some(board) => body.child(self.render_board_columns(theme, &settings, board, cx)),
+            Some(board) => {
+                body.child(self.render_board_columns(theme, &settings, board, &notes, cx))
+            }
             None => body.child(self.render_board_message(theme, read)),
         };
+        let drawer = self
+            .board
+            .drawer
+            .as_deref()
+            .and_then(|item_id| self.item_drawer(&settings.url, item_id, &notes, cx))
+            .map(|drawer| self.render_item_drawer(theme, drawer, cx));
+        let stage = div()
+            .flex()
+            .flex_row()
+            .flex_grow()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .child(body)
+            .children(drawer);
         let missing = read
             .and_then(|r| r.last_good.as_ref())
             .map(|board| missing_roles(board, &effective_mapping(board, &settings.columns)))
@@ -353,6 +413,7 @@ impl AppShell {
             .flex_col()
             .flex_grow()
             .size_full()
+            .min_w(px(0.0))
             .bg(canvas)
             .text_color(ink)
             .font(theme::font_sans())
@@ -362,7 +423,7 @@ impl AppShell {
             })
             .when(moves_back, |s| s.child(render_workflow_warning(theme)))
             .children(self.dispatch_error().map(|err| render_dispatch_error(theme, err)))
-            .child(body)
+            .child(stage)
             .into_any_element()
     }
 
@@ -419,6 +480,7 @@ impl AppShell {
                         cx.listener(move |this, _, _, cx| {
                             this.board.selected_url = Some(url.clone());
                             this.board.show_all_done = false;
+                            this.board.drawer = None;
                             cx.notify();
                         }),
                     )
@@ -613,10 +675,11 @@ impl AppShell {
         theme: &Arc<Theme>,
         settings: &BoardSettings,
         board: &Board,
+        notes: &HashMap<String, CardNote>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let columns = panel_columns(board, &effective_mapping(board, &settings.columns));
-        let notes = self.card_notes(&settings.url, cx);
+        let selected = self.board.drawer.as_deref();
         div()
             .flex()
             .flex_row()
@@ -629,7 +692,8 @@ impl AppShell {
                     PanelGroup::Done => self
                         .render_done_column(theme, column, board, cx)
                         .into_any_element(),
-                    _ => render_group_column(theme, column, board, &notes, cx).into_any_element(),
+                    _ => render_group_column(theme, column, board, (notes, selected), cx)
+                        .into_any_element(),
                 }
             }))
             .into_any_element()
@@ -657,7 +721,8 @@ impl AppShell {
             .iter()
             .map(|&index| {
                 let item = &board.items[index];
-                let url = item.url.clone().unwrap_or_else(|| board.url.clone());
+                let item_id = item.id.clone();
+                let selected = self.board.drawer.as_deref() == Some(item.id.as_str());
                 div()
                     .id(("board-done", index))
                     .flex()
@@ -667,14 +732,18 @@ impl AppShell {
                     .px(px(10.0))
                     .py(px(8.0))
                     .border_1()
-                    .border_color(theme::frost_10(theme))
+                    .border_color(if selected {
+                        theme::accent(theme)
+                    } else {
+                        theme::frost_10(theme)
+                    })
                     .rounded(px(8.0))
                     .text_color(theme::ink_muted(theme))
                     .cursor_pointer()
                     .hover(|s| s.border_color(theme::frost_20(theme)))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |_, _, _, _| crate::sidebar::open_url_in_browser(&url)),
+                        cx.listener(move |this, _, _, cx| this.select_board_item(&item_id, cx)),
                     )
                     .child(state_dot(state_color(item, theme)))
                     .child(
@@ -781,7 +850,7 @@ fn render_group_column(
     theme: &Arc<Theme>,
     column: &PanelColumn,
     board: &Board,
-    notes: &HashMap<String, CardNote>,
+    cards: (&HashMap<String, CardNote>, Option<&str>),
     cx: &mut Context<AppShell>,
 ) -> impl IntoElement {
     let framed = matches!(
@@ -813,7 +882,7 @@ fn render_group_column(
         .when(column.sections.is_empty(), |s| s.child(not_on_board()))
         .children(column.sections.iter().map(|section| {
             let heading = !(lone_todo && section.role == Some(ColumnRole::Todo));
-            render_section(theme, section, board, heading, notes, cx).into_any_element()
+            render_section(theme, section, board, heading, cards, cx).into_any_element()
         }))
 }
 
@@ -822,7 +891,7 @@ fn render_section(
     section: &PanelSection,
     board: &Board,
     heading: bool,
-    notes: &HashMap<String, CardNote>,
+    (notes, selected): (&HashMap<String, CardNote>, Option<&str>),
     cx: &mut Context<AppShell>,
 ) -> impl IntoElement {
     let trigger = section.role.map(ColumnRole::kind) == Some(RoleKind::Trigger);
@@ -866,39 +935,37 @@ fn render_section(
         })
         .children(section.items.iter().map(|&index| {
             let item = &board.items[index];
-            render_card(theme, item, index, &board.url, notes.get(&item.id), cx).into_any_element()
+            let chosen = selected == Some(item.id.as_str());
+            render_card(theme, (item, index, chosen), notes.get(&item.id), cx).into_any_element()
         }))
 }
 
 fn render_card(
     theme: &Arc<Theme>,
-    item: &BoardItem,
-    index: usize,
-    board_url: &str,
+    (item, index, selected): (&BoardItem, usize, bool),
     dispatch: Option<&CardNote>,
     cx: &mut Context<AppShell>,
 ) -> impl IntoElement {
-    let url = item.url.clone().unwrap_or_else(|| board_url.to_string());
     let note = match item.state {
         ItemState::Closed => Some("closed"),
         ItemState::Merged => Some("merged"),
         ItemState::Open => None,
     };
     let accent = theme::accent(theme);
-    let dispatched = dispatch.is_some();
-    let issue_url = url.clone();
     let reference = div()
         .id(("board-card-reference", index))
-        .when(!dispatched, |s| s.child(item_reference(item)))
-        .when(dispatched, |s| {
-            s.child(format!("{} ↗", item_reference(item)))
-                .hover(move |s| s.text_color(accent))
+        .when_some(item.url.clone(), |s, url| {
+            s.hover(move |s| s.text_color(accent))
                 .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                     cx.stop_propagation();
-                    crate::sidebar::open_url_in_browser(&issue_url);
+                    crate::sidebar::open_url_in_browser(&url);
                 })
+        })
+        .child(match item.url {
+            Some(_) => format!("{} ↗", item_reference(item)).into(),
+            None => item_reference(item),
         });
-    let (item_id, board_url) = (item.id.clone(), board_url.to_string());
+    let item_id = item.id.clone();
     div()
         .id(("board-card", index))
         .flex()
@@ -908,19 +975,17 @@ fn render_card(
         .py(px(10.0))
         .bg(theme::elevated(theme))
         .border_1()
-        .border_color(theme::divider(theme))
+        .border_color(if selected {
+            accent
+        } else {
+            theme::divider(theme)
+        })
         .rounded(px(8.0))
         .cursor_pointer()
         .hover(move |s| s.border_color(accent))
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |this, _, window, cx| {
-                if dispatched {
-                    this.open_dispatch_tab(&board_url, &item_id, window, cx);
-                } else {
-                    crate::sidebar::open_url_in_browser(&url);
-                }
-            }),
+            cx.listener(move |this, _, _, cx| this.select_board_item(&item_id, cx)),
         )
         .child(
             div()
@@ -1004,6 +1069,11 @@ fn render_card(
         }))
 }
 
+/// The dot that shows an item's kind and state, as its card has it.
+pub(crate) fn item_dot(kind: ItemKind, state: ItemState, theme: &Theme) -> impl IntoElement {
+    state_dot(kind_color(kind, state, theme))
+}
+
 fn state_dot(color: Hsla) -> impl IntoElement {
     div().flex_shrink_0().size(px(6.0)).rounded_full().bg(color)
 }
@@ -1051,4 +1121,102 @@ fn render_missing_roles(theme: &Arc<Theme>, missing: &[ColumnRole]) -> impl Into
              CodeScope finds them by name.",
             names.join(", ")
         ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn board_with_item_in(column: &str, set_at: &str) -> Board {
+        let item = BoardItem {
+            id: "PVTI_1".into(),
+            kind: ItemKind::Issue,
+            number: Some(411),
+            title: "Command palette: fuzzy match on paths".into(),
+            url: None,
+            repository: Some("acme/app".into()),
+            content_id: Some("I_411".into()),
+            assignees: Vec::new(),
+            state: ItemState::Open,
+            column_id: Some(column.into()),
+            column_set_at: Some(set_at.into()),
+            updated_at: String::new(),
+        };
+        Board {
+            id: "PVT_1".into(),
+            status_field_id: "PVTSSF_1".into(),
+            title: "Board".into(),
+            url: "https://github.com/users/acme/projects/1".into(),
+            closed: false,
+            columns: Vec::new(),
+            items: vec![item],
+            truncated: false,
+        }
+    }
+
+    const BEFORE: &str = "2026-11-27T10:00:00Z";
+
+    fn moved_back(at: Instant, pending: bool) -> HashMap<String, MoveBack> {
+        let back = MoveBack {
+            column: "todo".into(),
+            from: (Some("in-progress".into()), Some(BEFORE.into())),
+            at,
+            pending,
+        };
+        HashMap::from([("PVTI_1".to_string(), back)])
+    }
+
+    fn column(board: &Board) -> &str {
+        board.items[0].column_id.as_deref().unwrap()
+    }
+
+    #[test]
+    fn a_read_that_still_has_the_item_where_it_was_keeps_it_in_todo() {
+        let now = Instant::now();
+        for pending in [true, false] {
+            let mut moves = moved_back(now, pending);
+            let mut stale = board_with_item_in("in-progress", BEFORE);
+            keep_moves_back(&mut stale, &mut moves, now + Duration::from_secs(5));
+            assert_eq!(column(&stale), "todo");
+            assert!(moves.contains_key("PVTI_1"));
+        }
+        let mut moves = moved_back(now, false);
+        let mut other_board = board_with_item_in("in-progress", BEFORE);
+        other_board.items[0].id = "PVTI_2".into();
+        keep_moves_back(&mut other_board, &mut moves, now);
+        assert_eq!(column(&other_board), "in-progress");
+        assert!(moves.contains_key("PVTI_1"), "its item is on another board");
+    }
+
+    #[test]
+    fn a_read_that_shows_the_move_or_a_later_one_is_taken_as_it_is() {
+        let now = Instant::now();
+        let mut moves = moved_back(now, false);
+        let mut shown = board_with_item_in("todo", "2026-11-27T10:06:00Z");
+        keep_moves_back(&mut shown, &mut moves, now);
+        assert_eq!(column(&shown), "todo");
+        assert!(moves.is_empty());
+
+        let mut moves = moved_back(now, true);
+        let mut later = board_with_item_in("ready", "2026-11-27T10:07:00Z");
+        keep_moves_back(&mut later, &mut moves, now);
+        assert_eq!(column(&later), "ready", "a teammate moved it on since");
+        assert!(moves.is_empty());
+    }
+
+    #[test]
+    fn a_move_that_never_shows_lets_the_read_stand_once_github_has_answered() {
+        let long_ago = Instant::now();
+        let later = long_ago + MOVE_BACK_SHOWN_WITHIN + Duration::from_secs(1);
+        let mut moves = moved_back(long_ago, true);
+        let mut stale = board_with_item_in("in-progress", BEFORE);
+        keep_moves_back(&mut stale, &mut moves, later);
+        assert_eq!(column(&stale), "todo", "GitHub hasn't answered yet");
+
+        let mut moves = moved_back(long_ago, false);
+        let mut stale = board_with_item_in("in-progress", BEFORE);
+        keep_moves_back(&mut stale, &mut moves, later);
+        assert_eq!(column(&stale), "in-progress");
+        assert!(moves.is_empty());
+    }
 }
