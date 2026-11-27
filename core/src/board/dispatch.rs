@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use super::findings::Outcome;
+use super::cleanup::Kept;
 use super::forward::Forwarded;
 use super::repair::Repair;
 use super::pull_request::{LinkedPullRequest, PostedPullRequest, PullRequestHead};
@@ -141,6 +142,9 @@ pub struct WorktreeDispatch {
     /// The comments on that pull request last handed to the session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarded: Option<Forwarded>,
+    /// Set when its work ended but the worktree stays, so cleanup removed nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept: Option<Kept>,
 }
 
 /// The dispatch's session, after CodeScope handed it a repair or comments.
@@ -1368,6 +1372,7 @@ mod tests {
             fork: None,
             repair: None,
             forwarded: None,
+            kept: None,
         }
     }
 

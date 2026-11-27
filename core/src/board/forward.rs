@@ -494,6 +494,7 @@ mod tests {
             fork: None,
             repair: None,
             forwarded: None,
+            kept: None,
         }
     }
 

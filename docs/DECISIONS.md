@@ -1118,10 +1118,14 @@ board, each with their own CodeScope or another tool that follows the
   forwarded comments are only for the pull request the dispatch
   opened: a pull request item that no dispatch of the user's opened is
   worked on only in the rounds a person's move starts.
-* **Cleanup.** Merged: worktree removed, session closed, history kept
-  ([ADR-0015](#adr-0015--closed-session-retention-policy-100-per-worktree-90-day-ttl)).
-  Closed without a PR: removed only when the worktree is clean and has
-  no commits of its own, otherwise the row is marked. Moved by the
+* **Cleanup.** Once the pull request is merged, or the issue is closed
+  without that, and the session is not working: its tabs close, so the
+  session goes to the history
+  ([ADR-0015](#adr-0015--closed-session-retention-policy-100-per-worktree-90-day-ttl)),
+  and the worktree and its local branch are removed. That happens only
+  when nothing there is its own: no uncommitted changes, and no commits
+  that neither the merged head nor the default branch holds. Otherwise
+  nothing is removed, and the row is marked with the reason. Moved by the
   user to a column that is not a trigger column: no round starts,
   nothing more is sent into the session and nothing is removed; what
   the round already produced is still posted. CodeScope never stops an
