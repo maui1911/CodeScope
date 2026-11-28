@@ -814,6 +814,8 @@ pub struct Sidebar {
     /// DataTrigger.
     overview_visible: bool,
     board_visible: bool,
+    /// Items on the boards that need the user, pushed by `AppShell`'s board poll.
+    board_needs_you: usize,
     /// Footer "Bots" button state, pushed by `AppShell`'s bots poll:
     /// whether the selected project has a bot control plane (the
     /// button is hidden otherwise), whether the inbox is on stage, and
@@ -919,6 +921,7 @@ impl Sidebar {
             active_context_path: None,
             overview_visible: false,
             board_visible: false,
+            board_needs_you: 0,
             bots_footer: BotsFooter::default(),
             agent_registry,
             filter: String::new(),
@@ -990,6 +993,15 @@ impl Sidebar {
     pub fn set_board_visible(&mut self, value: bool, cx: &mut Context<Self>) {
         if self.board_visible != value {
             self.board_visible = value;
+            cx.notify();
+        }
+    }
+
+    /// Set how many items on the boards need the user, which the footer "Board" button shows
+    /// while it is more than none.
+    pub fn set_board_needs_you(&mut self, value: usize, cx: &mut Context<Self>) {
+        if self.board_needs_you != value {
+            self.board_needs_you = value;
             cx.notify();
         }
     }
@@ -4579,7 +4591,21 @@ impl Render for Sidebar {
                     MouseButton::Left,
                     cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenBoard)),
                 )
-                .child(div().flex_grow().child("Board"));
+                .child(div().flex_grow().child("Board"))
+                .when(self.board_needs_you > 0, |s| {
+                    s.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .text_size(px(11.0))
+                            .text_color(theme::signal_review())
+                            .font(theme::font_mono())
+                            .child(div().size(px(6.0)).rounded_full().bg(theme::signal_review()))
+                            .child(SharedString::from(self.board_needs_you.to_string())),
+                    )
+                });
 
             // Bots — same shape as Overview, shown only when the
             // selected project has a bot control plane. The count pill

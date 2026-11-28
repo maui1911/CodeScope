@@ -6319,6 +6319,24 @@ impl AppShell {
             row
         });
 
+        let board_segment = self.boards_count(cx).map(|count| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .text_color(ink_dim)
+                .child(div().child(count.running_text()))
+                .children(count.need_you_text().map(|text| {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(6.0))
+                        .child(div().child("·"))
+                        .child(div().text_color(theme::signal_review()).child(text))
+                }))
+        });
+
         // Empty-state tagline — `StatusEmptyVisible` in C# is
         // `Projects.Count == 0`, regardless of whether a tab is
         // focused. The session cluster yields to it below so the
@@ -6522,6 +6540,9 @@ impl AppShell {
                 clusters.push(model_cluster);
             }
             if let Some(seg) = agent_segment {
+                clusters.push(vec![seg.into_any_element()]);
+            }
+            if let Some(seg) = board_segment {
                 clusters.push(vec![seg.into_any_element()]);
             }
             if let Some(gl) = group_label {

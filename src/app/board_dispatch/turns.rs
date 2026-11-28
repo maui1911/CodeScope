@@ -1,5 +1,5 @@
-//! Whose turn each card is (ADR-0027), which cards are the user's own for *Mine*, and the board
-//! header's count of the user's dispatches.
+//! Whose turn each card is (ADR-0027), which cards are the user's own for *Mine* and which need
+//! them, and the count of the user's dispatches in the board header and the status bar.
 
 use std::collections::{HashMap, HashSet};
 
@@ -35,15 +35,25 @@ impl DispatchCount {
     /// `2 of 3 running · 1 needs you · 1 waiting for a slot`, leaving out what is zero.
     pub(crate) fn text(&self) -> String {
         let mut parts = vec![format!("{} of {} running", self.running, self.limit)];
-        match self.need_you {
-            0 => {}
-            1 => parts.push("1 needs you".to_string()),
-            n => parts.push(format!("{n} need you")),
-        }
+        parts.extend(self.need_you_text());
         if self.waiting > 0 {
             parts.push(format!("{} waiting for a slot", self.waiting));
         }
         parts.join(" · ")
+    }
+
+    /// `board: 2/3 running`, as the status bar starts its count.
+    pub(crate) fn running_text(&self) -> String {
+        format!("board: {}/{} running", self.running, self.limit)
+    }
+
+    /// `1 needs you` or `4 need you`; `None` while nothing does.
+    pub(crate) fn need_you_text(&self) -> Option<String> {
+        match self.need_you {
+            0 => None,
+            1 => Some("1 needs you".to_string()),
+            n => Some(format!("{n} need you")),
+        }
     }
 }
 
@@ -106,44 +116,88 @@ impl AppShell {
             .collect()
     }
 
-    /// The user's dispatches, and what on the board at `board_url` needs them or waits.
-    pub(crate) fn dispatch_count(
+    /// The items on the board at `board_url` that need the user, out of its cards' `notes` and
+    /// `turns`.
+    pub(crate) fn need_you_items(
         &self,
         board_url: &str,
         notes: &HashMap<String, CardNote>,
         turns: &HashMap<String, TurnLabel>,
-        cx: &App,
-    ) -> DispatchCount {
-        let on_board: HashSet<&str> = self
-            .board
+    ) -> HashSet<String> {
+        needing_you(&self.items_on(board_url), notes, turns)
+    }
+
+    fn items_on(&self, board_url: &str) -> HashSet<&str> {
+        self.board
             .reads_by_url
             .get(board_url)
             .and_then(|read| read.last_good.as_ref())
             .map(|board| board.items.iter().map(|item| item.id.as_str()).collect())
-            .unwrap_or_default();
-        let need_you: HashSet<&str> = notes
-            .iter()
-            .filter(|(_, note)| note.tone == NoteTone::NeedsYou)
-            .map(|(id, _)| id.as_str())
-            .chain(turns.iter().filter(|(_, t)| t.yours).map(|(id, _)| id.as_str()))
-            .filter(|id| on_board.contains(id))
-            .collect();
-        let waiting = self
-            .board
-            .dispatch
-            .holds
+            .unwrap_or_default()
+    }
+
+    /// The user's dispatches, `need_you` of the items on the board at `board_url` that need them,
+    /// and how many wait for a slot there.
+    pub(crate) fn dispatch_count(
+        &self,
+        board_url: &str,
+        need_you: usize,
+        cx: &App,
+    ) -> DispatchCount {
+        DispatchCount {
+            running: self.running_dispatches(cx),
+            limit: self.settings.dispatch_limit,
+            need_you,
+            waiting: self.waiting_for_a_slot(board_url),
+        }
+    }
+
+    fn waiting_for_a_slot(&self, board_url: &str) -> usize {
+        let on_board = self.items_on(board_url);
+        let holds = &self.board.dispatch.holds;
+        holds
             .iter()
             .filter(|(id, hold)| {
                 on_board.contains(id.as_str()) && matches!(hold, Hold::LimitReached(_))
             })
-            .count();
-        DispatchCount {
+            .count()
+    }
+
+    /// The user's dispatches, and what needs them or waits on every board, as the status bar and
+    /// the sidebar's *Board* button count them; `None` while no board is added.
+    pub(crate) fn boards_count(&self, cx: &App) -> Option<DispatchCount> {
+        let boards = &self.settings.boards;
+        if boards.is_empty() {
+            return None;
+        }
+        let need_you = boards.iter().map(|board| {
+            let notes = self.card_notes(&board.url, cx);
+            let turns = self.turn_labels(&board.url);
+            self.need_you_items(&board.url, &notes, &turns).len()
+        });
+        Some(DispatchCount {
             running: self.running_dispatches(cx),
             limit: self.settings.dispatch_limit,
-            need_you: need_you.len(),
-            waiting,
-        }
+            need_you: need_you.sum(),
+            waiting: boards.iter().map(|board| self.waiting_for_a_slot(&board.url)).sum(),
+        })
     }
+}
+
+/// The items of `on_board` whose card says they need the user, or whose turn is the user's.
+fn needing_you(
+    on_board: &HashSet<&str>,
+    notes: &HashMap<String, CardNote>,
+    turns: &HashMap<String, TurnLabel>,
+) -> HashSet<String> {
+    notes
+        .iter()
+        .filter(|(_, note)| note.tone == NoteTone::NeedsYou)
+        .map(|(id, _)| id)
+        .chain(turns.iter().filter(|(_, turn)| turn.yours).map(|(id, _)| id))
+        .filter(|id| on_board.contains(id.as_str()))
+        .cloned()
+        .collect()
 }
 
 /// Whether *Mine* shows `item`: it is assigned to the user, it is one of their dispatches, or
@@ -299,5 +353,41 @@ mod tests {
         assert_eq!(count(0, 0).text(), "2 of 3 running");
         assert_eq!(count(1, 0).text(), "2 of 3 running · 1 needs you");
         assert_eq!(count(3, 1).text(), "2 of 3 running · 3 need you · 1 waiting for a slot");
+    }
+
+    #[test]
+    fn the_status_bar_says_board_and_what_runs_and_then_what_needs_you() {
+        let count = |need_you| DispatchCount {
+            running: 3,
+            limit: 3,
+            need_you,
+            waiting: 2,
+        };
+        assert_eq!(count(0).running_text(), "board: 3/3 running");
+        assert_eq!(count(0).need_you_text(), None);
+        assert_eq!(count(1).need_you_text().as_deref(), Some("1 needs you"));
+        assert_eq!(count(4).need_you_text().as_deref(), Some("4 need you"));
+    }
+
+    #[test]
+    fn an_item_needs_you_when_its_card_says_so_or_it_is_your_turn() {
+        let note = |tone| CardNote::new("", tone);
+        let notes = HashMap::from([
+            ("PVTI_choice".to_string(), note(NoteTone::NeedsYou)),
+            ("PVTI_working".to_string(), note(NoteTone::Working)),
+            ("PVTI_elsewhere".to_string(), note(NoteTone::NeedsYou)),
+        ]);
+        let turn = |yours| TurnLabel {
+            text: "".into(),
+            yours,
+        };
+        let turns = HashMap::from([
+            ("PVTI_review".to_string(), turn(true)),
+            ("PVTI_working".to_string(), turn(false)),
+        ]);
+        let on_board = HashSet::from(["PVTI_choice", "PVTI_working", "PVTI_review"]);
+        let mut needing = Vec::from_iter(needing_you(&on_board, &notes, &turns));
+        needing.sort();
+        assert_eq!(needing, ["PVTI_choice", "PVTI_review"]);
     }
 }

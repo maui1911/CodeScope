@@ -1048,9 +1048,10 @@ board, each with their own CodeScope or another tool that follows the
   every teammate's screen: an agent (and whose), CI, a person (*you*,
   or a GitHub login), the reviewers, or nobody. *Needs you* adds what
   only the user's own CodeScope knows, such as a session waiting for
-  input, so it shows only to them. The board panel filters on *Mine*
-  or *All*; the toast and the bell fire only for the user's own
-  dispatches.
+  input, so it shows only to them. The board panel filters on *Mine*,
+  *All* or *Needs you*, and the *Board* button and the status bar
+  count what needs the user on every board; the toast and the bell
+  fire only for the user's own dispatches.
 * **Branch and link.** The branch is `<number>-<slug>`, the `gh issue
   develop` default, and can be edited in the manual dispatch dialog.
   Research uses it as a local branch. When implementation starts,
