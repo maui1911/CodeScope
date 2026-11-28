@@ -82,7 +82,9 @@ pub use session::{
 pub use session_title::{
     SessionTitle, TitleSource, normalize_title, session_label, terminal_title_candidate,
 };
-pub use settings::{CursorSettings, CursorShape, DEFAULT_AGENT_ID, FontSettings, Settings};
+pub use settings::{
+    CursorSettings, CursorShape, DEFAULT_AGENT_ID, FontSettings, NotifySettings, Settings,
+};
 pub use tab_drag::{TabRect, compute_drop_index};
 pub use tab_title::{TAB_TITLE_SEPARATOR, TabTitle};
 pub use telemetry::{
