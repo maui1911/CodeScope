@@ -99,19 +99,56 @@ fn split_first_sentence(line: &str) -> (&str, &str) {
     (line, "")
 }
 
-/// Markdown without `**` and without the backticks around code spans, trimmed; a code span
-/// keeps its text as written.
+/// Markdown without `**`, without the stars around `*emphasis*` and without the backticks
+/// around code spans, trimmed; a code span keeps its text as written.
 pub fn plain_text(markdown: &str) -> String {
     let mut plain = String::new();
+    let mut stars = Vec::new();
+    let mut push_prose = |plain: &mut String, prose: &str| {
+        let prose = prose.replace("**", "");
+        stars.extend(prose.match_indices('*').map(|(at, _)| plain.len() + at));
+        plain.push_str(&prose);
+    };
     let mut prose = 0;
     for span in code_spans(markdown) {
-        plain.push_str(&markdown[prose..span.start].replace("**", ""));
+        push_prose(&mut plain, &markdown[prose..span.start]);
         let run = backtick_run(&markdown[span.start..]);
         plain.push_str(code_span_text(&markdown[span.start + run..span.end - run]));
         prose = span.end;
     }
-    plain.push_str(&markdown[prose..].replace("**", ""));
-    plain.trim().to_string()
+    push_prose(&mut plain, &markdown[prose..]);
+    without_emphasis(&plain, &stars).trim().to_string()
+}
+
+/// `text` without the pairs among `stars` that open and close emphasis: an opening star has
+/// text right after it and no letter or digit before it, a closing one the other way round.
+fn without_emphasis(text: &str, stars: &[usize]) -> String {
+    let before = |at: usize| text[..at].chars().next_back();
+    let after = |at: usize| text[at + 1..].chars().next();
+    let opens = |at: usize| {
+        after(at).is_some_and(|c| !c.is_whitespace())
+            && before(at).is_none_or(|c| !c.is_alphanumeric())
+    };
+    let closes = |at: usize| {
+        before(at).is_some_and(|c| !c.is_whitespace())
+            && after(at).is_none_or(|c| !c.is_alphanumeric())
+    };
+    let mut dropped = Vec::new();
+    let mut next = 0;
+    while next < stars.len() {
+        let open = stars[next];
+        let close = opens(open)
+            .then(|| stars[next + 1..].iter().position(|&at| closes(at)))
+            .flatten();
+        match close {
+            Some(offset) => {
+                dropped.extend([open, stars[next + 1 + offset]]);
+                next += offset + 2;
+            }
+            None => next += 1,
+        }
+    }
+    text.char_indices().filter(|(at, _)| !dropped.contains(at)).map(|(_, c)| c).collect()
 }
 
 /// The code spans in `text`, backticks included, in order. A run of backticks without a
@@ -1474,6 +1511,18 @@ Advice: A, it keeps the slice small.
             option('A', "Run ``a. b`` first. Then go.").label_and_detail(),
             ("Run a. b first.".to_string(), "Then go.".to_string())
         );
+    }
+
+    #[test]
+    fn plain_text_drops_the_stars_around_emphasis_only() {
+        assert_eq!(
+            plain_text("Out of *Researching*, then (*Needs decision*)."),
+            "Out of Researching, then (Needs decision)."
+        );
+        assert_eq!(plain_text("***Both*** and `*kept*`"), "Both and *kept*");
+        assert_eq!(plain_text("*from `code` on*"), "from code on");
+        assert_eq!(plain_text("5 * 3 and 2*3*4 and * item"), "5 * 3 and 2*3*4 and * item");
+        assert_eq!(plain_text("an *open star"), "an *open star");
     }
 
     #[test]
