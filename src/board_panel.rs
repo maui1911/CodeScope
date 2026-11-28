@@ -3,6 +3,7 @@
 //! share; opening one closes the others. Boards are read every 30 s whether or not the panel is
 //! on stage.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,6 +11,7 @@ use std::time::{Duration, Instant};
 use codescope_core::board::github::{
     LINKED_PULL_REQUEST_WORKFLOW, TriggerReads, moves_back_from_review,
 };
+use codescope_core::board::turn::OpenPullRequest;
 use codescope_core::board::{
     Board, BoardItem, BoardRef, BoardSettings, ColumnRole, ItemKind, ItemState, PanelColumn,
     PanelGroup, PanelSection, RoleKind, effective_mapping, missing_roles, panel_columns,
@@ -23,8 +25,8 @@ use gpui::{
 
 use crate::app::AppShell;
 use crate::app::board_dispatch::{
-    CardAction, CardNote, DispatchState, DrawerRead, NoteTone, ReadInput, ReadOutput,
-    read_boards,
+    CardAction, CardNote, DispatchCount, DispatchState, DrawerRead, NoteTone, ReadInput,
+    ReadOutput, TurnLabel, read_boards,
 };
 use crate::dialogs::confirm::ConfirmSpec;
 use crate::theme;
@@ -41,6 +43,8 @@ pub(crate) struct BoardPanelState {
     pub reads_by_url: HashMap<String, BoardRead>,
     pub selected_url: Option<String>,
     pub show_all_done: bool,
+    /// Set while the panel shows only the user's own items.
+    pub mine: bool,
     /// The item whose drawer is open, on the selected board.
     pub drawer: Option<String>,
     /// What the open drawer read of its item.
@@ -50,6 +54,14 @@ pub(crate) struct BoardPanelState {
     pub reading: bool,
     pub last_read: Option<Instant>,
     pub dispatch: DispatchState,
+}
+
+/// What the cards of a board show beyond their item, by item id.
+struct Cards<'a> {
+    notes: &'a HashMap<String, CardNote>,
+    turns: &'a HashMap<String, TurnLabel>,
+    /// The item whose drawer is open.
+    selected: Option<&'a str>,
 }
 
 /// A move back to Todo the panel already shows, before a board read does.
@@ -72,6 +84,9 @@ pub(crate) struct BoardRead {
     pub read_at: Option<Instant>,
     /// Last moves and linked pull requests of the items in trigger columns; `None` until read.
     pub triggers: Option<TriggerReads>,
+    /// The open pull request of each item in *In progress* or *In review*, by content id, as the
+    /// last read that could read them found it.
+    pub turns: Option<HashMap<String, Option<OpenPullRequest>>>,
     pub workflows: Option<Vec<String>>,
     pub workflows_read_at: Option<Instant>,
 }
@@ -255,6 +270,9 @@ impl AppShell {
                     read.error = None;
                     read.read_at = Some(Instant::now());
                     read.triggers = fetch.triggers;
+                    if let Some(turns) = fetch.turns {
+                        read.turns = Some(turns);
+                    }
                 }
                 Err(err) => read.error = Some(err),
             }
@@ -287,6 +305,7 @@ impl AppShell {
                 error: None,
                 read_at: Some(Instant::now()),
                 triggers: None,
+                turns: None,
                 workflows: None,
                 workflows_read_at: None,
             },
@@ -374,18 +393,38 @@ impl AppShell {
                 .size_full()
                 .bg(canvas)
                 .text_color(ink)
-                .child(self.render_board_header(theme, None, cx))
+                .child(self.render_board_header(theme, None, None, cx))
                 .child(self.render_board_empty(theme, cx))
                 .into_any_element();
         };
         let read = self.board.reads_by_url.get(&settings.url);
         let notes = self.card_notes(&settings.url, cx);
+        let turns = self.turn_labels(&settings.url);
+        let count = self.dispatch_count(&settings.url, &notes, &turns, cx);
+        let mine = self.board.mine.then(|| self.my_items(&settings.url, cx));
         let mut body = div().id("board-body").flex_grow().h_full().overflow_scroll();
         body.style().min_size.height = Some(gpui::Length::Definite(px(0.0).into()));
         body.style().min_size.width = Some(gpui::Length::Definite(px(0.0).into()));
         let body = match read.and_then(|r| r.last_good.as_ref()) {
             Some(board) => {
-                body.child(self.render_board_columns(theme, &settings, board, &notes, cx))
+                let board = match &mine {
+                    Some(mine) => Cow::Owned(Board {
+                        items: board
+                            .items
+                            .iter()
+                            .filter(|item| mine.contains(&item.id))
+                            .cloned()
+                            .collect(),
+                        ..board.clone()
+                    }),
+                    None => Cow::Borrowed(board),
+                };
+                let cards = Cards {
+                    notes: &notes,
+                    turns: &turns,
+                    selected: self.board.drawer.as_deref(),
+                };
+                body.child(self.render_board_columns(theme, &settings, &board, cards, cx))
             }
             None => body.child(self.render_board_message(theme, read)),
         };
@@ -420,7 +459,7 @@ impl AppShell {
             .bg(canvas)
             .text_color(ink)
             .font(theme::font_sans())
-            .child(self.render_board_header(theme, Some(&settings), cx))
+            .child(self.render_board_header(theme, Some(&settings), Some(count), cx))
             .when(!missing.is_empty(), |s| {
                 s.child(render_missing_roles(theme, &missing))
             })
@@ -434,6 +473,7 @@ impl AppShell {
         &self,
         theme: &Arc<Theme>,
         selected: Option<&BoardSettings>,
+        count: Option<DispatchCount>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let accent = theme::accent(theme);
@@ -552,6 +592,17 @@ impl AppShell {
                     .text_color(color)
                     .child(text)
             }))
+            .children(count.map(|count| {
+                div()
+                    .text_size(px(13.0))
+                    .text_color(if count.need_you > 0 {
+                        theme::signal_review()
+                    } else {
+                        theme::ink_dim(theme)
+                    })
+                    .child(format!("· {}", count.text()))
+            }))
+            .when(selected.is_some(), |s| s.child(self.render_mine_toggle(theme, cx)))
             .child(div().flex_grow())
             .when(selected.is_some(), |s| {
                 s.child(
@@ -593,6 +644,45 @@ impl AppShell {
                 ),
             )
             .into_any_element()
+    }
+
+    fn render_mine_toggle(&self, theme: &Arc<Theme>, cx: &mut Context<Self>) -> impl IntoElement {
+        let option = |id: &'static str, label: &'static str, mine: bool| {
+            let active = self.board.mine == mine;
+            div()
+                .id(id)
+                .px(px(9.0))
+                .py(px(3.0))
+                .rounded(px(5.0))
+                .text_size(px(12.0))
+                .cursor_pointer()
+                .when(active, |s| {
+                    s.bg(theme::elevated(theme)).text_color(theme::ink(theme))
+                })
+                .when(!active, |s| {
+                    s.text_color(theme::ink_dim(theme))
+                        .hover(|s| s.text_color(theme::ink(theme)))
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.board.mine = mine;
+                        cx.notify();
+                    }),
+                )
+                .child(label)
+        };
+        div()
+            .ml(px(8.0))
+            .flex()
+            .flex_row()
+            .p(px(2.0))
+            .gap(px(2.0))
+            .rounded(px(7.0))
+            .border_1()
+            .border_color(theme::divider(theme))
+            .child(option("board-mine", "Mine", true))
+            .child(option("board-all", "All", false))
     }
 
     fn render_board_empty(&self, theme: &Arc<Theme>, cx: &mut Context<Self>) -> AnyElement {
@@ -679,11 +769,10 @@ impl AppShell {
         theme: &Arc<Theme>,
         settings: &BoardSettings,
         board: &Board,
-        notes: &HashMap<String, CardNote>,
+        cards: Cards,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let columns = panel_columns(board, &effective_mapping(board, &settings.columns));
-        let selected = self.board.drawer.as_deref();
         div()
             .flex()
             .flex_row()
@@ -696,8 +785,7 @@ impl AppShell {
                     PanelGroup::Done => self
                         .render_done_column(theme, column, board, cx)
                         .into_any_element(),
-                    _ => render_group_column(theme, column, board, (notes, selected), cx)
-                        .into_any_element(),
+                    _ => render_group_column(theme, column, board, &cards, cx).into_any_element(),
                 }
             }))
             .into_any_element()
@@ -854,7 +942,7 @@ fn render_group_column(
     theme: &Arc<Theme>,
     column: &PanelColumn,
     board: &Board,
-    cards: (&HashMap<String, CardNote>, Option<&str>),
+    cards: &Cards,
     cx: &mut Context<AppShell>,
 ) -> impl IntoElement {
     let framed = matches!(
@@ -895,7 +983,7 @@ fn render_section(
     section: &PanelSection,
     board: &Board,
     heading: bool,
-    (notes, selected): (&HashMap<String, CardNote>, Option<&str>),
+    cards: &Cards,
     cx: &mut Context<AppShell>,
 ) -> impl IntoElement {
     let trigger = section.role.map(ColumnRole::kind) == Some(RoleKind::Trigger);
@@ -939,15 +1027,16 @@ fn render_section(
         })
         .children(section.items.iter().map(|&index| {
             let item = &board.items[index];
-            let chosen = selected == Some(item.id.as_str());
-            render_card(theme, (item, index, chosen), notes.get(&item.id), cx).into_any_element()
+            let chosen = cards.selected == Some(item.id.as_str());
+            let (note, turn) = (cards.notes.get(&item.id), cards.turns.get(&item.id));
+            render_card(theme, (item, index, chosen), (note, turn), cx).into_any_element()
         }))
 }
 
 fn render_card(
     theme: &Arc<Theme>,
     (item, index, selected): (&BoardItem, usize, bool),
-    dispatch: Option<&CardNote>,
+    (dispatch, turn): (Option<&CardNote>, Option<&TurnLabel>),
     cx: &mut Context<AppShell>,
 ) -> impl IntoElement {
     let note = match item.state {
@@ -995,14 +1084,28 @@ fn render_card(
             div()
                 .flex()
                 .flex_row()
+                .flex_wrap()
                 .items_center()
-                .gap(px(6.0))
+                .gap_x(px(6.0))
+                .gap_y(px(2.0))
                 .text_size(px(11.0))
                 .text_color(theme::text_faint())
                 .font(theme::font_mono())
                 .child(state_dot(state_color(item, theme)))
                 .child(reference)
-                .children(note.map(|n| div().child(format!("· {n}")))),
+                .children(note.map(|n| div().child(format!("· {n}"))))
+                .children(turn.map(|turn| {
+                    div()
+                        .flex_grow()
+                        .flex()
+                        .justify_end()
+                        .text_color(if turn.yours {
+                            theme::signal_review()
+                        } else {
+                            theme::ink_muted(theme)
+                        })
+                        .child(turn.text.clone())
+                })),
         )
         .child(
             div()

@@ -42,6 +42,7 @@ use codescope_core::board::pull_request::{
 };
 use codescope_core::board::dispatch_settings::{DispatchSettings, ReviewRequest};
 use codescope_core::board::setup::run_setup;
+use codescope_core::board::turn::{OpenPullRequest, reads_pull_request};
 use codescope_core::board::reply::{read_reply, reply_problems_message};
 use codescope_core::board::repair::{
     Fault, FaultKind, REPAIR_ATTEMPTS, Repair, RepairStep, fault, repair_message, repair_step,
@@ -65,8 +66,10 @@ use super::{AppShell, ToastKind};
 mod cleanup;
 mod details;
 mod drawer;
+mod turns;
 pub(crate) use details::{DetailsView, DrawerRead, FindingsView, MoveRow};
 pub(crate) use drawer::{ItemDrawer, Mark, Needs};
+pub(crate) use turns::{DispatchCount, TurnLabel};
 use crate::dialogs::confirm::ConfirmSpec;
 use crate::dialogs::new_worktree::sanitize_branch_to_folder;
 use crate::notifications::NotificationKind;
@@ -643,6 +646,9 @@ pub(crate) struct BoardFetch {
     /// Last moves and linked pull requests of the items in trigger columns; `None` when they
     /// couldn't be read.
     pub triggers: Option<TriggerReads>,
+    /// The open pull request of each item in *In progress* or *In review*, by content id; `None`
+    /// when it couldn't be read.
+    pub turns: Option<HashMap<String, Option<OpenPullRequest>>>,
     pub workflows: Option<Result<Vec<String>, String>>,
 }
 
@@ -937,6 +943,21 @@ pub(crate) fn read_boards(input: ReadInput) -> ReadOutput {
         if let (Ok(board), Some(found), Some(viewer)) = (&board, &triggers, &viewer) {
             check_access(board, &found.changes, viewer, &input.known_access, &mut output.access);
         }
+        let turns = board.as_ref().ok().and_then(|board| {
+            let mapping = effective_mapping(board, &stored);
+            let ids: Vec<String> = board
+                .items
+                .iter()
+                .filter(|item| reads_pull_request(item, board.role_of(item, &mapping)))
+                .filter_map(|item| item.content_id.clone())
+                .collect();
+            if ids.is_empty() {
+                return Some(HashMap::new());
+            }
+            github::fetch_turn_reads(&ids)
+                .inspect_err(|err| eprintln!("warning: couldn't read turns on {url}: {err:#}"))
+                .ok()
+        });
         let workflows = match BoardRef::parse_url(&url) {
             Some(wanted) if board.is_ok() && input.workflows_due.contains(&url) => Some(
                 github::fetch_enabled_workflows(&wanted).map_err(|err| {
@@ -950,6 +971,7 @@ pub(crate) fn read_boards(input: ReadInput) -> ReadOutput {
             url,
             board,
             triggers,
+            turns,
             workflows,
         });
     }

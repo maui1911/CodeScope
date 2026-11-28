@@ -119,6 +119,10 @@ impl AppShell {
         let note = notes.get(item_id);
 
         let mut rows = vec![Row::new("Assigned", assigned(&item.assignees, viewer))];
+        if let Some(turn) = self.turn_labels(board_url).remove(item_id) {
+            let needs = turn.yours.then(|| ("needs you".to_string(), Mark::Busy));
+            rows.push(Row::new("Turn", turn.text.to_string()).marked(needs));
+        }
         let mut needs_link = None;
         if let Some((project_id, path, branch, record)) = &dispatch {
             rows.push(Row::new("Worktree", worktree_label(path)));
