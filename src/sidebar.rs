@@ -437,6 +437,9 @@ pub enum SidebarEvent {
     OpenBots,
     /// User clicked the footer "Board" button; the host toggles the board panel.
     OpenBoard,
+    /// User clicked the item chip of a worktree a board dispatch made; the host opens the item's
+    /// card on its board.
+    OpenBoardItem { board_url: String, item_id: String },
     /// User picked "View changes" in a worktree's context menu. The
     /// host opens the full-pane diff viewer for that worktree —
     /// same panel `Ctrl+Shift+D` opens for the focused tab.
@@ -584,6 +587,15 @@ struct WorktreeRowData {
     /// disclosure in the sidebar — mirrors C#
     /// `WorktreeViewModel.History`.
     closed_sessions: Vec<ClosedSessionRow>,
+    item: Option<WorktreeItem>,
+}
+
+/// The board item a dispatch made a worktree for.
+#[derive(Clone)]
+struct WorktreeItem {
+    board_url: String,
+    item_id: String,
+    number: u32,
 }
 
 /// Resolve a persisted `Session.agent_id` to the display name the
@@ -3343,6 +3355,11 @@ impl Render for Sidebar {
                             path: wt.path.clone(),
                             branch: wt.branch.clone(),
                             closed_sessions,
+                            item: wt.dispatch.as_ref().map(|dispatch| WorktreeItem {
+                                board_url: dispatch.board_url.clone(),
+                                item_id: dispatch.item_id.clone(),
+                                number: dispatch.number,
+                            }),
                         }
                     })
                     .collect();
@@ -4054,7 +4071,34 @@ impl Render for Sidebar {
                             .truncate()
                             .font(theme::font_mono())
                             .child(wt_label),
-                    );
+                    )
+                    .children(wt.item.as_ref().map(|item| {
+                        let board_url = item.board_url.clone();
+                        let item_id = item.item_id.clone();
+                        div()
+                            .id(("worktree-item", id_hash(&wt_row_id)))
+                            .flex_shrink_0()
+                            .px(px(4.0))
+                            .border_1()
+                            .border_color(theme::divider(&theme))
+                            .rounded(px(4.0))
+                            .text_size(px(10.0))
+                            .text_color(theme::ink_muted(&theme))
+                            .font(theme::font_mono())
+                            .cursor_pointer()
+                            .hover(move |s| s.text_color(ink_hover))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |_, _, _, cx| {
+                                    cx.stop_propagation();
+                                    cx.emit(SidebarEvent::OpenBoardItem {
+                                        board_url: board_url.clone(),
+                                        item_id: item_id.clone(),
+                                    });
+                                }),
+                            )
+                            .child(SharedString::from(format!("#{}", item.number)))
+                    }));
                 // Resolve the PR cache for this worktree (matched on
                 // the *current* branch, same logic the menu uses) so
                 // both the status slug and the badge can read from a
@@ -7483,6 +7527,7 @@ mod tests {
             path: path.into(),
             branch: branch.map(|s| s.to_string()),
             closed_sessions: Vec::new(),
+            item: None,
         }
     }
 

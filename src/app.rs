@@ -1444,6 +1444,9 @@ impl AppShell {
                     let next = !this.show_board;
                     this.set_show_board(next, cx);
                 }
+                SidebarEvent::OpenBoardItem { board_url, item_id } => {
+                    this.open_board_item(board_url.clone(), item_id, cx);
+                }
                 SidebarEvent::ReopenSession { session_id } => {
                     this.reopen_session(session_id.clone(), window, cx);
                 }
