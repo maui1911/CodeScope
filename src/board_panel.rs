@@ -148,12 +148,15 @@ fn state_color(item: &BoardItem, theme: &Theme) -> Hsla {
     kind_color(item.kind, item.state, theme)
 }
 
+/// The purple GitHub gives what is merged or done.
+pub(crate) fn done_purple() -> Hsla {
+    theme::rgb_to_hsla(codescope_core::Rgb::from_hex(DONE_PURPLE))
+}
+
 fn kind_color(kind: ItemKind, state: ItemState, theme: &Theme) -> Hsla {
     match (kind, state) {
         (ItemKind::Draft, _) => theme::text_faint(),
-        (_, ItemState::Merged) | (ItemKind::Issue, ItemState::Closed) => {
-            theme::rgb_to_hsla(codescope_core::Rgb::from_hex(DONE_PURPLE))
-        }
+        (_, ItemState::Merged) | (ItemKind::Issue, ItemState::Closed) => done_purple(),
         (ItemKind::PullRequest, ItemState::Closed) => theme::danger(),
         (ItemKind::PullRequest, ItemState::Open) => theme::accent(theme),
         (ItemKind::Issue, ItemState::Open) => theme::signal_ok(),
@@ -567,6 +570,7 @@ impl AppShell {
         };
 
         let selected_url = selected.map(|s| s.url.clone());
+        let has_read = read.is_some_and(|r| r.last_good.is_some());
         let board_url = read
             .and_then(|r| r.last_good.as_ref())
             .map(|b| b.url.clone())
@@ -623,6 +627,12 @@ impl AppShell {
                     cx.listener(|this, _, window, cx| this.open_add_board_dialog(window, cx)),
                 ),
             )
+            .when(has_read, |s| {
+                s.child(text_button("board-settings", "Board settings", accent).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.open_board_settings_dialog(window, cx)),
+                ))
+            })
             .children(board_url.map(|url| {
                 text_button("board-open", "Open on GitHub", accent).on_mouse_down(
                     MouseButton::Left,

@@ -311,6 +311,22 @@ pub fn effective_mapping(board: &Board, mapping: &ColumnMapping) -> ColumnMappin
     effective
 }
 
+/// Map `role` to the column named `column`. A role that had that column takes the one `role`
+/// had, or is left without one.
+pub fn remap(mapping: &mut ColumnMapping, role: ColumnRole, column: &str) {
+    let previous = mapping.insert(role, column.to_string());
+    let holder = mapping
+        .iter()
+        .find(|(other, name)| **other != role && name.as_str() == column)
+        .map(|(other, _)| *other);
+    if let Some(holder) = holder {
+        match previous {
+            Some(previous) => mapping.insert(holder, previous),
+            None => mapping.remove(&holder),
+        };
+    }
+}
+
 /// The column a role maps to: the one with exactly that name, else the only one whose
 /// [`normalize_column_name`] matches.
 pub fn mapped_column<'a>(
@@ -352,6 +368,10 @@ pub struct BoardSettings {
     pub columns: ColumnMapping,
     /// When the board was added, ISO 8601; moves made before then start nothing.
     pub added_at: String,
+    /// When each trigger role last got another column, ISO 8601; moves into it made before then
+    /// start nothing.
+    #[serde(deserialize_with = "known_roles", skip_serializing_if = "BTreeMap::is_empty")]
+    pub remapped_at: BTreeMap<ColumnRole, String>,
     /// The project id picked on this board for the items of an `owner/name` repository that
     /// several projects have a remote for.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -362,6 +382,18 @@ pub struct BoardSettings {
 }
 
 impl BoardSettings {
+    /// Store `mapping` as the board's columns at `now`; each trigger role whose column on
+    /// `board` it changes is stamped with `now` in [`Self::remapped_at`].
+    pub fn remap_columns(&mut self, board: &Board, mapping: ColumnMapping, now: &str) {
+        let before = effective_mapping(board, &self.columns);
+        for role in ColumnRole::ALL.into_iter().filter(|r| r.kind() == RoleKind::Trigger) {
+            if before.get(&role) != mapping.get(&role) {
+                self.remapped_at.insert(role, now.to_string());
+            }
+        }
+        self.columns = mapping;
+    }
+
     /// The project id picked on this board for `repository`, compared without case.
     pub fn picked_project(&self, repository: &str) -> Option<&str> {
         self.projects
@@ -763,6 +795,27 @@ mod tests {
     }
 
     #[test]
+    fn remapping_a_role_to_a_taken_column_hands_the_other_role_its_old_column() {
+        let names = |pairs: &[(ColumnRole, &str)]| -> ColumnMapping {
+            pairs.iter().map(|(role, name)| (*role, name.to_string())).collect()
+        };
+        let mut mapping = names(&[(ColumnRole::Ready, "Ready"), (ColumnRole::InProgress, "Doing")]);
+        remap(&mut mapping, ColumnRole::Ready, "Doing");
+        assert_eq!(
+            mapping,
+            names(&[(ColumnRole::Ready, "Doing"), (ColumnRole::InProgress, "Ready")])
+        );
+        remap(&mut mapping, ColumnRole::Research, "Ready");
+        assert_eq!(
+            mapping,
+            names(&[(ColumnRole::Ready, "Doing"), (ColumnRole::Research, "Ready")]),
+            "a role that had no column leaves the other role without one"
+        );
+        remap(&mut mapping, ColumnRole::Research, "Ready");
+        assert_eq!(mapping.len(), 2);
+    }
+
+    #[test]
     fn effective_mapping_keeps_stored_choices_and_fills_the_rest() {
         let b = board(
             vec![
@@ -786,6 +839,41 @@ mod tests {
             Some("Ready")
         );
         assert_eq!(effective.get(&ColumnRole::InReview), None);
+    }
+
+    #[test]
+    fn remapping_stamps_each_trigger_role_whose_column_changed() {
+        let b = board(
+            vec![
+                column("a", "Research"),
+                column("b", "Ready"),
+                column("c", "Doing"),
+                column("d", "Done"),
+            ],
+            vec![],
+        );
+        let mut settings = BoardSettings {
+            columns: ColumnMapping::from([(ColumnRole::Ready, "Ready".to_string())]),
+            ..BoardSettings::default()
+        };
+        let unchanged = effective_mapping(&b, &settings.columns);
+        settings.remap_columns(&b, unchanged.clone(), "2026-11-28T10:00:00Z");
+        assert!(settings.remapped_at.is_empty(), "a filled-in column is no change");
+        assert_eq!(settings.columns, unchanged);
+        assert!(!serde_json::to_string(&settings).unwrap().contains("remappedAt"));
+
+        let mut moved = unchanged.clone();
+        remap(&mut moved, ColumnRole::Ready, "Doing");
+        remap(&mut moved, ColumnRole::Done, "Ready");
+        settings.remap_columns(&b, moved.clone(), "2026-11-28T10:00:00Z");
+        assert_eq!(
+            settings.remapped_at,
+            BTreeMap::from([(ColumnRole::Ready, "2026-11-28T10:00:00Z".to_string())])
+        );
+        assert_eq!(settings.columns, moved);
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains(r#""remappedAt":{"ready":"2026-11-28T10:00:00Z"}"#), "{json}");
+        assert_eq!(serde_json::from_str::<BoardSettings>(&json).unwrap(), settings);
     }
 
     #[test]

@@ -1008,19 +1008,21 @@ pub(crate) fn read_boards(input: ReadInput) -> ReadOutput {
             read_discussions(&input.discussions, &input.known_access, &mut output.access);
     }
     if (any_trigger || input.dispatched) && let Some(projects) = input.projects {
-        output.remotes = Some(
-            projects
-                .into_iter()
-                .map(|(project_id, path)| ProjectRemotes {
-                    remotes: codescope_core::git::remote_urls(Path::new(&path))
-                        .unwrap_or_default(),
-                    project_id,
-                    path,
-                })
-                .collect(),
-        );
+        output.remotes = Some(read_remotes(projects));
     }
     output
+}
+
+/// The remotes of each `(project id, path)`; a project whose remotes can't be read has none.
+pub(crate) fn read_remotes(projects: Vec<(String, String)>) -> Vec<ProjectRemotes> {
+    projects
+        .into_iter()
+        .map(|(project_id, path)| ProjectRemotes {
+            remotes: codescope_core::git::remote_urls(Path::new(&path)).unwrap_or_default(),
+            project_id,
+            path,
+        })
+        .collect()
 }
 
 fn check_access(
@@ -1354,7 +1356,7 @@ impl AppShell {
         self.sidebar.read(cx).projects()
     }
 
-    fn local_projects(&self, cx: &App) -> Vec<(String, String)> {
+    pub(crate) fn local_projects(&self, cx: &App) -> Vec<(String, String)> {
         self.current_projects(cx)
             .projects
             .iter()
@@ -1565,6 +1567,7 @@ impl AppShell {
                     change,
                     mover_can_write,
                     board_added_at: &settings.added_at,
+                    remapped_at: &settings.remapped_at,
                     now: &now,
                     projects: self
                         .project_of(&settings.url, item, worktree.map(|(id, ..)| id.as_str()))
