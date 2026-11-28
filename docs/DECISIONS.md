@@ -904,7 +904,9 @@ board, each with their own CodeScope or another tool that follows the
   several boards. An item finds its project through its repository; a
   project belongs to every repository any of its remotes points to
   (`origin` is often a fork, the issues live on `upstream`). When
-  several projects match, the user picks once per board. A draft issue
+  several projects match, the user picks once per board. When none
+  does, the item *needs you*: *Clone and start* clones the repository
+  as a new project, and the next board read starts the round. A draft issue
   is not dispatched: it has no repository and no timeline that says
   who moved it. It waits, with that reason shown on it in the board
   panel, until a person converts it to an issue and moves it again.

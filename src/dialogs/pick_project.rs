@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use codescope_core::Theme;
-use codescope_core::board::{ColumnRole, effective_mapping};
+use codescope_core::board::{Board, BoardItem, BoardSettings, ColumnRole, effective_mapping};
 use gpui::{
     AnyElement, App, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
     MouseButton, ParentElement, StatefulInteractiveElement, Styled, Window, anchored, deferred,
@@ -77,10 +77,7 @@ impl AppShell {
         let item = board.items.iter().find(|item| item.id == item_id)?;
         let repository = item.repository.clone()?;
         let column = item.column_id.as_deref().and_then(|id| board.column(id))?;
-        let work = match board.role_of(item, &effective_mapping(board, &settings.columns)) {
-            Some(ColumnRole::Research) => "research",
-            _ => work_after_research(item.kind),
-        };
+        let work = work_on(board, settings, item);
         let projects = self.current_projects(cx);
         let choices: Vec<ProjectChoice> =
             self.projects_with_remote(&repository)
@@ -379,6 +376,15 @@ impl AppShell {
                 .with_priority(10)
                 .into_any_element(),
         )
+    }
+}
+
+/// What a round on `item` in its trigger column starts: `research`, `implementation` or
+/// `a review`.
+pub(crate) fn work_on(board: &Board, settings: &BoardSettings, item: &BoardItem) -> &'static str {
+    match board.role_of(item, &effective_mapping(board, &settings.columns)) {
+        Some(ColumnRole::Research) => "research",
+        _ => work_after_research(item.kind),
     }
 }
 

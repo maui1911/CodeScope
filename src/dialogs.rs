@@ -3,6 +3,7 @@
 
 pub mod add_board;
 pub mod board_settings;
+pub mod clone_start;
 pub mod confirm;
 pub mod decide;
 pub mod new_project;
