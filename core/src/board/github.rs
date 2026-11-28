@@ -229,8 +229,8 @@ pub fn parse_trigger_reads(json: &str, board_id: &str) -> Result<TriggerReads> {
         });
         if let Some(change) = change {
             let change = StatusChange {
+                was_automated: by_workflow(change.was_automated, change.actor.as_ref()),
                 actor: change.actor.map(|a| a.login),
-                was_automated: change.was_automated,
                 status: change.status,
                 created_at: change.created_at,
             };
@@ -319,9 +319,9 @@ pub struct ColumnMove {
     pub from: Option<String>,
     /// The column it moved into; `None` when its status was cleared.
     pub to: Option<String>,
-    /// Login of who moved it; `None` for a workflow or a deleted account.
+    /// Login of who moved it; `None` for a deleted account and for some workflows.
     pub actor: Option<String>,
-    /// Set when one of the board's workflows moved it.
+    /// Set when one of the board's workflows moved it, GitHub's built-in ones too.
     pub was_automated: bool,
     /// ISO 8601, as GitHub writes it.
     pub at: String,
@@ -405,8 +405,8 @@ pub fn parse_item_details(json: &str, board_id: &str) -> Result<ItemDetails> {
         .map(|m| ColumnMove {
             from: m.previous_status.filter(|s| !s.is_empty()),
             to: m.status.filter(|s| !s.is_empty()),
+            was_automated: by_workflow(m.was_automated, m.actor.as_ref()),
             actor: m.actor.map(|a| a.login),
-            was_automated: m.was_automated,
             at: m.created_at,
         })
         .collect();
@@ -1166,6 +1166,11 @@ struct Login {
     login: String,
 }
 
+fn by_workflow(was_automated: bool, actor: Option<&Login>) -> bool {
+    // GitHub's built-in project workflows move items as this bot, with `wasAutomated` false.
+    was_automated || actor.is_some_and(|a| a.login == "github-project-automation")
+}
+
 #[derive(Deserialize)]
 struct ItemDetailsData {
     node: Option<DetailsNode>,
@@ -1770,6 +1775,20 @@ mod tests {
                 created_at: "2026-11-25T10:00:00Z".into(),
             }
         );
+    }
+
+    #[test]
+    fn a_move_by_githubs_own_project_workflows_is_a_workflows_move() {
+        let event = r#"{"createdAt":"2026-11-26T10:33:24Z","previousStatus":"In review",
+          "status":"Done","wasAutomated":false,"actor":{"login":"github-project-automation"},
+          "project":{"id":"PVT_1"}}"#;
+        let trigger = format!(
+            r#"{{"data":{{"nodes":[{{"__typename":"Issue","id":"I_408",
+              "timelineItems":{{"nodes":[{event}]}}}}]}}}}"#
+        );
+        assert!(parse_trigger_reads(&trigger, "PVT_1").unwrap().changes["I_408"].was_automated);
+        let details = format!(r#"{{"data":{{"node":{{"timelineItems":{{"nodes":[{event}]}}}}}}}}"#);
+        assert!(parse_item_details(&details, "PVT_1").unwrap().moves[0].was_automated);
     }
 
     #[test]
