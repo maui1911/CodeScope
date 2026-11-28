@@ -188,6 +188,7 @@ impl AppShell {
                     this.run_dispatch(window, cx);
                     this.collect_findings(cx);
                     this.watch_pull_requests(cx);
+                    this.watch_attention(cx);
                     this.run_handovers(window, cx);
                     this.run_cleanups(window, cx);
                     this.begin_board_read(false, cx)
