@@ -1,6 +1,7 @@
 //! Which board items to dispatch and what their agent gets: the rules of `docs/board-protocol.md`
 //! as pure functions, and the files a dispatch writes into its worktree.
 
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -232,6 +233,8 @@ pub enum Hold {
     /// that move yet.
     MoveNotShownYet,
     MovedBeforeAdded,
+    /// Moved into its column before that column was mapped to the trigger role it has now.
+    MovedBeforeRemap,
     MovedByWorkflow,
     /// Moved by someone else: on an item not assigned to the user alone, or without write access.
     MovedByOther(String),
@@ -306,6 +309,9 @@ impl Hold {
             Hold::MovedBeforeAdded => {
                 "Moved before the board was added: move it again to start".into()
             }
+            Hold::MovedBeforeRemap => {
+                "Moved before its column was remapped: move it again to start".into()
+            }
             Hold::MovedByWorkflow => "Moved by a workflow: move it yourself to start".into(),
             Hold::MovedByOther(login) => format!("Moved by @{login}: move it yourself to start"),
             Hold::AccessUnknown(login) => {
@@ -373,6 +379,9 @@ pub struct Facts<'a> {
     pub mover_can_write: Option<bool>,
     /// When the board was added, ISO 8601; earlier moves start nothing.
     pub board_added_at: &'a str,
+    /// When each trigger role last got another column, ISO 8601; earlier moves into it start
+    /// nothing.
+    pub remapped_at: &'a BTreeMap<ColumnRole, String>,
     /// When this decision is made, ISO 8601.
     pub now: &'a str,
     /// Projects with a remote for the item's repository.
@@ -496,6 +505,10 @@ fn check(
     }
     if !is_at_or_after(&change.created_at, facts.board_added_at) {
         return Err(Hold::MovedBeforeAdded);
+    }
+    let remapped_at = board.role_of(item, mapping).and_then(|r| facts.remapped_at.get(&r));
+    if remapped_at.is_some_and(|at| !is_at_or_after(&change.created_at, at)) {
+        return Err(Hold::MovedBeforeRemap);
     }
     if change.was_automated {
         return Err(Hold::MovedByWorkflow);
@@ -1432,6 +1445,7 @@ mod tests {
     const ADDED: &str = "2026-11-25T09:00:00Z";
     const MOVED: &str = "2026-11-25T10:00:00Z";
     const NOW: &str = "2026-11-25T11:00:00Z";
+    static NOT_REMAPPED: BTreeMap<ColumnRole, String> = BTreeMap::new();
 
     fn board_with(item: BoardItem) -> Board {
         let columns = [
@@ -1494,6 +1508,7 @@ mod tests {
             change: Some(change),
             mover_can_write: None,
             board_added_at: ADDED,
+            remapped_at: &NOT_REMAPPED,
             now: NOW,
             projects: 1,
             dispatch: None,
@@ -2188,6 +2203,39 @@ mod tests {
             ..issue_in("y")
         };
         assert_eq!(run_decide(unknown, &at("2026-11-25T10:00:15Z")), ask_again);
+    }
+
+    #[test]
+    fn moves_before_their_column_became_a_trigger_start_nothing() {
+        let change = moved_by(VIEWER, "Ready");
+        let later = "2026-11-25T10:30:00Z".to_string();
+        let ready = BTreeMap::from([(ColumnRole::Ready, later.clone())]);
+        let remapped = Facts {
+            remapped_at: &ready,
+            ..facts(&change)
+        };
+        assert_eq!(
+            run_decide(issue_in("y"), &remapped),
+            Some(Err(Hold::MovedBeforeRemap))
+        );
+        let research = BTreeMap::from([(ColumnRole::Research, later)]);
+        let other_role = Facts {
+            remapped_at: &research,
+            ..facts(&change)
+        };
+        assert_eq!(
+            run_decide(issue_in("y"), &other_role),
+            Some(Ok(Round::Implementation))
+        );
+        let earlier = BTreeMap::from([(ColumnRole::Ready, ADDED.to_string())]);
+        let moved_since = Facts {
+            remapped_at: &earlier,
+            ..facts(&change)
+        };
+        assert_eq!(
+            run_decide(issue_in("y"), &moved_since),
+            Some(Ok(Round::Implementation))
+        );
     }
 
     #[test]

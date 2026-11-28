@@ -1565,6 +1565,7 @@ impl AppShell {
                     change,
                     mover_can_write,
                     board_added_at: &settings.added_at,
+                    remapped_at: &settings.remapped_at,
                     now: &now,
                     projects: self
                         .project_of(&settings.url, item, worktree.map(|(id, ..)| id.as_str()))
