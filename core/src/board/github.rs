@@ -229,8 +229,8 @@ pub fn parse_trigger_reads(json: &str, board_id: &str) -> Result<TriggerReads> {
         });
         if let Some(change) = change {
             let change = StatusChange {
+                was_automated: by_workflow(change.was_automated, change.actor.as_ref()),
                 actor: change.actor.map(|a| a.login),
-                was_automated: change.was_automated,
                 status: change.status,
                 created_at: change.created_at,
             };
@@ -297,21 +297,132 @@ pub fn parse_comments(json: &str) -> Result<HashMap<String, Vec<Comment>>> {
         .into_iter()
         .flatten()
         .filter_map(|node| {
-            let comments = node
-                .comments?
-                .nodes
-                .into_iter()
-                .flatten()
-                .map(|c| Comment {
-                    url: c.url,
-                    author: c.author.map(|a| a.login),
-                    body: c.body,
-                    created_at: c.created_at,
-                })
-                .collect();
+            let comments = node.comments?.nodes.into_iter().flatten().map(comment).collect();
             Some((node.id?, comments))
         })
         .collect())
+}
+
+fn comment(node: IssueCommentNode) -> Comment {
+    Comment {
+        url: node.url,
+        author: node.author.map(|a| a.login),
+        body: node.body,
+        created_at: node.created_at,
+    }
+}
+
+/// One move of an item between the columns of a board.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnMove {
+    /// The column it left; `None` when it had none.
+    pub from: Option<String>,
+    /// The column it moved into; `None` when its status was cleared.
+    pub to: Option<String>,
+    /// Login of who moved it; `None` for a deleted account and for some workflows.
+    pub actor: Option<String>,
+    /// Set when one of the board's workflows moved it, GitHub's built-in ones too.
+    pub was_automated: bool,
+    /// ISO 8601, as GitHub writes it.
+    pub at: String,
+}
+
+/// What the item drawer reads about an item when it opens.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ItemDetails {
+    /// Its moves on the board, oldest first, among its last 100 moves on any board.
+    pub moves: Vec<ColumnMove>,
+    /// Its last 50 comments, oldest first.
+    pub comments: Vec<Comment>,
+    /// The body of the pull request asked for; `None` when none was asked for or found.
+    pub pull_request_body: Option<String>,
+}
+
+const ITEM_DETAILS_FRAGMENTS: &str = r#"fragment move on ProjectV2ItemStatusChangedEvent {
+  createdAt previousStatus status wasAutomated actor { login } project { id }
+}
+fragment comment on IssueComment { url body createdAt author { login } }"#;
+
+fn item_details_query(with_pull_request: bool) -> String {
+    let (variables, pull_request) = if with_pull_request {
+        (
+            ", $owner: String!, $name: String!, $number: Int!",
+            "\n  repository(owner: $owner, name: $name) { pullRequest(number: $number) { body } }",
+        )
+    } else {
+        ("", "")
+    };
+    let details = "timelineItems(last: 100, itemTypes: [PROJECT_V2_ITEM_STATUS_CHANGED_EVENT]) \
+                   { nodes { ...move } } comments(last: 50) { nodes { ...comment } }";
+    format!(
+        "query($id: ID!{variables}) {{\n  node(id: $id) {{\n    ... on Issue {{ {details} }}\n    \
+         ... on PullRequest {{ {details} }}\n  }}{pull_request}\n}}\n{ITEM_DETAILS_FRAGMENTS}"
+    )
+}
+
+/// The moves on board `board_id` and the comments of the issue or pull request `content_id`,
+/// with the body of pull request `number` of `repository` (`owner/name`) when one is given.
+pub fn fetch_item_details(
+    board_id: &str,
+    content_id: &str,
+    pull_request: Option<(&str, u32)>,
+) -> Result<ItemDetails> {
+    let (raw, typed) = item_details_fields(content_id, pull_request)?;
+    parse_item_details(&run_graphql(&raw, &typed)?, board_id)
+}
+
+fn item_details_fields(
+    content_id: &str,
+    pull_request: Option<(&str, u32)>,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let mut raw = vec![
+        format!("query={}", item_details_query(pull_request.is_some())),
+        format!("id={content_id}"),
+    ];
+    let mut typed = Vec::new();
+    if let Some((repository, number)) = pull_request {
+        let (owner, name) = repository
+            .split_once('/')
+            .ok_or_else(|| anyhow!("{repository} is not an owner/name repository"))?;
+        raw.push(format!("owner={owner}"));
+        raw.push(format!("name={name}"));
+        typed.push(format!("number={number}"));
+    }
+    Ok((raw, typed))
+}
+
+/// Parse [`fetch_item_details`]' response, keeping the moves made on `board_id`.
+pub fn parse_item_details(json: &str, board_id: &str) -> Result<ItemDetails> {
+    let data: ItemDetailsData = parse_data(json)?;
+    let node = data.node.ok_or_else(|| anyhow!("GitHub has no such issue or pull request"))?;
+    let moves = node
+        .timeline_items
+        .map(|items| items.nodes)
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .filter(|m| m.project.as_ref().is_some_and(|p| p.id == board_id))
+        .map(|m| ColumnMove {
+            from: m.previous_status.filter(|s| !s.is_empty()),
+            to: m.status.filter(|s| !s.is_empty()),
+            was_automated: by_workflow(m.was_automated, m.actor.as_ref()),
+            actor: m.actor.map(|a| a.login),
+            at: m.created_at,
+        })
+        .collect();
+    let comments = node
+        .comments
+        .map(|list| list.nodes)
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .map(comment)
+        .collect();
+    Ok(ItemDetails {
+        moves,
+        comments,
+        pull_request_body: data.repository.and_then(|r| r.pull_request).map(|pr| pr.body),
+    })
 }
 
 /// Put an item in a column.
@@ -1055,6 +1166,51 @@ struct Login {
     login: String,
 }
 
+fn by_workflow(was_automated: bool, actor: Option<&Login>) -> bool {
+    // GitHub's built-in project workflows move items as this bot, with `wasAutomated` false.
+    was_automated || actor.is_some_and(|a| a.login == "github-project-automation")
+}
+
+#[derive(Deserialize)]
+struct ItemDetailsData {
+    node: Option<DetailsNode>,
+    repository: Option<BodyRepository>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DetailsNode {
+    timeline_items: Option<MoveList>,
+    comments: Option<CommentList>,
+}
+
+#[derive(Deserialize)]
+struct MoveList {
+    nodes: Vec<Option<MoveNode>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MoveNode {
+    created_at: String,
+    previous_status: Option<String>,
+    status: Option<String>,
+    was_automated: bool,
+    actor: Option<Login>,
+    project: Option<ProjectId>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BodyRepository {
+    pull_request: Option<PullRequestBody>,
+}
+
+#[derive(Deserialize)]
+struct PullRequestBody {
+    body: String,
+}
+
 #[derive(Deserialize)]
 struct CommentsData {
     nodes: Vec<Option<CommentsOwner>>,
@@ -1622,6 +1778,20 @@ mod tests {
     }
 
     #[test]
+    fn a_move_by_githubs_own_project_workflows_is_a_workflows_move() {
+        let event = r#"{"createdAt":"2026-11-26T10:33:24Z","previousStatus":"In review",
+          "status":"Done","wasAutomated":false,"actor":{"login":"github-project-automation"},
+          "project":{"id":"PVT_1"}}"#;
+        let trigger = format!(
+            r#"{{"data":{{"nodes":[{{"__typename":"Issue","id":"I_408",
+              "timelineItems":{{"nodes":[{event}]}}}}]}}}}"#
+        );
+        assert!(parse_trigger_reads(&trigger, "PVT_1").unwrap().changes["I_408"].was_automated);
+        let details = format!(r#"{{"data":{{"node":{{"timelineItems":{{"nodes":[{event}]}}}}}}}}"#);
+        assert!(parse_item_details(&details, "PVT_1").unwrap().moves[0].was_automated);
+    }
+
+    #[test]
     fn reads_each_issues_linked_pull_requests() {
         let json = r#"{"data":{"nodes":[
           {"__typename":"Issue","id":"I_432","timelineItems":{"nodes":[]},
@@ -1801,6 +1971,71 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn reads_an_items_moves_on_the_board_its_comments_and_the_pull_requests_body() {
+        let json = r###"{"data":{"node":{
+          "timelineItems":{"nodes":[
+            {"createdAt":"2026-11-27T21:52:08Z","previousStatus":"","status":"Ready",
+             "wasAutomated":false,"actor":{"login":"maui1911"},"project":{"id":"PVT_1"}},
+            {"createdAt":"2026-11-27T21:52:20Z","previousStatus":"Todo","status":"Done",
+             "wasAutomated":true,"actor":null,"project":{"id":"PVT_2"}},
+            {"createdAt":"2026-11-27T21:52:45Z","previousStatus":"Ready","status":null,
+             "wasAutomated":true,"actor":null,"project":{"id":"PVT_1"}}
+          ]},
+          "comments":{"nodes":[
+            {"url":"https://c/1","body":"B1 A","createdAt":"2026-11-27T22:00:00Z",
+             "author":{"login":"sanne"}},
+            {"url":"https://c/2","body":"Hm.","createdAt":"2026-11-27T22:01:00Z","author":null}
+          ]}},
+          "repository":{"pullRequest":{"body":"## Test by hand\n\n- Click."}}}}"###;
+        let details = parse_item_details(json, "PVT_1").unwrap();
+        assert_eq!(
+            details.moves,
+            vec![
+                ColumnMove {
+                    from: None,
+                    to: Some("Ready".into()),
+                    actor: Some("maui1911".into()),
+                    was_automated: false,
+                    at: "2026-11-27T21:52:08Z".into(),
+                },
+                ColumnMove {
+                    from: Some("Ready".into()),
+                    to: None,
+                    actor: None,
+                    was_automated: true,
+                    at: "2026-11-27T21:52:45Z".into(),
+                },
+            ]
+        );
+        assert_eq!(details.comments.len(), 2);
+        assert_eq!(details.comments[1].author, None);
+        assert_eq!(details.pull_request_body.as_deref(), Some("## Test by hand\n\n- Click."));
+    }
+
+    #[test]
+    fn an_item_read_without_its_pull_request_has_no_body_and_a_gone_item_fails() {
+        let bare = r#"{"data":{"node":{"timelineItems":{"nodes":[]},"comments":{"nodes":[]}}}}"#;
+        assert_eq!(parse_item_details(bare, "PVT_1").unwrap(), ItemDetails::default());
+        let missing = r#"{"data":{"node":{"timelineItems":{"nodes":[]},"comments":{"nodes":[]}},
+          "repository":{"pullRequest":null}}}"#;
+        assert_eq!(parse_item_details(missing, "PVT_1").unwrap().pull_request_body, None);
+        assert!(parse_item_details(r#"{"data":{"node":null}}"#, "PVT_1").is_err());
+    }
+
+    #[test]
+    fn the_item_read_asks_for_the_pull_request_only_when_there_is_one() {
+        let (raw, typed) = item_details_fields("I_1", Some(("maui1911/CodeScope", 488))).unwrap();
+        assert!(raw[0].contains("pullRequest(number: $number) { body }"), "{}", raw[0]);
+        assert_eq!(raw[1..], ["id=I_1", "owner=maui1911", "name=CodeScope"]);
+        assert_eq!(typed, ["number=488"]);
+        let (raw, typed) = item_details_fields("I_1", None).unwrap();
+        assert!(!raw[0].contains("repository("), "{}", raw[0]);
+        assert_eq!(raw[1..], ["id=I_1"]);
+        assert!(typed.is_empty());
+        assert!(item_details_fields("I_1", Some(("CodeScope", 488))).is_err());
     }
 
     #[test]

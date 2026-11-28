@@ -1,9 +1,10 @@
-//! The item drawer beside the board panel's columns (ADR-0027): one item's dispatch, and what it
-//! needs from the user.
+//! The item drawer beside the board panel's columns (ADR-0027): one item's dispatch, what it
+//! needs from the user, and what the drawer read of it.
 
 use std::sync::Arc;
 
 use codescope_core::Theme;
+use codescope_core::board::findings::Paragraph;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, Context, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement,
@@ -11,7 +12,9 @@ use gpui::{
 };
 
 use crate::app::AppShell;
-use crate::app::board_dispatch::{CardAction, ItemDrawer, Mark, Needs, NoteTone};
+use crate::app::board_dispatch::{
+    CardAction, DetailsView, FindingsView, ItemDrawer, Mark, MoveRow, Needs, NoteTone,
+};
 use crate::theme;
 
 pub(crate) const DRAWER_WIDTH: f32 = 420.0;
@@ -20,10 +23,14 @@ const LABEL_WIDTH: f32 = 88.0;
 impl AppShell {
     pub(crate) fn select_board_item(&mut self, item_id: &str, cx: &mut Context<Self>) {
         self.board.drawer = Some(item_id.to_string());
+        if let Some(url) = self.selected_board().map(|board| board.url.clone()) {
+            self.read_item_details(&url, item_id, cx);
+        }
         cx.notify();
     }
 
     pub(crate) fn close_item_drawer(&mut self, cx: &mut Context<Self>) {
+        self.board.details = None;
         if self.board.drawer.take().is_some() {
             cx.notify();
         }
@@ -46,6 +53,10 @@ impl AppShell {
             .px(px(20.0))
             .py(px(16.0));
         body.style().min_size.height = Some(gpui::Length::Definite(px(0.0).into()));
+        let test_by_hand = match &drawer.details {
+            DetailsView::Read(read) => read.test_by_hand.as_deref(),
+            DetailsView::None | DetailsView::Reading | DetailsView::Failed(_) => None,
+        };
         let body = body
             .children(drawer.needs.as_ref().map(|needs| {
                 render_needs(theme, needs, &drawer, cx).into_any_element()
@@ -58,7 +69,11 @@ impl AppShell {
                     .child(text.clone())
                     .into_any_element()
             }))
-            .child(render_rows(theme, &drawer));
+            .children(test_by_hand.map(|paragraphs| {
+                section("TEST BY HAND").child(render_paragraphs(theme, paragraphs))
+            }))
+            .child(render_rows(theme, &drawer))
+            .children(render_details(theme, &drawer.details));
         div()
             .id("item-drawer")
             .w(px(DRAWER_WIDTH))
@@ -341,18 +356,18 @@ fn secondary_button(
         .child(label)
 }
 
+fn section(heading: &'static str) -> gpui::Div {
+    div().flex().flex_col().gap(px(8.0)).child(
+        div()
+            .text_size(px(11.0))
+            .text_color(theme::text_faint())
+            .child(heading),
+    )
+}
+
 fn render_rows(theme: &Arc<Theme>, drawer: &ItemDrawer) -> impl IntoElement {
     let heading = if drawer.dispatched { "DISPATCH" } else { "ITEM" };
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(8.0))
-        .child(
-            div()
-                .text_size(px(11.0))
-                .text_color(theme::text_faint())
-                .child(heading),
-        )
+    section(heading)
         .children(drawer.rows.iter().map(|row| {
             let mono = matches!(row.label, "Worktree" | "Branch");
             let value = div()
@@ -385,6 +400,172 @@ fn render_rows(theme: &Arc<Theme>, drawer: &ItemDrawer) -> impl IntoElement {
                         .child(row.label),
                 )
                 .child(value)
+        }))
+}
+
+fn render_details(theme: &Arc<Theme>, details: &DetailsView) -> Vec<AnyElement> {
+    let line = |text: String, color: Hsla| {
+        div().text_size(px(12.0)).text_color(color).child(text).into_any_element()
+    };
+    match details {
+        DetailsView::None => Vec::new(),
+        DetailsView::Reading => {
+            vec![line("Reading its findings and its moves…".into(), theme::text_faint())]
+        }
+        DetailsView::Failed(message) => vec![line(
+            format!("Couldn't read its findings and its moves: {message}"),
+            theme::danger(),
+        )],
+        DetailsView::Read(read) => read
+            .findings
+            .iter()
+            .map(|findings| render_findings(theme, findings).into_any_element())
+            .chain([render_moves(theme, &read.moves).into_any_element()])
+            .collect(),
+    }
+}
+
+fn render_findings(theme: &Arc<Theme>, findings: &FindingsView) -> impl IntoElement {
+    let accent = theme::accent(theme);
+    let url = findings.url.clone();
+    let open = div()
+        .id("item-drawer-findings")
+        .text_size(px(11.0))
+        .text_color(theme::ink_muted(theme))
+        .cursor_pointer()
+        .hover(move |s| s.text_color(accent))
+        .on_mouse_down(MouseButton::Left, move |_, _, _| {
+            crate::sidebar::open_url_in_browser(&url);
+        })
+        .child("Open ↗");
+    let heading = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(theme::text_faint())
+                .child("FINDINGS"),
+        )
+        .child(div().flex_grow())
+        .child(open);
+    let summary = match &findings.summary {
+        Some((cause, approach)) => vec![
+            labeled("Cause", render_paragraphs(theme, cause)).into_any_element(),
+            labeled("Approach", render_paragraphs(theme, approach)).into_any_element(),
+        ],
+        None => vec![
+            div()
+                .text_size(px(12.0))
+                .text_color(theme::text_faint())
+                .child("Posted before the last 50 comments; open them on GitHub.")
+                .into_any_element(),
+        ],
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(10.0))
+        .child(heading)
+        .children(summary)
+        .children(findings.points.iter().enumerate().map(|(index, point)| {
+            let by = match &point.answered {
+                Some((who, url)) => {
+                    let url = url.clone();
+                    div()
+                        .id(("item-drawer-answer", index))
+                        .text_color(theme::ink_muted(theme))
+                        .cursor_pointer()
+                        .hover(move |s| s.text_color(accent))
+                        .on_mouse_down(MouseButton::Left, move |_, _, _| {
+                            crate::sidebar::open_url_in_browser(&url);
+                        })
+                        .child(format!("chosen by {who} ↗"))
+                        .into_any_element()
+                }
+                None => div()
+                    .text_color(theme::text_faint())
+                    .child("advised, not answered yet")
+                    .into_any_element(),
+            };
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .text_size(px(12.0))
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme::ink(theme))
+                        .child(point.question.clone()),
+                )
+                .child(div().text_color(theme::ink(theme)).child(point.choice.clone()))
+                .child(by)
+        }))
+}
+
+fn render_moves(theme: &Arc<Theme>, moves: &[MoveRow]) -> impl IntoElement {
+    let none = moves.is_empty().then(|| {
+        div()
+            .text_size(px(12.0))
+            .text_color(theme::text_faint())
+            .child("It hasn't moved between columns.")
+    });
+    section("ON THE BOARD")
+        .children(none)
+        .children(moves.iter().map(|row| {
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(8.0))
+                .text_size(px(12.0))
+                .child(div().text_color(theme::ink(theme)).child(format!("→ {}", row.column)))
+                .child(div().text_color(theme::text_faint()).child(row.by.clone()))
+        }))
+}
+
+fn labeled(label: &'static str, value: impl IntoElement) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .gap(px(12.0))
+        .text_size(px(12.0))
+        .child(
+            div()
+                .w(px(LABEL_WIDTH))
+                .flex_shrink_0()
+                .text_color(theme::text_faint())
+                .child(label),
+        )
+        .child(div().min_w(px(0.0)).flex_1().child(value))
+}
+
+fn render_paragraphs(theme: &Arc<Theme>, paragraphs: &[Paragraph]) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .text_size(px(12.0))
+        .text_color(theme::ink(theme))
+        .children(paragraphs.chunk_by(|a, b| a.code && b.code).map(|run| {
+            if !run[0].code {
+                return div().child(run[0].text.clone()).into_any_element();
+            }
+            div()
+                .px(px(8.0))
+                .py(px(6.0))
+                .rounded(px(4.0))
+                .bg(theme::frost_10(theme))
+                .font(theme::font_mono())
+                .text_size(px(11.0))
+                .text_color(theme::ink_muted(theme))
+                .children(run.iter().map(|line| match line.text.as_str() {
+                    "" => div().child(" "),
+                    text => div().child(text.to_string()),
+                }))
+                .into_any_element()
         }))
 }
 

@@ -52,7 +52,7 @@ const EXCLUDED_FILES: [&str; 6] = [
 pub struct StatusChange {
     /// Login of who moved it; `None` for a deleted account.
     pub actor: Option<String>,
-    /// Set when one of the board's workflows moved it.
+    /// Set when one of the board's workflows moved it, GitHub's built-in ones too.
     pub was_automated: bool,
     /// Name of the column it moved into.
     pub status: String,
