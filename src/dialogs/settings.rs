@@ -32,6 +32,11 @@ use crate::app::AppShell;
 use crate::text_field::{TextField, focused_caret_style, render_input_content};
 use crate::theme;
 
+mod boards;
+
+use boards::{SignInRead, parse_dispatch_limit, step_limit};
+use codescope_core::board::attention::Attention;
+
 /// Which text-input field currently receives typed keystrokes. The
 /// numeric stepper fields use plain text input so a user can paste
 /// values; we validate on Save. The font family is picked from a
@@ -43,6 +48,7 @@ pub enum SettingsField {
     FontSize,
     LineHeight,
     Scrollback,
+    DispatchLimit,
 }
 
 /// A page of the Settings dialog, picked in its left column.
@@ -50,17 +56,20 @@ pub enum SettingsField {
 pub enum SettingsSection {
     Appearance,
     Agents,
+    Boards,
 }
 
 impl SettingsSection {
     /// The sections in the order the left column lists them.
-    pub const ALL: [SettingsSection; 2] = [SettingsSection::Appearance, SettingsSection::Agents];
+    pub const ALL: [SettingsSection; 3] =
+        [SettingsSection::Appearance, SettingsSection::Agents, SettingsSection::Boards];
 
     /// The name in the left column.
     pub fn label(self) -> &'static str {
         match self {
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Agents => "Agents",
+            SettingsSection::Boards => "Boards",
         }
     }
 
@@ -71,6 +80,7 @@ impl SettingsSection {
                 &[SettingsField::FontSize, SettingsField::LineHeight, SettingsField::Scrollback]
             }
             SettingsSection::Agents => &[],
+            SettingsSection::Boards => &[SettingsField::DispatchLimit],
         }
     }
 }
@@ -118,6 +128,10 @@ pub struct SettingsDialogState {
     pub font_size_field: TextField,
     pub line_height_field: TextField,
     pub scrollback_field: TextField,
+    /// Text of *Dispatches at the same time*.
+    pub limit_field: TextField,
+    /// How `gh` is signed in, for the banner on the Boards page.
+    pub sign_in: SignInRead,
     /// Inline validation error, rendered above the footer. Cleared on
     /// any user edit.
     pub error: Option<String>,
@@ -148,6 +162,8 @@ impl SettingsDialogState {
             font_size_field: TextField::with_text(format_f32(settings.font.size)),
             line_height_field: TextField::with_text(format_f32(settings.font.line_height_multiplier)),
             scrollback_field: TextField::with_text(settings.scrollback.to_string()),
+            limit_field: TextField::with_text(settings.dispatch_limit.to_string()),
+            sign_in: SignInRead::NotAsked,
             draft,
             error: None,
         }
@@ -160,11 +176,20 @@ impl SettingsDialogState {
     /// runtime path and the unit tests share the exact same
     /// validation rules.
     pub fn commit_text_buffers(&mut self) -> Result<(), String> {
-        let (size, line, scrollback) = parse_numeric_fields(
+        let numbers = parse_numeric_fields(
             self.font_size_field.text(),
             self.line_height_field.text(),
             self.scrollback_field.text(),
-        )?;
+        );
+        let (size, line, scrollback) = numbers.inspect_err(|_| {
+            self.section = SettingsSection::Appearance;
+        })?;
+        if self.limit_field.text() != self.draft.dispatch_limit.to_string() {
+            self.draft.dispatch_limit =
+                parse_dispatch_limit(self.limit_field.text()).inspect_err(|_| {
+                    self.section = SettingsSection::Boards;
+                })?;
+        }
         self.draft.font.size = size;
         self.draft.font.line_height_multiplier = line;
         self.draft.scrollback = scrollback;
@@ -272,6 +297,7 @@ impl SettingsDialogState {
             SettingsField::FontSize => &mut self.font_size_field,
             SettingsField::LineHeight => &mut self.line_height_field,
             SettingsField::Scrollback => &mut self.scrollback_field,
+            SettingsField::DispatchLimit => &mut self.limit_field,
         }
     }
 
@@ -504,6 +530,29 @@ impl AppShell {
             state.show_section(section);
             cx.notify();
         }
+        if section == SettingsSection::Boards {
+            self.read_sign_in(cx);
+        }
+    }
+
+    /// Step *Dispatches at the same time* up or down by one.
+    pub fn settings_step_limit(&mut self, up: bool, cx: &mut Context<Self>) {
+        if let Some(state) = self.settings_dialog.as_mut() {
+            let next = step_limit(state.limit_field.text(), state.draft.dispatch_limit, up);
+            state.limit_field.set_text(next.to_string());
+            state.focused_field = SettingsField::DispatchLimit;
+            state.error = None;
+            cx.notify();
+        }
+    }
+
+    /// Turn notifying about `attention` on or off in the draft.
+    pub fn settings_toggle_notify(&mut self, attention: Attention, cx: &mut Context<Self>) {
+        if let Some(state) = self.settings_dialog.as_mut() {
+            let on = state.draft.notify.wants(attention);
+            state.draft.notify.set(attention, !on);
+            cx.notify();
+        }
     }
 
     /// Set the draft default-agent id.
@@ -624,6 +673,13 @@ impl AppShell {
     ) -> Option<gpui::AnyElement> {
         let state = self.settings_dialog.as_ref()?;
         let viewport = window.viewport_size();
+        let stacked = self.add_board_dialog.is_some()
+            || self.board_settings_dialog.is_some()
+            || self.confirm_dialog.is_some();
+        if !stacked && !state.focus_handle.is_focused(window) {
+            // gpui leaves the focus nowhere when a dialog opened over this one closes.
+            state.focus_handle.focus(window);
+        }
 
         let elevated = theme::elevated(theme);
         let divider = theme::divider(theme);
@@ -986,6 +1042,15 @@ impl AppShell {
         let page = match state.section {
             SettingsSection::Appearance => appearance.into_any_element(),
             SettingsSection::Agents => agents.into_any_element(),
+            SettingsSection::Boards => {
+                let limit_input = textbox(
+                    "settings-dispatch-limit",
+                    &state.limit_field,
+                    "3",
+                    SettingsField::DispatchLimit,
+                );
+                self.render_boards_page(state, limit_input, theme, cx)
+            }
         };
 
         let nav = div()
@@ -1549,6 +1614,10 @@ fn take_dialog_fields(draft: &Settings, latest: &mut Settings) {
     latest.scrollback = draft.scrollback;
     latest.cursor = draft.cursor.clone();
     latest.default_agent = draft.default_agent.clone();
+    latest.dispatch_limit = draft.dispatch_limit;
+    for attention in Attention::ALL {
+        latest.notify.set(attention, draft.notify.wants(attention));
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────
@@ -1559,7 +1628,9 @@ mod tests {
 
     #[test]
     fn saving_keeps_what_changed_on_disk_while_the_dialog_was_open() {
-        use codescope_core::{CursorSettings, CursorShape, FontSettings, board::BoardSettings};
+        use codescope_core::{
+            CursorSettings, CursorShape, FontSettings, NotifySettings, board::BoardSettings,
+        };
         let draft = Settings {
             theme: "light".into(),
             font: FontSettings {
@@ -1571,6 +1642,8 @@ mod tests {
             scrollback: 20_000,
             cursor: CursorSettings { shape: CursorShape::Beam, blinking: false },
             default_agent: "codex".into(),
+            dispatch_limit: 2,
+            notify: NotifySettings { may_be_waiting: false, ..Default::default() },
             ..Default::default()
         };
         let mut latest = Settings {
@@ -1592,8 +1665,9 @@ mod tests {
         assert_eq!(latest.cursor.shape, CursorShape::Beam);
         assert!(!latest.cursor.blinking);
         assert_eq!(latest.default_agent, "codex");
+        assert_eq!(latest.dispatch_limit, 2);
+        assert!(!latest.notify.may_be_waiting && latest.notify.findings);
         assert_eq!(latest.boards.len(), 1, "a board added while the dialog was open");
-        assert_eq!(latest.dispatch_limit, 5);
         assert_eq!(latest.font.fallbacks, ["Hack Nerd Font"]);
     }
 
@@ -1605,6 +1679,7 @@ mod tests {
             [SettingsField::FontSize, SettingsField::LineHeight, SettingsField::Scrollback]
         );
         assert!(order(SettingsSection::Agents).is_empty());
+        assert_eq!(order(SettingsSection::Boards), [SettingsField::DispatchLimit]);
     }
 
     // `SettingsDialogState` holds a `FocusHandle` and so can't be
