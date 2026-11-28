@@ -87,14 +87,6 @@ pub struct SettingsDialogState {
     pub font_size_field: TextField,
     pub line_height_field: TextField,
     pub scrollback_field: TextField,
-    /// Snapshot of the on-disk settings + theme captured at the moment
-    /// the dialog opened. The dialog mutates [`AppShell::theme`]
-    /// directly for live preview as the user clicks through the theme
-    /// list; on Cancel we hand `original_settings` back to
-    /// `apply_settings` so the in-memory state matches disk again
-    /// (the file-watch poller would not catch this because the file
-    /// itself is never touched during a preview).
-    pub original_settings: Settings,
     /// Inline validation error, rendered above the footer. Cleared on
     /// any user edit.
     pub error: Option<String>,
@@ -125,7 +117,6 @@ impl SettingsDialogState {
             line_height_field: TextField::with_text(format_f32(settings.font.line_height_multiplier)),
             scrollback_field: TextField::with_text(settings.scrollback.to_string()),
             draft,
-            original_settings: settings.clone(),
             error: None,
         }
     }
@@ -402,19 +393,12 @@ impl AppShell {
         cx.notify();
     }
 
-    /// Close the dialog without saving. If a live theme preview is
-    /// in-flight (i.e. the user clicked through the theme list before
-    /// hitting Cancel), restore the chrome to the on-disk settings —
-    /// `settings.json` is never touched during a preview, so the
-    /// file-watch poller would otherwise leave the preview-theme
-    /// pinned until the next real edit.
+    /// Close the dialog without saving, and put back the theme in use when a preview changed it.
     pub fn cancel_settings_dialog(&mut self, cx: &mut Context<Self>) {
         let Some(state) = self.settings_dialog.take() else { return };
-        // Reapply the original on-disk settings to revert any live
-        // theme preview cleanly. `apply_settings` only swaps
-        // in-memory state, so this is cheap and side-effect free.
-        if state.original_settings.theme != self.settings_ref().theme {
-            self.apply_settings(state.original_settings, cx);
+        let in_use = self.settings_ref().theme.clone();
+        if state.draft.theme != in_use {
+            self.set_theme_preview(Arc::new(builtin::by_name(&in_use)), cx);
         } else {
             cx.notify();
         }
@@ -430,15 +414,20 @@ impl AppShell {
             cx.notify();
             return;
         }
-        let new_settings = state.draft.clone();
+        let draft = state.draft.clone();
         let paths = self.paths_ref().clone();
-        if let Err(err) = new_settings.save(&paths) {
-            if let Some(state) = self.settings_dialog.as_mut() {
-                state.error = Some(format!("Failed to save settings: {err:#}"));
+        let new_settings = match Settings::update(&paths, |latest| {
+            take_dialog_fields(&draft, latest)
+        }) {
+            Ok(saved) => saved,
+            Err(err) => {
+                if let Some(state) = self.settings_dialog.as_mut() {
+                    state.error = Some(format!("Failed to save settings: {err:#}"));
+                }
+                cx.notify();
+                return;
             }
-            cx.notify();
-            return;
-        }
+        };
         self.settings_dialog = None;
         // Reuse the existing live-reload pathway so theme + chrome
         // swap atomically and the sidebar repaints. Palette and font
@@ -1471,11 +1460,62 @@ fn handle_key_down(
     }
 }
 
+/// Copy what the dialog edits onto the settings as they are on disk now.
+fn take_dialog_fields(draft: &Settings, latest: &mut Settings) {
+    latest.theme = draft.theme.clone();
+    latest.font.family = draft.font.family.clone();
+    latest.font.size = draft.font.size;
+    latest.font.line_height_multiplier = draft.font.line_height_multiplier;
+    latest.scrollback = draft.scrollback;
+    latest.cursor = draft.cursor.clone();
+    latest.default_agent = draft.default_agent.clone();
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saving_keeps_what_changed_on_disk_while_the_dialog_was_open() {
+        use codescope_core::{CursorSettings, CursorShape, FontSettings, board::BoardSettings};
+        let draft = Settings {
+            theme: "light".into(),
+            font: FontSettings {
+                family: "Consolas".into(),
+                size: 15.0,
+                line_height_multiplier: 1.2,
+                ..Default::default()
+            },
+            scrollback: 20_000,
+            cursor: CursorSettings { shape: CursorShape::Beam, blinking: false },
+            default_agent: "codex".into(),
+            ..Default::default()
+        };
+        let mut latest = Settings {
+            boards: vec![BoardSettings {
+                url: "https://github.com/users/maui1911/projects/1".into(),
+                ..Default::default()
+            }],
+            dispatch_limit: 5,
+            font: FontSettings { fallbacks: vec!["Hack Nerd Font".into()], ..Default::default() },
+            ..Default::default()
+        };
+
+        take_dialog_fields(&draft, &mut latest);
+
+        assert_eq!(latest.theme, "light");
+        assert_eq!(latest.font.family, "Consolas");
+        assert_eq!((latest.font.size, latest.font.line_height_multiplier), (15.0, 1.2));
+        assert_eq!(latest.scrollback, 20_000);
+        assert_eq!(latest.cursor.shape, CursorShape::Beam);
+        assert!(!latest.cursor.blinking);
+        assert_eq!(latest.default_agent, "codex");
+        assert_eq!(latest.boards.len(), 1, "a board added while the dialog was open");
+        assert_eq!(latest.dispatch_limit, 5);
+        assert_eq!(latest.font.fallbacks, ["Hack Nerd Font"]);
+    }
 
     // `SettingsDialogState` holds a `FocusHandle` and so can't be
     // constructed outside a gpui app, but the validation rules live

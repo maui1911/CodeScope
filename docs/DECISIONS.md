@@ -393,14 +393,15 @@ idiom mirrors the in-app modals (`new_project_dialog.rs`,
 
 **Consequences:**
 - The Rust port ships `src/settings_dialog.rs` with no C# counterpart.
-- Saves go through [`Settings::save`] — the existing settings-file watcher
-  in `app.rs` picks up the change on its next tick, and `apply_settings`
-  is also called inline so the swap is instant.
+- Saves go through [`Settings::update`]: the dialog writes its own fields
+  onto the file as it is at Save, so a board added, mapped or removed
+  while the dialog is open stays. `apply_settings` is also called inline
+  so the swap is instant.
 - The dialog can preview the theme live as the user clicks through the
-  list; Cancel explicitly reapplies the snapshot of `Settings` captured
-  when the dialog opened, reverting any in-flight preview (the file-watch
-  poller cannot do this on its own because `settings.json` is untouched
-  during a preview). Font + scrollback edits only take effect for
+  list; Cancel puts back the theme of the settings in use, reverting any
+  in-flight preview (the file-watch poller cannot do this on its own
+  because `settings.json` is untouched during a preview). Font +
+  scrollback edits only take effect for
   newly-spawned tabs (running terminals keep their baked-in palette /
   scrollback); the dialog surfaces a small "Applies to new tabs only."
   hint to make this explicit.
