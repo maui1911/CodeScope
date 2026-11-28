@@ -184,7 +184,11 @@ impl AppShell {
             let asks = dispatch.as_ref().zip(read_pr).and_then(|((project_id, _, _, r), pr)| {
                 self.review_request((project_id.as_str(), r), pr, cx).map(|request| request.names())
             });
-            let link = needs_link.clone().or_else(|| item.url.clone().map(|url| ("Open PR", url)));
+            let open_item = match item.kind {
+                ItemKind::PullRequest => "Open PR",
+                ItemKind::Issue | ItemKind::Draft => "Open issue",
+            };
+            let link = needs_link.clone().or_else(|| item.url.clone().map(|url| (open_item, url)));
             let pr = read_pr.map(|pr| pr.number);
             let posted = dispatch.as_ref().and_then(|(_, _, _, r)| {
                 r.pull_request.as_ref().or(watch.and_then(|w| w.reported.as_ref()))
