@@ -16,6 +16,7 @@ use super::pull_request::{
     Checks, FailedCheck, Health, LinkedPullRequest, Mergeable, PullRequest, PullRequestComment,
     PullRequestHead, PullRequestState,
 };
+use super::turn::OpenPullRequest;
 use super::{Board, BoardItem, BoardOwner, BoardRef, Column, ItemKind, ItemState};
 use crate::process::no_window_command;
 
@@ -210,6 +211,95 @@ pub fn fetch_trigger_reads(board_id: &str, content_ids: &[String]) -> Result<Tri
         reads.heads.extend(page.heads);
     }
     Ok(reads)
+}
+
+const TURN_QUERY: &str = r#"query($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    __typename
+    ... on Issue {
+      id closedByPullRequestsReferences(first: 3, includeClosedPrs: false) { nodes { ...turn } }
+    }
+    ... on PullRequest { id ...turn }
+  }
+}
+fragment turn on PullRequest {
+  number state isDraft mergeable createdAt author { login }
+  reviewRequests(first: 5) { nodes { requestedReviewer {
+    __typename ... on User { login } ... on Bot { login } ... on Mannequin { login }
+    ... on Team { combinedSlug }
+  } } }
+  reviews(last: 5, states: [APPROVED, CHANGES_REQUESTED, COMMENTED]) {
+    nodes { submittedAt author { login } }
+  }
+  commits(last: 1) { nodes { commit { committedDate statusCheckRollup { state } } } }
+}"#;
+
+/// The open pull request each issue or pull request in `content_ids` waits on, by content id:
+/// a pull request itself while it is open, an issue's newest open one that closes it.
+pub fn fetch_turn_reads(
+    content_ids: &[String],
+) -> Result<HashMap<String, Option<OpenPullRequest>>> {
+    let mut reads = HashMap::new();
+    for chunk in content_ids.chunks(50) {
+        let mut args = vec![format!("query={TURN_QUERY}")];
+        args.extend(chunk.iter().map(|id| format!("ids[]={id}")));
+        reads.extend(parse_turn_reads(&run_graphql(&args, &[])?)?);
+    }
+    Ok(reads)
+}
+
+/// Parse [`fetch_turn_reads`]' response.
+pub fn parse_turn_reads(json: &str) -> Result<HashMap<String, Option<OpenPullRequest>>> {
+    let data: TurnNodesData = parse_data(json)?;
+    Ok(data
+        .nodes
+        .into_iter()
+        .flatten()
+        .filter_map(|node| {
+            let open = match node.closed_by_pull_requests_references {
+                Some(linked) => linked
+                    .nodes
+                    .into_iter()
+                    .flatten()
+                    .filter(|pr| pr.state == "OPEN")
+                    .max_by(|a, b| a.created_at.cmp(&b.created_at)),
+                None => node.pull_request.filter(|pr| pr.state == "OPEN"),
+            };
+            Some((node.id?, open.map(open_pull_request)))
+        })
+        .collect())
+}
+
+fn open_pull_request(node: TurnPullRequestNode) -> OpenPullRequest {
+    let author = node.author.map(|a| a.login);
+    let head = node.commits.nodes.into_iter().flatten().next_back().map(|n| n.commit);
+    OpenPullRequest {
+        number: node.number,
+        is_draft: node.is_draft,
+        checks: Checks::from_rollup(
+            head.as_ref().and_then(|c| c.status_check_rollup.as_ref()).map(|r| r.state.as_str()),
+        ),
+        conflicting: node.mergeable == "CONFLICTING",
+        requested: node
+            .review_requests
+            .nodes
+            .into_iter()
+            .flatten()
+            .filter_map(|request| {
+                let reviewer = request.requested_reviewer?;
+                reviewer.login.or(reviewer.combined_slug)
+            })
+            .collect(),
+        head_at: head.map(|c| c.committed_date),
+        reviewed_at: node
+            .reviews
+            .nodes
+            .into_iter()
+            .flatten()
+            .filter(|review| review.author.as_ref().map(|a| &a.login) != author.as_ref())
+            .filter_map(|review| review.submitted_at)
+            .max(),
+    }
 }
 
 /// Parse [`fetch_trigger_reads`]' response, keeping the changes made on `board_id`.
@@ -1131,6 +1221,76 @@ struct TimelineOwner {
 }
 
 #[derive(Deserialize)]
+struct TurnNodesData {
+    nodes: Vec<Option<TurnNode>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnNode {
+    id: Option<String>,
+    closed_by_pull_requests_references: Option<TurnPullRequests>,
+    #[serde(flatten)]
+    pull_request: Option<TurnPullRequestNode>,
+}
+
+#[derive(Deserialize)]
+struct TurnPullRequests {
+    nodes: Vec<Option<TurnPullRequestNode>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnPullRequestNode {
+    number: u32,
+    state: String,
+    is_draft: bool,
+    mergeable: String,
+    created_at: String,
+    author: Option<Login>,
+    review_requests: TurnList<ReviewRequestNode>,
+    reviews: TurnList<ReviewNode>,
+    commits: TurnList<TurnCommitNode>,
+}
+
+#[derive(Deserialize)]
+struct TurnList<T> {
+    nodes: Vec<Option<T>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewRequestNode {
+    requested_reviewer: Option<Reviewer>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Reviewer {
+    login: Option<String>,
+    combined_slug: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewNode {
+    submitted_at: Option<String>,
+    author: Option<Login>,
+}
+
+#[derive(Deserialize)]
+struct TurnCommitNode {
+    commit: TurnCommit,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnCommit {
+    committed_date: String,
+    status_check_rollup: Option<Rollup>,
+}
+
+#[derive(Deserialize)]
 struct LinkedList {
     nodes: Vec<Option<LinkedNode>>,
 }
@@ -1789,6 +1949,50 @@ mod tests {
         assert!(parse_trigger_reads(&trigger, "PVT_1").unwrap().changes["I_408"].was_automated);
         let details = format!(r#"{{"data":{{"node":{{"timelineItems":{{"nodes":[{event}]}}}}}}}}"#);
         assert!(parse_item_details(&details, "PVT_1").unwrap().moves[0].was_automated);
+    }
+
+    #[test]
+    fn reads_the_open_pull_request_each_turn_depends_on() {
+        let json = r#"{"data":{"nodes":[
+          {"__typename":"Issue","id":"I_1","closedByPullRequestsReferences":{"nodes":[
+            {"number":9,"state":"OPEN","isDraft":true,"mergeable":"CONFLICTING",
+             "createdAt":"2026-11-27T09:00:00Z","author":null,
+             "reviewRequests":{"nodes":[]},"reviews":{"nodes":[]},
+             "commits":{"nodes":[{"commit":{"committedDate":"2026-11-27T09:30:00Z",
+               "statusCheckRollup":null}}]}},
+            {"number":8,"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE",
+             "createdAt":"2026-11-27T10:00:00Z","author":{"login":"maui1911"},
+             "reviewRequests":{"nodes":[
+               {"requestedReviewer":{"__typename":"User","login":"sanne"}},
+               {"requestedReviewer":{"__typename":"Team","combinedSlug":"acme/web"}},
+               {"requestedReviewer":null}]},
+             "reviews":{"nodes":[
+               {"submittedAt":"2026-11-27T12:00:00Z","author":{"login":"lead"}},
+               {"submittedAt":"2026-11-27T13:00:00Z","author":{"login":"maui1911"}}]},
+             "commits":{"nodes":[{"commit":{"committedDate":"2026-11-27T11:00:00Z",
+               "statusCheckRollup":{"state":"PENDING"}}}]}}]}},
+          {"__typename":"Issue","id":"I_2","closedByPullRequestsReferences":{"nodes":[]}},
+          {"__typename":"PullRequest","id":"PR_3","number":3,"state":"MERGED","isDraft":false,
+           "mergeable":"UNKNOWN","createdAt":"2026-11-20T10:00:00Z","author":null,
+           "reviewRequests":{"nodes":[]},"reviews":{"nodes":[]},"commits":{"nodes":[]}},
+          null
+        ]}}"#;
+        let reads = parse_turn_reads(json).unwrap();
+        assert_eq!(reads.len(), 3);
+        assert_eq!(
+            reads["I_1"],
+            Some(OpenPullRequest {
+                number: 8,
+                is_draft: false,
+                checks: Checks::Running,
+                conflicting: false,
+                requested: vec!["sanne".into(), "acme/web".into()],
+                head_at: Some("2026-11-27T11:00:00Z".into()),
+                reviewed_at: Some("2026-11-27T12:00:00Z".into()),
+            })
+        );
+        assert_eq!(reads["I_2"], None);
+        assert_eq!(reads["PR_3"], None, "a merged pull request item has no open one");
     }
 
     #[test]
