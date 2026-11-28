@@ -184,7 +184,11 @@ impl AppShell {
             let asks = dispatch.as_ref().zip(read_pr).and_then(|((project_id, _, _, r), pr)| {
                 self.review_request((project_id.as_str(), r), pr, cx).map(|request| request.names())
             });
-            let link = needs_link.clone().or_else(|| item.url.clone().map(|url| ("Open PR", url)));
+            let open_item = match item.kind {
+                ItemKind::PullRequest => "Open PR",
+                ItemKind::Issue | ItemKind::Draft => "Open issue",
+            };
+            let link = needs_link.clone().or_else(|| item.url.clone().map(|url| (open_item, url)));
             let pr = read_pr.map(|pr| pr.number);
             let posted = dispatch.as_ref().and_then(|(_, _, _, r)| {
                 r.pull_request.as_ref().or(watch.and_then(|w| w.reported.as_ref()))
@@ -404,6 +408,13 @@ fn needs(action: CardAction, kind: ItemKind, facts: Facts, note: &str) -> Needs 
             note.to_string(),
             "Its branch can change the skills and CLAUDE.md the agent loads, so it starts only \
              once you say so."
+                .to_string(),
+        ),
+        (CardAction::PickProject, _) => (
+            "Which project?".to_string(),
+            note.to_string(),
+            "Pick the one that works on it, for this item or for every item of its repository \
+             on this board."
                 .to_string(),
         ),
     };
@@ -654,6 +665,9 @@ mod tests {
         );
         let fork = needs(CardAction::StartFromFork, ItemKind::PullRequest, facts(None), "Fork");
         assert_eq!(fork.text, "Fork");
+        let several = "Several projects have maui1911/CodeScope as a remote";
+        let pick = needs(CardAction::PickProject, ItemKind::Issue, facts(None), several);
+        assert_eq!((pick.title.as_str(), pick.text.as_str()), ("Which project?", several));
     }
 
     #[test]

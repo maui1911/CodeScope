@@ -526,7 +526,7 @@ fn render_point(
         }))
 }
 
-fn radio(on: bool, accent: Hsla, divider: Hsla) -> impl IntoElement {
+pub(crate) fn radio(on: bool, accent: Hsla, divider: Hsla) -> impl IntoElement {
     div()
         .mt(px(2.0))
         .flex_shrink_0()
@@ -542,7 +542,7 @@ fn radio(on: bool, accent: Hsla, divider: Hsla) -> impl IntoElement {
         })
 }
 
-fn checkbox(on: bool, accent: Hsla, divider: Hsla, canvas: Hsla) -> impl IntoElement {
+pub(crate) fn checkbox(on: bool, accent: Hsla, divider: Hsla, canvas: Hsla) -> impl IntoElement {
     div()
         .flex_shrink_0()
         .size(px(14.0))

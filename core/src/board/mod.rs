@@ -352,9 +352,31 @@ pub struct BoardSettings {
     pub columns: ColumnMapping,
     /// When the board was added, ISO 8601; moves made before then start nothing.
     pub added_at: String,
+    /// The project id picked on this board for the items of an `owner/name` repository that
+    /// several projects have a remote for.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub projects: BTreeMap<String, String>,
     /// Keys this build doesn't know, kept so a save doesn't drop what a newer build wrote.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl BoardSettings {
+    /// The project id picked on this board for `repository`, compared without case.
+    pub fn picked_project(&self, repository: &str) -> Option<&str> {
+        self.projects
+            .iter()
+            .find(|(picked_for, _)| picked_for.eq_ignore_ascii_case(repository))
+            .map(|(_, project_id)| project_id.as_str())
+    }
+
+    /// Pick `project_id` for `repository` on this board, in place of a pick under any casing.
+    pub fn pick_project(&mut self, repository: &str, project_id: &str) {
+        self.projects
+            .retain(|picked_for, _| !picked_for.eq_ignore_ascii_case(repository));
+        self.projects
+            .insert(repository.to_string(), project_id.to_string());
+    }
 }
 
 fn known_roles<'de, D: Deserializer<'de>>(deserializer: D) -> Result<ColumnMapping, D::Error> {
@@ -783,6 +805,20 @@ mod tests {
             serde_json::from_str::<BoardSettings>(&json).unwrap(),
             settings
         );
+    }
+
+    #[test]
+    fn a_board_keeps_one_picked_project_per_repository_whatever_its_casing() {
+        let mut settings = BoardSettings::default();
+        assert_eq!(settings.picked_project("maui1911/CodeScope"), None);
+        assert!(!serde_json::to_string(&settings).unwrap().contains("projects"));
+        settings.pick_project("maui1911/CodeScope", "main");
+        settings.pick_project("Maui1911/codescope", "review");
+        assert_eq!(settings.picked_project("MAUI1911/CODESCOPE"), Some("review"));
+        assert_eq!(settings.projects.len(), 1);
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains(r#""projects":{"Maui1911/codescope":"review"}"#), "{json}");
+        assert_eq!(serde_json::from_str::<BoardSettings>(&json).unwrap(), settings);
     }
 
     #[test]
