@@ -43,8 +43,7 @@ pub(crate) struct BoardPanelState {
     pub reads_by_url: HashMap<String, BoardRead>,
     pub selected_url: Option<String>,
     pub show_all_done: bool,
-    /// Set while the panel shows only the user's own items.
-    pub mine: bool,
+    pub filter: BoardFilter,
     /// The item whose drawer is open, on the selected board.
     pub drawer: Option<String>,
     /// What the open drawer read of its item.
@@ -54,6 +53,17 @@ pub(crate) struct BoardPanelState {
     pub reading: bool,
     pub last_read: Option<Instant>,
     pub dispatch: DispatchState,
+}
+
+/// Which items of the selected board the panel shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum BoardFilter {
+    /// The user's own items, as [`AppShell::my_items`] has them.
+    Mine,
+    #[default]
+    All,
+    /// The items that need the user, as the board header counts them.
+    NeedsYou,
 }
 
 /// What the cards of a board show beyond their item, by item id.
@@ -191,6 +201,7 @@ impl AppShell {
                     this.watch_attention(cx);
                     this.run_handovers(window, cx);
                     this.run_cleanups(window, cx);
+                    this.push_board_needs_you(cx);
                     this.begin_board_read(false, cx)
                 }) else {
                     break;
@@ -200,6 +211,7 @@ impl AppShell {
                     let finished = this.update_in(cx, |this, window, cx| {
                         this.finish_board_read(output, cx);
                         this.run_dispatch(window, cx);
+                        this.push_board_needs_you(cx);
                     });
                     if finished.is_err() {
                         break;
@@ -209,6 +221,11 @@ impl AppShell {
             }
         })
         .detach();
+    }
+
+    fn push_board_needs_you(&self, cx: &mut Context<Self>) {
+        let need_you = self.boards_count(cx).map_or(0, |count| count.need_you);
+        self.sidebar_entity().update(cx, |sidebar, cx| sidebar.set_board_needs_you(need_you, cx));
     }
 
     /// Boards without `addedAt`, from before dispatch existed or added by hand to `settings.json`,
@@ -409,19 +426,24 @@ impl AppShell {
         let read = self.board.reads_by_url.get(&settings.url);
         let notes = self.card_notes(&settings.url, cx);
         let turns = self.turn_labels(&settings.url);
-        let count = self.dispatch_count(&settings.url, &notes, &turns, cx);
-        let mine = self.board.mine.then(|| self.my_items(&settings.url, cx));
+        let need_you = self.need_you_items(&settings.url, &notes, &turns);
+        let count = self.dispatch_count(&settings.url, need_you.len(), cx);
+        let shown = match self.board.filter {
+            BoardFilter::Mine => Some(self.my_items(&settings.url, cx)),
+            BoardFilter::All => None,
+            BoardFilter::NeedsYou => Some(need_you),
+        };
         let mut body = div().id("board-body").flex_grow().h_full().overflow_scroll();
         body.style().min_size.height = Some(gpui::Length::Definite(px(0.0).into()));
         body.style().min_size.width = Some(gpui::Length::Definite(px(0.0).into()));
         let body = match read.and_then(|r| r.last_good.as_ref()) {
             Some(board) => {
-                let board = match &mine {
-                    Some(mine) => Cow::Owned(Board {
+                let board = match &shown {
+                    Some(shown) => Cow::Owned(Board {
                         items: board
                             .items
                             .iter()
-                            .filter(|item| mine.contains(&item.id))
+                            .filter(|item| shown.contains(&item.id))
                             .cloned()
                             .collect(),
                         ..board.clone()
@@ -612,7 +634,7 @@ impl AppShell {
                     })
                     .child(format!("· {}", count.text()))
             }))
-            .when(selected.is_some(), |s| s.child(self.render_mine_toggle(theme, cx)))
+            .when(selected.is_some(), |s| s.child(self.render_filter(theme, cx)))
             .child(div().flex_grow())
             .when(selected.is_some(), |s| {
                 s.child(
@@ -666,9 +688,9 @@ impl AppShell {
             .into_any_element()
     }
 
-    fn render_mine_toggle(&self, theme: &Arc<Theme>, cx: &mut Context<Self>) -> impl IntoElement {
-        let option = |id: &'static str, label: &'static str, mine: bool| {
-            let active = self.board.mine == mine;
+    fn render_filter(&self, theme: &Arc<Theme>, cx: &mut Context<Self>) -> impl IntoElement {
+        let option = |id: &'static str, label: &'static str, filter: BoardFilter| {
+            let active = self.board.filter == filter;
             div()
                 .id(id)
                 .px(px(9.0))
@@ -686,7 +708,7 @@ impl AppShell {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
-                        this.board.mine = mine;
+                        this.board.filter = filter;
                         cx.notify();
                     }),
                 )
@@ -701,8 +723,9 @@ impl AppShell {
             .rounded(px(7.0))
             .border_1()
             .border_color(theme::divider(theme))
-            .child(option("board-mine", "Mine", true))
-            .child(option("board-all", "All", false))
+            .child(option("board-mine", "Mine", BoardFilter::Mine))
+            .child(option("board-all", "All", BoardFilter::All))
+            .child(option("board-needs-you", "Needs you", BoardFilter::NeedsYou))
     }
 
     fn render_board_empty(&self, theme: &Arc<Theme>, cx: &mut Context<Self>) -> AnyElement {
