@@ -107,8 +107,8 @@ fn notify_text(attention: Attention) -> (&'static str, &'static str) {
         ),
         Attention::NeedsYou => (
             "A dispatch needs you",
-            "A round stopped without its result, a draft pull request to test by hand, or a \
-             repair that needs you.",
+            "A choice before a round can start, a round stopped without its result, a draft \
+             pull request to test by hand, or a repair that needs you.",
         ),
         Attention::MayBeWaiting => (
             "A session may be waiting for you",

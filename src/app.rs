@@ -5345,7 +5345,13 @@ impl AppShell {
                     };
                     let title = entry.title.clone();
                     let detail = entry.detail.clone();
-                    let session_title = entry.session_title.clone();
+                    let session_title = match &entry.target {
+                        Some(crate::notifications::NotificationTarget::Tab(title)) => {
+                            Some(title.clone())
+                        }
+                        Some(crate::notifications::NotificationTarget::BoardItem { .. })
+                        | None => None,
+                    };
                     let timestamp =
                         crate::notifications::format_hhmm(entry.timestamp);
                     let has_divider = i > 0;
@@ -5392,24 +5398,29 @@ impl AppShell {
                                 // read. This is what the footer hint
                                 // ("Click an entry to jump to its
                                 // session.") promises.
-                                if let Some(session_title) =
-                                    this.notifications.activate(id)
-                                {
-                                    let target = this
-                                        .groups
-                                        .iter()
-                                        .enumerate()
-                                        .find_map(|(g_idx, group)| {
-                                            group
-                                                .tabs
-                                                .iter()
-                                                .position(|t| t.title == session_title)
-                                                .map(|t_idx| (g_idx, t_idx))
-                                        });
-                                    if let Some((g_idx, t_idx)) = target {
-                                        this.show_workspace(cx);
-                                        this.activate_tab(g_idx, t_idx, window, cx);
+                                use crate::notifications::NotificationTarget;
+                                match this.notifications.activate(id) {
+                                    Some(NotificationTarget::Tab(session_title)) => {
+                                        let target = this
+                                            .groups
+                                            .iter()
+                                            .enumerate()
+                                            .find_map(|(g_idx, group)| {
+                                                group
+                                                    .tabs
+                                                    .iter()
+                                                    .position(|t| t.title == session_title)
+                                                    .map(|t_idx| (g_idx, t_idx))
+                                            });
+                                        if let Some((g_idx, t_idx)) = target {
+                                            this.show_workspace(cx);
+                                            this.activate_tab(g_idx, t_idx, window, cx);
+                                        }
                                     }
+                                    Some(NotificationTarget::BoardItem { board_url, item_id }) => {
+                                        this.open_board_item(board_url, &item_id, cx);
+                                    }
+                                    None => {}
                                 }
                                 this.notifications.set_open(false);
                                 cx.notify();
@@ -5432,6 +5443,7 @@ impl AppShell {
                                 .flex()
                                 .flex_col()
                                 .flex_grow()
+                                .min_w(px(0.0))
                                 .child(
                                     div()
                                         .text_size(px(12.0))
@@ -5496,7 +5508,7 @@ impl AppShell {
             .pb(px(8.0))
             .text_size(px(10.5))
             .text_color(ink_dim)
-            .child("Click an entry to jump to its session.");
+            .child("Click an entry to go to its tab or card.");
 
         // Outer panel — 360 px wide, max-height 420 px, anchored
         // bottom-right above the status bar (mirroring the Popup
@@ -7314,7 +7326,8 @@ impl AppShell {
             .retain(|sid, _| self.telemetry_tails.contains_key(sid));
 
         for p in pending {
-            self.push_notification(p.kind, p.title, p.detail, Some(p.session_title), cx);
+            let tab = crate::notifications::NotificationTarget::Tab(p.session_title);
+            self.push_notification(p.kind, p.title, p.detail, Some(tab), cx);
         }
     }
 
@@ -7329,10 +7342,10 @@ impl AppShell {
         kind: crate::notifications::NotificationKind,
         title: impl Into<SharedString>,
         detail: impl Into<SharedString>,
-        session_title: Option<SharedString>,
+        target: Option<crate::notifications::NotificationTarget>,
         cx: &mut Context<Self>,
     ) -> u64 {
-        let id = self.notifications.push(kind, title, detail, session_title);
+        let id = self.notifications.push(kind, title, detail, target);
         cx.notify();
         id
     }

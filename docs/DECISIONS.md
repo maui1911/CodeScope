@@ -1158,8 +1158,10 @@ board, each with their own CodeScope or another tool that follows the
   findings are ready, when a dispatch *needs you*, and when a session
   may be waiting on the user: mid-turn for over three minutes without
   its transcript growing. Each of the three can be turned off in
-  *Settings → Boards* (`notify`). `notify_rust` cannot route a click on a
-  Windows toast, so the bell entry is what opens the tab. Claude Code
+  *Settings → Boards* (`notify`). A choice before a round can start
+  rings once per move. `notify_rust` cannot route a click on a
+  Windows toast, so the bell entry is what opens the tab, or, while
+  there is no tab yet, the item's card on the board. Claude Code
   writes a question or a permission prompt to its transcript only once
   it is answered, so while it waits the session reads as busy, not as
   in a pending tool call, and it cannot be told apart from a long tool
