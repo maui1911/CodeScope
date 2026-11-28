@@ -23,6 +23,7 @@ use codescope_core::board::dispatch::{
     projects_for_repository, remote_branch_tip, set_fork_push, start_still_wanted, task_file,
     task_message, track_remote_branch, tracks_same_name, trigger_content_ids, write_task_file,
 };
+use codescope_core::board::attention::Stall;
 use codescope_core::board::answers::{
     Answer, Comment, after_findings, answer_body, answers_section, choices_text, chosen,
     find_answers,
@@ -128,6 +129,8 @@ pub(crate) struct DispatchState {
     seen_from_start: HashSet<RoundKey>,
     /// Item id → the cleanup of a dispatch whose work ended.
     cleanups: HashMap<String, cleanup::Cleanup>,
+    /// Item id → how long its session has been mid-turn with nothing new.
+    stalls: HashMap<String, Stall>,
 }
 
 /// What the board poll knows about the pull request of an implementation or review round, and
@@ -2322,7 +2325,7 @@ impl AppShell {
                 self.push_toast(ToastKind::Err, title.clone(), Some(detail.clone().into()), cx);
                 let tab_title = self.tab_title_at(path, agent);
                 let kind = NotificationKind::SessionWaiting;
-                self.push_notification(kind, title, detail, tab_title, cx);
+                self.ring_away(kind, title, detail, tab_title, cx);
             }
             Remind::Nothing => {}
         }
@@ -2458,7 +2461,7 @@ impl AppShell {
         };
         self.push_toast(kind, title.clone(), Some(detail.clone().into()), cx);
         let tab_title = self.tab_title_at(&path, record.agent.as_deref());
-        self.push_notification(NotificationKind::SessionReady, title, detail, tab_title, cx);
+        self.ring_away(NotificationKind::SessionReady, title, detail, tab_title, cx);
         cx.notify();
     }
 
@@ -2514,6 +2517,60 @@ impl AppShell {
         let (board, mapping) = self.board_and_mapping(board_url)?;
         let column = mapped_column(board, &mapping, role)?;
         Some((board.clone(), column.id.clone()))
+    }
+
+    /// Follow each dispatched session mid-turn, and ring once when one may be waiting for the
+    /// user.
+    pub(crate) fn watch_attention(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let records = self.dispatch_records(cx);
+        self.board
+            .dispatch
+            .stalls
+            .retain(|id, _| records.iter().any(|(_, _, _, r)| r.item_id == *id));
+        for (_, path, _, record) in records {
+            let agent = record.agent.as_deref();
+            let snapshot = self.telemetry_at(&path, agent, cx);
+            let stall = self.board.dispatch.stalls.entry(record.item_id.clone()).or_default();
+            stall.observe(snapshot.as_ref(), now);
+            if !stall.ring(now) {
+                continue;
+            }
+            let tab_title = self.tab_title_at(&path, agent);
+            self.ring_away(
+                NotificationKind::SessionWaiting,
+                format!("#{} may be waiting for you", record.number),
+                format!(
+                    "{}. Nothing new in its session for 3 min: maybe a question or a permission \
+                     prompt.",
+                    record.title
+                ),
+                tab_title,
+                cx,
+            );
+        }
+    }
+
+    /// Ring the bell, and show an OS toast too while CodeScope isn't the active window. Only the
+    /// bell entry opens the tab.
+    fn ring_away(
+        &mut self,
+        kind: NotificationKind,
+        title: impl Into<SharedString>,
+        detail: impl Into<SharedString>,
+        tab_title: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let (title, detail) = (title.into(), detail.into());
+        if !self.window_active_cached {
+            let (toast_title, toast_detail) = (title.clone(), detail.clone());
+            cx.background_executor()
+                .spawn(async move {
+                    crate::idle_notifier::fire_os_notification(&toast_title, &toast_detail);
+                })
+                .detach();
+        }
+        self.push_notification(kind, title, detail, tab_title, cx);
     }
 
     /// Watch the pull request of every implementation and review round, and of research on an
@@ -2592,7 +2649,7 @@ impl AppShell {
             }
             if ring {
                 let tab_title = self.tab_title_at(&path, record.agent.as_deref());
-                self.push_notification(
+                self.ring_away(
                     NotificationKind::SessionWaiting,
                     format!("#{} waits for you", record.number),
                     "Implementation stopped without a pull request.",
@@ -2751,7 +2808,7 @@ impl AppShell {
                 if ring {
                     watch.rang_for = stop;
                     let tab_title = self.tab_title_at(&path, record.agent.as_deref());
-                    self.push_notification(
+                    self.ring_away(
                         NotificationKind::SessionWaiting,
                         format!("#{} waits for you", record.number),
                         "Review stopped without a push or a reply.",
@@ -3635,7 +3692,7 @@ impl AppShell {
             "Its session stopped without a push or a reply after {} commented.",
             named(&names)
         );
-        self.push_notification(
+        self.ring_away(
             NotificationKind::SessionWaiting,
             format!("#{} waits for you", record.number),
             detail,
@@ -3823,7 +3880,7 @@ impl AppShell {
             return;
         };
         watch.repair_rang = Some(rang_for);
-        self.push_notification(
+        self.ring_away(
             NotificationKind::SessionWaiting,
             format!("#{} waits for you", record.number),
             detail,
@@ -3835,6 +3892,7 @@ impl AppShell {
     /// What each card on the board at `board_url` says about dispatch, by item id.
     pub(crate) fn card_notes(&self, board_url: &str, cx: &App) -> HashMap<String, CardNote> {
         let state = &self.board.dispatch;
+        let now = Instant::now();
         let viewer = state.viewer.as_ref().map(|v| v.login.as_str());
         let records: Vec<_> = self
             .dispatch_records(cx)
@@ -3875,7 +3933,13 @@ impl AppShell {
                 let handover = state.watches.get(&r.item_id).and_then(handover_card);
                 let cleanup = self.cleanup_card(&r);
                 let parked = parked_note(self.item_role(&r.board_url, &r.item_id));
-                let note = cleanup.or(parked).or(handover).or(watched).unwrap_or(note);
+                let stalled = waiting_note(state.stalls.get(&r.item_id), now);
+                let note = cleanup
+                    .or(parked)
+                    .or(handover)
+                    .or(stalled)
+                    .or(watched)
+                    .unwrap_or(note);
                 (r.item_id, note)
             })
             .collect();
@@ -4182,6 +4246,14 @@ fn parked_note(role: Option<ColumnRole>) -> Option<CardNote> {
     let role = role.filter(|&role| rests(Some(role)))?;
     let text = format!("Moved to {} · nothing more runs until it moves again", role.label());
     Some(CardNote::new(text, NoteTone::Waiting))
+}
+
+/// The card's line while its session may be waiting for the user.
+fn waiting_note(stall: Option<&Stall>, now: Instant) -> Option<CardNote> {
+    let since = stall?.waiting_since(now)?;
+    let span = codescope_core::time::span(now.duration_since(since).as_secs_f64());
+    let text = format!("May be waiting for you · nothing new for {span}");
+    Some(CardNote::new(text, NoteTone::NeedsYou))
 }
 
 /// The card line of an item that waits.
@@ -5035,6 +5107,28 @@ mod tests {
         let note = pull_request_note(&watch, Some(&posted(415)), ItemKind::Issue).unwrap();
         assert_eq!(note.text.as_ref(), "PR #415 · checks failing");
         assert!(note.tone == NoteTone::Failed);
+    }
+
+    #[test]
+    fn a_session_with_nothing_new_mid_turn_may_be_waiting_for_you() {
+        let start = Instant::now();
+        let mut stall = Stall::default();
+        let busy = codescope_core::TelemetrySnapshot {
+            model: None,
+            tokens_used: 1_000,
+            context_pct: None,
+            turn_count: 1,
+            last_turn_duration: None,
+            state: SessionState::Busy,
+            quiet_timeout: false,
+            title: None,
+        };
+        stall.observe(Some(&busy), start);
+        assert!(waiting_note(Some(&stall), start + Duration::from_secs(179)).is_none());
+        let note = waiting_note(Some(&stall), start + Duration::from_secs(7 * 60 + 30)).unwrap();
+        assert_eq!(note.text.as_ref(), "May be waiting for you · nothing new for 7 min");
+        assert!(note.tone == NoteTone::NeedsYou && note.action.is_none());
+        assert!(waiting_note(None, start).is_none());
     }
 
     #[test]
