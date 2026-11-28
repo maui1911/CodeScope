@@ -393,6 +393,10 @@ idiom mirrors the in-app modals (`new_project_dialog.rs`,
 
 **Consequences:**
 - The Rust port ships `src/settings_dialog.rs` with no C# counterpart.
+- The dialog has a page per section, picked in a left column, after the
+  *Settings* design of ADR-0027: *Appearance* (theme, font, scrollback,
+  cursor) and *Agents* (default agent). A section appears once it has a
+  setting, so the design's *General* and *Updates* aren't there yet.
 - Saves go through [`Settings::update`]: the dialog writes its own fields
   onto the file as it is at Save, so a board added, mapped or removed
   while the dialog is open stays. `apply_settings` is also called inline

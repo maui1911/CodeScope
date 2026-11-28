@@ -13,10 +13,9 @@
 //! also call `apply_settings` inline so the swap is instant rather than
 //! waiting up to one `SETTINGS_POLL` tick).
 //!
-//! Visual idiom: mirrors `new_project_dialog.rs` and
-//! `new_worktree_dialog.rs` — elevated card on a dark backdrop,
-//! divider-bordered, 6 px corner radius, accent colour for the primary
-//! action button, ink-dim labels in uppercase.
+//! Layout: the *Settings* design, a page per section picked in the left column, with Cancel and
+//! Save under every page. Save writes only what the dialog edits onto the file as it is then, so
+//! a board added, mapped or removed while the dialog is open stays.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -46,11 +45,43 @@ pub enum SettingsField {
     Scrollback,
 }
 
+/// A page of the Settings dialog, picked in its left column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsSection {
+    Appearance,
+    Agents,
+}
+
+impl SettingsSection {
+    /// The sections in the order the left column lists them.
+    pub const ALL: [SettingsSection; 2] = [SettingsSection::Appearance, SettingsSection::Agents];
+
+    /// The name in the left column.
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingsSection::Appearance => "Appearance",
+            SettingsSection::Agents => "Agents",
+        }
+    }
+
+    /// The typed fields on this page, in Tab order.
+    fn fields(self) -> &'static [SettingsField] {
+        match self {
+            SettingsSection::Appearance => {
+                &[SettingsField::FontSize, SettingsField::LineHeight, SettingsField::Scrollback]
+            }
+            SettingsSection::Agents => &[],
+        }
+    }
+}
+
 /// Live state of the open Settings dialog. Holds an in-memory edit
 /// buffer — none of the fields are persisted until the user clicks
 /// Save. Cancel discards the buffer.
 pub struct SettingsDialogState {
     pub focus_handle: FocusHandle,
+    /// The page shown; typed keys reach only its fields.
+    pub section: SettingsSection,
     pub focused_field: SettingsField,
     /// Working copy of `Settings`. Edits mutate this; Save writes to
     /// disk and replaces the shell's `settings` Arc via
@@ -107,6 +138,7 @@ impl SettingsDialogState {
         draft.font.family = draft.font.family.trim().to_string();
         Self {
             focus_handle,
+            section: SettingsSection::Appearance,
             focused_field: SettingsField::FontSize,
             font_options: build_font_options(installed_fonts, &draft.font.family),
             font_popup_open: false,
@@ -139,16 +171,24 @@ impl SettingsDialogState {
         Ok(())
     }
 
-    fn focused_field_mut(&mut self) -> &mut TextField {
+    fn focused_field_mut(&mut self) -> Option<&mut TextField> {
         // An open font popup steals typed input for its filter — the
         // nominally-focused numeric field resumes when it closes.
         if self.font_popup_open {
-            return &mut self.font_query;
+            return Some(&mut self.font_query);
         }
-        match self.focused_field {
-            SettingsField::FontSize => &mut self.font_size_field,
-            SettingsField::LineHeight => &mut self.line_height_field,
-            SettingsField::Scrollback => &mut self.scrollback_field,
+        if !self.section.fields().contains(&self.focused_field) {
+            return None;
+        }
+        Some(self.field_mut_by(self.focused_field))
+    }
+
+    /// Show `section`, with the keyboard on its first typed field.
+    pub fn show_section(&mut self, section: SettingsSection) {
+        self.section = section;
+        self.font_popup_open = false;
+        if let Some(first) = section.fields().first() {
+            self.focused_field = *first;
         }
     }
 
@@ -162,7 +202,10 @@ impl SettingsDialogState {
     /// no-op (backspace at caret 0, move_left at caret 0, …) returns
     /// `false` and the caller skips the redraw.
     pub fn insert_char(&mut self, ch: char) -> bool {
-        self.focused_field_mut().insert_char(ch);
+        let Some(field) = self.focused_field_mut() else {
+            return false;
+        };
+        field.insert_char(ch);
         self.after_edit(true);
         true
     }
@@ -170,19 +213,19 @@ impl SettingsDialogState {
     /// Paste `s` into the focused field (control chars stripped by
     /// `TextField::insert_str`).
     pub fn insert_str(&mut self, s: &str) -> bool {
-        let changed = self.focused_field_mut().insert_str(s);
+        let changed = self.focused_field_mut().is_some_and(|field| field.insert_str(s));
         self.after_edit(changed);
         changed
     }
 
     pub fn backspace(&mut self) -> bool {
-        let changed = self.focused_field_mut().backspace();
+        let changed = self.focused_field_mut().is_some_and(TextField::backspace);
         self.after_edit(changed);
         changed
     }
 
     pub fn delete_forward(&mut self) -> bool {
-        let changed = self.focused_field_mut().delete_forward();
+        let changed = self.focused_field_mut().is_some_and(TextField::delete_forward);
         self.after_edit(changed);
         changed
     }
@@ -205,19 +248,19 @@ impl SettingsDialogState {
     }
 
     pub fn move_caret_left(&mut self) -> bool {
-        self.focused_field_mut().move_left()
+        self.focused_field_mut().is_some_and(TextField::move_left)
     }
 
     pub fn move_caret_right(&mut self) -> bool {
-        self.focused_field_mut().move_right()
+        self.focused_field_mut().is_some_and(TextField::move_right)
     }
 
     pub fn move_caret_home(&mut self) -> bool {
-        self.focused_field_mut().move_home()
+        self.focused_field_mut().is_some_and(TextField::move_home)
     }
 
     pub fn move_caret_end(&mut self) -> bool {
-        self.focused_field_mut().move_end()
+        self.focused_field_mut().is_some_and(TextField::move_end)
     }
 
     /// Mutable accessor for one of the numeric text-input fields.
@@ -233,11 +276,10 @@ impl SettingsDialogState {
     }
 
     fn cycle_field(&mut self, forward: bool) {
-        let order = [
-            SettingsField::FontSize,
-            SettingsField::LineHeight,
-            SettingsField::Scrollback,
-        ];
+        let order = self.section.fields();
+        if order.is_empty() {
+            return;
+        }
         let pos = order.iter().position(|f| *f == self.focused_field).unwrap_or(0);
         let next = if forward {
             (pos + 1) % order.len()
@@ -456,6 +498,14 @@ impl AppShell {
         self.set_theme_preview(theme, cx);
     }
 
+    /// Show another page of the dialog.
+    pub fn settings_show_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        if let Some(state) = self.settings_dialog.as_mut() {
+            state.show_section(section);
+            cx.notify();
+        }
+    }
+
     /// Set the draft default-agent id.
     pub fn settings_set_default_agent(&mut self, id: String, cx: &mut Context<Self>) {
         if let Some(state) = self.settings_dialog.as_mut() {
@@ -578,7 +628,6 @@ impl AppShell {
         let elevated = theme::elevated(theme);
         let divider = theme::divider(theme);
         let ink = theme::ink(theme);
-        let ink_dim = theme::ink_dim(theme);
         let ink_ghost = theme::ink_ghost(theme);
         let ink_muted = theme::ink_muted(theme);
         let frost = theme::frost_10(theme);
@@ -593,30 +642,48 @@ impl AppShell {
         let error_msg: Option<SharedString> = state.error.clone().map(Into::into);
         let blink_phase = self.text_blink_phase;
 
-        // Header — eyebrow + title + subtitle.
         let header = div()
             .flex()
-            .flex_col()
-            .gap_1()
-            .px_5()
-            .pt_5()
+            .flex_row()
+            .items_center()
+            .px_6()
+            .py(px(18.0))
+            .border_b_1()
+            .border_color(divider)
             .child(
                 div()
-                    .text_size(px(11.0))
-                    .text_color(accent)
-                    .child("SETTINGS"),
+                    .flex_1()
+                    .text_size(px(16.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(ink)
+                    .child("Settings"),
             )
-            .child(div().text_size(px(20.0)).text_color(ink).child("Settings"))
             .child(
                 div()
-                    .text_size(px(12.0))
+                    .id("settings-close")
+                    .px_2()
+                    .text_size(px(14.0))
                     .text_color(ink_muted)
-                    .child("Theme, font, cursor, default agent. Edits apply on Save."),
+                    .cursor_pointer()
+                    .hover(move |s| s.text_color(ink))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.cancel_settings_dialog(cx);
+                        }),
+                    )
+                    .child("×"),
             );
 
         let field_label = |text: &'static str| {
-            div().text_size(px(11.0)).text_color(ink_ghost).child(text)
+            div()
+                .text_size(px(13.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(ink)
+                .child(text)
         };
+        let group = |label: &'static str| div().flex().flex_col().gap_2().child(field_label(label));
         let hint = |text: SharedString| {
             div()
                 .w_full()
@@ -886,88 +953,94 @@ impl AppShell {
                     .child("Cursor blinks"),
             );
 
-        // ─── Body assembly ─────────────────────────────────────────
-        //
-        // Two-column scroll-friendly stack: left column = theme +
-        // agent pickers; right column = font + cursor + scrollback.
-        // Both share the dialog's 640 px width minus the 40 px side
-        // padding + 16 px gutter — leaves ~290 px per column which
-        // is enough for the font-family input plus the truncated
-        // fallback hint without wrapping.
-
         let restart_hint = div()
-            .text_size(px(10.0))
+            .text_size(px(11.0))
             .text_color(ink_ghost)
             .child("Applies to new tabs only.");
 
-        let left_col = div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .flex_grow()
-            .child(field_label("THEME"))
-            .child(theme_list)
-            .child(field_label("DEFAULT AGENT"))
-            .child(agent_list);
-
-        let right_col = div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .flex_grow()
-            .child(field_label("FONT FAMILY"))
-            .child(font_trigger)
-            .child(hint(fallbacks_hint))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .flex_grow()
-                            .child(field_label("FONT SIZE"))
-                            .child(font_size_input),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .flex_grow()
-                            .child(field_label("LINE HEIGHT"))
-                            .child(line_height_input),
-                    ),
-            )
-            .child(field_label("SCROLLBACK"))
-            .child(scrollback_input)
-            .child(restart_hint)
-            .child(field_label("CURSOR SHAPE"))
-            .child(cursor_row)
-            .child(blink_row);
-
-        let body = div()
-            .px_5()
+        let appearance = div()
             .flex()
             .flex_row()
-            .gap_4()
-            .child(left_col)
-            .child(right_col);
+            .gap_6()
+            .child(div().w(px(200.0)).flex_shrink_0().child(group("Theme").child(theme_list)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(20.0))
+                    .child(group("Font family").child(font_trigger).child(hint(fallbacks_hint)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_3()
+                            .child(group("Font size").flex_1().child(font_size_input))
+                            .child(group("Line height").flex_1().child(line_height_input)),
+                    )
+                    .child(group("Scrollback").child(scrollback_input).child(restart_hint))
+                    .child(group("Cursor shape").child(cursor_row).child(blink_row)),
+            );
+        let agents = group("Default agent").w(px(320.0)).child(agent_list);
+        let page = match state.section {
+            SettingsSection::Appearance => appearance.into_any_element(),
+            SettingsSection::Agents => agents.into_any_element(),
+        };
 
-        // ─── Footer ────────────────────────────────────────────────
-        let error_block = error_msg.map(|msg| {
-            div().px_5().text_size(px(12.0)).text_color(danger).child(msg)
-        });
+        let nav = div()
+            .w(px(180.0))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .px(px(10.0))
+            .py(px(14.0))
+            .border_r_1()
+            .border_color(divider)
+            .children(SettingsSection::ALL.into_iter().map(|section| {
+                let current = section == state.section;
+                div()
+                    .id(("settings-section", section as usize))
+                    .px(px(10.0))
+                    .py_2()
+                    .rounded(px(6.0))
+                    .text_size(px(13.0))
+                    .text_color(if current { ink } else { ink_muted })
+                    .bg(if current { frost } else { gpui::transparent_black() })
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(frost).text_color(ink))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.settings_show_section(section, cx);
+                        }),
+                    )
+                    .child(section.label())
+            }));
+        let content = div()
+            .id("settings-content")
+            .flex_1()
+            .min_w(px(0.0))
+            .px_6()
+            .py_5()
+            .overflow_y_scroll()
+            .child(page);
+        let body = div()
+            .flex_1()
+            .min_h(px(0.0))
+            .flex()
+            .flex_row()
+            .child(nav)
+            .child(content);
 
         let cancel_btn = div()
             .id("settings-cancel")
-            .px_4()
+            .px(px(14.0))
             .py_2()
             .text_size(px(13.0))
-            .text_color(ink_dim)
+            .text_color(ink)
             .border_1()
             .border_color(divider)
             .rounded(px(6.0))
@@ -984,9 +1057,10 @@ impl AppShell {
 
         let save_btn = div()
             .id("settings-save")
-            .px_4()
+            .px(px(14.0))
             .py_2()
             .text_size(px(13.0))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
             .text_color(canvas)
             .bg(accent)
             .rounded(px(6.0))
@@ -1000,28 +1074,37 @@ impl AppShell {
             )
             .child("Save");
 
-        let footer_buttons = div()
+        let footer = div()
             .flex()
             .flex_row()
-            .justify_end()
+            .items_center()
             .gap_2()
-            .px_5()
-            .pb_5()
+            .px_6()
+            .py(px(14.0))
+            .border_t_1()
+            .border_color(divider)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_size(px(12.0))
+                    .text_color(danger)
+                    .children(error_msg),
+            )
             .child(cancel_btn)
             .child(save_btn);
 
-        let mut card = div()
+        let height = px(f32::from(viewport.height - px(48.0)).min(760.0));
+        let card = div()
             .flex()
             .flex_col()
-            .gap_3()
-            .w(px(720.0))
-            .max_h(px(760.0))
+            .w(px(880.0))
+            .h(height)
             .bg(elevated)
             .border_1()
             .border_color(divider)
             .rounded_lg()
             .shadow_lg()
-            .pb_2()
             .track_focus(&focus_handle)
             .key_context("SettingsDialog")
             .on_key_down(cx.listener(handle_key_down))
@@ -1030,11 +1113,8 @@ impl AppShell {
                 cx.listener(|_, _, _, cx| cx.stop_propagation()),
             )
             .child(header)
-            .child(body);
-        if let Some(eb) = error_block {
-            card = card.child(eb);
-        }
-        card = card.child(footer_buttons);
+            .child(body)
+            .child(footer);
 
         let backdrop = div()
             .w(viewport.width)
@@ -1515,6 +1595,16 @@ mod tests {
         assert_eq!(latest.boards.len(), 1, "a board added while the dialog was open");
         assert_eq!(latest.dispatch_limit, 5);
         assert_eq!(latest.font.fallbacks, ["Hack Nerd Font"]);
+    }
+
+    #[test]
+    fn typed_keys_reach_only_the_fields_of_the_page_shown() {
+        let order = |section: SettingsSection| section.fields().to_vec();
+        assert_eq!(
+            order(SettingsSection::Appearance),
+            [SettingsField::FontSize, SettingsField::LineHeight, SettingsField::Scrollback]
+        );
+        assert!(order(SettingsSection::Agents).is_empty());
     }
 
     // `SettingsDialogState` holds a `FocusHandle` and so can't be
