@@ -1,0 +1,5 @@
+# Control plane. Mutable coordination state never belongs in git -
+# see ../README.md section 3.1.
+.state/
+# The sweep's own control plane - run/sweep.sh.
+.state-sweep/
