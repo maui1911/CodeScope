@@ -25,8 +25,8 @@ use gpui::{
 
 use crate::app::AppShell;
 use crate::app::board_dispatch::{
-    CardAction, CardNote, DispatchCount, DispatchState, DrawerRead, NoteTone, ReadInput,
-    ReadOutput, TurnLabel, read_boards,
+    CardNote, DispatchCount, DispatchState, DrawerRead, NoteTone, ReadInput, ReadOutput,
+    TurnLabel, read_boards,
 };
 use crate::dialogs::confirm::ConfirmSpec;
 use crate::theme;
@@ -1128,11 +1128,6 @@ fn render_card(
             match note.action {
                 Some(action) => {
                     let item_id = item.id.clone();
-                    let label = match action {
-                        CardAction::Decide => "Decide",
-                        CardAction::ReadyForReview => "Ready for review",
-                        CardAction::StartFromFork => "Start…",
-                    };
                     let button = div()
                         .id(("board-card-action", index))
                         .flex_shrink_0()
@@ -1147,20 +1142,10 @@ fn render_card(
                             MouseButton::Left,
                             cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
-                                match action {
-                                    CardAction::Decide => {
-                                        this.open_decide_dialog(&item_id, window, cx)
-                                    }
-                                    CardAction::ReadyForReview => {
-                                        this.ready_for_review(&item_id, cx)
-                                    }
-                                    CardAction::StartFromFork => {
-                                        this.confirm_fork_start(&item_id, window, cx)
-                                    }
-                                }
+                                this.take_card_action(action, &item_id, window, cx);
                             }),
                         )
-                        .child(label);
+                        .child(action.label());
                     div()
                         .flex()
                         .flex_row()

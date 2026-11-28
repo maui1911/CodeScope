@@ -13,7 +13,7 @@ use gpui::{
 
 use crate::app::AppShell;
 use crate::app::board_dispatch::{
-    CardAction, DetailsView, FindingsView, ItemDrawer, Mark, MoveRow, Needs, NoteTone,
+    DetailsView, FindingsView, ItemDrawer, Mark, MoveRow, Needs, NoteTone,
 };
 use crate::theme;
 
@@ -225,11 +225,6 @@ fn render_needs(
     let warn = theme::signal_warn();
     let (board_url, item_id) = (drawer.board_url.clone(), drawer.item_id.clone());
     let action = needs.action;
-    let primary_label = match action {
-        CardAction::ReadyForReview => "Ready for review",
-        CardAction::Decide => "Decide",
-        CardAction::StartFromFork => "Start…",
-    };
     let primary = div()
         .id("item-drawer-primary")
         .px(px(12.0))
@@ -242,13 +237,11 @@ fn render_needs(
         .cursor_pointer()
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |this, _, window: &mut Window, cx| match action {
-                CardAction::ReadyForReview => this.ready_for_review(&item_id, cx),
-                CardAction::Decide => this.open_decide_dialog(&item_id, window, cx),
-                CardAction::StartFromFork => this.confirm_fork_start(&item_id, window, cx),
+            cx.listener(move |this, _, window: &mut Window, cx| {
+                this.take_card_action(action, &item_id, window, cx)
             }),
         )
-        .child(primary_label);
+        .child(action.label());
     let item_id = drawer.item_id.clone();
     let open_tab = drawer.dispatched.then(|| {
         secondary_button(theme, "item-drawer-tab", "Open tab").on_mouse_down(

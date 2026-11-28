@@ -19,9 +19,9 @@ use codescope_core::board::dispatch::{
     add_dispatch_worktree, add_fork_worktree, add_pull_request_worktree, branch_base, branch_name,
     clear_findings, clear_reply, counts_towards_limit, decide, exclude_handover_files,
     fetch_branch_head, fetch_pull_head, find_skill, fork_branch, fork_push, is_plain_branch,
-    launch_with_task, mover_to_check, moves_to_needs_decision, opened_by, projects_for_repository,
-    remote_branch_tip, set_fork_push, start_still_wanted, task_file, task_message,
-    track_remote_branch, tracks_same_name, trigger_content_ids, write_task_file,
+    launch_with_task, mover_to_check, moves_to_needs_decision, opened_by, project_for_item,
+    projects_for_repository, remote_branch_tip, set_fork_push, start_still_wanted, task_file,
+    task_message, track_remote_branch, tracks_same_name, trigger_content_ids, write_task_file,
 };
 use codescope_core::board::answers::{
     Answer, Comment, after_findings, answer_body, answers_section, choices_text, chosen,
@@ -54,7 +54,7 @@ use codescope_core::board::{
 };
 use codescope_core::path_canon::paths_match;
 use codescope_core::process_tree;
-use codescope_core::{AgentProfile, SessionState, TelemetrySnapshot};
+use codescope_core::{AgentProfile, SessionState, Settings, TelemetrySnapshot};
 use codescope_core::projects::{Project, ProjectKind, ProjectsConfig};
 use codescope_core::worktree_create::{PendingId, record_dispatch, record_posted_findings};
 use codescope_terminal::TerminalView;
@@ -105,6 +105,9 @@ pub(crate) struct DispatchState {
     failed: HashMap<String, (String, String)>,
     /// Item id → the move of a fork's pull request the user confirmed starting.
     fork_confirmed: HashMap<String, String>,
+    /// Item id → the project the user picked for its next round, out of several with a remote
+    /// for its repository.
+    project_picked: HashMap<String, String>,
     holds: HashMap<String, Hold>,
     /// Rounds whose findings are being posted.
     posting: HashSet<RoundKey>,
@@ -675,6 +678,28 @@ pub(crate) enum CardAction {
     Decide,
     ReadyForReview,
     StartFromFork,
+    PickProject,
+}
+
+impl CardAction {
+    /// The text on its button.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            CardAction::Decide => "Decide",
+            CardAction::ReadyForReview => "Ready for review",
+            CardAction::StartFromFork | CardAction::PickProject => "Start…",
+        }
+    }
+}
+
+/// The project the user picked in the dialog for an item several projects could work on.
+pub(crate) struct ProjectPick {
+    pub board_url: String,
+    pub item_id: String,
+    pub repository: String,
+    pub project_id: String,
+    /// Set to keep the pick for every item of the repository on the board.
+    pub for_board: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1325,7 +1350,7 @@ impl AppShell {
     }
 
     /// The projects as the sidebar has them, which follows its own edits as well as this shell's.
-    fn current_projects<'a>(&self, cx: &'a App) -> &'a ProjectsConfig {
+    pub(crate) fn current_projects<'a>(&self, cx: &'a App) -> &'a ProjectsConfig {
         self.sidebar.read(cx).projects()
     }
 
@@ -1419,8 +1444,7 @@ impl AppShell {
                 branch: branch.or(new_branch)?,
             });
         }
-        let remotes = &self.board.dispatch.remotes;
-        let (matched, _) = *projects_for_repository(remotes, item.repository.as_deref()?).first()?;
+        let (matched, _) = self.project_of(board_url, item, None).ok()?;
         let project = self.current_projects(cx).project(&matched.project_id)?;
         let branch = new_branch?;
         let folder = sanitize_branch_to_folder(&branch);
@@ -1430,6 +1454,33 @@ impl AppShell {
             path: PathBuf::from(project.worktree_root_path()).join(folder),
             branch,
         })
+    }
+
+    /// The projects with a remote for `repository`, each with the name of that remote.
+    pub(crate) fn projects_with_remote(&self, repository: &str) -> Vec<(&ProjectRemotes, &str)> {
+        projects_for_repository(&self.board.dispatch.remotes, repository)
+    }
+
+    /// The project that works on `item` of the board at `board_url`, with its remote for the
+    /// item's repository: `dispatched`, the project of its dispatch, the user's pick for it or
+    /// for its repository on that board, or else the only project with such a remote. `Err`
+    /// holds how many projects have one when that leaves none or several.
+    pub(crate) fn project_of(
+        &self,
+        board_url: &str,
+        item: &BoardItem,
+        dispatched: Option<&str>,
+    ) -> Result<(&ProjectRemotes, &str), usize> {
+        let repository = item.repository.as_deref().ok_or(0usize)?;
+        let state = &self.board.dispatch;
+        let for_board = self
+            .settings
+            .boards
+            .iter()
+            .find(|b| b.url == board_url)
+            .and_then(|b| b.picked_project(repository));
+        let for_item = state.project_picked.get(&item.id).map(String::as_str);
+        project_for_item(&state.remotes, repository, &[dispatched, for_item, for_board])
     }
 
     fn running_dispatches(&self, cx: &App) -> usize {
@@ -1515,11 +1566,9 @@ impl AppShell {
                     mover_can_write,
                     board_added_at: &settings.added_at,
                     now: &now,
-                    projects: item
-                        .repository
-                        .as_deref()
-                        .map(|r| projects_for_repository(&state.remotes, r).len())
-                        .unwrap_or(0),
+                    projects: self
+                        .project_of(&settings.url, item, worktree.map(|(id, ..)| id.as_str()))
+                        .map_or_else(|count| count, |_| 1),
                     dispatch: record,
                     pull_request: own_pull_request(record, state.watches.get(&item.id)),
                     linked,
@@ -1624,13 +1673,19 @@ impl AppShell {
         ) else {
             return;
         };
-        let matched = projects_for_repository(&self.board.dispatch.remotes, &repository)
-            .first()
+        let dispatched = self
+            .dispatch_records(cx)
+            .into_iter()
+            .find(|(_, _, _, r)| r.board_url == board_url && r.item_id == item.id)
+            .map(|(project_id, ..)| project_id);
+        let matched = self
+            .project_of(&board_url, &item, dispatched.as_deref())
+            .ok()
             .map(|(project, remote)| {
                 let url = project
                     .remotes
                     .iter()
-                    .find(|(name, _)| name.as_str() == *remote)
+                    .find(|(name, _)| name.as_str() == remote)
                     .map(|(_, url)| url.clone())
                     .unwrap_or_default();
                 (project.project_id.clone(), remote.to_string(), url)
@@ -1776,6 +1831,7 @@ impl AppShell {
         };
         self.board.dispatch.readied.remove(&item.id);
         self.board.dispatch.fork_confirmed.remove(&item.id);
+        self.board.dispatch.project_picked.remove(&item.id);
         self.board.dispatch.starting.insert(item.id.clone(), round);
         self.board.dispatch.failed.remove(&item.id);
         cx.notify();
@@ -3124,6 +3180,52 @@ impl AppShell {
         .detach();
     }
 
+    /// Do what the button of `action` on the card or drawer of `item_id` does.
+    pub(crate) fn take_card_action(
+        &mut self,
+        action: CardAction,
+        item_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            CardAction::Decide => self.open_decide_dialog(item_id, window, cx),
+            CardAction::ReadyForReview => self.ready_for_review(item_id, cx),
+            CardAction::StartFromFork => self.confirm_fork_start(item_id, window, cx),
+            CardAction::PickProject => self.open_pick_project_dialog(item_id, window, cx),
+        }
+    }
+
+    /// Start the item of `pick` with the project picked for it, kept for its repository on the
+    /// board when the user asked for that.
+    pub(crate) fn pick_project(
+        &mut self,
+        pick: ProjectPick,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ProjectPick { board_url, item_id, repository, project_id, for_board } = pick;
+        if for_board {
+            let saved = Settings::update(self.paths_ref(), |settings| {
+                if let Some(board) = settings.boards.iter_mut().find(|b| b.url == board_url) {
+                    board.pick_project(&repository, &project_id);
+                }
+            });
+            match saved {
+                Ok(settings) => self.apply_settings(settings, cx),
+                Err(err) => self.push_toast(
+                    ToastKind::Err,
+                    "Couldn't remember the project for this board",
+                    Some(format!("{err:#}").into()),
+                    cx,
+                ),
+            }
+        }
+        self.board.dispatch.project_picked.insert(item_id, project_id);
+        self.run_dispatch(window, cx);
+        cx.notify();
+    }
+
     /// Mark the draft pull request of `item_id` ready for review; the next watch moves the item
     /// to In review.
     pub(crate) fn ready_for_review(&mut self, item_id: &str, cx: &mut Context<Self>) {
@@ -4086,6 +4188,10 @@ fn hold_note(hold: &Hold) -> CardNote {
             action: Some(CardAction::StartFromFork),
             ..CardNote::new(hold.label(), NoteTone::NeedsYou)
         },
+        Hold::SeveralProjects(_) => CardNote {
+            action: Some(CardAction::PickProject),
+            ..CardNote::new(hold.label(), NoteTone::NeedsYou)
+        },
         _ => CardNote::new(hold.label(), NoteTone::Waiting),
     }
 }
@@ -4732,6 +4838,15 @@ mod tests {
         assert!(note.action == Some(CardAction::StartFromFork));
         let other = hold_note(&Hold::NoMove);
         assert!(other.tone == NoteTone::Waiting && other.action.is_none());
+    }
+
+    #[test]
+    fn an_item_several_projects_could_take_asks_which() {
+        let note = hold_note(&Hold::SeveralProjects("maui1911/CodeScope".into()));
+        assert!(note.tone == NoteTone::NeedsYou);
+        assert!(note.action == Some(CardAction::PickProject));
+        let none = hold_note(&Hold::NoProject("maui1911/CodeScope".into()));
+        assert!(none.tone == NoteTone::Waiting && none.action.is_none());
     }
 
     #[test]

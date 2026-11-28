@@ -406,6 +406,13 @@ fn needs(action: CardAction, kind: ItemKind, facts: Facts, note: &str) -> Needs 
              once you say so."
                 .to_string(),
         ),
+        (CardAction::PickProject, _) => (
+            "Which project?".to_string(),
+            note.to_string(),
+            "Pick the one that works on it, for this item or for every item of its repository \
+             on this board."
+                .to_string(),
+        ),
     };
     Needs {
         action,
@@ -654,6 +661,9 @@ mod tests {
         );
         let fork = needs(CardAction::StartFromFork, ItemKind::PullRequest, facts(None), "Fork");
         assert_eq!(fork.text, "Fork");
+        let several = "Several projects have maui1911/CodeScope as a remote";
+        let pick = needs(CardAction::PickProject, ItemKind::Issue, facts(None), several);
+        assert_eq!((pick.title.as_str(), pick.text.as_str()), ("Which project?", several));
     }
 
     #[test]
