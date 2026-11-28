@@ -761,6 +761,25 @@ pub fn projects_for_repository<'a>(
         .collect()
 }
 
+/// The project that works on an item of `repository`, with the name of its remote for it: the
+/// first of `picks` with such a remote, else the only project with one. `Err` holds how many
+/// projects have one when that leaves none or several.
+pub fn project_for_item<'a>(
+    projects: &'a [ProjectRemotes],
+    repository: &str,
+    picks: &[Option<&str>],
+) -> Result<(&'a ProjectRemotes, &'a str), usize> {
+    let found = projects_for_repository(projects, repository);
+    let picked = picks.iter().flatten().find_map(|id| {
+        found.iter().find(|(project, _)| project.project_id == *id).copied()
+    });
+    match (picked, found.as_slice()) {
+        (Some(project), _) => Ok(project),
+        (None, [project]) => Ok(*project),
+        (None, found) => Err(found.len()),
+    }
+}
+
 /// The first message of a dispatched session: one line without quotes, pointing at [`TASK_FILE`].
 pub fn task_message(kind: ItemKind, number: u32) -> String {
     format!("Work on {} #{number}: read {TASK_FILE} and follow it.", kind.noun())
@@ -2622,6 +2641,39 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0.project_id, "fork");
         assert_eq!(found[0].1, "upstream");
+    }
+
+    #[test]
+    fn a_pick_settles_which_of_several_projects_works_on_an_item() {
+        let project = |id: &str, url: &str| ProjectRemotes {
+            project_id: id.into(),
+            path: format!("D:/{id}"),
+            remotes: vec![("origin".into(), url.into())],
+        };
+        let projects = vec![
+            project("main", "https://github.com/maui1911/CodeScope.git"),
+            project("review", "git@github.com:maui1911/CodeScope.git"),
+            project("other", "https://github.com/maui1911/other"),
+        ];
+        let id = |found: Result<(&ProjectRemotes, &str), usize>| {
+            found.map(|(project, remote)| (project.project_id.clone(), remote.to_string()))
+        };
+        let repo = "maui1911/codescope";
+        assert_eq!(id(project_for_item(&projects, repo, &[])), Err(2));
+        assert_eq!(
+            id(project_for_item(&projects, repo, &[None, Some("review")])),
+            Ok(("review".into(), "origin".into()))
+        );
+        assert_eq!(
+            id(project_for_item(&projects, repo, &[Some("gone"), Some("other"), Some("main")])),
+            Ok(("main".into(), "origin".into())),
+            "a pick without a remote for the repository counts for nothing"
+        );
+        assert_eq!(
+            id(project_for_item(&projects, "maui1911/other", &[Some("main")])),
+            Ok(("other".into(), "origin".into()))
+        );
+        assert_eq!(id(project_for_item(&projects, "acme/web", &[Some("main")])), Err(0));
     }
 
     #[test]
