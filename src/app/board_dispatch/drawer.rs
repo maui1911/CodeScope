@@ -1,5 +1,5 @@
 //! The item drawer's contents (ADR-0027): one board item as CodeScope knows it from the last
-//! board read and the worktree row of its dispatch, without a read of its own.
+//! board read and the worktree row of its dispatch, and what the drawer read when it opened.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -15,6 +15,7 @@ use codescope_core::board::{BoardItem, ColumnRole, ItemKind, ItemState, RoleKind
 use codescope_core::SessionState;
 use gpui::{App, AppContext as _, Context, SharedString};
 
+use super::details::{DetailsView, details_view};
 use super::{AppShell, CardAction, CardNote, NoteTone, ToastKind};
 use crate::board_panel::{BoardRead, MoveBack};
 
@@ -43,6 +44,8 @@ pub(crate) struct ItemDrawer {
     pub pull_request_url: Option<String>,
     /// Set while it can move back to Todo.
     pub back_to_todo: Option<BackToTodo>,
+    /// What the drawer read when it opened.
+    pub details: DetailsView,
 }
 
 /// What the card's button asks of the user, in the drawer's own words.
@@ -236,6 +239,7 @@ impl AppShell {
             dispatched: dispatch.is_some(),
             pull_request_url: dispatch.as_ref().and(read_pr).map(|pr| pr.url.clone()),
             back_to_todo,
+            details: details_view(self.board.details.as_ref(), item_id, viewer, now()),
         })
     }
 }

@@ -23,7 +23,8 @@ use gpui::{
 
 use crate::app::AppShell;
 use crate::app::board_dispatch::{
-    CardAction, CardNote, DispatchState, NoteTone, ReadInput, ReadOutput, read_boards,
+    CardAction, CardNote, DispatchState, DrawerRead, NoteTone, ReadInput, ReadOutput,
+    read_boards,
 };
 use crate::dialogs::confirm::ConfirmSpec;
 use crate::theme;
@@ -42,6 +43,8 @@ pub(crate) struct BoardPanelState {
     pub show_all_done: bool,
     /// The item whose drawer is open, on the selected board.
     pub drawer: Option<String>,
+    /// What the open drawer read of its item.
+    pub details: Option<DrawerRead>,
     /// Items CodeScope moved back to Todo for the user, until a read shows the move.
     pub moved_back: HashMap<String, MoveBack>,
     pub reading: bool,
@@ -291,7 +294,7 @@ impl AppShell {
         self.board.selected_url = Some(url);
     }
 
-    fn selected_board(&self) -> Option<&BoardSettings> {
+    pub(crate) fn selected_board(&self) -> Option<&BoardSettings> {
         let boards = &self.settings.boards;
         self.board
             .selected_url
@@ -481,6 +484,7 @@ impl AppShell {
                             this.board.selected_url = Some(url.clone());
                             this.board.show_all_done = false;
                             this.board.drawer = None;
+                            this.board.details = None;
                             cx.notify();
                         }),
                     )
