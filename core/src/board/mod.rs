@@ -311,6 +311,22 @@ pub fn effective_mapping(board: &Board, mapping: &ColumnMapping) -> ColumnMappin
     effective
 }
 
+/// Map `role` to the column named `column`. A role that had that column takes the one `role`
+/// had, or is left without one.
+pub fn remap(mapping: &mut ColumnMapping, role: ColumnRole, column: &str) {
+    let previous = mapping.insert(role, column.to_string());
+    let holder = mapping
+        .iter()
+        .find(|(other, name)| **other != role && name.as_str() == column)
+        .map(|(other, _)| *other);
+    if let Some(holder) = holder {
+        match previous {
+            Some(previous) => mapping.insert(holder, previous),
+            None => mapping.remove(&holder),
+        };
+    }
+}
+
 /// The column a role maps to: the one with exactly that name, else the only one whose
 /// [`normalize_column_name`] matches.
 pub fn mapped_column<'a>(
@@ -760,6 +776,27 @@ mod tests {
         assert_eq!(b.role_of(&b.items[0], &mapping), Some(ColumnRole::Ready));
         assert_eq!(b.role_of(&b.items[1], &mapping), None);
         assert_eq!(b.role_of(&b.items[2], &mapping), None);
+    }
+
+    #[test]
+    fn remapping_a_role_to_a_taken_column_hands_the_other_role_its_old_column() {
+        let names = |pairs: &[(ColumnRole, &str)]| -> ColumnMapping {
+            pairs.iter().map(|(role, name)| (*role, name.to_string())).collect()
+        };
+        let mut mapping = names(&[(ColumnRole::Ready, "Ready"), (ColumnRole::InProgress, "Doing")]);
+        remap(&mut mapping, ColumnRole::Ready, "Doing");
+        assert_eq!(
+            mapping,
+            names(&[(ColumnRole::Ready, "Doing"), (ColumnRole::InProgress, "Ready")])
+        );
+        remap(&mut mapping, ColumnRole::Research, "Ready");
+        assert_eq!(
+            mapping,
+            names(&[(ColumnRole::Ready, "Doing"), (ColumnRole::Research, "Ready")]),
+            "a role that had no column leaves the other role without one"
+        );
+        remap(&mut mapping, ColumnRole::Research, "Ready");
+        assert_eq!(mapping.len(), 2);
     }
 
     #[test]
