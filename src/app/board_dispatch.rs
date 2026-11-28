@@ -73,7 +73,7 @@ pub(crate) use drawer::{ItemDrawer, Mark, Needs};
 pub(crate) use turns::{DispatchCount, TurnLabel};
 use crate::dialogs::confirm::ConfirmSpec;
 use crate::dialogs::new_worktree::sanitize_branch_to_folder;
-use crate::notifications::NotificationKind;
+use crate::notifications::{NotificationKind, NotificationTarget};
 
 const REMOTES_MAX_AGE: Duration = Duration::from_secs(300);
 const VIEWER_MAX_AGE: Duration = Duration::from_secs(300);
@@ -131,6 +131,8 @@ pub(crate) struct DispatchState {
     cleanups: HashMap<String, cleanup::Cleanup>,
     /// Item id → how long its session has been mid-turn with nothing new.
     stalls: HashMap<String, Stall>,
+    /// Item id → the move whose choice the bell rang for.
+    choices_rung: HashMap<String, String>,
 }
 
 /// What the board poll knows about the pull request of an implementation or review round, and
@@ -1531,6 +1533,7 @@ impl AppShell {
         let mut seen = HashSet::new();
         let mut decided = HashSet::new();
         let mut starts = Vec::new();
+        let mut choices = Vec::new();
         let state = &self.board.dispatch;
         for settings in &self.settings.boards {
             let Some(read) = self.board.reads_by_url.get(&settings.url) else {
@@ -1592,6 +1595,18 @@ impl AppShell {
                 match decision {
                     None => {}
                     Some(Err(hold)) => {
+                        if hold.needs_choice()
+                            && let Some(change) = change
+                        {
+                            choices.push(Choice {
+                                board_url: settings.url.clone(),
+                                item_id: item.id.clone(),
+                                number: item.number,
+                                title: item.title.clone(),
+                                hold: hold.clone(),
+                                moved_at: change.created_at.clone(),
+                            });
+                        }
                         holds.insert(item.id.clone(), hold);
                     }
                     Some(Ok(round)) => {
@@ -1629,8 +1644,18 @@ impl AppShell {
         state.holds.retain(|id, _| !seen.contains(id));
         state.holds.extend(holds);
         state.failed.retain(|id, _| decided.contains(id) || !seen.contains(id));
+        let choices = new_choices(&mut state.choices_rung, choices, &seen);
         for start in starts {
             self.start_dispatch(start, &viewer, window, cx);
+        }
+        for choice in choices {
+            let (title, detail) = choice_bell(&choice);
+            let card = NotificationTarget::BoardItem {
+                board_url: choice.board_url,
+                item_id: choice.item_id,
+            };
+            let kind = NotificationKind::SessionWaiting;
+            self.ring_away(Attention::NeedsYou, kind, title, detail, Some(card), cx);
         }
     }
 
@@ -2235,12 +2260,12 @@ impl AppShell {
         sessions.next()
     }
 
-    fn tab_title_at(&self, path: &Path, agent: Option<&str>) -> Option<SharedString> {
+    fn bell_target_at(&self, path: &Path, agent: Option<&str>) -> Option<NotificationTarget> {
         let tabs = self.tabs_on(path);
         let own = tabs
             .iter()
             .find(|tab| !runs_another_agent(tab.agent_profile_id.as_deref(), agent));
-        own.or(tabs.first()).map(|tab| tab.title.clone())
+        own.or(tabs.first()).map(|tab| NotificationTarget::Tab(tab.title.clone()))
     }
 
     fn round_tab_at(&self, path: &Path, agent: Option<&str>) -> Option<(usize, usize)> {
@@ -2323,9 +2348,9 @@ impl AppShell {
             Remind::Notice => {
                 let Notice { title, detail } = notice;
                 self.push_toast(ToastKind::Err, title.clone(), Some(detail.clone().into()), cx);
-                let tab_title = self.tab_title_at(path, agent);
+                let bell_target = self.bell_target_at(path, agent);
                 let kind = NotificationKind::SessionWaiting;
-                self.ring_away(Attention::NeedsYou, kind, title, detail, tab_title, cx);
+                self.ring_away(Attention::NeedsYou, kind, title, detail, bell_target, cx);
             }
             Remind::Nothing => {}
         }
@@ -2460,9 +2485,9 @@ impl AppShell {
             ToastKind::Ok
         };
         self.push_toast(kind, title.clone(), Some(detail.clone().into()), cx);
-        let tab_title = self.tab_title_at(&path, record.agent.as_deref());
+        let bell_target = self.bell_target_at(&path, record.agent.as_deref());
         let kind = NotificationKind::SessionReady;
-        self.ring_away(Attention::Findings, kind, title, detail, tab_title, cx);
+        self.ring_away(Attention::Findings, kind, title, detail, bell_target, cx);
         cx.notify();
     }
 
@@ -2537,7 +2562,7 @@ impl AppShell {
             if !stall.ring(now) {
                 continue;
             }
-            let tab_title = self.tab_title_at(&path, agent);
+            let bell_target = self.bell_target_at(&path, agent);
             self.ring_away(
                 Attention::MayBeWaiting,
                 NotificationKind::SessionWaiting,
@@ -2547,7 +2572,7 @@ impl AppShell {
                      prompt.",
                     record.title
                 ),
-                tab_title,
+                bell_target,
                 cx,
             );
         }
@@ -2561,7 +2586,7 @@ impl AppShell {
         kind: NotificationKind,
         title: impl Into<SharedString>,
         detail: impl Into<SharedString>,
-        tab_title: Option<SharedString>,
+        bell_target: Option<NotificationTarget>,
         cx: &mut Context<Self>,
     ) {
         if !self.settings.notify.wants(attention) {
@@ -2576,7 +2601,7 @@ impl AppShell {
                 })
                 .detach();
         }
-        self.push_notification(kind, title, detail, tab_title, cx);
+        self.push_notification(kind, title, detail, bell_target, cx);
     }
 
     /// Watch the pull request of every implementation and review round, and of research on an
@@ -2654,13 +2679,13 @@ impl AppShell {
                 self.move_to_in_review(&record, cx);
             }
             if ring {
-                let tab_title = self.tab_title_at(&path, record.agent.as_deref());
+                let bell_target = self.bell_target_at(&path, record.agent.as_deref());
                 self.ring_away(
                     Attention::NeedsYou,
                     NotificationKind::SessionWaiting,
                     format!("#{} waits for you", record.number),
                     "Implementation stopped without a pull request.",
-                    tab_title,
+                    bell_target,
                     cx,
                 );
             }
@@ -2814,13 +2839,13 @@ impl AppShell {
                 let ring = stop.is_some() && watch.review_stop() == stop && watch.rang_for != stop;
                 if ring {
                     watch.rang_for = stop;
-                    let tab_title = self.tab_title_at(&path, record.agent.as_deref());
+                    let bell_target = self.bell_target_at(&path, record.agent.as_deref());
                     self.ring_away(
                         Attention::NeedsYou,
                         NotificationKind::SessionWaiting,
                         format!("#{} waits for you", record.number),
                         "Review stopped without a push or a reply.",
-                        tab_title,
+                        bell_target,
                         cx,
                     );
                 }
@@ -3001,11 +3026,11 @@ impl AppShell {
             )
         };
         self.push_toast(toast, title.clone(), Some(detail.clone().into()), cx);
-        let tab_title = self.tab_title_at(path, record.agent.as_deref());
+        let bell_target = self.bell_target_at(path, record.agent.as_deref());
         if pr.is_draft {
-            self.ring_away(Attention::NeedsYou, kind, title, detail, tab_title, cx);
+            self.ring_away(Attention::NeedsYou, kind, title, detail, bell_target, cx);
         } else {
-            self.push_notification(kind, title, detail, tab_title, cx);
+            self.push_notification(kind, title, detail, bell_target, cx);
         }
         cx.notify();
     }
@@ -3684,7 +3709,7 @@ impl AppShell {
         note: Option<ForwardNote>,
         cx: &mut Context<Self>,
     ) {
-        let tab_title = self.tab_title_at(path, record.agent.as_deref());
+        let bell_target = self.bell_target_at(path, record.agent.as_deref());
         let Some(watch) = self.board.dispatch.watches.get_mut(&record.item_id) else {
             return;
         };
@@ -3709,7 +3734,7 @@ impl AppShell {
             NotificationKind::SessionWaiting,
             format!("#{} waits for you", record.number),
             detail,
-            tab_title,
+            bell_target,
             cx,
         );
     }
@@ -3874,7 +3899,7 @@ impl AppShell {
         note: Option<RepairNote>,
         cx: &mut Context<Self>,
     ) {
-        let tab_title = self.tab_title_at(path, record.agent.as_deref());
+        let bell_target = self.bell_target_at(path, record.agent.as_deref());
         let Some(watch) = self.board.dispatch.watches.get_mut(&record.item_id) else {
             return;
         };
@@ -3898,7 +3923,7 @@ impl AppShell {
             NotificationKind::SessionWaiting,
             format!("#{} waits for you", record.number),
             detail,
-            tab_title,
+            bell_target,
             cx,
         );
     }
@@ -4270,6 +4295,50 @@ fn waiting_note(stall: Option<&Stall>, now: Instant) -> Option<CardNote> {
     Some(CardNote::new(text, NoteTone::NeedsYou))
 }
 
+/// An item a board read found waiting for a choice of the user's.
+struct Choice {
+    board_url: String,
+    item_id: String,
+    number: Option<u32>,
+    title: String,
+    hold: Hold,
+    /// When the move into its trigger column was made.
+    moved_at: String,
+}
+
+/// The choices the bell hasn't rung for yet: once per move. `rung` forgets the items no board
+/// shows any more.
+fn new_choices(
+    rung: &mut HashMap<String, String>,
+    choices: Vec<Choice>,
+    on_a_board: &HashSet<String>,
+) -> Vec<Choice> {
+    rung.retain(|item_id, _| on_a_board.contains(item_id));
+    choices
+        .into_iter()
+        .filter(|choice| {
+            let before = rung.insert(choice.item_id.clone(), choice.moved_at.clone());
+            before.as_deref() != Some(choice.moved_at.as_str())
+        })
+        .collect()
+}
+
+/// The bell's title and line for an item that waits for a choice of the user's.
+fn choice_bell(choice: &Choice) -> (String, String) {
+    let ask = match &choice.hold {
+        Hold::SeveralProjects(repository) => {
+            format!("Several projects have {repository} as a remote: pick the one that works on it")
+        }
+        Hold::FromFork => "From a fork: look at what its branch changes, then start it".into(),
+        hold => hold.label(),
+    };
+    let title = match choice.number {
+        Some(number) => format!("#{number} waits for you"),
+        None => "An item waits for you".into(),
+    };
+    (title, format!("{}. {ask}.", choice.title))
+}
+
 /// The card line of an item that waits.
 fn hold_note(hold: &Hold) -> CardNote {
     match hold {
@@ -4469,6 +4538,35 @@ fn pull_request_note(
 mod tests {
     use super::*;
     use codescope_core::board::findings::DecisionOption;
+
+    #[test]
+    fn a_choice_rings_once_per_move_and_says_what_to_choose() {
+        let choice = |moved_at: &str| Choice {
+            board_url: "https://github.com/users/octo/projects/1".into(),
+            item_id: "PVTI_1".into(),
+            number: Some(7),
+            title: "Add dark mode".into(),
+            hold: Hold::SeveralProjects("acme/web".into()),
+            moved_at: moved_at.into(),
+        };
+        let on_a_board = HashSet::from(["PVTI_1".to_string()]);
+        let mut rung = HashMap::new();
+
+        let first = new_choices(&mut rung, vec![choice("t1")], &on_a_board);
+        assert_eq!(first.len(), 1);
+        let (title, detail) = choice_bell(&first[0]);
+        assert_eq!(title, "#7 waits for you");
+        assert_eq!(
+            detail,
+            "Add dark mode. Several projects have acme/web as a remote: pick the one that works \
+             on it."
+        );
+        assert!(new_choices(&mut rung, vec![choice("t1")], &on_a_board).is_empty(), "next read");
+        assert_eq!(new_choices(&mut rung, vec![choice("t2")], &on_a_board).len(), 1, "moved again");
+
+        new_choices(&mut rung, Vec::new(), &HashSet::new());
+        assert!(rung.is_empty(), "taken off the board");
+    }
 
     fn tab(running: Option<&[u32]>, claude_idle: Option<bool>, typed: bool) -> TabAtHandover {
         tab_at_handover(&TabProbe {

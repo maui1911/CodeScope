@@ -298,6 +298,12 @@ impl Hold {
         )
     }
 
+    /// Whether a choice of the user's is all that keeps the round from starting: which project,
+    /// or starting a fork's pull request.
+    pub fn needs_choice(&self) -> bool {
+        matches!(self, Hold::SeveralProjects(_) | Hold::FromFork)
+    }
+
     /// One line for the item's card.
     pub fn label(&self) -> String {
         match self {
@@ -2427,6 +2433,20 @@ mod tests {
         assert!(later.iter().all(Hold::starts_later));
         let never = [Hold::Closed, Hold::Handled, Hold::NoMove, Hold::MovedByOther("octo".into())];
         assert!(!never.iter().any(Hold::starts_later));
+    }
+
+    #[test]
+    fn only_a_choice_of_the_user_s_is_all_that_holds_a_round_that_needs_them() {
+        let choices = [Hold::SeveralProjects("acme/web".into()), Hold::FromFork];
+        assert!(choices.iter().all(Hold::needs_choice));
+        let others = [
+            Hold::NoProject("acme/web".into()),
+            Hold::LimitReached(3),
+            Hold::OtherProgram,
+            Hold::MovedByOther("octo".into()),
+            Hold::NoProgressColumn(ColumnRole::Researching),
+        ];
+        assert!(!others.iter().any(Hold::needs_choice));
     }
 
     #[test]

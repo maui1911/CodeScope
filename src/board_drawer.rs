@@ -29,6 +29,20 @@ impl AppShell {
         cx.notify();
     }
 
+    /// Show the board at `board_url` with the drawer of `item_id` open, as a bell entry does.
+    pub(crate) fn open_board_item(
+        &mut self,
+        board_url: String,
+        item_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_show_board(true, cx);
+        if self.settings.boards.iter().any(|board| board.url == board_url) {
+            self.board.selected_url = Some(board_url);
+            self.select_board_item(item_id, cx);
+        }
+    }
+
     pub(crate) fn close_item_drawer(&mut self, cx: &mut Context<Self>) {
         self.board.details = None;
         if self.board.drawer.take().is_some() {

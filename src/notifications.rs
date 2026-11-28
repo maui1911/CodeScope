@@ -46,6 +46,15 @@ pub enum NotificationKind {
     UpdateAvailable,
 }
 
+/// Where clicking an entry takes the user.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotificationTarget {
+    /// The tab with this title.
+    Tab(SharedString),
+    /// The card of item `item_id` on the board at `board_url`, with its drawer open.
+    BoardItem { board_url: String, item_id: String },
+}
+
 /// One entry in the ring buffer.  Mutable only for the `read` flag
 /// (mark_read / mark_all_read).
 #[derive(Clone, Debug)]
@@ -54,8 +63,8 @@ pub struct NotificationEntry {
     pub kind: NotificationKind,
     pub title: SharedString,
     pub detail: SharedString,
-    /// `None` when the notification is not tied to a specific session.
-    pub session_title: Option<SharedString>,
+    /// `None` when the notification leads nowhere.
+    pub target: Option<NotificationTarget>,
     /// UTC seconds since the Unix epoch — formatted as "HH:mm" by
     /// `format_hhmm`.  Matches the `Timestamp` column in the BellPopup XAML.
     pub timestamp: u64,
@@ -68,7 +77,7 @@ impl NotificationEntry {
         kind: NotificationKind,
         title: impl Into<SharedString>,
         detail: impl Into<SharedString>,
-        session_title: Option<SharedString>,
+        target: Option<NotificationTarget>,
     ) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -79,7 +88,7 @@ impl NotificationEntry {
             kind,
             title: title.into(),
             detail: detail.into(),
-            session_title,
+            target,
             timestamp,
             read: false,
         }
@@ -221,9 +230,9 @@ impl Notifications {
         kind: NotificationKind,
         title: impl Into<SharedString>,
         detail: impl Into<SharedString>,
-        session_title: Option<SharedString>,
+        target: Option<NotificationTarget>,
     ) -> u64 {
-        let entry = NotificationEntry::new(kind, title, detail, session_title);
+        let entry = NotificationEntry::new(kind, title, detail, target);
         let id = entry.id;
         self.entries.insert(0, entry);
         if self.entries.len() > MAX_ENTRIES {
@@ -238,12 +247,12 @@ impl Notifications {
         self.is_open = false;
     }
 
-    /// Mark the entry read and return its `session_title` so the caller
-    /// (`AppShell`) can jump to that tab.
-    pub fn activate(&mut self, id: u64) -> Option<SharedString> {
+    /// Mark the entry read and return its target so the caller
+    /// (`AppShell`) can go there.
+    pub fn activate(&mut self, id: u64) -> Option<NotificationTarget> {
         let entry = self.entries.iter_mut().find(|e| e.id == id)?;
         entry.read = true;
-        entry.session_title.clone()
+        entry.target.clone()
     }
 }
 
@@ -332,17 +341,19 @@ mod tests {
     }
 
     #[test]
-    fn activate_marks_read_and_returns_session_title() {
+    fn activate_marks_read_and_returns_where_the_entry_leads() {
         let mut n = Notifications::new();
-        let id = n.push(
-            NotificationKind::SessionReady,
-            "t",
-            "d",
-            Some("my-session".into()),
-        );
-        let title = n.activate(id);
-        assert_eq!(title, Some(SharedString::from("my-session")));
+        let tab = NotificationTarget::Tab("my-session".into());
+        let id = n.push(NotificationKind::SessionReady, "t", "d", Some(tab.clone()));
+        assert_eq!(n.activate(id), Some(tab));
         assert!(n.entries()[0].read);
+
+        let card = NotificationTarget::BoardItem {
+            board_url: "https://github.com/users/octo/projects/1".into(),
+            item_id: "PVTI_1".into(),
+        };
+        let id = n.push(NotificationKind::SessionWaiting, "#7 waits", "d", Some(card.clone()));
+        assert_eq!(n.activate(id), Some(card));
     }
 
     #[test]
