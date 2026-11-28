@@ -2325,7 +2325,7 @@ impl AppShell {
                 self.push_toast(ToastKind::Err, title.clone(), Some(detail.clone().into()), cx);
                 let tab_title = self.tab_title_at(path, agent);
                 let kind = NotificationKind::SessionWaiting;
-                self.push_notification(kind, title, detail, tab_title, cx);
+                self.ring_away(kind, title, detail, tab_title, cx);
             }
             Remind::Nothing => {}
         }
@@ -2461,7 +2461,7 @@ impl AppShell {
         };
         self.push_toast(kind, title.clone(), Some(detail.clone().into()), cx);
         let tab_title = self.tab_title_at(&path, record.agent.as_deref());
-        self.push_notification(NotificationKind::SessionReady, title, detail, tab_title, cx);
+        self.ring_away(NotificationKind::SessionReady, title, detail, tab_title, cx);
         cx.notify();
     }
 
@@ -2649,7 +2649,7 @@ impl AppShell {
             }
             if ring {
                 let tab_title = self.tab_title_at(&path, record.agent.as_deref());
-                self.push_notification(
+                self.ring_away(
                     NotificationKind::SessionWaiting,
                     format!("#{} waits for you", record.number),
                     "Implementation stopped without a pull request.",
@@ -2808,7 +2808,7 @@ impl AppShell {
                 if ring {
                     watch.rang_for = stop;
                     let tab_title = self.tab_title_at(&path, record.agent.as_deref());
-                    self.push_notification(
+                    self.ring_away(
                         NotificationKind::SessionWaiting,
                         format!("#{} waits for you", record.number),
                         "Review stopped without a push or a reply.",
@@ -3692,7 +3692,7 @@ impl AppShell {
             "Its session stopped without a push or a reply after {} commented.",
             named(&names)
         );
-        self.push_notification(
+        self.ring_away(
             NotificationKind::SessionWaiting,
             format!("#{} waits for you", record.number),
             detail,
@@ -3880,7 +3880,7 @@ impl AppShell {
             return;
         };
         watch.repair_rang = Some(rang_for);
-        self.push_notification(
+        self.ring_away(
             NotificationKind::SessionWaiting,
             format!("#{} waits for you", record.number),
             detail,
