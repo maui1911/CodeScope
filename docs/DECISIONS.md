@@ -395,8 +395,12 @@ idiom mirrors the in-app modals (`new_project_dialog.rs`,
 - The Rust port ships `src/settings_dialog.rs` with no C# counterpart.
 - The dialog has a page per section, picked in a left column, after the
   *Settings* design of ADR-0027: *Appearance* (theme, font, scrollback,
-  cursor) and *Agents* (default agent). A section appears once it has a
-  setting, so the design's *General* and *Updates* aren't there yet.
+  cursor), *Agents* (default agent) and *Boards* (how `gh` is signed in,
+  each board with *Map columns* and *Remove*, the dispatch limit, and
+  which board events notify). A section appears once it has a setting,
+  so the design's *General* and *Updates* aren't there yet. The design's
+  *Project for draft issues* is left out: a draft issue is not
+  dispatched (ADR-0027), so there is nothing for it to pick.
 - Saves go through [`Settings::update`]: the dialog writes its own fields
   onto the file as it is at Save, so a board added, mapped or removed
   while the dialog is open stays. `apply_settings` is also called inline
@@ -409,9 +413,10 @@ idiom mirrors the in-app modals (`new_project_dialog.rs`,
   newly-spawned tabs (running terminals keep their baked-in palette /
   scrollback); the dialog surfaces a small "Applies to new tabs only."
   hint to make this explicit.
-- No new schema fields — anything not yet representable in `Settings`
-  (e.g. per-theme overrides for an external theme bundle) stays out of
-  reach of the dialog until the underlying struct grows the capability.
+- The dialog edits what `Settings` holds; a page grows only when the
+  struct does (`notify` came with the *Boards* page). Anything not yet
+  representable (e.g. per-theme overrides for an external theme bundle)
+  stays out of reach until then.
 
 ---
 
@@ -1152,7 +1157,8 @@ board, each with their own CodeScope or another tool that follows the
   toast (`idle_notifier`) and an entry in the in-app bell fire when
   findings are ready, when a dispatch *needs you*, and when a session
   may be waiting on the user: mid-turn for over three minutes without
-  its transcript growing. `notify_rust` cannot route a click on a
+  its transcript growing. Each of the three can be turned off in
+  *Settings → Boards* (`notify`). `notify_rust` cannot route a click on a
   Windows toast, so the bell entry is what opens the tab. Claude Code
   writes a question or a permission prompt to its transcript only once
   it is answered, so while it waits the session reads as busy, not as

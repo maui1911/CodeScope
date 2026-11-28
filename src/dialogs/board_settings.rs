@@ -64,12 +64,17 @@ pub struct RepositoryPick {
 }
 
 impl AppShell {
-    /// Open the dialog for the board the panel shows, once it has been read.
-    pub fn open_board_settings_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Open the dialog for the board at `url`, once it has been read.
+    pub fn open_board_settings_dialog(
+        &mut self,
+        url: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.board_settings_dialog.is_some() {
             return;
         }
-        let Some(settings) = self.selected_board().cloned() else {
+        let Some(settings) = self.settings.boards.iter().find(|b| b.url == url).cloned() else {
             return;
         };
         let Some(read) = self.board.reads_by_url.get(&settings.url) else {

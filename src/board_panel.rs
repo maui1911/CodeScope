@@ -31,7 +31,7 @@ use crate::app::board_dispatch::{
 use crate::dialogs::confirm::ConfirmSpec;
 use crate::theme;
 
-const BOARD_READ_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) const BOARD_READ_INTERVAL: Duration = Duration::from_secs(30);
 const MOVE_BACK_SHOWN_WITHIN: Duration = Duration::from_secs(60);
 const READ_AGE_REFRESH: Duration = Duration::from_secs(5);
 const DONE_PREVIEW: usize = 5;
@@ -91,7 +91,7 @@ pub(crate) struct BoardRead {
     pub workflows_read_at: Option<Instant>,
 }
 
-fn read_age(read_at: Option<Instant>) -> SharedString {
+pub(crate) fn read_age(read_at: Option<Instant>) -> SharedString {
     let Some(at) = read_at else {
         return "not read yet".into();
     };
@@ -123,7 +123,7 @@ fn keep_moves_back(board: &mut Board, moved_back: &mut HashMap<String, MoveBack>
     });
 }
 
-fn board_label(settings: &BoardSettings, read: Option<&BoardRead>) -> SharedString {
+pub(crate) fn board_label(settings: &BoardSettings, read: Option<&BoardRead>) -> SharedString {
     if let Some(board) = read.and_then(|r| r.last_good.as_ref()) {
         return board.title.clone().into();
     }
@@ -344,7 +344,12 @@ impl AppShell {
         cx.notify();
     }
 
-    fn remove_board(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn remove_board(
+        &mut self,
+        url: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let spec = ConfirmSpec::destructive(
             "Remove this board?",
             "CodeScope stops reading it. Nothing changes on GitHub.",
@@ -631,7 +636,11 @@ impl AppShell {
             .when(has_read, |s| {
                 s.child(text_button("board-settings", "Board settings", accent).on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, _, window, cx| this.open_board_settings_dialog(window, cx)),
+                    cx.listener(|this, _, window, cx| {
+                        if let Some(url) = this.selected_board().map(|b| b.url.clone()) {
+                            this.open_board_settings_dialog(&url, window, cx);
+                        }
+                    }),
                 ))
             })
             .children(board_url.map(|url| {

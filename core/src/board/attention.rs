@@ -10,6 +10,23 @@ use crate::telemetry::{SessionState, TelemetrySnapshot};
 /// How long a session goes mid-turn without anything new before it may be waiting.
 pub const MAY_BE_WAITING_AFTER: Duration = Duration::from_secs(3 * 60);
 
+/// What a board event that rings for the user is about; each can be turned off in Settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attention {
+    /// A research round posted its findings.
+    Findings,
+    /// A dispatch can't go on without the user.
+    NeedsYou,
+    /// A dispatched session went [`MAY_BE_WAITING_AFTER`] mid-turn with nothing new.
+    MayBeWaiting,
+}
+
+impl Attention {
+    /// Every kind, in the order Settings lists them.
+    pub const ALL: [Attention; 3] =
+        [Attention::Findings, Attention::NeedsYou, Attention::MayBeWaiting];
+}
+
 /// One session's time mid-turn with nothing new, as its snapshots show it over time.
 #[derive(Debug, Default)]
 pub struct Stall {
@@ -62,6 +79,13 @@ fn mid_turn(snapshot: &TelemetrySnapshot) -> Option<TelemetrySnapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_kind_of_attention_is_listed_once() {
+        let all = Attention::ALL;
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().enumerate().all(|(i, a)| !all[..i].contains(a)));
+    }
 
     fn snapshot(state: SessionState, tokens_used: u64) -> TelemetrySnapshot {
         TelemetrySnapshot {

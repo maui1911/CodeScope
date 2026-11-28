@@ -148,6 +148,62 @@ pub fn gh_api() -> std::process::Command {
     command
 }
 
+/// How `gh` is signed in to github.com, as `gh auth status` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GhSignIn {
+    /// Signed in as `login`; `scopes` is empty when the token doesn't list them, as a
+    /// fine-grained token doesn't.
+    Active { login: String, scopes: Vec<String> },
+    /// The active account's token doesn't work.
+    BadToken,
+    /// No account is signed in to github.com.
+    SignedOut,
+}
+
+/// Ask `gh auth status` how it is signed in to github.com; `None` when this `gh` can't say so
+/// as JSON. It checks the token with GitHub, so it takes a moment.
+pub fn fetch_sign_in() -> Option<GhSignIn> {
+    let output = no_window_command("gh")
+        .args(["auth", "status", "--hostname", "github.com", "--json", "hosts"])
+        .output()
+        .ok()?;
+    parse_sign_in(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Read the active github.com account out of `gh auth status --json hosts`.
+pub fn parse_sign_in(json: &str) -> Option<GhSignIn> {
+    #[derive(Deserialize)]
+    struct Status {
+        hosts: HashMap<String, Vec<Account>>,
+    }
+    #[derive(Deserialize)]
+    struct Account {
+        state: String,
+        #[serde(default)]
+        active: bool,
+        #[serde(default)]
+        login: String,
+        #[serde(default)]
+        scopes: String,
+    }
+    let status: Status = serde_json::from_str(json).ok()?;
+    let accounts = status.hosts.get("github.com");
+    let Some(account) = accounts.and_then(|a| a.iter().find(|a| a.active).or(a.first())) else {
+        return Some(GhSignIn::SignedOut);
+    };
+    if account.state != "success" {
+        return Some(GhSignIn::BadToken);
+    }
+    let scopes = account
+        .scopes
+        .split(',')
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .map(String::from)
+        .collect();
+    Some(GhSignIn::Active { login: account.login.clone(), scopes })
+}
+
 /// The signed-in `gh` user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Viewer {
@@ -1737,6 +1793,35 @@ struct Repository {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_active_github_account_says_who_is_signed_in_and_with_which_scopes() {
+        let json = r#"{"hosts":{"github.com":[
+            {"state":"success","active":true,"host":"github.com","login":"maui1911",
+             "tokenSource":"keyring","scopes":"gist, project, read:org, repo",
+             "gitProtocol":"https"}]}}"#;
+        let signed_in = GhSignIn::Active {
+            login: "maui1911".into(),
+            scopes: vec!["gist".into(), "project".into(), "read:org".into(), "repo".into()],
+        };
+        assert_eq!(parse_sign_in(json), Some(signed_in));
+
+        let fine_grained = r#"{"hosts":{"github.com":[
+            {"state":"success","active":true,"login":"maui1911","tokenSource":"GH_TOKEN"}]}}"#;
+        let no_scopes = GhSignIn::Active { login: "maui1911".into(), scopes: Vec::new() };
+        assert_eq!(parse_sign_in(fine_grained), Some(no_scopes));
+    }
+
+    #[test]
+    fn a_failing_token_or_no_account_is_not_signed_in() {
+        let bad = r#"{"hosts":{"github.com":[
+            {"state":"error","error":"401 Bad credentials","active":true,"login":"",
+             "tokenSource":"GH_TOKEN"},
+            {"state":"success","active":false,"login":"maui1911","scopes":"project"}]}}"#;
+        assert_eq!(parse_sign_in(bad), Some(GhSignIn::BadToken));
+        assert_eq!(parse_sign_in(r#"{"hosts":{}}"#), Some(GhSignIn::SignedOut));
+        assert_eq!(parse_sign_in(""), None, "a gh without --json prints nothing on stdout");
+    }
 
     const PAGE: &str = r#"{"data":{"user":{"projectV2":{
       "id":"PVT_1","title":"CodeScope","url":"https://github.com/users/maui1911/projects/3",

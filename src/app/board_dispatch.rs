@@ -23,7 +23,7 @@ use codescope_core::board::dispatch::{
     projects_for_repository, remote_branch_tip, set_fork_push, start_still_wanted, task_file,
     task_message, track_remote_branch, tracks_same_name, trigger_content_ids, write_task_file,
 };
-use codescope_core::board::attention::Stall;
+use codescope_core::board::attention::{Attention, Stall};
 use codescope_core::board::answers::{
     Answer, Comment, after_findings, answer_body, answers_section, choices_text, chosen,
     find_answers,
@@ -2325,7 +2325,7 @@ impl AppShell {
                 self.push_toast(ToastKind::Err, title.clone(), Some(detail.clone().into()), cx);
                 let tab_title = self.tab_title_at(path, agent);
                 let kind = NotificationKind::SessionWaiting;
-                self.ring_away(kind, title, detail, tab_title, cx);
+                self.ring_away(Attention::NeedsYou, kind, title, detail, tab_title, cx);
             }
             Remind::Nothing => {}
         }
@@ -2461,7 +2461,8 @@ impl AppShell {
         };
         self.push_toast(kind, title.clone(), Some(detail.clone().into()), cx);
         let tab_title = self.tab_title_at(&path, record.agent.as_deref());
-        self.ring_away(NotificationKind::SessionReady, title, detail, tab_title, cx);
+        let kind = NotificationKind::SessionReady;
+        self.ring_away(Attention::Findings, kind, title, detail, tab_title, cx);
         cx.notify();
     }
 
@@ -2538,6 +2539,7 @@ impl AppShell {
             }
             let tab_title = self.tab_title_at(&path, agent);
             self.ring_away(
+                Attention::MayBeWaiting,
                 NotificationKind::SessionWaiting,
                 format!("#{} may be waiting for you", record.number),
                 format!(
@@ -2551,16 +2553,20 @@ impl AppShell {
         }
     }
 
-    /// Ring the bell, and show an OS toast too while CodeScope isn't the active window. Only the
-    /// bell entry opens the tab.
+    /// Ring the bell, and show an OS toast too while CodeScope isn't the active window, unless
+    /// the user turned off notifying about `attention`. Only the bell entry opens the tab.
     fn ring_away(
         &mut self,
+        attention: Attention,
         kind: NotificationKind,
         title: impl Into<SharedString>,
         detail: impl Into<SharedString>,
         tab_title: Option<SharedString>,
         cx: &mut Context<Self>,
     ) {
+        if !self.settings.notify.wants(attention) {
+            return;
+        }
         let (title, detail) = (title.into(), detail.into());
         if !self.window_active_cached {
             let (toast_title, toast_detail) = (title.clone(), detail.clone());
@@ -2650,6 +2656,7 @@ impl AppShell {
             if ring {
                 let tab_title = self.tab_title_at(&path, record.agent.as_deref());
                 self.ring_away(
+                    Attention::NeedsYou,
                     NotificationKind::SessionWaiting,
                     format!("#{} waits for you", record.number),
                     "Implementation stopped without a pull request.",
@@ -2809,6 +2816,7 @@ impl AppShell {
                     watch.rang_for = stop;
                     let tab_title = self.tab_title_at(&path, record.agent.as_deref());
                     self.ring_away(
+                        Attention::NeedsYou,
                         NotificationKind::SessionWaiting,
                         format!("#{} waits for you", record.number),
                         "Review stopped without a push or a reply.",
@@ -2994,7 +3002,11 @@ impl AppShell {
         };
         self.push_toast(toast, title.clone(), Some(detail.clone().into()), cx);
         let tab_title = self.tab_title_at(path, record.agent.as_deref());
-        self.push_notification(kind, title, detail, tab_title, cx);
+        if pr.is_draft {
+            self.ring_away(Attention::NeedsYou, kind, title, detail, tab_title, cx);
+        } else {
+            self.push_notification(kind, title, detail, tab_title, cx);
+        }
         cx.notify();
     }
 
@@ -3693,6 +3705,7 @@ impl AppShell {
             named(&names)
         );
         self.ring_away(
+            Attention::NeedsYou,
             NotificationKind::SessionWaiting,
             format!("#{} waits for you", record.number),
             detail,
@@ -3881,6 +3894,7 @@ impl AppShell {
         };
         watch.repair_rang = Some(rang_for);
         self.ring_away(
+            Attention::NeedsYou,
             NotificationKind::SessionWaiting,
             format!("#{} waits for you", record.number),
             detail,

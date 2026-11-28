@@ -6,8 +6,8 @@
 //!
 //! Conservative defaults: every field is optional in serde, so a
 //! half-written or empty `settings.json` still loads. Unknown keys at
-//! the root and on each board are kept through a save, so an older
-//! build doesn't drop what a newer one wrote.
+//! the root, on each board and under `notify` are kept through a save,
+//! so an older build doesn't drop what a newer one wrote.
 
 use std::path::Path;
 
@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent_registry::AgentProfile;
 use crate::board::BoardSettings;
+use crate::board::attention::Attention;
 use crate::paths::AppPaths;
 use crate::theme::builtin::DEFAULT_NAME;
 
@@ -75,6 +76,8 @@ pub struct Settings {
     /// How many of the user's dispatches run at once; more wait in their trigger column.
     #[serde(rename = "dispatchLimit")]
     pub dispatch_limit: usize,
+    /// Which board events ring the bell and show the OS toast.
+    pub notify: NotifySettings,
     /// Keys this build doesn't know, kept so a save doesn't drop what a newer build wrote.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -91,7 +94,51 @@ impl Default for Settings {
             agents: Vec::new(),
             boards: Vec::new(),
             dispatch_limit: crate::board::dispatch::DEFAULT_DISPATCH_LIMIT,
+            notify: NotifySettings::default(),
             extra: serde_json::Map::new(),
+        }
+    }
+}
+
+/// Which board events notify the user (ADR-0027); each is on unless turned off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct NotifySettings {
+    pub findings: bool,
+    pub needs_you: bool,
+    pub may_be_waiting: bool,
+    /// Keys this build doesn't know, kept so a save doesn't drop what a newer build wrote.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Default for NotifySettings {
+    fn default() -> Self {
+        Self {
+            findings: true,
+            needs_you: true,
+            may_be_waiting: true,
+            extra: serde_json::Map::new(),
+        }
+    }
+}
+
+impl NotifySettings {
+    /// Whether `attention` rings the bell and shows the toast.
+    pub fn wants(&self, attention: Attention) -> bool {
+        match attention {
+            Attention::Findings => self.findings,
+            Attention::NeedsYou => self.needs_you,
+            Attention::MayBeWaiting => self.may_be_waiting,
+        }
+    }
+
+    /// Turn notifying about `attention` on or off.
+    pub fn set(&mut self, attention: Attention, on: bool) {
+        match attention {
+            Attention::Findings => self.findings = on,
+            Attention::NeedsYou => self.needs_you = on,
+            Attention::MayBeWaiting => self.may_be_waiting = on,
         }
     }
 }
@@ -431,5 +478,32 @@ mod tests {
         assert_eq!(loaded.cursor.shape, CursorShape::Underline);
         assert!(!loaded.cursor.blinking);
         assert_eq!(loaded.default_agent, "codex");
+    }
+
+    #[test]
+    fn every_board_event_notifies_unless_turned_off() {
+        use crate::board::attention::Attention;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{}").unwrap();
+        let notify = Settings::load_from(&path).unwrap().notify;
+        assert!(Attention::ALL.into_iter().all(|a| notify.wants(a)));
+
+        std::fs::write(&path, r#"{"notify": {"mayBeWaiting": false, "later": 1}}"#).unwrap();
+        let mut settings = Settings::load_from(&path).unwrap();
+        assert!(settings.notify.wants(Attention::Findings));
+        assert!(settings.notify.wants(Attention::NeedsYou));
+        assert!(!settings.notify.wants(Attention::MayBeWaiting));
+
+        settings.notify.set(Attention::Findings, false);
+        settings.save_to(&path).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved["notify"],
+            serde_json::json!({
+                "findings": false, "needsYou": true, "mayBeWaiting": false, "later": 1
+            })
+        );
     }
 }
