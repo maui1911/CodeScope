@@ -410,6 +410,12 @@ fn needs(action: CardAction, kind: ItemKind, facts: Facts, note: &str) -> Needs 
              once you say so."
                 .to_string(),
         ),
+        (CardAction::CloneAndStart, _) => (
+            "Clone it first".to_string(),
+            note.to_string(),
+            "Clone and start adds the clone as a project; the round then starts on its own."
+                .to_string(),
+        ),
         (CardAction::PickProject, _) => (
             "Which project?".to_string(),
             note.to_string(),
@@ -668,6 +674,9 @@ mod tests {
         let several = "Several projects have maui1911/CodeScope as a remote";
         let pick = needs(CardAction::PickProject, ItemKind::Issue, facts(None), several);
         assert_eq!((pick.title.as_str(), pick.text.as_str()), ("Which project?", several));
+        let none = "No project has maui1911/notes-sync as a remote";
+        let clone = needs(CardAction::CloneAndStart, ItemKind::Issue, facts(None), none);
+        assert_eq!((clone.title.as_str(), clone.text.as_str()), ("Clone it first", none));
     }
 
     #[test]

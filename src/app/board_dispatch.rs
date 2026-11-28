@@ -684,6 +684,7 @@ pub(crate) enum CardAction {
     ReadyForReview,
     StartFromFork,
     PickProject,
+    CloneAndStart,
 }
 
 impl CardAction {
@@ -693,6 +694,7 @@ impl CardAction {
             CardAction::Decide => "Decide",
             CardAction::ReadyForReview => "Ready for review",
             CardAction::StartFromFork | CardAction::PickProject => "Start…",
+            CardAction::CloneAndStart => "Clone and start",
         }
     }
 }
@@ -1359,6 +1361,11 @@ impl AppShell {
     /// The projects as the sidebar has them, which follows its own edits as well as this shell's.
     pub(crate) fn current_projects<'a>(&self, cx: &'a App) -> &'a ProjectsConfig {
         self.sidebar.read(cx).projects()
+    }
+
+    /// Add the folder at `path` as a project, at the bottom of the sidebar.
+    pub(crate) fn add_local_project(&mut self, path: String, cx: &mut Context<Self>) {
+        self.sidebar.update(cx, |sidebar, cx| sidebar.add_project(path, None, cx));
     }
 
     pub(crate) fn local_projects(&self, cx: &App) -> Vec<(String, String)> {
@@ -3290,6 +3297,7 @@ impl AppShell {
             CardAction::ReadyForReview => self.ready_for_review(item_id, cx),
             CardAction::StartFromFork => self.confirm_fork_start(item_id, window, cx),
             CardAction::PickProject => self.open_pick_project_dialog(item_id, window, cx),
+            CardAction::CloneAndStart => self.open_clone_start_dialog(item_id, window, cx),
         }
     }
 
@@ -4330,6 +4338,9 @@ fn choice_bell(choice: &Choice) -> (String, String) {
             format!("Several projects have {repository} as a remote: pick the one that works on it")
         }
         Hold::FromFork => "From a fork: look at what its branch changes, then start it".into(),
+        Hold::NoProject(repository) => {
+            format!("No project has {repository} as a remote: clone it to start")
+        }
         hold => hold.label(),
     };
     let title = match choice.number {
@@ -4348,6 +4359,10 @@ fn hold_note(hold: &Hold) -> CardNote {
         },
         Hold::SeveralProjects(_) => CardNote {
             action: Some(CardAction::PickProject),
+            ..CardNote::new(hold.label(), NoteTone::NeedsYou)
+        },
+        Hold::NoProject(_) => CardNote {
+            action: Some(CardAction::CloneAndStart),
             ..CardNote::new(hold.label(), NoteTone::NeedsYou)
         },
         _ => CardNote::new(hold.label(), NoteTone::Waiting),
@@ -5033,7 +5048,8 @@ mod tests {
         assert!(note.tone == NoteTone::NeedsYou);
         assert!(note.action == Some(CardAction::PickProject));
         let none = hold_note(&Hold::NoProject("maui1911/CodeScope".into()));
-        assert!(none.tone == NoteTone::Waiting && none.action.is_none());
+        assert!(none.tone == NoteTone::NeedsYou);
+        assert!(none.action == Some(CardAction::CloneAndStart));
     }
 
     #[test]
