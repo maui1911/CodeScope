@@ -1181,6 +1181,8 @@ pub struct AppShell {
     pub(crate) decide_dialog: Option<crate::dialogs::decide::DecideDialogState>,
     pub(crate) pick_project_dialog:
         Option<crate::dialogs::pick_project::PickProjectDialogState>,
+    pub(crate) board_settings_dialog:
+        Option<crate::dialogs::board_settings::BoardSettingsDialogState>,
     /// Monotonic sequence for diff-viewer background requests, so a
     /// stale `git diff` result can never clobber a newer one.
     pub(crate) diff_request_seq: u64,
@@ -1877,6 +1879,7 @@ impl AppShell {
             project_settings_dialog: None,
             decide_dialog: None,
             pick_project_dialog: None,
+            board_settings_dialog: None,
             diff_viewer: None,
             diff_request_seq: 0,
             settings_dialog: None,
@@ -8669,6 +8672,7 @@ impl Render for AppShell {
             .children(self.render_project_settings_dialog(window, &theme, cx))
             .children(self.render_decide_dialog(window, &theme, cx))
             .children(self.render_pick_project_dialog(window, &theme, cx))
+            .children(self.render_board_settings_dialog(window, &theme, cx))
             .children(self.render_confirm_dialog(window, &theme, cx))
     }
 }

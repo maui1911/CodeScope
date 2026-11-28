@@ -2,6 +2,7 @@
 //! dialog the [`crate::app::AppShell`] composes into its z-stack.
 
 pub mod add_board;
+pub mod board_settings;
 pub mod confirm;
 pub mod decide;
 pub mod new_project;
