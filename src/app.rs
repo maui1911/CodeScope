@@ -5443,6 +5443,7 @@ impl AppShell {
                                 .flex()
                                 .flex_col()
                                 .flex_grow()
+                                .min_w(px(0.0))
                                 .child(
                                     div()
                                         .text_size(px(12.0))
