@@ -427,7 +427,7 @@ impl AppShell {
         let notes = self.card_notes(&settings.url, cx);
         let turns = self.turn_labels(&settings.url);
         let need_you = self.need_you_items(&settings.url, &notes, &turns);
-        let count = self.dispatch_count(&settings.url, need_you.len(), cx);
+        let count = self.dispatch_count(&settings.url, need_you.len(), &turns, cx);
         let shown = match self.board.filter {
             BoardFilter::Mine => Some(self.my_items(&settings.url, cx)),
             BoardFilter::All => None,

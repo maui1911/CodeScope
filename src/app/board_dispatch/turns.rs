@@ -18,6 +18,8 @@ pub(crate) struct TurnLabel {
     pub text: SharedString,
     /// Set when it is the turn of the user, so the item needs them.
     pub yours: bool,
+    /// The login of the one other assignee whose agent has the turn.
+    pub teammate: Option<String>,
 }
 
 /// The user's dispatches, as the board header counts them.
@@ -29,15 +31,23 @@ pub(crate) struct DispatchCount {
     pub need_you: usize,
     /// Items on this board that wait until fewer dispatches run.
     pub waiting: usize,
+    /// Other people whose agent has the turn of an item on this board.
+    pub teammates: usize,
 }
 
 impl DispatchCount {
-    /// `2 of 3 running · 1 needs you · 1 waiting for a slot`, leaving out what is zero.
+    /// `Yours: 2 of 3 running · 1 needs you · 1 waiting for a slot · 2 teammates active`,
+    /// leaving out what is zero.
     pub(crate) fn text(&self) -> String {
-        let mut parts = vec![format!("{} of {} running", self.running, self.limit)];
+        let mut parts = vec![format!("Yours: {} of {} running", self.running, self.limit)];
         parts.extend(self.need_you_text());
         if self.waiting > 0 {
             parts.push(format!("{} waiting for a slot", self.waiting));
+        }
+        match self.teammates {
+            0 => {}
+            1 => parts.push("1 teammate active".to_string()),
+            n => parts.push(format!("{n} teammates active")),
         }
         parts.join(" · ")
     }
@@ -137,11 +147,12 @@ impl AppShell {
     }
 
     /// The user's dispatches, `need_you` of the items on the board at `board_url` that need them,
-    /// and how many wait for a slot there.
+    /// how many wait for a slot there, and the teammates whose agents its `turns` show working.
     pub(crate) fn dispatch_count(
         &self,
         board_url: &str,
         need_you: usize,
+        turns: &HashMap<String, TurnLabel>,
         cx: &App,
     ) -> DispatchCount {
         DispatchCount {
@@ -149,6 +160,7 @@ impl AppShell {
             limit: self.settings.dispatch_limit,
             need_you,
             waiting: self.waiting_for_a_slot(board_url),
+            teammates: teammates_active(turns).len(),
         }
     }
 
@@ -170,18 +182,31 @@ impl AppShell {
         if boards.is_empty() {
             return None;
         }
-        let need_you = boards.iter().map(|board| {
+        let mut need_you = 0;
+        let mut teammates = HashSet::new();
+        for board in boards {
             let notes = self.card_notes(&board.url, cx);
             let turns = self.turn_labels(&board.url);
-            self.need_you_items(&board.url, &notes, &turns).len()
-        });
+            need_you += self.need_you_items(&board.url, &notes, &turns).len();
+            teammates.extend(teammates_active(&turns));
+        }
         Some(DispatchCount {
             running: self.running_dispatches(cx),
             limit: self.settings.dispatch_limit,
-            need_you: need_you.sum(),
+            need_you,
             waiting: boards.iter().map(|board| self.waiting_for_a_slot(&board.url)).sum(),
+            teammates: teammates.len(),
         })
     }
+}
+
+/// The other people, in lowercase, whose agent has the turn of an item in `turns`.
+fn teammates_active(turns: &HashMap<String, TurnLabel>) -> HashSet<String> {
+    turns
+        .values()
+        .filter_map(|turn| turn.teammate.as_deref())
+        .map(str::to_lowercase)
+        .collect()
 }
 
 /// The items of `on_board` whose card says they need the user, or whose turn is the user's.
@@ -224,6 +249,10 @@ fn turn_label(
     now: f64,
 ) -> TurnLabel {
     let mine = |login: &str| viewer.is_some_and(|v| v.eq_ignore_ascii_case(login));
+    let teammate = match (&turn.turn, assignees) {
+        (Turn::Agent, [login]) if !mine(login) => Some(login.clone()),
+        _ => None,
+    };
     let (who, yours) = match &turn.turn {
         Turn::Agent => match assignees {
             [login] if mine(login) => ("Your agent".to_string(), false),
@@ -244,6 +273,7 @@ fn turn_label(
     TurnLabel {
         text: text.into(),
         yours,
+        teammate,
     }
 }
 
@@ -344,15 +374,41 @@ mod tests {
 
     #[test]
     fn the_count_leaves_out_what_is_zero() {
-        let count = |need_you, waiting| DispatchCount {
+        let count = |need_you, waiting, teammates| DispatchCount {
             running: 2,
             limit: 3,
             need_you,
             waiting,
+            teammates,
         };
-        assert_eq!(count(0, 0).text(), "2 of 3 running");
-        assert_eq!(count(1, 0).text(), "2 of 3 running · 1 needs you");
-        assert_eq!(count(3, 1).text(), "2 of 3 running · 3 need you · 1 waiting for a slot");
+        assert_eq!(count(0, 0, 0).text(), "Yours: 2 of 3 running");
+        assert_eq!(count(1, 0, 0).text(), "Yours: 2 of 3 running · 1 needs you");
+        assert_eq!(
+            count(3, 1, 2).text(),
+            "Yours: 2 of 3 running · 3 need you · 1 waiting for a slot · 2 teammates active"
+        );
+        assert_eq!(count(0, 0, 1).text(), "Yours: 2 of 3 running · 1 teammate active");
+    }
+
+    #[test]
+    fn a_teammate_is_active_while_the_agent_working_for_them_has_the_turn() {
+        assert_eq!(label(Turn::Agent, &["sanne"]).teammate.as_deref(), Some("sanne"));
+        assert_eq!(label(Turn::Agent, &["maui1911"]).teammate, None, "your own agent");
+        assert_eq!(label(Turn::Agent, &["sanne", "ana"]).teammate, None, "whose is unknown");
+        assert_eq!(label(Turn::Assignees, &["sanne"]).teammate, None, "sanne's own turn");
+        let working = |login: &str| TurnLabel {
+            teammate: Some(login.to_string()),
+            ..label(Turn::Agent, &[login])
+        };
+        let turns = HashMap::from([
+            ("PVTI_1".to_string(), working("sanne")),
+            ("PVTI_2".to_string(), working("Sanne")),
+            ("PVTI_3".to_string(), working("ana")),
+            ("PVTI_4".to_string(), label(Turn::Ci, &["lead"])),
+        ]);
+        let mut active = Vec::from_iter(teammates_active(&turns));
+        active.sort();
+        assert_eq!(active, ["ana", "sanne"]);
     }
 
     #[test]
@@ -362,6 +418,7 @@ mod tests {
             limit: 3,
             need_you,
             waiting: 2,
+            teammates: 1,
         };
         assert_eq!(count(0).running_text(), "board: 3/3 running");
         assert_eq!(count(0).need_you_text(), None);
@@ -380,6 +437,7 @@ mod tests {
         let turn = |yours| TurnLabel {
             text: "".into(),
             yours,
+            teammate: None,
         };
         let turns = HashMap::from([
             ("PVTI_review".to_string(), turn(true)),
